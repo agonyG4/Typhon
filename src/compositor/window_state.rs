@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use wayland_protocols::xdg::shell::server::xdg_toplevel;
 
 use super::{RenderableSurface, SurfacePlacement, XdgWindowGeometry};
+use crate::window_lifecycle_animation::ResolvedLifecycleTarget;
 
 #[derive(Debug, Clone)]
 pub(crate) struct WindowState {
@@ -10,6 +11,7 @@ pub(crate) struct WindowState {
     normal_restore_target: Option<NormalRestoreTarget>,
     minimized_surfaces: Vec<RenderableSurface>,
     minimized: bool,
+    minimized_lifecycle_target: Option<ResolvedLifecycleTarget>,
 }
 
 impl WindowState {
@@ -40,6 +42,22 @@ impl WindowState {
     pub(super) fn minimize(&mut self, surfaces: Vec<RenderableSurface>) {
         self.minimized = true;
         self.minimized_surfaces = surfaces;
+        self.minimized_lifecycle_target = None;
+    }
+
+    pub(super) fn set_minimized_lifecycle_target(
+        &mut self,
+        target: Option<ResolvedLifecycleTarget>,
+    ) {
+        self.minimized_lifecycle_target = target;
+    }
+
+    pub(super) fn minimized_lifecycle_target(&self) -> Option<ResolvedLifecycleTarget> {
+        self.minimized_lifecycle_target
+    }
+
+    pub(super) fn clear_minimized_lifecycle_target(&mut self) {
+        self.minimized_lifecycle_target = None;
     }
 
     pub(super) fn restore_minimized(&mut self) -> Option<Vec<RenderableSurface>> {
@@ -119,6 +137,7 @@ impl Default for WindowState {
             normal_restore_target: None,
             minimized_surfaces: Vec::new(),
             minimized: false,
+            minimized_lifecycle_target: None,
         }
     }
 }
@@ -213,6 +232,39 @@ pub(super) fn xdg_toplevel_state_bytes(states: &[xdg_toplevel::State]) -> Vec<u8
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn minimized_destination_survives_until_restore_uses_it_then_can_be_cleared() {
+        let target = ResolvedLifecycleTarget {
+            rect: crate::presentation_animation::PresentationRect::new(20.0, 30.0, 20.0, 20.0)
+                .expect("positive lifecycle destination"),
+            provenance:
+                crate::window_lifecycle_animation::LifecycleTargetProvenance::OutputFallback,
+        };
+        let mut window = WindowState::default();
+        window.mark_minimized_without_surfaces();
+        window.set_minimized_lifecycle_target(Some(target));
+
+        assert!(window.restore_minimized().is_some());
+        assert!(!window.is_minimized());
+        assert_eq!(window.minimized_lifecycle_target(), Some(target));
+        window.clear_minimized_lifecycle_target();
+        assert_eq!(window.minimized_lifecycle_target(), None);
+    }
+
+    #[test]
+    fn a_later_minimize_starts_a_new_destination_epoch() {
+        let target = ResolvedLifecycleTarget {
+            rect: crate::presentation_animation::PresentationRect::new(20.0, 30.0, 20.0, 20.0)
+                .expect("positive lifecycle destination"),
+            provenance:
+                crate::window_lifecycle_animation::LifecycleTargetProvenance::PointerFallback,
+        };
+        let mut window = WindowState::default();
+        window.set_minimized_lifecycle_target(Some(target));
+        window.minimize(Vec::new());
+        assert_eq!(window.minimized_lifecycle_target(), None);
+    }
 
     #[test]
     fn protocol_modes_publish_only_their_xdg_state() {

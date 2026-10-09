@@ -321,6 +321,11 @@ impl CompositorState {
             self.detach_surface_from_window_scene(old_surface_id);
             self.window_by_root_surface.remove(&old_surface_id);
         }
+        if old_surface_id.is_some()
+            && let Some(window) = self.window_mut(window_id)
+        {
+            window.state.clear_minimized_lifecycle_target();
+        }
         self.window_by_root_surface.insert(surface_id, window_id);
         let window = self
             .window_mut(window_id)

@@ -27,6 +27,13 @@ pub(crate) struct RetainedSurfacePresentationNode {
     pub(crate) render_target_size: Option<BufferSize>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LifecycleSurfaceCaptureFailure {
+    NoRenderableRoot,
+    MissingPresentationGeneration,
+    InvalidSurfaceTopology,
+}
+
 impl RetainedSurfacePresentationSnapshot {
     /// Captures the root's usable retained tree in painter order. Missing
     /// presentation generations are never substituted with render generations.
@@ -34,24 +41,28 @@ impl RetainedSurfacePresentationSnapshot {
         root_surface_id: u32,
         surfaces: &[RenderableSurface],
         presentation_generations: &HashMap<u32, u64>,
-    ) -> Option<Self> {
+    ) -> Result<Self, LifecycleSurfaceCaptureFailure> {
         let mut by_surface_id = HashMap::with_capacity(surfaces.len());
         for (index, surface) in surfaces.iter().enumerate() {
             if by_surface_id.insert(surface.surface_id, index).is_some() {
-                return None;
+                return Err(LifecycleSurfaceCaptureFailure::InvalidSurfaceTopology);
             }
         }
 
-        let root_index = *by_surface_id.get(&root_surface_id)?;
+        let root_index = *by_surface_id
+            .get(&root_surface_id)
+            .ok_or(LifecycleSurfaceCaptureFailure::NoRenderableRoot)?;
         let root_surface = &surfaces[root_index];
         if root_surface.placement.parent_surface_id.is_some()
             || root_surface
                 .render_placement
                 .is_some_and(|placement| placement.parent_surface_id.is_some())
         {
-            return None;
+            return Err(LifecycleSurfaceCaptureFailure::InvalidSurfaceTopology);
         }
-        let root_generation = *presentation_generations.get(&root_surface_id)?;
+        let root_generation = *presentation_generations
+            .get(&root_surface_id)
+            .ok_or(LifecycleSurfaceCaptureFailure::MissingPresentationGeneration)?;
         let root_key = SurfacePresentationKey {
             surface_id: root_surface_id,
             generation: root_generation,
@@ -107,7 +118,7 @@ impl RetainedSurfacePresentationSnapshot {
                 continue;
             }
             if !presentation_generations.contains_key(&surface.surface_id) {
-                return None;
+                return Err(LifecycleSurfaceCaptureFailure::MissingPresentationGeneration);
             }
         }
 
@@ -135,13 +146,15 @@ impl RetainedSurfacePresentationSnapshot {
             if !ancestry.get(&surface.surface_id).copied().unwrap_or(false) {
                 continue;
             }
-            let key = *keys_by_id.get(&surface.surface_id)?;
+            let key = *keys_by_id
+                .get(&surface.surface_id)
+                .ok_or(LifecycleSurfaceCaptureFailure::MissingPresentationGeneration)?;
             let parent_key = surface
                 .placement
                 .parent_surface_id
                 .and_then(|parent_id| keys_by_id.get(&parent_id).copied());
             if surface.placement.parent_surface_id.is_some() && parent_key.is_none() {
-                return None;
+                return Err(LifecycleSurfaceCaptureFailure::InvalidSurfaceTopology);
             }
             let render_parent_id = surface
                 .render_placement
@@ -213,7 +226,7 @@ impl RetainedSurfacePresentationSnapshot {
         }
 
         if !nodes_by_key.contains_key(&root_key) {
-            return None;
+            return Err(LifecycleSurfaceCaptureFailure::InvalidSurfaceTopology);
         }
         let mut valid_ancestry = HashMap::new();
         let nodes = surfaces
@@ -234,7 +247,10 @@ impl RetainedSurfacePresentationSnapshot {
                 }
             })
             .collect::<Vec<_>>();
-        Some(Self { root_key, nodes })
+        if !nodes.iter().any(|node| node.key == root_key) {
+            return Err(LifecycleSurfaceCaptureFailure::InvalidSurfaceTopology);
+        }
+        Ok(Self { root_key, nodes })
     }
 
     /// Projects current content through captured topology and captured order.
@@ -571,21 +587,47 @@ mod tests {
         let root = test_surface(42, SurfacePlacement::root());
         let child = test_surface(43, SurfacePlacement::subsurface(42, 1, 2));
 
-        assert!(
+        assert_eq!(
             RetainedSurfacePresentationSnapshot::capture(
                 42,
                 &[root.clone(), child.clone()],
                 &HashMap::from([(43, 1)]),
             )
-            .is_none()
+            .expect_err("root generation is required"),
+            LifecycleSurfaceCaptureFailure::MissingPresentationGeneration
         );
-        assert!(
+        assert_eq!(
             RetainedSurfacePresentationSnapshot::capture(
                 42,
                 &[root, child],
                 &HashMap::from([(42, 1)]),
             )
-            .is_none()
+            .expect_err("retained descendant generation is required"),
+            LifecycleSurfaceCaptureFailure::MissingPresentationGeneration
+        );
+    }
+
+    #[test]
+    fn capture_reports_missing_root_and_invalid_root_topology() {
+        let root = test_surface(42, SurfacePlacement::root());
+        assert_eq!(
+            RetainedSurfacePresentationSnapshot::capture(42, &[], &HashMap::new())
+                .expect_err("missing renderable root"),
+            LifecycleSurfaceCaptureFailure::NoRenderableRoot
+        );
+        let invalid_root = test_surface(42, SurfacePlacement::subsurface(43, 1, 2));
+        assert_eq!(
+            RetainedSurfacePresentationSnapshot::capture(
+                42,
+                &[invalid_root],
+                &HashMap::from([(42, 1)]),
+            )
+            .expect_err("root must be a topology root"),
+            LifecycleSurfaceCaptureFailure::InvalidSurfaceTopology
+        );
+        assert!(
+            RetainedSurfacePresentationSnapshot::capture(42, &[root], &HashMap::from([(42, 1)]),)
+                .is_ok()
         );
     }
 }

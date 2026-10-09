@@ -385,9 +385,13 @@ impl CompositorState {
                 && self
                     .window(window_id)
                     .is_some_and(|window| window.root_surface_id == surface_id)
-                && let Some(scene_node_id) = self.scene_node_id_for_window_group(window_id)
             {
-                self.presentation_animator.cancel_all(scene_node_id);
+                if let Some(window) = self.window_mut(window_id) {
+                    window.state.clear_minimized_lifecycle_target();
+                }
+                if let Some(scene_node_id) = self.scene_node_id_for_window_group(window_id) {
+                    self.presentation_animator.cancel_all(scene_node_id);
+                }
             }
             self.mark_astrea_toplevel_structure_dirty();
             self.refresh_keyboard_shortcut_inhibition();

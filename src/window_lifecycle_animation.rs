@@ -84,6 +84,109 @@ pub enum LifecycleVisualSourceKind {
     ResolvedOwnedEffects,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LifecycleTargetProvenance {
+    DockPublished,
+    RememberedDestination,
+    PointerFallback,
+    OutputFallback,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ResolvedLifecycleTarget {
+    pub rect: PresentationRect,
+    pub provenance: LifecycleTargetProvenance,
+}
+
+const LIFECYCLE_FALLBACK_TARGET_SIZE: f64 = 20.0;
+const LIFECYCLE_FALLBACK_BOTTOM_MARGIN: f64 = 12.0;
+const MAX_PUBLISHED_LIFECYCLE_ANCHOR_DIMENSION: f64 = 16_384.0;
+
+/// Resolve one lifecycle destination. A published Dock rectangle stays exact;
+/// synthetic targets are positive-sized and clipped to this output's viewport.
+pub fn resolve_lifecycle_target(
+    dock_anchor: Option<PresentationRect>,
+    remembered: Option<ResolvedLifecycleTarget>,
+    presented_window: PresentationRect,
+    pointer: Option<(f64, f64)>,
+    output_width: u32,
+    output_height: u32,
+) -> Option<ResolvedLifecycleTarget> {
+    if let Some(rect) = dock_anchor.filter(|rect| {
+        rect.width() <= MAX_PUBLISHED_LIFECYCLE_ANCHOR_DIMENSION
+            && rect.height() <= MAX_PUBLISHED_LIFECYCLE_ANCHOR_DIMENSION
+    }) {
+        return Some(ResolvedLifecycleTarget {
+            rect,
+            provenance: LifecycleTargetProvenance::DockPublished,
+        });
+    }
+    if let Some(target) = remembered {
+        return Some(ResolvedLifecycleTarget {
+            rect: target.rect,
+            provenance: LifecycleTargetProvenance::RememberedDestination,
+        });
+    }
+
+    let width = f64::from(output_width);
+    let height = f64::from(output_height);
+    if width <= 0.0 || height <= 0.0 {
+        return None;
+    }
+    let target_width = LIFECYCLE_FALLBACK_TARGET_SIZE.min(width);
+    let target_height = LIFECYCLE_FALLBACK_TARGET_SIZE.min(height);
+    let output_fallback = || {
+        let bottom_margin = LIFECYCLE_FALLBACK_BOTTOM_MARGIN.min(height - target_height);
+        PresentationRect::new(
+            (width - target_width) * 0.5,
+            height - target_height - bottom_margin,
+            target_width,
+            target_height,
+        )
+        .map(|rect| ResolvedLifecycleTarget {
+            rect,
+            provenance: LifecycleTargetProvenance::OutputFallback,
+        })
+    };
+
+    let Some((pointer_x, pointer_y)) = pointer.filter(|(x, y)| {
+        x.is_finite() && y.is_finite() && *x >= 0.0 && *x < width && *y >= 0.0 && *y < height
+    }) else {
+        return output_fallback();
+    };
+    let left = presented_window.x();
+    let top = presented_window.y();
+    let right = left + presented_window.width();
+    let bottom = top + presented_window.height();
+    if !right.is_finite() || !bottom.is_finite() {
+        return None;
+    }
+    let point =
+        if pointer_x >= left && pointer_x <= right && pointer_y >= top && pointer_y <= bottom {
+            let distances = [
+                (pointer_y - top, (pointer_x, top)),
+                (right - pointer_x, (right, pointer_y)),
+                (bottom - pointer_y, (pointer_x, bottom)),
+                (pointer_x - left, (left, pointer_y)),
+            ];
+            distances
+                .into_iter()
+                .min_by(|a, b| a.0.total_cmp(&b.0))
+                .map(|(_, point)| point)?
+        } else {
+            (pointer_x.clamp(left, right), pointer_y.clamp(top, bottom))
+        };
+    if !point.0.is_finite() || !point.1.is_finite() {
+        return None;
+    }
+    let x = (point.0 - target_width * 0.5).clamp(0.0, width - target_width);
+    let y = (point.1 - target_height * 0.5).clamp(0.0, height - target_height);
+    PresentationRect::new(x, y, target_width, target_height).map(|rect| ResolvedLifecycleTarget {
+        rect,
+        provenance: LifecycleTargetProvenance::PointerFallback,
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LampDirection {
     Top,
@@ -99,6 +202,7 @@ pub struct LifecycleVisualGroup {
     pub presented_source_client_rect: PresentationRect,
     pub presented_source_visual_rect: PresentationRect,
     pub anchor_rect: PresentationRect,
+    pub anchor_provenance: LifecycleTargetProvenance,
     pub portal_rect: PresentationRect,
     pub sink_rect: PresentationRect,
     pub lamp_direction: LampDirection,
@@ -116,12 +220,35 @@ impl LifecycleVisualGroup {
         output_width: u32,
         output_height: u32,
     ) -> Option<Self> {
+        Self::from_resolved_effect_bounds(
+            effect,
+            canonical_client_rect,
+            canonical_visual_rect,
+            presented_source_client_rect,
+            ResolvedLifecycleTarget {
+                rect: anchor_rect,
+                provenance: LifecycleTargetProvenance::DockPublished,
+            },
+            output_width,
+            output_height,
+        )
+    }
+
+    pub fn from_resolved_effect_bounds(
+        effect: LifecycleEffectKind,
+        canonical_client_rect: PresentationRect,
+        canonical_visual_rect: PresentationRect,
+        presented_source_client_rect: PresentationRect,
+        target: ResolvedLifecycleTarget,
+        output_width: u32,
+        output_height: u32,
+    ) -> Option<Self> {
         match effect {
-            LifecycleEffectKind::Lamp => Self::from_bounds(
+            LifecycleEffectKind::Lamp => Self::from_bounds_with_target(
                 canonical_client_rect,
                 canonical_visual_rect,
                 presented_source_client_rect,
-                anchor_rect,
+                target,
                 output_width,
                 output_height,
             ),
@@ -129,7 +256,7 @@ impl LifecycleVisualGroup {
                 canonical_client_rect,
                 canonical_visual_rect,
                 presented_source_client_rect,
-                anchor_rect,
+                target,
                 output_width,
                 output_height,
             ),
@@ -140,7 +267,7 @@ impl LifecycleVisualGroup {
         canonical_client_rect: PresentationRect,
         canonical_visual_rect: PresentationRect,
         presented_source_client_rect: PresentationRect,
-        anchor_rect: PresentationRect,
+        target: ResolvedLifecycleTarget,
         output_width: u32,
         output_height: u32,
     ) -> Option<Self> {
@@ -148,7 +275,7 @@ impl LifecycleVisualGroup {
             canonical_client_rect,
             canonical_visual_rect,
             presented_source_client_rect,
-        ) || !valid_rect(anchor_rect)
+        ) || !valid_rect(target.rect)
         {
             return None;
         }
@@ -162,14 +289,15 @@ impl LifecycleVisualGroup {
             canonical_visual_rect,
             presented_source_client_rect,
             presented_source_visual_rect,
-            anchor_rect,
+            anchor_rect: target.rect,
+            anchor_provenance: target.provenance,
             // These Lamp-only members remain populated so retained payloads
             // share one visual-group identity; Squash never consumes them.
-            portal_rect: anchor_rect,
-            sink_rect: anchor_rect,
+            portal_rect: target.rect,
+            sink_rect: target.rect,
             lamp_direction: infer_lamp_direction(
                 presented_source_visual_rect,
-                anchor_rect,
+                target.rect,
                 output_width,
                 output_height,
             ),
@@ -186,11 +314,32 @@ impl LifecycleVisualGroup {
         output_width: u32,
         output_height: u32,
     ) -> Option<Self> {
+        Self::from_bounds_with_target(
+            canonical_client_rect,
+            canonical_visual_rect,
+            presented_source_client_rect,
+            ResolvedLifecycleTarget {
+                rect: anchor_rect,
+                provenance: LifecycleTargetProvenance::DockPublished,
+            },
+            output_width,
+            output_height,
+        )
+    }
+
+    fn from_bounds_with_target(
+        canonical_client_rect: PresentationRect,
+        canonical_visual_rect: PresentationRect,
+        presented_source_client_rect: PresentationRect,
+        target: ResolvedLifecycleTarget,
+        output_width: u32,
+        output_height: u32,
+    ) -> Option<Self> {
         if !valid_lamp_rects(
             canonical_client_rect,
             canonical_visual_rect,
             presented_source_client_rect,
-        ) || !valid_rect(anchor_rect)
+        ) || !valid_rect(target.rect)
         {
             return None;
         }
@@ -201,29 +350,30 @@ impl LifecycleVisualGroup {
         )?;
         let lamp_direction = infer_lamp_direction(
             presented_source_visual_rect,
-            anchor_rect,
+            target.rect,
             output_width,
             output_height,
         );
         let portal_rect =
-            lamp_portal_rect(presented_source_visual_rect, anchor_rect, lamp_direction)?;
+            lamp_portal_rect(presented_source_visual_rect, target.rect, lamp_direction)?;
         let sink_rect = lamp_sink_rect(
-            anchor_rect,
+            target.rect,
             portal_rect,
             lamp_direction,
             ASTREA_LAMP_ABSORB_DEPTH,
             ASTREA_LAMP_SINK_THICKNESS,
         )?;
         let shape_factor =
-            lamp_shape_factor(presented_source_visual_rect, anchor_rect, lamp_direction);
+            lamp_shape_factor(presented_source_visual_rect, target.rect, lamp_direction);
         let bump_distance =
-            lamp_bump_distance(presented_source_visual_rect, anchor_rect, lamp_direction);
+            lamp_bump_distance(presented_source_visual_rect, target.rect, lamp_direction);
         Some(Self {
             canonical_client_rect,
             canonical_visual_rect,
             presented_source_client_rect,
             presented_source_visual_rect,
-            anchor_rect,
+            anchor_rect: target.rect,
+            anchor_provenance: target.provenance,
             portal_rect,
             sink_rect,
             lamp_direction,

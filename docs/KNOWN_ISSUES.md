@@ -1,5 +1,23 @@
 # Known Issues
 
+## Minimize and restore runtime qualification is pending
+
+Typhon prefers an exact, valid per-window Dock anchor. When none is published,
+it resolves one positive-sized target at lifecycle admission: a recent pointer
+is projected to the nearest edge of the presented window, and stale, unknown,
+or off-output pointer coordinates use a deterministic target near the bottom
+edge of the output. The chosen target is frozen in the retained visual group
+for reversals and remembered in minimized window state until restore. A live
+Dock anchor takes precedence for a fresh restore.
+
+Missing source geometry, a renderable root, exact presentation generations,
+valid surface ancestry, renderer support, visible output intersection, or
+retained ownership still rejects the effect while preserving the existing
+logical window action. Set `ASTREA_LIFECYCLE_DIAGNOSTICS=1` to emit bounded,
+machine-searchable `typhon.lifecycle_admission` reasons. Explorer, Steam,
+native Wayland applications, and managed XWayland applications have not been
+qualified in a live compositor session for this checkout.
+
 ## Effects hardware qualification is deferred
 
 The effects engine has deterministic model, graph, damage, resource, protocol,

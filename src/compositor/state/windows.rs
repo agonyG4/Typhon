@@ -6,7 +6,8 @@ use crate::compositor::window_state::{
     NormalRestoreGeometryObservation, NormalRestoreGeometrySource,
 };
 use crate::window_lifecycle_animation::{
-    LifecycleDirection, LifecycleVisualGroup, canonical_visual_rect,
+    LifecycleDirection, LifecycleVisualGroup, ResolvedLifecycleTarget, canonical_visual_rect,
+    presented_visual_rect,
 };
 use crate::wm::{LayoutMembership, WorkspaceSwitchOutcome};
 
@@ -1402,6 +1403,9 @@ impl CompositorState {
                 )
             })
             .is_some();
+        let active_lifecycle_visual_group = lifecycle_scene_node_id
+            .filter(|_| has_active_lifecycle)
+            .and_then(|scene_node_id| self.lifecycle_visual_group_for_scene_node(scene_node_id));
         let (presented_source_client_rect, canonical_client_rect, lifecycle_effect_scene) =
             if has_active_lifecycle {
                 (None, None, ResolvedEffectScene::default())
@@ -1483,8 +1487,7 @@ impl CompositorState {
         } else if minimize_effect.is_some() {
             presented_source_client_rect
                 .zip(canonical_client_rect)
-                .zip(self.lifecycle_anchor_rect(window_id))
-                .and_then(|((presented_source, canonical_client), anchor)| {
+                .and_then(|(presented_source, canonical_client)| {
                     let owned_bounds = minimized_surfaces.iter().filter_map(|surface| {
                         PresentationRect::new(
                             f64::from(surface.x),
@@ -1507,12 +1510,15 @@ impl CompositorState {
                         });
                     let visual =
                         canonical_visual_rect(canonical_client, owned_bounds, decoration_bounds)?;
-                    LifecycleVisualGroup::from_effect_bounds(
+                    let presented_visual =
+                        presented_visual_rect(canonical_client, visual, presented_source)?;
+                    let target = self.resolve_lifecycle_target(window_id, presented_visual)?;
+                    LifecycleVisualGroup::from_resolved_effect_bounds(
                         minimize_effect?,
                         canonical_client,
                         visual,
                         presented_source,
-                        anchor,
+                        target,
                         self.output_size.width,
                         self.output_size.height,
                     )
@@ -1523,6 +1529,15 @@ impl CompositorState {
 
         if let Some(window) = self.window_mut(window_id) {
             window.state.minimize(minimized_surfaces);
+            let target_group = lifecycle_visual_group.or(active_lifecycle_visual_group);
+            window
+                .state
+                .set_minimized_lifecycle_target(target_group.map(|group| {
+                    ResolvedLifecycleTarget {
+                        rect: group.anchor_rect,
+                        provenance: group.anchor_provenance,
+                    }
+                }));
         }
         self.cancel_pending_normal_restore(root_surface_id, "window_minimized");
         self.begin_lifecycle_minimize(
@@ -1671,8 +1686,7 @@ impl CompositorState {
                 .and_then(|scene_node_id| self.lifecycle_visual_group_for_scene_node(scene_node_id))
         } else {
             self.lifecycle_window_rect(root_surface_id)
-                .zip(self.lifecycle_anchor_rect(window_id))
-                .and_then(|(canonical_client, anchor)| {
+                .and_then(|canonical_client| {
                     let owned_bounds = self
                         .renderable_surfaces
                         .iter()
@@ -1703,12 +1717,15 @@ impl CompositorState {
                         });
                     let visual =
                         canonical_visual_rect(canonical_client, owned_bounds, decoration_bounds)?;
-                    LifecycleVisualGroup::from_effect_bounds(
+                    let presented_visual =
+                        presented_visual_rect(canonical_client, visual, canonical_client)?;
+                    let target = self.resolve_lifecycle_target(window_id, presented_visual)?;
+                    LifecycleVisualGroup::from_resolved_effect_bounds(
                         restore_effect?,
                         canonical_client,
                         visual,
                         canonical_client,
-                        anchor,
+                        target,
                         self.output_size.width,
                         self.output_size.height,
                     )
@@ -1721,6 +1738,9 @@ impl CompositorState {
             lifecycle_effect_scene,
             lifecycle_decorations,
         );
+        if let Some(window) = self.window_mut(window_id) {
+            window.state.clear_minimized_lifecycle_target();
+        }
         true
     }
 

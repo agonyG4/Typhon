@@ -9,8 +9,107 @@ use crate::window_lifecycle_animation::{
     LifecycleDirection, LifecycleEffectKind, LifecycleFrameSnapshot, LifecycleMotionRequest,
     LifecycleRenderFallbackEntry, LifecycleSceneSample, LifecycleVisualGroup,
     LifecycleVisualSource, LifecycleVisualSourceKind, LifecycleWindowSample,
+    ResolvedLifecycleTarget, resolve_lifecycle_target,
 };
 use std::num::NonZeroU64;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LifecycleAdmissionReason {
+    EffectDisabled,
+    RendererUnavailable,
+    NoSceneNode,
+    ClockUnavailable,
+    MissingSourceGeometry,
+    InvalidVisualGeometry,
+    NoRenderableRoot,
+    MissingPresentationGeneration,
+    InvalidSurfaceTopology,
+    OffscreenVisual,
+    RetainedCaptureFailed,
+    ReservationFailed,
+    MotionRejected,
+    UnexpectedOwnerChange,
+}
+
+impl LifecycleAdmissionReason {
+    const fn id(self) -> &'static str {
+        match self {
+            Self::EffectDisabled => "effect_disabled",
+            Self::RendererUnavailable => "renderer_unavailable",
+            Self::NoSceneNode => "no_scene_node",
+            Self::ClockUnavailable => "clock_unavailable",
+            Self::MissingSourceGeometry => "missing_source_geometry",
+            Self::InvalidVisualGeometry => "invalid_visual_geometry",
+            Self::NoRenderableRoot => "no_renderable_root",
+            Self::MissingPresentationGeneration => "missing_presentation_generation",
+            Self::InvalidSurfaceTopology => "invalid_surface_topology",
+            Self::OffscreenVisual => "offscreen_visual",
+            Self::RetainedCaptureFailed => "retained_capture_failed",
+            Self::ReservationFailed => "reservation_failed",
+            Self::MotionRejected => "motion_rejected",
+            Self::UnexpectedOwnerChange => "unexpected_owner_change",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LifecycleAdmissionOutcome {
+    Started,
+    Skipped(LifecycleAdmissionReason),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LifecycleAdmissionFailure {
+    reason: LifecycleAdmissionReason,
+    target_provenance: Option<crate::window_lifecycle_animation::LifecycleTargetProvenance>,
+}
+
+impl LifecycleAdmissionFailure {
+    const fn new(
+        reason: LifecycleAdmissionReason,
+        target_provenance: Option<crate::window_lifecycle_animation::LifecycleTargetProvenance>,
+    ) -> Self {
+        Self {
+            reason,
+            target_provenance,
+        }
+    }
+}
+
+static LIFECYCLE_DIAGNOSTICS_ENABLED: OnceLock<bool> = OnceLock::new();
+static LIFECYCLE_DIAGNOSTICS_LAST_NS: AtomicU64 = AtomicU64::new(0);
+
+fn lifecycle_diagnostics_enabled() -> bool {
+    *LIFECYCLE_DIAGNOSTICS_ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("ASTREA_LIFECYCLE_DIAGNOSTICS").as_deref(),
+            Ok("1" | "true" | "on")
+        )
+    })
+}
+
+fn lifecycle_diagnostic_budget_available() -> bool {
+    let Ok(now_ns) = crate::native::event_loop::monotonic_now_ns() else {
+        return false;
+    };
+    let mut previous = LIFECYCLE_DIAGNOSTICS_LAST_NS.load(Ordering::Relaxed);
+    loop {
+        if now_ns.saturating_sub(previous) < 100_000_000 {
+            return false;
+        }
+        match LIFECYCLE_DIAGNOSTICS_LAST_NS.compare_exchange_weak(
+            previous,
+            now_ns,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return true,
+            Err(observed) => previous = observed,
+        }
+    }
+}
 
 impl CompositorState {
     /// Freeze only the compositor-owned effect instances belonging to one
@@ -125,6 +224,110 @@ impl CompositorState {
         })
     }
 
+    fn lifecycle_effect_skip_reason(
+        &self,
+        direction: LifecycleDirection,
+    ) -> LifecycleAdmissionReason {
+        if !self.animation_control.enabled() {
+            return LifecycleAdmissionReason::EffectDisabled;
+        }
+        let slot = match direction {
+            LifecycleDirection::Minimize => AnimationSlot::WindowMinimize,
+            LifecycleDirection::Restore => AnimationSlot::WindowRestore,
+        };
+        let capabilities = self.animation_runtime_capabilities();
+        match self
+            .animation_control
+            .configuration()
+            .requested_effect(slot)
+            .0
+        {
+            AnimationEffect::MinimizeLamp if !capabilities.lamp_renderer => {
+                LifecycleAdmissionReason::RendererUnavailable
+            }
+            AnimationEffect::MinimizeSquash if !capabilities.squash_renderer => {
+                LifecycleAdmissionReason::RendererUnavailable
+            }
+            _ => LifecycleAdmissionReason::EffectDisabled,
+        }
+    }
+
+    fn record_lifecycle_admission(
+        &self,
+        window_id: WindowId,
+        root_surface_id: u32,
+        direction: LifecycleDirection,
+        selected_effect: Option<LifecycleEffectKind>,
+        target_provenance: Option<crate::window_lifecycle_animation::LifecycleTargetProvenance>,
+        reused_payload: bool,
+        outcome: LifecycleAdmissionOutcome,
+    ) {
+        if !lifecycle_diagnostics_enabled() || !lifecycle_diagnostic_budget_available() {
+            return;
+        }
+        let slot = match direction {
+            LifecycleDirection::Minimize => AnimationSlot::WindowMinimize,
+            LifecycleDirection::Restore => AnimationSlot::WindowRestore,
+        };
+        let configured_effect = self
+            .animation_control
+            .configuration()
+            .requested_effect(slot)
+            .0
+            .id();
+        let capabilities = self.animation_runtime_capabilities();
+        let (status, reason) = match outcome {
+            LifecycleAdmissionOutcome::Started => ("started", "none"),
+            LifecycleAdmissionOutcome::Skipped(reason) => ("skipped", reason.id()),
+        };
+        let backend = self.window(window_id).map_or("missing", |window| {
+            if matches!(window.backend, WindowBackend::X11(_)) {
+                "x11"
+            } else {
+                "xdg"
+            }
+        });
+        let operation = match direction {
+            LifecycleDirection::Minimize => "minimize",
+            LifecycleDirection::Restore => "restore",
+        };
+        let selected_effect = selected_effect.map_or("none", |effect| match effect {
+            LifecycleEffectKind::Lamp => "lamp",
+            LifecycleEffectKind::Squash => "squash",
+        });
+        let target_provenance = target_provenance.map_or("unavailable", |provenance| {
+            match provenance {
+                crate::window_lifecycle_animation::LifecycleTargetProvenance::DockPublished => {
+                    "dock_published"
+                }
+                crate::window_lifecycle_animation::LifecycleTargetProvenance::RememberedDestination => {
+                    "remembered_destination"
+                }
+                crate::window_lifecycle_animation::LifecycleTargetProvenance::PointerFallback => {
+                    "pointer_fallback"
+                }
+                crate::window_lifecycle_animation::LifecycleTargetProvenance::OutputFallback => {
+                    "output_fallback"
+                }
+            }
+        });
+        eprintln!(
+            "typhon.lifecycle_admission event=admission window_id={} root_surface_id={} backend={} operation={} configured_effect={} selected_effect={} capability_lamp={} capability_squash={} target_provenance={} reused_payload={} outcome={} reason={}",
+            window_id.get(),
+            root_surface_id,
+            backend,
+            operation,
+            configured_effect,
+            selected_effect,
+            capabilities.lamp_renderer,
+            capabilities.squash_renderer,
+            target_provenance,
+            reused_payload,
+            status,
+            reason,
+        );
+    }
+
     pub(in crate::compositor) fn lifecycle_minimize_source_rect(
         &self,
         root_surface_id: u32,
@@ -134,16 +337,44 @@ impl CompositorState {
             .or_else(|| self.current_presentation_rect_for_root(root_surface_id))
     }
 
-    pub(in crate::compositor) fn lifecycle_anchor_rect(
-        &self,
-        window_id: WindowId,
-    ) -> Option<PresentationRect> {
+    fn published_lifecycle_anchor_rect(&self, window_id: WindowId) -> Option<PresentationRect> {
         let anchor = self.astrea_toplevel_publisher.minimize_anchor(window_id)?;
         PresentationRect::new(
             f64::from(anchor.x),
             f64::from(anchor.y),
             f64::from(anchor.width),
             f64::from(anchor.height),
+        )
+    }
+
+    fn recent_lifecycle_pointer(&self) -> Option<(f64, f64)> {
+        const POINTER_FRESHNESS_USEC: u64 = 30_000_000;
+        let timestamp_usec = self.last_pointer_motion_usec?;
+        let now_usec = crate::native::event_loop::monotonic_now_ns()
+            .ok()?
+            .checked_div(1_000)?;
+        let age_usec = now_usec.checked_sub(timestamp_usec)?;
+        (age_usec <= POINTER_FRESHNESS_USEC
+            && self.last_pointer_x.is_finite()
+            && self.last_pointer_y.is_finite())
+        .then_some((self.last_pointer_x, self.last_pointer_y))
+    }
+
+    pub(in crate::compositor) fn resolve_lifecycle_target(
+        &self,
+        window_id: WindowId,
+        presented_source_client_rect: PresentationRect,
+    ) -> Option<ResolvedLifecycleTarget> {
+        let remembered = self
+            .window(window_id)
+            .and_then(|window| window.state.minimized_lifecycle_target());
+        resolve_lifecycle_target(
+            self.published_lifecycle_anchor_rect(window_id),
+            remembered,
+            presented_source_client_rect,
+            self.recent_lifecycle_pointer(),
+            self.output_size.width,
+            self.output_size.height,
         )
     }
 
@@ -171,19 +402,50 @@ impl CompositorState {
         let Some(effect) =
             self.lifecycle_effect_kind_for_window(window_id, LifecycleDirection::Minimize)
         else {
+            self.record_lifecycle_admission(
+                window_id,
+                root_surface_id,
+                LifecycleDirection::Minimize,
+                None,
+                self.window(window_id)
+                    .and_then(|window| window.state.minimized_lifecycle_target())
+                    .map(|target| target.provenance),
+                false,
+                LifecycleAdmissionOutcome::Skipped(
+                    self.lifecycle_effect_skip_reason(LifecycleDirection::Minimize),
+                ),
+            );
             return;
         };
         let Some(scene_node_id) = self.scene_node_id_for_window_group(window_id) else {
+            self.record_lifecycle_admission(
+                window_id,
+                root_surface_id,
+                LifecycleDirection::Minimize,
+                Some(effect),
+                visual_group.map(|group| group.anchor_provenance),
+                false,
+                LifecycleAdmissionOutcome::Skipped(LifecycleAdmissionReason::NoSceneNode),
+            );
             return;
         };
         let Some(now) = AnimationTime::monotonic_now() else {
+            self.record_lifecycle_admission(
+                window_id,
+                root_surface_id,
+                LifecycleDirection::Minimize,
+                Some(effect),
+                visual_group.map(|group| group.anchor_provenance),
+                false,
+                LifecycleAdmissionOutcome::Skipped(LifecycleAdmissionReason::ClockUnavailable),
+            );
             return;
         };
         let speed = self.animation_control.configuration().speed;
         let frozen_decoration = lifecycle_decorations
             .into_iter()
             .find(|decoration| decoration.root_surface_id() == root_surface_id);
-        let Some((_identity, _payload, _was_reversal)) = self.install_lifecycle_motion(
+        let admission = self.install_lifecycle_motion(
             scene_node_id,
             window_id,
             root_surface_id,
@@ -196,9 +458,31 @@ impl CompositorState {
             frozen_decoration,
             now,
             speed,
-        ) else {
-            return;
+        );
+        let (_identity, payload, reused_payload) = match admission {
+            Ok(admission) => admission,
+            Err(failure) => {
+                self.record_lifecycle_admission(
+                    window_id,
+                    root_surface_id,
+                    LifecycleDirection::Minimize,
+                    Some(effect),
+                    failure.target_provenance,
+                    false,
+                    LifecycleAdmissionOutcome::Skipped(failure.reason),
+                );
+                return;
+            }
         };
+        self.record_lifecycle_admission(
+            window_id,
+            root_surface_id,
+            LifecycleDirection::Minimize,
+            Some(effect),
+            Some(payload.visual_group.anchor_provenance),
+            reused_payload,
+            LifecycleAdmissionOutcome::Started,
+        );
         // Lamp takes over Group properties only after the retained transaction
         // and lifecycle executor have both accepted the same identity.
         self.presentation_animator.cancel_all(scene_node_id);
@@ -219,19 +503,34 @@ impl CompositorState {
         frozen_decoration: Option<DecorationRenderInstance>,
         now: AnimationTime,
         speed: f64,
-    ) -> Option<(
-        crate::presentation_animation::PresentationRetainedVisualIdentity,
-        std::sync::Arc<super::lifecycle_retained::RetainedLifecyclePayload>,
-        bool,
-    )> {
+    ) -> Result<
+        (
+            crate::presentation_animation::PresentationRetainedVisualIdentity,
+            std::sync::Arc<super::lifecycle_retained::RetainedLifecyclePayload>,
+            bool,
+        ),
+        LifecycleAdmissionFailure,
+    > {
         let previous_identity = self.presentation_animator.active_retained_visual(
             scene_node_id,
             PresentationRetainedVisualKind::WindowLifecycle,
         );
         let previous_payload = match previous_identity {
-            Some(identity) => Some(std::sync::Arc::clone(
-                self.retained_lifecycle_payloads.get_exact(identity)?,
-            )),
+            Some(identity) => {
+                let Some(payload) = self.retained_lifecycle_payloads.get_exact(identity) else {
+                    return Err(LifecycleAdmissionFailure::new(
+                        LifecycleAdmissionReason::UnexpectedOwnerChange,
+                        None,
+                    ));
+                };
+                if payload.window_id != window_id {
+                    return Err(LifecycleAdmissionFailure::new(
+                        LifecycleAdmissionReason::UnexpectedOwnerChange,
+                        Some(payload.visual_group.anchor_provenance),
+                    ));
+                }
+                Some(std::sync::Arc::clone(payload))
+            }
             None => None,
         };
         let visual_group = if let Some(payload) = previous_payload.as_ref() {
@@ -239,24 +538,50 @@ impl CompositorState {
         } else if let Some(visual_group) = visual_group {
             visual_group
         } else {
-            let canonical_client_rect =
-                canonical_client_rect.or_else(|| self.lifecycle_window_rect(root_surface_id))?;
+            let canonical_client_rect = canonical_client_rect
+                .or_else(|| self.lifecycle_window_rect(root_surface_id))
+                .ok_or_else(|| {
+                    LifecycleAdmissionFailure::new(
+                        LifecycleAdmissionReason::MissingSourceGeometry,
+                        None,
+                    )
+                })?;
             let presented_source_client_rect = match direction {
                 LifecycleDirection::Minimize => presented_source_client_rect
-                    .or_else(|| self.lifecycle_minimize_source_rect(root_surface_id))?,
+                    .or_else(|| self.lifecycle_minimize_source_rect(root_surface_id))
+                    .ok_or_else(|| {
+                        LifecycleAdmissionFailure::new(
+                            LifecycleAdmissionReason::MissingSourceGeometry,
+                            None,
+                        )
+                    })?,
                 LifecycleDirection::Restore => canonical_client_rect,
             };
-            let anchor_rect = self.lifecycle_anchor_rect(window_id)?;
-            LifecycleVisualGroup::from_effect_bounds(
+            let target = self
+                .resolve_lifecycle_target(window_id, presented_source_client_rect)
+                .ok_or_else(|| {
+                    LifecycleAdmissionFailure::new(
+                        LifecycleAdmissionReason::InvalidVisualGeometry,
+                        None,
+                    )
+                })?;
+            LifecycleVisualGroup::from_resolved_effect_bounds(
                 effect,
                 canonical_client_rect,
                 canonical_client_rect,
                 presented_source_client_rect,
-                anchor_rect,
+                target,
                 self.output_size.width,
                 self.output_size.height,
-            )?
+            )
+            .ok_or_else(|| {
+                LifecycleAdmissionFailure::new(
+                    LifecycleAdmissionReason::InvalidVisualGeometry,
+                    Some(target.provenance),
+                )
+            })?
         };
+        let target_provenance = Some(visual_group.anchor_provenance);
         let visual_intersects_output =
             crate::window_lifecycle_animation::lifecycle_visual_bounds_intersect_output(
                 effect,
@@ -266,10 +591,16 @@ impl CompositorState {
                 self.output_size.height,
             );
         if !visual_intersects_output {
-            return None;
+            return Err(LifecycleAdmissionFailure::new(
+                LifecycleAdmissionReason::OffscreenVisual,
+                target_provenance,
+            ));
         }
         let fresh_surface_presentation = if previous_payload.is_none() {
-            Some(self.capture_lifecycle_surface_presentation(window_id, root_surface_id)?)
+            Some(
+                self.capture_lifecycle_surface_presentation(window_id, root_surface_id)
+                    .map_err(|reason| LifecycleAdmissionFailure::new(reason, target_provenance))?,
+            )
         } else {
             None
         };
@@ -281,7 +612,12 @@ impl CompositorState {
                 PresentationRetainedVisualKind::WindowLifecycle,
                 now,
             )
-            .ok()?;
+            .map_err(|_| {
+                LifecycleAdmissionFailure::new(
+                    LifecycleAdmissionReason::ReservationFailed,
+                    target_provenance,
+                )
+            })?;
         let activated_previous = match self
             .presentation_animator
             .activate_retained_visual_exact(identity)
@@ -290,7 +626,10 @@ impl CompositorState {
             Err(_) => {
                 self.presentation_animator
                     .retire_retained_visual_exact(identity);
-                return None;
+                return Err(LifecycleAdmissionFailure::new(
+                    LifecycleAdmissionReason::ReservationFailed,
+                    target_provenance,
+                ));
             }
         };
         if activated_previous != previous_identity {
@@ -304,7 +643,10 @@ impl CompositorState {
                 restored && retired,
                 "unexpected lifecycle owner changed during start"
             );
-            return None;
+            return Err(LifecycleAdmissionFailure::new(
+                LifecycleAdmissionReason::UnexpectedOwnerChange,
+                target_provenance,
+            ));
         }
 
         let payload = if let Some(payload) = previous_payload {
@@ -321,7 +663,10 @@ impl CompositorState {
                     .expect("fresh lifecycle captured surface presentation before reservation"),
             ) else {
                 self.rollback_lifecycle_reservation(identity, previous_identity);
-                return None;
+                return Err(LifecycleAdmissionFailure::new(
+                    LifecycleAdmissionReason::RetainedCaptureFailed,
+                    target_provenance,
+                ));
             };
             payload
         };
@@ -336,7 +681,10 @@ impl CompositorState {
         };
         if !mapping_can_commit {
             self.rollback_lifecycle_reservation(identity, previous_identity);
-            return None;
+            return Err(LifecycleAdmissionFailure::new(
+                LifecycleAdmissionReason::ReservationFailed,
+                target_provenance,
+            ));
         }
         let started = self.window_lifecycle_animator.start_or_reverse(
             LifecycleMotionRequest {
@@ -354,7 +702,10 @@ impl CompositorState {
         );
         if started != Some(identity) {
             self.rollback_lifecycle_reservation(identity, previous_identity);
-            return None;
+            return Err(LifecycleAdmissionFailure::new(
+                LifecycleAdmissionReason::MotionRejected,
+                target_provenance,
+            ));
         }
 
         let published = if let Some(previous_identity) = previous_identity {
@@ -364,17 +715,21 @@ impl CompositorState {
             self.retained_lifecycle_payloads
                 .publish_exact(identity, std::sync::Arc::clone(&payload))
         };
-        debug_assert!(
-            published,
-            "lifecycle payload mapping must commit with motion"
-        );
+        if !published {
+            self.window_lifecycle_animator.cancel(identity);
+            self.rollback_lifecycle_reservation(identity, previous_identity);
+            return Err(LifecycleAdmissionFailure::new(
+                LifecycleAdmissionReason::ReservationFailed,
+                target_provenance,
+            ));
+        }
         if let Some(previous_identity) = previous_identity {
             debug_assert!(
                 self.presentation_animator
                     .retire_retained_visual_exact(previous_identity)
             );
         }
-        Some((identity, payload, previous_identity.is_some()))
+        Ok((identity, payload, previous_identity.is_some()))
     }
 
     fn rollback_lifecycle_reservation(
@@ -407,19 +762,54 @@ impl CompositorState {
         let Some(effect) =
             self.lifecycle_effect_kind_for_window(window_id, LifecycleDirection::Restore)
         else {
+            self.record_lifecycle_admission(
+                window_id,
+                root_surface_id,
+                LifecycleDirection::Restore,
+                None,
+                visual_group
+                    .map(|group| group.anchor_provenance)
+                    .or_else(|| {
+                        self.window(window_id)
+                            .and_then(|window| window.state.minimized_lifecycle_target())
+                            .map(|target| target.provenance)
+                    }),
+                false,
+                LifecycleAdmissionOutcome::Skipped(
+                    self.lifecycle_effect_skip_reason(LifecycleDirection::Restore),
+                ),
+            );
             return;
         };
         let Some(scene_node_id) = self.scene_node_id_for_window_group(window_id) else {
+            self.record_lifecycle_admission(
+                window_id,
+                root_surface_id,
+                LifecycleDirection::Restore,
+                Some(effect),
+                visual_group.map(|group| group.anchor_provenance),
+                false,
+                LifecycleAdmissionOutcome::Skipped(LifecycleAdmissionReason::NoSceneNode),
+            );
             return;
         };
         let Some(now) = AnimationTime::monotonic_now() else {
+            self.record_lifecycle_admission(
+                window_id,
+                root_surface_id,
+                LifecycleDirection::Restore,
+                Some(effect),
+                visual_group.map(|group| group.anchor_provenance),
+                false,
+                LifecycleAdmissionOutcome::Skipped(LifecycleAdmissionReason::ClockUnavailable),
+            );
             return;
         };
         let speed = self.animation_control.configuration().speed;
         let frozen_decoration = lifecycle_decorations
             .into_iter()
             .find(|decoration| decoration.root_surface_id() == root_surface_id);
-        let Some((_identity, _payload, _was_reversal)) = self.install_lifecycle_motion(
+        let admission = self.install_lifecycle_motion(
             scene_node_id,
             window_id,
             root_surface_id,
@@ -432,9 +822,31 @@ impl CompositorState {
             frozen_decoration,
             now,
             speed,
-        ) else {
-            return;
+        );
+        let (_identity, payload, reused_payload) = match admission {
+            Ok(admission) => admission,
+            Err(failure) => {
+                self.record_lifecycle_admission(
+                    window_id,
+                    root_surface_id,
+                    LifecycleDirection::Restore,
+                    Some(effect),
+                    failure.target_provenance,
+                    false,
+                    LifecycleAdmissionOutcome::Skipped(failure.reason),
+                );
+                return;
+            }
         };
+        self.record_lifecycle_admission(
+            window_id,
+            root_surface_id,
+            LifecycleDirection::Restore,
+            Some(effect),
+            Some(payload.visual_group.anchor_provenance),
+            reused_payload,
+            LifecycleAdmissionOutcome::Started,
+        );
     }
 
     pub(in crate::compositor) fn lifecycle_scene_sample_at(
@@ -547,13 +959,33 @@ impl CompositorState {
         &self,
         window_id: WindowId,
         root_surface_id: u32,
-    ) -> Option<super::lifecycle_surface_snapshot::RetainedSurfacePresentationSnapshot> {
+    ) -> Result<
+        super::lifecycle_surface_snapshot::RetainedSurfacePresentationSnapshot,
+        LifecycleAdmissionReason,
+    > {
         let surfaces = self.lifecycle_surface_candidates(window_id);
+        if !surfaces
+            .iter()
+            .any(|surface| surface.surface_id == root_surface_id)
+        {
+            return Err(LifecycleAdmissionReason::NoRenderableRoot);
+        }
         super::lifecycle_surface_snapshot::RetainedSurfacePresentationSnapshot::capture(
             root_surface_id,
             &surfaces,
             &self.surface_presentation_generations,
         )
+        .map_err(|failure| match failure {
+            super::lifecycle_surface_snapshot::LifecycleSurfaceCaptureFailure::NoRenderableRoot => {
+                LifecycleAdmissionReason::NoRenderableRoot
+            }
+            super::lifecycle_surface_snapshot::LifecycleSurfaceCaptureFailure::MissingPresentationGeneration => {
+                LifecycleAdmissionReason::MissingPresentationGeneration
+            }
+            super::lifecycle_surface_snapshot::LifecycleSurfaceCaptureFailure::InvalidSurfaceTopology => {
+                LifecycleAdmissionReason::InvalidSurfaceTopology
+            }
+        })
     }
 
     fn lifecycle_surface_candidates(&self, window_id: WindowId) -> Vec<RenderableSurface> {

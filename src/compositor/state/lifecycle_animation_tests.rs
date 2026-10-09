@@ -12,6 +12,7 @@ use crate::window_lifecycle_animation::{
     LifecycleMotionRequest, LifecycleRenderEvidence, LifecycleRenderEvidenceEntry,
     LifecycleRenderFallbackEntry, LifecycleRenderFallbackReason, LifecycleSceneSample,
     LifecycleVisualGroup, LifecycleVisualSource, LifecycleVisualSourceKind, LifecycleWindowSample,
+    ResolvedLifecycleTarget,
 };
 
 fn lifecycle_window_sample(
@@ -550,7 +551,25 @@ fn xwayland_backing_replacement_preserves_frozen_lifecycle_identity_and_root() {
     let frozen = LifecycleFrameSnapshot::from_sample(
         &state.lifecycle_scene_sample_at(AnimationTime::monotonic_now().expect("monotonic time")),
     );
+    let remembered_target = ResolvedLifecycleTarget {
+        rect: rect(24.0, 30.0, 20.0, 20.0),
+        provenance: crate::window_lifecycle_animation::LifecycleTargetProvenance::PointerFallback,
+    };
+    state
+        .window_mut(window_id)
+        .expect("XWayland window")
+        .state
+        .set_minimized_lifecycle_target(Some(remembered_target));
     assert_eq!(state.attach_x11_surface(handle, root_b), Ok(Some(root_a)));
+    assert_eq!(
+        state
+            .window(window_id)
+            .expect("replacement XWayland window")
+            .state
+            .minimized_lifecycle_target(),
+        None,
+        "surface reincarnation clears only the settled semantic destination"
+    );
     state.append_renderable_surface(ssd_test_surface(root_b));
     state.surface_presentation_generations.insert(root_b, 2);
     assert_eq!(
@@ -1236,8 +1255,9 @@ fn squash_restore_suppresses_canonical_root_and_blocks_direct_scanout() {
 }
 
 #[test]
-fn squash_without_a_taskbar_anchor_uses_immediate_lifecycle_fallback() {
+fn squash_without_a_taskbar_anchor_uses_safe_lifecycle_fallback() {
     let (mut state, window_id) = ssd_test_state(315);
+    assert!(state.set_output_size(100, 100));
     state.lifecycle_squash_renderer_available = Some(true);
     let directory = std::env::temp_dir().join(format!(
         "typhon-squash-anchor-{}-{}",
@@ -1276,9 +1296,21 @@ fn squash_without_a_taskbar_anchor_uses_immediate_lifecycle_fallback() {
         ResolvedEffectScene::default(),
         Vec::new(),
     );
-    assert_eq!(state.window_lifecycle_animator.active_count(), 0);
-    assert_eq!(state.presentation_animator.transaction_count(), 0);
+    assert_eq!(state.window_lifecycle_animator.active_count(), 1);
+    assert_eq!(state.presentation_animator.transaction_count(), 1);
 
+    let scene_node_id = state
+        .scene_node_id_for_window_group(window_id)
+        .expect("lifecycle scene node");
+    let original_group = state
+        .lifecycle_visual_group_for_scene_node(scene_node_id)
+        .expect("retained lifecycle visual group");
+    assert_eq!(
+        original_group.anchor_provenance,
+        crate::window_lifecycle_animation::LifecycleTargetProvenance::OutputFallback
+    );
+    assert_eq!(original_group.anchor_rect.width(), 20.0);
+    assert_eq!(original_group.anchor_rect.height(), 20.0);
     state.begin_lifecycle_restore(
         window_id,
         root_surface_id,
@@ -1286,9 +1318,165 @@ fn squash_without_a_taskbar_anchor_uses_immediate_lifecycle_fallback() {
         ResolvedEffectScene::default(),
         Vec::new(),
     );
+    assert_eq!(state.window_lifecycle_animator.active_count(), 1);
+    assert_eq!(state.presentation_animator.transaction_count(), 1);
+    assert_eq!(
+        state.lifecycle_visual_group_for_scene_node(scene_node_id),
+        Some(original_group),
+        "reversal keeps the exact resolved visual group"
+    );
+    assert!(state.lifecycle_root_restore_suppressed(root_surface_id));
+    let _ = std::fs::remove_dir_all(directory);
+}
+
+#[test]
+fn stale_pointer_uses_the_deterministic_output_fallback_source() {
+    const POINTER_FRESHNESS_USEC: u64 = 30_000_000;
+    let mut state = CompositorState::new(None);
+    let now_usec = crate::native::event_loop::monotonic_now_ns().expect("monotonic clock") / 1_000;
+    state.last_pointer_x = 30.0;
+    state.last_pointer_y = 40.0;
+    state.last_pointer_motion_usec = Some(now_usec.saturating_sub(POINTER_FRESHNESS_USEC + 1));
+    assert_eq!(state.recent_lifecycle_pointer(), None);
+
+    state.last_pointer_motion_usec = Some(now_usec);
+    assert_eq!(state.recent_lifecycle_pointer(), Some((30.0, 40.0)));
+}
+
+#[test]
+fn output_resize_discards_a_minimized_window_lifecycle_target() {
+    let (mut state, window_id) = ssd_test_state(315);
+    let target = ResolvedLifecycleTarget {
+        rect: rect(24.0, 30.0, 20.0, 20.0),
+        provenance: crate::window_lifecycle_animation::LifecycleTargetProvenance::OutputFallback,
+    };
+    state
+        .window_mut(window_id)
+        .expect("desktop window")
+        .state
+        .set_minimized_lifecycle_target(Some(target));
+
+    assert!(state.set_output_size(640, 480));
+    assert_eq!(
+        state
+            .window(window_id)
+            .expect("desktop window remains registered")
+            .state
+            .minimized_lifecycle_target(),
+        None,
+    );
+}
+
+#[test]
+fn missing_source_geometry_has_a_typed_admission_rejection() {
+    let mut state = CompositorState::new(None);
+    let window_id = state.allocate_window_id().expect("test window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_xdg(window_id, 316))
+        .expect("test XDG window");
+    let scene_node_id = state
+        .scene_node_id_for_window_group(window_id)
+        .expect("lifecycle scene node");
+
+    let failure = state
+        .install_lifecycle_motion(
+            scene_node_id,
+            window_id,
+            316,
+            None,
+            None,
+            None,
+            LifecycleDirection::Minimize,
+            LifecycleEffectKind::Squash,
+            ResolvedEffectScene::default(),
+            None,
+            AnimationTime::from_nanos(0),
+            1.0,
+        )
+        .expect_err("missing source geometry rejects visual admission");
+    assert_eq!(
+        failure.reason,
+        LifecycleAdmissionReason::MissingSourceGeometry
+    );
+}
+
+#[test]
+fn settled_minimize_restores_to_its_remembered_target_after_pointer_moves() {
+    let (mut state, window_id) = ssd_test_state(317);
+    assert!(state.set_output_size(640, 480));
+    state.lifecycle_squash_renderer_available = Some(true);
+    let directory = std::env::temp_dir().join(format!(
+        "typhon-remembered-lifecycle-target-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos()
+    ));
+    std::fs::create_dir(&directory).expect("create animation configuration directory");
+    state.animation_control = crate::animation_control::AnimationControlState::from_store(
+        crate::animation_control::AnimationConfigurationStore::new(directory.clone())
+            .expect("create animation configuration store"),
+    );
+    let mut candidate = state.animation_control.configuration().clone();
+    candidate.overrides.insert(
+        AnimationSlot::WindowMinimize,
+        AnimationEffect::MinimizeSquash,
+    );
+    candidate.overrides.insert(
+        AnimationSlot::WindowRestore,
+        AnimationEffect::MinimizeSquash,
+    );
+    state
+        .set_animation_configuration(candidate)
+        .expect("persist Squash selection");
+
+    assert!(state.minimize_desktop_window(window_id));
+    let minimized_target = state
+        .window(window_id)
+        .and_then(|window| window.state.minimized_lifecycle_target())
+        .expect("successful minimize stores semantic destination");
+    let scene_node_id = state
+        .scene_node_id_for_window_group(window_id)
+        .expect("lifecycle scene node");
+    let minimize_identity = active_lifecycle_identity(&state, scene_node_id);
+    settle_lifecycle_transition(&mut state, window_id);
     assert_eq!(state.window_lifecycle_animator.active_count(), 0);
-    assert_eq!(state.presentation_animator.transaction_count(), 0);
-    assert!(!state.lifecycle_root_restore_suppressed(root_surface_id));
+    assert!(
+        state
+            .retained_lifecycle_payloads
+            .get_exact(minimize_identity)
+            .is_none()
+    );
+
+    let now_usec = crate::native::event_loop::monotonic_now_ns().expect("monotonic clock") / 1_000;
+    state.last_pointer_x = 10.0;
+    state.last_pointer_y = 10.0;
+    state.last_pointer_motion_usec = Some(now_usec);
+    assert!(state.restore_minimized_desktop_window(window_id));
+
+    let restore_identity = active_lifecycle_identity(&state, scene_node_id);
+    let restore_group = state
+        .lifecycle_visual_group_for_scene_node(scene_node_id)
+        .expect("fresh restore visual group");
+    assert_eq!(restore_group.anchor_rect, minimized_target.rect);
+    assert_eq!(
+        restore_group.anchor_provenance,
+        crate::window_lifecycle_animation::LifecycleTargetProvenance::RememberedDestination
+    );
+    assert!(
+        state
+            .retained_lifecycle_payloads
+            .get_exact(restore_identity)
+            .is_some()
+    );
+    assert_eq!(
+        state
+            .window(window_id)
+            .and_then(|window| window.state.minimized_lifecycle_target()),
+        None,
+        "logical restore retires minimized-only target metadata"
+    );
     let _ = std::fs::remove_dir_all(directory);
 }
 

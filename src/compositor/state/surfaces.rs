@@ -1143,6 +1143,9 @@ impl CompositorState {
         }
 
         self.output_size = output_size;
+        for window in self.desktop_windows.values_mut() {
+            window.state.clear_minimized_lifecycle_target();
+        }
         self.send_output_mode_to_bound_outputs();
         self.reconfigure_layer_surfaces_for_output_change();
         let _ = self.reflow_usable_output_geometry();

@@ -8,6 +8,127 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_TEST_PRESENTATION_ID: AtomicU64 = AtomicU64::new(1_000_000);
 
+#[test]
+fn lifecycle_target_prefers_exact_dock_then_remembered_destination() {
+    let source = PresentationRect::new(100.0, 100.0, 200.0, 120.0).unwrap();
+    let dock = PresentationRect::new(1_120.0, 810.0, 44.0, 44.0).unwrap();
+    let remembered = ResolvedLifecycleTarget {
+        rect: PresentationRect::new(500.0, 400.0, 20.0, 20.0).unwrap(),
+        provenance: LifecycleTargetProvenance::PointerFallback,
+    };
+    assert_eq!(
+        resolve_lifecycle_target(
+            Some(dock),
+            Some(remembered),
+            source,
+            Some((150.0, 150.0)),
+            1280,
+            900
+        ),
+        Some(ResolvedLifecycleTarget {
+            rect: dock,
+            provenance: LifecycleTargetProvenance::DockPublished,
+        })
+    );
+    assert_eq!(
+        resolve_lifecycle_target(
+            None,
+            Some(remembered),
+            source,
+            Some((150.0, 150.0)),
+            1280,
+            900
+        ),
+        Some(ResolvedLifecycleTarget {
+            rect: remembered.rect,
+            provenance: LifecycleTargetProvenance::RememberedDestination,
+        })
+    );
+}
+
+#[test]
+fn lifecycle_pointer_target_projects_inside_pointer_to_nearest_window_edge() {
+    let source = PresentationRect::new(100.0, 100.0, 200.0, 120.0).unwrap();
+    let target = resolve_lifecycle_target(None, None, source, Some((150.0, 105.0)), 800, 600)
+        .expect("pointer fallback");
+    assert_eq!(
+        target.provenance,
+        LifecycleTargetProvenance::PointerFallback
+    );
+    assert_eq!(
+        target.rect,
+        PresentationRect::new(140.0, 90.0, 20.0, 20.0).unwrap()
+    );
+}
+
+#[test]
+fn lifecycle_pointer_target_projects_external_pointer_to_nearest_window_point() {
+    let source = PresentationRect::new(100.0, 100.0, 200.0, 120.0).unwrap();
+    let target = resolve_lifecycle_target(None, None, source, Some((350.0, 150.0)), 800, 600)
+        .expect("pointer fallback");
+    assert_eq!(
+        target.provenance,
+        LifecycleTargetProvenance::PointerFallback
+    );
+    assert_eq!(
+        target.rect,
+        PresentationRect::new(290.0, 140.0, 20.0, 20.0).unwrap()
+    );
+}
+
+#[test]
+fn lifecycle_target_uses_clamped_output_fallback_for_unusable_pointer_or_tiny_output() {
+    let source = PresentationRect::new(-40.0, 30.0, 80.0, 50.0).unwrap();
+    for pointer in [None, Some((f64::NAN, 20.0)), Some((-1.0, 20.0))] {
+        let target = resolve_lifecycle_target(None, None, source, pointer, 1, 10)
+            .expect("positive output fallback");
+        assert_eq!(target.provenance, LifecycleTargetProvenance::OutputFallback);
+        assert_eq!(
+            target.rect,
+            PresentationRect::new(0.0, 0.0, 1.0, 10.0).unwrap()
+        );
+    }
+    assert!(resolve_lifecycle_target(None, None, source, None, 0, 10).is_none());
+}
+
+#[test]
+fn lifecycle_target_clamps_pointer_fallback_to_output_and_rejects_oversized_dock_rect() {
+    let source = PresentationRect::new(-30.0, 40.0, 60.0, 50.0).unwrap();
+    let oversized = PresentationRect::new(4.0, 5.0, 20_000.0, 40.0).unwrap();
+    let target =
+        resolve_lifecycle_target(Some(oversized), None, source, Some((10.0, 55.0)), 100, 80)
+            .expect("bounded output fallback");
+    assert_eq!(
+        target.provenance,
+        LifecycleTargetProvenance::PointerFallback
+    );
+    assert!(target.rect.x() >= 0.0 && target.rect.y() >= 0.0);
+    assert!(target.rect.x() + target.rect.width() <= 100.0);
+    assert!(target.rect.y() + target.rect.height() <= 80.0);
+}
+
+#[test]
+fn positive_fallback_target_builds_visible_lamp_and_squash_groups() {
+    let source = PresentationRect::new(100.0, 100.0, 200.0, 120.0).unwrap();
+    let target = resolve_lifecycle_target(None, None, source, None, 800, 600)
+        .expect("output fallback target");
+    assert_eq!(target.provenance, LifecycleTargetProvenance::OutputFallback);
+    for effect in [LifecycleEffectKind::Lamp, LifecycleEffectKind::Squash] {
+        let group = LifecycleVisualGroup::from_resolved_effect_bounds(
+            effect, source, source, source, target, 800, 600,
+        )
+        .expect("fallback target produces a valid visual group");
+        assert_eq!(group.anchor_rect, target.rect);
+        assert_eq!(group.anchor_provenance, target.provenance);
+        assert!(lifecycle_visual_bounds_intersect_output(
+            effect, group, 0.0, 800, 600
+        ));
+        assert!(lifecycle_visual_bounds_intersect_output(
+            effect, group, 0.5, 800, 600
+        ));
+    }
+}
+
 fn test_identity(window_id: WindowId) -> PresentationRetainedVisualIdentity {
     let value = NEXT_TEST_PRESENTATION_ID.fetch_add(1, Ordering::Relaxed);
     retained_identity(window_id.get(), value, value)
@@ -259,9 +380,16 @@ fn visible_lifecycle_fallback_candidates_include_squash_samples() {
     let payload_id = PresentationRetainedVisualPayloadId::from_origin_identity(identity);
     let source = rect(100.0, 80.0, 160.0, 100.0);
     let anchor = rect(260.0, 160.0, 32.0, 24.0);
-    let visual_group =
-        LifecycleVisualGroup::from_squash_bounds(source, source, source, anchor, 320, 200)
-            .expect("valid Squash visual group");
+    let visual_group = LifecycleVisualGroup::from_effect_bounds(
+        LifecycleEffectKind::Squash,
+        source,
+        source,
+        source,
+        anchor,
+        320,
+        200,
+    )
+    .expect("valid Squash visual group");
     let mut sample = lifecycle_sample(
         window_id,
         704,

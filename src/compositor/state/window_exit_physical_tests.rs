@@ -244,6 +244,32 @@ fn direct_fullscreen_xdg_window() -> (
     )
 }
 
+#[test]
+fn unmapping_minimized_xdg_root_discards_remembered_lifecycle_target() {
+    let (mut state, root_surface_id, _, window_id, _, _) = direct_fullscreen_xdg_window();
+    let target = crate::window_lifecycle_animation::ResolvedLifecycleTarget {
+        rect: crate::presentation_animation::PresentationRect::new(20.0, 30.0, 20.0, 20.0)
+            .expect("positive lifecycle destination"),
+        provenance: crate::window_lifecycle_animation::LifecycleTargetProvenance::OutputFallback,
+    };
+    let window = state
+        .window_mut(window_id)
+        .expect("registered desktop window");
+    window.state.mark_minimized_without_surfaces();
+    window.state.set_minimized_lifecycle_target(Some(target));
+
+    state.begin_xdg_empty_or_unmap_commit(root_surface_id);
+
+    assert_eq!(
+        state
+            .window(window_id)
+            .expect("minimized desktop window remains registered")
+            .state
+            .minimized_lifecycle_target(),
+        None,
+    );
+}
+
 fn promote_direct_candidate(
     state: &mut CompositorState,
     candidate: &crate::compositor::DirectScanoutSceneCandidate,
