@@ -28,9 +28,10 @@ use oblivion_one::render_backend::{
 use crate::egl_renderer::dmabuf::{query_egl_main_device, query_egl_renderable_dmabuf_formats};
 use crate::egl_renderer::native_fence::{NativeFenceFunctions, NativeRenderFence};
 use crate::egl_renderer::{
-    EglFrameOutcome, EglInstance, EglOutputRenderTarget, EglSceneFrameCommit, FrameSkipReason,
-    GlesSceneRenderer, OutputDamage, OutputFramebufferOrigin, choose_surfaceless_egl_config,
-    create_gles_context, detect_partial_repaint_capabilities, load_egl_image_target_texture_2d,
+    CreatedGlesContext, EglContextPriorityPolicy, EglFrameOutcome, EglInstance,
+    EglOutputRenderTarget, EglSceneFrameCommit, FrameSkipReason, GlesSceneRenderer, OutputDamage,
+    OutputFramebufferOrigin, choose_surfaceless_egl_config, create_compositor_gles_context,
+    detect_partial_repaint_capabilities, load_egl_image_target_texture_2d,
 };
 use crate::native_output::runtime::take_client_cursor_presentation_feedback_batch;
 use crate::native_output::runtime::{
@@ -628,8 +629,12 @@ impl AtomicEglGbmScanout {
             )?;
             let config = choose_surfaceless_egl_config(&egl, egl_display, format_modifier.fourcc)
                 .map_err(native_egl_io_error)?;
-            let egl_context =
-                create_gles_context(&egl, egl_display, config).map_err(native_egl_io_error)?;
+            let context_policy = EglContextPriorityPolicy::from_environment();
+            let created_gles_context: CreatedGlesContext =
+                create_compositor_gles_context(&egl, egl_display, config, context_policy)
+                    .map_err(native_egl_io_error)?;
+            let egl_context = created_gles_context.context;
+            let priority_report = created_gles_context.priority;
             created_context = Some(egl_context);
             if let Err(error) = egl.make_current(egl_display, None, None, Some(egl_context)) {
                 return Err(native_egl_io_error(error));
@@ -750,6 +755,7 @@ impl AtomicEglGbmScanout {
                 }
             };
             let pool = AtomicOutputPool::from_validated_slots(slots, pool_generation);
+            priority_report.log_startup("atomic-egl-gbm");
             Ok((
                 egl_context,
                 gl,

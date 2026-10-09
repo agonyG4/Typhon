@@ -1,5 +1,8 @@
 use super::*;
 use crate::egl_renderer::OutputFramebufferOrigin;
+use crate::egl_renderer::{
+    CreatedGlesContext, EglContextPriorityPolicy, create_compositor_gles_context,
+};
 use oblivion_one::native::kms::KmsBackendKind;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -422,13 +425,17 @@ impl NativeEglGbmScanout {
             }
         };
         let egl_config = format_config.config;
-        let egl_context = match create_gles_context(&egl, egl_display, egl_config) {
-            Ok(context) => context,
-            Err(error) => {
-                let _ = egl.terminate(egl_display);
-                return Err(native_egl_io_error(error));
-            }
-        };
+        let context_policy = EglContextPriorityPolicy::from_environment();
+        let created_context: CreatedGlesContext =
+            match create_compositor_gles_context(&egl, egl_display, egl_config, context_policy) {
+                Ok(context) => context,
+                Err(error) => {
+                    let _ = egl.terminate(egl_display);
+                    return Err(native_egl_io_error(error));
+                }
+            };
+        let egl_context = created_context.context;
+        let priority_report = created_context.priority;
         let egl_surface = match unsafe {
             egl.create_platform_window_surface(
                 egl_display,
@@ -490,6 +497,7 @@ impl NativeEglGbmScanout {
                 return Err(native_egl_io_error(error));
             }
         };
+        priority_report.log_startup("native-egl-gbm-opaque");
         let dmabuf_feedback = query_egl_dmabuf_feedback(&egl, egl_display);
         let (dmabuf_main_device_path, dmabuf_main_device) =
             match query_egl_main_device(&egl, egl_display) {

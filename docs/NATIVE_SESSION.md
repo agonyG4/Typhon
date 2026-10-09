@@ -57,6 +57,15 @@ bounded by discovered capabilities and transaction validation.
 | `OBLIVION_ONE_CURSOR` | `auto`, `hardware` (`hw`, `drm`), `software` (`sw`, `cpu`) | `auto` | Auto uses an available safe hardware cursor and falls back to software. Explicit `hardware` fails startup if its requested hardware path cannot be established. Unknown values warn and use `auto`. |
 | `OBLIVION_ONE_CURSOR_SCHEDULING` | `auto`, `piggyback`, `software` | `auto` | Auto uses normal cursor/output arbitration; `piggyback` prioritizes primary work, and `software` selects software cursor scheduling. Unknown values warn and use `auto`. |
 | `OBLIVION_ONE_DMABUF_KMS_PREFERRED` | `auto`, `off`, `force` | `auto` | Auto prefers exact same-FOURCC renderer/KMS modifier intersections only on NVIDIA EGL. Force removes incompatible advertised choices only when a safe replacement exists; it cannot create a missing intersection. Unknown values warn and use `off`. |
+| `TYPHON_EGL_CONTEXT_PRIORITY` | `auto`, `high`, `medium` | `auto` | Auto requests HIGH when `EGL_IMG_context_priority` is advertised. High explicitly requests HIGH but falls back to default context creation if the request is rejected or the extension is unavailable. Medium preserves the previous default-priority behavior and is the rollback/A-B control. Unknown values warn and use `auto`. |
+
+EGL context priority is a scheduling hint; a successful HIGH request may still be
+assigned MEDIUM or another priority by the driver. Native renderer startup emits
+one `typhon egl: event=context_priority` line with the selected policy, extension
+status, attempted fallback details, and assigned priority when the driver exposes
+it. A failure to inspect this optional extension or query the assigned priority
+does not by itself prevent renderer startup. This policy does not guarantee a
+performance improvement; compare native workloads before drawing conclusions.
 
 `experimental-auto` is accepted temporarily for existing launch scripts and emits
 a deprecation warning; `auto` is the canonical Direct Scanout policy. The

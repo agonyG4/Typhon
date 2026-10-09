@@ -52,15 +52,21 @@ pub(in crate::egl_renderer) use checkpoint::{
 #[cfg(test)]
 pub(crate) use effects::replay_capture_region_layout;
 pub(crate) use egl_support::{
-    EglSwapBuffersWithDamage, choose_native_egl_config, choose_surfaceless_egl_config,
-    create_gles_context, detect_partial_repaint_capabilities, egl_swap_buffers_with_damage,
+    CreatedGlesContext, EglContextPriorityPolicy, EglSwapBuffersWithDamage,
+    choose_native_egl_config, choose_surfaceless_egl_config, create_compositor_gles_context,
+    detect_partial_repaint_capabilities, egl_swap_buffers_with_damage,
     load_egl_image_target_texture_2d, load_swap_buffers_with_damage, native_visual_label,
 };
 #[cfg(test)]
 pub(in crate::egl_renderer) use egl_support::{
-    NativeEglConfigCandidate, format_gles3_context_error, gles_context_attributes,
-    native_egl_config_candidate_matches, native_egl_config_candidate_matches_common,
-    select_native_egl_config_candidate, select_native_egl_visual_format,
+    EGL_CONTEXT_PRIORITY_HIGH_IMG, EGL_CONTEXT_PRIORITY_LEVEL_IMG, EGL_CONTEXT_PRIORITY_LOW_IMG,
+    EGL_CONTEXT_PRIORITY_MEDIUM_IMG, EglContextCreationCandidate, EglContextPriorityLevel,
+    EglPriorityExtensionSupport, NativeEglConfigCandidate, create_context_from_candidates,
+    create_gles_context, format_gles3_context_error, gles_context_attributes,
+    has_egl_img_context_priority, native_egl_config_candidate_matches,
+    native_egl_config_candidate_matches_common, plan_gles_context_candidates,
+    retain_context_when_priority_query_fails, select_native_egl_config_candidate,
+    select_native_egl_visual_format,
 };
 pub(in crate::egl_renderer) use egl_support::{native_egl_debug_enabled, query_egl_buffer_age};
 #[cfg(test)]

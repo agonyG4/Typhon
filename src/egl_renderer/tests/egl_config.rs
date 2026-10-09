@@ -23,11 +23,237 @@ fn config_attribute_value(attributes: &[egl::Int], key: egl::Int) -> Option<egl:
 
 #[test]
 fn gles_context_attributes_request_client_version_3_only() {
-    let client_version =
-        config_attribute_value(gles_context_attributes(), egl::CONTEXT_CLIENT_VERSION).unwrap();
+    assert_eq!(
+        gles_context_attributes(),
+        &[egl::CONTEXT_CLIENT_VERSION, 3, egl::NONE]
+    );
+}
 
-    assert_eq!(client_version, 3);
-    assert!(!gles_context_attributes().contains(&2));
+#[test]
+fn egl_context_priority_policy_parses_values_conservatively() {
+    for (input, expected, unknown) in [
+        (None, EglContextPriorityPolicy::Auto, false),
+        (Some("auto"), EglContextPriorityPolicy::Auto, false),
+        (Some("AUTO"), EglContextPriorityPolicy::Auto, false),
+        (Some(" high "), EglContextPriorityPolicy::High, false),
+        (Some("medium"), EglContextPriorityPolicy::Medium, false),
+        (Some("unknown"), EglContextPriorityPolicy::Auto, true),
+        (Some("low"), EglContextPriorityPolicy::Auto, true),
+        (Some("realtime"), EglContextPriorityPolicy::Auto, true),
+        (Some("3101"), EglContextPriorityPolicy::Auto, true),
+    ] {
+        let parsed = EglContextPriorityPolicy::parse(input);
+        assert_eq!(parsed.policy, expected, "input={input:?}");
+        assert_eq!(parsed.unknown_value, unknown, "input={input:?}");
+    }
+}
+
+#[test]
+fn egl_context_priority_environment_wrapper_reads_the_policy() {
+    use std::ffi::OsString;
+
+    let _environment_lock = crate::native_output::ASTREA_ENV_LOCK.lock().unwrap();
+    const VARIABLE: &str = "TYPHON_EGL_CONTEXT_PRIORITY";
+    let previous = std::env::var_os(VARIABLE);
+    struct RestoreEnvironment(Option<OsString>);
+    impl Drop for RestoreEnvironment {
+        fn drop(&mut self) {
+            // SAFETY: the test owns ASTREA_ENV_LOCK until this restoration guard drops.
+            unsafe {
+                if let Some(value) = self.0.take() {
+                    std::env::set_var("TYPHON_EGL_CONTEXT_PRIORITY", value);
+                } else {
+                    std::env::remove_var("TYPHON_EGL_CONTEXT_PRIORITY");
+                }
+            }
+        }
+    }
+    let _restore = RestoreEnvironment(previous);
+    // SAFETY: ASTREA_ENV_LOCK serializes this test's environment mutation.
+    unsafe { std::env::set_var(VARIABLE, " medium ") };
+
+    assert_eq!(
+        EglContextPriorityPolicy::from_environment(),
+        EglContextPriorityPolicy::Medium
+    );
+}
+
+#[test]
+fn egl_context_priority_extension_matching_requires_an_exact_whitespace_token() {
+    for (extensions, expected) in [
+        ("EGL_IMG_context_priority", true),
+        ("EGL_KHR_x EGL_IMG_context_priority EGL_EXT_y", true),
+        ("EGL_IMG_context_priority_other", false),
+        ("X_EGL_IMG_context_priority", false),
+        ("", false),
+    ] {
+        assert_eq!(
+            has_egl_img_context_priority(extensions),
+            expected,
+            "extensions={extensions:?}"
+        );
+    }
+}
+
+#[test]
+fn egl_context_priority_candidate_plans_follow_policy_and_extension_state() {
+    use EglContextCreationCandidate::{Default, High};
+    use EglPriorityExtensionSupport::{Available, QueryFailed, Unsupported};
+
+    for (policy, extension, expected) in [
+        (
+            EglContextPriorityPolicy::Auto,
+            Available,
+            vec![High, Default],
+        ),
+        (
+            EglContextPriorityPolicy::High,
+            Available,
+            vec![High, Default],
+        ),
+        (EglContextPriorityPolicy::Medium, Available, vec![Default]),
+        (EglContextPriorityPolicy::Auto, Unsupported, vec![Default]),
+        (EglContextPriorityPolicy::High, Unsupported, vec![Default]),
+        (EglContextPriorityPolicy::Auto, QueryFailed, vec![Default]),
+        (EglContextPriorityPolicy::High, QueryFailed, vec![Default]),
+    ] {
+        assert_eq!(
+            plan_gles_context_candidates(policy, extension),
+            expected,
+            "policy={policy:?}, extension={extension:?}"
+        );
+    }
+}
+
+#[test]
+fn egl_context_priority_candidates_always_require_gles3() {
+    use EglContextCreationCandidate::{Default, High};
+
+    for candidate in [High, Default] {
+        let attributes = candidate.attributes();
+        assert_eq!(
+            config_attribute_value(attributes, egl::CONTEXT_CLIENT_VERSION),
+            Some(3)
+        );
+        assert!(!attributes.contains(&2));
+    }
+}
+
+#[test]
+fn egl_context_priority_high_candidate_has_one_pair_and_default_has_none() {
+    use EglContextCreationCandidate::{Default, High};
+
+    let high_attributes = High.attributes();
+    let high_pairs = high_attributes
+        .chunks_exact(2)
+        .take_while(|pair| pair[0] != egl::NONE)
+        .filter(|pair| pair[0] == EGL_CONTEXT_PRIORITY_LEVEL_IMG)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        high_pairs,
+        [&[
+            EGL_CONTEXT_PRIORITY_LEVEL_IMG,
+            EGL_CONTEXT_PRIORITY_HIGH_IMG
+        ][..]]
+    );
+
+    let default_attributes = Default.attributes();
+    assert_eq!(
+        default_attributes,
+        &[egl::CONTEXT_CLIENT_VERSION, 3, egl::NONE]
+    );
+    assert!(!default_attributes.contains(&EGL_CONTEXT_PRIORITY_LEVEL_IMG));
+}
+
+#[test]
+fn egl_context_priority_fallback_uses_default_context_after_high_failure() {
+    use EglContextCreationCandidate::{Default, High};
+
+    let candidates = plan_gles_context_candidates(
+        EglContextPriorityPolicy::High,
+        EglPriorityExtensionSupport::Available,
+    );
+    let mut attempted = Vec::new();
+    let (context, report) = create_context_from_candidates(&candidates, |candidate| {
+        attempted.push(candidate);
+        match candidate {
+            High => Err("high rejected"),
+            Default => Ok("default-context"),
+        }
+    })
+    .expect("the default GLES3 candidate succeeds");
+
+    assert_eq!(context, "default-context");
+    assert_eq!(attempted, [High, Default]);
+    assert!(report.high_attempted);
+    assert!(report.high_creation_failed);
+    assert!(report.fallback_used);
+    assert_eq!(report.requested_priority, EglContextPriorityLevel::High);
+}
+
+#[test]
+fn egl_context_priority_does_not_try_default_after_high_succeeds() {
+    use EglContextCreationCandidate::High;
+
+    let candidates = plan_gles_context_candidates(
+        EglContextPriorityPolicy::Auto,
+        EglPriorityExtensionSupport::Available,
+    );
+    let mut attempted = Vec::new();
+    let (context, report) = create_context_from_candidates(&candidates, |candidate| {
+        attempted.push(candidate);
+        Ok::<_, &'static str>("high-context")
+    })
+    .expect("HIGH context succeeds");
+
+    assert_eq!(context, "high-context");
+    assert_eq!(attempted, [High]);
+    assert!(report.high_attempted);
+    assert!(!report.high_creation_failed);
+    assert!(!report.fallback_used);
+}
+
+#[test]
+fn egl_context_priority_maps_driver_values_exactly() {
+    assert_eq!(
+        EglContextPriorityLevel::from_img_value(EGL_CONTEXT_PRIORITY_HIGH_IMG),
+        EglContextPriorityLevel::High
+    );
+    assert_eq!(
+        EglContextPriorityLevel::from_img_value(EGL_CONTEXT_PRIORITY_MEDIUM_IMG),
+        EglContextPriorityLevel::Medium
+    );
+    assert_eq!(
+        EglContextPriorityLevel::from_img_value(EGL_CONTEXT_PRIORITY_LOW_IMG),
+        EglContextPriorityLevel::Low
+    );
+    assert_eq!(
+        EglContextPriorityLevel::from_img_value(0),
+        EglContextPriorityLevel::Unknown
+    );
+}
+
+#[test]
+fn egl_context_priority_query_failure_keeps_created_context_and_reports_unknown() {
+    let (context, assignment) = retain_context_when_priority_query_fails("created-context", || {
+        Err::<egl::Int, _>("query rejected")
+    });
+
+    assert_eq!(context, "created-context");
+    assert_eq!(assignment.priority, EglContextPriorityLevel::Unknown);
+    assert!(!assignment.assigned_known);
+    assert!(assignment.query_failed);
+}
+
+#[test]
+fn egl_context_priority_unknown_driver_value_is_not_claimed_as_known() {
+    let (context, assignment) =
+        retain_context_when_priority_query_fails("created-context", || Ok::<_, ()>(0));
+
+    assert_eq!(context, "created-context");
+    assert_eq!(assignment.priority, EglContextPriorityLevel::Unknown);
+    assert!(!assignment.assigned_known);
+    assert!(!assignment.query_failed);
 }
 
 #[test]
