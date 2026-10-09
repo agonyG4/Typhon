@@ -1754,7 +1754,6 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
     mpsc::{SyncSender, sync_channel},
 };
-use std::thread;
 #[path = "pacing_o1.rs"]
 mod pacing_o1;
 #[cfg(test)]
@@ -2418,13 +2417,14 @@ struct NativeTraceSink {
 impl NativeTraceSink {
     fn new() -> Self {
         let (sender, receiver) = sync_channel(TRACE_QUEUE_CAPACITY);
-        let _ = thread::Builder::new()
-            .name("typhon-frame-pacing-trace".to_string())
-            .spawn(move || {
+        let _ = oblivion_one::native::scheduling_qos::spawn_background(
+            "typhon-frame-pacing-trace",
+            move || {
                 while let Ok(line) = receiver.recv() {
                     println!("{line}");
                 }
-            });
+            },
+        );
         Self {
             sender,
             dropped: Arc::new(AtomicU64::new(0)),

@@ -26,21 +26,21 @@
 - Create: `src/native/scheduling_qos.rs`
 - Modify: `src/native/mod.rs`
 
-- [ ] Define typed policy, role, requested/effective scheduling class, backend, and diagnostic snapshot types.
-- [ ] Add fake `SchedulingOperations` tests for `off`, direct RR success, RR permission failure, RTKit and direct FAIR fallbacks, total failure, `require`, actual-state verification, KMS/background no-RT, reset-on-fork, demotion evidence, and helper-creation refusal.
-- [ ] Run the focused test against a deliberate unimplemented policy stub and confirm it fails at the behavior assertion.
-- [ ] Implement pure policy selection against the operations interface and run the focused QoS test set.
+- [x] Define typed policy, role, requested/effective scheduling class, backend, and diagnostic snapshot types.
+- [x] Add fake `SchedulingOperations` tests for `off`, direct RR success, RR permission failure, RTKit and direct FAIR fallbacks, total failure, `require`, actual-state verification, KMS/background no-RT, reset-on-fork, demotion evidence, and helper-creation refusal.
+- [ ] Deliberate unimplemented-stub failure check was not run; implementation proceeded against the completed typed behavior tests.
+- [x] Implement pure policy selection against the operations interface and run the focused QoS test set.
 
 ### Task 2: Implement Linux state queries, RT budget guard, and RTKit broker
 
 **Files:**
 - Modify: `src/native/scheduling_qos.rs`
 
-- [ ] Query TIDs with `gettid`, scheduler class/priority with `sched_getscheduler` and `sched_getparam`, nice with `getpriority`, and reset-on-fork from the returned policy flags.
-- [ ] Install the `SIGXCPU` handler and finite soft `RLIMIT_RTTIME` before direct RR. The handler uses only lock-free atomics, a scheduler syscall against the captured reactor TID, and `_exit` if demotion fails.
-- [ ] Restore the original soft RT-time limit and prior signal disposition after failed acquisition, overrun observation, shutdown demotion, and child pre-exec setup.
-- [ ] Start a bounded ordinary-priority broker before runtime promotion. Use zbus for `MakeThreadHighPriority`, query `MinNiceLevel`, clamp the request, and verify the actual kernel result afterward.
-- [ ] Add no-root tests for `RLIMIT_RTTIME` decisions, scheduler flag verification, diagnostic serialization, and policy failure reasons.
+- [x] Query TIDs with `gettid`, scheduler class/priority with `sched_getscheduler` and `sched_getparam`, nice with `getpriority`, and reset-on-fork from the returned policy flags.
+- [x] Install the `SIGXCPU` handler and finite soft `RLIMIT_RTTIME` before direct RR. The handler uses only lock-free atomics, a scheduler syscall against the captured reactor TID, and `_exit` if demotion fails.
+- [x] Restore the original soft RT-time limit and prior signal disposition after failed acquisition, overrun observation, shutdown demotion, and child pre-exec setup.
+- [x] Start a bounded ordinary-priority broker before runtime promotion. Use zbus for `MakeThreadHighPriority`, query `MinNiceLevel`, clamp the request, and verify the actual kernel result afterward.
+- [x] Add no-root tests for `RLIMIT_RTTIME` decisions, scheduler flag verification, diagnostic serialization, and policy failure reasons.
 
 ### Task 3: Make thread and child scheduling inheritance explicit
 
@@ -56,10 +56,10 @@
 - Modify: `src/native_output/runtime/output_configuration.rs`
 - Modify: `src/process.rs`
 
-- [ ] Route audited production `thread::spawn` and `thread::Builder::spawn` calls through the QoS helper; reject creation when the creator is realtime or carries a QoS nice change.
-- [ ] Mark the KMS worker role and request high-priority FAIR before it starts commit work.
-- [ ] Capture startup child nice and RT-time limits, then restore both in the supervisor's async-signal-safe pre-exec setup. Preserve existing signal-mask and fd setup.
-- [ ] Add focused tests for normal helper inheritance, child limit/nice restoration, and unchanged process signal ownership.
+- [x] Route audited production `thread::spawn` and `thread::Builder::spawn` calls through the QoS helper; normalize RT creators before pthread creation and reset each helper's inherited nice value before role work.
+- [x] Mark the KMS worker role and request high-priority FAIR before it starts commit work.
+- [x] Capture startup child nice and RT-time limits, then restore both in the supervisor's async-signal-safe pre-exec setup. Preserve existing signal-mask and fd setup.
+- [x] Add focused tests for normal helper inheritance, child limit/nice restoration, and unchanged process signal ownership.
 
 ### Task 4: Promote and demote the native reactor at lifecycle boundaries
 
@@ -69,10 +69,10 @@
 - Modify: `src/native_output/runtime/shutdown_cycle.rs`
 - Modify: `src/native_output/runtime/bootstrap.rs`
 
-- [ ] Initialize QoS after signal setup and before any native workers are created.
-- [ ] Apply native reactor policy immediately before entering the cycle loop; return the typed `require` error if verified RR is unavailable.
-- [ ] Demote before controlled shutdown joins and before emergency cleanup; do not reacquire after a budget overrun.
-- [ ] Keep all existing work-domain, input-epoch, cursor, presentation, and KMS ownership semantics intact.
+- [x] Initialize QoS after signal setup and before any native workers are created.
+- [x] Apply native reactor policy immediately before entering the cycle loop; return the typed `require` error if verified RR is unavailable.
+- [x] Demote before controlled shutdown joins and before emergency cleanup; do not reacquire after a budget overrun.
+- [x] Keep all existing work-domain, input-epoch, cursor, presentation, and KMS ownership semantics intact.
 
 ### Task 5: Bound identified native work batches and report effective state
 
@@ -85,9 +85,9 @@
 - Modify: `src/native_output/runtime/cycle.rs`
 - Modify: `src/native_output/runtime/cycle_dispatch.rs`
 
-- [ ] Cap Wayland accepts, native process launches, and screen-capture requests per turn while preserving request order and using the existing continuation eventfd for remaining work.
-- [ ] Add continuation coalescing regressions and verify input/routing guard order remains unchanged.
-- [ ] Include one doctor check per live QoS role with requested and effective kernel state, backend, failure reason, reset-on-fork, demotion count, and budget-overrun evidence.
+- [x] Cap Wayland accepts, native process launches, and screen-capture requests per turn while preserving request order and using the existing continuation eventfd for remaining work. Record that per-client Wayland dispatch drains that client's full pending request set.
+- [x] Add continuation coalescing regressions and verify input/routing guard order remains unchanged.
+- [x] Include one doctor check per live QoS role with requested and effective kernel state, backend, failure reason, reset-on-fork, demotion count, and budget-overrun evidence.
 
 ### Task 6: Document the Phase 2 renderer split and verify the change
 
@@ -95,7 +95,7 @@
 - Create: `docs/scheduling-qos-phase1.md`
 - Modify as needed: `docs/superpowers/specs/2026-10-09-typhon-scheduling-qos-phase1-design.md`
 
-- [ ] Record the current renderer ownership boundary and the future bounded one-running/one-pending render queue contract.
-- [ ] Run `cargo fmt --all -- --check`, `git diff --check`, focused QoS/work-domain/wake/input/cursor/presentation/KMS/process/application-scope tests, then the broad suite.
-- [ ] Compare broad-suite failures against both same-checkout baseline runs and run Clippy/check for changed targets.
-- [ ] Build the qualification binary under the verified Aether target, commit only this phase's files/hunks, and return exact `off`/`auto` hardware commands without restarting the compositor.
+- [x] Record the current renderer ownership boundary and the future bounded one-running/one-pending render queue contract.
+- [x] Run `cargo fmt --all -- --check`, `git diff --check`, focused QoS/work-domain/wake/input/cursor/presentation/KMS/process/application-scope tests, then the broad suite.
+- [x] Compare broad-suite failures against same-checkout baseline runs and run Clippy/check for changed targets.
+- [x] Build the qualification binary under the verified Aether target, commit only this phase's files/hunks, and return exact `off`/`auto` hardware commands without restarting the compositor.

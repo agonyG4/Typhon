@@ -212,9 +212,10 @@ where
     let unit_name = unit_name.to_owned();
     let registration_unit_name = unit_name.clone();
     let (sender, receiver) = sync_channel(1);
-    thread::spawn(move || {
-        let _ = sender.send(registrar.register(&registration_unit_name, pid));
-    });
+    let _ =
+        crate::native::scheduling_qos::spawn_background("typhon-app-scope-register", move || {
+            let _ = sender.send(registrar.register(&registration_unit_name, pid));
+        });
 
     match receiver.recv_timeout(timeouts.registration) {
         Ok(Ok(())) => {}

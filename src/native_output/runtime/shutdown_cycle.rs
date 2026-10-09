@@ -1,6 +1,8 @@
 use super::shutdown::KmsRestoreReason;
 use super::*;
 
+const MAX_PENDING_PROCESS_LAUNCHES_SETTLED_PER_TURN: usize = 2;
+
 impl NativeRuntime {
     pub(super) fn request_native_shutdown(&mut self) -> NativeResult<()> {
         self.request_native_shutdown_inner(true)
@@ -13,6 +15,7 @@ impl NativeRuntime {
     }
 
     fn request_native_shutdown_inner(&mut self, advance_without_cycle: bool) -> NativeResult<()> {
+        oblivion_one::native::scheduling_qos::demote_current_reactor();
         self.termination.set_phase(RuntimePhase::ShutdownRequest);
         self.fail_pending_screen_captures("session_inactive");
         self.quiesce_system_action_transport();
@@ -101,11 +104,34 @@ impl NativeRuntime {
             }
             None => native_shutdown_debug_log("shutdown_requested_duplicate"),
         }
-        if advance_without_cycle {
+        let process_launch_backlog_pending = self.fail_pending_process_launches_for_shutdown();
+        if advance_without_cycle
+            && !self.server.has_pending_astrea_screen_capture()
+            && !process_launch_backlog_pending
+        {
             self.advance_shutdown_lifecycle_without_cycle()
         } else {
             Ok(())
         }
+    }
+
+    pub(super) fn fail_pending_process_launches_for_shutdown(&mut self) -> bool {
+        let (pending_launches, backlog_pending) = self
+            .server
+            .take_pending_process_launches(MAX_PENDING_PROCESS_LAUNCHES_SETTLED_PER_TURN);
+        for pending in pending_launches {
+            if pending.request.is_alive() {
+                pending
+                    .request
+                    .failed(5, "compositor is shutting down".to_owned());
+            }
+        }
+        if backlog_pending {
+            let _ = self.event_loop.request_continuation(
+                oblivion_one::native::event_loop::NativeContinuationReason::ProcessLaunchBacklog,
+            );
+        }
+        backlog_pending
     }
 
     pub(super) fn advance_shutdown_lifecycle_without_cycle(&mut self) -> NativeResult<()> {

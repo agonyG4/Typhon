@@ -204,6 +204,7 @@ impl OwnCompositorServer {
                 client_pids: self.client_pids.clone(),
             }),
         )?;
+        self.wayland_dispatch_clients.push_back(client.id());
         let identity = XwaylandClientIdentity {
             client_id: client.id(),
             generation,

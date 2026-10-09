@@ -183,7 +183,9 @@ impl NativeWakeAuthorityMetrics {
                 self.frame_scheduler_continuations =
                     self.frame_scheduler_continuations.saturating_add(1)
             }
-            NativeContinuationReason::ControllerBacklog => {}
+            NativeContinuationReason::ControllerBacklog
+            | NativeContinuationReason::ProcessLaunchBacklog
+            | NativeContinuationReason::ScreenCaptureBacklog => {}
         }
     }
 

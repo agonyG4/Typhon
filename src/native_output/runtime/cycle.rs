@@ -3,6 +3,8 @@ use crate::native_output::screen_capture::{
     CaptureDimensions, RGBA8888_FORMAT, create_sealed_memfd,
 };
 
+const MAX_SCREEN_CAPTURES_FAILED_PER_TURN: usize = 16;
+
 #[path = "cycle_direct.rs"]
 mod cycle_direct;
 #[path = "cycle/fallback.rs"]
@@ -334,10 +336,13 @@ impl NativeRuntime {
     }
 
     pub(super) fn run_native_cycle(&mut self) -> NativeResult<()> {
+        oblivion_one::native::scheduling_qos::promote_current_reactor()?;
         while !self.shutdown.is_complete() {
             self.termination.set_phase(RuntimePhase::RuntimeCycle);
+            oblivion_one::native::scheduling_qos::observe_rt_budget_event();
             self.run_cycle()?;
         }
+        oblivion_one::native::scheduling_qos::demote_current_reactor();
         self.termination.set_phase(RuntimePhase::Complete);
         native_shutdown_debug_log("shutdown_complete");
         Ok(())
@@ -428,7 +433,11 @@ impl NativeRuntime {
             self.reap_supervised_children(&cycle)?;
         }
         if signal_shutdown_requested {
-            self.advance_shutdown_lifecycle_without_cycle()?;
+            if !self.server.has_pending_astrea_screen_capture()
+                && !self.server.has_pending_process_launches()
+            {
+                self.advance_shutdown_lifecycle_without_cycle()?;
+            }
             self.finish_slow_cycle(&cycle, render_attempted)?;
             return Ok(());
         }
@@ -483,6 +492,15 @@ impl NativeRuntime {
                     start_ns,
                     monotonic_now_ns()?,
                 );
+            }
+        }
+        if (self.shutdown.is_running() || !self.session.permits_output())
+            && self.server.has_pending_astrea_screen_capture()
+        {
+            self.fail_pending_screen_captures("session_inactive");
+            if self.server.has_pending_astrea_screen_capture() {
+                self.finish_slow_cycle(&cycle, render_attempted)?;
+                return Ok(());
             }
         }
         self.advance_shutdown_lifecycle(&cycle)?;
@@ -727,17 +745,39 @@ impl NativeRuntime {
             self.finish_slow_cycle(&cycle, render_attempted)?;
             return Ok(());
         }
-        if work_domains.wayland_dispatch || work_domains.control || xwayland_scene_work {
-            drain_pending_process_launches_with_xwayland_environment_and_cursor(
-                &mut self.server,
-                &mut self.process_supervisor,
-                &mut self.astrea_launch_tracker,
-                self.effective_app_gpu_policy,
-                self.perf,
-                &mut self.pending_launches,
-                self.xwayland.normal_app_environment(),
-                Some(self.cursor_manager.desired_configuration()),
-            );
+        if work_domains.wayland_dispatch
+            || work_domains.control
+            || xwayland_scene_work
+            || cycle.wakeup.continuation.contains(
+                oblivion_one::native::event_loop::NativeContinuationReason::ProcessLaunchBacklog,
+            )
+        {
+            let launch_backlog_pending = if self.shutdown.is_running() {
+                self.fail_pending_process_launches_for_shutdown()
+            } else {
+                drain_pending_process_launches_with_xwayland_environment_and_cursor(
+                    &mut self.server,
+                    &mut self.process_supervisor,
+                    &mut self.astrea_launch_tracker,
+                    self.effective_app_gpu_policy,
+                    self.perf,
+                    &mut self.pending_launches,
+                    self.xwayland.normal_app_environment(),
+                    Some(self.cursor_manager.desired_configuration()),
+                )
+            };
+            if launch_backlog_pending && !self.shutdown.is_running() {
+                self.event_loop.request_continuation(
+                    oblivion_one::native::event_loop::NativeContinuationReason::ProcessLaunchBacklog,
+                )?;
+            }
+        }
+        if self.shutdown.is_running()
+            && (self.server.has_pending_process_launches()
+                || self.server.has_pending_astrea_screen_capture())
+        {
+            self.finish_slow_cycle(&cycle, render_attempted)?;
+            return Ok(());
         }
         let commit_timing_planning_generation_before_prepare =
             self.server.commit_timing_planning_generation();
@@ -810,8 +850,13 @@ impl NativeRuntime {
             return Ok(());
         }
         if prepare_operation_plan.service_screen_capture {
-            while self.server.has_pending_astrea_screen_capture() {
+            if self.server.has_pending_astrea_screen_capture() {
                 self.service_pending_screen_capture()?;
+                if self.server.has_pending_astrea_screen_capture() {
+                    self.event_loop.request_continuation(
+                        oblivion_one::native::event_loop::NativeContinuationReason::ScreenCaptureBacklog,
+                    )?;
+                }
             }
         }
         let presentation_operation_plan = NativeWorkDomains::classify(
@@ -998,6 +1043,22 @@ impl NativeRuntime {
         &mut self,
         cycle: &NativeCycleState,
     ) -> NativeResult<()> {
+        if self.shutdown.is_running()
+            && (self.server.has_pending_process_launches()
+                || self.server.has_pending_astrea_screen_capture())
+        {
+            if self.server.has_pending_process_launches() {
+                self.event_loop.request_continuation(
+                    oblivion_one::native::event_loop::NativeContinuationReason::ProcessLaunchBacklog,
+                )?;
+            }
+            if self.server.has_pending_astrea_screen_capture() {
+                self.event_loop.request_continuation(
+                    oblivion_one::native::event_loop::NativeContinuationReason::ScreenCaptureBacklog,
+                )?;
+            }
+            return Ok(());
+        }
         loop {
             match self.shutdown.state() {
                 ShutdownState::Running | ShutdownState::Complete => return Ok(()),
@@ -1305,6 +1366,7 @@ impl NativeRuntime {
                 NativePerfField::str("explicit_sync_policy", "park_and_rearm"),
             ]
         });
+        oblivion_one::native::scheduling_qos::demote_current_reactor();
         quiesce_and_acknowledge(self, |io| {
             if seat.acknowledge_disable()? {
                 io.observe(NativeIoOperation::SeatDisableAcknowledged);
@@ -1322,7 +1384,7 @@ impl NativeRuntime {
         self.log_session_transition("suspended", "resuming", "seat_enable");
         match recover_native_output(self) {
             Ok(NativeSessionRecoveryProgress::Complete) => {
-                self.finish_native_session_recovery();
+                self.finish_native_session_recovery()?;
             }
             Ok(NativeSessionRecoveryProgress::WaitingForSuspendedFence) => {}
             Err(error) => return self.fail_native_session_recovery(error),
@@ -1330,10 +1392,13 @@ impl NativeRuntime {
         Ok(())
     }
 
-    fn finish_native_session_recovery(&mut self) {
+    fn finish_native_session_recovery(&mut self) -> NativeResult<()> {
         self.session.finish_resume();
         self.reconcile_dmem_foreground();
+        oblivion_one::native::scheduling_qos::reacquire_current_reactor_after_session_resume()
+            .map_err(|error| io::Error::other(error.to_string()))?;
         self.log_session_transition("resuming", "active", "output_recovered");
+        Ok(())
     }
 
     fn fail_native_session_recovery(&mut self, error: Box<dyn Error>) -> NativeResult<()> {
@@ -1362,7 +1427,7 @@ impl NativeRuntime {
     fn continue_native_session_recovery(&mut self) -> NativeResult<()> {
         match continue_native_output_recovery(self) {
             Ok(NativeSessionRecoveryProgress::Complete) => {
-                self.finish_native_session_recovery();
+                self.finish_native_session_recovery()?;
                 Ok(())
             }
             Ok(NativeSessionRecoveryProgress::WaitingForSuspendedFence) => Ok(()),
@@ -1440,8 +1505,16 @@ impl NativeRuntime {
         });
     }
     pub(super) fn fail_pending_screen_captures(&mut self, reason: &str) {
-        while let Some(pending) = self.server.take_pending_astrea_screen_capture() {
+        for _ in 0..MAX_SCREEN_CAPTURES_FAILED_PER_TURN {
+            let Some(pending) = self.server.take_pending_astrea_screen_capture() else {
+                break;
+            };
             pending.capture.failed(reason.to_owned());
+        }
+        if self.server.has_pending_astrea_screen_capture() {
+            let _ = self.event_loop.request_continuation(
+                oblivion_one::native::event_loop::NativeContinuationReason::ScreenCaptureBacklog,
+            );
         }
     }
 

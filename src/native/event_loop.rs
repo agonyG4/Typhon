@@ -323,6 +323,8 @@ pub enum NativeContinuationReason {
     SceneVisualDebt,
     FrameScheduler,
     ControllerBacklog,
+    ProcessLaunchBacklog,
+    ScreenCaptureBacklog,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -337,6 +339,8 @@ impl NativeContinuationReasons {
     const SCENE_VISUAL_DEBT: u32 = 1 << 5;
     const FRAME_SCHEDULER: u32 = 1 << 6;
     const CONTROLLER_BACKLOG: u32 = 1 << 7;
+    const PROCESS_LAUNCH_BACKLOG: u32 = 1 << 8;
+    const SCREEN_CAPTURE_BACKLOG: u32 = 1 << 9;
 
     pub const fn contains(self, reason: NativeContinuationReason) -> bool {
         self.0 & reason.bit() != 0
@@ -375,6 +379,8 @@ impl NativeContinuationReason {
             Self::SceneVisualDebt => NativeContinuationReasons::SCENE_VISUAL_DEBT,
             Self::FrameScheduler => NativeContinuationReasons::FRAME_SCHEDULER,
             Self::ControllerBacklog => NativeContinuationReasons::CONTROLLER_BACKLOG,
+            Self::ProcessLaunchBacklog => NativeContinuationReasons::PROCESS_LAUNCH_BACKLOG,
+            Self::ScreenCaptureBacklog => NativeContinuationReasons::SCREEN_CAPTURE_BACKLOG,
         }
     }
 }
@@ -1867,6 +1873,12 @@ mod tests {
             .request_continuation(NativeContinuationReason::FrameScheduler)
             .unwrap();
         event_loop
+            .request_continuation(NativeContinuationReason::ProcessLaunchBacklog)
+            .unwrap();
+        event_loop
+            .request_continuation(NativeContinuationReason::ScreenCaptureBacklog)
+            .unwrap();
+        event_loop
             .request_continuation(NativeContinuationReason::FrameScheduler)
             .unwrap();
 
@@ -1876,6 +1888,16 @@ mod tests {
             wakeup
                 .continuation
                 .contains(NativeContinuationReason::InputBacklog)
+        );
+        assert!(
+            wakeup
+                .continuation
+                .contains(NativeContinuationReason::ProcessLaunchBacklog)
+        );
+        assert!(
+            wakeup
+                .continuation
+                .contains(NativeContinuationReason::ScreenCaptureBacklog)
         );
         assert!(
             wakeup
@@ -1897,8 +1919,8 @@ mod tests {
                 .continuation
                 .contains(NativeContinuationReason::FrameScheduler)
         );
-        assert_eq!(event_loop.continuation_requests(), 6);
-        assert_eq!(event_loop.continuation_coalesced(), 5);
+        assert_eq!(event_loop.continuation_requests(), 8);
+        assert_eq!(event_loop.continuation_coalesced(), 7);
         assert_eq!(event_loop.continuation_wakes(), 1);
     }
 

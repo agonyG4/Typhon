@@ -878,6 +878,8 @@ impl NativeRuntime {
             // can create a thread. The child supervisor's signalfd remains the
             // normal delivery path for all five managed signals.
             oblivion_one::process::prepare_runtime_signal_handling()?;
+            oblivion_one::native::scheduling_qos::initialize_from_environment()
+                .map_err(io::Error::other)?;
             frame::initialize_effect_owner_diagnostics();
             Self::bootstrap_native(config, &mut termination)
         })();
@@ -898,6 +900,7 @@ impl NativeRuntime {
         match self.run_native_cycle() {
             Ok(()) => Ok(()),
             Err(error) => {
+                oblivion_one::native::scheduling_qos::demote_current_reactor();
                 self.termination.record_runtime_error(error.as_ref());
                 let snapshot = self.termination_snapshot();
                 self.termination.capture_pre_cleanup_snapshot(snapshot);

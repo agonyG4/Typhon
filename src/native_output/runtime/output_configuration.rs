@@ -114,9 +114,9 @@ impl OutputConfigurationPersistenceWorker {
         let worker_busy = Arc::clone(&busy);
         let available = Arc::new(AtomicBool::new(true));
         let worker_available = Arc::clone(&available);
-        let thread = std::thread::Builder::new()
-            .name("typhon-output-persistence".to_string())
-            .spawn(move || {
+        let thread = oblivion_one::native::scheduling_qos::spawn_background(
+            "typhon-output-persistence",
+            move || {
                 while let Ok(job) = job_receiver.recv() {
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         file.write_bytes(&job.bytes, MAX_OUTPUT_CONFIGURATION_BYTES)
@@ -138,7 +138,8 @@ impl OutputConfigurationPersistenceWorker {
                     }
                 }
                 worker_available.store(false, Ordering::Release);
-            })?;
+            },
+        )?;
         Ok(Self {
             jobs,
             completions,

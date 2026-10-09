@@ -1456,7 +1456,7 @@ impl NativeRuntime {
                 );
                 let dmem_snapshot = self.dmem_foreground.snapshot();
                 let app_scope_snapshot = oblivion_one::application_scope::snapshot();
-                let checks = vec![
+                let mut checks = vec![
                     doctor_check(
                         "control.endpoint",
                         DoctorSeverity::Ok,
@@ -1608,6 +1608,28 @@ impl NativeRuntime {
                         ),
                     ),
                 ];
+                checks.extend(
+                    oblivion_one::native::scheduling_qos::diagnostic_snapshots()
+                        .into_iter()
+                        .map(|snapshot| {
+                            let severity = if snapshot.degradation_reason.is_some() {
+                                DoctorSeverity::Warning
+                            } else {
+                                DoctorSeverity::Ok
+                            };
+                            doctor_check_with_detail(
+                                &format!("scheduling_qos.{}", snapshot.role.as_str()),
+                                severity,
+                                format!(
+                                    "role={} tid={} effective={}",
+                                    snapshot.role.as_str(),
+                                    snapshot.tid,
+                                    snapshot.effective_class.as_str()
+                                ),
+                                snapshot.detail(),
+                            )
+                        }),
+                );
                 serde_json::to_value(DoctorSnapshot {
                     healthy: checks
                         .iter()

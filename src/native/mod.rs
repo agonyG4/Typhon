@@ -18,3 +18,4 @@ pub mod vrr_window;
 
 #[cfg(test)]
 mod control_tests;
+pub mod scheduling_qos;

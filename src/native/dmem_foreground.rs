@@ -12,7 +12,7 @@ use std::{
     panic::{self, AssertUnwindSafe},
     path::{Component, Path, PathBuf},
     sync::{Arc, Condvar, Mutex},
-    thread::{self, JoinHandle},
+    thread::JoinHandle,
     time::Duration,
 };
 
@@ -1037,9 +1037,10 @@ impl DmemForeground {
         let writer = FilesystemDmemWriter::new(paths.cgroup_root);
         let controller = ForegroundController::new(resolver, writer, capacities);
         let worker_shared = Arc::clone(&shared);
-        let worker = thread::Builder::new()
-            .name("typhon-dmem-foreground".to_owned())
-            .spawn(move || worker_loop(worker_shared, controller));
+        let worker =
+            crate::native::scheduling_qos::spawn_background("typhon-dmem-foreground", move || {
+                worker_loop(worker_shared, controller)
+            });
 
         match worker {
             Ok(worker) => {

@@ -801,9 +801,8 @@ impl CursorIoWorker {
         let worker_busy = busy.clone();
         let available = Arc::new(AtomicBool::new(true));
         let worker_available = available.clone();
-        let thread = thread::Builder::new()
-            .name("typhon-cursor-io".to_string())
-            .spawn(move || {
+        let thread =
+            crate::native::scheduling_qos::spawn_background("typhon-cursor-io", move || {
                 while let Ok(operation) = job_receiver.recv() {
                     let job_id = operation.job_id();
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

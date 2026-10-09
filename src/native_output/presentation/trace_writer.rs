@@ -377,9 +377,9 @@ impl PresentationTraceWriter {
         let (ready_sender, ready) = mpsc::sync_channel(1);
         let (activate_sender, activate_receiver) = mpsc::sync_channel(1);
         let deadline = Instant::now() + config.startup_timeout;
-        let worker = thread::Builder::new()
-            .name("typhon-trace-writer".to_owned())
-            .spawn(move || {
+        let worker = oblivion_one::native::scheduling_qos::spawn_background(
+            "typhon-trace-writer",
+            move || {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     #[cfg(test)]
                     if let Some(hook) = test_hooks.before_recovery.as_ref() {
@@ -421,7 +421,8 @@ impl PresentationTraceWriter {
                     worker_stats.writer_panics.fetch_add(1, Ordering::Relaxed);
                 }
                 let _ = completion_sender.try_send(());
-            })?;
+            },
+        )?;
 
         Ok(Self {
             producer: Some(TraceBatchProducer::new(

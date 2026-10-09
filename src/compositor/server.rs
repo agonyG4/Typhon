@@ -1,6 +1,6 @@
 use std::{
     borrow::Cow,
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     io,
     os::fd::{AsFd, BorrowedFd},
     sync::{Arc, Mutex},
@@ -91,6 +91,10 @@ use super::{
         ResolvedPointerConstraintBackendRequest,
     },
 };
+
+const MAX_WAYLAND_ACCEPTS_PER_DISPATCH: usize = 16;
+const MAX_WAYLAND_CLIENTS_PER_DISPATCH: usize = 32;
+
 #[derive(Debug)]
 pub struct OwnCompositorServer {
     pub(super) display: Display<CompositorState>,
@@ -101,6 +105,7 @@ pub struct OwnCompositorServer {
     astrea_shell_capability: Option<AstreaShellCapability>,
     disconnected_clients: Arc<Mutex<Vec<DisconnectedClient>>>,
     client_pids: Arc<Mutex<HashMap<ClientId, i32>>>,
+    wayland_dispatch_clients: VecDeque<ClientId>,
     xwayland_global_data: XwaylandShellGlobalData,
     xwayland_disconnects: Vec<XwaylandClientIdentity>,
     gpu_buffer_protocols_enabled: bool,
@@ -559,6 +564,7 @@ impl OwnCompositorServer {
             astrea_shell_capability: Some(astrea_shell_capability),
             disconnected_clients,
             client_pids,
+            wayland_dispatch_clients: VecDeque::new(),
             xwayland_global_data,
             xwayland_disconnects: Vec::new(),
             gpu_buffer_protocols_enabled: gpu_buffers_enabled
@@ -2260,8 +2266,15 @@ impl OwnCompositorServer {
     }
 
     #[doc(hidden)]
-    pub fn take_pending_process_launches(&mut self) -> Vec<PendingProcessLaunch> {
-        self.state.take_pending_process_launches()
+    pub fn take_pending_process_launches(
+        &mut self,
+        limit: usize,
+    ) -> (Vec<PendingProcessLaunch>, bool) {
+        self.state.take_pending_process_launches(limit)
+    }
+
+    pub fn has_pending_process_launches(&self) -> bool {
+        self.state.has_pending_process_launches()
     }
 
     pub fn pointer_constraint_backend_activated(&mut self, id: PointerConstraintBackendId) {
@@ -2689,7 +2702,10 @@ impl OwnCompositorServer {
         }
         let pacing_generation_before = self.state.surface_pacing_readiness_generation();
         let mut accepted = 0;
-        while let Some(stream) = self.socket.accept()? {
+        while accepted < MAX_WAYLAND_ACCEPTS_PER_DISPATCH {
+            let Some(stream) = self.socket.accept()? else {
+                break;
+            };
             let mut handle = self.display.handle();
             let client = handle.insert_client(
                 stream,
@@ -2698,10 +2714,12 @@ impl OwnCompositorServer {
                     client_pids: self.client_pids.clone(),
                 }),
             )?;
+            let client_id = client.id();
+            self.wayland_dispatch_clients.push_back(client_id.clone());
             if let Ok(credentials) = client.get_credentials(&handle)
                 && let Ok(mut client_pids) = self.client_pids.lock()
             {
-                client_pids.insert(client.id(), credentials.pid);
+                client_pids.insert(client_id, credentials.pid);
             }
             accepted += 1;
         }
@@ -2709,7 +2727,42 @@ impl OwnCompositorServer {
         self.state.accepted_clients += accepted;
         self.state.poll_clipboard_bridge();
         self.state.begin_client_dispatch_cycle();
-        let dispatch_result = self.display.dispatch_clients(&mut self.state);
+        let dispatch_count = self
+            .wayland_dispatch_clients
+            .len()
+            .min(MAX_WAYLAND_CLIENTS_PER_DISPATCH);
+        let mut dispatched = 0usize;
+        let mut dispatch_error = None;
+        for _ in 0..dispatch_count {
+            let Some(client_id) = self.wayland_dispatch_clients.pop_front() else {
+                break;
+            };
+            // The project uses wayland-backend's Rust server backend, whose
+            // per-client dispatch preserves each client's request order while
+            // limiting callbacks to a bounded rotating client batch.
+            match self
+                .display
+                .backend()
+                .dispatch_single_client(&mut self.state, client_id.clone())
+            {
+                Ok(count) => {
+                    dispatched = dispatched.saturating_add(count);
+                    self.wayland_dispatch_clients.push_back(client_id);
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    self.wayland_dispatch_clients.push_back(client_id);
+                }
+                Err(error) if error.kind() == io::ErrorKind::InvalidInput => {
+                    // A queued ID may have disconnected since the last turn.
+                }
+                Err(error) => {
+                    self.wayland_dispatch_clients.push_back(client_id);
+                    dispatch_error = Some(error);
+                    break;
+                }
+            }
+        }
+        let dispatch_result = dispatch_error.map_or(Ok(dispatched), Err);
         self.state.finish_client_dispatch_cycle();
         self.kill_pending_resource_exhaustion_clients();
         self.teardown_disconnected_clients();

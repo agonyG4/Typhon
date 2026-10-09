@@ -505,6 +505,7 @@ impl ChildSupervisor {
         }
         let id = self.allocate_process_id()?;
         child_signal::prepare_child_signal_mask(command);
+        crate::native::scheduling_qos::prepare_child_scheduling(command);
         let mut child = command.spawn()?;
         let stderr = child.stderr.take().map(|stderr| {
             let raw_fd = std::os::fd::IntoRawFd::into_raw_fd(stderr);

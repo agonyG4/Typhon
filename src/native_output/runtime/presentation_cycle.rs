@@ -149,6 +149,23 @@ fn run_scaled_probe_candidate(
     safe_to_probe: bool,
 ) {
     probe_cache.observe_candidate();
+    if let Some((completed_key, result)) = probe_cache.poll_pending_test() {
+        match result {
+            Ok(()) => {
+                let result = ScaledPrimaryProbeResult::Supported;
+                probe_cache.record_test_result(completed_key, result.clone());
+                log_scaled_probe_result(&result, completed_key);
+            }
+            Err(error) if error.kind == oblivion_one::native::kms::AtomicKmsErrorKind::Busy => {
+                probe_cache.record_busy_skip();
+            }
+            Err(error) => {
+                let result = ScaledPrimaryProbeResult::Rejected(error.to_string());
+                probe_cache.record_test_result(completed_key, result.clone());
+                log_scaled_probe_result(&result, completed_key);
+            }
+        }
+    }
     let Some(pipeline) = pipeline else {
         probe_cache.record_unavailable_skip();
         return;
@@ -168,6 +185,10 @@ fn run_scaled_probe_candidate(
         return;
     };
     if probe_cache.lookup(key).is_some() {
+        return;
+    }
+    if probe_cache.has_pending_test() {
+        probe_cache.record_busy_skip();
         return;
     }
     if !worker_available {
@@ -192,26 +213,13 @@ fn run_scaled_probe_candidate(
                 probe_cache.record_busy_skip();
                 return;
             };
-            match worker.test_primary_geometry_if_idle(
+            match worker.queue_primary_geometry_test_if_idle(
                 framebuffer.framebuffer,
                 geometry,
                 content_type,
             ) {
                 None => probe_cache.record_busy_skip(),
-                Some(Ok(())) => {
-                    let result = ScaledPrimaryProbeResult::Supported;
-                    probe_cache.record_test_result(key, result.clone());
-                    log_scaled_probe_result(&result, key);
-                }
-                Some(Err(error)) => {
-                    if error.kind == oblivion_one::native::kms::AtomicKmsErrorKind::Busy {
-                        probe_cache.record_busy_skip();
-                    } else {
-                        let result = ScaledPrimaryProbeResult::Rejected(error.to_string());
-                        probe_cache.record_test_result(key, result.clone());
-                        log_scaled_probe_result(&result, key);
-                    }
-                }
+                Some(response) => probe_cache.start_test(key, response),
             }
         }
         Ok(None) => {

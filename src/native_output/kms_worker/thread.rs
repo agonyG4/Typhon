@@ -32,7 +32,7 @@ use std::{
     io,
     os::fd::{AsRawFd, OwnedFd},
     sync::{Arc, Mutex, mpsc},
-    thread::{self, JoinHandle},
+    thread::JoinHandle,
     time::{Duration, Instant},
 };
 
@@ -200,17 +200,19 @@ impl KmsCommitWorkerHandle {
         let result_fd = create_eventfd().map_err(|_| KmsCommitWorkerStartError::EventFd)?;
         let shared = Arc::new(WorkerShared::new(result_fd));
         let thread_shared = Arc::clone(&shared);
-        let join = thread::Builder::new()
-            .name("typhon-kms-commit".to_string())
-            .spawn(move || {
+        let join = oblivion_one::native::scheduling_qos::spawn_role_thread(
+            "typhon-kms-commit",
+            oblivion_one::native::scheduling_qos::SchedulingThreadRole::KmsCommit,
+            move || {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     run_worker(thread_shared.clone(), executor);
                 }));
                 if result.is_err() {
                     mark_fatal(&thread_shared, KmsWorkerFatalReason::Panic, true);
                 }
-            })
-            .map_err(|_| KmsCommitWorkerStartError::Thread)?;
+            },
+        )
+        .map_err(|_| KmsCommitWorkerStartError::Thread)?;
         Ok(Self {
             shared,
             join: Mutex::new(Some(join)),
@@ -239,15 +241,15 @@ impl KmsCommitWorkerHandle {
         self.shared.try_reserve()
     }
 
-    /// Synchronously runs a diagnostic primary-plane TEST_ONLY request on the
-    /// KMS worker only when its full submission state is idle. `None` means
-    /// the request was skipped or the worker stopped before returning a result.
-    pub(crate) fn test_primary_geometry_if_idle(
+    /// Queues a diagnostic primary-plane TEST_ONLY request on the KMS worker
+    /// only when its full submission state is idle. The returned receiver is
+    /// polled by the reactor; it must not block on KMS progress.
+    pub(crate) fn queue_primary_geometry_test_if_idle(
         &self,
         framebuffer: FramebufferId,
         geometry: AtomicPlaneGeometry,
         content_type: DrmContentType,
-    ) -> Option<Result<(), AtomicKmsError>> {
+    ) -> Option<mpsc::Receiver<Result<(), AtomicKmsError>>> {
         let (response, result) = mpsc::sync_channel(1);
         let _submit_gate = match self.shared.submit_gate.try_lock() {
             Ok(guard) => guard,
@@ -280,7 +282,7 @@ impl KmsCommitWorkerHandle {
         drop(state);
         drop(_submit_gate);
         self.shared.work_wakeup.notify_one();
-        result.recv().ok()
+        Some(result)
     }
     pub(crate) fn cancel_queued_primary(
         &self,
@@ -1804,11 +1806,14 @@ mod scaled_primary_probe_tests {
     }
 
     fn request(handle: &KmsCommitWorkerHandle) -> Option<Result<(), AtomicKmsError>> {
-        handle.test_primary_geometry_if_idle(
-            FramebufferId::new(9).unwrap(),
-            AtomicPlaneGeometry::full_source_to_output(1600, 900, 1920, 1080).unwrap(),
-            DrmContentType::Graphics,
-        )
+        handle
+            .queue_primary_geometry_test_if_idle(
+                FramebufferId::new(9).unwrap(),
+                AtomicPlaneGeometry::full_source_to_output(1600, 900, 1920, 1080).unwrap(),
+                DrmContentType::Graphics,
+            )?
+            .recv_timeout(Duration::from_secs(1))
+            .ok()
     }
 
     #[test]

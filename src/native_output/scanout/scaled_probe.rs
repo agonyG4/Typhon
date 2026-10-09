@@ -1,9 +1,12 @@
-use std::collections::{HashMap, VecDeque};
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::mpsc::{Receiver, TryRecvError},
+};
 
 use oblivion_one::{
     compositor::DrmContentType,
     core::OutputId,
-    native::kms::{AtomicPipelineProperties, AtomicPlaneGeometry},
+    native::kms::{AtomicKmsError, AtomicPipelineProperties, AtomicPlaneGeometry},
     render_backend::buffer::DmabufBufferHandle,
 };
 
@@ -118,7 +121,14 @@ pub(crate) struct ScaledPrimaryProbeCounters {
 pub(crate) struct ScaledPrimaryProbeCache {
     entries: HashMap<ScaledPrimaryProbeKey, ScaledPrimaryProbeResult>,
     insertion_order: VecDeque<ScaledPrimaryProbeKey>,
+    pending_test: Option<PendingScaledPrimaryProbe>,
     counters: ScaledPrimaryProbeCounters,
+}
+
+#[derive(Debug)]
+struct PendingScaledPrimaryProbe {
+    key: ScaledPrimaryProbeKey,
+    response: Receiver<Result<(), AtomicKmsError>>,
 }
 
 impl ScaledPrimaryProbeCache {
@@ -163,6 +173,37 @@ impl ScaledPrimaryProbeCache {
             }
         }
         self.insert(key, result);
+    }
+
+    pub(crate) fn start_test(
+        &mut self,
+        key: ScaledPrimaryProbeKey,
+        response: Receiver<Result<(), AtomicKmsError>>,
+    ) {
+        debug_assert!(self.pending_test.is_none());
+        self.pending_test = Some(PendingScaledPrimaryProbe { key, response });
+    }
+
+    pub(crate) fn poll_pending_test(
+        &mut self,
+    ) -> Option<(ScaledPrimaryProbeKey, Result<(), AtomicKmsError>)> {
+        let pending = self.pending_test.as_ref()?;
+        match pending.response.try_recv() {
+            Ok(result) => {
+                let pending = self.pending_test.take().expect("pending probe remains set");
+                Some((pending.key, result))
+            }
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => {
+                self.pending_test = None;
+                self.record_busy_skip();
+                None
+            }
+        }
+    }
+
+    pub(crate) fn has_pending_test(&self) -> bool {
+        self.pending_test.is_some()
     }
 
     pub(crate) fn record_import_failure(
@@ -315,6 +356,22 @@ mod tests {
         );
         assert_eq!(cache.counters().test_only_attempts, 1);
         assert_eq!(cache.counters().rejected, 1);
+    }
+
+    #[test]
+    fn pending_probe_result_is_polled_without_blocking() {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let mut cache = ScaledPrimaryProbeCache::default();
+        let key = key();
+        cache.start_test(key, receiver);
+
+        assert!(cache.poll_pending_test().is_none());
+        assert!(cache.has_pending_test());
+        sender.send(Ok(())).unwrap();
+        assert!(
+            matches!(cache.poll_pending_test(), Some((result_key, Ok(()))) if result_key == key)
+        );
+        assert!(!cache.has_pending_test());
     }
 
     #[test]

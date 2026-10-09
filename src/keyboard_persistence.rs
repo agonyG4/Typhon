@@ -405,9 +405,9 @@ impl KeyboardPersistenceWorker {
         let worker_busy = Arc::clone(&busy);
         let available = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let worker_available = Arc::clone(&available);
-        let thread = thread::Builder::new()
-            .name("typhon-keyboard-persistence".to_string())
-            .spawn(move || {
+        let thread = crate::native::scheduling_qos::spawn_background(
+            "typhon-keyboard-persistence",
+            move || {
                 while let Ok(operation) = job_receiver.recv() {
                     let job_id = operation.job_id();
                     let result =
@@ -428,7 +428,8 @@ impl KeyboardPersistenceWorker {
                     }
                 }
                 worker_available.store(false, Ordering::Release);
-            })?;
+            },
+        )?;
         Ok(Self {
             jobs,
             completions,

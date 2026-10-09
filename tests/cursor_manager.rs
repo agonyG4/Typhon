@@ -556,26 +556,26 @@ fn panicking_cursor_io_worker_publishes_terminal_completion_and_becomes_unavaila
         .unwrap();
     entered.wait();
 
-    let mut completion = None;
-    for _ in 0..10_000 {
+    let completion_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let completion = loop {
         if let Some(value) = worker.try_completion() {
-            completion = Some(value);
-            break;
+            break value;
         }
-        std::thread::yield_now();
-    }
-    let completion = completion.expect("panic completion should be delivered");
+        assert!(
+            std::time::Instant::now() < completion_deadline,
+            "panic completion should be delivered"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    };
     assert_eq!(completion.job_id, CursorJobId(1));
     assert!(matches!(
         completion.result,
         Err(CursorIoError::WorkerPanicked)
     ));
 
-    for _ in 0..10_000 {
-        if !worker.is_available() {
-            break;
-        }
-        std::thread::yield_now();
+    let unavailable_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while worker.is_available() && std::time::Instant::now() < unavailable_deadline {
+        std::thread::sleep(std::time::Duration::from_millis(1));
     }
     assert!(!worker.is_available());
     assert!(!worker.is_busy());

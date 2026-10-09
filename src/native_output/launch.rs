@@ -6,6 +6,8 @@ use oblivion_one::{
 };
 use std::process::Command;
 
+const MAX_PROCESS_LAUNCHES_PER_CYCLE: usize = 2;
+
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
@@ -217,7 +219,7 @@ pub(crate) fn drain_pending_process_launches(
     perf: NativePerfLogger,
     pending_launches: &mut VecDeque<NativeAppLaunchPerf>,
 ) {
-    drain_pending_process_launches_with_xwayland_environment_and_cursor(
+    let _ = drain_pending_process_launches_with_xwayland_environment_and_cursor(
         server,
         supervisor,
         launch_tracker,
@@ -239,9 +241,11 @@ pub(crate) fn drain_pending_process_launches_with_xwayland_environment_and_curso
     pending_launches: &mut VecDeque<NativeAppLaunchPerf>,
     xwayland: Option<&oblivion_one::xwayland::XwaylandAppEnvironment>,
     cursor: Option<&oblivion_one::cursor_theme::CursorConfiguration>,
-) {
+) -> bool {
     let socket_name = server.socket_name().to_string();
-    for pending in server.take_pending_process_launches() {
+    let (pending_launches_batch, backlog_pending) =
+        server.take_pending_process_launches(MAX_PROCESS_LAUNCHES_PER_CYCLE);
+    for pending in pending_launches_batch {
         if !pending.request.is_alive() {
             continue;
         }
@@ -294,6 +298,7 @@ pub(crate) fn drain_pending_process_launches_with_xwayland_environment_and_curso
             }
         }
     }
+    backlog_pending
 }
 
 fn native_process_options(request: &NativeLaunchRequest) -> ProcessOptions {

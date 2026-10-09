@@ -267,8 +267,15 @@ impl CompositorState {
 
     pub(in crate::compositor) fn take_pending_process_launches(
         &mut self,
-    ) -> Vec<PendingProcessLaunch> {
-        self.pending_process_launches.drain(..).collect()
+        limit: usize,
+    ) -> (Vec<PendingProcessLaunch>, bool) {
+        let count = self.pending_process_launches.len().min(limit);
+        let pending = self.pending_process_launches.drain(..count).collect();
+        (pending, !self.pending_process_launches.is_empty())
+    }
+
+    pub(in crate::compositor) fn has_pending_process_launches(&self) -> bool {
+        !self.pending_process_launches.is_empty()
     }
 
     pub(in crate::compositor) fn register_astrea_shortcut(
