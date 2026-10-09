@@ -272,10 +272,14 @@ impl OutputConfigurationTransactions {
 
     pub(crate) fn remaining_ms(&self, now_ns: u64) -> Option<u32> {
         let transaction = self.active.as_ref()?;
-        Some(remaining_deadline_ms(
-            transaction.rollback_deadline_ns,
-            now_ns,
-        ))
+        Some(match &transaction.phase {
+            OutputConfigurationTransactionPhase::PendingConfirmation
+            | OutputConfigurationTransactionPhase::PersistencePending => {
+                remaining_deadline_ms(transaction.rollback_deadline_ns, now_ns)
+            }
+            OutputConfigurationTransactionPhase::RollingBack
+            | OutputConfigurationTransactionPhase::RollbackFailed { .. } => 0,
+        })
     }
 
     pub(crate) fn deadline_ns(&self) -> Option<u64> {
@@ -346,7 +350,11 @@ impl OutputConfigurationTransactions {
             .as_mut()
             .filter(|transaction| transaction.id == id)
             .ok_or(OutputConfigurationTransactionError::StaleTransaction)?;
-        if transaction.phase == OutputConfigurationTransactionPhase::RollingBack {
+        if !matches!(
+            transaction.phase,
+            OutputConfigurationTransactionPhase::PendingConfirmation
+                | OutputConfigurationTransactionPhase::PersistencePending
+        ) {
             return Err(OutputConfigurationTransactionError::NotConfirmable);
         }
         transaction.phase = OutputConfigurationTransactionPhase::RollingBack;
@@ -693,6 +701,65 @@ mod tests {
             temporary.mode.clock
         );
         assert_eq!(transactions.deadline_ns(), Some(20_000_000_000));
+    }
+
+    #[test]
+    fn explicit_revert_zeroes_remaining_time_and_terminal_phases_reject_actions() {
+        let mut transactions = OutputConfigurationTransactions::new();
+        let previous = applied_configuration(1920, 1080, 408_375);
+        let temporary = applied_configuration(1920, 1080, 148_500);
+        let id = transactions
+            .begin_temporary_apply("output-1", previous, temporary, 2, 5_000_000_000)
+            .expect("temporary mode starts confirmation");
+
+        assert_eq!(transactions.remaining_ms(5_000_000_000), Some(15_000));
+        transactions
+            .begin_revert(id)
+            .expect("pending transaction can revert");
+        assert_eq!(transactions.remaining_ms(5_001_000_000), Some(0));
+        assert!(matches!(
+            transactions.begin_confirm(id, 5_001_000_000),
+            Err(OutputConfigurationTransactionError::NotConfirmable)
+        ));
+        assert!(matches!(
+            transactions.begin_revert(id),
+            Err(OutputConfigurationTransactionError::NotConfirmable)
+        ));
+
+        transactions
+            .fail_rollback(id, "output_rollback_failed")
+            .expect("rollback failure remains visible");
+        assert_eq!(transactions.remaining_ms(5_002_000_000), Some(0));
+        assert!(matches!(
+            transactions.begin_confirm(id, 5_002_000_000),
+            Err(OutputConfigurationTransactionError::NotConfirmable)
+        ));
+        assert!(matches!(
+            transactions.begin_revert(id),
+            Err(OutputConfigurationTransactionError::NotConfirmable)
+        ));
+    }
+
+    #[test]
+    fn persistence_pending_allows_revert_but_not_a_second_confirm() {
+        let mut transactions = OutputConfigurationTransactions::new();
+        let previous = applied_configuration(1920, 1080, 408_375);
+        let temporary = applied_configuration(1280, 720, 74_176);
+        let id = transactions
+            .begin_temporary_apply("output-1", previous, temporary, 2, 1_000_000_000)
+            .expect("temporary mode starts confirmation");
+
+        transactions
+            .begin_confirm(id, 1_001_000_000)
+            .expect("pending transaction can begin persistence");
+        assert!(matches!(
+            transactions.begin_confirm(id, 1_002_000_000),
+            Err(OutputConfigurationTransactionError::NotConfirmable)
+        ));
+        transactions
+            .begin_revert(id)
+            .expect("persistence-pending transaction remains revertible");
+        assert_eq!(transactions.remaining_ms(1_003_000_000), Some(0));
     }
 
     #[test]

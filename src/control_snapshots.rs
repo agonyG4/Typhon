@@ -1396,4 +1396,26 @@ mod tests {
             assert_eq!(state.as_str(), expected);
         }
     }
+
+    #[test]
+    fn output_transaction_wire_states_use_the_shared_snake_case_names() {
+        let states = [
+            (
+                OutputTransactionStateSnapshot::PendingConfirmation,
+                "pending_confirmation",
+            ),
+            (
+                OutputTransactionStateSnapshot::PersistencePending,
+                "persistence_pending",
+            ),
+            (OutputTransactionStateSnapshot::RollingBack, "rolling_back"),
+            (
+                OutputTransactionStateSnapshot::RollbackFailed,
+                "rollback_failed",
+            ),
+        ];
+        for (state, expected) in states {
+            assert_eq!(serde_json::to_value(state).unwrap(), expected);
+        }
+    }
 }

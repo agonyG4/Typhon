@@ -4405,15 +4405,10 @@ impl NativeRuntime {
                         (OutputTransactionStateSnapshot::RollingBack, None)
                     }
                 };
-                let remaining_ms = match &transaction.phase {
-                    OutputConfigurationTransactionPhase::PendingConfirmation
-                    | OutputConfigurationTransactionPhase::PersistencePending => self
-                        .output_configuration_transactions
-                        .remaining_ms(now_ns)
-                        .unwrap_or(0),
-                    OutputConfigurationTransactionPhase::RollingBack
-                    | OutputConfigurationTransactionPhase::RollbackFailed { .. } => 0,
-                };
+                let remaining_ms = self
+                    .output_configuration_transactions
+                    .remaining_ms(now_ns)
+                    .unwrap_or(0);
                 OutputTransactionSnapshot {
                     id: transaction.id.get(),
                     output_id: transaction.output_id.clone(),
