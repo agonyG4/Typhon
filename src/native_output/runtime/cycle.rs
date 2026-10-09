@@ -156,6 +156,12 @@ impl NativeRuntime {
                 )
             }),
             independent_kms_admission,
+            physical_admission: self
+                .cursor_output_arbitration
+                .physical_admission_for_transport(
+                    crate::native_output::kms_worker::KmsCommitWorkerTransport::Worker,
+                    now_ns,
+                ),
         };
         let desired = cursor.desired().clone();
         let hardware_usable =
@@ -871,7 +877,7 @@ impl NativeRuntime {
         );
         let cursor_temporal_work = self
             .cursor_output_arbitration
-            .has_future_wake_requirement(monotonic_now_ns()?);
+            .has_future_wake_requirement(monotonic_now_ns()?, self.kms_commit_worker_transport);
         if super::wake_plan::cycle_tail_requires_runtime_wake_plan(
             presentation_work,
             self.input_epoch.backlog_pending(),

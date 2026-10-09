@@ -66,6 +66,16 @@ fn auto_atomic_falls_back_to_sync_when_startup_fails() {
 }
 
 #[test]
+fn off_atomic_uses_sync_transport_without_a_worker() {
+    assert_eq!(
+        KmsCommitWorkerPolicy::Off
+            .effective(KmsBackendKind::Atomic, false)
+            .unwrap(),
+        KmsCommitWorkerTransport::Synchronous
+    );
+}
+
+#[test]
 fn force_legacy_is_unsupported() {
     assert_eq!(
         KmsCommitWorkerPolicy::Force.effective(KmsBackendKind::Legacy, true),

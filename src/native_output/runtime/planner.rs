@@ -462,6 +462,7 @@ pub(crate) fn plan_native_presentation_path(
 
 #[cfg(test)]
 mod tests {
+    use super::super::frame::NativeCursorPhysicalAdmission;
     use super::super::frame::{
         cursor_output_disposition_at_deadline, cursor_output_disposition_for_primary_state,
         plane_delta_allowed_at_deadline,
@@ -478,7 +479,11 @@ mod tests {
         KmsModeTiming, KmsPresentationTimingModel,
     };
     use crate::native_output::runtime::update_cursor_output_arbitration;
-    use crate::native_output::{NativeScanoutKind, runtime::NativeCursorPreference};
+    use crate::native_output::{
+        NativeScanoutKind,
+        kms_worker::{KmsCommitWorkerPolicy, KmsCommitWorkerTransport},
+        runtime::NativeCursorPreference,
+    };
     use drm_sys::drm_mode_modeinfo;
     use oblivion_one::native::kms::{
         AtomicKmsError, AtomicKmsErrorKind, KmsBackendKind, KmsPolicy,
@@ -955,7 +960,7 @@ mod tests {
             true,
             false,
             false,
-            arbitration.has_future_wake_requirement(now_ns),
+            arbitration.has_future_wake_requirement(now_ns, KmsCommitWorkerTransport::Worker),
         ));
 
         let disposition = cursor_output_disposition_for_primary_state(
@@ -1027,7 +1032,7 @@ mod tests {
             true,
             false,
             false,
-            arbitration.has_future_wake_requirement(input_ns),
+            arbitration.has_future_wake_requirement(input_ns, KmsCommitWorkerTransport::Worker),
         ));
 
         // Model the actual presentation-cycle order: the CursorResponse
@@ -1195,6 +1200,13 @@ mod tests {
             current = next;
         }
 
+        let worker_physical_admission =
+            arbitration.physical_admission_for_transport(KmsCommitWorkerTransport::Worker, now_ns);
+        assert_eq!(
+            worker_physical_admission,
+            NativeCursorPhysicalAdmission::WorkerQueueNow,
+            "worker transport can take ownership while its future physical wake remains queued"
+        );
         assert_eq!(
             cursor_output_disposition_for_primary_state(
                 &mut arbitration,
@@ -1202,6 +1214,7 @@ mod tests {
                 now_ns,
                 NativeCursorPrimaryState {
                     independent_kms_admission: true,
+                    physical_admission: worker_physical_admission,
                     ..NativeCursorPrimaryState::default()
                 },
                 true,
@@ -1210,6 +1223,294 @@ mod tests {
             "the overdue cursor is handed to the worker immediately; the worker owns its future KMS wake"
         );
         assert_eq!(arbitration.desired_epoch(), 42);
+        assert_eq!(arbitration.plane_delta_plans(), 1);
+    }
+
+    #[test]
+    fn synchronous_auto_waits_for_replacement_physical_admission_without_sliding_freshness() {
+        const REFRESH_NS: u64 = 1_000_000_000 / 165;
+        let input_ns = 2_000_000_000;
+        let input_time = MonotonicTimestampNs::new(input_ns);
+        let mut planner = PresentationDeadlinePlanner::new(Duration::from_nanos(REFRESH_NS));
+        planner.note_presented(input_time);
+        let timing = KmsPresentationTimingModel::new(
+            KmsModeTiming::from_mode(&drm_mode_modeinfo::default(), REFRESH_NS),
+            7,
+        );
+        let scheduler = NativeFrameScheduler::new(165, 0);
+        let first = plan_cursor_service_opportunity(&planner, &timing, input_time, None, 500_000)
+            .expect("initial KMS-timed opportunity");
+        let original_deadline = first.service_deadline_ns;
+        let mut arbitration = NativeCursorOutputArbitration::default();
+        update_cursor_output_arbitration(
+            &mut arbitration,
+            NativeCursorSchedulingPolicy::Auto,
+            42,
+            41,
+            input_ns,
+            &scheduler,
+            false,
+            true,
+            Some(first),
+        );
+
+        let replan_ns = first
+            .submit_window
+            .commit_complete_deadline_ns()
+            .saturating_add(1);
+        let replacement = plan_cursor_service_opportunity(
+            &planner,
+            &timing,
+            MonotonicTimestampNs::new(replan_ns),
+            None,
+            500_000,
+        )
+        .expect("replacement physical target after O1 expires");
+        update_cursor_output_arbitration(
+            &mut arbitration,
+            NativeCursorSchedulingPolicy::Auto,
+            42,
+            41,
+            replan_ns,
+            &scheduler,
+            false,
+            true,
+            Some(replacement),
+        );
+
+        assert!(arbitration.due(replan_ns));
+        assert_eq!(arbitration.pending_since_ns(), Some(input_ns));
+        assert_eq!(arbitration.deadline_ns(), Some(original_deadline));
+        assert_eq!(arbitration.service_opportunity(), Some(replacement));
+        assert!(replacement.service_deadline_ns > replan_ns);
+        assert!(replacement.submit_window.worker_wake_at_ns() > replan_ns);
+        for policy in [KmsCommitWorkerPolicy::Auto, KmsCommitWorkerPolicy::Off] {
+            let transport = policy
+                .effective(KmsBackendKind::Atomic, false)
+                .expect("Auto startup degradation and explicit off both select sync");
+            assert_eq!(transport, KmsCommitWorkerTransport::Synchronous);
+            let physical_admission =
+                arbitration.physical_admission_for_transport(transport, replan_ns);
+            assert_eq!(
+                physical_admission,
+                NativeCursorPhysicalAdmission::PhysicalAt(replacement.service_deadline_ns)
+            );
+            assert_eq!(
+                cursor_output_disposition_for_primary_state(
+                    &mut arbitration,
+                    NativeCursorSchedulingPolicy::Auto,
+                    replan_ns,
+                    NativeCursorPrimaryState {
+                        independent_kms_admission: true,
+                        physical_admission,
+                        ..NativeCursorPrimaryState::default()
+                    },
+                    true,
+                ),
+                NativeCursorOutputDisposition::Noop,
+                "synchronous Auto must retain O2 and wait for its admission point"
+            );
+        }
+        assert_eq!(arbitration.plane_delta_plans(), 0);
+        assert_eq!(arbitration.plane_delta_submissions(), 0);
+        assert_eq!(
+            super::plan_native_presentation_path(super::NativePresentationPlanInput {
+                direct_active: false,
+                direct_candidate_changed: false,
+                direct_candidate_eligible: false,
+                primary_visual_work_pending: false,
+                cursor_changed: true,
+                cursor_hardware_usable: true,
+                cursor_visible: true,
+                composition_required: false,
+                atomic_commit_pending: false,
+                plane_delta_allowed: false,
+                render_ahead_requested: false,
+            }),
+            super::NativePresentationPath::IdleComposited,
+            "waiting for physical admission does not generate a primary render"
+        );
+        let sync_admission_deadline = arbitration
+            .synchronous_physical_admission_wake_deadline_ns(replan_ns)
+            .expect("synchronous transport owns the future physical admission");
+        assert_eq!(sync_admission_deadline, replacement.service_deadline_ns);
+        let mut software_fallback = arbitration;
+        software_fallback.set_software_overlay_pending(true);
+        software_fallback.reconcile_hardware_cursor_liveness(false);
+        assert!(!software_fallback.hardware_cursor_pending());
+        assert_eq!(
+            software_fallback.synchronous_physical_admission_wake_deadline_ns(replan_ns),
+            None,
+            "software fallback drops the hardware physical-admission timer"
+        );
+        let fallback_physical_admission = software_fallback
+            .physical_admission_for_transport(KmsCommitWorkerTransport::Synchronous, replan_ns);
+        assert_eq!(
+            cursor_output_disposition_for_primary_state(
+                &mut software_fallback,
+                NativeCursorSchedulingPolicy::Auto,
+                replan_ns,
+                NativeCursorPrimaryState {
+                    independent_kms_admission: true,
+                    physical_admission: fallback_physical_admission,
+                    ..NativeCursorPrimaryState::default()
+                },
+                true,
+            ),
+            NativeCursorOutputDisposition::SoftwareOverlay
+        );
+        assert!(
+            arbitration
+                .has_future_wake_requirement(replan_ns, KmsCommitWorkerTransport::Synchronous)
+        );
+        assert!(cycle_tail_requires_runtime_wake_plan(
+            true,
+            false,
+            false,
+            arbitration
+                .has_future_wake_requirement(replan_ns, KmsCommitWorkerTransport::Synchronous),
+        ));
+        assert!(
+            !arbitration.has_future_wake_requirement(replan_ns, KmsCommitWorkerTransport::Worker)
+        );
+        let admission_plan = build_native_wake_plan(NativeWakePlanInputs {
+            now_ns: replan_ns,
+            cursor_sync_admission_deadline_ns: Some(sync_admission_deadline),
+            ..NativeWakePlanInputs::default()
+        });
+        let mut wake_metrics = super::super::wake_plan::NativeWakeAuthorityMetrics::default();
+        wake_metrics.observe_plan(admission_plan, replan_ns, None, None);
+        assert_eq!(wake_metrics.past_deadline_arms, 0);
+        assert_eq!(wake_metrics.stale_deadline_rearms, 0);
+        assert_eq!(
+            admission_plan.deadline,
+            Some(NativeDeadline {
+                owner: NativeDeadlineOwner::CursorSynchronousAdmission,
+                at_ns: replacement.service_deadline_ns,
+            })
+        );
+        assert_eq!(
+            arbitration
+                .synchronous_physical_admission_wake_deadline_ns(replacement.service_deadline_ns),
+            None,
+            "an admission wake does not rearm itself at zero delay"
+        );
+
+        assert_eq!(
+            {
+                let physical_admission = arbitration.physical_admission_for_transport(
+                    KmsCommitWorkerTransport::Synchronous,
+                    replacement.service_deadline_ns,
+                );
+                cursor_output_disposition_for_primary_state(
+                    &mut arbitration,
+                    NativeCursorSchedulingPolicy::Auto,
+                    replacement.service_deadline_ns,
+                    NativeCursorPrimaryState {
+                        independent_kms_admission: true,
+                        physical_admission,
+                        ..NativeCursorPrimaryState::default()
+                    },
+                    true,
+                )
+            },
+            NativeCursorOutputDisposition::SubmitPlaneDelta
+        );
+        arbitration.note_plane_delta_submission();
+        arbitration.consume_submitted_epoch(
+            42,
+            replacement.service_deadline_ns,
+            scheduler.next_refresh_deadline_ns(replacement.service_deadline_ns),
+        );
+        assert!(!arbitration.pending());
+        assert_eq!(arbitration.plane_delta_plans(), 1);
+        assert_eq!(arbitration.plane_delta_submissions(), 1);
+    }
+
+    #[test]
+    fn synchronous_auto_replans_an_expired_replacement_without_resetting_freshness() {
+        const REFRESH_NS: u64 = 1_000_000_000 / 165;
+        let input_ns = 3_000_000_000;
+        let input_time = MonotonicTimestampNs::new(input_ns);
+        let mut planner = PresentationDeadlinePlanner::new(Duration::from_nanos(REFRESH_NS));
+        planner.note_presented(input_time);
+        let timing = KmsPresentationTimingModel::new(
+            KmsModeTiming::from_mode(&drm_mode_modeinfo::default(), REFRESH_NS),
+            7,
+        );
+        let scheduler = NativeFrameScheduler::new(165, 0);
+        let first = plan_cursor_service_opportunity(&planner, &timing, input_time, None, 500_000)
+            .expect("initial KMS-timed opportunity");
+        let original_deadline = first.service_deadline_ns;
+        let mut arbitration = NativeCursorOutputArbitration::default();
+        arbitration.request_hardware_for_opportunity(42, input_ns, first);
+
+        let o2_replan_ns = first
+            .submit_window
+            .commit_complete_deadline_ns()
+            .saturating_add(1);
+        let second = plan_cursor_service_opportunity(
+            &planner,
+            &timing,
+            MonotonicTimestampNs::new(o2_replan_ns),
+            None,
+            500_000,
+        )
+        .expect("O2 after O1 physically expires");
+        arbitration.reconcile_pending_service_opportunity(second, o2_replan_ns);
+        assert_eq!(arbitration.service_opportunity(), Some(second));
+        assert_eq!(arbitration.deadline_ns(), Some(original_deadline));
+
+        // The O2 admission wake is missed too. Replan O3 and retain the one
+        // original cursor age/deadline rather than opening a fresh response.
+        let o3_replan_ns = second
+            .submit_window
+            .commit_complete_deadline_ns()
+            .saturating_add(1);
+        let third = plan_cursor_service_opportunity(
+            &planner,
+            &timing,
+            MonotonicTimestampNs::new(o3_replan_ns),
+            None,
+            500_000,
+        )
+        .expect("O3 after O2 physically expires");
+        arbitration.reconcile_pending_service_opportunity(third, o3_replan_ns);
+
+        assert!(arbitration.due(o3_replan_ns));
+        assert_eq!(arbitration.pending_since_ns(), Some(input_ns));
+        assert_eq!(arbitration.deadline_ns(), Some(original_deadline));
+        assert_eq!(arbitration.service_opportunity(), Some(third));
+        assert_eq!(
+            arbitration.synchronous_physical_admission_wake_deadline_ns(o3_replan_ns),
+            Some(third.service_deadline_ns)
+        );
+        let physical_admission = arbitration.physical_admission_for_transport(
+            KmsCommitWorkerTransport::Synchronous,
+            third.service_deadline_ns,
+        );
+        assert_eq!(
+            cursor_output_disposition_for_primary_state(
+                &mut arbitration,
+                NativeCursorSchedulingPolicy::Auto,
+                third.service_deadline_ns,
+                NativeCursorPrimaryState {
+                    independent_kms_admission: true,
+                    physical_admission,
+                    ..NativeCursorPrimaryState::default()
+                },
+                true,
+            ),
+            NativeCursorOutputDisposition::SubmitPlaneDelta
+        );
+        arbitration.note_plane_delta_submission();
+        arbitration.consume_submitted_epoch(
+            42,
+            third.service_deadline_ns,
+            scheduler.next_refresh_deadline_ns(third.service_deadline_ns),
+        );
+        assert!(!arbitration.pending());
+        assert_eq!(arbitration.plane_delta_submissions(), 1);
     }
 
     #[test]
@@ -1564,6 +1865,13 @@ mod tests {
             .submit_window
             .commit_complete_deadline_ns()
             .saturating_add(1);
+        assert!(arbitration.due(missed_at));
+        assert_eq!(
+            arbitration
+                .physical_admission_for_transport(KmsCommitWorkerTransport::Worker, missed_at),
+            NativeCursorPhysicalAdmission::NoValidOpportunity,
+            "freshness debt does not make the expired physical target valid"
+        );
         let next = plan_cursor_service_opportunity(
             &planner,
             &timing,

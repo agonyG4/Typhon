@@ -1,4 +1,5 @@
 use super::*;
+use crate::native_output::kms_worker::KmsCommitWorkerTransport;
 use oblivion_one::effects::{
     EffectRect, EffectRegion, EffectRegistryGeneration, effect_output_influence_region,
 };
@@ -957,6 +958,35 @@ pub(crate) struct NativeCursorPrimaryState {
     pub(crate) primary_worker_queued: bool,
     pub(crate) primary_kernel_submitted: bool,
     pub(crate) independent_kms_admission: bool,
+    pub(crate) physical_admission: NativeCursorPhysicalAdmission,
+}
+
+/// Physical KMS timing authority for a cursor submission. This is kept
+/// separate from cursor freshness debt: a worker may accept a future target
+/// now and sleep until its worker wake, while synchronous transport must wait
+/// for the target's service admission point in the reactor.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NativeCursorPhysicalAdmission {
+    #[default]
+    NotRequired,
+    /// Worker admission is legal now; the worker owns the physical wait.
+    WorkerQueueNow,
+    /// Synchronous transport has reached the physical service point.
+    PhysicalNow,
+    /// Synchronous transport must wait for this exact service point.
+    PhysicalAt(u64),
+    /// No current physical target can legally carry the hardware cursor.
+    NoValidOpportunity,
+}
+
+impl NativeCursorPhysicalAdmission {
+    const fn permits_submit_at(self, now_ns: u64) -> bool {
+        match self {
+            Self::NotRequired | Self::WorkerQueueNow | Self::PhysicalNow => true,
+            Self::PhysicalAt(deadline_ns) => now_ns >= deadline_ns,
+            Self::NoValidOpportunity => false,
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -1105,6 +1135,53 @@ impl NativeCursorOutputArbitration {
         self.service_opportunity
     }
 
+    pub(crate) fn physical_admission_for_transport(
+        &self,
+        transport: KmsCommitWorkerTransport,
+        now_ns: u64,
+    ) -> NativeCursorPhysicalAdmission {
+        if !self.pending() {
+            return NativeCursorPhysicalAdmission::NotRequired;
+        }
+        if !self.hardware_cursor_pending {
+            return NativeCursorPhysicalAdmission::NoValidOpportunity;
+        }
+        let Some(opportunity) = self.service_opportunity else {
+            return NativeCursorPhysicalAdmission::NoValidOpportunity;
+        };
+        let target_expired = opportunity.target.presentation_time.get() <= now_ns
+            || opportunity.submit_window.commit_complete_deadline_ns() <= now_ns;
+        if target_expired {
+            return NativeCursorPhysicalAdmission::NoValidOpportunity;
+        }
+        if transport == KmsCommitWorkerTransport::Worker {
+            return NativeCursorPhysicalAdmission::WorkerQueueNow;
+        }
+        if opportunity.service_deadline_ns > now_ns {
+            NativeCursorPhysicalAdmission::PhysicalAt(opportunity.service_deadline_ns)
+        } else {
+            NativeCursorPhysicalAdmission::PhysicalNow
+        }
+    }
+
+    /// Return the physical-admission wake only after freshness is already
+    /// mature. Worker transport has a separate timed queue and never uses
+    /// this reactor deadline.
+    pub(crate) fn synchronous_physical_admission_wake_deadline_ns(
+        &self,
+        now_ns: u64,
+    ) -> Option<u64> {
+        if !self.pending()
+            || !self.hardware_cursor_pending
+            || self.planning_retry_ns.is_some()
+            || !self.due(now_ns)
+        {
+            return None;
+        }
+        let deadline_ns = self.service_opportunity?.service_deadline_ns;
+        (deadline_ns > now_ns).then_some(deadline_ns)
+    }
+
     /// Return the cursor response deadline only while it is still a future
     /// temporal boundary.  Matured debt remains pending for disposition and
     /// exact epoch settlement, but its old timestamp must not poll the owner
@@ -1126,9 +1203,17 @@ impl NativeCursorOutputArbitration {
             .filter(|deadline_ns| *deadline_ns > now_ns)
     }
 
-    pub(crate) fn has_future_wake_requirement(&self, now_ns: u64) -> bool {
+    pub(crate) fn has_future_wake_requirement(
+        &self,
+        now_ns: u64,
+        transport: KmsCommitWorkerTransport,
+    ) -> bool {
         self.wake_deadline_ns(now_ns).is_some()
             || self.planning_retry_wake_deadline_ns(now_ns).is_some()
+            || (transport == KmsCommitWorkerTransport::Synchronous
+                && self
+                    .synchronous_physical_admission_wake_deadline_ns(now_ns)
+                    .is_some())
     }
 
     pub(crate) const fn desired_epoch(&self) -> u64 {
@@ -1506,6 +1591,14 @@ pub(crate) fn cursor_output_disposition_for_primary_state(
         } else {
             NativeCursorOutputDisposition::Noop
         }
+    } else if policy == NativeCursorSchedulingPolicy::Auto
+        && hardware_usable
+        && !arbitration.software_overlay_pending
+        && !primary.physical_admission.permits_submit_at(now_ns)
+    {
+        // Freshness remains overdue; synchronous transport retains the
+        // physical target and waits on its separate admission timer.
+        NativeCursorOutputDisposition::Noop
     } else if primary.primary_target_owned
         || primary.primary_worker_queued
         || primary.primary_kernel_submitted

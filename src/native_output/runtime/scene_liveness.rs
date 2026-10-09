@@ -47,6 +47,13 @@ impl NativeRuntime {
             cursor_planning_deadline_ns: self
                 .cursor_output_arbitration
                 .planning_retry_wake_deadline_ns(now_ns),
+            cursor_sync_admission_deadline_ns: (self.kms_commit_worker_transport
+                == crate::native_output::kms_worker::KmsCommitWorkerTransport::Synchronous)
+                .then(|| {
+                    self.cursor_output_arbitration
+                        .synchronous_physical_admission_wake_deadline_ns(now_ns)
+                })
+                .flatten(),
             control_timeout_deadline_ns: control_timeout_deadline
                 .filter(|deadline| *deadline > now_ns),
             system_action_transport_deadline_ns: system_action_transport_deadline
@@ -94,6 +101,9 @@ impl NativeRuntime {
                     NativeDeadlineOwner::XwaylandTimeout => "deadline:xwayland_timeout",
                     NativeDeadlineOwner::CursorResponse => "deadline:cursor_response",
                     NativeDeadlineOwner::CursorPlanningRetry => "deadline:cursor_planning_retry",
+                    NativeDeadlineOwner::CursorSynchronousAdmission => {
+                        "deadline:cursor_sync_admission"
+                    }
                     NativeDeadlineOwner::ControlTimeout => "deadline:control_timeout",
                     NativeDeadlineOwner::SystemActionTransport => {
                         "deadline:system_action_transport"

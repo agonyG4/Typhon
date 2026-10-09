@@ -878,6 +878,10 @@ impl NativeRuntime {
                     || can_queue_worker_cursor)
                     && !scanout.ready_frame_queued()
                     && (!worker_mode || worker_queue_available || can_queue_worker_cursor),
+                physical_admission: cursor_output_arbitration.physical_admission_for_transport(
+                    *kms_commit_worker_transport,
+                    scheduler_now.get(),
+                ),
             };
             let disposition = cursor_output_disposition_for_primary_state(
                 cursor_output_arbitration,
