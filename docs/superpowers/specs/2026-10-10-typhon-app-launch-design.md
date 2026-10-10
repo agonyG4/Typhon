@@ -20,6 +20,15 @@ This is a one-condition correction in Typhon. Eclipse already selects the
 Typhon launch bridge and delivers the requests, so changing Eclipse would
 leave the underlying compositor behavior broken for other clients too.
 
+## Build prerequisite discovered during implementation
+
+The first release build exposed existing compile errors in
+`src/egl_renderer/effects/mod.rs`: duplicate resource re-exports and a missing
+re-export for the external-bindings preparation function used by the frame
+pipeline. Make the smallest export-only correction needed to build the updated
+binary. This is a compile prerequisite and does not change runtime behavior or
+the launch design.
+
 ## Alternatives considered
 
 - **Recommended: correct the shutdown condition.** Smallest change, preserves
