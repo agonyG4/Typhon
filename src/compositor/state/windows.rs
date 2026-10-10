@@ -12,6 +12,113 @@ use crate::window_lifecycle_animation::{
 use crate::wm::{LayoutMembership, WorkspaceSwitchOutcome};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingXwaylandRestoreWaitReason {
+    NoAssociatedSurface,
+    WrongSurfaceIdentity,
+    NoCommittedContent,
+    MissingAuthoritativeGeometry,
+    GeometryMismatch,
+    WrongGeneration,
+    UnexpectedPlacement,
+}
+
+impl PendingXwaylandRestoreWaitReason {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::NoAssociatedSurface => "no_associated_surface",
+            Self::WrongSurfaceIdentity => "wrong_surface_identity",
+            Self::NoCommittedContent => "no_committed_content",
+            Self::MissingAuthoritativeGeometry => "missing_authoritative_geometry",
+            Self::GeometryMismatch => "geometry_mismatch",
+            Self::WrongGeneration => "wrong_generation",
+            Self::UnexpectedPlacement => "unexpected_placement",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PendingXwaylandRestoreWait {
+    reason: PendingXwaylandRestoreWaitReason,
+    surface_id: Option<u32>,
+    expected_rect: Option<PresentationRect>,
+    committed_rect: Option<PresentationRect>,
+    logical_size: Option<(u32, u32)>,
+    buffer_size: Option<crate::render_backend::buffer::BufferSize>,
+}
+
+impl PendingXwaylandRestoreWait {
+    fn new(
+        reason: PendingXwaylandRestoreWaitReason,
+        surface_id: Option<u32>,
+        expected_rect: Option<PresentationRect>,
+        source: Option<&RenderableSurface>,
+    ) -> Self {
+        Self {
+            reason,
+            surface_id,
+            expected_rect,
+            committed_rect: source.and_then(pending_xwayland_restore_surface_rect),
+            logical_size: source.map(|source| (source.width, source.height)),
+            buffer_size: source.map(RenderableSurface::buffer_size),
+        }
+    }
+}
+
+fn pending_xwayland_restore_surface_rect(source: &RenderableSurface) -> Option<PresentationRect> {
+    if source.placement.parent_surface_id.is_some()
+        || source.placement.root_mode != RootPlacementMode::Absolute
+    {
+        return None;
+    }
+    PresentationRect::new(
+        f64::from(source.placement.local_x.saturating_add(source.x)),
+        f64::from(source.placement.local_y.saturating_add(source.y)),
+        f64::from(source.width),
+        f64::from(source.height),
+    )
+}
+
+fn lifecycle_diagnostics_enabled() -> bool {
+    matches!(
+        std::env::var("ASTREA_LIFECYCLE_DIAGNOSTICS").as_deref(),
+        Ok("1" | "true" | "on")
+    )
+}
+
+fn lifecycle_rect_diagnostic_fields(prefix: &str, rect: Option<PresentationRect>) -> String {
+    match rect {
+        Some(rect) => format!(
+            "{prefix}_x={:.1} {prefix}_y={:.1} {prefix}_width={:.1} {prefix}_height={:.1}",
+            rect.x(),
+            rect.y(),
+            rect.width(),
+            rect.height(),
+        ),
+        None => format!("{prefix}_x=none {prefix}_y=none {prefix}_width=none {prefix}_height=none"),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PendingXwaylandRestoreSource {
+    window_id: WindowId,
+    handle: crate::xwayland::X11WindowHandle,
+    surface_id: u32,
+    generation: crate::xwayland::XwaylandGeneration,
+    canonical_geometry: WindowGeometry,
+    canonical_client_rect: PresentationRect,
+    committed_client_rect: PresentationRect,
+    logical_width: u32,
+    logical_height: u32,
+    buffer_size: crate::render_backend::buffer::BufferSize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum PendingXwaylandRestoreReadiness {
+    Waiting(PendingXwaylandRestoreWait),
+    Ready(PendingXwaylandRestoreSource),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::compositor) enum WindowModeRequestSource {
     XdgClient,
     CompositorShortcut,
@@ -190,7 +297,7 @@ impl CompositorState {
         {
             return WindowActivationOutcome::Unavailable;
         }
-        if was_minimized && !self.restore_minimized_desktop_window_contents(window_id) {
+        if was_minimized && !self.restore_minimized_desktop_window_contents(window_id, None) {
             return WindowActivationOutcome::Unavailable;
         }
         let root_surface_id = self
@@ -1592,7 +1699,15 @@ impl CompositorState {
         &mut self,
         window_id: WindowId,
     ) -> bool {
-        if !self.restore_minimized_desktop_window_contents(window_id) {
+        self.restore_minimized_desktop_window_with_source(window_id, None)
+    }
+
+    fn restore_minimized_desktop_window_with_source(
+        &mut self,
+        window_id: WindowId,
+        source: Option<PendingXwaylandRestoreSource>,
+    ) -> bool {
+        if !self.restore_minimized_desktop_window_contents(window_id, source) {
             return false;
         }
         let _ = self.focus_desktop_window(window_id, WindowFocusReason::Restore);
@@ -1610,17 +1725,146 @@ impl CompositorState {
             .is_some()
     }
 
-    fn pending_xwayland_restore_source_ready(&self, window_id: WindowId) -> bool {
-        let Some(window) = self.window(window_id) else {
-            return false;
+    fn resolve_pending_xwayland_restore_source(
+        &self,
+        pending: PendingXwaylandRestore,
+    ) -> PendingXwaylandRestoreReadiness {
+        let waiting = |reason, surface_id, expected_rect, source| {
+            PendingXwaylandRestoreReadiness::Waiting(PendingXwaylandRestoreWait::new(
+                reason,
+                surface_id,
+                expected_rect,
+                source,
+            ))
         };
+        let Some(window) = self.window(pending.window_id) else {
+            return waiting(
+                PendingXwaylandRestoreWaitReason::WrongSurfaceIdentity,
+                None,
+                None,
+                None,
+            );
+        };
+        if window.id != pending.window_id
+            || window.backend != WindowBackend::X11(pending.handle)
+            || self.window_by_x11_handle.get(&pending.handle) != Some(&pending.window_id)
+        {
+            return waiting(
+                PendingXwaylandRestoreWaitReason::WrongSurfaceIdentity,
+                window.x11_surface_id,
+                None,
+                None,
+            );
+        }
         let Some(surface_id) = window.x11_surface_id else {
-            return false;
+            return waiting(
+                PendingXwaylandRestoreWaitReason::NoAssociatedSurface,
+                None,
+                None,
+                None,
+            );
         };
-        window.root_surface_id == surface_id
-            && self
-                .lifecycle_client_rect_for_surface(window_id, surface_id, true)
-                .is_some()
+        if window.root_surface_id != surface_id
+            || self.window_by_root_surface.get(&surface_id) != Some(&pending.window_id)
+        {
+            return waiting(
+                PendingXwaylandRestoreWaitReason::WrongSurfaceIdentity,
+                Some(surface_id),
+                None,
+                None,
+            );
+        }
+        let Some(xwayland_surface) = self.xwayland.surface_states.get(&surface_id) else {
+            return waiting(
+                PendingXwaylandRestoreWaitReason::WrongGeneration,
+                Some(surface_id),
+                None,
+                None,
+            );
+        };
+        if xwayland_surface.generation != pending.handle.generation()
+            || !xwayland_surface.association_object_alive
+        {
+            return waiting(
+                PendingXwaylandRestoreWaitReason::WrongGeneration,
+                Some(surface_id),
+                None,
+                None,
+            );
+        }
+        let Some(geometry) = window.x11_geometry else {
+            return waiting(
+                PendingXwaylandRestoreWaitReason::MissingAuthoritativeGeometry,
+                Some(surface_id),
+                None,
+                None,
+            );
+        };
+        let canonical_geometry = geometry.frame;
+        if canonical_geometry.placement.parent_surface_id.is_some()
+            || canonical_geometry.placement.root_mode != RootPlacementMode::Absolute
+        {
+            return waiting(
+                PendingXwaylandRestoreWaitReason::UnexpectedPlacement,
+                Some(surface_id),
+                None,
+                window.state.minimized_root_surface(surface_id),
+            );
+        }
+        let Some(canonical_client_rect) = PresentationRect::new(
+            f64::from(canonical_geometry.placement.local_x),
+            f64::from(canonical_geometry.placement.local_y),
+            f64::from(canonical_geometry.width),
+            f64::from(canonical_geometry.height),
+        ) else {
+            return waiting(
+                PendingXwaylandRestoreWaitReason::MissingAuthoritativeGeometry,
+                Some(surface_id),
+                None,
+                None,
+            );
+        };
+        let Some(source) = window.state.minimized_root_surface(surface_id) else {
+            return waiting(
+                PendingXwaylandRestoreWaitReason::NoCommittedContent,
+                Some(surface_id),
+                Some(canonical_client_rect),
+                None,
+            );
+        };
+        let Some(committed_client_rect) = pending_xwayland_restore_surface_rect(source) else {
+            return waiting(
+                PendingXwaylandRestoreWaitReason::UnexpectedPlacement,
+                Some(surface_id),
+                Some(canonical_client_rect),
+                Some(source),
+            );
+        };
+        let buffer_size = source.buffer_size();
+        if source.placement != canonical_geometry.placement
+            || source.width != canonical_geometry.width
+            || source.height != canonical_geometry.height
+            || committed_client_rect != canonical_client_rect
+        {
+            return waiting(
+                PendingXwaylandRestoreWaitReason::GeometryMismatch,
+                Some(surface_id),
+                Some(canonical_client_rect),
+                Some(source),
+            );
+        }
+        PendingXwaylandRestoreReadiness::Ready(PendingXwaylandRestoreSource {
+            window_id: pending.window_id,
+            handle: pending.handle,
+            surface_id,
+            generation: xwayland_surface.generation,
+            canonical_geometry,
+            canonical_client_rect,
+            committed_client_rect,
+            logical_width: source.width,
+            logical_height: source.height,
+            buffer_size,
+        })
     }
 
     fn lifecycle_client_rect_for_surface(
@@ -1664,6 +1908,98 @@ impl CompositorState {
         );
     }
 
+    fn trace_pending_xwayland_restore_source_wait(
+        &self,
+        pending: PendingXwaylandRestore,
+        wait: PendingXwaylandRestoreWait,
+    ) {
+        if !lifecycle_diagnostics_enabled() {
+            return;
+        }
+        let expected = lifecycle_rect_diagnostic_fields("expected", wait.expected_rect);
+        let committed = lifecycle_rect_diagnostic_fields("committed", wait.committed_rect);
+        let (logical_width, logical_height) = wait
+            .logical_size
+            .map_or(("none".to_owned(), "none".to_owned()), |(width, height)| {
+                (width.to_string(), height.to_string())
+            });
+        let (buffer_width, buffer_height) = wait
+            .buffer_size
+            .map_or(("none".to_owned(), "none".to_owned()), |size| {
+                (size.width.to_string(), size.height.to_string())
+            });
+        eprintln!(
+            "typhon.lifecycle_xwayland_restore event=source_wait window_id={:?} xid={} generation={} surface_id={} reason={} {expected} {committed} logical_width={logical_width} logical_height={logical_height} buffer_width={buffer_width} buffer_height={buffer_height}",
+            pending.window_id,
+            pending.handle.xid(),
+            pending.handle.generation().get(),
+            wait.surface_id
+                .map_or_else(|| "none".to_owned(), |surface_id| surface_id.to_string()),
+            wait.reason.as_str(),
+        );
+    }
+
+    fn trace_pending_xwayland_restore_source_ready(&self, source: PendingXwaylandRestoreSource) {
+        if !lifecycle_diagnostics_enabled() {
+            return;
+        }
+        let canonical =
+            lifecycle_rect_diagnostic_fields("canonical", Some(source.canonical_client_rect));
+        let committed =
+            lifecycle_rect_diagnostic_fields("source", Some(source.committed_client_rect));
+        eprintln!(
+            "typhon.lifecycle_xwayland_restore event=source_ready window_id={:?} xid={} generation={} surface_id={} source_generation={} {canonical} {committed} logical_width={} logical_height={} buffer_width={} buffer_height={} frame_width={} frame_height={}",
+            source.window_id,
+            source.handle.xid(),
+            source.handle.generation().get(),
+            source.surface_id,
+            source.generation.get(),
+            source.logical_width,
+            source.logical_height,
+            source.buffer_size.width,
+            source.buffer_size.height,
+            source.canonical_geometry.width,
+            source.canonical_geometry.height,
+        );
+    }
+
+    fn trace_pending_xwayland_restore_lifecycle_geometry(
+        &self,
+        source: PendingXwaylandRestoreSource,
+        visual_group: LifecycleVisualGroup,
+    ) {
+        if !lifecycle_diagnostics_enabled() {
+            return;
+        }
+        eprintln!(
+            "typhon.lifecycle_xwayland_restore event=lifecycle_geometry window_id={:?} xid={} generation={} surface_id={} canonical_client_rect=({:.1},{:.1},{:.1},{:.1}) presented_source_client_rect=({:.1},{:.1},{:.1},{:.1}) canonical_visual_rect=({:.1},{:.1},{:.1},{:.1}) presented_source_visual_rect=({:.1},{:.1},{:.1},{:.1}) anchor_rect=({:.1},{:.1},{:.1},{:.1})",
+            source.window_id,
+            source.handle.xid(),
+            source.handle.generation().get(),
+            source.surface_id,
+            visual_group.canonical_client_rect.x(),
+            visual_group.canonical_client_rect.y(),
+            visual_group.canonical_client_rect.width(),
+            visual_group.canonical_client_rect.height(),
+            visual_group.presented_source_client_rect.x(),
+            visual_group.presented_source_client_rect.y(),
+            visual_group.presented_source_client_rect.width(),
+            visual_group.presented_source_client_rect.height(),
+            visual_group.canonical_visual_rect.x(),
+            visual_group.canonical_visual_rect.y(),
+            visual_group.canonical_visual_rect.width(),
+            visual_group.canonical_visual_rect.height(),
+            visual_group.presented_source_visual_rect.x(),
+            visual_group.presented_source_visual_rect.y(),
+            visual_group.presented_source_visual_rect.width(),
+            visual_group.presented_source_visual_rect.height(),
+            visual_group.anchor_rect.x(),
+            visual_group.anchor_rect.y(),
+            visual_group.anchor_rect.width(),
+            visual_group.anchor_rect.height(),
+        );
+    }
+
     fn defer_xwayland_restore_until_source(
         &mut self,
         window_id: WindowId,
@@ -1686,12 +2022,9 @@ impl CompositorState {
         self.backend_commands.push(
             crate::compositor::window_backend::WindowBackendCommand::Map { window: window_id },
         );
-        if matches!(
-            std::env::var("ASTREA_LIFECYCLE_DIAGNOSTICS").as_deref(),
-            Ok("1" | "true" | "on")
-        ) {
+        if lifecycle_diagnostics_enabled() {
             eprintln!(
-                "typhon.lifecycle_xwayland_restore event=pending window_id={window_id:?} xid={} generation={} reason=missing_source_geometry",
+                "typhon.lifecycle_xwayland_restore event=pending window_id={window_id:?} xid={} generation={} reason=source_not_ready",
                 handle.xid(),
                 handle.generation().get(),
             );
@@ -1725,28 +2058,97 @@ impl CompositorState {
             }
             return false;
         }
-        if !self.pending_xwayland_restore_source_ready(window_id) {
-            return false;
+        match self.resolve_pending_xwayland_restore_source(pending) {
+            PendingXwaylandRestoreReadiness::Waiting(wait) => {
+                self.trace_pending_xwayland_restore_source_wait(pending, wait);
+                false
+            }
+            PendingXwaylandRestoreReadiness::Ready(source) => {
+                self.trace_pending_xwayland_restore_source_ready(source);
+                let restored =
+                    self.restore_minimized_desktop_window_with_source(window_id, Some(source));
+                if restored {
+                    self.complete_pending_x11_activation(source.handle);
+                }
+                restored
+            }
         }
-        self.restore_minimized_desktop_window(window_id)
     }
 
-    fn restore_minimized_desktop_window_contents(&mut self, window_id: WindowId) -> bool {
+    fn restore_minimized_desktop_window_contents(
+        &mut self,
+        window_id: WindowId,
+        resolved_xwayland_source: Option<PendingXwaylandRestoreSource>,
+    ) -> bool {
         let Some((root_surface_id, x11_surface_id)) = self
             .window(window_id)
             .map(|window| (window.root_surface_id, window.x11_surface_id))
         else {
             return false;
         };
-        if let Some(window) = self.window(window_id)
+        let xwayland_restore_source = if let Some(source) = resolved_xwayland_source {
+            let source_matches_current_state = self.window(window_id).is_some_and(|window| {
+                window.id == source.window_id
+                    && window.root_surface_id == source.surface_id
+                    && window.x11_surface_id == Some(source.surface_id)
+                    && window.backend == WindowBackend::X11(source.handle)
+                    && window
+                        .x11_geometry
+                        .is_some_and(|geometry| geometry.frame == source.canonical_geometry)
+                    && self
+                        .xwayland
+                        .surface_states
+                        .get(&source.surface_id)
+                        .is_some_and(|surface| surface.generation == source.generation)
+            });
+            if !source_matches_current_state || root_surface_id != source.surface_id {
+                return false;
+            }
+            Some(source)
+        } else if let Some(window) = self.window(window_id)
             && window.kind == DesktopWindowKind::Managed
             && window.is_normal_x11_role()
+            && window.state.is_minimized()
             && !self.window_has_active_lifecycle(window_id)
-            && !self.pending_xwayland_restore_source_ready(window_id)
             && let WindowBackend::X11(handle) = window.backend
         {
-            return self.defer_xwayland_restore_until_source(window_id, handle);
-        }
+            let pending = if let Some(pending) = self.pending_xwayland_restores.get(&window_id) {
+                if pending.window_id != window_id || pending.handle != handle {
+                    if let Some(pending) = self.pending_xwayland_restores.remove(&window_id) {
+                        self.trace_pending_xwayland_restore_cancelled(
+                            pending,
+                            PendingXwaylandRestoreCancellationReason::AssociationIdentityMismatch,
+                        );
+                    }
+                    return false;
+                }
+                *pending
+            } else {
+                PendingXwaylandRestore {
+                    window_id,
+                    handle,
+                    minimized_target: window.state.minimized_lifecycle_target(),
+                }
+            };
+            match self.resolve_pending_xwayland_restore_source(pending) {
+                PendingXwaylandRestoreReadiness::Ready(source) => {
+                    self.trace_pending_xwayland_restore_source_ready(source);
+                    Some(source)
+                }
+                PendingXwaylandRestoreReadiness::Waiting(wait) => {
+                    let _ = self.defer_xwayland_restore_until_source(window_id, handle);
+                    let pending = self
+                        .pending_xwayland_restores
+                        .get(&window_id)
+                        .copied()
+                        .unwrap_or(pending);
+                    self.trace_pending_xwayland_restore_source_wait(pending, wait);
+                    return true;
+                }
+            }
+        } else {
+            None
+        };
         if let Some(pending) = self.pending_xwayland_restores.remove(&window_id) {
             if self.window(window_id).is_some_and(|window| {
                 window.backend == WindowBackend::X11(pending.handle)
@@ -1840,22 +2242,27 @@ impl CompositorState {
             lifecycle_scene_node_id
                 .and_then(|scene_node_id| self.lifecycle_visual_group_for_scene_node(scene_node_id))
         } else {
-            self.lifecycle_window_rect(root_surface_id)
+            xwayland_restore_source
+                .map(|source| source.canonical_client_rect)
+                .or_else(|| self.lifecycle_window_rect(root_surface_id))
                 .or_else(|| {
                     self.lifecycle_client_rect_for_surface(window_id, root_surface_id, false)
                 })
                 .and_then(|canonical_client| {
+                    let surface_origins =
+                        crate::compositor::render::surface_origins(&self.renderable_surfaces);
                     let owned_bounds = self
                         .renderable_surfaces
                         .iter()
-                        .filter(|surface| {
+                        .zip(surface_origins)
+                        .filter(|(surface, _)| {
                             self.surface_topology.root_surface_id(surface.surface_id)
                                 == root_surface_id
                         })
-                        .filter_map(|surface| {
+                        .filter_map(|(surface, (x, y))| {
                             PresentationRect::new(
-                                f64::from(surface.x),
-                                f64::from(surface.y),
+                                f64::from(x),
+                                f64::from(y),
                                 f64::from(surface.width),
                                 f64::from(surface.height),
                             )
@@ -1875,18 +2282,33 @@ impl CompositorState {
                         });
                     let visual =
                         canonical_visual_rect(canonical_client, owned_bounds, decoration_bounds)?;
-                    let presented_visual =
-                        presented_visual_rect(canonical_client, visual, canonical_client)?;
+                    let presented_visual = presented_visual_rect(
+                        canonical_client,
+                        visual,
+                        xwayland_restore_source
+                            .map(|source| source.committed_client_rect)
+                            .unwrap_or(canonical_client),
+                    )?;
                     let target = self.resolve_lifecycle_target(window_id, presented_visual)?;
-                    LifecycleVisualGroup::from_resolved_effect_bounds(
+                    let presented_source_client = xwayland_restore_source
+                        .map(|source| source.committed_client_rect)
+                        .unwrap_or(canonical_client);
+                    let visual_group = LifecycleVisualGroup::from_resolved_effect_bounds(
                         restore_effect?,
                         canonical_client,
                         visual,
-                        canonical_client,
+                        presented_source_client,
                         target,
                         self.output_size.width,
                         self.output_size.height,
-                    )
+                    )?;
+                    if let Some(source) = xwayland_restore_source {
+                        self.trace_pending_xwayland_restore_lifecycle_geometry(
+                            source,
+                            visual_group,
+                        );
+                    }
+                    Some(visual_group)
                 })
         };
         self.begin_lifecycle_restore(

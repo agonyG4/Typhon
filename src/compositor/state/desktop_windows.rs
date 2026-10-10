@@ -979,6 +979,7 @@ impl CompositorState {
         } else if placement_changed {
             self.update_toplevel_visual_render_assignment(root_surface_id);
         }
+        let _ = self.complete_pending_xwayland_restore_for_surface(root_surface_id);
         true
     }
 

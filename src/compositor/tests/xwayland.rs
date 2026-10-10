@@ -406,7 +406,6 @@ fn stationary_pointer_xwayland_fixture() -> StationaryPointerXwaylandFixture {
     };
     let parent_surface_id = surface_for_serial(parent_serial).expect("parent association");
     let popup_surface_id = surface_for_serial(popup_serial).expect("popup association");
-
     StationaryPointerXwaylandFixture {
         server,
         connection,
@@ -422,6 +421,124 @@ fn stationary_pointer_xwayland_fixture() -> StationaryPointerXwaylandFixture {
         parent_surface_id,
         popup_surface_id,
     }
+}
+
+fn prepare_pending_xwayland_restore(
+    fixture: &mut StationaryPointerXwaylandFixture,
+    geometry: X11Geometry,
+) -> (
+    crate::core::WindowId,
+    X11WindowHandle,
+    crate::compositor::state_data::CurrentSurfaceBuffer,
+) {
+    let mut snapshot = fake_snapshot();
+    snapshot.surface_id = fixture.parent_surface_id;
+    snapshot.geometry = geometry;
+    let handle = snapshot.handle;
+    fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::WindowReady(snapshot));
+    let window_id = fixture
+        .server
+        .state
+        .window_id_for_x11_handle(handle)
+        .expect("admitted X11 window");
+    assert!(fixture.server.state.set_x11_geometry(handle, geometry));
+    let replacement_source_content = fixture
+        .server
+        .state
+        .current_surface_buffers
+        .get(&fixture.parent_surface_id)
+        .cloned()
+        .expect("initial root buffer before its association is retired");
+    fixture
+        .server
+        .set_lifecycle_animation_renderer_available(false);
+    assert!(fixture.server.state.minimize_desktop_window(window_id));
+    fixture
+        .server
+        .state
+        .remove_current_surface_buffer(fixture.popup_surface_id);
+    fixture
+        .server
+        .apply_xwayland_association_event(XwmAssociationEvent::Associated {
+            generation: handle.generation(),
+            window: handle,
+            surface_id: fixture.popup_surface_id,
+        });
+    assert!(
+        fixture
+            .server
+            .state
+            .restore_minimized_desktop_window(window_id)
+    );
+    assert!(
+        fixture
+            .server
+            .state
+            .pending_xwayland_restores
+            .contains_key(&window_id)
+    );
+    assert!(fixture.server.renderable_surfaces().is_empty());
+    (window_id, handle, replacement_source_content)
+}
+
+fn replacement_xwayland_content(
+    source_content: &crate::compositor::state_data::CurrentSurfaceBuffer,
+    width: u32,
+    height: u32,
+    x: i32,
+    y: i32,
+) -> crate::compositor::state_data::CurrentSurfaceBuffer {
+    let mut content = source_content.clone();
+    let crate::compositor::state_data::CurrentSurfaceBuffer::Materialized(materialized) =
+        &mut content
+    else {
+        panic!("test source buffer is materialized");
+    };
+    materialized.surface_size = Some(
+        crate::render_backend::buffer::BufferSize::new(width, height)
+            .expect("positive logical test surface size"),
+    );
+    materialized.x = x;
+    materialized.y = y;
+    content
+}
+
+fn commit_replacement_xwayland_content(
+    fixture: &mut StationaryPointerXwaylandFixture,
+    source_content: &crate::compositor::state_data::CurrentSurfaceBuffer,
+    width: u32,
+    height: u32,
+    x: i32,
+    y: i32,
+) {
+    let content = replacement_xwayland_content(source_content, width, height, x, y);
+    assert!(fixture.server.state.commit_xwayland_surface_buffer(
+        fixture.popup_surface_id,
+        content,
+        Vec::new(),
+        SurfacePublicationSource::Immediate,
+    ));
+}
+
+fn assert_xwayland_restore_lifecycle_rect(
+    fixture: &StationaryPointerXwaylandFixture,
+    window_id: crate::core::WindowId,
+    expected: crate::compositor::PresentationRect,
+) {
+    let scene_node_id = fixture
+        .server
+        .state
+        .scene_node_id_for_window_group(window_id)
+        .expect("X11 window scene node");
+    let visual_group = fixture
+        .server
+        .state
+        .lifecycle_visual_group_for_scene_node(scene_node_id)
+        .expect("restore lifecycle visual group");
+    assert_eq!(visual_group.canonical_client_rect, expected);
+    assert_eq!(visual_group.presented_source_client_rect, expected);
 }
 
 fn admit_first_buffer(fixture: &mut FirstBufferFixture, x: i32, y: i32) {
@@ -1284,7 +1401,47 @@ fn pending_x11_activation_completes_on_the_same_window_replacement_surface() {
             .and_then(|window| window.x11_surface_id),
         Some(fixture.popup_surface_id)
     );
+    assert_eq!(fixture.server.state.focused_window_id, None);
+    assert!(fixture.server.state.pending_x11_activation.is_some());
+    assert!(
+        fixture
+            .server
+            .state
+            .pending_xwayland_restores
+            .contains_key(&window_id)
+    );
+    assert!(
+        fixture
+            .server
+            .state
+            .window(window_id)
+            .is_some_and(|window| window.state.is_minimized())
+    );
+
+    let replacement_source_content = fixture
+        .server
+        .state
+        .current_surface_buffers
+        .get(&fixture.popup_surface_id)
+        .cloned()
+        .expect("replacement surface content before matching geometry commit");
+    commit_replacement_xwayland_content(&mut fixture, &replacement_source_content, 800, 600, 0, 0);
+
     assert!(fixture.server.state.pending_x11_activation.is_none());
+    assert!(
+        !fixture
+            .server
+            .state
+            .pending_xwayland_restores
+            .contains_key(&window_id)
+    );
+    assert!(
+        fixture
+            .server
+            .state
+            .window(window_id)
+            .is_some_and(|window| !window.state.is_minimized())
+    );
     assert_eq!(fixture.server.state.focused_window_id, Some(window_id));
 }
 
@@ -1580,13 +1737,15 @@ fn xwayland_minimize_restore_waits_for_replacement_content_and_keeps_window_iden
         .state
         .window_id_for_x11_handle(handle)
         .expect("admitted X11 window");
-    let replacement_content = fixture
+    let replacement_source_content = fixture
         .server
         .state
         .current_surface_buffers
         .get(&fixture.parent_surface_id)
         .cloned()
-        .expect("initial root content");
+        .expect("initial root buffer");
+    let replacement_content =
+        replacement_xwayland_content(&replacement_source_content, 800, 600, 0, 0);
     let frame_placement = fixture
         .server
         .state
@@ -1744,6 +1903,208 @@ fn xwayland_minimize_restore_waits_for_replacement_content_and_keeps_window_iden
             .window_id_for_surface(fixture.parent_surface_id),
         None,
         "the old map-local surface must not retain root ownership"
+    );
+}
+
+#[test]
+fn xwayland_restore_waits_for_authoritative_logical_geometry() {
+    let mut fixture = stationary_pointer_xwayland_fixture();
+    let geometry = X11Geometry {
+        x: 37,
+        y: 42,
+        width: 800,
+        height: 600,
+    };
+    let (window_id, _, replacement_source_content) =
+        prepare_pending_xwayland_restore(&mut fixture, geometry);
+    fixture
+        .server
+        .set_lifecycle_animation_renderer_available(true);
+
+    commit_replacement_xwayland_content(
+        &mut fixture,
+        &replacement_source_content,
+        1920,
+        1080,
+        0,
+        0,
+    );
+
+    assert!(
+        fixture
+            .server
+            .state
+            .window(window_id)
+            .is_some_and(|window| window.state.is_minimized())
+    );
+    assert!(
+        fixture
+            .server
+            .state
+            .pending_xwayland_restores
+            .contains_key(&window_id)
+    );
+    assert!(fixture.server.renderable_surfaces().is_empty());
+    let oversized = fixture
+        .server
+        .state
+        .window(window_id)
+        .and_then(|window| {
+            window
+                .state
+                .minimized_root_surface(fixture.popup_surface_id)
+        })
+        .expect("oversized replacement remains minimized");
+    assert_eq!((oversized.width, oversized.height), (1920, 1080));
+    assert!(oversized.render_target_size.is_none());
+
+    commit_replacement_xwayland_content(&mut fixture, &replacement_source_content, 800, 600, 0, 0);
+
+    assert!(
+        fixture
+            .server
+            .state
+            .window(window_id)
+            .is_some_and(|window| !window.state.is_minimized())
+    );
+    assert!(
+        !fixture
+            .server
+            .state
+            .pending_xwayland_restores
+            .contains_key(&window_id)
+    );
+    assert_xwayland_restore_lifecycle_rect(
+        &fixture,
+        window_id,
+        crate::compositor::PresentationRect::new(37.0, 42.0, 800.0, 600.0)
+            .expect("expected authoritative X11 client rectangle"),
+    );
+}
+
+#[test]
+fn xwayland_restore_tracks_authoritative_geometry_changes_while_pending() {
+    let mut fixture = stationary_pointer_xwayland_fixture();
+    let initial_geometry = X11Geometry {
+        x: 137,
+        y: 91,
+        width: 800,
+        height: 600,
+    };
+    let (window_id, handle, replacement_source_content) =
+        prepare_pending_xwayland_restore(&mut fixture, initial_geometry);
+    let current_geometry = X11Geometry {
+        x: 177,
+        y: 122,
+        width: 1024,
+        height: 768,
+    };
+    assert!(
+        fixture
+            .server
+            .state
+            .set_x11_geometry(handle, current_geometry)
+    );
+    fixture
+        .server
+        .set_lifecycle_animation_renderer_available(true);
+
+    commit_replacement_xwayland_content(&mut fixture, &replacement_source_content, 800, 600, 0, 0);
+
+    assert!(
+        fixture
+            .server
+            .state
+            .window(window_id)
+            .is_some_and(|window| window.state.is_minimized())
+    );
+    assert!(
+        fixture
+            .server
+            .state
+            .pending_xwayland_restores
+            .contains_key(&window_id)
+    );
+    assert!(fixture.server.renderable_surfaces().is_empty());
+
+    commit_replacement_xwayland_content(&mut fixture, &replacement_source_content, 1024, 768, 0, 0);
+
+    assert!(
+        fixture
+            .server
+            .state
+            .window(window_id)
+            .is_some_and(|window| !window.state.is_minimized())
+    );
+    assert!(
+        !fixture
+            .server
+            .state
+            .pending_xwayland_restores
+            .contains_key(&window_id)
+    );
+    assert_xwayland_restore_lifecycle_rect(
+        &fixture,
+        window_id,
+        crate::compositor::PresentationRect::new(177.0, 122.0, 1024.0, 768.0)
+            .expect("latest authoritative X11 client rectangle"),
+    );
+}
+
+#[test]
+fn xwayland_restore_rejects_replacement_content_offset_from_authoritative_position() {
+    let mut fixture = stationary_pointer_xwayland_fixture();
+    let geometry = X11Geometry {
+        x: 137,
+        y: 91,
+        width: 800,
+        height: 600,
+    };
+    let (window_id, _, replacement_source_content) =
+        prepare_pending_xwayland_restore(&mut fixture, geometry);
+    fixture
+        .server
+        .set_lifecycle_animation_renderer_available(true);
+
+    commit_replacement_xwayland_content(
+        &mut fixture,
+        &replacement_source_content,
+        800,
+        600,
+        17,
+        -11,
+    );
+
+    assert!(
+        fixture
+            .server
+            .state
+            .window(window_id)
+            .is_some_and(|window| window.state.is_minimized())
+    );
+    assert!(
+        fixture
+            .server
+            .state
+            .pending_xwayland_restores
+            .contains_key(&window_id)
+    );
+    assert!(fixture.server.renderable_surfaces().is_empty());
+
+    commit_replacement_xwayland_content(&mut fixture, &replacement_source_content, 800, 600, 0, 0);
+
+    assert!(
+        fixture
+            .server
+            .state
+            .window(window_id)
+            .is_some_and(|window| !window.state.is_minimized())
+    );
+    assert_xwayland_restore_lifecycle_rect(
+        &fixture,
+        window_id,
+        crate::compositor::PresentationRect::new(137.0, 91.0, 800.0, 600.0)
+            .expect("authoritative X11 client rectangle"),
     );
 }
 
@@ -2113,6 +2474,7 @@ fn replacement_surface_commit_stays_hidden_while_x11_window_is_minimized() {
         .get(&fixture.surface_id)
         .cloned()
         .expect("replacement commit buffer");
+    let pending = replacement_xwayland_content(&pending, 800, 600, 0, 0);
     fixture.server.state.commit_xwayland_surface_buffer(
         replacement_surface_id,
         pending,
@@ -2170,6 +2532,7 @@ fn restore_adopts_active_xwayland_surface_after_old_surface_is_retired() {
         .get(&fixture.surface_id)
         .cloned()
         .expect("replacement commit buffer");
+    let pending = replacement_xwayland_content(&pending, 800, 600, 0, 0);
     fixture.server.state.commit_xwayland_surface_buffer(
         replacement_surface_id,
         pending,
