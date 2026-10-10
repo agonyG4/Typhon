@@ -1,5 +1,6 @@
 use super::{
-    FrozenNativeRenderFrame, OwnedClientCursorRenderState, project_egl_scene_draw_request,
+    FrozenNativeRenderFrame, FrozenRenderSnapshotIdentity, OwnedClientCursorRenderState,
+    project_egl_scene_draw_request,
 };
 use crate::egl_renderer::OutputDamage;
 use crate::native_output::runtime::frame::{
@@ -255,6 +256,73 @@ fn owned_client_cursor_keeps_the_frozen_commit_and_placement() {
     assert_eq!((projected.hotspot_x, projected.hotspot_y), (3, 5));
     assert_ne!(projected.surface.buffer_id(), c1.buffer_id());
     assert_eq!(c1.buffer_id(), c2_buffer_id);
+}
+
+fn frozen_client_cursor_identity_for_placement(
+    server: &OwnCompositorServer,
+    surface: &RenderableSurface,
+    logical_x: i32,
+    logical_y: i32,
+    hotspot_x: i32,
+    hotspot_y: i32,
+) -> FrozenRenderSnapshotIdentity {
+    let state = ClientCursorRenderState {
+        surface,
+        scene_node_id: oblivion_one::core::SceneNodeId::from_raw(729)
+            .expect("client cursor scene node"),
+        logical_x,
+        logical_y,
+        hotspot_x,
+        hotspot_y,
+    };
+    let scene = ResolvedNativeFrameScene::from_server_at(server, AnimationTime::from_nanos(12))
+        .into_owned();
+    FrozenNativeRenderFrame::from_snapshot_parts(
+        1280,
+        800,
+        scene,
+        DesktopVisualState::wallpaper_only(),
+        Some(OwnedClientCursorRenderState::from_render_state(state)),
+        Vec::new(),
+        None,
+    )
+    .identity
+}
+
+#[test]
+fn frozen_identity_distinguishes_client_cursor_position() {
+    let socket_name = format!("typhon-frozen-cursor-position-{}", process::id());
+    let server = OwnCompositorServer::bind_cpu_composition(&socket_name)
+        .expect("bind compositor for frozen cursor position identity regression");
+    let surface = test_surface(729, 32, 32, SurfacePlacement::root_at(0, 0));
+
+    let position_a = frozen_client_cursor_identity_for_placement(&server, &surface, 10, 20, 3, 5);
+    let position_b = frozen_client_cursor_identity_for_placement(&server, &surface, 11, 20, 3, 5);
+
+    assert_eq!(
+        position_a.client_cursor.unwrap().buffer_id,
+        position_b.client_cursor.unwrap().buffer_id,
+        "both frames refer to the same committed cursor content"
+    );
+    assert_ne!(position_a, position_b);
+}
+
+#[test]
+fn frozen_identity_distinguishes_client_cursor_hotspot() {
+    let socket_name = format!("typhon-frozen-cursor-hotspot-{}", process::id());
+    let server = OwnCompositorServer::bind_cpu_composition(&socket_name)
+        .expect("bind compositor for frozen cursor hotspot identity regression");
+    let surface = test_surface(729, 32, 32, SurfacePlacement::root_at(0, 0));
+
+    let hotspot_a = frozen_client_cursor_identity_for_placement(&server, &surface, 10, 20, 3, 5);
+    let hotspot_b = frozen_client_cursor_identity_for_placement(&server, &surface, 10, 20, 4, 5);
+
+    assert_eq!(
+        hotspot_a.client_cursor.unwrap().buffer_id,
+        hotspot_b.client_cursor.unwrap().buffer_id,
+        "both frames refer to the same committed cursor content"
+    );
+    assert_ne!(hotspot_a, hotspot_b);
 }
 
 #[test]

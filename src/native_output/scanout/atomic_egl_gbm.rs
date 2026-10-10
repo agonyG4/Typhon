@@ -411,10 +411,7 @@ impl AtomicEglGbmScanout {
                 .rebind_pool_generation(generation)
                 .expect("recovery retires all non-current explicit output ownership");
         }
-        pool.pool_generation = generation;
-        for slot in &mut pool.slots {
-            slot.pool_generation = generation;
-        }
+        pool.rebind_pool_generation(generation);
         self.direct
             .framebuffer_cache
             .clear_for_generation(generation);
@@ -724,42 +721,50 @@ impl AtomicEglGbmScanout {
                     let descriptor = explicit_framebuffer_descriptor(&bo)?;
                     let framebuffer = add_explicit_framebuffer(drm, &descriptor)?;
                     let id = OutputSlotId::new(u8::try_from(raw_id).unwrap()).unwrap();
-                    AtomicOutputSlot::import(
-                        id,
-                        pool_generation,
-                        bo,
-                        framebuffer,
-                        &egl,
-                        egl_display,
-                        &gl,
-                        image_target,
-                    )
-                    .inspect_err(|_| {
-                        let _ = drm_ffi::mode::rm_fb(drm, framebuffer.get());
-                    })
+                    let physical =
+                        AtomicOutputSlotBacking::new(id, pool_generation, bo, framebuffer);
+                    let render_import = physical.render_descriptor().and_then(|descriptor| {
+                        AtomicRenderSlot::import(descriptor, &egl, egl_display, &gl, image_target)
+                    });
+                    let render =
+                        remove_framebuffer_after_render_import_failure(render_import, || {
+                            let _ = drm_ffi::mode::rm_fb(drm, framebuffer.get());
+                        })?;
+                    Ok(AtomicOutputSlotPair { physical, render })
                 })();
                 match slot {
                     Ok(slot) => slots.push(slot),
                     Err(error) => {
-                        teardown_atomic_slots(&slots, &gl, &egl, egl_display, drm);
+                        teardown_atomic_slot_pairs(&slots, &gl, &egl, egl_display, drm);
+                        drop(slots);
                         return Err(error);
                     }
                 }
             }
-            if let Err(error) = AtomicOutputPool::validate_slots(&slots, pool_generation) {
-                teardown_atomic_slots(&slots, &gl, &egl, egl_display, drm);
+            if let Err(error) = AtomicOutputPool::validate_pairs(&slots, pool_generation) {
+                teardown_atomic_slot_pairs(&slots, &gl, &egl, egl_display, drm);
+                drop(slots);
                 return Err(error);
             }
-            let slots: [AtomicOutputSlot; EXPLICIT_OUTPUT_SLOT_CAPACITY] = match slots.try_into() {
-                Ok(slots) => slots,
-                Err(slots) => {
-                    teardown_atomic_slots(&slots, &gl, &egl, egl_display, drm);
-                    return Err(io::Error::other(
-                        "explicit output pool did not construct 3 slots",
-                    ));
-                }
-            };
-            let pool = AtomicOutputPool::from_validated_slots(slots, pool_generation);
+            let slots: [AtomicOutputSlotPair; EXPLICIT_OUTPUT_SLOT_CAPACITY] =
+                match slots.try_into() {
+                    Ok(slots) => slots,
+                    Err(slots) => {
+                        teardown_atomic_slot_pairs(&slots, &gl, &egl, egl_display, drm);
+                        drop(slots);
+                        return Err(io::Error::other(
+                            "explicit output pool did not construct 3 slots",
+                        ));
+                    }
+                };
+            let [slot0, slot1, slot2] = slots;
+            let physical_slots = [slot0.physical, slot1.physical, slot2.physical];
+            let render_slots = [slot0.render, slot1.render, slot2.render];
+            let pool = AtomicOutputPool::from_validated_slots(
+                physical_slots,
+                render_slots,
+                pool_generation,
+            );
             priority_report.log_startup("atomic-egl-gbm");
             Ok((
                 egl_context,
@@ -880,7 +885,7 @@ impl AtomicEglGbmScanout {
     }
 
     pub(crate) fn framebuffer(&self, slot: OutputSlotId) -> io::Result<FramebufferId> {
-        Ok(self.slot(slot)?.framebuffer)
+        Ok(self.physical_slot(slot)?.framebuffer)
     }
 
     /// Abandon an unpresented render after the caller has proven completion of
@@ -892,14 +897,15 @@ impl AtomicEglGbmScanout {
                 "completed unpresented output slot does not match active rendering ownership",
             ));
         }
-        self.slot_mut(slot)?.invalidate_after_unpresented_render();
+        self.physical_slot_mut(slot)?
+            .invalidate_after_unpresented_render();
         self.swapchain_mut()?.complete_unpresented_render(slot)
     }
 
     pub(crate) fn plane_count(&self) -> io::Result<u32> {
         self.pool
             .as_ref()
-            .map(|pool| pool.slots[0].bo.plane_count())
+            .map(|pool| pool.physical_slots[0].bo.plane_count())
             .ok_or_else(|| io::Error::other("explicit output pool is unavailable"))
     }
 
@@ -924,15 +930,23 @@ impl AtomicEglGbmScanout {
         context_activation.map_err(native_egl_io_error)?;
 
         let target_preparation_started = phase_durations.as_ref().map(|_| Instant::now());
-        let (framebuffer, buffer_age) = {
-            let slot = self.slot(slot)?;
+        let (render_target, framebuffer, sampleable_texture) = {
+            let pool = self
+                .pool
+                .as_ref()
+                .ok_or_else(|| io::Error::other("explicit output pool is unavailable"))?;
             let presentation_serial = self
                 .swapchain
                 .as_ref()
                 .map_or(0, AtomicOutputSwapchain::presentation_serial);
-            (slot.gl_framebuffer, slot.buffer_age(presentation_serial))
+            let render_target = pool.render_target_request(slot, presentation_serial)?;
+            let render_slot = pool.render_slot_for_request(render_target)?;
+            (
+                render_target,
+                render_slot.gl_framebuffer,
+                render_slot.texture,
+            )
         };
-        let sampleable_texture = self.slot(slot)?.texture;
         let request = frozen_frame
             .draw_request(Some(frame_id))
             .ok_or_else(|| io::Error::other("frozen render frame request already consumed"))?;
@@ -954,7 +968,7 @@ impl AtomicEglGbmScanout {
                 sampleable_texture: Some(sampleable_texture),
                 width: self.width,
                 height: self.height,
-                buffer_age,
+                buffer_age: render_target.buffer_age,
                 framebuffer_origin: OutputFramebufferOrigin::TopLeftScanout,
             },
             request,
@@ -1882,7 +1896,8 @@ impl AtomicEglGbmScanout {
                 self.scene
                     .commit_presented(scene_commit, presented_transition_damage);
                 if let Some(pool) = self.pool.as_mut() {
-                    pool.slots[usize::from(completed.new_current.get())]
+                    pool.physical_slot_mut(completed.new_current)
+                        .expect("validated pageflip slot remains in physical pool")
                         .record_presentation(completed.presentation_serial);
                 }
             },
@@ -2019,7 +2034,7 @@ impl AtomicEglGbmScanout {
             OutputSlotId::new(1).unwrap(),
             OutputSlotId::new(2).unwrap(),
         ])?;
-        let framebuffer_id = pool.slots[usize::from(slot.get())].framebuffer;
+        let framebuffer_id = pool.physical_slot(slot)?.framebuffer;
         let mut swapchain = AtomicOutputSwapchain::from_presented_slots_for_output(
             self.direct.output_id,
             slots,
@@ -2028,7 +2043,7 @@ impl AtomicEglGbmScanout {
         )?;
         swapchain.set_current_framebuffer_id(framebuffer_id);
         self.swapchain = Some(swapchain);
-        pool.slots[usize::from(slot.get())].record_presentation(0);
+        pool.physical_slot_mut(slot)?.record_presentation(0);
         self.scene
             .commit_presented(scene_commit, OutputDamage::Full);
         self.direct.inhibit_until_composited_present = false;
@@ -2126,26 +2141,23 @@ impl AtomicEglGbmScanout {
         self.direct.disarm_drm_cleanup();
     }
 
-    fn slot(&self, slot: OutputSlotId) -> io::Result<&AtomicOutputSlot> {
+    fn physical_slot(&self, slot: OutputSlotId) -> io::Result<&AtomicOutputSlotBacking> {
         let pool = self
             .pool
             .as_ref()
             .ok_or_else(|| io::Error::other("explicit output pool is unavailable"))?;
-        pool.slots
-            .get(usize::from(slot.get()))
-            .filter(|candidate| candidate.id == slot)
-            .ok_or_else(|| io::Error::other("explicit output slot is unavailable"))
+        pool.physical_slot(slot)
     }
 
-    fn slot_mut(&mut self, slot: OutputSlotId) -> io::Result<&mut AtomicOutputSlot> {
+    fn physical_slot_mut(
+        &mut self,
+        slot: OutputSlotId,
+    ) -> io::Result<&mut AtomicOutputSlotBacking> {
         let pool = self
             .pool
             .as_mut()
             .ok_or_else(|| io::Error::other("explicit output pool is unavailable"))?;
-        pool.slots
-            .get_mut(usize::from(slot.get()))
-            .filter(|candidate| candidate.id == slot)
-            .ok_or_else(|| io::Error::other("explicit output slot is unavailable"))
+        pool.physical_slot_mut(slot)
     }
 }
 
@@ -2324,16 +2336,14 @@ impl Drop for AtomicEglGbmScanout {
             if self.drm_cleanup_armed {
                 pool.teardown(&self.gl, &self.egl, self.egl_display, drm);
             } else {
-                // GL/EGL resources must still be deleted; revoked DRM skips rm_fb.
-                unsafe {
-                    for slot in &pool.slots {
-                        self.gl.delete_framebuffer(slot.gl_framebuffer);
-                        self.gl.delete_texture(slot.texture);
-                    }
-                }
-                for slot in &pool.slots {
-                    let _ = self.egl.destroy_image(self.egl_display, slot.egl_image);
-                }
+                // Render-side resources must still be destroyed with this
+                // context current; revoked DRM skips physical rm_fb calls.
+                teardown_atomic_render_slots(
+                    &pool.render_slots,
+                    &self.gl,
+                    &self.egl,
+                    self.egl_display,
+                );
                 drop(pool);
             }
         }

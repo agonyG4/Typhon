@@ -2045,6 +2045,10 @@ pub(crate) struct FrozenClientCursorIdentity {
     pub(crate) generation: u64,
     pub(crate) commit_sequence: u64,
     pub(crate) buffer_id: u64,
+    pub(crate) logical_x: i32,
+    pub(crate) logical_y: i32,
+    pub(crate) hotspot_x: i32,
+    pub(crate) hotspot_y: i32,
 }
 
 /// An owned client cursor commit. Cloning its `RenderableSurface` retains the
@@ -2090,6 +2094,10 @@ impl OwnedClientCursorRenderState {
             generation: self.surface.generation,
             commit_sequence: self.surface.commit_sequence.0,
             buffer_id: self.surface.buffer_id().get(),
+            logical_x: self.logical_x,
+            logical_y: self.logical_y,
+            hotspot_x: self.hotspot_x,
+            hotspot_y: self.hotspot_y,
         }
     }
 }

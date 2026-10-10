@@ -204,7 +204,8 @@ impl Drop for DropOrderProbe {
 #[test]
 fn output_slot_two_construction_failure_tears_down_resources_in_safe_order() {
     let log = Rc::new(RefCell::new(Vec::new()));
-    let slots = vec![
+    let render_slots = [0_u8, 1];
+    let physical_slots = vec![
         DropOrderProbe {
             id: 0,
             log: Rc::clone(&log),
@@ -215,13 +216,14 @@ fn output_slot_two_construction_failure_tears_down_resources_in_safe_order() {
         },
     ];
 
-    teardown_slot_resources(
-        &slots,
-        |slot| log.borrow_mut().push(format!("gl{}", slot.id)),
-        |slot| log.borrow_mut().push(format!("image{}", slot.id)),
+    teardown_split_slot_resources(
+        &render_slots,
+        &physical_slots,
+        |slot| log.borrow_mut().push(format!("gl{slot}")),
+        |slot| log.borrow_mut().push(format!("image{slot}")),
         |slot| log.borrow_mut().push(format!("fb{}", slot.id)),
     );
-    drop(slots);
+    drop(physical_slots);
 
     assert_eq!(
         *log.borrow(),

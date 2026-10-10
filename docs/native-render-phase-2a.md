@@ -169,6 +169,70 @@ revision barriers are designed and verified, complete control lane boundedness
 remains a Phase 2B design blocker. No unbounded channel or reactor wait is
 acceptable.
 
+## Phase 2B.0 Atomic slot ownership split
+
+The explicit Atomic composited output pool now represents its two future
+ownership domains separately while construction, rendering, presentation, and
+teardown remain synchronous:
+
+```text
+RT reactor / DRM domain:
+    AtomicOutputSlotBacking[]
+    GBM BO lifetime and DRM framebuffer IDs
+    swapchain and OutputTransactionLedger
+    presentation/content-validity history
+    buffer-age calculation and KMS scheduling
+
+render-worker / EGL / GL domain:
+    AtomicRenderSlot[]
+    EGLImage, GL texture, and GL framebuffer
+    EGL/GL context, GlesSceneRenderer, RendererResourceState, EffectRuntime
+```
+
+Pool setup exports one owned `AtomicRenderSlotDescriptor` per BO. Its
+`DmabufBufferHandle` retains the exported plane descriptors through the
+existing `DmabufPlane` / `Arc<OwnedFd>` ownership. EGL import happens when the
+pool is created or replaced; normal frame rendering performs no DMA-BUF FD
+export. The descriptor is compile-time qualified as `Send`. The render slot
+does not retain a GBM BO, DRM framebuffer authority, or presentation history.
+
+Each render target request contains the exact slot ID, pool generation, and
+buffer age. The reactor calculates that age from the matching physical
+backing's content-validity state, including after an unpresented render or a
+confirmed presentation. `render_to_slot` resolves the render resource by the
+same ID and generation before drawing. Pool validation checks identity pairing
+across both slot arrays; array position is not pairing authority.
+
+Initial Atomic bootstrap and output-configuration replacement both use
+`AtomicEglGbmScanout::create_unattached_pool`, so they share the split model.
+Session recovery preserves the current synchronous reuse/rebind behavior and
+updates the generation metadata in both halves together after swapchain
+ownership is rebound. A future worker implementation must deliver that
+generation transition to the worker as an ordered pool-control operation or
+recreate the pool. Direct scanout remains reactor/scanout-owned and does not
+use these composited render slots.
+
+Current teardown makes the EGL context current and finishes pending GL work,
+then destroys every render slot's GL framebuffer, texture, and EGLImage before
+removing any physical DRM framebuffer and dropping the GBM BOs. Revoked DRM
+teardown still destroys all EGL/GL resources first and skips only `rm_fb`.
+Phase 2B must turn this synchronous order into an acknowledgement boundary:
+
+```text
+worker proves AtomicRenderSlot generation G destroyed
+        ↓
+reactor may remove DRM framebuffer generation G
+        ↓
+reactor may drop GBM BO generation G
+```
+
+That acknowledgement must be nonblocking for the RT reactor during normal
+operation. Slot identity, pool generation, and calculated buffer age form the
+physical-to-render boundary for each future job; transaction and output
+generation authority stays in its future `RenderJob` envelope. This split does
+not change current rendering, fence creation, buffer-age policy, swapchain
+ownership, or protocol settlement.
+
 Every future `RenderJob` envelope must pair the frozen renderer input identity
 with the physical output transaction it serves. Use source-grounded equivalents
 of `frame_id`, `transaction_id`, `output_generation`, `pool_generation`, slot
