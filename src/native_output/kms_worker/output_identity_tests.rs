@@ -2,8 +2,8 @@ use super::tests::{reserve_for_test, test_job, wait_for_fence_event};
 use super::thread::{KmsCommitExecutor, KmsWorkerSubmission, KmsWorkerSubmitFailure};
 use super::{
     CursorSidecar, CursorSidecarCoupling, EstablishedKmsBase, KmsBundleOwners,
-    KmsCommitBundleIdentity, KmsCommitJob, KmsCommitWorkerHandle, KmsTestOnlyPolicy,
-    KmsValidationBase, KmsWorkerEvent, PendingBundleSnapshot,
+    KmsCommitBundleIdentity, KmsCommitJob, KmsCommitPayloadError, KmsCommitWorkerHandle,
+    KmsTestOnlyPolicy, KmsValidationBase, KmsWorkerEvent, PendingBundleSnapshot,
 };
 use crate::native_output::presentation::plane::{
     CursorRevision, CursorSidecarId, PresentedCursorDelivery,
@@ -117,6 +117,24 @@ fn test_job_with_cursor_owner(token: u64) -> KmsCommitJob {
     )
     .unwrap();
     job
+}
+
+#[test]
+fn enqueue_rejects_owner_with_a_different_exact_reservation() {
+    let mut job = test_job_with_cursor_owner(20_010);
+    let different_target = test_job(20_011)
+        .fixed_target()
+        .expect("test job has a fixed target");
+    job.reservation =
+        crate::native_output::presentation::transaction::FramePresentationReservation::Fixed(
+            different_target,
+        );
+
+    super::tests::assert_invalid_enqueue_releases_capacity(
+        job,
+        KmsCommitPayloadError::OwnerTargetMismatch,
+        test_job(20_012),
+    );
 }
 
 #[test]

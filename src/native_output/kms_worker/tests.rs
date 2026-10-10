@@ -682,6 +682,159 @@ fn test_pending_sidecar(job: &KmsCommitJob, id: u64) -> CursorSidecar {
     }
 }
 
+#[test]
+fn enqueue_rejects_deferred_o1_without_producer_validation() {
+    let mut job = test_job(78_001);
+    job.reservation =
+        crate::native_output::presentation::transaction::test_deferred_o1_reservation();
+    let valid_job = test_job(78_002);
+
+    assert_invalid_enqueue_releases_capacity(
+        job,
+        KmsCommitPayloadError::DeferredO1Reservation,
+        valid_job,
+    );
+}
+
+#[test]
+fn enqueue_rejects_variable_reservation_with_fixed_timing() {
+    use crate::native_output::presentation::transaction::{
+        FramePresentationReservation, VariablePresentationReservation,
+    };
+    use oblivion_one::native::buffering::{PresentationOpportunity, PresentationOpportunityId};
+    use oblivion_one::native::presentation_timing::PresentationTiming;
+
+    let mut job = test_job(78_003);
+    let opportunity = PresentationOpportunity::new(
+        PresentationOpportunityId::new(1, 78_003),
+        PresentationTiming::VrrWindow {
+            anchor: MonotonicTimestampNs::new(10),
+            earliest_present: MonotonicTimestampNs::new(20),
+            presentation_not_before: None,
+            preferred_present: MonotonicTimestampNs::new(30),
+            service_deadline: None,
+            shortest_interval: Duration::from_millis(6),
+            longest_interval: Some(Duration::from_millis(20)),
+        },
+    );
+    job.reservation = FramePresentationReservation::Variable(
+        VariablePresentationReservation::try_new(
+            opportunity,
+            PresentationTargetReason::CommitTiming,
+        )
+        .expect("VRR opportunity creates variable reservation"),
+    );
+
+    assert_invalid_enqueue_releases_capacity(
+        job,
+        KmsCommitPayloadError::PresentationTimingMismatch,
+        test_job(78_004),
+    );
+}
+
+#[test]
+fn enqueue_rejects_fixed_reservation_with_variable_timing() {
+    let mut job = test_job(78_006);
+    job.presentation_timing =
+        crate::native_output::presentation::kms_timing::KmsPresentationTiming::variable(20);
+
+    assert_invalid_enqueue_releases_capacity(
+        job,
+        KmsCommitPayloadError::PresentationTimingMismatch,
+        test_job(78_007),
+    );
+}
+
+#[test]
+fn enqueue_preserves_valid_fixed_job_unchanged() {
+    let executor = Arc::new(ScriptedExecutor {
+        outcomes: Mutex::new(VecDeque::new()),
+        submitted: Mutex::new(Vec::new()),
+    });
+    let handle = KmsCommitWorkerHandle::start(executor.clone()).unwrap();
+    let job = test_job(78_005);
+    let token = job.token;
+    let transaction_id = job.transaction_id;
+    let reservation = job.reservation;
+    let presentation_timing = job.presentation_timing;
+
+    reserve_for_test(&handle, job.kind).enqueue(job).unwrap();
+    let events = wait_for_fence_event(
+        &handle,
+        token.get(),
+        |event| matches!(event, KmsWorkerEvent::Submitted { ownership } if ownership.job.token == token),
+    );
+    let submitted = events
+        .iter()
+        .find_map(|event| match event {
+            KmsWorkerEvent::Submitted { ownership } => Some(&ownership.job),
+            _ => None,
+        })
+        .expect("worker submitted the fixed job");
+    assert_eq!(submitted.reservation, reservation);
+    assert_eq!(submitted.presentation_timing, presentation_timing);
+    assert_eq!(
+        executor.submitted.lock().unwrap().as_slice(),
+        &[token.get()]
+    );
+
+    handle.ack_pageflip(token, transaction_id, 1).unwrap();
+    handle.request_quiesce();
+    handle.join().unwrap();
+}
+
+pub(super) fn assert_invalid_enqueue_releases_capacity(
+    invalid_job: KmsCommitJob,
+    expected: KmsCommitPayloadError,
+    valid_job: KmsCommitJob,
+) {
+    let executor = Arc::new(ScriptedExecutor {
+        outcomes: Mutex::new(VecDeque::new()),
+        submitted: Mutex::new(Vec::new()),
+    });
+    let handle = KmsCommitWorkerHandle::start(executor.clone()).unwrap();
+    let invalid_token = invalid_job.token;
+    let invalid_identity = invalid_job.identity();
+    let invalid_reservation = invalid_job.reservation;
+    let invalid_timing = invalid_job.presentation_timing;
+    let jobs_enqueued_before = handle.metrics_snapshot().jobs_enqueued;
+
+    let error = reserve_for_test(&handle, invalid_job.kind)
+        .enqueue(invalid_job)
+        .expect_err("malformed executable payloads must fail synchronously");
+
+    assert_eq!(
+        error.failure,
+        super::KmsCommitEnqueueFailure::InvalidPayload(expected)
+    );
+    assert_eq!(error.job.token, invalid_token);
+    assert_eq!(error.job.identity(), invalid_identity);
+    assert_eq!(error.job.reservation, invalid_reservation);
+    assert_eq!(error.job.presentation_timing, invalid_timing);
+    assert_eq!(handle.queue_depth(), 0);
+    assert_eq!(
+        handle.metrics_snapshot().jobs_enqueued,
+        jobs_enqueued_before
+    );
+    assert!(handle.admission_available());
+
+    let valid_token = valid_job.token;
+    let valid_transaction_id = valid_job.transaction_id;
+    reserve_for_test(&handle, valid_job.kind)
+        .enqueue(valid_job)
+        .expect("the rejected permit released capacity for valid work");
+    wait_for_inflight(&handle);
+    assert_eq!(
+        executor.submitted.lock().unwrap().as_slice(),
+        &[valid_token.get()]
+    );
+    handle
+        .ack_pageflip(valid_token, valid_transaction_id, 1)
+        .unwrap();
+    handle.request_quiesce();
+    handle.join().unwrap();
+}
+
 fn offer_pending_sidecar(handle: &KmsCommitWorkerHandle, mut sidecar: CursorSidecar) {
     for _ in 0..10_000 {
         match handle.offer_cursor_sidecar(sidecar) {

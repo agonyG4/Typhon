@@ -354,34 +354,12 @@ impl KmsCommitJob {
         Ok(())
     }
 
-    pub(crate) fn validate_submitted_against(
-        &self,
-        transaction: &OutputTransaction,
-    ) -> Result<(), KmsCommitPayloadError> {
-        self.validate_against_mode(transaction, true)
-    }
-
-    fn validate_against_mode(
-        &self,
-        transaction: &OutputTransaction,
-        submitted: bool,
-    ) -> Result<(), KmsCommitPayloadError> {
+    pub(crate) fn validate_executable_contract(&self) -> Result<(), KmsCommitPayloadError> {
         self.validate_pacing_ownership()?;
-        if self.output_id != transaction.output_id() {
-            return Err(KmsCommitPayloadError::OutputMismatch);
-        }
-        if self.transaction_id != transaction.id()
-            || kind_transaction_id(self.kind) != self.transaction_id
-        {
+        if kind_transaction_id(self.kind) != self.transaction_id {
             return Err(KmsCommitPayloadError::TransactionIdentityMismatch);
         }
-        if self.output_generation != transaction.output_generation() {
-            return Err(KmsCommitPayloadError::GenerationMismatch);
-        }
         self.validate_presentation_timing_domain()?;
-        if self.reservation != transaction.reservation() {
-            return Err(KmsCommitPayloadError::TargetMismatch);
-        }
         match self.validation_base {
             KmsValidationBase::Presented {
                 output_id,
@@ -437,6 +415,34 @@ impl KmsCommitJob {
             if expected_legacy_owner != Some(self.transaction_id) {
                 return Err(KmsCommitPayloadError::OwnerIdentityMismatch);
             }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_submitted_against(
+        &self,
+        transaction: &OutputTransaction,
+    ) -> Result<(), KmsCommitPayloadError> {
+        self.validate_against_mode(transaction, true)
+    }
+
+    fn validate_against_mode(
+        &self,
+        transaction: &OutputTransaction,
+        submitted: bool,
+    ) -> Result<(), KmsCommitPayloadError> {
+        self.validate_executable_contract()?;
+        if self.output_id != transaction.output_id() {
+            return Err(KmsCommitPayloadError::OutputMismatch);
+        }
+        if self.transaction_id != transaction.id() {
+            return Err(KmsCommitPayloadError::TransactionIdentityMismatch);
+        }
+        if self.output_generation != transaction.output_generation() {
+            return Err(KmsCommitPayloadError::GenerationMismatch);
+        }
+        if self.reservation != transaction.reservation() {
+            return Err(KmsCommitPayloadError::TargetMismatch);
         }
 
         match (self.kind, self.direct_primary_lease.as_ref()) {

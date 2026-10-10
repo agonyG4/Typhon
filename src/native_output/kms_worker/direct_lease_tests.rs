@@ -1,8 +1,8 @@
 use super::tests::{reserve_for_test, test_job, wait_for_fence_event};
 use super::thread::{KmsCommitExecutor, KmsWorkerSubmission, KmsWorkerSubmitFailure};
 use super::{
-    KmsCommitJob, KmsCommitPayloadError, KmsCommitTestPolicy, KmsCommitWorkerHandle,
-    KmsCursorUpdate, KmsPrimaryUpdate, KmsTestOnlyPolicy, KmsValidationBase,
+    KmsCommitEnqueueFailure, KmsCommitJob, KmsCommitPayloadError, KmsCommitTestPolicy,
+    KmsCommitWorkerHandle, KmsCursorUpdate, KmsPrimaryUpdate, KmsTestOnlyPolicy, KmsValidationBase,
     KmsWorkerAdmissionError, KmsWorkerEvent,
 };
 use crate::native_output::scanout::DirectPrimaryLease;
@@ -262,6 +262,77 @@ fn test_direct_job(
     job.direct_primary_lease = lease;
     let _ = key;
     job
+}
+
+#[test]
+fn invalid_direct_enqueue_releases_candidate_reservation_and_capacity() {
+    let executor = Arc::new(DirectLeaseRecordingExecutor {
+        outcomes: Mutex::new(VecDeque::new()),
+        observations: Mutex::new(Vec::new()),
+    });
+    let handle = KmsCommitWorkerHandle::start(executor.clone()).unwrap();
+    let key = test_direct_key(5);
+    let (invalid_lease, invalid_cleanup_count) =
+        DirectPrimaryLease::test_fixture_with_probe(key, 42);
+    let mut invalid_job = test_direct_job(65, key, 42, Some(invalid_lease));
+    invalid_job.reservation =
+        crate::native_output::presentation::transaction::test_deferred_o1_reservation();
+    let invalid_reservation = invalid_job.reservation;
+    let jobs_enqueued_before = handle.metrics_snapshot().jobs_enqueued;
+
+    let error = handle
+        .try_reserve_direct_admission(key)
+        .expect("reserve the exact direct candidate")
+        .enqueue(invalid_job)
+        .expect_err("DeferredO1 cannot cross the executable queue boundary");
+
+    assert_eq!(
+        error.failure,
+        KmsCommitEnqueueFailure::InvalidPayload(KmsCommitPayloadError::DeferredO1Reservation)
+    );
+    assert_eq!(error.job.token.get(), 65);
+    assert_eq!(error.job.reservation, invalid_reservation);
+    assert_eq!(handle.queue_depth(), 0);
+    assert_eq!(
+        handle.metrics_snapshot().jobs_enqueued,
+        jobs_enqueued_before
+    );
+    assert_eq!(
+        invalid_cleanup_count.load(std::sync::atomic::Ordering::Acquire),
+        0
+    );
+
+    drop(error.job);
+    assert_eq!(
+        invalid_cleanup_count.load(std::sync::atomic::Ordering::Acquire),
+        1
+    );
+    let (valid_lease, valid_cleanup_count) = DirectPrimaryLease::test_fixture_with_probe(key, 42);
+    let valid_job = test_direct_job(66, key, 42, Some(valid_lease));
+    handle
+        .try_reserve_direct_admission(key)
+        .expect("invalid enqueue released the exact direct candidate reservation")
+        .enqueue(valid_job)
+        .expect("invalid enqueue also released queue capacity");
+
+    let events = wait_for_fence_event(
+        &handle,
+        66,
+        |event| matches!(event, KmsWorkerEvent::Submitted { ownership } if ownership.job.token.get() == 66),
+    );
+    assert_eq!(*executor.observations.lock().unwrap(), vec![(key, 42)]);
+    assert_eq!(handle.direct_content_keys().2, Some(key));
+    handle
+        .ack_pageflip(test_job(66).token, test_job(66).transaction_id, 1)
+        .unwrap();
+    drop(events);
+    assert_eq!(
+        valid_cleanup_count.load(std::sync::atomic::Ordering::Acquire),
+        1
+    );
+    assert_eq!(handle.direct_content_keys(), (None, None, None));
+    handle.request_quiesce();
+    handle.join().unwrap();
 }
 
 #[test]

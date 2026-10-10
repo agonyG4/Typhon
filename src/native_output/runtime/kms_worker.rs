@@ -394,6 +394,7 @@ pub(super) fn queue_explicit_composited_frame(
         return Err(io::Error::other(format!("invalid Atomic worker payload: {error:?}")).into());
     }
     if let Err(error) = permit.enqueue(job) {
+        let failure = error.failure;
         drop(error.job);
         if atomic_commit_arbiter.reject_worker_queued(token).is_none() {
             return Err(io::Error::other(
@@ -415,9 +416,7 @@ pub(super) fn queue_explicit_composited_frame(
                 Ok(())
             },
         )?;
-        return Err(
-            io::Error::other(format!("Atomic worker enqueue failed: {:?}", error.reason)).into(),
-        );
+        return Err(io::Error::other(format!("Atomic worker enqueue failed: {failure:?}")).into());
     }
     presentation_trace.push(PresentationTransactionEvent::WorkerQueued {
         transaction_id,
@@ -627,6 +626,7 @@ pub(super) fn queue_atomic_compatibility_frame(
         );
     }
     if let Err(error) = permit.enqueue(job) {
+        let failure = error.failure;
         drop(error.job);
         atomic_commit_arbiter.reject_worker_queued(token);
         scanout.fail_worker_compatibility_submission(token)?;
@@ -645,7 +645,7 @@ pub(super) fn queue_atomic_compatibility_frame(
         )?;
         return Err(io::Error::other(format!(
             "compatibility worker enqueue failed: {:?}",
-            error.reason
+            failure
         ))
         .into());
     }

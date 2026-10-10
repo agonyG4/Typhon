@@ -28,9 +28,9 @@ pub(crate) use queue::AttachablePrimaryPhase;
 #[cfg(test)]
 pub(crate) use queue::KmsWorkerForcedShutdownDisposition;
 pub(crate) use queue::{
-    AttachablePrimary, CursorSidecarOfferError, KmsCommitAdmissionPermit, KmsWorkerAdmissionError,
-    KmsWorkerFatalJob, KmsWorkerQueuedCancellation, PendingBundleSnapshot, WorkerInFlight,
-    WorkerMetricsSnapshot,
+    AttachablePrimary, CursorSidecarOfferError, KmsCommitAdmissionPermit, KmsCommitEnqueueFailure,
+    KmsWorkerAdmissionError, KmsWorkerFatalJob, KmsWorkerQueuedCancellation, PendingBundleSnapshot,
+    WorkerInFlight, WorkerMetricsSnapshot,
 };
 #[cfg(test)]
 pub(crate) use thread::{KmsCommitExecutor, KmsWorkerSubmission, KmsWorkerSubmitFailure};

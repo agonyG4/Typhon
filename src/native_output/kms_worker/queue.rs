@@ -1,5 +1,6 @@
 //! Bounded admission and lossless result delivery for the Atomic submit worker.
 
+use super::payload::KmsCommitPayloadError;
 use super::{
     CursorSidecar, CursorSidecarMailbox, EstablishedKmsBase, KmsCommitBundleIdentity, KmsCommitJob,
     KmsValidationBase, KmsWorkerEvent, ValidationBaseDisposition, WorkerTimingMetrics,
@@ -261,10 +262,16 @@ pub(crate) enum KmsWorkerAdmissionError {
     Fatal,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KmsCommitEnqueueFailure {
+    Admission(KmsWorkerAdmissionError),
+    InvalidPayload(KmsCommitPayloadError),
+}
+
 #[derive(Debug)]
 pub(crate) struct KmsCommitEnqueueError {
     pub(crate) job: KmsCommitJob,
-    pub(crate) reason: KmsWorkerAdmissionError,
+    pub(crate) failure: KmsCommitEnqueueFailure,
 }
 
 #[derive(Debug)]
@@ -1079,6 +1086,13 @@ pub(crate) struct KmsCommitAdmissionPermit {
 
 impl KmsCommitAdmissionPermit {
     pub(crate) fn enqueue(mut self, job: KmsCommitJob) -> Result<(), Box<KmsCommitEnqueueError>> {
+        if let Err(reason) = job.validate_executable_contract() {
+            return Err(Box::new(KmsCommitEnqueueError {
+                job,
+                failure: KmsCommitEnqueueFailure::InvalidPayload(reason),
+            }));
+        }
+
         let mut state = self
             .shared
             .state
@@ -1102,7 +1116,10 @@ impl KmsCommitAdmissionPermit {
                 KmsWorkerLifecycle::Fatal => KmsWorkerAdmissionError::Fatal,
                 KmsWorkerLifecycle::Running => KmsWorkerAdmissionError::QueueFull,
             };
-            return Err(Box::new(KmsCommitEnqueueError { job, reason }));
+            return Err(Box::new(KmsCommitEnqueueError {
+                job,
+                failure: KmsCommitEnqueueFailure::Admission(reason),
+            }));
         }
         if state.established_base.is_none()
             && let KmsValidationBase::Presented {

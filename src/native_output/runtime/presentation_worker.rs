@@ -12,9 +12,10 @@ use super::presentation_transactions::{
 };
 use super::*;
 use crate::native_output::kms_worker::{
-    KmsBundleOwners, KmsCommitAdmissionPermit, KmsCommitJob, KmsCommitTestPolicy,
-    KmsCommitWorkerHandle, KmsCursorUpdate, KmsPrimaryCursorPresentation, KmsPrimaryUpdate,
-    KmsTestOnlyPolicy, KmsValidationBase, KmsWorkerAdmissionError, PendingBundleSnapshot,
+    KmsBundleOwners, KmsCommitAdmissionPermit, KmsCommitEnqueueFailure, KmsCommitJob,
+    KmsCommitTestPolicy, KmsCommitWorkerHandle, KmsCursorUpdate, KmsPrimaryCursorPresentation,
+    KmsPrimaryUpdate, KmsTestOnlyPolicy, KmsValidationBase, KmsWorkerAdmissionError,
+    PendingBundleSnapshot,
 };
 use crate::native_output::presentation::plane::{
     CursorRevision, CursorSource, FrozenCursorTestPolicy, FrozenPrimaryCursorPresentation,
@@ -1452,17 +1453,29 @@ pub(super) fn finish_direct_worker_queued(
         .take()
         .expect("direct worker admission permit was just retained");
     if let Err(error) = admission.enqueue(job) {
+        let failure = error.failure;
         let returned_job = error.job;
-        scanout.note_direct_worker_admission_rejected(matches!(
-            error.reason,
-            KmsWorkerAdmissionError::QueueFull
-        ));
+        let invalid_payload = match failure {
+            KmsCommitEnqueueFailure::Admission(reason) => {
+                scanout.note_direct_worker_admission_rejected(matches!(
+                    reason,
+                    KmsWorkerAdmissionError::QueueFull
+                ));
+                None
+            }
+            KmsCommitEnqueueFailure::InvalidPayload(reason) => Some(reason),
+        };
         let rollback = guard.rollback(
             context.frame_pacing,
             atomic_commit_arbiter,
             output_transactions,
         );
         if let Err(reason) = rollback {
+            let reason = if let Some(payload) = invalid_payload {
+                format!("{reason}; invalid executable KMS payload: {payload:?}")
+            } else {
+                reason
+            };
             return quarantine_direct_admission_failure(
                 emergency_quarantined_worker_jobs,
                 direct_fallback_tracker,
@@ -1475,7 +1488,7 @@ pub(super) fn finish_direct_worker_queued(
                 reason,
             );
         }
-        settle_failed_direct_worker_transaction(
+        if let Err(settle_error) = settle_failed_direct_worker_transaction(
             scanout,
             server,
             output_transactions,
@@ -1483,8 +1496,22 @@ pub(super) fn finish_direct_worker_queued(
             protocol_batch_id,
             OutputTransactionFailureStage::BackendOwnershipTransfer,
             MonotonicTimestampNs::new(monotonic_now_ns()?),
-        )?;
+        ) {
+            if let Some(payload) = invalid_payload {
+                return Err(io::Error::other(format!(
+                    "invalid direct worker executable payload: {payload:?}; settlement failed: {settle_error:?}"
+                ))
+                .into());
+            }
+            return Err(settle_error);
+        }
         drop(returned_job);
+        if let Some(payload) = invalid_payload {
+            return Err(io::Error::other(format!(
+                "invalid direct worker executable payload: {payload:?}"
+            ))
+            .into());
+        }
         return Ok(DirectWorkerQueueResult::AdmissionRejected);
     }
     guard.commit();

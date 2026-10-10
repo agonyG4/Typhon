@@ -409,6 +409,7 @@ pub(super) fn queue_plane_delta(
         return Err(error.into());
     }
     if let Err(error) = permit.enqueue(job) {
+        let failure = error.failure;
         drop(error.job);
         cursor.cancel_worker_submission(transaction_id, token, cursor_epoch)?;
         atomic_commit_arbiter.reject_worker_queued(token);
@@ -424,7 +425,7 @@ pub(super) fn queue_plane_delta(
         )?;
         return Err(io::Error::other(format!(
             "cursor Atomic worker enqueue failed: {:?}",
-            error.reason
+            failure
         ))
         .into());
     }
