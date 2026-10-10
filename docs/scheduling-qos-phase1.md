@@ -19,10 +19,19 @@ preserves an RTKit FAIR grant on the reactor without letting helper work
 inherit it. The KMS thread applies its FAIR policy from its own startup.
 Managed child launches restore Typhon's startup nice value and original
 `RLIMIT_RTTIME` in the post-fork, pre-exec path and clear ambient capabilities.
-The `SIGXCPU` handler only demotes the known reactor TID, records atomic
-evidence, and returns after successful demotion. If the kernel refuses the
-demotion syscall, it exits the process rather than leave a possibly runaway
-RT reactor active.
+Normal demotion retains `SCHED_RESET_ON_FORK` when it is already set, so an
+RR reactor becomes `SCHED_OTHER | SCHED_RESET_ON_FORK`; ordinary workers that
+do not have the flag stay on bare `SCHED_OTHER`. Effective scheduling class
+and reset-on-fork state are reported independently.
+
+The QoS subsystem reserves process-level `SIGXCPU` once it installs its
+fail-safe handler. Typhon leaves that disposition installed for the process
+lifetime; with no active reactor the handler returns without action. No other
+Typhon subsystem uses `RLIMIT_CPU`, installs a `SIGXCPU` action, or owns this
+signal. The handler only demotes the known reactor TID with
+`SCHED_OTHER | SCHED_RESET_ON_FORK`, records atomic evidence, and returns after
+successful demotion. If that legal preserving syscall fails, it exits the
+process rather than leave a possibly runaway RT reactor active.
 
 Session suspend and shutdown demote the reactor before controlled KMS joins.
 Session recovery tries direct scheduling only, so the runtime thread never

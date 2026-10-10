@@ -779,7 +779,7 @@ fn normalized_spawn_creator_state(
         policy: PolicyKind::Other,
         priority: 0,
         nice: creator.nice.max(baseline_nice),
-        reset_on_fork: false,
+        reset_on_fork: creator.reset_on_fork,
     }
 }
 
@@ -975,6 +975,7 @@ static RT_BUDGET_REACTOR_TID: AtomicI32 = AtomicI32::new(0);
 static RT_BUDGET_OVERRUN: AtomicBool = AtomicBool::new(false);
 static RT_DEMOTION_COUNT: AtomicU64 = AtomicU64::new(0);
 static SIGXCPU_HANDLER_INSTALLED: AtomicBool = AtomicBool::new(false);
+const SIGXCPU_DEMOTION_POLICY: libc::c_int = libc::SCHED_OTHER | libc::SCHED_RESET_ON_FORK;
 
 struct BrokerRequest {
     tid: i32,
@@ -1072,7 +1073,7 @@ pub fn promote_current_reactor() -> Result<SchedulingDiagnosticSnapshot, Box<dyn
         Err(error) => {
             if manager.policy != SchedulingQosPolicy::Off {
                 let tid = unsafe { libc::gettid() };
-                let _ = set_scheduler_other(tid);
+                let _ = set_scheduler_other_preserving_flags(tid);
                 let _ = set_nice(tid, manager.baseline_nice);
                 if matches!(inspect_kernel_state(tid), Ok(state) if matches!(state.policy, PolicyKind::Other))
                 {
@@ -1325,11 +1326,24 @@ fn with_normalized_thread_creator<T>(
     let scheduler_changed = !matches!(prior.policy, PolicyKind::Other);
     let nice_changed = prior.nice != desired.nice;
     if scheduler_changed {
-        set_scheduler_other(tid).map_err(io::Error::other)?;
+        set_scheduler_other_preserving_flags(tid).map_err(io::Error::other)?;
     }
     if nice_changed && let Err(error) = set_nice(tid, desired.nice) {
+        let sigxcpu_demoted = can_restore_rt && ACTIVE_REACTOR_TID.load(Ordering::Acquire) != tid;
         if scheduler_changed {
-            let _ = restore_thread_scheduler(tid, prior);
+            if !sigxcpu_demoted {
+                let _ = restore_thread_scheduler(tid, prior);
+            }
+        }
+        if can_restore_rt && ACTIVE_REACTOR_TID.load(Ordering::Acquire) != tid {
+            let _ = set_scheduler_other_preserving_flags(tid);
+            let _ = set_nice(tid, manager.baseline_nice);
+            manager.restore_rt_budget_for_reactor(tid);
+            record_reactor_degradation(
+                manager,
+                tid,
+                "SIGXCPU demoted reactor during normalized helper creation",
+            );
         }
         return Err(io::Error::other(error));
     }
@@ -1358,7 +1372,7 @@ fn with_normalized_thread_creator<T>(
         }
     });
     if let Err(error) = restore_result {
-        let _ = set_scheduler_other(tid);
+        let _ = set_scheduler_other_preserving_flags(tid);
         let _ = set_nice(tid, manager.baseline_nice);
         if can_restore_rt {
             manager.restore_rt_budget_for_reactor(tid);
@@ -1374,7 +1388,7 @@ fn with_normalized_thread_creator<T>(
     // syscall. If it raced with this restoration, undo any re-promotion. If it
     // races after this check, its own syscall demotes the restored reactor.
     if can_restore_rt && ACTIVE_REACTOR_TID.load(Ordering::Acquire) != tid {
-        let _ = set_scheduler_other(tid);
+        let _ = set_scheduler_other_preserving_flags(tid);
         let _ = set_nice(tid, manager.baseline_nice);
         manager.restore_rt_budget_for_reactor(tid);
         record_reactor_degradation(
@@ -1409,6 +1423,25 @@ fn restore_thread_scheduler(tid: i32, state: KernelSchedulingState) -> Result<()
     };
     if unsafe { libc::sched_setscheduler(tid, policy, &parameter) } != 0 {
         return Err(io::Error::last_os_error());
+    }
+    let effective_policy = unsafe { libc::sched_getscheduler(tid) };
+    if effective_policy < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if effective_policy != policy {
+        return Err(io::Error::other(format!(
+            "scheduler restoration requested policy {policy:#x}, observed {effective_policy:#x}"
+        )));
+    }
+    let mut effective_parameter = libc::sched_param { sched_priority: -1 };
+    if unsafe { libc::sched_getparam(tid, &mut effective_parameter) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if effective_parameter.sched_priority != state.priority {
+        return Err(io::Error::other(format!(
+            "scheduler restoration requested priority {}, observed {}",
+            state.priority, effective_parameter.sched_priority
+        )));
     }
     Ok(())
 }
@@ -1696,7 +1729,9 @@ fn install_sigxcpu_handler() -> Result<(), String> {
     action.sa_flags = libc::SA_RESTART;
     unsafe { libc::sigemptyset(&mut action.sa_mask) };
     // SAFETY: The handler only performs lock-free atomic operations and a
-    // direct scheduler syscall. SIGXCPU is not owned by the runtime signalfd.
+    // direct scheduler syscall. SIGXCPU is reserved for this safety mechanism:
+    // its process-level disposition remains installed, and an inactive reactor
+    // makes the handler return without action. It is not owned by signalfd.
     if unsafe { libc::sigaction(libc::SIGXCPU, &action, std::ptr::null_mut()) } != 0 {
         return Err(format!(
             "cannot install SIGXCPU fail-safe: {}",
@@ -1717,18 +1752,18 @@ impl SchedulingOperations for LinuxSchedulingOperations<'_> {
     }
 
     fn request_rtkit_high_priority_fair(&mut self, tid: i32, nice: i32) -> Result<(), String> {
-        set_scheduler_other(tid)?;
+        set_scheduler_other_preserving_flags(tid)?;
         set_nice(tid, self.manager.baseline_nice)?;
         self.manager.request_rtkit_high_priority_fair(tid, nice)
     }
 
     fn request_direct_high_priority_fair(&mut self, tid: i32, nice: i32) -> Result<(), String> {
-        set_scheduler_other(tid)?;
+        set_scheduler_other_preserving_flags(tid)?;
         set_nice(tid, nice)
     }
 
     fn request_normal_fair(&mut self, tid: i32, nice: i32) -> Result<(), String> {
-        set_scheduler_other(tid)?;
+        set_scheduler_other_preserving_flags(tid)?;
         set_nice(tid, nice)
     }
 
@@ -1784,7 +1819,7 @@ impl ReactorSchedulingOperations for LinuxSchedulingOperations<'_> {
             return Err(io::Error::last_os_error().to_string());
         }
         if RT_BUDGET_OVERRUN.load(Ordering::Acquire) {
-            if set_scheduler_other(tid).is_err() {
+            if set_scheduler_other_preserving_flags(tid).is_err() {
                 unsafe { libc::_exit(128 + libc::SIGXCPU) };
             }
             return Err("RLIMIT_RTTIME overrun raced with realtime acquisition".to_owned());
@@ -1891,7 +1926,7 @@ extern "C" fn sigxcpu_demote(_signal: libc::c_int) {
         libc::syscall(
             libc::SYS_sched_setscheduler,
             tid,
-            libc::SCHED_OTHER,
+            SIGXCPU_DEMOTION_POLICY,
             &parameter,
         )
     };
@@ -1949,10 +1984,40 @@ fn set_nice(tid: i32, nice: i32) -> Result<(), String> {
     Ok(())
 }
 
-fn set_scheduler_other(tid: i32) -> Result<(), String> {
-    let parameter = libc::sched_param { sched_priority: 0 };
-    if unsafe { libc::sched_setscheduler(tid, libc::SCHED_OTHER, &parameter) } != 0 {
+fn scheduler_other_policy_for_demotion(current_policy: libc::c_int) -> libc::c_int {
+    libc::SCHED_OTHER | (current_policy & libc::SCHED_RESET_ON_FORK)
+}
+
+fn set_scheduler_other_preserving_flags(tid: i32) -> Result<(), String> {
+    // Linux includes SCHED_RESET_ON_FORK in this return value. Preserve only
+    // that known policy flag; do not propagate unknown policy bits.
+    let current_policy = unsafe { libc::sched_getscheduler(tid) };
+    if current_policy < 0 {
         return Err(io::Error::last_os_error().to_string());
+    }
+    let policy = scheduler_other_policy_for_demotion(current_policy);
+    let parameter = libc::sched_param { sched_priority: 0 };
+    if unsafe { libc::sched_setscheduler(tid, policy, &parameter) } != 0 {
+        return Err(io::Error::last_os_error().to_string());
+    }
+    let effective_policy = unsafe { libc::sched_getscheduler(tid) };
+    if effective_policy < 0 {
+        return Err(io::Error::last_os_error().to_string());
+    }
+    if effective_policy != policy {
+        return Err(format!(
+            "scheduler normalization requested policy {policy:#x}, observed {effective_policy:#x}"
+        ));
+    }
+    let mut effective_parameter = libc::sched_param { sched_priority: -1 };
+    if unsafe { libc::sched_getparam(tid, &mut effective_parameter) } != 0 {
+        return Err(io::Error::last_os_error().to_string());
+    }
+    if effective_parameter.sched_priority != 0 {
+        return Err(format!(
+            "scheduler normalization requested priority 0, observed {}",
+            effective_parameter.sched_priority
+        ));
     }
     Ok(())
 }
@@ -2039,6 +2104,7 @@ mod tests {
         sigxcpu_handler_installed: bool,
         demotions: u64,
         overrun: bool,
+        overrun_after_rr_acquisition: bool,
     }
 
     impl FakeOps {
@@ -2066,6 +2132,7 @@ mod tests {
                 sigxcpu_handler_installed: false,
                 demotions: 0,
                 overrun: false,
+                overrun_after_rr_acquisition: false,
             }
         }
 
@@ -2088,6 +2155,8 @@ mod tests {
         fn request_rtkit_high_priority_fair(&mut self, _tid: i32, nice: i32) -> Result<(), String> {
             self.fair_mutations.push(SchedulingBackend::RealtimeKit);
             self.rtkit_result.map_err(str::to_owned)?;
+            self.state.policy = PolicyKind::Other;
+            self.state.priority = 0;
             self.state.nice = self
                 .fair_effective_nice
                 .unwrap_or_else(|| self.state.nice.min(nice));
@@ -2101,6 +2170,8 @@ mod tests {
         ) -> Result<(), String> {
             self.fair_mutations.push(SchedulingBackend::Direct);
             self.direct_fair_result.map_err(str::to_owned)?;
+            self.state.policy = PolicyKind::Other;
+            self.state.priority = 0;
             self.state.nice = self
                 .fair_effective_nice
                 .unwrap_or_else(|| self.state.nice.min(nice));
@@ -2113,7 +2184,7 @@ mod tests {
                 policy: PolicyKind::Other,
                 priority: 0,
                 nice,
-                reset_on_fork: false,
+                reset_on_fork: self.state.reset_on_fork,
             };
             Ok(())
         }
@@ -2164,6 +2235,17 @@ mod tests {
                     nice: self.state.nice,
                     reset_on_fork,
                 };
+                if self.overrun_after_rr_acquisition {
+                    self.overrun = true;
+                    self.state = KernelSchedulingState {
+                        policy: PolicyKind::Other,
+                        priority: 0,
+                        nice: self.state.nice,
+                        reset_on_fork: self.state.reset_on_fork,
+                    };
+                    self.demotions += 1;
+                    return Err("RLIMIT_RTTIME overrun raced with realtime acquisition".to_owned());
+                }
             }
             Ok(())
         }
@@ -2931,6 +3013,229 @@ mod tests {
     }
 
     #[test]
+    fn scheduler_other_request_preserves_only_reset_on_fork() {
+        let unknown_flag = 0x2000_0000;
+        assert_eq!(
+            scheduler_other_policy_for_demotion(
+                libc::SCHED_RR | libc::SCHED_RESET_ON_FORK | unknown_flag,
+            ),
+            libc::SCHED_OTHER | libc::SCHED_RESET_ON_FORK
+        );
+        assert_eq!(
+            scheduler_other_policy_for_demotion(libc::SCHED_OTHER),
+            libc::SCHED_OTHER
+        );
+    }
+
+    #[test]
+    fn current_thread_can_be_normalized_without_clearing_or_inventing_flags() {
+        let tid = unsafe { libc::gettid() };
+        let current = unsafe { libc::sched_getscheduler(tid) };
+        assert!(current >= 0);
+        let expected = scheduler_other_policy_for_demotion(current);
+
+        set_scheduler_other_preserving_flags(tid).unwrap();
+
+        assert_eq!(unsafe { libc::sched_getscheduler(tid) }, expected);
+        let mut parameter = libc::sched_param { sched_priority: -1 };
+        assert_eq!(unsafe { libc::sched_getparam(tid, &mut parameter) }, 0);
+        assert_eq!(parameter.sched_priority, 0);
+    }
+
+    fn modeled_unprivileged_scheduler_change(
+        current_policy: libc::c_int,
+        requested_policy: libc::c_int,
+        priority: i32,
+        cap_sys_nice: bool,
+        rlimit_rtprio: i32,
+    ) -> Result<libc::c_int, i32> {
+        let current_reset = current_policy & libc::SCHED_RESET_ON_FORK != 0;
+        let requested_reset = requested_policy & libc::SCHED_RESET_ON_FORK != 0;
+        if current_reset && !requested_reset && !cap_sys_nice {
+            return Err(libc::EPERM);
+        }
+        let requested_class = requested_policy & !libc::SCHED_RESET_ON_FORK;
+        if requested_class == libc::SCHED_RR && !cap_sys_nice && priority > rlimit_rtprio {
+            return Err(libc::EPERM);
+        }
+        Ok(requested_policy)
+    }
+
+    #[test]
+    fn rlimit_rtprio_only_can_acquire_and_demote_rr_without_clearing_reset() {
+        let mut policy = libc::SCHED_OTHER;
+        let cap_sys_nice = false;
+        let rlimit_rtprio = 1;
+        policy = modeled_unprivileged_scheduler_change(
+            policy,
+            libc::SCHED_RR | libc::SCHED_RESET_ON_FORK,
+            REACTOR_RR_PRIORITY,
+            cap_sys_nice,
+            rlimit_rtprio,
+        )
+        .expect("RLIMIT_RTPRIO permits RR priority 1 without CAP_SYS_NICE");
+
+        policy = modeled_unprivileged_scheduler_change(
+            policy,
+            scheduler_other_policy_for_demotion(policy),
+            0,
+            cap_sys_nice,
+            rlimit_rtprio,
+        )
+        .expect("normal demotion retains reset-on-fork");
+        assert_eq!(policy, libc::SCHED_OTHER | libc::SCHED_RESET_ON_FORK);
+        assert_eq!(
+            modeled_unprivileged_scheduler_change(
+                policy,
+                libc::SCHED_OTHER,
+                0,
+                cap_sys_nice,
+                rlimit_rtprio,
+            ),
+            Err(libc::EPERM),
+            "bare SCHED_OTHER would illegally clear the established flag"
+        );
+    }
+
+    #[test]
+    fn overrun_during_rr_acquisition_uses_flag_preserving_demotion() {
+        let mut ops = FakeOps::normal(0);
+        ops.overrun_after_rr_acquisition = true;
+        let snapshot =
+            configure_reactor_policy_with_rtkit(SchedulingQosPolicy::Auto, 711, 0, false, &mut ops)
+                .expect("the overrun race degrades without terminating the process");
+
+        assert!(ops.overrun);
+        assert_eq!(ops.demotions, 1);
+        assert_eq!(ops.state.policy, PolicyKind::Other);
+        assert!(ops.state.reset_on_fork);
+        assert!(snapshot.rt_budget_overrun);
+        assert_eq!(snapshot.demotion_count, 1);
+        assert_eq!(
+            snapshot.effective_class,
+            EffectiveSchedulingClass::Fair { nice: 0 }
+        );
+        assert!(snapshot.reset_on_fork_effective);
+        let source = include_str!("scheduling_qos.rs");
+        let reactor_ops = source
+            .split_once("impl ReactorSchedulingOperations for LinuxSchedulingOperations")
+            .expect("Linux reactor operations are isolated")
+            .1
+            .split_once("\nimpl QosManager")
+            .expect("reactor scheduler implementation ends before the manager")
+            .0;
+        assert!(reactor_ops.contains("set_scheduler_other_preserving_flags(tid).is_err()"));
+    }
+
+    #[test]
+    fn reset_on_fork_remains_valid_through_suspend_and_resume() {
+        let mut ops = FakeOps::normal(0);
+        ops.state = KernelSchedulingState {
+            policy: PolicyKind::RoundRobin,
+            priority: REACTOR_RR_PRIORITY,
+            nice: 0,
+            reset_on_fork: true,
+        };
+        ops.rt_budget_active = true;
+        ops.active_reactor_tid = 712;
+        ops.budget_reactor_tid = 712;
+
+        prepare_reactor_for_session_suspend(712, 0, &mut ops)
+            .expect("suspend removes RR while retaining reset-on-fork");
+        assert_eq!(ops.state.policy, PolicyKind::Other);
+        assert!(ops.state.reset_on_fork);
+
+        let resumed = reacquire_reactor_policy_after_suspend(
+            SchedulingQosPolicy::Auto,
+            712,
+            0,
+            false,
+            None,
+            &mut ops,
+        )
+        .expect("resume reacquires verified RR");
+        assert_eq!(ops.state.policy, PolicyKind::RoundRobin);
+        assert!(ops.state.reset_on_fork);
+        assert!(resumed.reset_on_fork_effective);
+    }
+
+    #[test]
+    fn session_resume_fair_fallback_retains_reset_on_fork() {
+        let mut ops = FakeOps::normal(0);
+        ops.state = KernelSchedulingState {
+            policy: PolicyKind::RoundRobin,
+            priority: REACTOR_RR_PRIORITY,
+            nice: 0,
+            reset_on_fork: true,
+        };
+        ops.rt_budget_active = true;
+        ops.active_reactor_tid = 715;
+        ops.budget_reactor_tid = 715;
+        prepare_reactor_for_session_suspend(715, 0, &mut ops)
+            .expect("suspend retains the inherited reset-on-fork property");
+        ops.rr_result = Err("EPERM");
+        ops.direct_fair_result = Ok(());
+        ops.fair_effective_nice = Some(-8);
+
+        let resumed = reacquire_reactor_policy_after_suspend(
+            SchedulingQosPolicy::Auto,
+            715,
+            0,
+            false,
+            None,
+            &mut ops,
+        )
+        .expect("resume falls back to FAIR without clearing the flag");
+
+        assert_eq!(ops.state.policy, PolicyKind::Other);
+        assert!(ops.state.reset_on_fork);
+        assert_eq!(
+            resumed.effective_class,
+            EffectiveSchedulingClass::Fair { nice: -8 }
+        );
+        assert!(resumed.reset_on_fork_effective);
+    }
+
+    #[test]
+    fn fair_fallback_keeps_reset_on_fork_and_does_not_invent_it_for_workers() {
+        let mut reactor = FakeOps::normal(0);
+        reactor.state = KernelSchedulingState {
+            policy: PolicyKind::RoundRobin,
+            priority: REACTOR_RR_PRIORITY,
+            nice: 0,
+            reset_on_fork: true,
+        };
+        reactor.safety_result = Err("RT budget unavailable");
+        reactor.direct_fair_result = Ok(());
+        reactor.fair_effective_nice = Some(-8);
+        let fallback = configure_reactor_policy_with_rtkit(
+            SchedulingQosPolicy::Auto,
+            713,
+            0,
+            false,
+            &mut reactor,
+        )
+        .expect("failed RR safety falls back to FAIR");
+        assert_eq!(
+            fallback.effective_class,
+            EffectiveSchedulingClass::Fair { nice: -8 }
+        );
+        assert!(fallback.reset_on_fork_effective);
+
+        let mut worker = FakeOps::normal(0);
+        worker.direct_fair_result = Ok(());
+        let worker_snapshot = configure_worker_policy(
+            SchedulingThreadRole::Background,
+            SchedulingQosPolicy::Auto,
+            714,
+            0,
+            &mut worker,
+        );
+        assert!(!worker_snapshot.reset_on_fork_effective);
+        assert!(!worker.state.reset_on_fork);
+    }
+
+    #[test]
     fn realtime_demotion_and_budget_overrun_are_visible() {
         let mut ops = FakeOps::normal(0);
         ops.rr_result = Err("EPERM");
@@ -2969,8 +3274,12 @@ mod tests {
                 policy: PolicyKind::Other,
                 priority: 0,
                 nice: 0,
-                reset_on_fork: false,
+                reset_on_fork: true,
             }
+        );
+        assert_eq!(
+            scheduler_other_policy_for_demotion(libc::SCHED_RR | libc::SCHED_RESET_ON_FORK),
+            libc::SCHED_OTHER | libc::SCHED_RESET_ON_FORK
         );
         assert_eq!(
             normalized_spawn_creator_state(reniced_creator, 0),
@@ -2986,7 +3295,7 @@ mod tests {
             .find("normalized_spawn_creator_state")
             .expect("creator state is normalized");
         let normal_policy = function
-            .find("set_scheduler_other(tid)")
+            .find("set_scheduler_other_preserving_flags(tid)")
             .expect("creator policy is ordinary before spawn");
         let normal_nice = function
             .find("set_nice(tid, desired.nice)")
@@ -2994,9 +3303,14 @@ mod tests {
         let spawn = function
             .find("let spawned = spawn()")
             .expect("classified child is spawned");
+        let restore = function[spawn..]
+            .find("restore_thread_scheduler(tid, prior)")
+            .map(|offset| spawn + offset)
+            .expect("creator scheduler is restored after helper creation");
         assert!(normalize < spawn);
         assert!(normal_policy < spawn);
         assert!(normal_nice < spawn);
+        assert!(spawn < restore);
 
         let thread_start = source
             .split_once("thread::Builder::new().name(name.to_owned()).spawn(move || {")
@@ -3097,6 +3411,12 @@ mod tests {
         }
         assert!(body.contains("SYS_sched_setscheduler"));
         assert!(body.contains("claim_reactor_for_sigxcpu"));
+        assert!(body.contains("SIGXCPU_DEMOTION_POLICY"));
+        assert!(body.contains("sched_priority: 0"));
+        assert_eq!(
+            SIGXCPU_DEMOTION_POLICY,
+            libc::SCHED_OTHER | libc::SCHED_RESET_ON_FORK
+        );
         assert!(source.contains("budget_overrun.store(true, Ordering::SeqCst)"));
     }
 
