@@ -1760,7 +1760,7 @@ mod tests {
                     frame_demand: EffectFrameDemand::OnDamage,
                     visual_group: None,
                     anchor_scope: EffectAnchorScope::VisualGroup,
-                    backdrop_reuse: crate::compositor::EffectBackdropReuse::Exact,
+                    backdrop_reuse: oblivion_one::compositor::EffectBackdropReuse::Exact,
                     scene_order: EffectSceneOrder::for_anchor(anchor),
                 }
             })
@@ -2889,13 +2889,13 @@ mod tests {
         let owner_id = owner.id;
         let alias = GraphTextureBinding::precomputed_backdrop_alias(owner.clone());
         assert!(alias.is_precomputed_backdrop_alias());
-        assert!(alias.into_transient().is_none());
+        assert!(alias.clone().into_transient().is_none());
 
         cache
             .release_graph(HashMap::from([(GraphTextureId::new(9).unwrap(), alias)]))
             .unwrap();
         assert!(cache.pool.is_checked_out(owner_id));
-        assert_eq!(cache.pool.checked_out_bytes(), u64::from(16 * 12 * 4));
+        assert_eq!(cache.pool.checked_out_bytes(), 16_u64 * 12 * 4);
 
         cache.release(owner.clone()).unwrap();
         assert!(!cache.pool.is_checked_out(owner_id));

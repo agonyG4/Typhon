@@ -10,9 +10,9 @@ use std::{collections::HashMap, io, time::Instant};
 
 use glow::HasContext;
 use oblivion_one::effects::{
-    CompiledFrameGraph, CompiledRenderPass, EffectAlphaMode, EffectColorConversion,
-    EffectExecutionDemand, EffectFrameDemand, EffectInstanceId, EffectNodeKind, EffectRect,
-    EffectRegion, GraphPassId, GraphTextureId, GraphTextureSource,
+    CompiledFrameGraph, CompiledPrecomputedBackdropBuild, CompiledRenderPass, EffectAlphaMode,
+    EffectColorConversion, EffectExecutionDemand, EffectFrameDemand, EffectInstanceId,
+    EffectNodeKind, EffectRect, EffectRegion, GraphPassId, GraphTextureId, GraphTextureSource,
     INTERNAL_EFFECT_SHADER_MODULE_BLEND, INTERNAL_EFFECT_SHADER_MODULE_FRAGMENT,
     INTERNAL_EFFECT_SHADER_MODULE_MASK, MAX_EFFECT_REGION_RECTS, RenderPassKind, ShaderModuleId,
     logical_rect_to_physical_coverage,
@@ -60,7 +60,9 @@ mod session;
 #[cfg(test)]
 pub(crate) use session::checkpoint_capture_cache_candidates;
 pub(crate) use session::execute_effect_graph_for_lifecycle;
-pub(crate) use session::execute_precomputed_backdrop_graph;
+pub(crate) use session::execute_precomputed_backdrop_build;
+#[cfg(test)]
+pub(crate) use session::prepare_effect_graph_execution;
 #[cfg(test)]
 pub(crate) use session::{
     execute_effect_graph, execute_effect_graph_with_debug_config,
@@ -68,7 +70,7 @@ pub(crate) use session::{
 };
 pub(in crate::egl_renderer) use session::{
     execute_prepared_effect_graph_core, finish_prepared_effect_graph_execution,
-    prepare_effect_graph_execution, prepare_effect_graph_execution_with_external_bindings,
+    prepare_effect_graph_execution_with_external_bindings,
 };
 mod graph_runner;
 use graph_runner::*;

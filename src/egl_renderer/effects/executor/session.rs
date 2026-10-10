@@ -197,96 +197,179 @@ pub(crate) fn execute_effect_graph_for_lifecycle(
     finish_prepared_effect_graph_execution(renderer, prepared, result)
 }
 
-pub(crate) fn execute_precomputed_backdrop_graph(
+pub(crate) fn execute_precomputed_backdrop_build(
     renderer: &mut EffectExecutionContext<'_>,
-    graph: &CompiledFrameGraph,
-    shared_output: GraphTextureId,
-    baseline_framebuffer: glow::Framebuffer,
+    build: &CompiledPrecomputedBackdropBuild,
+    capture_texture: PooledEffectTexture,
+    timing_scope: Option<super::super::gpu_timing::GraphTimingScope>,
     framebuffer_origin: OutputFramebufferOrigin,
-    output_size: (u32, u32),
-) -> RendererResult<(
-    EffectExecutionStats,
-    super::super::resources::PooledEffectTexture,
-)> {
-    let bounds = EffectRect::new(0, 0, output_size.0, output_size.1)
-        .ok_or_else(|| io::Error::other("invalid precomputed backdrop output bounds"))?;
-    let full = EffectRegion::from_rect(bounds);
-    let instance = graph
-        .instances
-        .first()
-        .ok_or_else(|| io::Error::other("precomputed backdrop graph has no baseline instance"))?;
-    let demand = EffectExecutionDemand::new(
-        vec![oblivion_one::effects::EffectInstanceExecutionDemand {
-            id: instance.id,
-            presentation_output_region: full.clone(),
-            output_region: full.clone(),
-        }],
-        full,
-    );
-    let mut selection = EffectExecutionSelection::default();
-    selection.executed_instances.push(instance.id);
-    for pass in &graph.passes {
-        if !matches!(
-            pass.kind,
-            RenderPassKind::SceneCapture
-                | RenderPassKind::DualKawaseDownsample
-                | RenderPassKind::DualKawaseUpsample
-        ) {
-            continue;
+) -> RendererResult<(EffectExecutionStats, PooledEffectTexture)> {
+    let mut owned_textures = vec![capture_texture];
+    let capture_pixels =
+        u64::from(build.capture.width).saturating_mul(u64::from(build.capture.height));
+    let mut stats = EffectExecutionStats {
+        passes: 1,
+        scene_captures: 1,
+        capture_execution_pixels: capture_pixels,
+        scene_capture_execution_pixels: capture_pixels,
+        replay_capture_execution_pixels: capture_pixels,
+        replay_capture_passes: 1,
+        resource_acquisitions: 1,
+        ..EffectExecutionStats::default()
+    };
+
+    let execution_result = (|| {
+        if build.blur.passes != 2
+            || build.capture.working_space
+                != oblivion_one::effects::EffectWorkingSpace::OutputEncodedSrgb
+            || build.working_space != oblivion_one::effects::EffectWorkingSpace::LinearSrgb
+        {
+            return Err(io::Error::other(
+                "precomputed backdrop build does not match the canonical two-pass working spaces",
+            )
+            .into());
         }
-        selection.executed_passes.push(pass.id);
-        for texture_id in pass.inputs.iter().copied().chain(pass.output) {
-            if graph
-                .textures
-                .iter()
-                .find(|texture| texture.id == texture_id)
-                .is_some_and(|texture| texture.source != GraphTextureSource::Output)
-                && !selection.acquired_texture_ids.contains(&texture_id)
-            {
-                selection.acquired_texture_ids.push(texture_id);
+
+        let mut input_layout = FullscreenTextureLayout {
+            width: build.capture.width,
+            height: build.capture.height,
+            origin: oblivion_one::effects::GraphTextureOrigin::BottomLeft,
+        };
+        let mut input_is_linear = false;
+        let mut output_index = 0;
+        for (stage_index, stage) in build.stages.iter().copied().enumerate().skip(1) {
+            let (kind, width, height) = match stage {
+                oblivion_one::effects::PrecomputedBackdropBuildStage::KawaseDownsample {
+                    width,
+                    height,
+                    ..
+                } => (RenderPassKind::DualKawaseDownsample, width, height),
+                oblivion_one::effects::PrecomputedBackdropBuildStage::KawaseUpsample {
+                    width,
+                    height,
+                    ..
+                } => (RenderPassKind::DualKawaseUpsample, width, height),
+                oblivion_one::effects::PrecomputedBackdropBuildStage::SceneCaptureReplay => {
+                    return Err(io::Error::other(
+                        "precomputed backdrop build has an unexpected capture stage",
+                    )
+                    .into());
+                }
+            };
+            let input_texture = renderer
+                .runtime
+                .effect_resources
+                .texture(&owned_textures[output_index])
+                .ok_or_else(|| io::Error::other("precomputed backdrop input is not realized"))?;
+            let output = renderer.runtime.effect_resources.acquire(
+                renderer.gl,
+                EffectTextureKey::new(
+                    width,
+                    height,
+                    EffectTextureFormat::Rgba16Float,
+                    EffectTextureFilter::Linear,
+                    build.working_space,
+                ),
+            )?;
+            owned_textures.push(output);
+            output_index = owned_textures.len() - 1;
+            let output_layout = FullscreenTextureLayout {
+                width,
+                height,
+                origin: oblivion_one::effects::GraphTextureOrigin::BottomLeft,
+            };
+            let pixels = u64::from(width).saturating_mul(u64::from(height));
+            let work = PassTimingWork {
+                effect_pixels: pixels,
+                damage_rect_count: 1,
+                damage_bbox_pixels: pixels,
+                target_width: width,
+                target_height: height,
+            };
+            let span = timing_scope.and_then(|scope| {
+                renderer.begin_precomputed_build_stage(scope, stage_index, kind, work, None)
+            });
+            let shader_variant =
+                u8::from(kind == RenderPassKind::DualKawaseDownsample && input_is_linear);
+            let targets = EffectExecutionTargets::ordinary(EffectFramebufferTarget::new(
+                renderer.scene.active_output_framebuffer,
+            ));
+            let draw_result = super::execute_kawase_texture_stage(
+                renderer,
+                input_texture,
+                input_layout,
+                &owned_textures[output_index],
+                output_layout,
+                kind,
+                build.blur.radius,
+                shader_variant,
+                framebuffer_origin,
+                None,
+                targets,
+            );
+            renderer.end_precomputed_build_stage(span);
+            draw_result?;
+
+            stats.passes = stats.passes.saturating_add(1);
+            stats.resource_acquisitions = stats.resource_acquisitions.saturating_add(1);
+            match kind {
+                RenderPassKind::DualKawaseDownsample => {
+                    stats.blur_downsamples = stats.blur_downsamples.saturating_add(1);
+                }
+                RenderPassKind::DualKawaseUpsample => {
+                    stats.blur_upsamples = stats.blur_upsamples.saturating_add(1);
+                }
+                _ => unreachable!(),
+            }
+            input_layout = output_layout;
+            input_is_linear = true;
+        }
+        Ok(output_index)
+    })();
+
+    renderer.end_precomputed_build_scope(timing_scope);
+    match execution_result {
+        Ok(final_index) => {
+            match release_precomputed_owned(owned_textures, Some(final_index), |texture| {
+                renderer.runtime.effect_resources.release(texture)
+            }) {
+                Ok(Some(texture)) => Ok((stats, texture)),
+                Ok(None) => {
+                    Err(io::Error::other("precomputed backdrop output was not retained").into())
+                }
+                Err(error) => Err(error.into()),
             }
         }
-    }
-    if !selection.executed_passes.iter().any(|pass_id| {
-        graph
-            .passes
-            .iter()
-            .any(|pass| pass.id == *pass_id && pass.output == Some(shared_output))
-    }) {
-        return Err(
-            io::Error::other("precomputed backdrop output is not produced by its graph").into(),
-        );
-    }
-    let rects = [OutputRect::new(0, 0, output_size.0, output_size.1)];
-    let mut prepared = prepare_lifecycle_effect_graph_execution(
-        renderer,
-        graph,
-        EffectExecutionTargets::ordinary(EffectFramebufferTarget::new(Some(baseline_framebuffer))),
-        framebuffer_origin,
-        &rects,
-        &demand,
-        &selection,
-        true,
-    )?;
-    let result = execute_prepared_effect_graph_core(renderer, &mut prepared);
-    let retained = result
-        .is_ok()
-        .then(|| prepared.textures.remove(&shared_output))
-        .flatten();
-    let result = finish_prepared_effect_graph_execution(renderer, prepared, result);
-    match (
-        result,
-        retained.and_then(GraphTextureBinding::into_transient),
-    ) {
-        (Ok(stats), Some(texture)) => Ok((stats, texture)),
-        (Err(error), Some(texture)) => {
-            let _ = renderer.runtime.effect_resources.release(texture);
+        Err(error) => {
+            let _ = release_precomputed_owned(owned_textures, None, |texture| {
+                renderer.runtime.effect_resources.release(texture)
+            });
             Err(error)
         }
-        (Err(error), None) => Err(error),
-        (Ok(_), None) => {
-            Err(io::Error::other("precomputed backdrop output was not retained").into())
+    }
+}
+
+fn release_precomputed_owned<T, E: Copy>(
+    textures: Vec<T>,
+    retained_index: Option<usize>,
+    mut release: impl FnMut(T) -> Result<(), E>,
+) -> Result<Option<T>, E> {
+    let mut retained = None;
+    let mut first_error = None;
+    for (index, texture) in textures.into_iter().enumerate() {
+        if Some(index) == retained_index {
+            retained = Some(texture);
+        } else if let Err(error) = release(texture) {
+            first_error.get_or_insert(error);
         }
+    }
+    if let Some(error) = first_error {
+        if let Some(texture) = retained.take() {
+            let _ = release(texture);
+        }
+        Err(error)
+    } else {
+        Ok(retained)
     }
 }
 
@@ -527,5 +610,48 @@ pub(crate) fn finish_prepared_effect_graph_execution(
         (Ok(stats), Ok(())) => Ok(stats),
         (Err(error), _) => Err(error),
         (Ok(_), Err(error)) => Err(error),
+    }
+}
+
+#[cfg(test)]
+mod precomputed_build_ownership_tests {
+    use super::release_precomputed_owned;
+
+    #[test]
+    fn successful_build_releases_intermediates_and_returns_one_frame_owner() {
+        let mut released = Vec::new();
+        let owner = release_precomputed_owned(vec![10, 11, 12, 13, 14], Some(4), |id| {
+            released.push(id);
+            Ok::<(), ()>(())
+        })
+        .unwrap();
+
+        assert_eq!(owner, Some(14));
+        assert_eq!(released, [10, 11, 12, 13]);
+    }
+
+    #[test]
+    fn partial_build_failure_releases_each_allocated_texture_once() {
+        let mut released = Vec::new();
+        let owner = release_precomputed_owned(vec![20, 21, 22], None, |id| {
+            released.push(id);
+            Ok::<(), ()>(())
+        })
+        .unwrap();
+
+        assert_eq!(owner, None);
+        assert_eq!(released, [20, 21, 22]);
+    }
+
+    #[test]
+    fn cleanup_attempts_every_texture_and_releases_retained_output_on_error() {
+        let mut released = Vec::new();
+        let result = release_precomputed_owned(vec![30, 31, 32], Some(2), |id| {
+            released.push(id);
+            (id != 30).then_some(()).ok_or(())
+        });
+
+        assert_eq!(result, Err(()));
+        assert_eq!(released, [30, 31, 32]);
     }
 }

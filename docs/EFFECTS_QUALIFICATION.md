@@ -256,13 +256,20 @@ older than the frame in which the record is logged, and a monotonic `scope`
 that distinguishes multiple graph executions associated with one frame.
 
 When a graph-total query resolves, one aggregate record is emitted for that
-scope. Durations are integer nanoseconds. The `*_pixels` fields are bounded
+scope. `scope_role` distinguishes `effect_graph` from `precomputed_build` when
+one frame has both. For precomputed-window-blur qualification, group by
+`frame_id` and add the `total_ns` values from both roles before comparing a
+frame; the `precomputed_build` scope includes the direct scene-prefix
+capture/replay and all four Kawase draws. Do not treat the two scope records as
+separate frames. Frame-shared pass timing uses `instance_id=0` in timing
+metadata only; zero is not an ordinary `EffectInstanceId`. Durations are
+integer nanoseconds. The `*_pixels` fields are bounded
 effect-space demanded-region areas, not literal fragment counts and not
 allocated texture area; scaled pyramid passes therefore do not report their
 physical target-FBO fragment count:
 
 ```text
-typhon effect: event=effect_gpu_timing frame_id=<u64|unknown> scope=<u64> total_ns=<u64> capture_ns=<u64> normalize_ns=<u64> blur_downsample_ns=<u64> blur_upsample_ns=<u64> fragment_ns=<u64> blend_ns=<u64> mask_ns=<u64> composite_ns=<u64> postprocess_ns=<u64> timed_passes=<usize> dropped_passes=<usize> capture_pixels=<u64> normalize_pixels=<u64> blur_downsample_pixels=<u64> blur_upsample_pixels=<u64> fragment_pixels=<u64> blend_pixels=<u64> mask_pixels=<u64> composite_pixels=<u64> postprocess_pixels=<u64> query_pool_capacity=<usize> query_pool_high_water=<usize> dropped_spans=<usize> disjoint_invalidated_spans=<usize>
+typhon effect: event=effect_gpu_timing frame_id=<u64|unknown> scope=<u64> scope_role=<effect_graph|precomputed_build> total_ns=<u64> capture_ns=<u64> normalize_ns=<u64> blur_downsample_ns=<u64> blur_upsample_ns=<u64> fragment_ns=<u64> blend_ns=<u64> mask_ns=<u64> composite_ns=<u64> postprocess_ns=<u64> timed_passes=<usize> dropped_passes=<usize> capture_pixels=<u64> normalize_pixels=<u64> blur_downsample_pixels=<u64> blur_upsample_pixels=<u64> fragment_pixels=<u64> blend_pixels=<u64> mask_pixels=<u64> composite_pixels=<u64> postprocess_pixels=<u64> query_pool_capacity=<usize> query_pool_high_water=<usize> dropped_spans=<usize> disjoint_invalidated_spans=<usize>
 ```
 
 `capture_ns` and `capture_pixels` combine `SceneCapture` and `SurfaceCapture`;

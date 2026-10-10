@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use glow::HasContext;
 use oblivion_one::effects::{
     CompiledFrameGraph, CompiledPrecomputedBackdropPlan, GraphTextureId, RenderPassKind,
-    compile_precomputed_backdrop_materialization_graph,
+    compile_precomputed_backdrop_build,
 };
 
 use super::super::checkpoint::CheckpointEffectCausalState;
@@ -100,8 +100,11 @@ impl FramePipeline<'_> {
                         .precomputed_backdrop
                         .as_ref()
                         .expect("selected optimized consumers require a shared plan");
-                    match self.prepare_precomputed_backdrop(precomputed, framebuffer_origin) {
-                        Ok((shared_texture, build_stats)) => {
+                    let preparation = self
+                        .prepare_precomputed_backdrop(precomputed, framebuffer_origin)
+                        .map_err(|_| ());
+                    dispatch_shared_preparation(preparation, |outcome| match outcome {
+                        SharedPreparationOutcome::Ready((shared_texture, build_stats)) => {
                             precomputed_telemetry.built = true;
                             precomputed_telemetry.build_stats = Some(build_stats);
                             if self
@@ -164,7 +167,7 @@ impl FramePipeline<'_> {
                                 }
                             }
                         }
-                        Err(_) => {
+                        SharedPreparationOutcome::Failed => {
                             precomputed_telemetry.fallback = true;
                             precomputed_telemetry.fallback_reason = "shared_prepare_failed";
                             let exact_graph = match planned.exact_execution_plan.as_ref() {
@@ -194,7 +197,7 @@ impl FramePipeline<'_> {
                                 exact_selection,
                             )
                         }
-                    }
+                    })
                 };
                 self.emit_precomputed_window_blur_telemetry(planned, &precomputed_telemetry);
                 match execution_result {
@@ -474,80 +477,46 @@ impl FramePipeline<'_> {
         let size = self.scene.current_size;
         let output_bounds = oblivion_one::effects::EffectRect::new(0, 0, size.0, size.1)
             .ok_or_else(|| std::io::Error::other("invalid precomputed backdrop output size"))?;
-        let (build_graph, shared_output) = compile_precomputed_backdrop_materialization_graph(
-            plan,
-            output_bounds,
-            &self.effects.effect_registry,
-        )?;
-        let baseline_key = EffectTextureKey::new(
-            size.0,
-            size.1,
+        let build = compile_precomputed_backdrop_build(plan, output_bounds);
+        let capture_key = EffectTextureKey::new(
+            build.capture.width,
+            build.capture.height,
             EffectTextureFormat::Rgba8,
             EffectTextureFilter::Linear,
-            oblivion_one::effects::EffectWorkingSpace::OutputEncodedSrgb,
+            build.capture.working_space,
         );
-        let baseline = self
+        let capture = self
             .effects
             .effect_resources
-            .acquire(self.gl, baseline_key)?;
-        let result = (|| {
-            let framebuffer = self
-                .effects
-                .effect_resources
-                .bind_draw_target(self.gl, &baseline)?;
-            self.scene
-                .establish_scene_state_for_framebuffer(self.gl, Some(framebuffer));
-            unsafe {
-                self.gl.disable(glow::SCISSOR_TEST);
-                self.gl.disable(glow::BLEND);
-                self.gl.clear_color(0.0, 0.0, 0.0, 1.0);
-                self.gl.clear(glow::COLOR_BUFFER_BIT);
+            .acquire(self.gl, capture_key)?;
+        let mut context = self.effect_execution_context();
+        let timing_scope = match context.replay_precomputed_backdrop_capture(
+            &capture,
+            plan.baseline_anchor,
+            plan.baseline_visual_group,
+            plan.baseline_anchor_scope,
+            framebuffer_origin,
+        ) {
+            Ok(scope) => scope,
+            Err(error) => {
+                drop(context);
+                let release = self.effects.effect_resources.release(capture);
+                return match release {
+                    Ok(()) => Err(error),
+                    Err(release_error) => Err(release_error.into()),
+                };
             }
-            let (prefix_end, _) = composition_range_with_metadata(
-                &self.scene.commands,
-                &self.scene.capture_layers,
-                &self.scene.capture_visual_groups,
-                plan.baseline_anchor,
-                plan.baseline_visual_group,
-                plan.baseline_anchor_scope,
-            );
-            let full_output = [OutputRect::new(0, 0, size.0, size.1)];
-            self.effect_execution_context().draw_effect_scene_range(
-                &full_output,
-                0,
-                prefix_end,
-                framebuffer_origin,
-                super::super::EffectFramebufferTarget::new(Some(framebuffer)),
-            )?;
-            self.effects.effect_resources.unbind_render_target(self.gl);
-            self.scene.establish_scene_state_for_framebuffer(
-                self.gl,
-                self.scene.active_output_framebuffer,
-            );
-            let (stats, texture) = {
-                let mut context = self.effect_execution_context();
-                super::super::effects::execute_precomputed_backdrop_graph(
-                    &mut context,
-                    &build_graph,
-                    shared_output,
-                    framebuffer,
-                    framebuffer_origin,
-                    size,
-                )?
-            };
-            Ok((texture, stats))
-        })();
-        self.effects.effect_resources.unbind_render_target(self.gl);
-        self.scene
-            .establish_scene_state_for_framebuffer(self.gl, self.scene.active_output_framebuffer);
-        let release = self.effects.effect_resources.release(baseline);
-        match (result, release) {
-            (Ok(value), Ok(())) => Ok(value),
-            (Err(error), _) => Err(error),
-            (Ok((texture, _)), Err(error)) => {
-                let _ = self.effects.effect_resources.release(texture);
-                Err(error.into())
-            }
+        };
+        let build_result = super::super::effects::execute_precomputed_backdrop_build(
+            &mut context,
+            &build,
+            capture,
+            timing_scope,
+            framebuffer_origin,
+        );
+        match build_result {
+            Ok((stats, texture)) => Ok((texture, stats)),
+            Err(error) => Err(error),
         }
     }
 
@@ -892,6 +861,21 @@ impl FramePipeline<'_> {
     }
 }
 
+enum SharedPreparationOutcome<T> {
+    Ready(T),
+    Failed,
+}
+
+fn dispatch_shared_preparation<T, R>(
+    result: Result<T, ()>,
+    dispatch: impl FnOnce(SharedPreparationOutcome<T>) -> R,
+) -> R {
+    dispatch(match result {
+        Ok(value) => SharedPreparationOutcome::Ready(value),
+        Err(()) => SharedPreparationOutcome::Failed,
+    })
+}
+
 fn graph_pass_work(
     graph: &CompiledFrameGraph,
     owners: &[oblivion_one::effects::EffectInstanceId],
@@ -942,6 +926,52 @@ fn precomputed_blur_pixel_work(
         ));
     }
     (pixels(size.0, size.1), downsample, upsample)
+}
+
+#[cfg(test)]
+mod shared_preparation_tests {
+    use super::*;
+
+    #[test]
+    fn shared_prepare_failure_selects_exact_before_optimized_output_mutation() {
+        let mut events = Vec::new();
+        let mut temporary_release_count = 0;
+        let mut optimized_output_mutated = false;
+        let mut exact_executed = false;
+
+        events.push("precomputed_candidate_selected");
+        events.push("shared_prepare_started");
+        let preparation = Err::<(), ()>(());
+        dispatch_shared_preparation(preparation, |outcome| match outcome {
+            SharedPreparationOutcome::Ready(()) => {
+                optimized_output_mutated = true;
+                events.push("optimized_output_mutated");
+            }
+            SharedPreparationOutcome::Failed => {
+                events.push("fallback_reason=shared_prepare_failed");
+                temporary_release_count += 1;
+                events.push("shared_temporary_released");
+                events.push("exact_graph_selected");
+                exact_executed = true;
+                events.push("exact_graph_executed");
+            }
+        });
+
+        assert_eq!(
+            events,
+            [
+                "precomputed_candidate_selected",
+                "shared_prepare_started",
+                "fallback_reason=shared_prepare_failed",
+                "shared_temporary_released",
+                "exact_graph_selected",
+                "exact_graph_executed",
+            ]
+        );
+        assert!(!optimized_output_mutated);
+        assert!(exact_executed);
+        assert_eq!(temporary_release_count, 1);
+    }
 }
 
 pub(in crate::egl_renderer) fn promote_checkpoint_cache_causal_state(

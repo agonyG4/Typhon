@@ -5,6 +5,8 @@ use std::{
 };
 
 use glow::HasContext;
+#[cfg(test)]
+use oblivion_one::effects::EffectInstanceId;
 use oblivion_one::effects::{MAX_EFFECT_INSTANCES_PER_OUTPUT, MAX_GRAPH_PASSES, RenderPassKind};
 
 use super::resources::CheckpointCacheAdmissionStats;
@@ -17,6 +19,9 @@ const GPU_MEMORY_INFO_CURRENT_AVAILABLE_VIDMEM_NVX: u32 = 0x9049;
 const GPU_MEMORY_INFO_EVICTION_COUNT_NVX: u32 = 0x904a;
 const GPU_MEMORY_INFO_EVICTED_MEMORY_NVX: u32 = 0x904b;
 const GPU_DISJOINT_EXT: u32 = 0x8fbb;
+// Timing metadata only: zero denotes frame-shared work; ordinary effect IDs
+// are non-zero EffectInstanceId values and cannot collide with it.
+const FRAME_SHARED_TIMING_INSTANCE_ID: u64 = 0;
 const EXPECTED_IN_FLIGHT_GRAPH_SCOPES: usize = 2;
 const CURRENT_BUILTIN_BLUR_PASSES: usize = 2;
 const CURRENT_PASSES_PER_BLUR_INSTANCE: usize = 1 + CURRENT_BUILTIN_BLUR_PASSES * 2 + 1;
@@ -102,6 +107,21 @@ pub(crate) struct GraphTimingScope {
     total: SpanToken,
     frame_id: Option<u64>,
     host_start: Option<Instant>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TimingScopeRole {
+    EffectGraph,
+    PrecomputedBuild,
+}
+
+impl TimingScopeRole {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::EffectGraph => "effect_graph",
+            Self::PrecomputedBuild => "precomputed_build",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -556,6 +576,7 @@ impl GraphGapTiming {
 struct GpuTimingRecord {
     frame_id: Option<u64>,
     scope_id: u64,
+    scope_role: TimingScopeRole,
     total_ns: u64,
     durations_ns: [u64; 10],
     pixels: [u64; 10],
@@ -688,6 +709,7 @@ struct PendingSpan {
 struct GraphAggregate {
     scope_id: u64,
     frame_id: Option<u64>,
+    scope_role: TimingScopeRole,
     durations_ns: [u64; 10],
     pixels: [u64; 10],
     timed_passes: usize,
@@ -876,6 +898,14 @@ impl TimingState {
     }
 
     fn begin_scope(&mut self, frame_id: Option<u64>) -> Option<GraphTimingScope> {
+        self.begin_scope_with_role(frame_id, TimingScopeRole::EffectGraph)
+    }
+
+    fn begin_scope_with_role(
+        &mut self,
+        frame_id: Option<u64>,
+        scope_role: TimingScopeRole,
+    ) -> Option<GraphTimingScope> {
         if !self.enabled {
             return None;
         }
@@ -899,6 +929,7 @@ impl TimingState {
         self.aggregates.push(GraphAggregate {
             scope_id,
             frame_id,
+            scope_role,
             durations_ns: [0; 10],
             pixels: [0; 10],
             timed_passes: 0,
@@ -1621,6 +1652,7 @@ impl TimingState {
         Some(GpuTimingRecord {
             frame_id: aggregate.frame_id,
             scope_id: aggregate.scope_id,
+            scope_role: aggregate.scope_role,
             total_ns,
             durations_ns: aggregate.durations_ns,
             pixels: aggregate.pixels,
@@ -2277,11 +2309,12 @@ fn format_gpu_timing_line(record: &GpuTimingRecord) -> String {
         .max_composite_scene_replay
         .map_or(0, |replay| replay.scene_vbo_upload_bytes);
     let line = format!(
-        "event=effect_gpu_timing frame_id={} scope={} total_ns={} capture_ns={} normalize_ns={} blur_downsample_ns={} blur_upsample_ns={} fragment_ns={} blend_ns={} mask_ns={} composite_ns={} postprocess_ns={} timed_passes={} dropped_passes={} capture_pixels={} normalize_pixels={} blur_downsample_pixels={} blur_upsample_pixels={} fragment_pixels={} blend_pixels={} mask_pixels={} composite_pixels={} postprocess_pixels={} query_pool_capacity={} query_pool_high_water={} dropped_spans={} disjoint_invalidated_spans={} scene_capture_ns={} surface_capture_ns={} replay_capture_ns={} framebuffer_capture_ns={} framebuffer_blit_capture_ns={} framebuffer_shader_copy_capture_ns={} checkpoint_capture_ns={} scene_capture_passes={} surface_capture_passes={} replay_capture_passes={} framebuffer_capture_passes={} framebuffer_blit_capture_passes={} framebuffer_shader_copy_capture_passes={} checkpoint_capture_passes={} scene_capture_pixels={} surface_capture_pixels={} replay_capture_pixels={} framebuffer_capture_pixels={} framebuffer_blit_capture_pixels={} framebuffer_shader_copy_capture_pixels={} checkpoint_capture_pixels={} capture_execution_summary_available={} capture_execution_pixels={} scene_capture_execution_pixels={} surface_capture_execution_pixels={} replay_capture_execution_pixels={} framebuffer_capture_execution_pixels={} framebuffer_shader_copy_capture_execution_pixels={} checkpoint_capture_execution_pixels={} replay_capture_execution_passes={} framebuffer_capture_execution_passes={} checkpoint_capture_execution_passes={} replay_capture_commands={} checkpoint_dependency_edges={} replay_capture_materialization_rects={} replay_capture_execution_regions={} replay_capture_disjoint_overflows={} replay_capture_command_region_pairs={} replay_capture_scene_scan_pairs={} replay_capture_planner_commands_visited={} replay_capture_planner_commands_drawable={} replay_capture_commands_executed={} replay_capture_draw_calls={} replay_capture_host_cpu_ns={} replay_capture_selection_cpu_ns={} replay_capture_visibility_cpu_ns={} replay_capture_draw_submit_cpu_ns={} checkpoint_cache_hits={} checkpoint_cache_full_refreshes={} checkpoint_cache_zero_copy_hits={} checkpoint_cache_update_pixels={} checkpoint_cache_domain_pixels={} checkpoint_cache_saved_pixels={} replay_capture_cache_hits={} replay_capture_cache_full_refreshes={} replay_capture_cache_zero_copy_hits={} replay_capture_cache_update_pixels={} replay_capture_cache_domain_pixels={} replay_capture_cache_saved_pixels={} checkpoint_causal_proven_unchanged={} checkpoint_causal_unproven={} checkpoint_causal_dependency_changed={} checkpoint_causal_scene_prefix_changed={} checkpoint_cache_entries={} checkpoint_cache_bytes={} capture_downsample_fusion_candidates={} capture_downsample_fusion_executed={} capture_downsample_fusion_elided_capture_pixels={} capture_downsample_fusion_output_pixels={} capture_downsample_fusion_ineligible={} max_capture_pass_ns={} max_capture_pass_id={} max_capture_instance_id={} max_capture_kind={} max_capture_mode={} max_capture_pixels={} max_capture_checkpoint_count={} max_capture_execution_pixels={} max_capture_materialization_rects={} max_capture_execution_regions={} max_capture_disjoint_overflow={} max_capture_replay_commands={} max_capture_command_region_pairs={} max_capture_scene_commands={} max_capture_scene_scan_pairs={} max_capture_planner_commands_visited={} max_capture_planner_commands_drawable={} max_capture_commands_executed={} max_capture_draw_calls={} max_capture_host_cpu_ns={} max_capture_selection_cpu_ns={} max_capture_visibility_cpu_ns={} max_capture_draw_submit_cpu_ns={}",
+        "event=effect_gpu_timing frame_id={} scope={} scope_role={} total_ns={} capture_ns={} normalize_ns={} blur_downsample_ns={} blur_upsample_ns={} fragment_ns={} blend_ns={} mask_ns={} composite_ns={} postprocess_ns={} timed_passes={} dropped_passes={} capture_pixels={} normalize_pixels={} blur_downsample_pixels={} blur_upsample_pixels={} fragment_pixels={} blend_pixels={} mask_pixels={} composite_pixels={} postprocess_pixels={} query_pool_capacity={} query_pool_high_water={} dropped_spans={} disjoint_invalidated_spans={} scene_capture_ns={} surface_capture_ns={} replay_capture_ns={} framebuffer_capture_ns={} framebuffer_blit_capture_ns={} framebuffer_shader_copy_capture_ns={} checkpoint_capture_ns={} scene_capture_passes={} surface_capture_passes={} replay_capture_passes={} framebuffer_capture_passes={} framebuffer_blit_capture_passes={} framebuffer_shader_copy_capture_passes={} checkpoint_capture_passes={} scene_capture_pixels={} surface_capture_pixels={} replay_capture_pixels={} framebuffer_capture_pixels={} framebuffer_blit_capture_pixels={} framebuffer_shader_copy_capture_pixels={} checkpoint_capture_pixels={} capture_execution_summary_available={} capture_execution_pixels={} scene_capture_execution_pixels={} surface_capture_execution_pixels={} replay_capture_execution_pixels={} framebuffer_capture_execution_pixels={} framebuffer_shader_copy_capture_execution_pixels={} checkpoint_capture_execution_pixels={} replay_capture_execution_passes={} framebuffer_capture_execution_passes={} checkpoint_capture_execution_passes={} replay_capture_commands={} checkpoint_dependency_edges={} replay_capture_materialization_rects={} replay_capture_execution_regions={} replay_capture_disjoint_overflows={} replay_capture_command_region_pairs={} replay_capture_scene_scan_pairs={} replay_capture_planner_commands_visited={} replay_capture_planner_commands_drawable={} replay_capture_commands_executed={} replay_capture_draw_calls={} replay_capture_host_cpu_ns={} replay_capture_selection_cpu_ns={} replay_capture_visibility_cpu_ns={} replay_capture_draw_submit_cpu_ns={} checkpoint_cache_hits={} checkpoint_cache_full_refreshes={} checkpoint_cache_zero_copy_hits={} checkpoint_cache_update_pixels={} checkpoint_cache_domain_pixels={} checkpoint_cache_saved_pixels={} replay_capture_cache_hits={} replay_capture_cache_full_refreshes={} replay_capture_cache_zero_copy_hits={} replay_capture_cache_update_pixels={} replay_capture_cache_domain_pixels={} replay_capture_cache_saved_pixels={} checkpoint_causal_proven_unchanged={} checkpoint_causal_unproven={} checkpoint_causal_dependency_changed={} checkpoint_causal_scene_prefix_changed={} checkpoint_cache_entries={} checkpoint_cache_bytes={} capture_downsample_fusion_candidates={} capture_downsample_fusion_executed={} capture_downsample_fusion_elided_capture_pixels={} capture_downsample_fusion_output_pixels={} capture_downsample_fusion_ineligible={} max_capture_pass_ns={} max_capture_pass_id={} max_capture_instance_id={} max_capture_kind={} max_capture_mode={} max_capture_pixels={} max_capture_checkpoint_count={} max_capture_execution_pixels={} max_capture_materialization_rects={} max_capture_execution_regions={} max_capture_disjoint_overflow={} max_capture_replay_commands={} max_capture_command_region_pairs={} max_capture_scene_commands={} max_capture_scene_scan_pairs={} max_capture_planner_commands_visited={} max_capture_planner_commands_drawable={} max_capture_commands_executed={} max_capture_draw_calls={} max_capture_host_cpu_ns={} max_capture_selection_cpu_ns={} max_capture_visibility_cpu_ns={} max_capture_draw_submit_cpu_ns={}",
         record
             .frame_id
             .map_or_else(|| "unknown".to_owned(), |id| id.to_string()),
         record.scope_id,
+        record.scope_role.as_str(),
         record.total_ns,
         capture_ns,
         field(&record.durations_ns, TimingCategory::NormalizeInput),
@@ -2631,13 +2664,30 @@ impl EffectGpuProfiler {
         gl: &glow::Context,
         frame_id: Option<u64>,
     ) -> Option<GraphTimingScope> {
+        self.begin_scope_with_role(gl, frame_id, TimingScopeRole::EffectGraph)
+    }
+
+    pub(crate) fn begin_precomputed_build(
+        &mut self,
+        gl: &glow::Context,
+        frame_id: Option<u64>,
+    ) -> Option<GraphTimingScope> {
+        self.begin_scope_with_role(gl, frame_id, TimingScopeRole::PrecomputedBuild)
+    }
+
+    fn begin_scope_with_role(
+        &mut self,
+        gl: &glow::Context,
+        frame_id: Option<u64>,
+        role: TimingScopeRole,
+    ) -> Option<GraphTimingScope> {
         let ProfilerState::Active(active) = &mut self.state else {
             return None;
         };
         if active.path.uses_disjoint() && observe_disjoint(&mut active.timing, gpu_disjoint(gl)) {
             return None;
         }
-        let mut scope = active.timing.begin_scope(frame_id)?;
+        let mut scope = active.timing.begin_scope_with_role(frame_id, role)?;
         active
             .timing
             .set_stall_diagnostics_enabled(scope, active.stall_diagnostics_enabled);
@@ -2771,6 +2821,26 @@ impl EffectGpuProfiler {
                 .timing
                 .attach_replay_execution_detail(span.token, replay_execution);
         }
+    }
+
+    pub(crate) fn begin_precomputed_stage(
+        &mut self,
+        gl: &glow::Context,
+        scope: GraphTimingScope,
+        stage_index: usize,
+        kind: RenderPassKind,
+        work: PassTimingWork,
+        capture: Option<CaptureTimingMetadata>,
+    ) -> Option<PassTimingSpan> {
+        self.begin_pass(
+            gl,
+            scope,
+            u64::try_from(stage_index).ok()?.saturating_add(1),
+            FRAME_SHARED_TIMING_INSTANCE_ID,
+            kind,
+            work,
+            capture,
+        )
     }
 
     pub(crate) fn begin_composite_scene_replay(
@@ -5684,6 +5754,80 @@ mod tests {
     }
 
     #[test]
+    fn timing_scope_roles_separate_shared_build_from_effect_graph() {
+        let mut state = TimingState::active_for_test(4);
+        let _graph = state.begin_scope(Some(120)).expect("effect graph scope");
+        let _shared = state
+            .begin_scope_with_role(Some(120), TimingScopeRole::PrecomputedBuild)
+            .expect("precomputed build scope");
+        assert_eq!(state.aggregates[0].scope_role, TimingScopeRole::EffectGraph);
+        assert_eq!(
+            state.aggregates[1].scope_role,
+            TimingScopeRole::PrecomputedBuild
+        );
+        assert_eq!(
+            TimingScopeRole::PrecomputedBuild.as_str(),
+            "precomputed_build"
+        );
+        assert_eq!(TimingScopeRole::EffectGraph.as_str(), "effect_graph");
+    }
+
+    #[test]
+    fn shared_build_capture_and_kawase_stages_share_one_timed_scope() {
+        let mut state = TimingState::active_for_test(8);
+        let scope = state
+            .begin_scope_with_role(Some(120), TimingScopeRole::PrecomputedBuild)
+            .expect("shared build scope");
+        let stages = [
+            (
+                RenderPassKind::SceneCapture,
+                1_000,
+                Some(CaptureTimingMode::Replay),
+            ),
+            (RenderPassKind::DualKawaseDownsample, 250, None),
+            (RenderPassKind::DualKawaseDownsample, 64, None),
+            (RenderPassKind::DualKawaseUpsample, 250, None),
+            (RenderPassKind::DualKawaseUpsample, 1_000, None),
+        ];
+        for (index, (kind, pixels, capture_mode)) in stages.into_iter().enumerate() {
+            let capture = capture_mode.map(|mode| capture_metadata(mode, 0));
+            let mut metadata = pass_metadata(index as u64 + 1, kind, pixels, capture);
+            metadata.instance_id = Some(FRAME_SHARED_TIMING_INSTANCE_ID);
+            resolve_test_pass(
+                &mut state,
+                scope,
+                metadata,
+                110 + index as u64 * 20,
+                130 + index as u64 * 20,
+            );
+        }
+        let record = resolve_test_total(&mut state, scope, 100, 300);
+
+        assert_eq!(record.frame_id, Some(120));
+        assert_eq!(record.scope_role, TimingScopeRole::PrecomputedBuild);
+        assert_eq!(record.timed_passes, 5);
+        assert_eq!(record.scene_capture_passes, 1);
+        assert_eq!(record.scene_capture_ns, 20);
+        assert_eq!(record.replay_capture_passes, 1);
+        assert_eq!(
+            record.durations_ns[TimingCategory::DualKawaseDownsample.index()],
+            40
+        );
+        assert_eq!(
+            record.durations_ns[TimingCategory::DualKawaseUpsample.index()],
+            40
+        );
+        assert_eq!(record.max_capture_pass.unwrap().instance_id, 0);
+        assert_eq!(record.max_effect_pass.unwrap().instance_id, 0);
+    }
+
+    #[test]
+    fn frame_shared_timing_instance_id_cannot_collide_with_effect_ids() {
+        assert!(EffectInstanceId::new(FRAME_SHARED_TIMING_INSTANCE_ID).is_none());
+        assert!(EffectInstanceId::new(FRAME_SHARED_TIMING_INSTANCE_ID + 1).is_some());
+    }
+
+    #[test]
     fn disjoint_invalidates_all_pending_measurements() {
         let mut state = TimingState::active_for_test(3);
         let scope = state.begin_scope(Some(120)).expect("scope slot");
@@ -5703,6 +5847,7 @@ mod tests {
         let record = GpuTimingRecord {
             frame_id: Some(120),
             scope_id: 31,
+            scope_role: TimingScopeRole::EffectGraph,
             total_ns: 281_400,
             durations_ns: [41_200, 0, 0, 78_300, 109_700, 0, 0, 0, 52_200, 0],
             pixels: [640, 0, 0, 320, 160, 0, 0, 0, 640, 0],
@@ -5800,6 +5945,12 @@ mod tests {
             max_graph_gap: GraphGapTiming::unavailable(),
         };
         let line = format_gpu_timing_line(&record);
+        assert!(line.contains("scope_role=effect_graph"));
+        let shared_line = format_gpu_timing_line(&GpuTimingRecord {
+            scope_role: TimingScopeRole::PrecomputedBuild,
+            ..record
+        });
+        assert!(shared_line.contains("scope_role=precomputed_build"));
         let mut keys = HashSet::new();
         for field in line.split_whitespace() {
             let (key, _) = field.split_once('=').expect("telemetry key=value field");
@@ -5957,6 +6108,7 @@ mod tests {
         assert!(line.contains("max_graph_gap_before_capture_mode=none"));
         assert!(line.contains("max_graph_gap_before_checkpoint_count=0"));
         assert!(line.contains("composite_scene_replay_timing_available=1"));
+        assert!(line.contains("scope_role=effect_graph"));
         assert!(line.contains("composite_scene_replay_expected_spans=0"));
         assert!(line.contains("composite_scene_replay_resolved_spans=0"));
         assert!(line.contains("composite_scene_replay_gpu_ns=0"));
@@ -5976,6 +6128,7 @@ mod tests {
             " capture_downsample_fusion_candidates=3 capture_downsample_fusion_executed=2 capture_downsample_fusion_elided_capture_pixels=345 capture_downsample_fusion_output_pixels=78 capture_downsample_fusion_ineligible=1",
             "",
         );
+        let legacy_line = legacy_line.replace(" scope_role=effect_graph", "");
         let (legacy_prefix, diagnostics_and_suffix) = legacy_line
             .split_once(" effect_graph_host_cpu_ns=")
             .expect("diagnostics fields follow legacy timing fields");

@@ -68,7 +68,7 @@ pub(in crate::egl_renderer::tests) fn lifecycle_blur_effect_scene_for_rect(
             frame_demand: EffectFrameDemand::OnDamage,
             visual_group: Some(VisualGroupId::new(1).expect("test visual group id")),
             anchor_scope: compositor::EffectAnchorScope::VisualGroup,
-            backdrop_reuse: crate::compositor::EffectBackdropReuse::Exact,
+            backdrop_reuse: oblivion_one::compositor::EffectBackdropReuse::Exact,
             scene_order: compositor::EffectSceneOrder::for_anchor(anchor),
         }],
     )

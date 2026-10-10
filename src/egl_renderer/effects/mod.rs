@@ -29,10 +29,12 @@ pub(crate) use executor::checkpoint_causal_stability_plan;
 pub(super) use executor::composition_range_with_metadata;
 #[cfg(test)]
 pub(crate) use executor::execute_effect_graph_with_debug_config_and_scene_replay_mode;
-pub(crate) use executor::execute_precomputed_backdrop_graph;
+pub(crate) use executor::execute_precomputed_backdrop_build;
 #[cfg(test)]
 pub(crate) use executor::plan_effect_surface_consumers_with_debug_config;
 pub(crate) use executor::plan_effect_surface_consumers_with_metadata;
+#[cfg(test)]
+pub(crate) use executor::prepare_effect_graph_execution;
 #[cfg(test)]
 pub(crate) use executor::replay_capture_region_layout;
 pub(crate) use executor::{EffectExecutionSelection, EffectExecutionStats};
@@ -51,7 +53,7 @@ pub(crate) use executor::{execute_effect_graph, execute_effect_graph_with_debug_
 pub(crate) use executor::{execute_effect_graph_for_lifecycle, select_effect_execution};
 pub(super) use executor::{
     execute_prepared_effect_graph_core, finish_prepared_effect_graph_execution,
-    prepare_effect_graph_execution, prepare_effect_graph_execution_with_external_bindings,
+    prepare_effect_graph_execution_with_external_bindings,
 };
 pub(crate) use metrics::{EffectFailureReason, EffectGraphMetrics, graph_metrics};
 #[cfg(test)]

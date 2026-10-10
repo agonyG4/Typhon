@@ -45,6 +45,151 @@ pub(crate) fn establish_effect_pass_blend_state(gl: &glow::Context, mode: Effect
     }
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct FullscreenTextureLayout {
+    pub(super) width: u32,
+    pub(super) height: u32,
+    pub(super) origin: oblivion_one::effects::GraphTextureOrigin,
+}
+
+impl From<&oblivion_one::effects::GraphTexturePlan> for FullscreenTextureLayout {
+    fn from(plan: &oblivion_one::effects::GraphTexturePlan) -> Self {
+        Self {
+            width: plan.width,
+            height: plan.height,
+            origin: plan.origin,
+        }
+    }
+}
+
+/// Shared fullscreen Kawase draw primitive. Ordinary graph passes translate
+/// their plans into this texture-only input; frame-shared builds provide the
+/// same texture metadata without a graph pass or an effect instance owner.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn execute_kawase_texture_stage(
+    renderer: &mut EffectExecutionContext<'_>,
+    input_texture: glow::Texture,
+    input_layout: FullscreenTextureLayout,
+    output_texture: &PooledEffectTexture,
+    output_layout: FullscreenTextureLayout,
+    kind: RenderPassKind,
+    blur_radius: f32,
+    shader_variant: u8,
+    framebuffer_origin: OutputFramebufferOrigin,
+    damage: Option<(&EffectRegion, &oblivion_one::effects::GraphTexturePlan)>,
+    targets: EffectExecutionTargets,
+) -> RendererResult<()> {
+    let module = match kind {
+        RenderPassKind::DualKawaseDownsample => {
+            oblivion_one::effects::INTERNAL_EFFECT_SHADER_MODULE_DOWNSAMPLE
+        }
+        RenderPassKind::DualKawaseUpsample => {
+            oblivion_one::effects::INTERNAL_EFFECT_SHADER_MODULE_UPSAMPLE
+        }
+        _ => return Err(io::Error::other("fullscreen Kawase stage has invalid kind").into()),
+    };
+    let module = ShaderModuleId::new(module)
+        .ok_or_else(|| io::Error::other("fullscreen Kawase shader id is zero"))?;
+    let shader_key = ShaderProgramKey::new(
+        module,
+        u64::from(shader_variant),
+        oblivion_one::effects::EffectWorkingSpace::LinearSrgb,
+    );
+    let program = renderer.runtime.effect_shaders.lookup(shader_key)?;
+    let (vertex_array, _) = renderer.ensure_effect_quad()?;
+    renderer
+        .runtime
+        .effect_resources
+        .bind_render_target(renderer.gl, output_texture)?;
+    establish_effect_pass_blend_state(renderer.gl, EffectPassBlendMode::Replace);
+    let target_flip_y = effect_target_requires_logical_y_flip(false, framebuffer_origin);
+    let input_flip_y = effect_input_requires_sample_y_flip(input_layout.origin);
+    unsafe {
+        renderer.gl.viewport(
+            0,
+            0,
+            output_layout.width as i32,
+            output_layout.height as i32,
+        );
+        renderer.gl.use_program(Some(program));
+        if let Some(location) = uniform_location(
+            &mut renderer.runtime.effect_shaders,
+            renderer.gl,
+            shader_key,
+            program,
+            "u_effect_target_flip_y",
+        ) {
+            renderer
+                .gl
+                .uniform_1_i32(Some(&location), i32::from(target_flip_y));
+        }
+        if let Some(location) = uniform_location(
+            &mut renderer.runtime.effect_shaders,
+            renderer.gl,
+            shader_key,
+            program,
+            "u_effect_input_flip_y",
+        ) {
+            renderer
+                .gl
+                .uniform_1_i32(Some(&location), i32::from(input_flip_y));
+        }
+        renderer.gl.active_texture(glow::TEXTURE0);
+        renderer
+            .gl
+            .bind_texture(glow::TEXTURE_2D, Some(input_texture));
+        if let Some(location) = uniform_location(
+            &mut renderer.runtime.effect_shaders,
+            renderer.gl,
+            shader_key,
+            program,
+            "u_effect_input",
+        ) {
+            renderer.gl.uniform_1_i32(Some(&location), 0);
+        }
+        if let Some(location) = uniform_location(
+            &mut renderer.runtime.effect_shaders,
+            renderer.gl,
+            shader_key,
+            program,
+            "u_effect_texel_size",
+        ) {
+            renderer.gl.uniform_2_f32(
+                Some(&location),
+                1.0 / input_layout.width.max(1) as f32,
+                1.0 / input_layout.height.max(1) as f32,
+            );
+        }
+        if let Some(location) = uniform_location(
+            &mut renderer.runtime.effect_shaders,
+            renderer.gl,
+            shader_key,
+            program,
+            "u_effect_blur_radius",
+        ) {
+            renderer.gl.uniform_1_f32(Some(&location), blur_radius);
+        }
+        renderer.gl.bind_vertex_array(Some(vertex_array));
+        if let Some((damage, output_plan)) = damage {
+            draw_damage_scissors(renderer.gl, damage, output_plan, framebuffer_origin, None);
+        } else {
+            renderer.gl.disable(glow::SCISSOR_TEST);
+            renderer.gl.draw_arrays(glow::TRIANGLES, 0, 6);
+        }
+        renderer.gl.bind_vertex_array(None);
+        renderer.gl.bind_texture(glow::TEXTURE_2D, None);
+        renderer.gl.disable(glow::SCISSOR_TEST);
+        renderer.gl.disable(glow::BLEND);
+    }
+    renderer
+        .runtime
+        .effect_resources
+        .unbind_render_target(renderer.gl);
+    renderer.establish_effect_composition_state(targets.composition_draw);
+    restore_output_viewport(renderer.gl, renderer.scene.current_size);
+    Ok(())
+}
+
 pub(super) fn capture_blend_mode() -> EffectPassBlendMode {
     EffectPassBlendMode::PremultipliedSourceOver
 }
@@ -824,6 +969,43 @@ pub(super) fn execute_fullscreen_pass(
     let input_plan = graph_texture(graph, input)?;
     let output_plan = graph_texture(graph, output)?;
     let output_is_framebuffer = output_plan.source == GraphTextureSource::Output;
+    if blur_shader
+        && capture_fusion.is_none()
+        && !output_is_framebuffer
+        && matches!(
+            pass.kind,
+            RenderPassKind::DualKawaseDownsample | RenderPassKind::DualKawaseUpsample
+        )
+    {
+        let input_binding = textures
+            .get(&input)
+            .ok_or_else(|| io::Error::other("effect input texture is not realized"))?;
+        let input_texture = renderer
+            .runtime
+            .effect_resources
+            .texture(input_binding)
+            .ok_or_else(|| io::Error::other("effect input texture is not realized"))?;
+        let output_binding = textures
+            .get(&output)
+            .ok_or_else(|| io::Error::other("effect output texture is not allocated"))?;
+        let variant = u8::from(
+            pass.kind == RenderPassKind::DualKawaseDownsample
+                && fragment_shader == blur::DUAL_KAWASE_DOWNSAMPLE_LINEAR_SHADER,
+        );
+        return execute_kawase_texture_stage(
+            renderer,
+            input_texture,
+            FullscreenTextureLayout::from(input_plan),
+            output_binding,
+            FullscreenTextureLayout::from(output_plan),
+            pass.kind,
+            pass.blur_radius.unwrap_or(1.0),
+            variant,
+            framebuffer_origin,
+            Some((execution_damage, output_plan)),
+            targets,
+        );
+    }
     let module = if blur_shader {
         match pass.kind {
             RenderPassKind::DualKawaseDownsample => {

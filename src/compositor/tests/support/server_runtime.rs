@@ -2162,8 +2162,7 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                                 committed_region: snapshot.committed_region,
                                 committed_cursor_position_hint: snapshot
                                     .committed_cursor_position_hint,
-                            },
-                        );
+                            });
                         let _ = reply.send(snapshot);
                     }
                     ServerCommand::CaptureLastPointerPosition(reply) => {

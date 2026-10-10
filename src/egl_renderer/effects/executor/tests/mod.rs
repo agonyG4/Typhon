@@ -71,7 +71,7 @@ fn compile_builtin_background_blur(
             frame_demand: oblivion_one::effects::EffectFrameDemand::OnDamage,
             visual_group: None,
             anchor_scope: oblivion_one::compositor::EffectAnchorScope::VisualGroup,
-            backdrop_reuse: crate::compositor::EffectBackdropReuse::Exact,
+            backdrop_reuse: oblivion_one::compositor::EffectBackdropReuse::Exact,
             scene_order: oblivion_one::compositor::EffectSceneOrder::for_anchor(anchor),
         }],
     );

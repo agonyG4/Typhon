@@ -1,3 +1,6 @@
+use super::super::gpu_timing::{
+    CaptureTimingMetadata, GraphTimingScope, PassTimingSpan, PassTimingWork,
+};
 use super::*;
 use glow::HasContext;
 
@@ -98,6 +101,119 @@ impl<'a> EffectExecutionContext<'a> {
         visual_group: Option<VisualGroupId>,
     ) -> Option<u32> {
         self.scene.presentation_owner_for_visual_group(visual_group)
+    }
+
+    pub(in crate::egl_renderer) fn begin_precomputed_build_scope(
+        &mut self,
+    ) -> Option<GraphTimingScope> {
+        self.runtime
+            .effect_gpu_profiler
+            .begin_precomputed_build(self.gl, self.runtime.effect_trace.frame_id())
+    }
+
+    pub(in crate::egl_renderer) fn begin_precomputed_build_stage(
+        &mut self,
+        scope: GraphTimingScope,
+        stage_index: usize,
+        kind: RenderPassKind,
+        work: PassTimingWork,
+        capture: Option<CaptureTimingMetadata>,
+    ) -> Option<PassTimingSpan> {
+        self.runtime.effect_gpu_profiler.begin_precomputed_stage(
+            self.gl,
+            scope,
+            stage_index,
+            kind,
+            work,
+            capture,
+        )
+    }
+
+    pub(in crate::egl_renderer) fn end_precomputed_build_stage(
+        &mut self,
+        span: Option<PassTimingSpan>,
+    ) {
+        self.runtime
+            .effect_gpu_profiler
+            .end_pass(self.gl, span, None, 0);
+    }
+
+    pub(in crate::egl_renderer) fn end_precomputed_build_scope(
+        &mut self,
+        scope: Option<GraphTimingScope>,
+    ) -> bool {
+        self.runtime.effect_gpu_profiler.end_graph(self.gl, scope)
+    }
+
+    pub(in crate::egl_renderer) fn replay_precomputed_backdrop_capture(
+        &mut self,
+        capture_texture: &PooledEffectTexture,
+        anchor: oblivion_one::compositor::EffectAnchor,
+        visual_group: Option<VisualGroupId>,
+        anchor_scope: oblivion_one::compositor::EffectAnchorScope,
+        framebuffer_origin: OutputFramebufferOrigin,
+    ) -> RendererResult<Option<GraphTimingScope>> {
+        let output_size = self.scene.current_size;
+        let capture_pixels = u64::from(output_size.0).saturating_mul(u64::from(output_size.1));
+        let capture_work = PassTimingWork {
+            effect_pixels: capture_pixels,
+            damage_rect_count: 1,
+            damage_bbox_pixels: capture_pixels,
+            target_width: output_size.0,
+            target_height: output_size.1,
+        };
+        let (prefix_end, _) = composition_range_with_metadata(
+            &self.scene.commands,
+            &self.scene.capture_layers,
+            &self.scene.capture_visual_groups,
+            anchor,
+            visual_group,
+            anchor_scope,
+        );
+        let full_output = [OutputRect::new(0, 0, output_size.0, output_size.1)];
+        let timing_scope = self.begin_precomputed_build_scope();
+        let capture_span = timing_scope.and_then(|scope| {
+            self.begin_precomputed_build_stage(
+                scope,
+                0,
+                RenderPassKind::SceneCapture,
+                capture_work,
+                Some(CaptureTimingMetadata {
+                    mode: super::super::gpu_timing::CaptureTimingMode::Replay,
+                    checkpoint_count: 0,
+                }),
+            )
+        });
+        let capture_result: RendererResult<()> = (|| {
+            let framebuffer = self
+                .runtime
+                .effect_resources
+                .bind_draw_target(self.gl, capture_texture)?;
+            self.establish_scene_state_for_framebuffer(Some(framebuffer));
+            unsafe {
+                self.gl.disable(glow::SCISSOR_TEST);
+                self.gl.disable(glow::BLEND);
+                self.gl.clear_color(0.0, 0.0, 0.0, 1.0);
+                self.gl.clear(glow::COLOR_BUFFER_BIT);
+            }
+            self.draw_effect_scene_range(
+                &full_output,
+                0,
+                prefix_end,
+                framebuffer_origin,
+                EffectFramebufferTarget::new(Some(framebuffer)),
+            )
+        })();
+        self.runtime.effect_resources.unbind_render_target(self.gl);
+        self.establish_scene_state_for_framebuffer(self.scene.active_output_framebuffer);
+        self.end_precomputed_build_stage(capture_span);
+        match capture_result {
+            Ok(()) => Ok(timing_scope),
+            Err(error) => {
+                self.end_precomputed_build_scope(timing_scope);
+                Err(error)
+            }
+        }
     }
 }
 
