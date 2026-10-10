@@ -51,18 +51,14 @@ pub(crate) use executor::{execute_effect_graph, execute_effect_graph_with_debug_
 pub(crate) use executor::{execute_effect_graph_for_lifecycle, select_effect_execution};
 pub(super) use executor::{
     execute_prepared_effect_graph_core, finish_prepared_effect_graph_execution,
-    prepare_effect_graph_execution,
+    prepare_effect_graph_execution, prepare_effect_graph_execution_with_external_bindings,
 };
 pub(crate) use metrics::{EffectFailureReason, EffectGraphMetrics, graph_metrics};
 #[cfg(test)]
 pub(crate) use resources::checkpoint_capture_cache_key;
 pub(crate) use resources::{
     EffectGlResourceCache, EffectTextureFilter, EffectTextureFormat, EffectTextureKey,
-    PooledEffectTexture,
-};
-pub(crate) use resources::{
-    EffectTextureFilter, EffectTextureFormat, EffectTextureKey, GraphTextureBinding,
-    PooledEffectTexture,
+    GraphTextureBinding, PooledEffectTexture,
 };
 pub(super) use runtime::{EffectRuntime, EffectRuntimeCaptureSnapshot};
 #[cfg(test)]
