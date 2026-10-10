@@ -1,15 +1,11 @@
 use std::{
     collections::HashSet,
     fs, io, iter,
-    os::fd::{AsFd, AsRawFd},
+    os::fd::{AsFd, AsRawFd, BorrowedFd},
     os::unix::fs::MetadataExt,
-    ptr,
     time::Instant,
 };
 
-use gbm::AsRaw as _;
-use glow::HasContext;
-use khronos_egl as egl;
 use oblivion_one::compositor::{
     CompositorFrameBatchId, DirectScanoutFeedbackCapabilities, DirectScanoutFormatCapability,
     DmabufKmsPreferredState, DrmContentType, FrameBatchDiscardReason, OwnCompositorServer,
@@ -25,13 +21,9 @@ use oblivion_one::render_backend::{
     egl_gles::EglGlesDmabufFormat,
 };
 
-use crate::egl_renderer::dmabuf::{query_egl_main_device, query_egl_renderable_dmabuf_formats};
-use crate::egl_renderer::native_fence::{NativeFenceFunctions, NativeRenderFence};
+use crate::egl_renderer::native_fence::NativeRenderFence;
 use crate::egl_renderer::{
-    CreatedGlesContext, EglContextPriorityPolicy, EglFrameOutcome, EglInstance,
-    EglOutputRenderTarget, EglSceneFrameCommit, FrameSkipReason, GlesSceneRenderer, OutputDamage,
-    OutputFramebufferOrigin, choose_surfaceless_egl_config, create_compositor_gles_context,
-    detect_partial_repaint_capabilities, load_egl_image_target_texture_2d,
+    EglSceneFrameCommit, FrameSkipReason, GlesSceneFrameStats, OutputDamage,
 };
 use crate::native_output::runtime::take_client_cursor_presentation_feedback_batch;
 use crate::native_output::runtime::{
@@ -43,6 +35,8 @@ use crate::native_output::runtime::{
 use oblivion_one::window_lifecycle_animation::LifecycleRenderFallbacks;
 
 use super::atomic_direct::{direct_candidate_key, direct_scanout_debug};
+use super::atomic_render_domain::{AtomicRenderDomain, AtomicRenderDomainBootstrap};
+pub(crate) use super::atomic_render_domain::{AtomicRenderedFrameParts, AtomicSlotRenderOutcome};
 use super::*;
 use crate::native_output::presentation::async_validation::CompositedPresentationValidationKey;
 use crate::native_output::presentation::transaction::{
@@ -51,6 +45,14 @@ use crate::native_output::presentation::transaction::{
 
 fn elapsed_nanos(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
+fn teardown_render_before_physical(
+    destroy_render_domain: impl FnOnce(),
+    release_physical_pool: impl FnOnce(),
+) {
+    destroy_render_domain();
+    release_physical_pool();
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -71,14 +73,9 @@ mod worker;
 mod atomic_egl_gbm_transactions;
 
 pub(crate) struct AtomicEglGbmScanout {
-    _device: gbm::Device<std::os::fd::OwnedFd>,
-    egl: EglInstance,
-    egl_display: egl::Display,
-    egl_context: egl::Context,
-    gl: glow::Context,
-    scene: GlesSceneRenderer,
-    native_fence_functions: NativeFenceFunctions,
-    pool: Option<AtomicOutputPool>,
+    _physical_device: gbm::Device<std::os::fd::OwnedFd>,
+    physical_pool: Option<AtomicPhysicalOutputPool>,
+    render_domain: AtomicRenderDomain,
     swapchain: Option<AtomicOutputSwapchain>,
     direct: DirectScanoutControl,
     width: u32,
@@ -224,9 +221,75 @@ impl GbmAllocationProbe for DeviceAllocationProbe<'_> {
     }
 }
 
+fn create_physical_output_pool(
+    device: &gbm::Device<std::os::fd::OwnedFd>,
+    drm: BorrowedFd<'_>,
+    width: u32,
+    height: u32,
+    format_modifier: DrmFormatModifierPair,
+    pool_generation: u64,
+) -> io::Result<AtomicPhysicalOutputPool> {
+    let format = gbm::Format::try_from(format_modifier.fourcc)
+        .map_err(|_| io::Error::other("selected output FourCC is unsupported by GBM"))?;
+    let usage = gbm::BufferObjectFlags::SCANOUT | gbm::BufferObjectFlags::RENDERING;
+    let mut physical_slots = Vec::with_capacity(EXPLICIT_OUTPUT_SLOT_CAPACITY);
+
+    for raw_id in 0..EXPLICIT_OUTPUT_SLOT_CAPACITY {
+        let mut framebuffer_created = None;
+        let slot = (|| {
+            let bo = device.create_buffer_object_with_modifiers2::<()>(
+                width,
+                height,
+                format,
+                iter::once(gbm::Modifier::from(format_modifier.modifier)),
+                usage,
+            )?;
+            let descriptor = explicit_framebuffer_descriptor(&bo)?;
+            let framebuffer = add_explicit_framebuffer(drm, &descriptor)?;
+            framebuffer_created = Some(framebuffer);
+            let id = OutputSlotId::new(u8::try_from(raw_id).unwrap()).unwrap();
+            let physical = AtomicOutputSlotBacking::new(id, pool_generation, bo, framebuffer);
+            Ok(physical)
+        })();
+
+        match slot {
+            Ok(physical) => physical_slots.push(physical),
+            Err(error) => {
+                if let Some(framebuffer) = framebuffer_created {
+                    let _ = drm_ffi::mode::rm_fb(drm, framebuffer.get());
+                }
+                AtomicPhysicalOutputPool::remove_framebuffers(&physical_slots, drm);
+                drop(physical_slots);
+                return Err(error);
+            }
+        }
+    }
+
+    if let Err(error) = AtomicPhysicalOutputPool::validate_slots(&physical_slots, pool_generation) {
+        AtomicPhysicalOutputPool::remove_framebuffers(&physical_slots, drm);
+        drop(physical_slots);
+        return Err(error);
+    }
+    let physical_slots: [AtomicOutputSlotBacking; EXPLICIT_OUTPUT_SLOT_CAPACITY] =
+        match physical_slots.try_into() {
+            Ok(slots) => slots,
+            Err(slots) => {
+                AtomicPhysicalOutputPool::remove_framebuffers(&slots, drm);
+                drop(slots);
+                return Err(io::Error::other(
+                    "explicit physical output pool did not construct 3 slots",
+                ));
+            }
+        };
+    Ok(AtomicPhysicalOutputPool::from_validated_slots(
+        physical_slots,
+        pool_generation,
+    ))
+}
+
 impl AtomicEglGbmScanout {
     pub(crate) fn finish_render_work(&self) {
-        unsafe { self.gl.finish() };
+        self.render_domain.finish_render_work();
     }
 
     pub(crate) fn import_scaled_probe_framebuffer(
@@ -239,11 +302,11 @@ impl AtomicEglGbmScanout {
     }
 
     pub(crate) fn lifecycle_animation_available(&self) -> bool {
-        self.scene.lifecycle_animation_available()
+        self.render_domain.lifecycle_animation_available()
     }
 
     pub(crate) fn squash_animation_available(&self) -> bool {
-        self.scene.squash_animation_available()
+        self.render_domain.squash_animation_available()
     }
 
     pub(crate) fn reload_trusted_effect_registry(
@@ -254,7 +317,7 @@ impl AtomicEglGbmScanout {
         std::sync::Arc<oblivion_one::effects::EffectRegistryGeneration>,
         oblivion_one::effects::RegistryReloadError,
     > {
-        self.scene
+        self.render_domain
             .reload_trusted_effect_registry(registry, manifest)
     }
 
@@ -262,21 +325,23 @@ impl AtomicEglGbmScanout {
         &mut self,
         generation: &oblivion_one::effects::EffectRegistryGeneration,
     ) {
-        self.scene.publish_material_effect_generation(generation);
+        self.render_domain
+            .publish_material_effect_generation(generation);
     }
 
     pub(crate) fn publish_effect_registry_generation(
         &mut self,
         generation: oblivion_one::effects::EffectRegistryGeneration,
     ) -> Result<(), oblivion_one::effects::RegistryReloadError> {
-        self.scene.publish_effect_registry_generation(generation)
+        self.render_domain
+            .publish_effect_registry_generation(generation)
     }
 
     pub(crate) fn set_cursor_image(
         &mut self,
         image: std::sync::Arc<oblivion_one::cursor_theme::CompositorCursorImage>,
     ) {
-        self.scene.set_cursor_image(image);
+        self.render_domain.set_cursor_image(image);
     }
     pub(crate) fn prepare_session_recovery(&self) -> io::Result<AtomicExplicitRecovery> {
         let swapchain = self.swapchain()?;
@@ -313,12 +378,12 @@ impl AtomicEglGbmScanout {
             return Ok(NativeSessionRecoveryProgress::WaitingForSuspendedFence);
         }
         while let Some(frame) = self.swapchain_mut()?.take_suspended_frame() {
-            self.scene.discard_rendered(frame.scene_commit);
+            self.render_domain.discard_rendered(frame.scene_commit);
             drop(frame.surface_damage);
         }
         self.swapchain_mut()?.recover_suspended_slot(true)?;
         if let Some(frame) = self.swapchain_mut()?.retire_pending_after_recovery() {
-            self.scene.discard_rendered(frame.scene_commit);
+            self.render_domain.discard_rendered(frame.scene_commit);
             drop(frame.surface_damage);
         }
         match self.direct.complete_suspended() {
@@ -403,15 +468,35 @@ impl AtomicEglGbmScanout {
     ) {
         self.vrr_connector_capable = vrr_connector_capable;
         self.vrr_crtc_property_available = vrr_crtc_property_available;
-        let Some(pool) = self.pool.as_mut() else {
+        let Some(pool) = self.physical_pool.as_ref() else {
             return;
         };
+        validate_split_slot_pairing(
+            &pool.identities(),
+            &self.render_domain.pool_identities(),
+            pool.pool_generation(),
+        )
+        .expect("session recovery starts with exactly paired Atomic pools");
         if let Some(swapchain) = self.swapchain.as_mut() {
             swapchain
                 .rebind_pool_generation(generation)
                 .expect("recovery retires all non-current explicit output ownership");
         }
-        pool.rebind_pool_generation(generation);
+        self.physical_pool
+            .as_mut()
+            .expect("physical pool was checked above")
+            .rebind_pool_generation(generation);
+        self.render_domain.rebind_pool_generation(generation);
+        validate_split_slot_pairing(
+            &self
+                .physical_pool
+                .as_ref()
+                .expect("physical pool remains installed during recovery")
+                .identities(),
+            &self.render_domain.pool_identities(),
+            generation,
+        )
+        .expect("session recovery rebinds physical and render pools together");
         self.direct
             .framebuffer_cache
             .clear_for_generation(generation);
@@ -423,7 +508,7 @@ impl AtomicEglGbmScanout {
         self.async_output_generation = generation;
         self.presentation_validation_accepted.clear();
         self.presentation_validation_rejected.clear();
-        self.scene.invalidate_presented_damage_history();
+        self.render_domain.invalidate_presented_damage_history();
     }
 
     pub(crate) fn composited_presentation_validation_key(
@@ -579,297 +664,148 @@ impl AtomicEglGbmScanout {
         pool_generation: u64,
         output_id: OutputId,
     ) -> io::Result<Self> {
-        let gbm_fd = duplicate_fd_cloexec(kms.as_raw_fd()).map_err(io::Error::from_raw_os_error)?;
-        let device = gbm::Device::new(gbm_fd)?;
-        let egl = unsafe { EglInstance::load_required() }.map_err(native_egl_io_error)?;
-        const EGL_PLATFORM_GBM_KHR: egl::Enum = 0x31d7;
-        let egl_display = unsafe {
-            egl.get_platform_display(
-                EGL_PLATFORM_GBM_KHR,
-                device.as_raw_mut() as egl::NativeDisplayType,
-                &[egl::ATTRIB_NONE],
-            )
-        }
-        .map_err(native_egl_io_error)?;
-        egl.initialize(egl_display).map_err(native_egl_io_error)?;
-        let mut created_context = None;
-        let result = (|| {
-            egl.bind_api(egl::OPENGL_ES_API)
-                .map_err(native_egl_io_error)?;
-            let extensions = egl
-                .query_string(Some(egl_display), egl::EXTENSIONS)
-                .map_err(native_egl_io_error)?
-                .to_string_lossy();
-            for required in [
-                "EGL_KHR_surfaceless_context",
-                "EGL_KHR_image_base",
-                "EGL_EXT_image_dma_buf_import",
-                "EGL_EXT_image_dma_buf_import_modifiers",
-            ] {
-                if !extensions
-                    .split_ascii_whitespace()
-                    .any(|entry| entry == required)
-                {
-                    return Err(io::Error::other(format!(
-                        "explicit Atomic EGL/GBM requires {required}"
-                    )));
-                }
-            }
+        let physical_fd =
+            duplicate_fd_cloexec(kms.as_raw_fd()).map_err(io::Error::from_raw_os_error)?;
+        let physical_device = gbm::Device::new(physical_fd)?;
+        let render_fd =
+            duplicate_fd_cloexec(kms.as_raw_fd()).map_err(io::Error::from_raw_os_error)?;
+        let render_device = gbm::Device::new(render_fd)?;
+        let render_bootstrap = AtomicRenderDomainBootstrap::new(render_device)?;
 
-            let egl_formats = query_egl_renderable_dmabuf_formats(&egl, egl_display);
-            let mut probe = DeviceAllocationProbe {
-                device: &device,
-                width,
-                height,
-            };
-            let format_modifier = select_output_format_modifier_for_presentation(
-                oblivion_one::compositor::OutputPresentationMode::Vsync,
-                &discovery.plane_scanout_formats,
-                Some(&discovery.plane_async_scanout_formats),
-                &egl_formats,
-                &mut probe,
-            )?;
-            let config = choose_surfaceless_egl_config(&egl, egl_display, format_modifier.fourcc)
-                .map_err(native_egl_io_error)?;
-            let context_policy = EglContextPriorityPolicy::from_environment();
-            let created_gles_context: CreatedGlesContext =
-                create_compositor_gles_context(&egl, egl_display, config, context_policy)
-                    .map_err(native_egl_io_error)?;
-            let egl_context = created_gles_context.context;
-            let priority_report = created_gles_context.priority;
-            created_context = Some(egl_context);
-            if let Err(error) = egl.make_current(egl_display, None, None, Some(egl_context)) {
-                return Err(native_egl_io_error(error));
-            }
-            let image_target = load_egl_image_target_texture_2d(&egl).ok_or_else(|| {
-                io::Error::other("explicit Atomic EGL/GBM requires GL_OES_EGL_image")
-            })?;
-            let native_fence_functions =
-                NativeFenceFunctions::load(&egl, egl_display).map_err(|error| {
-                    io::Error::other(format!(
-                        "native output fence initialization failed: {error}"
-                    ))
-                })?;
-            let gl = unsafe {
-                glow::Context::from_loader_function(|name| {
-                    egl.get_proc_address(name)
-                        .map(|symbol| symbol as *const _)
-                        .unwrap_or(ptr::null())
-                })
-            };
-            let scene = GlesSceneRenderer::new_current(
-                &egl,
-                width,
-                height,
-                Some(image_target),
-                detect_partial_repaint_capabilities(&egl, egl_display, true, true, false),
-                oblivion_one::cursor_theme::shared_compositor_cursor_image(),
-            )
-            .map_err(native_egl_io_error)?;
-            let dmabuf_egl_vendor = egl
-                .query_string(Some(egl_display), egl::VENDOR)
-                .map(|value| value.to_string_lossy().into_owned())
-                .unwrap_or_else(|_| "unknown".to_string());
-            let renderer_dmabuf_feedback = query_egl_dmabuf_feedback(&egl, egl_display);
-            let scanout_capabilities = discover_direct_scanout_capabilities(
-                &discovery.plane_scanout_formats,
-                &renderer_dmabuf_feedback,
-            );
-            let scanout_capabilities = DirectScanoutFeedbackCapabilities::new(
-                kms.metadata()?.rdev(),
-                pool_generation,
-                discovery.pipeline.plane.get(),
-                scanout_capabilities,
-            );
-            let kms_presentable_client_formats = discover_kms_presentable_client_formats(
-                &discovery.plane_scanout_formats,
-                renderer_dmabuf_feedback.formats(),
-            );
-            let kms_preferred_selection = resolve_kms_preferred_dmabuf_policy(
-                KmsPreferredDmabufPolicy::from_env(),
-                &dmabuf_egl_vendor,
-                renderer_dmabuf_feedback.formats(),
-                &kms_presentable_client_formats,
-            );
-            let dmabuf_kms_preferred_state = kms_preferred_selection.summary();
-            let dmabuf_feedback = EglGlesDmabufFeedback::with_scanout_tranche(
-                scanout_capabilities.formats.iter().map(|format| {
-                    EglGlesDmabufFormat::new(
-                        DrmFormat::from_fourcc(format.format),
-                        DrmModifier(format.modifier),
-                    )
-                }),
-                kms_preferred_selection.advertised_renderer_formats,
-            );
-            let (dmabuf_main_device_path, dmabuf_main_device) =
-                query_egl_main_device(&egl, egl_display)
-                    .map_or((None, None), |(path, device)| (Some(path), Some(device)));
-            let format = gbm::Format::try_from(format_modifier.fourcc)
-                .map_err(|_| io::Error::other("selected output FourCC is unsupported by GBM"))?;
-            let usage = gbm::BufferObjectFlags::SCANOUT | gbm::BufferObjectFlags::RENDERING;
-            let drm = kms.as_fd();
-            let mut slots = Vec::with_capacity(EXPLICIT_OUTPUT_SLOT_CAPACITY);
-            for raw_id in 0..EXPLICIT_OUTPUT_SLOT_CAPACITY {
-                let slot = (|| {
-                    let bo = device.create_buffer_object_with_modifiers2::<()>(
-                        width,
-                        height,
-                        format,
-                        iter::once(gbm::Modifier::from(format_modifier.modifier)),
-                        usage,
-                    )?;
-                    let descriptor = explicit_framebuffer_descriptor(&bo)?;
-                    let framebuffer = add_explicit_framebuffer(drm, &descriptor)?;
-                    let id = OutputSlotId::new(u8::try_from(raw_id).unwrap()).unwrap();
-                    let physical =
-                        AtomicOutputSlotBacking::new(id, pool_generation, bo, framebuffer);
-                    let render_import = physical.render_descriptor().and_then(|descriptor| {
-                        AtomicRenderSlot::import(descriptor, &egl, egl_display, &gl, image_target)
-                    });
-                    let render =
-                        remove_framebuffer_after_render_import_failure(render_import, || {
-                            let _ = drm_ffi::mode::rm_fb(drm, framebuffer.get());
-                        })?;
-                    Ok(AtomicOutputSlotPair { physical, render })
-                })();
-                match slot {
-                    Ok(slot) => slots.push(slot),
-                    Err(error) => {
-                        teardown_atomic_slot_pairs(&slots, &gl, &egl, egl_display, drm);
-                        drop(slots);
-                        return Err(error);
-                    }
+        let mut probe = DeviceAllocationProbe {
+            device: &physical_device,
+            width,
+            height,
+        };
+        let format_modifier = select_output_format_modifier_for_presentation(
+            oblivion_one::compositor::OutputPresentationMode::Vsync,
+            &discovery.plane_scanout_formats,
+            Some(&discovery.plane_async_scanout_formats),
+            render_bootstrap.renderable_dmabuf_formats(),
+            &mut probe,
+        )?;
+        let (mut render_domain, render_info) =
+            render_bootstrap.initialize_renderer(width, height, format_modifier)?;
+
+        let scanout_capabilities = discover_direct_scanout_capabilities(
+            &discovery.plane_scanout_formats,
+            &render_info.dmabuf_feedback,
+        );
+        let scanout_capabilities = DirectScanoutFeedbackCapabilities::new(
+            kms.metadata()?.rdev(),
+            pool_generation,
+            discovery.pipeline.plane.get(),
+            scanout_capabilities,
+        );
+        let kms_presentable_client_formats = discover_kms_presentable_client_formats(
+            &discovery.plane_scanout_formats,
+            render_info.dmabuf_feedback.formats(),
+        );
+        let kms_preferred_selection = resolve_kms_preferred_dmabuf_policy(
+            KmsPreferredDmabufPolicy::from_env(),
+            &render_info.egl_vendor,
+            render_info.dmabuf_feedback.formats(),
+            &kms_presentable_client_formats,
+        );
+        let dmabuf_kms_preferred_state = kms_preferred_selection.summary();
+        let dmabuf_feedback = EglGlesDmabufFeedback::with_scanout_tranche(
+            scanout_capabilities.formats.iter().map(|format| {
+                EglGlesDmabufFormat::new(
+                    DrmFormat::from_fourcc(format.format),
+                    DrmModifier(format.modifier),
+                )
+            }),
+            kms_preferred_selection.advertised_renderer_formats,
+        );
+        let drm = kms.as_fd();
+        let physical_pool = create_physical_output_pool(
+            &physical_device,
+            drm,
+            width,
+            height,
+            format_modifier,
+            pool_generation,
+        )?;
+        let mut physical_pool = Some(physical_pool);
+        let physical_pool_ref = physical_pool
+            .as_ref()
+            .expect("physical pool is retained until render import finishes");
+        let physical_identities = physical_pool_ref.identities();
+        let descriptors = match physical_pool_ref.export_render_slot_descriptors() {
+            Ok(descriptors) => descriptors,
+            Err(error) => {
+                if let Some(pool) = physical_pool.take() {
+                    pool.teardown(drm, true);
                 }
-            }
-            if let Err(error) = AtomicOutputPool::validate_pairs(&slots, pool_generation) {
-                teardown_atomic_slot_pairs(&slots, &gl, &egl, egl_display, drm);
-                drop(slots);
                 return Err(error);
             }
-            let slots: [AtomicOutputSlotPair; EXPLICIT_OUTPUT_SLOT_CAPACITY] =
-                match slots.try_into() {
-                    Ok(slots) => slots,
-                    Err(slots) => {
-                        teardown_atomic_slot_pairs(&slots, &gl, &egl, egl_display, drm);
-                        drop(slots);
-                        return Err(io::Error::other(
-                            "explicit output pool did not construct 3 slots",
-                        ));
-                    }
-                };
-            let [slot0, slot1, slot2] = slots;
-            let physical_slots = [slot0.physical, slot1.physical, slot2.physical];
-            let render_slots = [slot0.render, slot1.render, slot2.render];
-            let pool = AtomicOutputPool::from_validated_slots(
-                physical_slots,
-                render_slots,
-                pool_generation,
-            );
-            priority_report.log_startup("atomic-egl-gbm");
-            Ok((
-                egl_context,
-                gl,
-                native_fence_functions,
-                scene,
-                pool,
-                format_modifier,
-                dmabuf_feedback,
-                dmabuf_main_device,
-                dmabuf_main_device_path,
-                dmabuf_egl_vendor,
-                scanout_capabilities,
-                dmabuf_kms_preferred_state,
-            ))
-        })();
-
-        match result {
-            Ok((
-                egl_context,
-                gl,
-                native_fence_functions,
-                scene,
-                pool,
-                format_modifier,
-                dmabuf_feedback,
-                dmabuf_main_device,
-                dmabuf_main_device_path,
-                dmabuf_egl_vendor,
-                scanout_capabilities,
-                dmabuf_kms_preferred_state,
-            )) => Ok(Self {
-                _device: device,
-                egl,
-                egl_display,
-                egl_context,
-                gl,
-                scene,
-                native_fence_functions,
-                pool: Some(pool),
-                swapchain: None,
-                direct: DirectScanoutControl::new(kms.as_fd(), pool_generation, output_id),
-                width,
-                height,
-                dmabuf_feedback,
-                dmabuf_main_device,
-                dmabuf_main_device_path,
-                dmabuf_egl_vendor,
-                dmabuf_scanout_capabilities: scanout_capabilities,
-                dmabuf_kms_preferred_state,
-                format_modifier,
-                drm_cleanup_armed: true,
-                deadline_hints_enabled: true,
-                counters: ExplicitOutputCounters::default(),
-                async_page_flip_capable: discovery.optional.async_page_flip,
-                async_format_capable: discovery
-                    .plane_async_scanout_formats
-                    .contains(&format_modifier),
-                vrr_connector_capable: discovery.pipeline.connector_props.vrr_capable.is_some()
-                    && discovery
-                        .pipeline
-                        .connector_props
-                        .vrr_capable_value
-                        .is_some_and(|value| value != 0),
-                vrr_crtc_property_available: discovery.pipeline.crtc_props.vrr_enabled.is_some(),
-                connector_content_types: [
-                    DrmContentType::Graphics,
-                    DrmContentType::Photo,
-                    DrmContentType::Cinema,
-                    DrmContentType::Game,
-                ]
-                .into_iter()
-                .filter(|content_type| {
-                    discovery
-                        .pipeline
-                        .connector_props
-                        .content_type_value(content_type.as_str())
-                        .is_some()
-                })
-                .collect(),
-                async_crtc_id: discovery.pipeline.crtc.get(),
-                async_primary_plane_id: discovery.pipeline.plane.get(),
-                async_output_generation: pool_generation,
-                presentation_validation_accepted: HashSet::new(),
-                presentation_validation_rejected: HashSet::new(),
-            }),
-            Err(error) => {
-                let _ = egl.make_current(egl_display, None, None, None);
-                if let Some(context) = created_context {
-                    let _ = egl.destroy_context(egl_display, context);
-                }
-                let _ = egl.terminate(egl_display);
-                Err(error)
+        };
+        let render_import = render_domain.install_pool(
+            descriptors,
+            physical_pool_ref.pool_generation(),
+            &physical_identities,
+        );
+        remove_framebuffer_after_render_import_failure(render_import, || {
+            if let Some(pool) = physical_pool.take() {
+                pool.teardown(drm, true);
             }
-        }
+        })?;
+        let physical_pool = physical_pool.expect("successful render import retains physical pool");
+
+        Ok(Self {
+            _physical_device: physical_device,
+            physical_pool: Some(physical_pool),
+            render_domain,
+            swapchain: None,
+            direct: DirectScanoutControl::new(kms.as_fd(), pool_generation, output_id),
+            width,
+            height,
+            dmabuf_feedback,
+            dmabuf_main_device: render_info.dmabuf_main_device,
+            dmabuf_main_device_path: render_info.dmabuf_main_device_path,
+            dmabuf_egl_vendor: render_info.egl_vendor,
+            dmabuf_scanout_capabilities: scanout_capabilities,
+            dmabuf_kms_preferred_state,
+            format_modifier,
+            drm_cleanup_armed: true,
+            deadline_hints_enabled: true,
+            counters: ExplicitOutputCounters::default(),
+            async_page_flip_capable: discovery.optional.async_page_flip,
+            async_format_capable: discovery
+                .plane_async_scanout_formats
+                .contains(&format_modifier),
+            vrr_connector_capable: discovery.pipeline.connector_props.vrr_capable.is_some()
+                && discovery
+                    .pipeline
+                    .connector_props
+                    .vrr_capable_value
+                    .is_some_and(|value| value != 0),
+            vrr_crtc_property_available: discovery.pipeline.crtc_props.vrr_enabled.is_some(),
+            connector_content_types: [
+                DrmContentType::Graphics,
+                DrmContentType::Photo,
+                DrmContentType::Cinema,
+                DrmContentType::Game,
+            ]
+            .into_iter()
+            .filter(|content_type| {
+                discovery
+                    .pipeline
+                    .connector_props
+                    .content_type_value(content_type.as_str())
+                    .is_some()
+            })
+            .collect(),
+            async_crtc_id: discovery.pipeline.crtc.get(),
+            async_primary_plane_id: discovery.pipeline.plane.get(),
+            async_output_generation: pool_generation,
+            presentation_validation_accepted: HashSet::new(),
+            presentation_validation_rejected: HashSet::new(),
+        })
     }
 
     pub(crate) fn create_render_fence(&self) -> io::Result<NativeRenderFence> {
-        NativeRenderFence::create(
-            &self.egl,
-            self.egl_display,
-            &self.gl,
-            self.native_fence_functions,
-        )
-        .map_err(|error| io::Error::other(format!("native render fence export failed: {error}")))
+        self.render_domain.create_render_fence()
     }
 
     pub(crate) fn duplicate_ready_render_completion_fd(&self) -> io::Result<std::os::fd::OwnedFd> {
@@ -903,10 +839,10 @@ impl AtomicEglGbmScanout {
     }
 
     pub(crate) fn plane_count(&self) -> io::Result<u32> {
-        self.pool
+        self.physical_pool
             .as_ref()
-            .map(|pool| pool.physical_slots[0].bo.plane_count())
-            .ok_or_else(|| io::Error::other("explicit output pool is unavailable"))
+            .ok_or_else(|| io::Error::other("explicit output pool is unavailable"))?
+            .plane_count()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -918,38 +854,16 @@ impl AtomicEglGbmScanout {
         gpu_sampling_started: &mut bool,
         mut phase_durations: Option<&mut AtomicRenderPhaseDurations>,
     ) -> io::Result<AtomicSlotRenderOutcome> {
-        let context_activation_started = phase_durations.as_ref().map(|_| Instant::now());
-        let context_activation =
-            self.egl
-                .make_current(self.egl_display, None, None, Some(self.egl_context));
-        if let (Some(durations), Some(started)) =
-            (phase_durations.as_deref_mut(), context_activation_started)
-        {
-            durations.egl_context_activation_ns = elapsed_nanos(started);
-        }
-        context_activation.map_err(native_egl_io_error)?;
-
         let target_preparation_started = phase_durations.as_ref().map(|_| Instant::now());
-        let (render_target, framebuffer, sampleable_texture) = {
-            let pool = self
-                .pool
-                .as_ref()
-                .ok_or_else(|| io::Error::other("explicit output pool is unavailable"))?;
-            let presentation_serial = self
-                .swapchain
-                .as_ref()
-                .map_or(0, AtomicOutputSwapchain::presentation_serial);
-            let render_target = pool.render_target_request(slot, presentation_serial)?;
-            let render_slot = pool.render_slot_for_request(render_target)?;
-            (
-                render_target,
-                render_slot.gl_framebuffer,
-                render_slot.texture,
-            )
-        };
-        let request = frozen_frame
-            .draw_request(Some(frame_id))
-            .ok_or_else(|| io::Error::other("frozen render frame request already consumed"))?;
+        let presentation_serial = self
+            .swapchain
+            .as_ref()
+            .map_or(0, AtomicOutputSwapchain::presentation_serial);
+        let target = self
+            .physical_pool
+            .as_ref()
+            .ok_or_else(|| io::Error::other("explicit physical output pool is unavailable"))?
+            .render_target_request(slot, presentation_serial)?;
         if let (Some(durations), Some(started)) =
             (phase_durations.as_deref_mut(), target_preparation_started)
         {
@@ -957,73 +871,13 @@ impl AtomicEglGbmScanout {
                 .render_target_preparation_ns
                 .saturating_add(elapsed_nanos(started));
         }
-        let started = Instant::now();
-        *gpu_sampling_started = true;
-        let scene_drawing_started = phase_durations.as_ref().map(|_| Instant::now());
-        let outcome = self.scene.draw_scene_to_target(
-            &self.egl,
-            self.egl_display,
-            EglOutputRenderTarget {
-                framebuffer,
-                sampleable_texture: Some(sampleable_texture),
-                width: self.width,
-                height: self.height,
-                buffer_age: render_target.buffer_age,
-                framebuffer_origin: OutputFramebufferOrigin::TopLeftScanout,
-            },
-            request,
-        );
-        if let (Some(durations), Some(scene_started)) =
-            (phase_durations.as_deref_mut(), scene_drawing_started)
-        {
-            durations.scene_drawing_ns = elapsed_nanos(scene_started);
-        }
-        let outcome = outcome.map_err(native_egl_io_error)?;
-        match outcome {
-            EglFrameOutcome::Rendered {
-                commit,
-                stats,
-                lifecycle_evidence,
-            } => {
-                self.scene.trace_render_fence_export_begin();
-                let fence_started = phase_durations.as_ref().map(|_| Instant::now());
-                let fence_result = self.create_render_fence();
-                if let (Some(durations), Some(started)) =
-                    (phase_durations.as_deref_mut(), fence_started)
-                {
-                    durations.native_render_fence_export_ns = elapsed_nanos(started);
-                }
-                self.scene.trace_render_fence_export_end();
-                let fence = fence_result?;
-                Ok(AtomicSlotRenderOutcome::Rendered(Box::new(
-                    AtomicRenderedFrameParts {
-                        slot,
-                        scene_commit: commit,
-                        render_fence: fence,
-                        stats,
-                        lifecycle_evidence,
-                        render_us: elapsed_micros(started),
-                    },
-                )))
-            }
-            EglFrameOutcome::Skipped { reason, .. } => {
-                // The renderer did not sample scene content.  Keep the slot
-                // on the pre-GPU cancellation path and do not classify this
-                // normal no-damage result as a post-draw failure.
-                *gpu_sampling_started = false;
-                Ok(AtomicSlotRenderOutcome::Skipped {
-                    slot,
-                    reason,
-                    render_us: elapsed_micros(started),
-                })
-            }
-            EglFrameOutcome::LifecycleFallback { fallbacks, .. } => {
-                Ok(AtomicSlotRenderOutcome::LifecycleFallback {
-                    fallbacks,
-                    render_us: elapsed_micros(started),
-                })
-            }
-        }
+        self.render_domain.render_to_slot(
+            target,
+            frame_id,
+            frozen_frame,
+            gpu_sampling_started,
+            phase_durations,
+        )
     }
 
     /// Capture the published scene without acquiring a physical output slot.
@@ -1045,20 +899,7 @@ impl AtomicEglGbmScanout {
             cursor_mode,
             Some(OutputDamage::Full),
         );
-        self.egl
-            .make_current(self.egl_display, None, None, Some(self.egl_context))
-            .map_err(native_egl_io_error)?;
-        let request = frozen_frame
-            .draw_request(None)
-            .ok_or_else(|| io::Error::other("frozen capture frame request already consumed"))?;
-        self.scene
-            .capture_scene(
-                &self.egl,
-                self.egl_display,
-                request,
-                OutputFramebufferOrigin::TopLeftScanout,
-            )
-            .map_err(native_egl_io_error)
+        self.render_domain.capture_scene(&mut frozen_frame)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1530,7 +1371,7 @@ impl AtomicEglGbmScanout {
                         // A renderer skip can still follow partial GLES work.
                         // Complete it before restoring any sampled client
                         // buffers or recycling this compositor slot.
-                        unsafe { self.gl.finish() };
+                        self.render_domain.finish_render_work();
                     }
                     settle_failed_output_transaction(
                         output_transactions,
@@ -1614,7 +1455,7 @@ impl AtomicEglGbmScanout {
                 // work started, complete it before restoring frame ownership
                 // or recycling the slot.
                 if gpu_sampling_started {
-                    unsafe { self.gl.finish() };
+                    self.render_domain.finish_render_work();
                 }
                 settle_failed_output_transaction(
                     output_transactions,
@@ -1639,7 +1480,7 @@ impl AtomicEglGbmScanout {
             }
             Err(error) => {
                 if gpu_sampling_started {
-                    unsafe { self.gl.finish() };
+                    self.render_domain.finish_render_work();
                 }
                 let failure_stage = if gpu_sampling_started {
                     OutputTransactionFailureStage::RenderExecution
@@ -1893,9 +1734,9 @@ impl AtomicEglGbmScanout {
             timing_result
                 .map(|sample| sample.map(|evidence| (evidence.signaled_at, evidence.quality))),
             || {
-                self.scene
+                self.render_domain
                     .commit_presented(scene_commit, presented_transition_damage);
-                if let Some(pool) = self.pool.as_mut() {
+                if let Some(pool) = self.physical_pool.as_mut() {
                     pool.physical_slot_mut(completed.new_current)
                         .expect("validated pageflip slot remains in physical pool")
                         .record_presentation(completed.presentation_serial);
@@ -2016,7 +1857,7 @@ impl AtomicEglGbmScanout {
     }
 
     fn discard_failed_frame_resources(&mut self, frame: RenderedOutputFrame) {
-        self.scene.discard_rendered(frame.scene_commit);
+        self.render_domain.discard_rendered(frame.scene_commit);
         drop(frame.surface_damage);
     }
 
@@ -2026,7 +1867,7 @@ impl AtomicEglGbmScanout {
         scene_commit: EglSceneFrameCommit,
     ) -> io::Result<()> {
         let pool = self
-            .pool
+            .physical_pool
             .as_mut()
             .ok_or_else(|| io::Error::other("explicit output pool is unavailable"))?;
         let slots = OutputSlotSet::new([
@@ -2039,12 +1880,12 @@ impl AtomicEglGbmScanout {
             self.direct.output_id,
             slots,
             slot,
-            pool.pool_generation,
+            pool.pool_generation(),
         )?;
         swapchain.set_current_framebuffer_id(framebuffer_id);
         self.swapchain = Some(swapchain);
         pool.physical_slot_mut(slot)?.record_presentation(0);
-        self.scene
+        self.render_domain
             .commit_presented(scene_commit, OutputDamage::Full);
         self.direct.inhibit_until_composited_present = false;
         Ok(())
@@ -2077,7 +1918,7 @@ impl AtomicEglGbmScanout {
         let mut recovered = false;
         while let Some(frame) = self.swapchain_mut()?.take_suspended_frame() {
             recovered = true;
-            self.scene.discard_rendered(frame.scene_commit);
+            self.render_domain.discard_rendered(frame.scene_commit);
             drop(frame.surface_damage);
         }
         self.swapchain_mut()?.recover_suspended_slot(true)?;
@@ -2143,7 +1984,7 @@ impl AtomicEglGbmScanout {
 
     fn physical_slot(&self, slot: OutputSlotId) -> io::Result<&AtomicOutputSlotBacking> {
         let pool = self
-            .pool
+            .physical_pool
             .as_ref()
             .ok_or_else(|| io::Error::other("explicit output pool is unavailable"))?;
         pool.physical_slot(slot)
@@ -2154,7 +1995,7 @@ impl AtomicEglGbmScanout {
         slot: OutputSlotId,
     ) -> io::Result<&mut AtomicOutputSlotBacking> {
         let pool = self
-            .pool
+            .physical_pool
             .as_mut()
             .ok_or_else(|| io::Error::other("explicit output pool is unavailable"))?;
         pool.physical_slot_mut(slot)
@@ -2170,19 +2011,6 @@ fn complete_confirmed_pageflip_with_timing<T>(
         Ok(timing) => (timing, None),
         Err(error) => (None, Some(error)),
     }
-}
-
-pub(crate) enum AtomicSlotRenderOutcome {
-    Rendered(Box<AtomicRenderedFrameParts>),
-    Skipped {
-        slot: OutputSlotId,
-        reason: FrameSkipReason,
-        render_us: u64,
-    },
-    LifecycleFallback {
-        fallbacks: LifecycleRenderFallbacks,
-        render_us: u64,
-    },
 }
 
 #[expect(
@@ -2221,16 +2049,6 @@ pub(crate) enum AtomicFrameRenderOutcome {
         fallbacks: LifecycleRenderFallbacks,
         render_us: u64,
     },
-}
-
-pub(crate) struct AtomicRenderedFrameParts {
-    pub(crate) slot: OutputSlotId,
-    pub(crate) scene_commit: EglSceneFrameCommit,
-    pub(crate) render_fence: NativeRenderFence,
-    pub(crate) stats: GlesSceneFrameStats,
-    pub(crate) lifecycle_evidence:
-        oblivion_one::window_lifecycle_animation::LifecycleRenderEvidence,
-    pub(crate) render_us: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2324,38 +2142,87 @@ impl AtomicRenderedFrameParts {
 
 impl Drop for AtomicEglGbmScanout {
     fn drop(&mut self) {
-        let _ = self
-            .egl
-            .make_current(self.egl_display, None, None, Some(self.egl_context));
-        // Prove that GLES no longer samples any imported client or scanout
-        // image before releasing frame-owned protocol buffers during runtime
-        // shutdown.
-        unsafe { self.gl.finish() };
-        if let Some(pool) = self.pool.take() {
-            let drm = self._device.as_fd();
-            if self.drm_cleanup_armed {
-                pool.teardown(&self.gl, &self.egl, self.egl_display, drm);
-            } else {
-                // Render-side resources must still be destroyed with this
-                // context current; revoked DRM skips physical rm_fb calls.
-                teardown_atomic_render_slots(
-                    &pool.render_slots,
-                    &self.gl,
-                    &self.egl,
-                    self.egl_display,
-                );
-                drop(pool);
-            }
-        }
-        let _ = self.egl.make_current(self.egl_display, None, None, None);
-        let _ = self.egl.destroy_context(self.egl_display, self.egl_context);
-        let _ = self.egl.terminate(self.egl_display);
+        let render_domain = &mut self.render_domain;
+        let physical_pool = &mut self.physical_pool;
+        let physical_device = &self._physical_device;
+        let drm_cleanup_armed = self.drm_cleanup_armed;
+        teardown_render_before_physical(
+            || {
+                // Prove GLES no longer samples imported images, then destroy
+                // all EGL/GL render resources before their physical BO owners.
+                render_domain.teardown();
+            },
+            || {
+                if let Some(pool) = physical_pool.take() {
+                    // Revoked DRM skips rm_fb but still drops all GBM BOs.
+                    pool.teardown(physical_device.as_fd(), drm_cleanup_armed);
+                }
+            },
+        );
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+
+    #[test]
+    fn render_domain_is_destroyed_before_physical_pool_release() {
+        let order = RefCell::new(Vec::new());
+        teardown_render_before_physical(
+            || order.borrow_mut().push("render"),
+            || order.borrow_mut().push("physical"),
+        );
+        assert_eq!(order.into_inner(), ["render", "physical"]);
+    }
+
+    #[derive(Default)]
+    struct FutureRenderAdmissionState {
+        worker_busy: bool,
+        render_demand: bool,
+    }
+
+    impl FutureRenderAdmissionState {
+        fn dispatch(&mut self) {
+            assert!(!self.worker_busy);
+            self.worker_busy = true;
+            self.render_demand = false;
+        }
+
+        fn visual_change(&mut self) {
+            if self.worker_busy {
+                self.render_demand = true;
+            }
+        }
+
+        fn worker_completed(&mut self) -> bool {
+            self.worker_busy = false;
+            if self.render_demand {
+                self.dispatch();
+                true
+            } else {
+                false
+            }
+        }
+    }
+
+    #[test]
+    fn future_busy_worker_coalesces_many_visual_changes_to_one_newest_admission() {
+        let mut state = FutureRenderAdmissionState::default();
+        state.dispatch();
+
+        for _ in 0..4 {
+            state.visual_change();
+        }
+        assert!(state.worker_busy);
+        assert!(state.render_demand);
+
+        assert!(state.worker_completed());
+        assert!(state.worker_busy);
+        assert!(!state.render_demand);
+        assert!(!state.worker_completed());
+    }
 
     #[test]
     fn empty_composited_damage_is_forced_for_unrepresented_kms_state() {

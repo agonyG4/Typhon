@@ -5,6 +5,7 @@ use oblivion_one::native::kms::KmsBackendKind;
 mod atomic_direct;
 #[allow(dead_code)] // Runtime attachment is completed after frame-owned rendering is available.
 mod atomic_egl_gbm;
+mod atomic_render_domain;
 mod backend;
 mod direct;
 mod direct_lease;

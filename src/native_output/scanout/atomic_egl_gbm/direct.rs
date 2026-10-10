@@ -1064,7 +1064,7 @@ impl AtomicEglGbmScanout {
     }
 
     pub(crate) fn invalidate_presented_damage_history(&mut self) {
-        self.scene.invalidate_presented_damage_history();
+        self.render_domain.invalidate_presented_damage_history();
     }
 
     pub(crate) fn mark_composited_submission(&mut self) {
@@ -1088,7 +1088,7 @@ impl AtomicEglGbmScanout {
             .complete_composited_transition(expected, worker_owns_current);
         if let CompositedTransitionResult::Completed { released: Some(_) } = &result {
             direct_scanout_debug("exited direct scanout to composition");
-            self.scene.invalidate_presented_damage_history();
+            self.render_domain.invalidate_presented_damage_history();
         }
         result
     }
@@ -1290,7 +1290,7 @@ impl AtomicEglGbmScanout {
 
     pub(crate) fn direct_scanout_suspend(&mut self) -> io::Result<()> {
         self.direct.suspend()?;
-        self.scene.invalidate_presented_damage_history();
+        self.render_domain.invalidate_presented_damage_history();
         Ok(())
     }
 }

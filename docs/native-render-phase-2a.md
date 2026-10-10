@@ -98,7 +98,8 @@ RT reactor:
     presentation planning and frame pacing
     OutputTransactionLedger and protocol frame batches
     logical swapchain ownership and KMS scheduling
-    one replaceable pending RenderJob
+    render_worker_busy: bool
+    render_demand: bool
 
 render worker:
     EGL and GL contexts
@@ -140,40 +141,53 @@ barrier synchronously, so they must not retain a direct reactor-to-renderer
 call in Phase 2B.
 
 The physical Atomic swapchain has three slots
-(`EXPLICIT_OUTPUT_SLOT_CAPACITY == 3`), and its invariants prevent slot-role
-aliasing or ownership beyond that capacity. This supplies a source-grounded
-bound of three outstanding output-frame renderer tokens, provided Phase 2B
-keeps a slot in a renderer-control-pending role until the worker acknowledges
-that token's single terminal operation. A proposed terminal lane therefore has
-three fixed records, one per occupied slot. When all are occupied, the reactor
-does not wait: it leaves its one pending render replaceable and admits no job
-that needs another slot. A `CommitPresented` or `DiscardRendered` consumes the
-record belonging to that frame, never a record selected by “newest render.”
-This three-slot proof covers output-frame renderer tokens only. The current
-capture path is slotless and immediately discards its renderer commit; if
-capture moves to the worker, Phase 2B must keep it outside this lane or give it
-separate bounded admission and terminal ownership.
+(`EXPLICIT_OUTPUT_SLOT_CAPACITY == 3`). Its invariants prevent slot-role
+aliasing and more than three outstanding output-frame renderer tokens. The
+future control lane keeps each terminal token attached to its occupied physical
+slot until `CommitPresented` or `DiscardRendered` is applied exactly once. Each
+operation names its frame's token; it is never selected by “newest render.”
+Use a fixed-capacity, lossless control path: at most three reactor-owned
+per-slot terminal commands, retained until applied, with those commands drained
+in order before admitting another render. This bound comes from the swapchain's
+three physical slots. The reactor records completion and continues its event
+loop if the worker is busy; it never waits for control-lane capacity.
 
-The bound does not by itself bound arbitrary reload requests or prove safe
-configuration coalescing. Phase 2B may use revisioned fixed latest-value slots
-for cursor and material configuration, retaining each revision referenced by
-an admitted job and carrying invalidation across coalesced updates. Registry
-generation publication remains ordered while GL compilation can fail; skipping
-an intermediate successful publish before a later failure would change the
-active generation. The worker must apply all operations in sequence order
-relative to terminal controls and jobs. Trusted-registry reload requests still
-need a bounded request/result policy; the source reviewed here provides no
-renderer-control admission limit to reuse. Slotless capture also needs separate
-bounded admission if it moves to the worker. Until those policies and the
-revision barriers are designed and verified, complete control lane boundedness
-remains a Phase 2B design blocker. No unbounded channel or reactor wait is
-acceptable.
+Phase 2B.2 uses one executing render job and a reactor-owned demand bit. The
+reactor does not prepare another slot, transaction, frame batch, or frozen
+payload while the worker is busy. Visual changes set `render_demand = true`;
+repeated changes coalesce there. Once the executing job completes and existing
+settlement permits another render, the reactor resolves the newest compositor
+state, prepares one exact job, clears the demand bit, and dispatches it. Resize
+configure/ACK state continues to advance and is never coalesced. This does not
+add a second prepared physical render job.
 
-## Phase 2B.0 Atomic slot ownership split
+The three-slot bound covers output-frame terminal tokens. Other worker work
+uses separate fixed admission limits, not entries in an unbounded common queue:
 
-The explicit Atomic composited output pool now represents its two future
-ownership domains separately while construction, rendering, presentation, and
-teardown remain synchronous:
+- Trusted-effect reload has at most one in-flight asynchronous request. The
+  runtime already has a deferred control-response pattern: a pending job retains
+  request identity, then delivers completion through `queue_response`. A
+  second reload is not admitted while that request is in flight.
+- Screen capture has at most one admitted worker capture initially; protocol
+  completion remains asynchronous. Further captures are not accumulated as
+  render jobs.
+- Output configuration remains owned by its existing reactor state machine;
+  render-domain candidate preparation advances asynchronously as one active
+  candidate at a time.
+- `finish_render_work` is a single barrier request whose completion is reported
+  asynchronously. It is not an unbounded list of barriers.
+- Cursor/material revisions can coalesce only under the revision and
+  invalidation ordering rules above. Registry publication and renderer
+  terminal operations remain lossless and ordered.
+
+The reactor never waits when an admission limit is occupied. No unbounded
+channel or queue is permitted.
+
+## Phase 2B.0 Atomic slot ownership split (baseline before 2B.1)
+
+Phase 2B.0 first represented the explicit Atomic composited output pool's two
+future ownership domains separately while construction, rendering,
+presentation, and teardown remained synchronous:
 
 ```text
 RT reactor / DRM domain:
@@ -247,15 +261,32 @@ The fundamental invariant is:
 
 The reactor must not use a blocking receive, a mutex owned by the render worker,
 a condition-variable wait, synchronous D-Bus, or a normal-operation `join()`.
-There is no unbounded render queue: at most one job executes, and at most one
-replaceable pending job remains owned by the reactor. A pending physical render
-job may be superseded before GPU ownership starts; configure/ACK protocol state
-is never coalesced. Resize supersession must settle the displaced job before
-the newer job replaces it. Renderer terminal/control operations may not be
-dropped when a newer render arrives.
+Phase 2B.2 must not add a second prepared render job. The Atomic swapchain has
+one active rendering slot, so the initial topology is:
 
-Each job must have one terminal result, using existing transaction/failure
-ownership where possible:
+```text
+render worker:
+    at most one executing RenderJob
+
+reactor:
+    render_worker_busy: bool
+    render_demand: bool
+```
+
+While the worker is busy, compositor, input, and resize state continue to
+advance on the reactor. Visual changes set `render_demand = true`; repeated
+changes coalesce without allocating another slot, transaction, frame batch, or
+frozen payload. When the executing job completes and normal settlement permits
+another render, the reactor resolves the newest state, prepares one exact job,
+clears the demand bit, and dispatches it. Configure/ACK protocol state
+continues to advance and is never coalesced. Renderer terminal/control
+operations are lossless and remain ordered independently of visual demand.
+
+This is a latest-state render policy, not render-job supersession: visual states
+that arrive while a job executes do not become prepared jobs of their own.
+
+Each admitted job must have one terminal result, using existing
+transaction/failure ownership where possible:
 
 ```text
 Rendered
@@ -273,6 +304,78 @@ ShutdownAbandonment
 a payload qualification. It does not establish worker queue ownership,
 shutdown behavior, cancellation settlement, performance improvement, or
 hardware qualification.
+
+## Phase 2B.1 Atomic render ownership domain
+
+Phase 2B.1 keeps execution synchronous and moves EGL/GL state behind one
+`AtomicRenderDomain`. `AtomicEglGbmScanout` remains the reactor-side owner of
+the physical output domain:
+
+```text
+AtomicEglGbmScanout:
+    physical GBM device
+    AtomicPhysicalOutputPool
+    AtomicOutputSwapchain
+    DirectScanoutControl and direct framebuffer cache
+    DRM framebuffer IDs and content-validity history
+    buffer-age calculation and KMS/presentation policy
+
+AtomicRenderDomain:
+    render GBM device backing its EGLDisplay
+    EglInstance, EGLDisplay, EGLContext, glow::Context
+    GlesSceneRenderer and renderer resource/effect state
+    NativeFenceFunctions
+    AtomicRenderPool (EGLImages, GL textures and framebuffers)
+    output width and height
+```
+
+The KMS DRM fd is duplicated independently for the physical GBM device and
+the render GBM device. Only the physical device allocates output BOs. The
+render device supplies the native display for EGL and remains owned by the
+render domain until after `eglTerminate`. It cannot be dropped before its
+EGLDisplay.
+
+The pool containers are separate. `AtomicPhysicalOutputPool` owns only GBM
+BOs, DRM framebuffer IDs, and content-validity state. `AtomicRenderPool` is
+private to `AtomicRenderDomain` and owns only EGL/GL slot resources. The setup
+descriptor exports each physical BO's owned DMA-BUF planes once per pool
+creation/replacement; it is naturally `Send` and retains its plane fds through
+the existing `Arc<OwnedFd>` ownership. No descriptor or fd is exported during
+frame rendering.
+
+The reactor calculates `RenderTargetRequest { slot, pool_generation,
+buffer_age }` from the physical pool and passes it with the
+`FrozenNativeRenderFrame` to the render domain. The domain resolves its render
+slot only by the matching ID and generation. It never reads physical slot
+validity or swapchain state. Renderer execution, fence creation, capture,
+finish barriers, lifecycle/squash queries, and renderer mutations all enter
+through the domain. Terminal results return to the reactor for the unchanged
+transaction, frame-batch, and KMS settlement.
+
+Bootstrap and output-configuration candidates use the same independent-device
+and split-pool constructor. Session recovery validates the current physical
+and render ID/generation pairing, then rebinds the physical pool, render pool,
+and swapchain synchronously. Phase 2B.2 must carry pool replacement or
+generation rebind as ordered worker control; callers must not mutate render
+slot generations directly. Direct scanout and its framebuffer cache remain
+outside `AtomicRenderDomain`.
+
+Teardown is explicit: make the EGL context current, finish GLES work, delete
+render-pool GL framebuffers and textures, destroy EGLImages, drop
+`GlesSceneRenderer` resources, unbind and destroy the EGL context, terminate
+EGLDisplay, and then drop the render GBM device. Only after that completes may
+the reactor remove physical DRM framebuffers and drop physical BOs. A revoked
+DRM fd still skips `rm_fb`, while render resources are destroyed first. Phase
+2B.2 must replace this synchronous ordering with a nonblocking worker
+acknowledgement before physical teardown.
+
+The initialized `AtomicRenderDomain` is not `Send`: the exact blocker is
+`khronos_egl::Context`, which contains `*mut libc::c_void`. No unsafe trait
+implementation is used. The future worker bootstrap instead transfers a
+naturally `Send` payload containing only an owned render-device fd, dimensions,
+the selected format/modifier, and the owned render-slot descriptors. The worker
+constructs EGL and GL on its own thread. This test qualifies the setup payload,
+not an initialized context handle.
 
 ## Freeze timing
 

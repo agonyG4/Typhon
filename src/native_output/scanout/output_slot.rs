@@ -1,28 +1,17 @@
-use std::{io, os::fd::BorrowedFd, ptr};
-
-use glow::HasContext;
-use khronos_egl as egl;
 use oblivion_one::{
     native::kms::FramebufferId,
-    render_backend::{
-        buffer::{
-            BufferSize, DmabufBufferHandle, DmabufPlane, DmabufPlaneDescriptor, DrmFormat,
-            DrmModifier,
-        },
-        egl_gles::EglGlesDmabufImportAttributes,
+    render_backend::buffer::{
+        BufferSize, DmabufBufferHandle, DmabufPlane, DmabufPlaneDescriptor, DrmFormat, DrmModifier,
     },
 };
+use std::{io, os::fd::BorrowedFd};
 
-use crate::egl_renderer::{
-    BufferAge, EglImageGuard, EglInstance, GlEglImageTargetTexture2DOes, render_target_buffer_age,
-};
+use crate::egl_renderer::{BufferAge, render_target_buffer_age};
 
 use super::{
     EXPLICIT_OUTPUT_SLOT_CAPACITY, ExplicitFramebufferDescriptor, ExplicitFramebufferPlane,
     OutputSlotId,
 };
-
-const EGL_LINUX_DMA_BUF_EXT: egl::Enum = 0x3270;
 
 /// Reactor/DRM-owned state for one composited output slot.
 pub(crate) struct AtomicOutputSlotBacking {
@@ -42,25 +31,11 @@ pub(crate) struct AtomicRenderSlotDescriptor {
     pub(crate) buffer: DmabufBufferHandle,
 }
 
-/// EGL/GL-owned resources imported from one physical output slot.
-pub(crate) struct AtomicRenderSlot {
-    pub(crate) id: OutputSlotId,
-    pub(crate) pool_generation: u64,
-    pub(crate) egl_image: egl::Image,
-    pub(crate) texture: glow::Texture,
-    pub(crate) gl_framebuffer: glow::Framebuffer,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RenderTargetRequest {
     pub(crate) slot: OutputSlotId,
     pub(crate) pool_generation: u64,
     pub(crate) buffer_age: BufferAge,
-}
-
-pub(crate) struct AtomicOutputSlotPair {
-    pub(crate) physical: AtomicOutputSlotBacking,
-    pub(crate) render: AtomicRenderSlot,
 }
 
 #[allow(dead_code)]
@@ -182,94 +157,6 @@ impl AtomicOutputSlotBacking {
     }
 }
 
-impl AtomicRenderSlot {
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn import(
-        descriptor: AtomicRenderSlotDescriptor,
-        egl: &EglInstance,
-        egl_display: egl::Display,
-        gl: &glow::Context,
-        image_target: GlEglImageTargetTexture2DOes,
-    ) -> io::Result<Self> {
-        let AtomicRenderSlotDescriptor {
-            id,
-            pool_generation,
-            buffer,
-        } = descriptor;
-        let attributes = EglGlesDmabufImportAttributes::from_handle(&buffer)
-            .map_err(|error| io::Error::other(format!("invalid EGL output import: {error:?}")))?;
-        let no_context = unsafe { egl::Context::from_ptr(egl::NO_CONTEXT) };
-        let null_buffer = unsafe { egl::ClientBuffer::from_ptr(ptr::null_mut()) };
-        let egl_image = egl
-            .create_image(
-                egl_display,
-                no_context,
-                EGL_LINUX_DMA_BUF_EXT,
-                null_buffer,
-                attributes.as_slice(),
-            )
-            .map_err(|error| {
-                io::Error::other(format!("EGL output image import failed: {error}"))
-            })?;
-        let image_guard = EglImageGuard::new(egl_image, |image| {
-            let _ = egl.destroy_image(egl_display, image);
-        });
-
-        let texture = unsafe { gl.create_texture().map_err(io::Error::other)? };
-        unsafe {
-            gl.bind_texture(glow::TEXTURE_2D, Some(texture));
-            gl.tex_parameter_i32(
-                glow::TEXTURE_2D,
-                glow::TEXTURE_MIN_FILTER,
-                glow::LINEAR as i32,
-            );
-            gl.tex_parameter_i32(
-                glow::TEXTURE_2D,
-                glow::TEXTURE_MAG_FILTER,
-                glow::LINEAR as i32,
-            );
-            image_target(glow::TEXTURE_2D, image_guard.image().as_ptr());
-            if gl.get_error() != glow::NO_ERROR {
-                gl.delete_texture(texture);
-                return Err(io::Error::other(
-                    "glEGLImageTargetTexture2DOES failed for explicit output BO",
-                ));
-            }
-        }
-        let gl_framebuffer = match unsafe { gl.create_framebuffer() } {
-            Ok(framebuffer) => framebuffer,
-            Err(error) => {
-                unsafe { gl.delete_texture(texture) };
-                return Err(io::Error::other(error));
-            }
-        };
-        unsafe {
-            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(gl_framebuffer));
-            gl.framebuffer_texture_2d(
-                glow::FRAMEBUFFER,
-                glow::COLOR_ATTACHMENT0,
-                glow::TEXTURE_2D,
-                Some(texture),
-                0,
-            );
-            if gl.check_framebuffer_status(glow::FRAMEBUFFER) != glow::FRAMEBUFFER_COMPLETE {
-                gl.delete_framebuffer(gl_framebuffer);
-                gl.delete_texture(texture);
-                return Err(io::Error::other("explicit output FBO is incomplete"));
-            }
-            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
-            gl.bind_texture(glow::TEXTURE_2D, None);
-        }
-        Ok(Self {
-            id,
-            pool_generation,
-            egl_image: image_guard.disarm(),
-            texture,
-            gl_framebuffer,
-        })
-    }
-}
-
 pub(crate) fn explicit_framebuffer_descriptor(
     bo: &gbm::BufferObject<()>,
 ) -> io::Result<ExplicitFramebufferDescriptor> {
@@ -314,60 +201,52 @@ pub(crate) fn add_explicit_framebuffer(
         .ok_or_else(|| io::Error::other("AddFB2 returned framebuffer ID zero"))
 }
 
-pub(crate) struct AtomicOutputPool {
-    pub(crate) physical_slots: [AtomicOutputSlotBacking; EXPLICIT_OUTPUT_SLOT_CAPACITY],
-    pub(crate) render_slots: [AtomicRenderSlot; EXPLICIT_OUTPUT_SLOT_CAPACITY],
-    pub(crate) pool_generation: u64,
+pub(crate) struct AtomicPhysicalOutputPool {
+    slots: [AtomicOutputSlotBacking; EXPLICIT_OUTPUT_SLOT_CAPACITY],
+    pool_generation: u64,
 }
 
-impl AtomicOutputPool {
-    pub(crate) fn validate_pairs(
-        slots: &[AtomicOutputSlotPair],
+impl AtomicPhysicalOutputPool {
+    pub(crate) fn validate_slots(
+        slots: &[AtomicOutputSlotBacking],
         pool_generation: u64,
     ) -> io::Result<()> {
         let first = slots
             .first()
-            .ok_or_else(|| io::Error::other("explicit output pool has no slots"))?;
-        if slots.iter().any(|slot| {
-            slot.physical.pool_generation != pool_generation
-                || slot.render.pool_generation != pool_generation
-                || slot.physical.id != slot.render.id
-                || slot.physical.bo.width() != first.physical.bo.width()
-                || slot.physical.bo.height() != first.physical.bo.height()
-                || slot.physical.bo.format() != first.physical.bo.format()
-                || slot.physical.bo.modifier() != first.physical.bo.modifier()
-                || slot.physical.bo.plane_count() != first.physical.bo.plane_count()
-        }) {
+            .ok_or_else(|| io::Error::other("explicit physical output pool has no slots"))?;
+        let identities = slots
+            .iter()
+            .map(|slot| (slot.id, slot.pool_generation))
+            .collect::<Vec<_>>();
+        validate_slot_identities(&identities, pool_generation, "physical")?;
+        if slots.len() != EXPLICIT_OUTPUT_SLOT_CAPACITY
+            || slots.iter().any(|slot| {
+                slot.bo.width() != first.bo.width()
+                    || slot.bo.height() != first.bo.height()
+                    || slot.bo.format() != first.bo.format()
+                    || slot.bo.modifier() != first.bo.modifier()
+                    || slot.bo.plane_count() != first.bo.plane_count()
+            })
+        {
             return Err(io::Error::other(
-                "explicit output pool slots do not share matching identities and metadata",
+                "explicit physical output pool slots do not share matching metadata",
             ));
         }
-        let physical_identities = slots
-            .iter()
-            .map(|slot| (slot.physical.id, slot.physical.pool_generation))
-            .collect::<Vec<_>>();
-        let render_identities = slots
-            .iter()
-            .map(|slot| (slot.render.id, slot.render.pool_generation))
-            .collect::<Vec<_>>();
-        validate_split_slot_pairing(&physical_identities, &render_identities, pool_generation)?;
         Ok(())
     }
 
     pub(crate) fn from_validated_slots(
-        physical_slots: [AtomicOutputSlotBacking; EXPLICIT_OUTPUT_SLOT_CAPACITY],
-        render_slots: [AtomicRenderSlot; EXPLICIT_OUTPUT_SLOT_CAPACITY],
+        slots: [AtomicOutputSlotBacking; EXPLICIT_OUTPUT_SLOT_CAPACITY],
         pool_generation: u64,
     ) -> Self {
         Self {
-            physical_slots,
-            render_slots,
+            slots,
             pool_generation,
         }
     }
 
     pub(crate) fn physical_slot(&self, slot: OutputSlotId) -> io::Result<&AtomicOutputSlotBacking> {
-        self.physical_slots
+        self.slots
             .iter()
             .find(|candidate| candidate.id == slot)
             .filter(|candidate| candidate.pool_generation == self.pool_generation)
@@ -378,7 +257,7 @@ impl AtomicOutputPool {
         &mut self,
         slot: OutputSlotId,
     ) -> io::Result<&mut AtomicOutputSlotBacking> {
-        self.physical_slots
+        self.slots
             .iter_mut()
             .find(|candidate| candidate.id == slot)
             .filter(|candidate| candidate.pool_generation == self.pool_generation)
@@ -398,50 +277,74 @@ impl AtomicOutputPool {
         })
     }
 
-    pub(crate) fn render_slot_for_request(
-        &self,
-        request: RenderTargetRequest,
-    ) -> io::Result<&AtomicRenderSlot> {
-        self.render_slots
+    pub(crate) const fn pool_generation(&self) -> u64 {
+        self.pool_generation
+    }
+
+    pub(crate) fn plane_count(&self) -> io::Result<u32> {
+        self.slots
+            .first()
+            .map(|slot| slot.bo.plane_count())
+            .ok_or_else(|| io::Error::other("explicit physical output pool is unavailable"))
+    }
+
+    pub(crate) fn identities(&self) -> Vec<(OutputSlotId, u64)> {
+        self.slots
             .iter()
-            .find(|candidate| candidate.id == request.slot)
-            .filter(|candidate| candidate.pool_generation == request.pool_generation)
-            .ok_or_else(|| io::Error::other("explicit render slot does not match target request"))
+            .map(|slot| (slot.id, slot.pool_generation))
+            .collect()
+    }
+
+    /// Export owned render-side DMA-BUF descriptors once during pool setup.
+    pub(crate) fn export_render_slot_descriptors(
+        &self,
+    ) -> io::Result<Vec<AtomicRenderSlotDescriptor>> {
+        self.slots
+            .iter()
+            .map(AtomicOutputSlotBacking::render_descriptor)
+            .collect()
     }
 
     pub(crate) fn rebind_pool_generation(&mut self, pool_generation: u64) {
         self.pool_generation = pool_generation;
-        for slot in &mut self.physical_slots {
-            slot.pool_generation = pool_generation;
-        }
-        for slot in &mut self.render_slots {
+        for slot in &mut self.slots {
             slot.pool_generation = pool_generation;
         }
     }
 
-    pub(crate) fn teardown(
-        self,
-        gl: &glow::Context,
-        egl: &EglInstance,
-        egl_display: egl::Display,
-        drm: BorrowedFd<'_>,
-    ) {
-        teardown_split_slot_resources(
-            &self.render_slots,
-            &self.physical_slots,
-            |slot| unsafe {
-                gl.delete_framebuffer(slot.gl_framebuffer);
-                gl.delete_texture(slot.texture);
-            },
-            |slot| {
-                let _ = egl.destroy_image(egl_display, slot.egl_image);
-            },
-            |slot| {
-                let _ = drm_ffi::mode::rm_fb(drm, slot.framebuffer.get());
-            },
-        );
-        drop(self)
+    pub(crate) fn teardown(self, drm: BorrowedFd<'_>, drm_cleanup_armed: bool) {
+        if drm_cleanup_armed {
+            Self::remove_framebuffers(&self.slots, drm);
+        }
+        drop(self);
     }
+
+    pub(crate) fn remove_framebuffers(slots: &[AtomicOutputSlotBacking], drm: BorrowedFd<'_>) {
+        for slot in slots {
+            let _ = drm_ffi::mode::rm_fb(drm, slot.framebuffer.get());
+        }
+    }
+}
+
+fn validate_slot_identities(
+    identities: &[(OutputSlotId, u64)],
+    pool_generation: u64,
+    domain: &str,
+) -> io::Result<()> {
+    if identities.len() != EXPLICIT_OUTPUT_SLOT_CAPACITY {
+        return Err(io::Error::other(format!(
+            "explicit {domain} output pool has the wrong slot count"
+        )));
+    }
+    let mut ids = std::collections::HashSet::with_capacity(identities.len());
+    for (id, generation) in identities {
+        if *generation != pool_generation || !ids.insert(id.get()) {
+            return Err(io::Error::other(format!(
+                "explicit output pool has invalid {domain} slot identity"
+            )));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_split_slot_pairing(
@@ -449,22 +352,17 @@ pub(crate) fn validate_split_slot_pairing(
     render: &[(OutputSlotId, u64)],
     pool_generation: u64,
 ) -> io::Result<()> {
-    if physical.is_empty() || physical.len() != render.len() {
+    if physical.len() != EXPLICIT_OUTPUT_SLOT_CAPACITY
+        || physical.len() != render.len()
+        || render.len() != EXPLICIT_OUTPUT_SLOT_CAPACITY
+    {
         return Err(io::Error::other(
             "explicit output pool physical/render slot counts differ",
         ));
     }
 
-    for (slots, domain) in [(physical, "physical"), (render, "render")] {
-        let mut ids = std::collections::HashSet::with_capacity(slots.len());
-        for (id, generation) in slots {
-            if *generation != pool_generation || !ids.insert(id.get()) {
-                return Err(io::Error::other(format!(
-                    "explicit output pool has invalid {domain} slot identity"
-                )));
-            }
-        }
-    }
+    validate_slot_identities(physical, pool_generation, "physical")?;
+    validate_slot_identities(render, pool_generation, "render")?;
 
     if physical
         .iter()
@@ -477,6 +375,25 @@ pub(crate) fn validate_split_slot_pairing(
     Ok(())
 }
 
+#[cfg(test)]
+pub(crate) fn teardown_split_slot_resources<R, P>(
+    render_slots: &[R],
+    physical_slots: &[P],
+    mut delete_render_resources: impl FnMut(&R),
+    mut destroy_render_images: impl FnMut(&R),
+    mut remove_physical_framebuffers: impl FnMut(&P),
+) {
+    for slot in render_slots {
+        delete_render_resources(slot);
+    }
+    for slot in render_slots {
+        destroy_render_images(slot);
+    }
+    for slot in physical_slots {
+        remove_physical_framebuffers(slot);
+    }
+}
+
 pub(crate) fn remove_framebuffer_after_render_import_failure<T>(
     render_import: io::Result<T>,
     remove_framebuffer: impl FnOnce(),
@@ -487,83 +404,6 @@ pub(crate) fn remove_framebuffer_after_render_import_failure<T>(
             remove_framebuffer();
             Err(error)
         }
-    }
-}
-
-pub(crate) fn teardown_split_slot_resources<R, P>(
-    render_slots: &[R],
-    physical_slots: &[P],
-    mut delete_gl: impl FnMut(&R),
-    mut destroy_image: impl FnMut(&R),
-    mut remove_framebuffer: impl FnMut(&P),
-) {
-    for slot in render_slots {
-        delete_gl(slot);
-    }
-    for slot in render_slots {
-        destroy_image(slot);
-    }
-    for slot in physical_slots {
-        remove_framebuffer(slot);
-    }
-}
-
-pub(crate) fn teardown_atomic_slot_pairs(
-    slots: &[AtomicOutputSlotPair],
-    gl: &glow::Context,
-    egl: &EglInstance,
-    egl_display: egl::Display,
-    drm: BorrowedFd<'_>,
-) {
-    teardown_split_slot_resources(
-        slots,
-        slots,
-        |slot| unsafe {
-            gl.delete_framebuffer(slot.render.gl_framebuffer);
-            gl.delete_texture(slot.render.texture);
-        },
-        |slot| {
-            let _ = egl.destroy_image(egl_display, slot.render.egl_image);
-        },
-        |slot| {
-            let _ = drm_ffi::mode::rm_fb(drm, slot.physical.framebuffer.get());
-        },
-    );
-}
-
-pub(crate) fn teardown_atomic_render_slots(
-    slots: &[AtomicRenderSlot],
-    gl: &glow::Context,
-    egl: &EglInstance,
-    egl_display: egl::Display,
-) {
-    teardown_slot_resources(
-        slots,
-        |slot| unsafe {
-            gl.delete_framebuffer(slot.gl_framebuffer);
-            gl.delete_texture(slot.texture);
-        },
-        |slot| {
-            let _ = egl.destroy_image(egl_display, slot.egl_image);
-        },
-        |_| {},
-    );
-}
-
-pub(crate) fn teardown_slot_resources<T>(
-    slots: &[T],
-    mut delete_gl: impl FnMut(&T),
-    mut destroy_image: impl FnMut(&T),
-    mut remove_framebuffer: impl FnMut(&T),
-) {
-    for slot in slots {
-        delete_gl(slot);
-    }
-    for slot in slots {
-        destroy_image(slot);
-    }
-    for slot in slots {
-        remove_framebuffer(slot);
     }
 }
 
@@ -649,6 +489,18 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn session_recovery_rebinds_matching_physical_and_render_generations() {
+        let physical = [(id(0), 5), (id(1), 5), (id(2), 5)];
+        let render = [(id(0), 5), (id(1), 5), (id(2), 5)];
+        let physical_rebound = [(id(0), 6), (id(1), 6), (id(2), 6)];
+        let render_rebound = [(id(0), 6), (id(1), 6), (id(2), 6)];
+
+        assert!(validate_split_slot_pairing(&physical, &render, 5).is_ok());
+        assert!(validate_split_slot_pairing(&physical_rebound, &render_rebound, 6).is_ok());
+        assert!(validate_split_slot_pairing(&physical_rebound, &render, 6).is_err());
     }
 
     #[test]
