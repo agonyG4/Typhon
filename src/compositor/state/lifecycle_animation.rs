@@ -488,6 +488,7 @@ impl CompositorState {
         self.presentation_rect_for_geometry(root_surface_id, geometry)
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(in crate::compositor) fn begin_lifecycle_minimize(
         &mut self,
@@ -498,6 +499,35 @@ impl CompositorState {
         visual_group: Option<LifecycleVisualGroup>,
         resolved_effect_scene: ResolvedEffectScene,
         lifecycle_decorations: Vec<DecorationRenderInstance>,
+    ) {
+        self.begin_lifecycle_minimize_with_preparation(
+            window_id,
+            root_surface_id,
+            presented_source_client_rect,
+            canonical_client_rect,
+            visual_group,
+            resolved_effect_scene,
+            lifecycle_decorations,
+            None,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn begin_lifecycle_minimize_with_preparation(
+        &mut self,
+        window_id: WindowId,
+        root_surface_id: u32,
+        presented_source_client_rect: Option<PresentationRect>,
+        canonical_client_rect: Option<PresentationRect>,
+        visual_group: Option<LifecycleVisualGroup>,
+        resolved_effect_scene: ResolvedEffectScene,
+        lifecycle_decorations: Vec<DecorationRenderInstance>,
+        precapture_preparation: Option<
+            Result<
+                super::lifecycle_precapture::LifecyclePreCapturePreparation,
+                LifecycleAdmissionReason,
+            >,
+        >,
     ) {
         let Some(effect) =
             self.lifecycle_effect_kind_for_window(window_id, LifecycleDirection::Minimize)
@@ -545,7 +575,7 @@ impl CompositorState {
         let frozen_decoration = lifecycle_decorations
             .into_iter()
             .find(|decoration| decoration.root_surface_id() == root_surface_id);
-        let admission = self.install_lifecycle_motion(
+        let admission = self.install_lifecycle_motion_with_preparation(
             scene_node_id,
             window_id,
             root_surface_id,
@@ -558,6 +588,7 @@ impl CompositorState {
             frozen_decoration,
             now,
             speed,
+            precapture_preparation,
         );
         let (_identity, payload, reused_payload) = match admission {
             Ok(admission) => admission,
@@ -603,6 +634,52 @@ impl CompositorState {
         frozen_decoration: Option<DecorationRenderInstance>,
         now: AnimationTime,
         speed: f64,
+    ) -> Result<
+        (
+            crate::presentation_animation::PresentationRetainedVisualIdentity,
+            std::sync::Arc<super::lifecycle_retained::RetainedLifecyclePayload>,
+            bool,
+        ),
+        LifecycleAdmissionFailure,
+    > {
+        self.install_lifecycle_motion_with_preparation(
+            scene_node_id,
+            window_id,
+            root_surface_id,
+            presented_source_client_rect,
+            canonical_client_rect,
+            visual_group,
+            direction,
+            effect,
+            resolved_effect_scene,
+            frozen_decoration,
+            now,
+            speed,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn install_lifecycle_motion_with_preparation(
+        &mut self,
+        scene_node_id: crate::core::SceneNodeId,
+        window_id: WindowId,
+        root_surface_id: u32,
+        presented_source_client_rect: Option<PresentationRect>,
+        canonical_client_rect: Option<PresentationRect>,
+        visual_group: Option<LifecycleVisualGroup>,
+        direction: LifecycleDirection,
+        effect: LifecycleEffectKind,
+        resolved_effect_scene: ResolvedEffectScene,
+        frozen_decoration: Option<DecorationRenderInstance>,
+        now: AnimationTime,
+        speed: f64,
+        mut supplied_preparation: Option<
+            Result<
+                super::lifecycle_precapture::LifecyclePreCapturePreparation,
+                LifecycleAdmissionReason,
+            >,
+        >,
     ) -> Result<
         (
             crate::presentation_animation::PresentationRetainedVisualIdentity,
@@ -697,10 +774,16 @@ impl CompositorState {
             ));
         }
         let mut fresh_source_preparation = if previous_payload.is_none() {
-            Some(
-                self.capture_lifecycle_precapture_source(window_id, root_surface_id)
+            let preparation = match supplied_preparation.take() {
+                Some(Ok(preparation)) => preparation,
+                Some(Err(reason)) => {
+                    return Err(LifecycleAdmissionFailure::new(reason, target_provenance));
+                }
+                None => self
+                    .capture_lifecycle_precapture_source(window_id, root_surface_id)
                     .map_err(|reason| LifecycleAdmissionFailure::new(reason, target_provenance))?,
-            )
+            };
+            Some(preparation)
         } else {
             None
         };
@@ -764,6 +847,12 @@ impl CompositorState {
                     .expect("fresh lifecycle captured source before reservation")
                     .surface_presentation
                     .clone(),
+                std::sync::Arc::clone(
+                    &fresh_source_preparation
+                        .as_ref()
+                        .expect("fresh lifecycle captured source before reservation")
+                        .render_layout,
+                ),
             ) else {
                 self.rollback_lifecycle_reservation(identity, previous_identity);
                 return Err(LifecycleAdmissionFailure::new(
@@ -1063,6 +1152,7 @@ impl CompositorState {
                 payload_id: payload.payload_id,
                 kind,
                 effect_scene: std::sync::Arc::clone(&payload.effect_scene),
+                render_layout: Some(std::sync::Arc::clone(&payload.render_layout)),
             };
             let stable_order = payload.window_id.get() as usize;
             let (scene_band, layer_rank, stack_position, stable_order) =

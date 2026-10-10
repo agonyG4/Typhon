@@ -39,6 +39,7 @@ fn lifecycle_window_sample(
             payload_id,
             kind: LifecycleVisualSourceKind::NoOwnedEffects,
             effect_scene: std::sync::Arc::new(ResolvedEffectScene::default()),
+            render_layout: None,
         },
         effect: LifecycleEffectKind::Lamp,
         progress,
@@ -644,6 +645,7 @@ fn lifecycle_request_with_group(
             ResolvedEffectScene::default(),
             None,
             super::super::RetainedSurfacePresentationSnapshot::test_root(_root_surface_id),
+            std::sync::Arc::new(crate::compositor::FrozenLifecycleRenderLayout::empty_for_test()),
         )
         .expect("valid test lifecycle payload");
         assert!(
@@ -1179,6 +1181,7 @@ fn unactivated_lifecycle_reservation_and_orphan_executor_do_not_drive_compositor
         ResolvedEffectScene::default(),
         None,
         super::super::RetainedSurfacePresentationSnapshot::test_root(312),
+        std::sync::Arc::new(crate::compositor::FrozenLifecycleRenderLayout::empty_for_test()),
     )
     .expect("test payload");
     assert!(

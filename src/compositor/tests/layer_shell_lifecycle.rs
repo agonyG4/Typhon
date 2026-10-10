@@ -157,6 +157,7 @@ fn active_lamp(anchor_rect: PresentationRect) -> LifecycleSceneSample {
                 payload_id,
                 kind: LifecycleVisualSourceKind::NoOwnedEffects,
                 effect_scene: std::sync::Arc::new(crate::compositor::ResolvedEffectScene::default()),
+                render_layout: None,
             },
             effect: LifecycleEffectKind::Lamp,
             progress: 0.4,

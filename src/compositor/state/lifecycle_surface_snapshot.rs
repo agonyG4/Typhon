@@ -39,6 +39,15 @@ pub(crate) enum LifecycleSurfaceCaptureFailure {
 }
 
 impl RetainedSurfacePresentationSnapshot {
+    pub(crate) fn matches_render_layout(
+        &self,
+        layout: &crate::compositor::FrozenLifecycleRenderLayout,
+    ) -> bool {
+        self.nodes
+            .iter()
+            .all(|node| layout.matches_presentation_key(node.key.surface_id, node.key.generation))
+    }
+
     /// Captures the root's usable retained tree in painter order. Missing
     /// presentation generations are never substituted with render generations.
     pub(crate) fn capture(

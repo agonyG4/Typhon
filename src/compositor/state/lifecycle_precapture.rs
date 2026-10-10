@@ -1,5 +1,7 @@
 use crate::compositor::ResolvedEffectScene;
-use crate::compositor::{CompositorState, RenderableSurface, WindowId, client_pacing_log};
+use crate::compositor::{
+    CompositorState, FrozenLifecycleRenderLayout, RenderableSurface, WindowId, client_pacing_log,
+};
 use crate::presentation_animation::AnimationTime;
 use crate::window_lifecycle_animation::{
     LifecycleDirection, LifecycleEffectKind, LifecycleFrameSnapshot, LifecycleSceneSample,
@@ -14,6 +16,7 @@ pub(super) struct LifecyclePreCapturePreparation {
         super::lifecycle_surface_snapshot::RetainedSurfacePresentationSnapshot,
     pub(super) surfaces: Vec<RenderableSurface>,
     pub(super) release_candidates: Vec<super::lifecycle_retained::LifecycleHeldReleaseObligation>,
+    pub(super) render_layout: std::sync::Arc<FrozenLifecycleRenderLayout>,
 }
 
 impl CompositorState {
@@ -273,6 +276,17 @@ impl CompositorState {
         let Some(surfaces) = surface_presentation.project_captured_source(&surfaces) else {
             return Err(LifecycleAdmissionReason::InvalidSurfaceTopology);
         };
+        let Some(render_layout) = FrozenLifecycleRenderLayout::capture(
+            self.active_scene_surfaces(),
+            &surfaces,
+            &self.surface_presentation_generations,
+        ) else {
+            return Err(LifecycleAdmissionReason::InvalidSurfaceTopology);
+        };
+
+        if !surface_presentation.matches_render_layout(&render_layout) {
+            return Err(LifecycleAdmissionReason::InvalidSurfaceTopology);
+        }
 
         let mut release_candidates = Vec::new();
         for surface in &surfaces {
@@ -310,6 +324,7 @@ impl CompositorState {
             surface_presentation,
             surfaces,
             release_candidates,
+            render_layout: std::sync::Arc::new(render_layout),
         })
     }
 

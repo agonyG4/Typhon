@@ -2064,6 +2064,129 @@ pub struct SurfaceRenderSpaceAssignment {
     pub visual_clip: Option<SurfaceVisualAperture>,
 }
 
+/// Immutable logical render-space mapping captured while the full scene still
+/// supplies the root ordering used by CascadedWindow placements.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FrozenLifecycleRenderLayout {
+    entries: Vec<FrozenLifecycleRenderLayoutEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FrozenLifecycleRenderLayoutEntry {
+    surface_id: u32,
+    presentation_generation: u64,
+    surface_generation: u64,
+    buffer_id: crate::render_backend::buffer::BufferId,
+    commit_sequence: crate::compositor::SurfaceCommitSequence,
+    logical_origin: (i32, i32),
+    root_clip_base: (i32, i32),
+    target_size: (u32, u32),
+    visual_clip: Option<SurfaceVisualAperture>,
+}
+
+impl FrozenLifecycleRenderLayout {
+    /// Captures retained surfaces from their exact positions in the active
+    /// scene. The resulting layout no longer depends on root ordinals.
+    pub fn capture(
+        scene_surfaces: &[RenderableSurface],
+        retained_surfaces: &[RenderableSurface],
+        presentation_generations: &HashMap<u32, u64>,
+    ) -> Option<Self> {
+        let mut scene_index_by_id = HashMap::with_capacity(scene_surfaces.len());
+        for (index, surface) in scene_surfaces.iter().enumerate() {
+            if scene_index_by_id
+                .insert(surface.surface_id, index)
+                .is_some()
+            {
+                return None;
+            }
+        }
+        let origins = surface_origins(scene_surfaces);
+        let root_indices = surface_root_indices(scene_surfaces);
+        let mut entries = Vec::with_capacity(retained_surfaces.len());
+        let mut seen = HashSet::with_capacity(retained_surfaces.len());
+        for retained in retained_surfaces {
+            if !seen.insert(retained.surface_id) {
+                return None;
+            }
+            let index = *scene_index_by_id.get(&retained.surface_id)?;
+            let current = scene_surfaces.get(index)?;
+            if current.buffer_id() != retained.buffer_id()
+                || current.commit_sequence != retained.commit_sequence
+                || current.generation != retained.generation
+            {
+                return None;
+            }
+            let presentation_generation = *presentation_generations.get(&retained.surface_id)?;
+            let root_index = root_indices.get(index).copied().unwrap_or(index);
+            let root = scene_surfaces.get(root_index)?;
+            let root_origin = origins.get(root_index).copied()?;
+            let root_placement = root.render_placement.unwrap_or(root.placement);
+            entries.push(FrozenLifecycleRenderLayoutEntry {
+                surface_id: retained.surface_id,
+                presentation_generation,
+                surface_generation: retained.generation,
+                buffer_id: retained.buffer_id(),
+                commit_sequence: retained.commit_sequence,
+                logical_origin: origins.get(index).copied()?,
+                root_clip_base: (
+                    root_origin.0.saturating_sub(root_placement.local_x),
+                    root_origin.1.saturating_sub(root_placement.local_y),
+                ),
+                target_size: retained
+                    .render_target_size
+                    .map(|size| (size.width, size.height))
+                    .unwrap_or((retained.width, retained.height)),
+                visual_clip: retained.visual_clip.clone(),
+            });
+        }
+        (!entries.is_empty()).then_some(Self { entries })
+    }
+
+    /// Resolves one exact retained content revision at the current output
+    /// scale. A stale or substituted surface cannot use this layout entry.
+    pub fn assignment_for(
+        &self,
+        surface: &RenderableSurface,
+        output_scale: f64,
+    ) -> Option<SurfaceRenderSpaceAssignment> {
+        let entry = self.entries.iter().find(|entry| {
+            entry.surface_id == surface.surface_id
+                && entry.surface_generation == surface.generation
+                && entry.buffer_id == surface.buffer_id()
+                && entry.commit_sequence == surface.commit_sequence
+        })?;
+        Some(SurfaceRenderSpaceAssignment {
+            target: render_space_rect_from_logical(
+                entry.logical_origin,
+                entry.target_size.0,
+                entry.target_size.1,
+                normalized_output_scale(output_scale),
+            ),
+            visual_clip: entry
+                .visual_clip
+                .clone()
+                .map(|aperture| aperture.map_logical(entry.root_clip_base, output_scale)),
+        })
+    }
+
+    pub(crate) fn matches_presentation_key(
+        &self,
+        surface_id: u32,
+        presentation_generation: u64,
+    ) -> bool {
+        self.entries.iter().any(|entry| {
+            entry.surface_id == surface_id
+                && entry.presentation_generation == presentation_generation
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn empty_for_test() -> Self {
+        Self::default()
+    }
+}
+
 /// Compute the same target rectangles consumed by the renderer for a set of
 /// already-resolved scene origins. Coverage analysis must use these bounds so
 /// retained-buffer/client-driven geometry cannot be mistaken for the pixels

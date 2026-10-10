@@ -1653,6 +1653,14 @@ impl CompositorState {
         }
         self.clear_fullscreen_presentation_owner(root_surface_id);
 
+        let minimize_effect =
+            self.lifecycle_effect_kind_for_window(window_id, LifecycleDirection::Minimize);
+        let precapture_preparation = if !has_active_lifecycle && minimize_effect.is_some() {
+            Some(self.capture_lifecycle_precapture_source(window_id, root_surface_id))
+        } else {
+            None
+        };
+
         let mut minimized_surfaces = Vec::new();
         let mut visible_surfaces = Vec::with_capacity(self.renderable_surfaces.len());
         for surface in self.renderable_surfaces.drain(..) {
@@ -1678,8 +1686,6 @@ impl CompositorState {
         // Capture only the compositor-owned SSD plan while the minimized
         // window still has its pre-focus-change visual state. Client and
         // subsurface content remains live in the retained surface list.
-        let minimize_effect =
-            self.lifecycle_effect_kind_for_window(window_id, LifecycleDirection::Minimize);
         let lifecycle_decorations = if !has_active_lifecycle && minimize_effect.is_some() {
             self.native_decoration_render_instances_for_scale(&minimized_surfaces, 1.0)
         } else {
@@ -1743,7 +1749,7 @@ impl CompositorState {
                 }));
         }
         self.cancel_pending_normal_restore(root_surface_id, "window_minimized");
-        self.begin_lifecycle_minimize(
+        self.begin_lifecycle_minimize_with_preparation(
             window_id,
             root_surface_id,
             presented_source_client_rect,
@@ -1751,6 +1757,7 @@ impl CompositorState {
             lifecycle_visual_group,
             lifecycle_effect_scene,
             lifecycle_decorations,
+            precapture_preparation,
         );
         self.refresh_active_scene_surface_order();
         self.deactivate_pointer_constraints_for_departing_window_ids(

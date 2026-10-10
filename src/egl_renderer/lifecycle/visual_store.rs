@@ -222,8 +222,13 @@ impl LifecycleVisualStore {
         {
             return;
         }
-        let assignments =
-            compositor::surface_render_space_assignments(lifecycle_surfaces, output_scale);
+        let dynamic_assignments = lifecycle
+            .samples
+            .iter()
+            .any(|sample| sample.visual_source.render_layout.is_none())
+            .then(|| {
+                compositor::surface_render_space_assignments(lifecycle_surfaces, output_scale)
+            });
         for sample in &lifecycle.samples {
             let source = &sample.visual_source;
             if source.root_surface_id != sample.root_surface_id
@@ -241,19 +246,30 @@ impl LifecycleVisualStore {
                 .first()
                 .and_then(|instance| instance.visual_group)
                 .or_else(|| VisualGroupId::new(1));
-            for (surface, assignment) in lifecycle_surfaces.iter().zip(assignments.iter()) {
+            for (surface_index, surface) in lifecycle_surfaces.iter().enumerate() {
                 if surface_root_for_lifecycle_surface(surface, lifecycle_surfaces, lifecycle)
                     != sample.root_surface_id
                 {
                     continue;
                 }
+                let assignment = if let Some(layout) = source.render_layout.as_ref() {
+                    layout.assignment_for(surface, output_scale)
+                } else {
+                    dynamic_assignments
+                        .as_ref()
+                        .and_then(|assignments| assignments.get(surface_index))
+                        .cloned()
+                };
+                let Some(assignment) = assignment else {
+                    continue;
+                };
                 push_egl_surface_commands(
                     &mut vertices,
                     &mut commands,
                     output_size.0,
                     output_size.1,
                     surface,
-                    assignment.clone(),
+                    assignment,
                     framebuffer_origin,
                     visual_group,
                 );

@@ -222,6 +222,7 @@ fn lifecycle_sample(
             payload_id,
             kind: LifecycleVisualSourceKind::NoOwnedEffects,
             effect_scene: std::sync::Arc::new(ResolvedEffectScene::default()),
+            render_layout: None,
         },
         effect: LifecycleEffectKind::Lamp,
         progress,

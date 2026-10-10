@@ -68,6 +68,17 @@ fn ssd_test_state(surface_id: u32) -> (CompositorState, WindowId) {
     (state, window_id)
 }
 
+fn append_ssd_test_window(state: &mut CompositorState, surface_id: u32) -> (WindowId, u32) {
+    let window_id = state.allocate_window_id().expect("test window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_xdg(window_id, surface_id))
+        .expect("insert test XDG window");
+    state.append_renderable_surface(ssd_test_surface(surface_id));
+    state.surface_presentation_generations.insert(surface_id, 1);
+    state.rebuild_active_scene_view();
+    (window_id, surface_id)
+}
+
 #[test]
 fn active_lamp_geometry_stays_frozen_when_live_subsurface_moves() {
     let root_surface_id = 392;
@@ -146,6 +157,131 @@ fn active_lamp_geometry_stays_frozen_when_live_subsurface_moves() {
             .expect("canonical child remains live")
             .placement,
         live_placement
+    );
+}
+
+#[test]
+fn retained_cascaded_root_keeps_its_full_scene_origin_and_clip_after_isolation() {
+    let (mut state, first_window_id) = ssd_test_state(500);
+    state.lifecycle_animation_renderer_available = Some(true);
+    state.presentation_animator.set_enabled(true);
+    state.window_mut(first_window_id).unwrap().management = Some(
+        crate::wm::WindowManagementState::new(crate::wm::WorkspaceLocation::Regular(
+            crate::wm::WorkspaceId::new(2).expect("hidden workspace"),
+        )),
+    );
+    state.rebuild_active_scene_view();
+    let _second_window = append_ssd_test_window(&mut state, 501);
+    let (target_window_id, target_surface_id) = append_ssd_test_window(&mut state, 502);
+    let target_placement = SurfacePlacement::root_at(11, 13);
+    let target = state
+        .renderable_surfaces
+        .iter_mut()
+        .find(|surface| surface.surface_id == target_surface_id)
+        .expect("third root surface");
+    target.x = 2;
+    target.y = 3;
+    target.placement = target_placement;
+    state
+        .surface_topology
+        .set_placement(target_surface_id, target_placement);
+
+    let child_surface_id = 503;
+    let mut child = ssd_test_surface(child_surface_id);
+    child.width = 60;
+    child.height = 40;
+    child.placement = SurfacePlacement::subsurface(target_surface_id, 23, 29);
+    child.visual_clip = Some(crate::compositor::SurfaceVisualAperture::logical_only(
+        crate::compositor::SurfaceTargetRect::new(4, 5, 24, 16),
+    ));
+    state.append_renderable_surface(child);
+    state.surface_topology.set_placement(
+        child_surface_id,
+        SurfacePlacement::subsurface(target_surface_id, 23, 29),
+    );
+    state
+        .surface_presentation_generations
+        .insert(child_surface_id, 1);
+    state.rebuild_active_scene_view();
+
+    let full_scene = state.active_scene_surfaces();
+    let full_scene_assignments =
+        crate::compositor::surface_render_space_assignments(full_scene, 1.0);
+    let expected_root = full_scene
+        .iter()
+        .position(|surface| surface.surface_id == target_surface_id)
+        .map(|index| full_scene_assignments[index].clone())
+        .expect("target assignment in full scene");
+    let expected_child = full_scene
+        .iter()
+        .position(|surface| surface.surface_id == child_surface_id)
+        .map(|index| full_scene_assignments[index].clone())
+        .expect("child assignment in full scene");
+    assert!(state.minimize_desktop_window(target_window_id));
+
+    state
+        .renderable_surfaces
+        .retain(|surface| surface.surface_id != 500);
+    state.rebuild_active_scene_view();
+    let sample = state.lifecycle_scene_sample_at(AnimationTime::monotonic_now().expect("sample"));
+    let retained = state.lifecycle_renderable_surfaces(&sample);
+    let frozen_layout = sample.samples[0]
+        .visual_source
+        .render_layout
+        .as_ref()
+        .expect("admission freezes logical render layout");
+    let retained_assignments = retained
+        .iter()
+        .map(|surface| {
+            frozen_layout
+                .assignment_for(surface, 1.0)
+                .expect("frozen assignment")
+        })
+        .collect::<Vec<_>>();
+    let root_surface = retained
+        .iter()
+        .find(|surface| surface.surface_id == target_surface_id)
+        .expect("retained root for output-scale check");
+    let mut recycled_surface = root_surface.clone();
+    recycled_surface.generation = recycled_surface.generation.saturating_add(1);
+    assert!(
+        frozen_layout
+            .assignment_for(&recycled_surface, 1.0)
+            .is_none(),
+        "a recycled surface generation must not reuse the retained render layout"
+    );
+    let scaled_root = frozen_layout
+        .assignment_for(root_surface, 2.0)
+        .expect("frozen logical layout remaps at output scale");
+    assert_eq!(
+        (
+            scaled_root.target.x(),
+            scaled_root.target.y(),
+            scaled_root.target.width()
+        ),
+        (
+            expected_root.target.x() * 2,
+            expected_root.target.y() * 2,
+            600
+        ),
+        "the layout freezes logical coordinates and applies the current output scale"
+    );
+    let retained_root_index = retained
+        .iter()
+        .position(|surface| surface.surface_id == target_surface_id)
+        .expect("retained root");
+    let retained_child_index = retained
+        .iter()
+        .position(|surface| surface.surface_id == child_surface_id)
+        .expect("retained child");
+
+    assert_eq!(
+        retained_assignments[retained_root_index], expected_root,
+        "isolating a CascadedWindow root must use its full-scene origin"
+    );
+    assert_eq!(
+        retained_assignments[retained_child_index], expected_child,
+        "retained descendants must keep their admission-time origin and visual clip"
     );
 }
 

@@ -350,6 +350,9 @@ mod tests {
                     super::super::state::RetainedSurfacePresentationSnapshot::test_root(
                         _root_surface_id,
                     ),
+                    std::sync::Arc::new(
+                        crate::compositor::FrozenLifecycleRenderLayout::empty_for_test(),
+                    ),
                 )
                 .expect("valid test lifecycle payload");
             assert!(

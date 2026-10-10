@@ -12,6 +12,8 @@ use oblivion_one::core::SceneNodeId;
 use oblivion_one::presentation_animation::{
     AnimationTime, PresentationEngine, PresentationRect, PresentationRetainedVisualKind,
 };
+use oblivion_one::render_backend::buffer::BufferIdAllocator;
+use oblivion_one::window_lifecycle_animation::LifecycleVisualGroup;
 
 fn clear_test_target(harness: &mut GlesEffectTestHarness, target: &PooledEffectTexture) {
     let renderer = &mut harness.renderer;
@@ -84,6 +86,133 @@ fn frozen_visual_signature_survives_reversal_but_changes_for_fresh_payload() {
         lifecycle_visual_source_signature(first_source, first_lamp, 1.0),
         "a new lifecycle payload cannot alias the previous resolved visual"
     );
+}
+
+#[test]
+fn retained_cascaded_source_commands_keep_admission_origin_and_clip_after_isolation() {
+    let mut buffer_ids = BufferIdAllocator::default();
+    let mut first = crate::egl_renderer::tests::lifecycle_test_surface_fixture(
+        8,
+        0,
+        0,
+        8,
+        8,
+        0xff10_2030,
+        &mut buffer_ids,
+    );
+    first.placement = compositor::SurfacePlacement::absolute_root_at(5, 7);
+    let mut second = crate::egl_renderer::tests::lifecycle_test_surface_fixture(
+        9,
+        0,
+        0,
+        8,
+        8,
+        0xff20_3040,
+        &mut buffer_ids,
+    );
+    second.placement = compositor::SurfacePlacement::absolute_root_at(25, 27);
+    let mut target = crate::egl_renderer::tests::lifecycle_test_surface_fixture(
+        1,
+        2,
+        3,
+        120,
+        90,
+        0xff30_4050,
+        &mut buffer_ids,
+    );
+    target.placement = compositor::SurfacePlacement::root_at(11, 13);
+    let mut child = crate::egl_renderer::tests::lifecycle_test_surface_fixture(
+        2,
+        4,
+        6,
+        60,
+        40,
+        0xff40_5060,
+        &mut buffer_ids,
+    );
+    child.placement = compositor::SurfacePlacement::subsurface(1, 23, 29);
+    child.visual_clip = Some(compositor::SurfaceVisualAperture::logical_only(
+        compositor::SurfaceTargetRect::new(4, 5, 24, 16),
+    ));
+
+    let full_scene = vec![first, second, target.clone(), child.clone()];
+    let retained = vec![target.clone(), child.clone()];
+    let presentation_generations = [(8, 1), (9, 1), (1, 1), (2, 1)].into();
+    let layout = std::sync::Arc::new(
+        compositor::FrozenLifecycleRenderLayout::capture(
+            &full_scene,
+            &retained,
+            &presentation_generations,
+        )
+        .expect("full scene supplies exact retained render layout"),
+    );
+    let full_assignments = compositor::surface_render_space_assignments(&full_scene, 1.0);
+    let expected_root = full_assignments[2].clone();
+    let expected_child = full_assignments[3].clone();
+    assert_eq!(
+        (expected_root.target.x(), expected_root.target.y()),
+        (149, 152)
+    );
+
+    let mut lifecycle = lamp_test_sample(0.5);
+    let root_rect = PresentationRect::new(
+        f64::from(expected_root.target.x()),
+        f64::from(expected_root.target.y()),
+        f64::from(expected_root.target.width()),
+        f64::from(expected_root.target.height()),
+    )
+    .expect("root source rectangle");
+    let anchor = PresentationRect::new(300.0, 300.0, 32.0, 32.0).expect("anchor");
+    let visual_group =
+        LifecycleVisualGroup::from_bounds(root_rect, root_rect, root_rect, anchor, 400, 400)
+            .expect("lifecycle source group");
+    lifecycle.samples[0].visual_group = visual_group;
+    lifecycle.samples[0].visual_source.render_layout = Some(layout);
+
+    let mut store = LifecycleVisualStore::default();
+    store.rebuild_source_commands(
+        &lifecycle,
+        &retained,
+        &[],
+        1.0,
+        (400, 400),
+        OutputFramebufferOrigin::BottomLeft,
+    );
+    let commands = store
+        .source_commands
+        .get(&lifecycle.samples[0].payload_id)
+        .expect("source commands captured");
+    let root_command = commands
+        .iter()
+        .find(|command| command.layer == EglDrawLayer::Surface(1))
+        .expect("root surface command");
+    assert_eq!(
+        root_command.bounds,
+        EglRect::new(149.0, 152.0, 120.0, 90.0),
+        "retained capture must use the full-scene CascadedWindow origin"
+    );
+    let expected_child_plans = compositor::surface_render_plans_with_aperture(
+        &child,
+        expected_child.target,
+        expected_child.visual_clip.as_ref(),
+    );
+    let child_commands = commands
+        .iter()
+        .filter(|command| command.layer == EglDrawLayer::Surface(2))
+        .collect::<Vec<_>>();
+    assert_eq!(child_commands.len(), expected_child_plans.len());
+    for (command, plan) in child_commands.into_iter().zip(expected_child_plans) {
+        assert_eq!(
+            command.bounds,
+            EglRect::new(
+                plan.content_target.x() as f32,
+                plan.content_target.y() as f32,
+                plan.content_target.width() as f32,
+                plan.content_target.height() as f32,
+            ),
+            "retained child clipping must match the admission-time scene"
+        );
+    }
 }
 
 #[test]

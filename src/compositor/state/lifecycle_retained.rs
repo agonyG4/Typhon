@@ -1,7 +1,7 @@
 use crate::compositor::state::RetainedSurfacePresentationSnapshot;
 use crate::compositor::{
-    DecorationRenderInstance, DmabufReleaseObligation, RenderableSurface, ResolvedEffectScene,
-    WindowId,
+    DecorationRenderInstance, DmabufReleaseObligation, FrozenLifecycleRenderLayout,
+    RenderableSurface, ResolvedEffectScene, WindowId,
 };
 use crate::core::SceneNodeId;
 use crate::presentation_animation::{
@@ -99,6 +99,7 @@ pub(crate) struct RetainedLifecyclePayload {
     pub(crate) effect_scene: Arc<ResolvedEffectScene>,
     pub(crate) frozen_decoration: Option<DecorationRenderInstance>,
     pub(crate) surface_presentation: RetainedSurfacePresentationSnapshot,
+    pub(crate) render_layout: Arc<FrozenLifecycleRenderLayout>,
 }
 
 impl RetainedLifecyclePayload {
@@ -110,6 +111,7 @@ impl RetainedLifecyclePayload {
         effect_scene: ResolvedEffectScene,
         frozen_decoration: Option<DecorationRenderInstance>,
         surface_presentation: RetainedSurfacePresentationSnapshot,
+        render_layout: Arc<FrozenLifecycleRenderLayout>,
     ) -> Option<Arc<Self>> {
         if origin_identity.kind() != PresentationRetainedVisualKind::WindowLifecycle
             || !valid_lifecycle_visual_group(visual_group)
@@ -124,6 +126,7 @@ impl RetainedLifecyclePayload {
             effect_scene: Arc::new(effect_scene),
             frozen_decoration,
             surface_presentation,
+            render_layout,
         }))
     }
 }
@@ -340,6 +343,7 @@ mod tests {
             ResolvedEffectScene::default(),
             None,
             RetainedSurfacePresentationSnapshot::test_root(root_surface_id),
+            Arc::new(crate::compositor::FrozenLifecycleRenderLayout::empty_for_test()),
         )
         .expect("valid payload")
     }

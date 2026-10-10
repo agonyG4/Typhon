@@ -325,6 +325,7 @@ fn draw_scene_reconciles_canonical_and_empty_lifecycle_decoration_resources_toge
             ),
         kind: LifecycleVisualSourceKind::ResolvedOwnedEffects,
         effect_scene: std::sync::Arc::new(oblivion_one::compositor::ResolvedEffectScene::default()),
+        render_layout: None,
     };
     renderer.lifecycle.invalidate_lamp_geometry_for_test();
     renderer.lifecycle.rebuild_lamp_commands(

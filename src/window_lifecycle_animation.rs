@@ -391,6 +391,7 @@ pub struct LifecycleVisualSource {
     pub payload_id: PresentationRetainedVisualPayloadId,
     pub kind: LifecycleVisualSourceKind,
     pub effect_scene: Arc<ResolvedEffectScene>,
+    pub render_layout: Option<Arc<crate::compositor::FrozenLifecycleRenderLayout>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
