@@ -3176,19 +3176,73 @@ pub fn surface_local_point_at_origin(
     output_x: f64,
     output_y: f64,
 ) -> Option<(f64, f64)> {
-    let (origin_x, origin_y) = origin;
-    let local_x = output_x - f64::from(origin_x);
-    let local_y = output_y - f64::from(origin_y);
+    let (target_width, target_height) = surface
+        .render_target_size
+        .map(|size| (size.width, size.height))
+        .unwrap_or((surface.width, surface.height));
+    let assignment = SurfaceRenderSpaceAssignment {
+        target: SurfaceTargetRect::new(origin.0, origin.1, target_width, target_height),
+        visual_clip: surface.visual_clip.clone(),
+    };
+    surface_local_point_for_assignment(surface, &assignment, output_x, output_y)
+}
 
-    if local_x >= 0.0
-        && local_y >= 0.0
-        && local_x < f64::from(surface.width)
-        && local_y < f64::from(surface.height)
-    {
-        Some((local_x, local_y))
-    } else {
-        None
+pub fn surface_logical_extent(surface: &RenderableSurface) -> Option<(u32, u32)> {
+    let extent = surface_buffer_mapping(surface)
+        .map(SurfaceBufferMapping::surface_extent)
+        .map(|size| (size.width, size.height))
+        .unwrap_or((surface.width, surface.height));
+    (extent.0 > 0 && extent.1 > 0).then_some(extent)
+}
+
+/// Invert the exact logical target and visual aperture used by scene rendering.
+/// The result remains surface-local logical coordinates; it is never a buffer
+/// pixel coordinate.
+pub fn surface_local_point_for_assignment(
+    surface: &RenderableSurface,
+    assignment: &SurfaceRenderSpaceAssignment,
+    output_x: f64,
+    output_y: f64,
+) -> Option<(f64, f64)> {
+    if !output_x.is_finite() || !output_y.is_finite() {
+        return None;
     }
+    let target = assignment.target;
+    let target_x = f64::from(target.x());
+    let target_y = f64::from(target.y());
+    let target_width = f64::from(target.width());
+    let target_height = f64::from(target.height());
+    let relative_x = output_x - target_x;
+    let relative_y = output_y - target_y;
+    if target_width <= 0.0
+        || target_height <= 0.0
+        || relative_x < 0.0
+        || relative_y < 0.0
+        || relative_x >= target_width
+        || relative_y >= target_height
+    {
+        return None;
+    }
+
+    let visible =
+        surface_render_plans_with_aperture(surface, target, assignment.visual_clip.as_ref())
+            .into_iter()
+            .any(|plan| {
+                let content = plan.content_target;
+                output_x >= f64::from(content.x())
+                    && output_y >= f64::from(content.y())
+                    && output_x < f64::from(content.right())
+                    && output_y < f64::from(content.bottom())
+            });
+    if !visible {
+        return None;
+    }
+
+    let (logical_width, logical_height) = surface_logical_extent(surface)?;
+    Some((
+        relative_x * f64::from(logical_width) / target_width,
+        relative_y * f64::from(logical_height) / target_height,
+    ))
 }
 
 pub fn cursor_damage_rect(
@@ -3564,7 +3618,9 @@ impl Default for DesktopSceneRenderer {
 mod tests {
     use super::*;
     use crate::compositor::{SurfaceCommitSequence, SurfacePlacement, ViewportSourceRect};
-    use crate::presentation_animation::PresentationOpacity;
+    use crate::presentation_animation::{
+        PresentationGeometryTransform, PresentationOpacity, PresentationRect,
+    };
     use crate::render_backend::buffer::{
         BufferIdAllocator, BufferIdentity, BufferSize, CommittedSurfaceBuffer,
     };
@@ -6836,6 +6892,165 @@ mod tests {
                 72.0 + 6.0 + 10.0
             ),
             Some((32.0, 10.0))
+        );
+    }
+
+    #[test]
+    fn surface_local_point_maps_render_target_to_committed_logical_extent() {
+        let mut surface = RenderableSurface {
+            surface_id: 70,
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            placement: SurfacePlacement::absolute_root_at(200, 100),
+            render_backend: SurfaceRenderBackend::NativeWayland,
+            render_placement: Some(SurfacePlacement::absolute_root_at(200, 100)),
+            visual_clip: None,
+            render_target_size: Some(BufferSize::new(800, 600).unwrap()),
+            generation: 0,
+            commit_sequence: SurfaceCommitSequence::initial(),
+            buffer: shm_buffer(1920, 1080, vec![0; 1920 * 1080]),
+            viewport_source: None,
+            viewport_destination: None,
+            buffer_scale: 1,
+            buffer_transform: wl_output::Transform::Normal,
+            damage: crate::compositor::RenderableSurfaceDamage::full(),
+        };
+        surface.width = 1920;
+
+        assert_eq!(
+            surface_local_point_at_origin(&surface, (200, 100), 600.0, 400.0),
+            Some((960.0, 540.0)),
+            "the rendered target center maps to the committed surface-local center"
+        );
+        assert_eq!(
+            surface_local_point_at_origin(&surface, (200, 100), 1000.0, 400.0),
+            None,
+            "points outside the rendered target do not hit the client surface"
+        );
+    }
+
+    #[test]
+    fn surface_local_point_uses_viewport_destination_logical_extent() {
+        let surface = RenderableSurface {
+            surface_id: 71,
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 40,
+            placement: SurfacePlacement::absolute_root_at(20, 30),
+            render_backend: SurfaceRenderBackend::NativeWayland,
+            render_placement: Some(SurfacePlacement::absolute_root_at(20, 30)),
+            visual_clip: None,
+            render_target_size: Some(BufferSize::new(160, 80).unwrap()),
+            generation: 0,
+            commit_sequence: SurfaceCommitSequence::initial(),
+            buffer: shm_buffer(200, 100, vec![0; 200 * 100]),
+            viewport_source: Some(crate::compositor::ViewportSourceRect {
+                x: 10.0,
+                y: 5.0,
+                width: 40.0,
+                height: 20.0,
+            }),
+            viewport_destination: Some(BufferSize::new(80, 40).unwrap()),
+            buffer_scale: 2,
+            buffer_transform: wl_output::Transform::Normal,
+            damage: crate::compositor::RenderableSurfaceDamage::full(),
+        };
+
+        assert_eq!(
+            surface_local_point_at_origin(&surface, (20, 30), 100.0, 70.0),
+            Some((40.0, 20.0)),
+            "viewport and buffer-scale mapping preserves surface-local coordinates"
+        );
+    }
+
+    #[test]
+    fn surface_local_point_rejects_visual_clip_and_maps_visible_content() {
+        let surface = RenderableSurface {
+            surface_id: 72,
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            placement: SurfacePlacement::absolute_root_at(200, 100),
+            render_backend: SurfaceRenderBackend::NativeWayland,
+            render_placement: Some(SurfacePlacement::absolute_root_at(200, 100)),
+            visual_clip: Some(SurfaceVisualAperture::logical_only(SurfaceTargetRect::new(
+                100, 50, 400, 300,
+            ))),
+            render_target_size: Some(BufferSize::new(800, 600).unwrap()),
+            generation: 0,
+            commit_sequence: SurfaceCommitSequence::initial(),
+            buffer: shm_buffer(1920, 1080, vec![0; 1920 * 1080]),
+            viewport_source: None,
+            viewport_destination: None,
+            buffer_scale: 1,
+            buffer_transform: wl_output::Transform::Normal,
+            damage: crate::compositor::RenderableSurfaceDamage::full(),
+        };
+        let assignment = surface_render_space_assignments(&[surface.clone()], 1.0)
+            .into_iter()
+            .next()
+            .expect("surface assignment");
+
+        assert_eq!(
+            surface_local_point_for_assignment(&surface, &assignment, 250.0, 150.0),
+            Some((120.0, 90.0)),
+            "visible clipped pixels preserve their position within the full logical surface"
+        );
+        assert_eq!(
+            surface_local_point_for_assignment(&surface, &assignment, 550.0, 400.0),
+            None,
+            "content hidden by the visual aperture must not receive input"
+        );
+    }
+
+    #[test]
+    fn surface_input_mapping_composes_with_presented_window_inverse_transform() {
+        let surface = RenderableSurface {
+            surface_id: 73,
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            placement: SurfacePlacement::absolute_root_at(200, 100),
+            render_backend: SurfaceRenderBackend::NativeWayland,
+            render_placement: Some(SurfacePlacement::absolute_root_at(200, 100)),
+            visual_clip: None,
+            render_target_size: Some(BufferSize::new(800, 600).unwrap()),
+            generation: 0,
+            commit_sequence: SurfaceCommitSequence::initial(),
+            buffer: shm_buffer(1920, 1080, vec![0; 1920 * 1080]),
+            viewport_source: None,
+            viewport_destination: None,
+            buffer_scale: 1,
+            buffer_transform: wl_output::Transform::Normal,
+            damage: crate::compositor::RenderableSurfaceDamage::full(),
+        };
+        let assignment = surface_render_space_assignments(std::slice::from_ref(&surface), 1.0)
+            .into_iter()
+            .next()
+            .expect("surface render assignment");
+        let presented_transform = PresentationGeometryTransform::new(
+            PresentationRect::new(200.0, 100.0, 800.0, 600.0).unwrap(),
+            PresentationRect::new(400.0, 200.0, 400.0, 300.0).unwrap(),
+        );
+        let canonical_point = presented_transform
+            .inverse_map_point_unbounded((500.0, 250.0))
+            .expect("inverse presented-window point");
+
+        assert_eq!(canonical_point, (400.0, 200.0));
+        assert_eq!(
+            surface_local_point_for_assignment(
+                &surface,
+                &assignment,
+                canonical_point.0,
+                canonical_point.1,
+            ),
+            Some((480.0, 180.0)),
+            "presentation inversion and render-target inversion compose into surface-local coordinates"
         );
     }
 

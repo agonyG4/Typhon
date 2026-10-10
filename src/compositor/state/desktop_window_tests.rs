@@ -171,12 +171,22 @@ pub(super) fn x11_output_snapshot(
     xid: u32,
     surface_id: u32,
 ) -> X11WindowSnapshot {
+    x11_output_snapshot_for_size(generation, xid, surface_id, 1280, 800)
+}
+
+fn x11_output_snapshot_for_size(
+    generation: XwaylandGeneration,
+    xid: u32,
+    surface_id: u32,
+    output_width: u32,
+    output_height: u32,
+) -> X11WindowSnapshot {
     let mut snapshot = x11_snapshot(generation, xid, surface_id);
     snapshot.geometry = X11Geometry {
         x: 0,
         y: 0,
-        width: 1280,
-        height: 800,
+        width: output_width,
+        height: output_height,
     };
     snapshot.decoration_hints.motif = X11MotifDecorationHint::Undecorated;
     snapshot
@@ -260,7 +270,7 @@ fn xwayland_borderless_xrgb_window_is_a_direct_scanout_candidate_without_fullscr
     install_x11_scanout_surface(
         &mut state,
         surface,
-        x11_output_snapshot(generation, 301, 301),
+        x11_output_snapshot_for_size(generation, 301, 301, output_width, output_height),
     );
 
     assert!(!state.fullscreen_render_plan_metrics().fullscreen_active);
@@ -284,7 +294,7 @@ fn canonical_opacity_blocks_an_opaque_direct_scanout_candidate() {
             SurfacePlacement::absolute_root_at(0, 0),
             DrmFormat::Xrgb8888,
         ),
-        x11_output_snapshot(generation, 341, 341),
+        x11_output_snapshot_for_size(generation, 341, 341, output_width, output_height),
     );
     let window_id = state.window_id_for_surface(341).expect("scanout window");
     state
@@ -322,7 +332,7 @@ fn direct_scanout_opacity_recovers_only_after_opaque_frame_is_physically_present
             SurfacePlacement::absolute_root_at(0, 0),
             DrmFormat::Xrgb8888,
         ),
-        x11_output_snapshot(generation, 361, 361),
+        x11_output_snapshot_for_size(generation, 361, 361, output_width, output_height),
     );
     let window_id = state.window_id_for_surface(361).expect("scanout window");
     state.layout_animation_epoch = Some(AnimationTime::from_nanos(0));
@@ -416,7 +426,7 @@ fn xwayland_xbgr_window_is_an_opaque_direct_scanout_candidate() {
             SurfacePlacement::absolute_root_at(0, 0),
             DrmFormat::Xbgr8888,
         ),
-        x11_output_snapshot(generation, 302, 302),
+        x11_output_snapshot_for_size(generation, 302, 302, output_width, output_height),
     );
 
     let analysis = state.direct_scanout_scene_analysis();
@@ -459,7 +469,7 @@ fn xwayland_shm_root_with_xrgb_child_uses_child_as_scanout_source() {
         &mut state,
         root,
         [child],
-        x11_output_snapshot(generation, 330, 330),
+        x11_output_snapshot_for_size(generation, 330, 330, output_width, output_height),
     );
 
     let analysis = state.direct_scanout_scene_analysis();
@@ -501,7 +511,7 @@ fn xwayland_surface_above_child_source_has_a_precise_scene_blocker() {
         &mut state,
         root,
         [child, above],
-        x11_output_snapshot(generation, 332, 332),
+        x11_output_snapshot_for_size(generation, 332, 332, output_width, output_height),
     );
 
     let analysis = state.direct_scanout_scene_analysis();
@@ -540,7 +550,7 @@ fn xwayland_surface_behind_or_outside_child_source_does_not_block_scanout() {
         &mut state,
         root,
         [child, outside],
-        x11_output_snapshot(generation, 335, 335),
+        x11_output_snapshot_for_size(generation, 335, 335, output_width, output_height),
     );
 
     let analysis = state.direct_scanout_scene_analysis();
@@ -573,7 +583,10 @@ fn xwayland_root_painted_above_child_remains_the_conservative_source() {
         SurfacePlacement::subsurface(338, 0, 0),
         DrmFormat::Xrgb8888,
     );
-    insert_x11(&mut state, x11_output_snapshot(generation, 338, 338));
+    insert_x11(
+        &mut state,
+        x11_output_snapshot_for_size(generation, 338, 338, output_width, output_height),
+    );
     state.append_renderable_surface(child);
     state.append_renderable_surface(root);
     for surface_id in state
@@ -612,7 +625,8 @@ fn xwayland_visible_ssd_blocks_direct_scanout() {
     let output_width = state.output_size.width;
     let output_height = state.output_size.height;
     let generation = XwaylandGeneration::new(NonZeroU64::new(4).expect("generation"));
-    let mut snapshot = x11_output_snapshot(generation, 302, 302);
+    let mut snapshot =
+        x11_output_snapshot_for_size(generation, 302, 302, output_width, output_height);
     snapshot.decoration_hints.motif = X11MotifDecorationHint::Unspecified;
     install_x11_scanout_surface(
         &mut state,
@@ -660,7 +674,7 @@ fn xwayland_render_target_content_above_blocks_direct_scanout() {
             SurfacePlacement::absolute_root_at(0, 0),
             DrmFormat::Xrgb8888,
         ),
-        x11_output_snapshot(generation, 303, 303),
+        x11_output_snapshot_for_size(generation, 303, 303, output_width, output_height),
     );
     let mut above = x11_scanout_surface(
         304,
@@ -716,7 +730,7 @@ fn xwayland_non_xrgb_dmabuf_does_not_qualify_for_direct_scanout() {
             SurfacePlacement::absolute_root_at(0, 0),
             DrmFormat::Argb8888,
         ),
-        x11_output_snapshot(generation, 305, 305),
+        x11_output_snapshot_for_size(generation, 305, 305, output_width, output_height),
     );
 
     let analysis = state.direct_scanout_scene_analysis();
@@ -744,7 +758,7 @@ fn xwayland_unknown_dmabuf_format_has_unknown_opacity() {
             SurfacePlacement::absolute_root_at(0, 0),
             DrmFormat::Other(0xfeed_beef),
         ),
-        x11_output_snapshot(generation, 306, 306),
+        x11_output_snapshot_for_size(generation, 306, 306, output_width, output_height),
     );
 
     let analysis = state.direct_scanout_scene_analysis();
@@ -3149,6 +3163,101 @@ fn x11_resize_queues_a_typed_backend_command() {
             ..
         } if window == id
     ));
+}
+
+#[test]
+fn x11_frame_setter_materializes_cascaded_placement_before_publishing_geometry() {
+    let mut state = CompositorState::new(None);
+    for surface_id in [601_u32, 602] {
+        let id = state.allocate_window_id().expect("XDG window id");
+        state
+            .insert_desktop_window(DesktopWindow::new_xdg(id, surface_id))
+            .expect("insert XDG window");
+        state.append_renderable_surface(x11_shm_surface(
+            surface_id,
+            64,
+            64,
+            SurfacePlacement::root(),
+        ));
+    }
+
+    let snapshot = x11_snapshot(
+        XwaylandGeneration::new(NonZeroU64::new(1).expect("generation")),
+        603,
+        603,
+    );
+    let window_id = insert_x11(&mut state, snapshot);
+    state.append_renderable_surface(x11_shm_surface(
+        603,
+        800,
+        600,
+        SurfacePlacement::absolute_root_at(0, 0),
+    ));
+    state.rebuild_active_scene_view();
+
+    let geometry = WindowGeometry::new(SurfacePlacement::root_at(7, 9), 800, 600);
+    assert!(state.set_x11_frame_geometry(window_id, geometry));
+
+    let expected = PresentationRect::new(143.0, 145.0, 800.0, 600.0).unwrap();
+    let window = state.window(window_id).expect("managed X11 window");
+    assert_eq!(window.x11_materialized_client_rect, Some(expected));
+    assert_eq!(window.x11_geometry.expect("X11 geometry").client.x, 143);
+    assert_eq!(window.x11_geometry.expect("X11 geometry").client.y, 145);
+    assert_eq!(
+        state.desktop_window_frame(window_id),
+        Some((143, 145, 800, 600))
+    );
+}
+
+#[test]
+fn managed_x11_render_bounds_and_input_share_the_render_target_mapping() {
+    let mut state = CompositorState::new(None);
+    let generation = XwaylandGeneration::new(NonZeroU64::new(77).expect("generation"));
+    let mut snapshot = x11_snapshot(generation, 770, 770);
+    snapshot.geometry = X11Geometry {
+        x: 200,
+        y: 100,
+        width: 800,
+        height: 600,
+    };
+    let window_id = insert_x11(&mut state, snapshot);
+    let expected = PresentationRect::new(200.0, 100.0, 800.0, 600.0).unwrap();
+    let window = state.window_mut(window_id).expect("managed window");
+    window.x11_materialized_client_rect = Some(expected);
+    window.x11_geometry.as_mut().unwrap().frame =
+        WindowGeometry::new(SurfacePlacement::root_at(7, 9), 800, 600);
+
+    let mut surface = x11_shm_surface(770, 1920, 1080, SurfacePlacement::root_at(7, 9));
+    surface.render_placement = Some(SurfacePlacement::absolute_root_at(200, 100));
+    surface.render_target_size = Some(BufferSize::new(800, 600).unwrap());
+    state.append_renderable_surface(surface);
+    state.rebuild_active_scene_view();
+
+    assert_eq!(
+        state.current_presentation_rect_for_root(770),
+        Some(expected),
+        "managed X11 presentation uses the materialized XWM rectangle"
+    );
+    let surface = state
+        .active_scene_surfaces()
+        .iter()
+        .find(|surface| surface.surface_id == 770)
+        .expect("active backing surface");
+    let assignment = state
+        .active_scene_surface_render_assignments()
+        .iter()
+        .find(|assignment| assignment.target == SurfaceTargetRect::new(200, 100, 800, 600))
+        .expect("render target matches managed presentation bounds");
+    assert_eq!(
+        render::surface_local_point_for_assignment(surface, assignment, 600.0, 400.0),
+        Some((960.0, 540.0)),
+        "the visual center maps to the backing surface's logical center"
+    );
+    assert_eq!(
+        render::surface_local_point_for_assignment(surface, assignment, 1000.0, 400.0),
+        None,
+        "input outside the rendered managed-window target cannot hit the backing surface"
+    );
 }
 
 #[test]

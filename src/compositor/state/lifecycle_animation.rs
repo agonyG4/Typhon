@@ -482,10 +482,7 @@ impl CompositorState {
         &self,
         root_surface_id: u32,
     ) -> Option<PresentationRect> {
-        let geometry = self
-            .current_visual_root_window_geometry(root_surface_id)
-            .or_else(|| self.current_root_window_geometry(root_surface_id))?;
-        self.presentation_rect_for_geometry(root_surface_id, geometry)
+        self.current_presentation_rect_for_root(root_surface_id)
     }
 
     #[cfg(test)]

@@ -61,6 +61,7 @@ pub(in crate::compositor) struct ActiveSceneView {
     presentation_owner_roots_in_order: Vec<u32>,
     scene_node_indices: HashMap<SceneNodeId, usize>,
     surface_origins: Vec<(i32, i32)>,
+    surface_render_assignments: Vec<render::SurfaceRenderSpaceAssignment>,
     popup_surface_ids: Vec<u32>,
     selection: Option<ActiveSceneSelection>,
     rebuild_count: u64,
@@ -78,6 +79,12 @@ impl ActiveSceneView {
 
     pub(in crate::compositor) fn surface_origins(&self) -> &[(i32, i32)] {
         &self.surface_origins
+    }
+
+    pub(in crate::compositor) fn surface_render_assignments(
+        &self,
+    ) -> &[render::SurfaceRenderSpaceAssignment] {
+        &self.surface_render_assignments
     }
 
     pub(in crate::compositor) fn surface_scene_nodes_in_order(&self) -> &[SceneNodeId] {
@@ -665,10 +672,40 @@ impl CompositorState {
         &self,
         root_surface_id: u32,
     ) -> Option<PresentationRect> {
+        if let Some(window_id) = self.window_id_for_surface(root_surface_id)
+            && let Some(rect) = self.managed_window_presentation_rect(window_id)
+        {
+            return Some(rect);
+        }
         let geometry = self
             .current_visual_root_window_geometry(root_surface_id)
             .or_else(|| self.current_root_window_geometry(root_surface_id))?;
         self.presentation_rect_for_geometry(root_surface_id, geometry)
+    }
+
+    /// Resolves a managed toplevel's canonical output-space client rectangle.
+    /// X11 geometry is materialized independently from its backing surface;
+    /// XDG geometry continues through the protocol geometry path.
+    pub(in crate::compositor) fn managed_window_presentation_rect(
+        &self,
+        window_id: crate::core::WindowId,
+    ) -> Option<PresentationRect> {
+        let window = self.window(window_id)?;
+        if window.kind != DesktopWindowKind::Managed {
+            return None;
+        }
+        match window.backend {
+            WindowBackend::X11(_) if window.is_normal_x11_role() => {
+                window.x11_materialized_client_rect
+            }
+            WindowBackend::Xdg(_) => {
+                let geometry = self
+                    .current_visual_root_window_geometry(window.root_surface_id)
+                    .or_else(|| self.current_root_window_geometry(window.root_surface_id))?;
+                self.presentation_rect_for_geometry(window.root_surface_id, geometry)
+            }
+            _ => None,
+        }
     }
 
     pub(in crate::compositor) fn presented_window_geometries_for_targets(
@@ -1079,6 +1116,7 @@ impl CompositorState {
             .collect();
         let popup_surface_ids = self.active_popup_surface_ids_from_state();
         let surface_origins = render::surface_origins(&surfaces);
+        let surface_render_assignments = render::surface_render_space_assignments(&surfaces, 1.0);
         let previous_selection = self.active_scene_view.selection;
         let previous_surface_ids = self
             .active_scene_view
@@ -1104,6 +1142,7 @@ impl CompositorState {
             presentation_owner_roots_in_order;
         self.active_scene_view.scene_node_indices = scene_node_indices;
         self.active_scene_view.surface_origins = surface_origins;
+        self.active_scene_view.surface_render_assignments = surface_render_assignments;
         self.active_scene_view.popup_surface_ids = popup_surface_ids;
         self.active_scene_view.selection = Some(selection);
         self.active_scene_view.rebuild_count =
@@ -1194,7 +1233,11 @@ impl CompositorState {
                     previous.x != updated.x
                         || previous.y != updated.y
                         || previous.placement != updated.placement
-                        || previous.render_placement != updated.render_placement,
+                        || previous.render_placement != updated.render_placement
+                        || previous.width != updated.width
+                        || previous.height != updated.height
+                        || previous.render_target_size != updated.render_target_size
+                        || previous.visual_clip != updated.visual_clip,
                     effect_scene_surface_geometry_changed(previous, &updated),
                 )
             };
@@ -1204,6 +1247,8 @@ impl CompositorState {
             if origin_changed {
                 self.active_scene_view.surface_origins =
                     render::surface_origins(&self.active_scene_view.surfaces);
+                self.active_scene_view.surface_render_assignments =
+                    render::surface_render_space_assignments(&self.active_scene_view.surfaces, 1.0);
             }
             self.active_scene_view.incremental_surface_update_count = self
                 .active_scene_view
@@ -1260,7 +1305,11 @@ impl CompositorState {
                     origins_changed |= previous.x != source.x
                         || previous.y != source.y
                         || previous.placement != source.placement
-                        || previous.render_placement != source.render_placement;
+                        || previous.render_placement != source.render_placement
+                        || previous.width != source.width
+                        || previous.height != source.height
+                        || previous.render_target_size != source.render_target_size
+                        || previous.visual_clip != source.visual_clip;
                     self.active_scene_view.surfaces[index] = source;
                     self.active_scene_view.presentation_owner_roots_in_order[index] =
                         self.presentation_owner_root_for_surface(surface_id);
@@ -1276,6 +1325,8 @@ impl CompositorState {
             if origins_changed {
                 self.active_scene_view.surface_origins =
                     render::surface_origins(&self.active_scene_view.surfaces);
+                self.active_scene_view.surface_render_assignments =
+                    render::surface_render_space_assignments(&self.active_scene_view.surfaces, 1.0);
             }
             self.active_scene_view.incremental_surface_update_count = self
                 .active_scene_view
@@ -1297,6 +1348,12 @@ impl CompositorState {
 
     pub(in crate::compositor) fn active_scene_surface_origins(&self) -> &[(i32, i32)] {
         self.active_scene_view.surface_origins()
+    }
+
+    pub(in crate::compositor) fn active_scene_surface_render_assignments(
+        &self,
+    ) -> &[render::SurfaceRenderSpaceAssignment] {
+        self.active_scene_view.surface_render_assignments()
     }
 
     pub(in crate::compositor) fn active_scene_surface_scene_nodes_in_order(

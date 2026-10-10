@@ -3207,6 +3207,65 @@ fn x11_configure_notify_does_not_mutate_committed_buffer_extent() {
 }
 
 #[test]
+fn minimize_uses_managed_x11_client_rect_instead_of_backing_surface_size() {
+    let mut fixture = first_buffer_fixture();
+    admit_first_buffer(&mut fixture, 136, 136);
+    let handle = fake_snapshot().handle;
+    let window_id = fixture
+        .server
+        .state
+        .window_id_for_x11_handle(handle)
+        .expect("managed X11 window");
+    let managed_rect =
+        crate::presentation_animation::PresentationRect::new(136.0, 136.0, 800.0, 600.0)
+            .expect("managed client rectangle");
+    {
+        let window = fixture
+            .server
+            .state
+            .window_mut(window_id)
+            .expect("managed X11 window state");
+        window.x11_materialized_client_rect = Some(managed_rect);
+        let geometry = window.x11_geometry.as_mut().expect("X11 geometry");
+        geometry.frame.width = 800;
+        geometry.frame.height = 600;
+    }
+    let backing = fixture
+        .server
+        .state
+        .renderable_surfaces
+        .iter_mut()
+        .find(|surface| surface.surface_id == fixture.surface_id)
+        .expect("backing surface");
+    backing.width = 1920;
+    backing.height = 1080;
+    backing.render_target_size =
+        Some(crate::render_backend::buffer::BufferSize::new(800, 600).unwrap());
+
+    assert_eq!(
+        fixture
+            .server
+            .state
+            .lifecycle_window_rect(fixture.surface_id),
+        Some(managed_rect),
+        "lifecycle geometry comes from the managed X11 window"
+    );
+    fixture
+        .server
+        .set_lifecycle_animation_renderer_available(false);
+    assert!(fixture.server.state.minimize_desktop_window(window_id));
+    assert_eq!(
+        fixture
+            .server
+            .state
+            .window(window_id)
+            .and_then(|window| window.x11_materialized_client_rect),
+        Some(managed_rect),
+        "minimization cannot rewrite X11 geometry from backing dimensions"
+    );
+}
+
+#[test]
 fn single_frame_x11_client_becomes_renderable_without_second_commit() {
     let mut fixture = first_buffer_fixture();
     admit_first_buffer(&mut fixture, 0, 0);

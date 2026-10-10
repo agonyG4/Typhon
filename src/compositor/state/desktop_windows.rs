@@ -17,38 +17,62 @@ fn rectangles_overlap(
 }
 
 impl CompositorState {
-    pub(in crate::compositor) fn update_x11_materialized_client_rect_from_frame(
-        &mut self,
+    /// Resolve stored placement representation into a self-contained output
+    /// rectangle. Cascaded placement needs the live root ordering; if the
+    /// root is absent, only an unchanged representation can safely retain its
+    /// previous materialized origin while its size changes.
+    pub(in crate::compositor) fn materialized_x11_client_rect_for_frame(
+        &self,
         window_id: WindowId,
         frame: WindowGeometry,
-        explicit_output_origin: Option<(i32, i32)>,
-    ) {
-        let Some(window) = self.window_mut(window_id) else {
-            return;
-        };
-        if !matches!(window.backend, WindowBackend::X11(_)) {
-            return;
+    ) -> Option<PresentationRect> {
+        let window = self.window(window_id)?;
+        if !matches!(window.backend, WindowBackend::X11(_))
+            || frame.placement.parent_surface_id.is_some()
+        {
+            return None;
         }
-        let origin = explicit_output_origin
-            .or_else(|| {
-                window
-                    .x11_materialized_client_rect
-                    .map(|rect| (rect.x().round() as i32, rect.y().round() as i32))
-            })
-            .or_else(|| {
-                let placement = frame.placement;
-                (placement.parent_surface_id.is_none()
-                    && placement.root_mode == RootPlacementMode::Absolute)
-                    .then_some((placement.local_x, placement.local_y))
-            });
-        window.x11_materialized_client_rect = origin.and_then(|(x, y)| {
-            PresentationRect::new(
-                f64::from(x),
-                f64::from(y),
+
+        let root_surface_id = window.root_surface_id;
+        let materialized = match frame.placement.root_mode {
+            RootPlacementMode::Absolute => PresentationRect::new(
+                f64::from(frame.placement.local_x),
+                f64::from(frame.placement.local_y),
                 f64::from(frame.width),
                 f64::from(frame.height),
-            )
-        });
+            ),
+            RootPlacementMode::CascadedWindow => self
+                .presentation_rect_for_geometry(root_surface_id, frame)
+                .or_else(|| {
+                    let previous = window.x11_geometry?;
+                    (previous.frame.placement == frame.placement)
+                        .then_some(window.x11_materialized_client_rect?)
+                        .and_then(|rect| {
+                            PresentationRect::new(
+                                rect.x(),
+                                rect.y(),
+                                f64::from(frame.width),
+                                f64::from(frame.height),
+                            )
+                        })
+                }),
+        }?;
+        Some(materialized)
+    }
+
+    pub(in crate::compositor) fn set_x11_materialized_client_rect(
+        &mut self,
+        window_id: WindowId,
+        rect: PresentationRect,
+    ) -> bool {
+        let Some(window) = self.window_mut(window_id) else {
+            return false;
+        };
+        if !matches!(window.backend, WindowBackend::X11(_)) {
+            return false;
+        }
+        window.x11_materialized_client_rect = Some(rect);
+        true
     }
 
     pub(in crate::compositor) fn toplevel_window_id(&self, surface_id: u32) -> Option<WindowId> {
@@ -130,11 +154,21 @@ impl CompositorState {
         if let Some(placement) = initial_placement
             && let Some(geometry) = window.x11_geometry.as_mut()
         {
+            // Initial placement selection returns an Absolute root placement,
+            // so these coordinates are already in output-space.
             if window.x11_placement_policy == Some(X11PlacementPolicy::CompositorManaged) {
                 geometry.client.x = placement.local_x;
                 geometry.client.y = placement.local_y;
             }
             geometry.frame.placement = placement;
+            if let Some(rect) = PresentationRect::new(
+                f64::from(placement.local_x),
+                f64::from(placement.local_y),
+                f64::from(geometry.frame.width),
+                f64::from(geometry.frame.height),
+            ) {
+                window.x11_materialized_client_rect = Some(rect);
+            }
         }
         let root_surface_id = window.root_surface_id;
         self.ensure_window_scene_nodes(window.id, root_surface_id);
@@ -222,6 +256,18 @@ impl CompositorState {
         window_id: WindowId,
     ) -> Option<(i32, i32, u32, u32)> {
         let window = self.window(window_id)?;
+        if window.kind == DesktopWindowKind::Managed
+            && window.is_normal_x11_role()
+            && matches!(window.backend, WindowBackend::X11(_))
+            && let Some(rect) = window.x11_materialized_client_rect
+        {
+            return Some((
+                rect.x().round() as i32,
+                rect.y().round() as i32,
+                rect.width().round().max(1.0) as u32,
+                rect.height().round().max(1.0) as u32,
+            ));
+        }
         if let Some(geometry) = window.x11_geometry {
             return Some((
                 geometry.frame.placement.local_x,
@@ -740,19 +786,22 @@ impl CompositorState {
             | None => SurfacePlacement::absolute_root_at(client.x, client.y),
         };
         let frame = WindowGeometry::new(placement, client.width.max(1), client.height.max(1));
+        let materialized_client_rect =
+            self.materialized_x11_client_rect_for_frame(window_id, frame);
         if let Some(window) = self.window_mut(window_id)
             && let Some(geometry) = window.x11_geometry.as_mut()
         {
-            if new_policy == Some(X11PlacementPolicy::CompositorManaged) {
-                geometry.client.x = placement.local_x;
-                geometry.client.y = placement.local_y;
+            if new_policy == Some(X11PlacementPolicy::CompositorManaged)
+                && let Some(rect) = materialized_client_rect
+            {
+                geometry.client.x = rect.x().round() as i32;
+                geometry.client.y = rect.y().round() as i32;
             }
             geometry.frame = frame;
         }
-        let output_origin = (placement.parent_surface_id.is_none()
-            && placement.root_mode == RootPlacementMode::Absolute)
-            .then_some((placement.local_x, placement.local_y));
-        self.update_x11_materialized_client_rect_from_frame(window_id, frame, output_origin);
+        if let Some(rect) = materialized_client_rect {
+            self.set_x11_materialized_client_rect(window_id, rect);
+        }
         self.set_surface_placement_with_cause(
             surface_id,
             placement,
@@ -964,6 +1013,9 @@ impl CompositorState {
             )
             | None => SurfacePlacement::absolute_root_at(filtered.x, filtered.y),
         };
+        let frame = WindowGeometry::new(placement, filtered.width.max(1), filtered.height.max(1));
+        let materialized_client_rect =
+            self.materialized_x11_client_rect_for_frame(window_id, frame);
         let previous_visual = self
             .current_visual_root_window_geometry(root_surface_id)
             .or_else(|| self.current_root_window_geometry(root_surface_id));
@@ -972,24 +1024,22 @@ impl CompositorState {
         {
             x11_geometry.client = if placement_policy == Some(X11PlacementPolicy::CompositorManaged)
             {
-                crate::xwayland::xwm::X11Geometry {
-                    x: placement.local_x,
-                    y: placement.local_y,
-                    ..filtered
-                }
+                materialized_client_rect.map_or(x11_geometry.client, |rect| {
+                    crate::xwayland::xwm::X11Geometry {
+                        x: rect.x().round() as i32,
+                        y: rect.y().round() as i32,
+                        ..filtered
+                    }
+                })
             } else {
                 filtered
             };
-            x11_geometry.frame =
-                WindowGeometry::new(placement, filtered.width.max(1), filtered.height.max(1));
+            x11_geometry.frame = frame;
         }
 
-        let frame = WindowGeometry::new(placement, filtered.width.max(1), filtered.height.max(1));
-        self.update_x11_materialized_client_rect_from_frame(
-            window_id,
-            frame,
-            Some((placement.local_x, placement.local_y)),
-        );
+        if let Some(rect) = materialized_client_rect {
+            self.set_x11_materialized_client_rect(window_id, rect);
+        }
         let visual_changed = normal_managed && !resize_active && previous_visual != Some(frame);
         let animation_kind = if visual_changed {
             previous_visual.map(|previous| {
@@ -1062,29 +1112,28 @@ impl CompositorState {
             | None => SurfacePlacement::absolute_root_at(geometry.x, geometry.y),
         };
         let frame = WindowGeometry::new(placement, geometry.width.max(1), geometry.height.max(1));
+        let materialized_client_rect =
+            self.materialized_x11_client_rect_for_frame(window_id, frame);
         if let Some(window) = self.window_mut(window_id)
             && let Some(x11_geometry) = window.x11_geometry.as_mut()
         {
             x11_geometry.client = if placement_policy == Some(X11PlacementPolicy::CompositorManaged)
             {
-                crate::xwayland::xwm::X11Geometry {
-                    x: placement.local_x,
-                    y: placement.local_y,
-                    ..geometry
-                }
+                materialized_client_rect.map_or(x11_geometry.client, |rect| {
+                    crate::xwayland::xwm::X11Geometry {
+                        x: rect.x().round() as i32,
+                        y: rect.y().round() as i32,
+                        ..geometry
+                    }
+                })
             } else {
                 geometry
             };
             x11_geometry.frame = frame;
         }
-        let explicit_output_origin = (placement_policy
-            != Some(X11PlacementPolicy::CompositorManaged))
-        .then_some((geometry.x, geometry.y));
-        self.update_x11_materialized_client_rect_from_frame(
-            window_id,
-            frame,
-            explicit_output_origin,
-        );
+        if let Some(rect) = materialized_client_rect {
+            self.set_x11_materialized_client_rect(window_id, rect);
+        }
         if self.active_toplevel_resizes.contains_key(&root_surface_id) {
             return false;
         }

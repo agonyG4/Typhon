@@ -188,6 +188,11 @@ impl CompositorState {
         window_id: WindowId,
         geometry: WindowGeometry,
     ) -> bool {
+        let Some(materialized_client_rect) =
+            self.materialized_x11_client_rect_for_frame(window_id, geometry)
+        else {
+            return false;
+        };
         let Some(window) = self.window_mut(window_id) else {
             return false;
         };
@@ -195,16 +200,13 @@ impl CompositorState {
             return false;
         };
         x11_geometry.client = crate::xwayland::xwm::X11Geometry {
-            x: geometry.placement.local_x,
-            y: geometry.placement.local_y,
+            x: materialized_client_rect.x().round() as i32,
+            y: materialized_client_rect.y().round() as i32,
             width: geometry.width,
             height: geometry.height,
         };
         x11_geometry.frame = geometry;
-        let output_origin = (geometry.placement.parent_surface_id.is_none()
-            && geometry.placement.root_mode == RootPlacementMode::Absolute)
-            .then_some((geometry.placement.local_x, geometry.placement.local_y));
-        self.update_x11_materialized_client_rect_from_frame(window_id, geometry, output_origin);
+        window.x11_materialized_client_rect = Some(materialized_client_rect);
         true
     }
 
@@ -238,6 +240,11 @@ impl CompositorState {
         };
         let placement = SurfacePlacement::absolute_root_at(filtered.x, filtered.y);
         let frame = WindowGeometry::new(placement, filtered.width, filtered.height);
+        let Some(materialized_client_rect) =
+            self.materialized_x11_client_rect_for_frame(window_id, frame)
+        else {
+            return false;
+        };
         let Some(window) = self.window_mut(window_id) else {
             return false;
         };
@@ -252,14 +259,15 @@ impl CompositorState {
                 ..filtered
             }
         } else {
-            filtered
+            crate::xwayland::xwm::X11Geometry {
+                x: materialized_client_rect.x().round() as i32,
+                y: materialized_client_rect.y().round() as i32,
+                width: filtered.width,
+                height: filtered.height,
+            }
         };
         x11_geometry.frame = frame;
-        self.update_x11_materialized_client_rect_from_frame(
-            window_id,
-            frame,
-            Some((placement.local_x, placement.local_y)),
-        );
+        window.x11_materialized_client_rect = Some(materialized_client_rect);
         resize_debug_log(|| {
             format!(
                 "event=xwayland_resize_geometry_promoted xid={} resize_epoch={} geometry={:?} visual_preserved=true",

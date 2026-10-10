@@ -1757,16 +1757,6 @@ impl CompositorState {
         };
 
         if let Some(window) = self.window_mut(window_id) {
-            if matches!(window.backend, WindowBackend::X11(_))
-                && window.kind == DesktopWindowKind::Managed
-                && window.is_normal_x11_role()
-            {
-                window.x11_materialized_client_rect = canonical_client_rect
-                    .or_else(|| {
-                        active_lifecycle_visual_group.map(|group| group.canonical_client_rect)
-                    })
-                    .or(window.x11_materialized_client_rect);
-            }
             window.state.minimize(minimized_surfaces);
             let target_group = lifecycle_visual_group.or(active_lifecycle_visual_group);
             window
@@ -2967,6 +2957,18 @@ impl CompositorState {
                 u32::try_from(geometry.width).ok()?,
                 u32::try_from(geometry.height).ok()?,
             ));
+        }
+        if let Some(window) = self
+            .window_id_for_surface(surface_id)
+            .and_then(|window_id| self.window(window_id))
+            .filter(|window| {
+                window.kind == DesktopWindowKind::Managed
+                    && window.is_normal_x11_role()
+                    && matches!(window.backend, WindowBackend::X11(_))
+            })
+            && let Some(geometry) = window.x11_geometry
+        {
+            return Some(geometry.frame);
         }
         let surface = self
             .renderable_surfaces

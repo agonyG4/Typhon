@@ -92,9 +92,9 @@ impl CompositorState {
         self.refresh_surface_origin_cache();
         let fullscreen_plan = self.fullscreen_composition_plan();
         let surfaces = self.active_scene_surfaces();
-        let origins = self.active_scene_surface_origins();
+        let assignments = self.active_scene_surface_render_assignments();
         for (index, renderable) in surfaces.iter().enumerate().rev() {
-            let Some(origin) = origins.get(index).copied() else {
+            let Some(assignment) = assignments.get(index) else {
                 continue;
             };
             let root_surface_id = self.visual_stack_root_for_surface(renderable.surface_id);
@@ -113,22 +113,22 @@ impl CompositorState {
             else {
                 continue;
             };
-            let Some(root_origin) = origins.get(root_index).copied() else {
+            let Some(root_assignment) = assignments.get(root_index) else {
                 continue;
             };
-            let root_surface = &surfaces[root_index];
             let Some((hit_x, hit_y, _)) =
                 self.presentation_input_point_for_root(root_surface_id, x, y)
             else {
                 continue;
             };
-            let local_x = hit_x - f64::from(root_origin.0);
-            let local_y = hit_y - f64::from(root_origin.1);
+            let root_target = root_assignment.target;
+            let local_x = hit_x - f64::from(root_target.x());
+            let local_y = hit_y - f64::from(root_target.y());
             if window_frame_action_for_local_point(
                 local_x,
                 local_y,
-                root_surface.width,
-                root_surface.height,
+                root_target.width(),
+                root_target.height(),
             )
             .is_some()
             {
@@ -137,13 +137,13 @@ impl CompositorState {
                     root_surface_id,
                     local_x,
                     local_y,
-                    width: root_surface.width,
-                    height: root_surface.height,
+                    width: root_target.width(),
+                    height: root_target.height(),
                 });
             }
 
             if let Some((surface_x, surface_y)) =
-                render::surface_local_point_at_origin(renderable, origin, hit_x, hit_y)
+                render::surface_local_point_for_assignment(renderable, assignment, hit_x, hit_y)
                 && self.surface_accepts_input_at(renderable, surface_x, surface_y)
             {
                 return None;
@@ -430,6 +430,7 @@ impl CompositorState {
     ) -> (PointerSceneHit, u64, u64) {
         let surfaces = self.active_scene_surfaces();
         let origins = self.active_scene_surface_origins();
+        let assignments = self.active_scene_surface_render_assignments();
         let mut groups_inspected = 0;
         let mut surfaces_inspected = 0;
         for group in self.visual_stack_groups_cache.iter().rev() {
@@ -466,7 +467,7 @@ impl CompositorState {
                     hit_x,
                     hit_y,
                 )
-                && (!self.root_surface_accepts_input_at(root_index, root_origin, hit_x, hit_y)
+                && (!self.root_surface_accepts_input_at(root_index, hit_x, hit_y)
                     || (matches!(hit, DecorationHit::Resize(_))
                         && self
                             .window_id_for_surface(group.root_surface_id())
@@ -498,12 +499,12 @@ impl CompositorState {
                 let Some(renderable) = surfaces.get(index) else {
                     continue;
                 };
-                let Some(origin) = origins.get(index).copied() else {
+                let Some(assignment) = assignments.get(index) else {
                     continue;
                 };
-                let Some((surface_x, surface_y)) =
-                    render::surface_local_point_at_origin(renderable, origin, hit_x, hit_y)
-                else {
+                let Some((surface_x, surface_y)) = render::surface_local_point_for_assignment(
+                    renderable, assignment, hit_x, hit_y,
+                ) else {
                     continue;
                 };
                 let accepts_input = self.surface_accepts_input_at(renderable, surface_x, surface_y);
@@ -566,11 +567,12 @@ impl CompositorState {
                     .active_scene_index_hits
                     .saturating_add(1);
                 let renderable = self.active_scene_surfaces().get(index)?;
-                let origin = self.active_scene_surface_origins().get(index).copied()?;
+                let assignment = self.active_scene_surface_render_assignments().get(index)?;
                 let (hit_x, hit_y, _) =
                     self.presentation_input_point_for_root(root_surface_id, x, y)?;
-                let (surface_x, surface_y) =
-                    render::surface_local_point_at_origin(renderable, origin, hit_x, hit_y)?;
+                let (surface_x, surface_y) = render::surface_local_point_for_assignment(
+                    renderable, assignment, hit_x, hit_y,
+                )?;
                 if !self.surface_accepts_input_at(renderable, surface_x, surface_y) {
                     return None;
                 }
@@ -663,7 +665,7 @@ impl CompositorState {
                 })
                 .flatten()
                 .filter(|hit| {
-                    !self.root_surface_accepts_input_at(root_index, root_origin, x, y)
+                    !self.root_surface_accepts_input_at(root_index, hit_x, hit_y)
                         || (matches!(hit, DecorationHit::Resize(_))
                             && self
                                 .window_id_for_surface(group.root_surface_id())
@@ -684,11 +686,12 @@ impl CompositorState {
                         .rev()
                         .filter_map(|index| {
                             let renderable = self.active_scene_surfaces().get(*index)?;
-                            let origin =
-                                self.active_scene_surface_origins().get(*index).copied()?;
-                            let (surface_x, surface_y) = render::surface_local_point_at_origin(
-                                renderable, origin, hit_x, hit_y,
-                            )?;
+                            let assignment =
+                                self.active_scene_surface_render_assignments().get(*index)?;
+                            let (surface_x, surface_y) =
+                                render::surface_local_point_for_assignment(
+                                    renderable, assignment, hit_x, hit_y,
+                                )?;
                             self.surface_accepts_input_at(renderable, surface_x, surface_y)
                                 .then_some((renderable.surface_id, None))
                         })
@@ -711,18 +714,18 @@ impl CompositorState {
         false
     }
 
-    fn root_surface_accepts_input_at(
-        &self,
-        root_index: usize,
-        root_origin: (i32, i32),
-        x: f64,
-        y: f64,
-    ) -> bool {
+    fn root_surface_accepts_input_at(&self, root_index: usize, x: f64, y: f64) -> bool {
         let Some(root_surface) = self.active_scene_surfaces().get(root_index) else {
             return false;
         };
+        let Some(assignment) = self
+            .active_scene_surface_render_assignments()
+            .get(root_index)
+        else {
+            return false;
+        };
         let Some((surface_x, surface_y)) =
-            render::surface_local_point_at_origin(root_surface, root_origin, x, y)
+            render::surface_local_point_for_assignment(root_surface, assignment, x, y)
         else {
             return false;
         };
@@ -752,23 +755,17 @@ impl CompositorState {
         }
         self.refresh_surface_origin_cache();
         let surfaces = self.active_scene_surfaces();
-        let origins = self.active_scene_surface_origins();
         let root_index = surfaces
             .iter()
             .position(|surface| surface.surface_id == root_surface_id)?;
-        let origin = origins.get(root_index).copied()?;
+        let root_surface = surfaces.get(root_index)?;
+        let assignment = self
+            .active_scene_surface_render_assignments()
+            .get(root_index)?;
         let (hit_x, hit_y, _presented_origin) =
             self.presentation_input_point_for_root(root_surface_id, x, y)?;
-        let geometry = self.current_visual_root_window_geometry(root_surface_id)?;
-        let surface_x = hit_x - f64::from(origin.0);
-        let surface_y = hit_y - f64::from(origin.1);
-        if surface_x < 0.0
-            || surface_y < 0.0
-            || surface_x >= f64::from(geometry.width)
-            || surface_y >= f64::from(geometry.height)
-        {
-            return None;
-        }
+        let (surface_x, surface_y) =
+            render::surface_local_point_for_assignment(root_surface, assignment, hit_x, hit_y)?;
         let surface = self.surface_resource_by_id(root_surface_id)?;
         Some(PointerTarget {
             surface,
@@ -795,16 +792,15 @@ impl CompositorState {
         let surface_id = compositor_surface_id(surface);
         self.refresh_surface_origin_cache();
         let surfaces = self.active_scene_surfaces();
-        let origins = self.active_scene_surface_origins();
         let index = surfaces
             .iter()
             .position(|renderable| renderable.surface_id == surface_id)?;
         let renderable = &surfaces[index];
-        let origin = origins.get(index).copied()?;
+        let assignment = self.active_scene_surface_render_assignments().get(index)?;
         let root_surface_id = self.visual_stack_root_for_surface(surface_id);
         let (hit_x, hit_y, _) = self.presentation_input_point_for_root(root_surface_id, x, y)?;
         let (surface_x, surface_y) =
-            render::surface_local_point_at_origin(renderable, origin, hit_x, hit_y)?;
+            render::surface_local_point_for_assignment(renderable, assignment, hit_x, hit_y)?;
         Some(PointerTarget {
             surface: surface.clone(),
             surface_x,
@@ -825,7 +821,9 @@ impl CompositorState {
         self.surface_resource_by_id(surface.surface_id)
             .and_then(|resource| {
                 resource.data::<SurfaceData>().map(|data| {
-                    data.input_region_contains(surface_x, surface_y, surface.width, surface.height)
+                    render::surface_logical_extent(surface).is_some_and(|(width, height)| {
+                        data.input_region_contains(surface_x, surface_y, width, height)
+                    })
                 })
             })
             .unwrap_or(true)
