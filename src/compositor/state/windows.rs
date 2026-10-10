@@ -17,9 +17,11 @@ enum PendingXwaylandRestoreWaitReason {
     WrongSurfaceIdentity,
     NoCommittedContent,
     MissingAuthoritativeGeometry,
+    MissingMaterializedGeometry,
+    ParentRelativeCanonicalGeometry,
+    ParentRelativeSource,
     GeometryMismatch,
     WrongGeneration,
-    UnexpectedPlacement,
 }
 
 impl PendingXwaylandRestoreWaitReason {
@@ -29,9 +31,11 @@ impl PendingXwaylandRestoreWaitReason {
             Self::WrongSurfaceIdentity => "wrong_surface_identity",
             Self::NoCommittedContent => "no_committed_content",
             Self::MissingAuthoritativeGeometry => "missing_authoritative_geometry",
+            Self::MissingMaterializedGeometry => "missing_materialized_geometry",
+            Self::ParentRelativeCanonicalGeometry => "parent_relative_canonical_geometry",
+            Self::ParentRelativeSource => "parent_relative_source",
             Self::GeometryMismatch => "geometry_mismatch",
             Self::WrongGeneration => "wrong_generation",
-            Self::UnexpectedPlacement => "unexpected_placement",
         }
     }
 }
@@ -85,6 +89,22 @@ fn pending_xwayland_restore_surface_rect(source: &RenderableSurface) -> Option<P
         f64::from(source.width),
         f64::from(source.height),
     )
+}
+
+fn pending_xwayland_restore_canonical_rect(
+    geometry: WindowGeometry,
+    materialized_rect: Option<PresentationRect>,
+) -> Result<PresentationRect, PendingXwaylandRestoreWaitReason> {
+    if geometry.placement.parent_surface_id.is_some() {
+        return Err(PendingXwaylandRestoreWaitReason::ParentRelativeCanonicalGeometry);
+    }
+    let Some(rect) = materialized_rect else {
+        return Err(PendingXwaylandRestoreWaitReason::MissingMaterializedGeometry);
+    };
+    if rect.width() != f64::from(geometry.width) || rect.height() != f64::from(geometry.height) {
+        return Err(PendingXwaylandRestoreWaitReason::MissingMaterializedGeometry);
+    }
+    Ok(rect)
 }
 
 fn lifecycle_diagnostics_enabled() -> bool {
@@ -1737,6 +1757,16 @@ impl CompositorState {
         };
 
         if let Some(window) = self.window_mut(window_id) {
+            if matches!(window.backend, WindowBackend::X11(_))
+                && window.kind == DesktopWindowKind::Managed
+                && window.is_normal_x11_role()
+            {
+                window.x11_materialized_client_rect = canonical_client_rect
+                    .or_else(|| {
+                        active_lifecycle_visual_group.map(|group| group.canonical_client_rect)
+                    })
+                    .or(window.x11_materialized_client_rect);
+            }
             window.state.minimize(minimized_surfaces);
             let target_group = lifecycle_visual_group.or(active_lifecycle_visual_group);
             window
@@ -1908,28 +1938,19 @@ impl CompositorState {
             );
         };
         let canonical_geometry = geometry.frame;
-        if canonical_geometry.placement.parent_surface_id.is_some()
-            || canonical_geometry.placement.root_mode != RootPlacementMode::Absolute
-        {
-            return waiting(
-                PendingXwaylandRestoreWaitReason::UnexpectedPlacement,
-                Some(surface_id),
-                None,
-                window.state.minimized_root_surface(surface_id),
-            );
-        }
-        let Some(canonical_client_rect) = PresentationRect::new(
-            f64::from(canonical_geometry.placement.local_x),
-            f64::from(canonical_geometry.placement.local_y),
-            f64::from(canonical_geometry.width),
-            f64::from(canonical_geometry.height),
-        ) else {
-            return waiting(
-                PendingXwaylandRestoreWaitReason::MissingAuthoritativeGeometry,
-                Some(surface_id),
-                None,
-                None,
-            );
+        let canonical_client_rect = match pending_xwayland_restore_canonical_rect(
+            canonical_geometry,
+            window.x11_materialized_client_rect,
+        ) {
+            Ok(rect) => rect,
+            Err(reason) => {
+                return waiting(
+                    reason,
+                    Some(surface_id),
+                    window.x11_materialized_client_rect,
+                    window.state.minimized_root_surface(surface_id),
+                );
+            }
         };
         let Some(source) = window.state.minimized_root_surface(surface_id) else {
             return waiting(
@@ -1939,19 +1960,26 @@ impl CompositorState {
                 None,
             );
         };
-        let Some(committed_client_rect) = pending_xwayland_restore_surface_rect(source) else {
+        if source.placement.parent_surface_id.is_some()
+            || source
+                .render_placement
+                .is_some_and(|placement| placement.parent_surface_id.is_some())
+        {
             return waiting(
-                PendingXwaylandRestoreWaitReason::UnexpectedPlacement,
+                PendingXwaylandRestoreWaitReason::ParentRelativeSource,
                 Some(surface_id),
                 Some(canonical_client_rect),
                 Some(source),
             );
-        };
+        }
         let buffer_size = source.buffer_size();
-        if source.placement != canonical_geometry.placement
+        if source.width != canonical_client_rect.width() as u32
+            || source.height != canonical_client_rect.height() as u32
             || source.width != canonical_geometry.width
             || source.height != canonical_geometry.height
-            || committed_client_rect != canonical_client_rect
+            || source.render_target_size.is_some_and(|target| {
+                target.width != source.width || target.height != source.height
+            })
         {
             return waiting(
                 PendingXwaylandRestoreWaitReason::GeometryMismatch,
@@ -1967,7 +1995,7 @@ impl CompositorState {
             generation: xwayland_surface.generation,
             canonical_geometry,
             canonical_client_rect,
-            committed_client_rect,
+            committed_client_rect: canonical_client_rect,
             logical_width: source.width,
             logical_height: source.height,
             buffer_size,
@@ -2240,6 +2268,7 @@ impl CompositorState {
                     && window
                         .x11_geometry
                         .is_some_and(|geometry| geometry.frame == source.canonical_geometry)
+                    && window.x11_materialized_client_rect == Some(source.canonical_client_rect)
                     && self
                         .xwayland
                         .surface_states
@@ -2313,12 +2342,26 @@ impl CompositorState {
                 return false;
             }
         }
-        let Some(minimized_surfaces) = self
+        let Some(mut minimized_surfaces) = self
             .window_mut(window_id)
             .and_then(|window| window.state.restore_minimized())
         else {
             return false;
         };
+
+        if let Some(source) = xwayland_restore_source {
+            let canonical_x = source.canonical_client_rect.x().round() as i32;
+            let canonical_y = source.canonical_client_rect.y().round() as i32;
+            if let Some(root) = minimized_surfaces
+                .iter_mut()
+                .find(|surface| surface.surface_id == source.surface_id)
+            {
+                root.render_placement = Some(SurfacePlacement::absolute_root_at(
+                    canonical_x.saturating_sub(root.x),
+                    canonical_y.saturating_sub(root.y),
+                ));
+            }
+        }
 
         for surface in minimized_surfaces {
             self.append_renderable_surface(surface);
@@ -2332,6 +2375,20 @@ impl CompositorState {
         self.refresh_active_scene_surface_order();
         if let Some(surface_id) = x11_surface_id {
             let _ = self.adopt_current_xwayland_surface_content(surface_id);
+            if let Some(source) = xwayland_restore_source
+                && let Some(root) = self
+                    .renderable_surfaces
+                    .iter_mut()
+                    .find(|surface| surface.surface_id == source.surface_id)
+            {
+                let canonical_x = source.canonical_client_rect.x().round() as i32;
+                let canonical_y = source.canonical_client_rect.y().round() as i32;
+                root.render_placement = Some(SurfacePlacement::absolute_root_at(
+                    canonical_x.saturating_sub(root.x),
+                    canonical_y.saturating_sub(root.y),
+                ));
+                self.refresh_active_scene_surface_tree(source.surface_id);
+            }
         } else if let Some(window) = self.window(window_id)
             && matches!(window.backend, WindowBackend::X11(_))
         {
@@ -3398,7 +3455,7 @@ mod tests {
         let canonical_geometry = Some(WindowGeometry::new(cascaded, 800, 600));
         let expected = Some(PresentationRect::new(137.0, 91.0, 800.0, 600.0).unwrap());
         let first_wait = PendingXwaylandRestoreWait::new(
-            PendingXwaylandRestoreWaitReason::UnexpectedPlacement,
+            PendingXwaylandRestoreWaitReason::GeometryMismatch,
             Some(25),
             canonical_geometry,
             expected,
@@ -3421,7 +3478,7 @@ mod tests {
         assert_eq!(emitted, 1);
 
         let changed_wait = PendingXwaylandRestoreWait::new(
-            PendingXwaylandRestoreWaitReason::UnexpectedPlacement,
+            PendingXwaylandRestoreWaitReason::GeometryMismatch,
             Some(25),
             canonical_geometry,
             Some(PresentationRect::new(137.0, 91.0, 1024.0, 768.0).unwrap()),
@@ -3435,6 +3492,30 @@ mod tests {
             ),
             Some(99),
             "a changed geometry emits once and reports the suppressed repeats"
+        );
+    }
+
+    #[test]
+    fn restore_geometry_materialization_accepts_cascaded_and_rejects_parent_relative_frames() {
+        let expected = PresentationRect::new(137.0, 91.0, 800.0, 600.0).unwrap();
+        let cascaded = WindowGeometry::new(SurfacePlacement::root_at(17, -11), 800, 600);
+        assert_eq!(
+            pending_xwayland_restore_canonical_rect(cascaded, Some(expected)),
+            Ok(expected),
+            "CascadedWindow local coordinates are accepted only alongside a materialized rectangle"
+        );
+        let absolute = WindowGeometry::new(SurfacePlacement::absolute_root_at(900, 700), 800, 600);
+        assert_eq!(
+            pending_xwayland_restore_canonical_rect(absolute, Some(expected)),
+            Ok(expected),
+            "the materialized output rectangle is independent of raw placement representation"
+        );
+
+        let parent_relative = WindowGeometry::new(SurfacePlacement::subsurface(91, 5, 7), 800, 600);
+        assert_eq!(
+            pending_xwayland_restore_canonical_rect(parent_relative, Some(expected)),
+            Err(PendingXwaylandRestoreWaitReason::ParentRelativeCanonicalGeometry),
+            "a parent-relative frame cannot be normalized as a managed top-level"
         );
     }
 }

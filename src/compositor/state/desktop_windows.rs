@@ -17,6 +17,40 @@ fn rectangles_overlap(
 }
 
 impl CompositorState {
+    pub(in crate::compositor) fn update_x11_materialized_client_rect_from_frame(
+        &mut self,
+        window_id: WindowId,
+        frame: WindowGeometry,
+        explicit_output_origin: Option<(i32, i32)>,
+    ) {
+        let Some(window) = self.window_mut(window_id) else {
+            return;
+        };
+        if !matches!(window.backend, WindowBackend::X11(_)) {
+            return;
+        }
+        let origin = explicit_output_origin
+            .or_else(|| {
+                window
+                    .x11_materialized_client_rect
+                    .map(|rect| (rect.x().round() as i32, rect.y().round() as i32))
+            })
+            .or_else(|| {
+                let placement = frame.placement;
+                (placement.parent_surface_id.is_none()
+                    && placement.root_mode == RootPlacementMode::Absolute)
+                    .then_some((placement.local_x, placement.local_y))
+            });
+        window.x11_materialized_client_rect = origin.and_then(|(x, y)| {
+            PresentationRect::new(
+                f64::from(x),
+                f64::from(y),
+                f64::from(frame.width),
+                f64::from(frame.height),
+            )
+        });
+    }
+
     pub(in crate::compositor) fn toplevel_window_id(&self, surface_id: u32) -> Option<WindowId> {
         self.toplevel_surfaces
             .get(&surface_id)
@@ -705,6 +739,7 @@ impl CompositorState {
             )
             | None => SurfacePlacement::absolute_root_at(client.x, client.y),
         };
+        let frame = WindowGeometry::new(placement, client.width.max(1), client.height.max(1));
         if let Some(window) = self.window_mut(window_id)
             && let Some(geometry) = window.x11_geometry.as_mut()
         {
@@ -712,9 +747,12 @@ impl CompositorState {
                 geometry.client.x = placement.local_x;
                 geometry.client.y = placement.local_y;
             }
-            geometry.frame =
-                WindowGeometry::new(placement, client.width.max(1), client.height.max(1));
+            geometry.frame = frame;
         }
+        let output_origin = (placement.parent_surface_id.is_none()
+            && placement.root_mode == RootPlacementMode::Absolute)
+            .then_some((placement.local_x, placement.local_y));
+        self.update_x11_materialized_client_rect_from_frame(window_id, frame, output_origin);
         self.set_surface_placement_with_cause(
             surface_id,
             placement,
@@ -947,6 +985,11 @@ impl CompositorState {
         }
 
         let frame = WindowGeometry::new(placement, filtered.width.max(1), filtered.height.max(1));
+        self.update_x11_materialized_client_rect_from_frame(
+            window_id,
+            frame,
+            Some((placement.local_x, placement.local_y)),
+        );
         let visual_changed = normal_managed && !resize_active && previous_visual != Some(frame);
         let animation_kind = if visual_changed {
             previous_visual.map(|previous| {
@@ -1034,6 +1077,14 @@ impl CompositorState {
             };
             x11_geometry.frame = frame;
         }
+        let explicit_output_origin = (placement_policy
+            != Some(X11PlacementPolicy::CompositorManaged))
+        .then_some((geometry.x, geometry.y));
+        self.update_x11_materialized_client_rect_from_frame(
+            window_id,
+            frame,
+            explicit_output_origin,
+        );
         if self.active_toplevel_resizes.contains_key(&root_surface_id) {
             return false;
         }

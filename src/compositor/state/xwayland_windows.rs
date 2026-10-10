@@ -2,6 +2,48 @@ use super::*;
 use crate::xwayland::trace::{self, TraceFields};
 
 impl CompositorState {
+    pub(in crate::compositor) fn apply_x11_materialized_root_render_placement(
+        &mut self,
+        root_surface_id: u32,
+    ) -> bool {
+        let Some(window_id) = self.window_id_for_surface(root_surface_id) else {
+            return false;
+        };
+        let Some((rect, managed)) = self.window(window_id).map(|window| {
+            (
+                window.x11_materialized_client_rect,
+                window.kind == DesktopWindowKind::Managed && window.is_normal_x11_role(),
+            )
+        }) else {
+            return false;
+        };
+        let Some(rect) = rect.filter(|_| managed) else {
+            return false;
+        };
+        if self.active_toplevel_resizes.contains_key(&root_surface_id)
+            || self
+                .toplevel_visual_geometries
+                .contains_key(&root_surface_id)
+        {
+            return false;
+        }
+        let Some(root) = self
+            .renderable_surfaces
+            .iter_mut()
+            .find(|surface| surface.surface_id == root_surface_id)
+        else {
+            return false;
+        };
+        let x = rect.x().round() as i32;
+        let y = rect.y().round() as i32;
+        root.render_placement = Some(SurfacePlacement::absolute_root_at(
+            x.saturating_sub(root.x),
+            y.saturating_sub(root.y),
+        ));
+        self.refresh_active_scene_surface_tree(root_surface_id);
+        true
+    }
+
     pub(in crate::compositor) fn retire_xwayland_attachment(&mut self, surface_id: u32) {
         let mut retired_ids = self
             .surface_topology
@@ -324,6 +366,7 @@ impl CompositorState {
         );
         self.reorder_renderable_surfaces_by_committed_stack();
         self.reapply_root_visual_assignment_after_surface_publication(surface_id);
+        self.apply_x11_materialized_root_render_placement(root_surface_id);
         self.publish_surface_generation(
             surface_id,
             generation,
@@ -542,6 +585,7 @@ impl CompositorState {
                     }
                 }
                 self.reapply_root_visual_assignment_after_surface_publication(root_surface_id);
+                self.apply_x11_materialized_root_render_placement(root_surface_id);
                 let mut metrics = self.locality_metrics.get();
                 metrics.xwayland_full_visual_reassignments =
                     metrics.xwayland_full_visual_reassignments.saturating_add(1);

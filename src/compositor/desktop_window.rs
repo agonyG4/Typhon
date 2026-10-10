@@ -3,6 +3,7 @@
 use std::io;
 
 use crate::core::WindowId;
+use crate::presentation_animation::PresentationRect;
 use crate::presentation_animation::{PresentationClip, PresentationOpacity};
 use crate::wm::{WindowDecorationPolicy, WindowManagementState, WorkspaceId, WorkspaceLocation};
 use crate::xwayland::X11WindowHandle;
@@ -116,6 +117,9 @@ pub struct DesktopWindow {
     pub x11_accepts_input: Option<bool>,
     pub x11_transient_for: Option<X11WindowHandle>,
     pub(super) x11_geometry: Option<X11GeometryState>,
+    /// Materialized output-space client rectangle for this X11 window. It is
+    /// independent of XWayland surface identity and placement representation.
+    pub(super) x11_materialized_client_rect: Option<PresentationRect>,
     pub metadata: WindowMetadata,
     pub constraints: WindowConstraints,
     pub relationships: WindowRelationships,
@@ -189,6 +193,7 @@ impl DesktopWindow {
             x11_accepts_input: None,
             x11_transient_for: None,
             x11_geometry: None,
+            x11_materialized_client_rect: None,
             metadata: WindowMetadata::default(),
             constraints: WindowConstraints::default(),
             relationships: WindowRelationships::default(),
@@ -231,6 +236,12 @@ impl DesktopWindow {
                     geometry.height.max(1),
                 ),
             }),
+            x11_materialized_client_rect: PresentationRect::new(
+                f64::from(geometry.x),
+                f64::from(geometry.y),
+                f64::from(geometry.width.max(1)),
+                f64::from(geometry.height.max(1)),
+            ),
             metadata: snapshot.metadata,
             constraints: snapshot.constraints,
             relationships: WindowRelationships::default(),

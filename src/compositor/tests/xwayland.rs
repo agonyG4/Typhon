@@ -1983,6 +1983,69 @@ fn xwayland_restore_waits_for_authoritative_logical_geometry() {
 }
 
 #[test]
+fn xwayland_restore_accepts_cascaded_frame_with_materialized_position() {
+    let mut fixture = stationary_pointer_xwayland_fixture();
+    let geometry = X11Geometry {
+        x: 137,
+        y: 91,
+        width: 800,
+        height: 600,
+    };
+    let (window_id, _, replacement_source_content) =
+        prepare_pending_xwayland_restore(&mut fixture, geometry);
+    let cascaded_placement = SurfacePlacement::root_at(17, -11);
+    {
+        let window = fixture
+            .server
+            .state
+            .window_mut(window_id)
+            .expect("managed X11 window");
+        let frame = window.x11_geometry.expect("persistent X11 geometry").frame;
+        window.x11_geometry.as_mut().unwrap().frame =
+            crate::compositor::WindowGeometry::new(cascaded_placement, frame.width, frame.height);
+    }
+    fixture
+        .server
+        .state
+        .set_surface_placement(fixture.popup_surface_id, cascaded_placement);
+    fixture
+        .server
+        .set_lifecycle_animation_renderer_available(true);
+
+    commit_replacement_xwayland_content(&mut fixture, &replacement_source_content, 800, 600, 0, 0);
+
+    assert!(
+        fixture
+            .server
+            .state
+            .window(window_id)
+            .is_some_and(|window| !window.state.is_minimized()),
+        "a valid CascadedWindow representation must not block deferred restore"
+    );
+    assert!(
+        !fixture
+            .server
+            .state
+            .pending_xwayland_restores
+            .contains_key(&window_id)
+    );
+    let expected = crate::compositor::PresentationRect::new(137.0, 91.0, 800.0, 600.0)
+        .expect("materialized authoritative client rectangle");
+    assert_xwayland_restore_lifecycle_rect(&fixture, window_id, expected);
+    let restored_root = fixture
+        .server
+        .renderable_surfaces()
+        .iter()
+        .find(|surface| surface.surface_id == fixture.popup_surface_id)
+        .expect("replacement root is visible after readiness");
+    assert_eq!(
+        restored_root.render_placement,
+        Some(SurfacePlacement::absolute_root_at(137, 91)),
+        "the ordinary scene must finish at the same materialized rectangle"
+    );
+}
+
+#[test]
 fn xwayland_restore_tracks_authoritative_geometry_changes_while_pending() {
     let mut fixture = stationary_pointer_xwayland_fixture();
     let initial_geometry = X11Geometry {
@@ -2052,7 +2115,7 @@ fn xwayland_restore_tracks_authoritative_geometry_changes_while_pending() {
 }
 
 #[test]
-fn xwayland_restore_rejects_replacement_content_offset_from_authoritative_position() {
+fn xwayland_restore_materializes_replacement_root_offset_at_authoritative_position() {
     let mut fixture = stationary_pointer_xwayland_fixture();
     let geometry = X11Geometry {
         x: 137,
@@ -2080,25 +2143,15 @@ fn xwayland_restore_rejects_replacement_content_offset_from_authoritative_positi
             .server
             .state
             .window(window_id)
-            .is_some_and(|window| window.state.is_minimized())
+            .is_some_and(|window| !window.state.is_minimized()),
+        "a root content offset can be normalized without stretching the committed content"
     );
     assert!(
-        fixture
+        !fixture
             .server
             .state
             .pending_xwayland_restores
             .contains_key(&window_id)
-    );
-    assert!(fixture.server.renderable_surfaces().is_empty());
-
-    commit_replacement_xwayland_content(&mut fixture, &replacement_source_content, 800, 600, 0, 0);
-
-    assert!(
-        fixture
-            .server
-            .state
-            .window(window_id)
-            .is_some_and(|window| !window.state.is_minimized())
     );
     assert_xwayland_restore_lifecycle_rect(
         &fixture,
@@ -2106,6 +2159,17 @@ fn xwayland_restore_rejects_replacement_content_offset_from_authoritative_positi
         crate::compositor::PresentationRect::new(137.0, 91.0, 800.0, 600.0)
             .expect("authoritative X11 client rectangle"),
     );
+    let root = fixture
+        .server
+        .renderable_surfaces()
+        .iter()
+        .find(|surface| surface.surface_id == fixture.popup_surface_id)
+        .expect("restored XWayland root");
+    assert_eq!(
+        root.render_placement,
+        Some(SurfacePlacement::absolute_root_at(120, 102))
+    );
+    assert!(root.render_target_size.is_none());
 }
 
 #[test]

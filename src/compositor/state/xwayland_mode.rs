@@ -201,6 +201,10 @@ impl CompositorState {
             height: geometry.height,
         };
         x11_geometry.frame = geometry;
+        let output_origin = (geometry.placement.parent_surface_id.is_none()
+            && geometry.placement.root_mode == RootPlacementMode::Absolute)
+            .then_some((geometry.placement.local_x, geometry.placement.local_y));
+        self.update_x11_materialized_client_rect_from_frame(window_id, geometry, output_origin);
         true
     }
 
@@ -251,6 +255,11 @@ impl CompositorState {
             filtered
         };
         x11_geometry.frame = frame;
+        self.update_x11_materialized_client_rect_from_frame(
+            window_id,
+            frame,
+            Some((placement.local_x, placement.local_y)),
+        );
         resize_debug_log(|| {
             format!(
                 "event=xwayland_resize_geometry_promoted xid={} resize_epoch={} geometry={:?} visual_preserved=true",

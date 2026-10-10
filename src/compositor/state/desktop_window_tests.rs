@@ -2309,6 +2309,17 @@ fn late_popup_to_toplevel_reclassification_migrates_to_managed_placement() {
             crate::compositor::render::FIRST_SURFACE_OFFSET.1,
         )
     );
+    let frame = state.window(popup_id).unwrap().x11_geometry.unwrap().frame;
+    assert_eq!(
+        state.window(popup_id).unwrap().x11_materialized_client_rect,
+        crate::presentation_animation::PresentationRect::new(
+            f64::from(frame.placement.local_x),
+            f64::from(frame.placement.local_y),
+            f64::from(frame.width),
+            f64::from(frame.height),
+        ),
+        "placement-policy migration must refresh materialized X11 geometry"
+    );
 }
 
 #[test]
