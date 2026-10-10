@@ -9,6 +9,8 @@ use super::presentation_worker::{
 };
 use super::*;
 use crate::native_output::kms_worker::KmsCommitWorkerHandle;
+#[cfg(test)]
+use crate::native_output::presentation::kms_timing::KmsPresentationTiming;
 use oblivion_one::compositor::FrameCallbackAdmission;
 #[cfg(test)]
 use oblivion_one::native::kms::KmsBackendKind;
@@ -67,8 +69,16 @@ pub(super) fn pull_ready_frame_into_reachable_opportunity_on_swapchain(
     let Some(ready_identity) = swapchain.ready_identity() else {
         return Ok(ReadyPullInResult::RejectedIdentity);
     };
-    let Some(current_target) = ready_identity.target else {
-        return Ok(ReadyPullInResult::RejectedIdentity);
+    let current_target = match ready_identity.reservation {
+        crate::native_output::presentation::transaction::FramePresentationReservation::Fixed(
+            target,
+        ) => target,
+        crate::native_output::presentation::transaction::FramePresentationReservation::Variable(
+            _,
+        )
+        | crate::native_output::presentation::transaction::FramePresentationReservation::DeferredO1(
+            _,
+        ) => return Ok(ReadyPullInResult::RejectedIdentity),
     };
     if !current_target.is_binding() {
         return Ok(ReadyPullInResult::RejectedIdentity);
@@ -83,7 +93,7 @@ pub(super) fn pull_ready_frame_into_reachable_opportunity_on_swapchain(
     let Some(mut frontier) = swapchain.last_presented_primary_claim() else {
         return Ok(ReadyPullInResult::RejectedIdentity);
     };
-    if let Some(future) = swapchain.latest_future_primary_target() {
+    if let Some(future) = swapchain.latest_future_fixed_target()? {
         let future_claim = future.physical_claim();
         if future_claim.sequence <= frontier.sequence
             || future_claim.presentation_time <= frontier.presentation_time
@@ -215,9 +225,17 @@ pub(super) fn submit_ready_frame(
     let explicit_submission = matches!(scanout, NativeScanoutBackend::AtomicEglGbm(_));
     let guard = if let NativeScanoutBackend::AtomicEglGbm(explicit) = scanout {
         explicit.swapchain()?.ready_identity().and_then(|identity| {
-            identity
-                .target
-                .map(|target| (identity.protocol_batch_id, target))
+            match identity.reservation {
+                crate::native_output::presentation::transaction::FramePresentationReservation::Fixed(
+                    target,
+                ) => Some((identity.protocol_batch_id, target)),
+                crate::native_output::presentation::transaction::FramePresentationReservation::Variable(
+                    _,
+                )
+                | crate::native_output::presentation::transaction::FramePresentationReservation::DeferredO1(
+                    _,
+                ) => None,
+            }
         })
     } else {
         server.prepared_frame_batch_id().zip(compatibility_target)
@@ -718,13 +736,15 @@ mod tests {
                 render_generation: 1,
                 pool_generation: 1,
                 reservation: FramePresentationReservation::Fixed(old_target),
-                submit_window: KmsSubmitWindow::try_new(
-                    old_target.presentation_time.get(),
-                    old_target.submit_not_before().get(),
-                    0,
-                    0,
-                )
-                .unwrap(),
+                presentation_timing: KmsPresentationTiming::Fixed(
+                    KmsSubmitWindow::try_new(
+                        old_target.presentation_time.get(),
+                        old_target.submit_not_before().get(),
+                        0,
+                        0,
+                    )
+                    .unwrap(),
+                ),
                 render_fence: test_render_fence(),
                 fence_timing_evidence: None,
                 scene_commit: EglSceneFrameCommit::empty_for_test(),
@@ -775,7 +795,7 @@ mod tests {
         assert_eq!(
             swapchain
                 .ready_identity()
-                .and_then(|identity| identity.target),
+                .and_then(|identity| identity.fixed_target()),
             Some(old_target)
         );
 
@@ -813,7 +833,7 @@ mod tests {
         assert_eq!(
             swapchain
                 .ready_identity()
-                .and_then(|identity| identity.target),
+                .and_then(|identity| identity.fixed_target()),
             Some(expected_target)
         );
         assert_eq!(
@@ -821,7 +841,7 @@ mod tests {
                 .transaction(transaction_id)
                 .unwrap()
                 .descriptor()
-                .bound_target(),
+                .fixed_target(),
             Some(expected_target)
         );
         let ready_window = swapchain.ready_submit_window().expect("N+1 ready window");
@@ -844,7 +864,7 @@ mod tests {
                 .transaction(transaction_id)
                 .unwrap()
                 .descriptor()
-                .bound_target(),
+                .fixed_target(),
             Some(expected_target)
         );
     }

@@ -41,6 +41,7 @@ fn offer_sidecar(handle: &KmsCommitWorkerHandle, mut sidecar: CursorSidecar) {
 }
 
 fn test_sidecar(job: &KmsCommitJob) -> CursorSidecar {
+    let target = job.fixed_target().expect("test job has fixed timing");
     let transaction_id = crate::native_output::OutputTransactionId::new(
         NonZeroU64::new(job.transaction_id.get().saturating_mul(100)).unwrap(),
     );
@@ -49,8 +50,8 @@ fn test_sidecar(job: &KmsCommitJob) -> CursorSidecar {
             job.output_id,
             transaction_id,
             job.output_generation,
-            job.target.presentation_time,
-            job.target,
+            target.presentation_time,
+            target,
             oblivion_one::native::scheduler::NativeOutputPacingMode::ReactiveDouble,
             transaction_id.get(),
             None,
@@ -68,8 +69,8 @@ fn test_sidecar(job: &KmsCommitJob) -> CursorSidecar {
         },
         lease: None,
         coupling: CursorSidecarCoupling::Independent,
-        created_at: job.target.presentation_time,
-        deadline: job.target,
+        created_at: target.presentation_time,
+        deadline: target,
         crtc_id: job.crtc_id,
         test_policy: KmsTestOnlyPolicy::Skip,
         cursor_delivery: PresentedCursorDelivery::Hidden,
@@ -81,13 +82,14 @@ fn test_sidecar(job: &KmsCommitJob) -> CursorSidecar {
 
 fn test_job_with_cursor_owner(token: u64) -> KmsCommitJob {
     let mut job = test_job(token);
+    let target = job.fixed_target().expect("test job has fixed timing");
     let transaction = Arc::new(
         OutputTransaction::composited(
             job.output_id,
             job.transaction_id,
             job.output_generation,
             MonotonicTimestampNs::new(0),
-            job.target,
+            target,
             NativeOutputPacingMode::ReactiveDouble,
             token,
             1,

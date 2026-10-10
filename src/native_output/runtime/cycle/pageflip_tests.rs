@@ -693,14 +693,20 @@ fn worker_composited_job() -> (KmsCommitJob, AtomicOutputSwapchain) {
         output_generation: 1,
         crtc_id: 7,
         kind,
-        target,
-        submit_window: crate::native_output::presentation::kms_timing::KmsSubmitWindow::try_new(
-            target.presentation_time.get(),
-            target.submit_not_before().get(),
-            0,
-            0,
-        )
-        .unwrap(),
+        reservation:
+            crate::native_output::presentation::transaction::FramePresentationReservation::Fixed(
+                target,
+            ),
+        presentation_timing:
+            crate::native_output::presentation::kms_timing::KmsPresentationTiming::Fixed(
+                crate::native_output::presentation::kms_timing::KmsSubmitWindow::try_new(
+                    target.presentation_time.get(),
+                    target.submit_not_before().get(),
+                    0,
+                    0,
+                )
+                .unwrap(),
+            ),
         validation_base: KmsValidationBase::Presented {
             output_id: oblivion_one::core::OutputId::from_raw(1).expect("nonzero output id"),
             snapshot: PresentedPlaneSnapshot::legacy(None),

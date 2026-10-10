@@ -23,7 +23,8 @@ fn physical_identity(frame_id: u64) -> OutputFrameIdentitySnapshot {
         framebuffer_id: FramebufferId::new(frame_id as u32).expect("test framebuffer ID"),
         render_generation: frame_id,
         pool_generation: 1,
-        target: None,
+        reservation: crate::native_output::presentation::transaction::test_deferred_o1_reservation(
+        ),
     }
 }
 
@@ -298,7 +299,7 @@ fn deferred_target_mutation_does_not_change_physical_lifecycle_identity() {
 
     let mut completed = physical;
     let target_time = MonotonicTimestampNs::new(12_121_212);
-    completed.target = Some(PresentationTarget {
+    completed.reservation = crate::native_output::presentation::transaction::FramePresentationReservation::Fixed(PresentationTarget {
         sequence: 2,
         presentation_time: target_time,
         submit_not_before: target_time,

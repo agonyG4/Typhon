@@ -139,7 +139,10 @@ fn submitted_composited_job_accepts_consumed_input_fence() {
         frame_id: token,
         framebuffer_id: 42,
     };
-    job.target = test_target();
+    job.reservation =
+        crate::native_output::presentation::transaction::FramePresentationReservation::Fixed(
+            test_target(),
+        );
     job.primary = KmsPrimaryUpdate::Framebuffer {
         framebuffer: oblivion_one::native::kms::FramebufferId::new(42).expect("framebuffer"),
         in_fence: None,
@@ -193,7 +196,10 @@ fn composited_job_rejects_cursor_geometry_newer_than_transaction_plan() {
         frame_id: token,
         framebuffer_id: 42,
     };
-    job.target = test_target();
+    job.reservation =
+        crate::native_output::presentation::transaction::FramePresentationReservation::Fixed(
+            test_target(),
+        );
     job.primary = KmsPrimaryUpdate::Framebuffer {
         framebuffer: oblivion_one::native::kms::FramebufferId::new(42).expect("framebuffer"),
         in_fence: None,
@@ -249,7 +255,10 @@ fn test_direct_job(
         in_fence: None,
         request_out_fence: false,
     };
-    job.target = test_target();
+    job.reservation =
+        crate::native_output::presentation::transaction::FramePresentationReservation::Fixed(
+            test_target(),
+        );
     job.direct_primary_lease = lease;
     let _ = key;
     job
@@ -738,8 +747,18 @@ fn direct_shutdown_quiesce_returns_the_queued_lease() {
     let key = test_direct_key(3);
     let (lease, cleanup_count) = DirectPrimaryLease::test_fixture_with_probe(key, 42);
     let mut job = test_direct_job(68, key, 42, Some(lease));
-    job.target.presentation_time = MonotonicTimestampNs::new(u64::MAX / 2);
-    job.target.submit_not_before = MonotonicTimestampNs::new(u64::MAX / 2);
+    let crate::native_output::presentation::transaction::FramePresentationReservation::Fixed(
+        mut target,
+    ) = job.reservation
+    else {
+        panic!("test job has a fixed reservation");
+    };
+    target.presentation_time = MonotonicTimestampNs::new(u64::MAX / 2);
+    target.submit_not_before = MonotonicTimestampNs::new(u64::MAX / 2);
+    job.reservation =
+        crate::native_output::presentation::transaction::FramePresentationReservation::Fixed(
+            target,
+        );
     reserve_for_test(&handle, job.kind).enqueue(job).unwrap();
     handle.request_quiesce();
 

@@ -529,10 +529,7 @@ fn abandon_overtaken_worker_queued(
     output_transactions: &mut OutputTransactionLedger,
     emergency_worker_jobs: &mut Vec<KmsCommitJob>,
 ) -> NativeResult<()> {
-    let owner_target = owner
-        .frame
-        .target
-        .ok_or_else(|| io::Error::other("queued worker frame is unbound"))?;
+    let owner_target = owner.frame.require_fixed_target()?;
     match worker.cancel_queued_primary(
         owner.token,
         owner.frame.transaction_id,
@@ -1307,20 +1304,25 @@ impl NativeRuntime {
                             .iter()
                             .find(|ownership| ownership.job.token == pageflip_token)
                     {
-                        let window = ownership.job.submit_window;
-                        let outcome = KmsPresentationOutcome::classify(
-                            &window,
-                            None,
-                            ownership.submit_returned_at.get(),
-                            ownership.job.target.sequence,
-                            actual_logical_sequence,
-                        );
-                        if let Some(mode_key) = window.mode_key() {
-                            presentation_timing.observe_pageflip(
-                                ownership.job.output_generation,
-                                mode_key,
-                                outcome,
+                        if let (
+                            crate::native_output::presentation::transaction::FramePresentationReservation::Fixed(target),
+                            crate::native_output::presentation::kms_timing::KmsPresentationTiming::Fixed(window),
+                        ) = (ownership.job.reservation, ownership.job.presentation_timing)
+                        {
+                            let outcome = KmsPresentationOutcome::classify(
+                                &window,
+                                None,
+                                ownership.submit_returned_at.get(),
+                                target.sequence,
+                                actual_logical_sequence,
                             );
+                            if let Some(mode_key) = window.mode_key() {
+                                presentation_timing.observe_pageflip(
+                                    ownership.job.output_generation,
+                                    mode_key,
+                                    outcome,
+                                );
+                            }
                         }
                     }
                     let direct_pageflip_identity = pageflip_identity(
@@ -1412,7 +1414,12 @@ impl NativeRuntime {
                     let dispatch_tail_observation = submitted_ownership
                         .and_then(|ownership| ownership.dispatch_tail_observation);
                     let dispatch_budget_used_ns = submitted_ownership
-                        .map(|ownership| ownership.job.submit_window.dispatch_budget_ns());
+                        .and_then(|ownership| match ownership.job.presentation_timing {
+                            crate::native_output::presentation::kms_timing::KmsPresentationTiming::Fixed(window) => {
+                                Some(window.dispatch_budget_ns())
+                            }
+                            crate::native_output::presentation::kms_timing::KmsPresentationTiming::Variable { .. } => None,
+                        });
                     let dispatch_budget_after_adaptation_ns =
                         submitted_ownership.map(|ownership| ownership.submission_budget_ns);
                     let pending_identity =

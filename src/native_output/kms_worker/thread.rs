@@ -18,7 +18,11 @@ use super::{
     KmsWorkerAdmissionError, KmsWorkerDispatchModel,
 };
 use crate::native_output::{
-    OutputTransactionId, presentation::transaction::DirectScanoutCandidateKey,
+    OutputTransactionId,
+    presentation::{
+        kms_timing::KmsPresentationTiming,
+        transaction::{DirectScanoutCandidateKey, FramePresentationReservation},
+    },
     runtime::AtomicCommitKind,
 };
 use oblivion_one::compositor::DrmContentType;
@@ -802,16 +806,18 @@ fn collect_cursor_sidecar_before_freeze(
         let primary_id = job.owners.primary_transaction_id();
         let eligible_job = matches!(job.primary, KmsPrimaryUpdate::Framebuffer { .. })
             && (primary_id.is_some() || matches!(job.cursor, KmsCursorUpdate::Unchanged));
-        let claimed = eligible_job
-            .then(|| {
-                state.cursor_sidecar.claim_for(
-                    job.output_generation,
-                    job.crtc_id,
-                    job.target,
-                    primary_id,
+        let claimed =
+            match (eligible_job, job.reservation) {
+                (true, FramePresentationReservation::Fixed(target)) => state
+                    .cursor_sidecar
+                    .claim_for(job.output_generation, job.crtc_id, target, primary_id),
+                (
+                    true,
+                    FramePresentationReservation::Variable(_)
+                    | FramePresentationReservation::DeferredO1(_),
                 )
-            })
-            .flatten();
+                | (false, _) => None,
+            };
         let current_cursor_revision = job.owners.cursor().map(|owner| owner.revision);
         let (claimed, rejected) = match claimed {
             Some(sidecar)
@@ -940,8 +946,15 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
         }
         let mut executing = ExecutingDirectCandidateGuard::from_dequeued(&shared, direct_candidate);
         let now_ns = monotonic_now_ns();
-        let planned_worker_wake_at = job.submit_window.worker_wake_at_ns();
-        let wait_armed = worker_wait_is_armed(job.target.reason, planned_worker_wake_at, now_ns);
+        let planned_worker_wake_at = job.presentation_timing.worker_wake_at_ns();
+        let wait_armed = match job.presentation_timing {
+            KmsPresentationTiming::Fixed(_) => job
+                .reason()
+                .is_some_and(|reason| worker_wait_is_armed(reason, planned_worker_wake_at, now_ns)),
+            KmsPresentationTiming::Variable { .. } => {
+                !job.presentation_timing.is_eligible_at(now_ns)
+            }
+        };
         let actual_worker_wait_returned_at = if wait_armed {
             let Some(returned_at) = wait_until_or_quiesce(&shared, planned_worker_wake_at) else {
                 drop(executing);
@@ -1115,33 +1128,50 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
                     // that acquired executable worker ownership by its planned wake gives
                     // the worker a fair chance to meet the dispatch deadline and may train
                     // the adaptive tail guard.
-                    let binding_target = job.target.is_binding();
+                    let binding_target = match job.reservation {
+                        FramePresentationReservation::Fixed(target) => target.is_binding(),
+                        FramePresentationReservation::Variable(_)
+                        | FramePresentationReservation::DeferredO1(_) => false,
+                    };
                     let dequeued_before_planned_wake = dequeued_at.get() <= planned_worker_wake_at;
-                    let fair_dispatch_chance = super::timing::dispatch_fairness(
-                        binding_target,
-                        dequeued_before_planned_wake,
-                    );
                     dispatch_model.record(
                         submit_wake_lateness_ns,
                         pre_submit_duration_ns,
                         submit_duration_ns,
                         dispatch_duration_ns,
                     );
-                    let dispatch_tail = dispatch_model.observe_submission_deadline(
-                        job.submit_window.commit_complete_deadline_ns(),
-                        submit_returned_at,
-                        binding_target,
-                        dequeued_before_planned_wake,
-                    );
-                    debug_assert_eq!(dispatch_tail.fair_dispatch_chance, fair_dispatch_chance);
-                    shared.metrics.timing.record_dispatch_tail(dispatch_tail);
+                    let dispatch_tail = job.fixed_submit_window().map(|window| {
+                        let fair_dispatch_chance = super::timing::dispatch_fairness(
+                            binding_target,
+                            dequeued_before_planned_wake,
+                        );
+                        let observation = dispatch_model.observe_submission_deadline(
+                            window.commit_complete_deadline_ns(),
+                            submit_returned_at,
+                            binding_target,
+                            dequeued_before_planned_wake,
+                        );
+                        debug_assert_eq!(observation.fair_dispatch_chance, fair_dispatch_chance);
+                        shared.metrics.timing.record_dispatch_tail(observation);
+                        observation
+                    });
                     let dispatch_budget: super::KmsWorkerDispatchBudget = dispatch_model.budget();
                     let submission_budget_ns = dispatch_budget.dispatch_budget_ns;
+                    let (fixed_deadline_ns, telemetry_present_ns) = match job.presentation_timing {
+                        KmsPresentationTiming::Fixed(window) => (
+                            Some(window.commit_complete_deadline_ns()),
+                            Some(window.target_presentation_ns()),
+                        ),
+                        KmsPresentationTiming::Variable {
+                            preferred_present_ns,
+                            ..
+                        } => (None, Some(preferred_present_ns)),
+                    };
                     shared.metrics.timing.record_submission(
                         planned_worker_wake_at,
                         actual_worker_wait_returned_at,
-                        job.submit_window.commit_complete_deadline_ns(),
-                        job.target.presentation_time.get(),
+                        fixed_deadline_ns,
+                        telemetry_present_ns,
                         submit_started_at,
                         submit_returned_at,
                         queue_wait_ns,
@@ -1178,7 +1208,7 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
                             ioctl_duration_ns: submit_duration_ns,
                             dispatch_duration_ns,
                             submission_budget_ns,
-                            dispatch_tail_observation: Some(dispatch_tail),
+                            dispatch_tail_observation: dispatch_tail,
                         },
                     };
                     if !publish_event(&shared, event) {
@@ -1488,20 +1518,28 @@ fn take_next_work(shared: &Arc<WorkerShared>) -> Option<WorkerWork> {
             state.executing_direct_content_key = direct_candidate;
             state.executing_primary_transaction_id = job.owners.primary_transaction_id();
             state.executing_bundle_identity = Some(job.identity());
-            state.executing_primary = (job.kind.is_primary()
-                && matches!(job.primary, KmsPrimaryUpdate::Framebuffer { .. }))
-            .then(|| {
-                Some(AttachablePrimary {
-                    transaction_id: job.owners.primary_transaction_id()?,
-                    bundle_identity: job.identity(),
-                    validation_base: job.validation_base,
-                    output_generation: job.output_generation,
-                    crtc_id: job.crtc_id,
-                    target: job.target,
-                    phase: AttachablePrimaryPhase::DequeuedWaitingPredecessor,
-                })
-            })
-            .flatten();
+            state.executing_primary = if job.kind.is_primary()
+                && matches!(job.primary, KmsPrimaryUpdate::Framebuffer { .. })
+            {
+                match job.reservation {
+                    FramePresentationReservation::Fixed(target) => job
+                        .owners
+                        .primary_transaction_id()
+                        .map(|transaction_id| AttachablePrimary {
+                            transaction_id,
+                            bundle_identity: job.identity(),
+                            validation_base: job.validation_base,
+                            output_generation: job.output_generation,
+                            crtc_id: job.crtc_id,
+                            target,
+                            phase: AttachablePrimaryPhase::DequeuedWaitingPredecessor,
+                        }),
+                    FramePresentationReservation::Variable(_)
+                    | FramePresentationReservation::DeferredO1(_) => None,
+                }
+            } else {
+                None
+            };
             state.phase = KmsWorkerPhase::DequeuedWaitingPredecessor;
             return Some(WorkerWork::Job(ExecutingKmsJob {
                 job,

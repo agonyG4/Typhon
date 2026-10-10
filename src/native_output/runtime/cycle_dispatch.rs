@@ -1,6 +1,7 @@
 use super::cursor_cycle::{apply_cursor_position, resolve_native_cursor_for_server};
 use super::planner::{
-    cursor_primary_ordering_target, pending_target_for_scanout, plan_cursor_service_opportunity,
+    cursor_primary_ordering_target, pending_fixed_target_for_scanout,
+    plan_cursor_service_opportunity,
 };
 use super::*;
 
@@ -2611,7 +2612,7 @@ impl NativeRuntime {
                     refresh_interval,
                     presentation_timing.apply_guard_ns(),
                 );
-                let pending_target = pending_target_for_scanout(scanout)?;
+                let pending_target = pending_fixed_target_for_scanout(scanout)?;
                 plan_cursor_service_opportunity(
                     presentation_deadline,
                     presentation_timing,

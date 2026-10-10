@@ -25,7 +25,8 @@ mod tests {
             framebuffer_id: oblivion_one::native::kms::FramebufferId::new(frame_id as u32).unwrap(),
             render_generation,
             pool_generation: 1,
-            target: None,
+            reservation:
+                crate::native_output::presentation::transaction::test_deferred_o1_reservation(),
         }
     }
 

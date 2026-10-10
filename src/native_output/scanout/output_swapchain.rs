@@ -27,7 +27,7 @@ use crate::native_output::presentation::transaction::{
     FramePresentationReservation, O1PredecessorAnchor,
 };
 use crate::native_output::presentation::{
-    kms_timing::KmsSubmitWindow,
+    kms_timing::{KmsPresentationTiming, KmsSubmitWindow},
     plane::{CursorRevealTraceSnapshot, FrozenPrimaryCursorPlan},
     plane_policy::CursorCapabilityKey,
 };
@@ -199,7 +199,7 @@ pub(crate) struct RenderedOutputFrame {
     pub(crate) render_generation: u64,
     pub(crate) pool_generation: u64,
     pub(crate) reservation: FramePresentationReservation,
-    pub(crate) submit_window: KmsSubmitWindow,
+    pub(crate) presentation_timing: KmsPresentationTiming,
     pub(crate) render_fence: NativeRenderFence,
     pub(crate) fence_timing_evidence: Option<RenderFenceTimingEvidence>,
     pub(crate) scene_commit: EglSceneFrameCommit,
@@ -229,12 +229,46 @@ pub(crate) struct RenderFenceTimingEvidence {
 }
 
 impl RenderedOutputFrame {
-    pub(crate) const fn bound_target(&self) -> Option<PresentationTarget> {
-        self.reservation.fixed_target()
+    pub(crate) fn require_fixed_target(&self) -> io::Result<PresentationTarget> {
+        match self.reservation {
+            FramePresentationReservation::Fixed(target) => Ok(target),
+            FramePresentationReservation::Variable(_) => Err(io::Error::other(
+                "variable presentation is not active in the output runtime",
+            )),
+            FramePresentationReservation::DeferredO1(_) => Err(io::Error::other(
+                "deferred O1 frame must be bound before KMS submission",
+            )),
+        }
+    }
+
+    pub(crate) const fn fixed_submit_window(&self) -> Option<KmsSubmitWindow> {
+        self.presentation_timing.fixed_submit_window()
+    }
+
+    pub(crate) fn require_fixed_submit_window(&self) -> io::Result<KmsSubmitWindow> {
+        self.fixed_submit_window().ok_or_else(|| {
+            io::Error::other("variable presentation timing is not active in the output runtime")
+        })
     }
 
     pub(crate) const fn is_deferred_o1(&self) -> bool {
         self.reservation.is_deferred_o1()
+    }
+
+    fn validate_presentation_domain(&self) -> io::Result<()> {
+        match (self.reservation, self.presentation_timing) {
+            (
+                FramePresentationReservation::Fixed(_)
+                | FramePresentationReservation::DeferredO1(_),
+                KmsPresentationTiming::Fixed(_),
+            ) => Ok(()),
+            (FramePresentationReservation::Variable(_), _) => Err(io::Error::other(
+                "variable presentation is not active in the output runtime",
+            )),
+            _ => Err(io::Error::other(
+                "fixed-refresh reservations require fixed KMS timing",
+            )),
+        }
     }
 
     pub(crate) fn sample_fence_timing(
@@ -300,7 +334,25 @@ pub(crate) struct OutputFrameIdentitySnapshot {
     pub(crate) framebuffer_id: FramebufferId,
     pub(crate) render_generation: u64,
     pub(crate) pool_generation: u64,
-    pub(crate) target: Option<PresentationTarget>,
+    pub(crate) reservation: FramePresentationReservation,
+}
+
+impl OutputFrameIdentitySnapshot {
+    pub(crate) const fn fixed_target(self) -> Option<PresentationTarget> {
+        self.reservation.fixed_target()
+    }
+
+    pub(crate) fn require_fixed_target(self) -> io::Result<PresentationTarget> {
+        match self.reservation {
+            FramePresentationReservation::Fixed(target) => Ok(target),
+            FramePresentationReservation::Variable(_) => Err(io::Error::other(
+                "variable presentation is not active in the output runtime",
+            )),
+            FramePresentationReservation::DeferredO1(_) => Err(io::Error::other(
+                "deferred O1 frame must be bound before fixed target use",
+            )),
+        }
+    }
 }
 
 /// Immutable identity of one physical output frame.
@@ -361,7 +413,7 @@ impl From<&RenderedOutputFrame> for OutputFrameIdentitySnapshot {
             framebuffer_id: frame.framebuffer_id,
             render_generation: frame.render_generation,
             pool_generation: frame.pool_generation,
-            target: frame.bound_target(),
+            reservation: frame.reservation,
         }
     }
 }
@@ -376,6 +428,7 @@ pub(crate) struct QueuedOutputFrameIdentitySnapshot {
 pub(crate) enum PhysicalPrimaryClaimViolation {
     GenerationMismatch,
     Regression,
+    VariableReservationNotActive,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -639,13 +692,13 @@ impl AtomicOutputSwapchain {
             render_generation,
             pool_generation: self.pool_generation,
             reservation: FramePresentationReservation::Fixed(target),
-            submit_window: KmsSubmitWindow::try_new(
+            presentation_timing: KmsPresentationTiming::Fixed(KmsSubmitWindow::try_new(
                 target.presentation_time.get(),
                 target.submit_not_before().get(),
                 0,
                 0,
             )
-            .expect("test output frame has a reachable submit window"),
+            .expect("test output frame has a reachable submit window")),
             render_fence,
             fence_timing_evidence: None,
             scene_commit: EglSceneFrameCommit::empty_for_test(),
@@ -694,10 +747,17 @@ impl AtomicOutputSwapchain {
                 "rendered output frame belongs to another logical output",
             ));
         }
-        if let Some(target) = frame.bound_target() {
-            self.validate_later_primary_target(target)?;
-        } else if !frame.is_deferred_o1() {
-            return Err(io::Error::other("rendered output frame has no reservation"));
+        frame.validate_presentation_domain()?;
+        match frame.reservation {
+            FramePresentationReservation::Fixed(target) => {
+                self.validate_later_primary_target(target)?;
+            }
+            FramePresentationReservation::Variable(_) => {
+                return Err(io::Error::other(
+                    "variable presentation is not active in the output runtime",
+                ));
+            }
+            FramePresentationReservation::DeferredO1(_) => {}
         }
         let frame_id = frame.id;
         let next_frame_id = self
@@ -784,8 +844,10 @@ impl AtomicOutputSwapchain {
                 },
                 selection_evidence: Default::default(),
             }),
-            submit_window: KmsSubmitWindow::try_new(now.get(), now.get(), 0, 0)
-                .expect("test ready frame has a reachable submit window"),
+            presentation_timing: KmsPresentationTiming::Fixed(
+                KmsSubmitWindow::try_new(now.get(), now.get(), 0, 0)
+                    .expect("test ready frame has a reachable submit window"),
+            ),
             render_fence,
             fence_timing_evidence: None,
             scene_commit: EglSceneFrameCommit::empty_for_test(),
@@ -1038,9 +1100,8 @@ impl AtomicOutputSwapchain {
             .ready
             .as_ref()
             .ok_or_else(|| io::Error::other("no rendered output frame is ready"))?;
-        let target = ready
-            .bound_target()
-            .ok_or_else(|| io::Error::other("unbound output frame cannot be submitted"))?;
+        ready.validate_presentation_domain()?;
+        let target = ready.require_fixed_target()?;
         self.validate_later_primary_target(target)?;
         self.ready
             .take()
@@ -1064,9 +1125,7 @@ impl AtomicOutputSwapchain {
                 "submitted output frame does not match available pending ownership",
             ));
         }
-        let target = frame
-            .bound_target()
-            .ok_or_else(|| io::Error::other("unbound output frame cannot be submitted"))?;
+        let target = frame.require_fixed_target()?;
         self.validate_later_primary_target(target)?;
         self.pending = Some(SubmittedOutputFrame {
             frame,
@@ -1453,27 +1512,44 @@ impl AtomicOutputSwapchain {
                 PhysicalPrimaryClaimViolation::Regression,
             );
         }
-        if let Some(worker) = &self.worker_queued
-            && worker
-                .frame
-                .bound_target()
-                .is_some_and(|target| !is_strictly_later_claim(claim, target.physical_claim()))
-        {
-            return PhysicalPrimaryClaimRevalidation::OvertakesWorkerQueued {
-                owner: QueuedOutputFrameIdentitySnapshot {
-                    frame: (&worker.frame).into(),
-                    token: worker.token,
-                },
-            };
+        if let Some(worker) = &self.worker_queued {
+            match worker.frame.reservation {
+                FramePresentationReservation::Fixed(target)
+                    if !is_strictly_later_claim(claim, target.physical_claim()) =>
+                {
+                    return PhysicalPrimaryClaimRevalidation::OvertakesWorkerQueued {
+                        owner: QueuedOutputFrameIdentitySnapshot {
+                            frame: (&worker.frame).into(),
+                            token: worker.token,
+                        },
+                    };
+                }
+                FramePresentationReservation::Variable(_) => {
+                    return PhysicalPrimaryClaimRevalidation::Fatal(
+                        PhysicalPrimaryClaimViolation::VariableReservationNotActive,
+                    );
+                }
+                FramePresentationReservation::Fixed(_)
+                | FramePresentationReservation::DeferredO1(_) => {}
+            }
         }
-        if let Some(ready) = &self.ready
-            && ready
-                .bound_target()
-                .is_some_and(|target| !is_strictly_later_claim(claim, target.physical_claim()))
-        {
-            return PhysicalPrimaryClaimRevalidation::OvertakesReady {
-                owner: ready.into(),
-            };
+        if let Some(ready) = &self.ready {
+            match ready.reservation {
+                FramePresentationReservation::Fixed(target)
+                    if !is_strictly_later_claim(claim, target.physical_claim()) =>
+                {
+                    return PhysicalPrimaryClaimRevalidation::OvertakesReady {
+                        owner: ready.into(),
+                    };
+                }
+                FramePresentationReservation::Variable(_) => {
+                    return PhysicalPrimaryClaimRevalidation::Fatal(
+                        PhysicalPrimaryClaimViolation::VariableReservationNotActive,
+                    );
+                }
+                FramePresentationReservation::Fixed(_)
+                | FramePresentationReservation::DeferredO1(_) => {}
+            }
         }
         PhysicalPrimaryClaimRevalidation::Valid
     }
@@ -1520,17 +1596,18 @@ impl AtomicOutputSwapchain {
         self.pending.as_ref().map(|pending| pending.token)
     }
 
-    pub(crate) fn pending_target(&self) -> Option<PresentationTarget> {
+    pub(crate) fn pending_fixed_target(&self) -> io::Result<Option<PresentationTarget>> {
         self.pending
             .as_ref()
-            .and_then(|pending| pending.frame.bound_target())
+            .map(|pending| pending.frame.require_fixed_target())
+            .transpose()
     }
 
-    pub(crate) fn latest_future_primary_target(&self) -> Option<PresentationTarget> {
-        self.worker_queued
-            .as_ref()
-            .and_then(|queued| queued.frame.bound_target())
-            .or_else(|| self.pending_target())
+    pub(crate) fn latest_future_fixed_target(&self) -> io::Result<Option<PresentationTarget>> {
+        if let Some(queued) = &self.worker_queued {
+            return queued.frame.require_fixed_target().map(Some);
+        }
+        self.pending_fixed_target()
     }
 
     pub(crate) fn deferred_o1_predecessor(&self) -> Option<O1PredecessorAnchor> {
@@ -1591,7 +1668,7 @@ impl AtomicOutputSwapchain {
             .as_ref()
             .ok_or_else(|| io::Error::other("ready target replacement has no ready frame"))?;
         if ready.transaction_id != transaction_id
-            || ready.bound_target() != Some(expected)
+            || ready.reservation != FramePresentationReservation::Fixed(expected)
             || !expected.is_binding()
             || !replacement.is_binding()
         {
@@ -1628,7 +1705,7 @@ impl AtomicOutputSwapchain {
             .as_mut()
             .ok_or_else(|| io::Error::other("ready target replacement has no ready frame"))?;
         ready.reservation = FramePresentationReservation::Fixed(replacement);
-        ready.submit_window = submit_window;
+        ready.presentation_timing = KmsPresentationTiming::Fixed(submit_window);
         Ok(())
     }
 
@@ -1747,7 +1824,7 @@ impl AtomicOutputSwapchain {
         loop {
             let target = intent.bind_target(claim, earliest_submit);
             if let Ok(window) = frame
-                .submit_window
+                .require_fixed_submit_window()?
                 .rebind(target.presentation_time.get(), earliest_submit_ns)
             {
                 let advanced_intervals = target
@@ -1789,12 +1866,14 @@ impl AtomicOutputSwapchain {
         self.validate_later_primary_target(target)?;
         let ready = self.ready.as_mut().expect("ready frame was observed above");
         ready.reservation = FramePresentationReservation::Fixed(target);
-        ready.submit_window = submit_window;
+        ready.presentation_timing = KmsPresentationTiming::Fixed(submit_window);
         Ok(())
     }
 
     pub(crate) fn ready_submit_window(&self) -> Option<KmsSubmitWindow> {
-        self.ready.as_ref().map(|frame| frame.submit_window)
+        self.ready
+            .as_ref()
+            .and_then(RenderedOutputFrame::fixed_submit_window)
     }
 
     pub(crate) fn pending_frame_mut(&mut self) -> Option<&mut RenderedOutputFrame> {
@@ -1914,20 +1993,29 @@ impl AtomicOutputSwapchain {
         .into_iter()
         .flatten()
         {
+            frame.validate_presentation_domain()?;
             if frame.pool_generation != self.pool_generation {
                 return Err(io::Error::other(
                     "output frame belongs to an old swapchain generation",
                 ));
             }
-            if let Some(target) = frame.bound_target() {
-                self.validate_target_claim(target)?;
-                if target.clock_generation != self.pool_generation
-                    || target.physical_claim().clock_generation != self.pool_generation
-                {
+            match frame.reservation {
+                FramePresentationReservation::Fixed(target) => {
+                    self.validate_target_claim(target)?;
+                    if target.clock_generation != self.pool_generation
+                        || target.physical_claim().clock_generation != self.pool_generation
+                    {
+                        return Err(io::Error::other(
+                            "output frame belongs to an old presentation generation",
+                        ));
+                    }
+                }
+                FramePresentationReservation::Variable(_) => {
                     return Err(io::Error::other(
-                        "output frame belongs to an old presentation generation",
+                        "variable presentation is not active in the output runtime",
                     ));
                 }
+                FramePresentationReservation::DeferredO1(_) => {}
             }
         }
         for suspended in self.suspended.iter().flatten() {
@@ -1944,19 +2032,37 @@ impl AtomicOutputSwapchain {
                 ));
             }
         }
+        let fixed_claim_id = |reservation| match reservation {
+            FramePresentationReservation::Fixed(target) => {
+                Ok(Some(target.physical_claim().opportunity_id()))
+            }
+            FramePresentationReservation::Variable(_) => Err(io::Error::other(
+                "variable presentation is not active in the output runtime",
+            )),
+            FramePresentationReservation::DeferredO1(_) => Ok(None),
+        };
+        let pending_claim = self
+            .pending
+            .as_ref()
+            .map(|pending| fixed_claim_id(pending.frame.reservation))
+            .transpose()?
+            .flatten();
+        let worker_claim = self
+            .worker_queued
+            .as_ref()
+            .map(|queued| fixed_claim_id(queued.frame.reservation))
+            .transpose()?
+            .flatten();
+        let ready_claim = self
+            .ready
+            .as_ref()
+            .map(|ready| fixed_claim_id(ready.reservation))
+            .transpose()?
+            .flatten();
         let frontier = PresentationOpportunityFrontier::from_claims(
-            [
-                self.pending
-                    .as_ref()
-                    .and_then(|pending| pending.frame.bound_target()),
-                self.worker_queued
-                    .as_ref()
-                    .and_then(|queued| queued.frame.bound_target()),
-                self.ready.as_ref().and_then(|ready| ready.bound_target()),
-            ]
-            .into_iter()
-            .flatten()
-            .map(|target| target.physical_claim().opportunity_id()),
+            [pending_claim, worker_claim, ready_claim]
+                .into_iter()
+                .flatten(),
         )
         .map_err(|error| {
             io::Error::other(format!("presentation opportunity frontier: {error:?}"))
@@ -2104,9 +2210,7 @@ impl AtomicOutputSwapchain {
     }
 
     fn validate_worker_queued_frame(&self, frame: &RenderedOutputFrame) -> io::Result<()> {
-        let frame_target = frame
-            .bound_target()
-            .ok_or_else(|| io::Error::other("unbound output frame cannot enter worker queue"))?;
+        let frame_target = frame.require_fixed_target()?;
         if self.ready.as_ref().is_some_and(|ready| {
             ready.slot != frame.slot
                 || ready.id != frame.id
@@ -2135,13 +2239,7 @@ impl AtomicOutputSwapchain {
             validate_strictly_later_claim(last_presented, frame_target.physical_claim())?;
         }
         if let Some(pending) = &self.pending {
-            validate_strictly_later_target(
-                pending
-                    .frame
-                    .bound_target()
-                    .ok_or_else(|| io::Error::other("pending output frame is unbound"))?,
-                frame_target,
-            )?;
+            validate_strictly_later_target(pending.frame.require_fixed_target()?, frame_target)?;
         }
         Ok(())
     }
@@ -2152,21 +2250,9 @@ impl AtomicOutputSwapchain {
             validate_strictly_later_claim(last_presented, target.physical_claim())?;
         }
         if let Some(worker) = &self.worker_queued {
-            validate_strictly_later_target(
-                worker
-                    .frame
-                    .bound_target()
-                    .ok_or_else(|| io::Error::other("worker output frame is unbound"))?,
-                target,
-            )
+            validate_strictly_later_target(worker.frame.require_fixed_target()?, target)
         } else if let Some(pending) = &self.pending {
-            validate_strictly_later_target(
-                pending
-                    .frame
-                    .bound_target()
-                    .ok_or_else(|| io::Error::other("pending output frame is unbound"))?,
-                target,
-            )
+            validate_strictly_later_target(pending.frame.require_fixed_target()?, target)
         } else {
             Ok(())
         }
@@ -2177,45 +2263,47 @@ impl AtomicOutputSwapchain {
             if let Some(worker) = &self.worker_queued {
                 validate_strictly_later_claim(
                     last_presented,
-                    worker
-                        .frame
-                        .bound_target()
-                        .ok_or_else(|| io::Error::other("worker output frame is unbound"))?
-                        .physical_claim(),
+                    worker.frame.require_fixed_target()?.physical_claim(),
                 )?;
             }
             if let Some(pending) = &self.pending {
                 validate_strictly_later_claim(
                     last_presented,
-                    pending
-                        .frame
-                        .bound_target()
-                        .ok_or_else(|| io::Error::other("pending output frame is unbound"))?
-                        .physical_claim(),
+                    pending.frame.require_fixed_target()?.physical_claim(),
                 )?;
             }
-            if let Some(ready) = &self.ready
-                && let Some(target) = ready.bound_target()
-            {
-                validate_strictly_later_claim(last_presented, target.physical_claim())?;
+            if let Some(ready) = &self.ready {
+                match ready.reservation {
+                    FramePresentationReservation::Fixed(target) => {
+                        validate_strictly_later_claim(last_presented, target.physical_claim())?;
+                    }
+                    FramePresentationReservation::Variable(_) => {
+                        return Err(io::Error::other(
+                            "variable presentation is not active in the output runtime",
+                        ));
+                    }
+                    FramePresentationReservation::DeferredO1(_) => {}
+                }
             }
         }
         if let (Some(pending), Some(worker)) = (&self.pending, &self.worker_queued) {
             validate_strictly_later_target(
-                pending
-                    .frame
-                    .bound_target()
-                    .ok_or_else(|| io::Error::other("pending output frame is unbound"))?,
-                worker
-                    .frame
-                    .bound_target()
-                    .ok_or_else(|| io::Error::other("worker output frame is unbound"))?,
+                pending.frame.require_fixed_target()?,
+                worker.frame.require_fixed_target()?,
             )?;
         }
-        if let Some(ready) = &self.ready
-            && let Some(target) = ready.bound_target()
-        {
-            self.validate_later_primary_target(target)?;
+        if let Some(ready) = &self.ready {
+            match ready.reservation {
+                FramePresentationReservation::Fixed(target) => {
+                    self.validate_later_primary_target(target)?;
+                }
+                FramePresentationReservation::Variable(_) => {
+                    return Err(io::Error::other(
+                        "variable presentation is not active in the output runtime",
+                    ));
+                }
+                FramePresentationReservation::DeferredO1(_) => {}
+            }
         }
         Ok(())
     }
@@ -2386,6 +2474,58 @@ mod tests {
         frame.output_id = second;
 
         assert!(swapchain.finish_render_owned(frame).is_err());
+    }
+
+    #[test]
+    fn swapchain_rejects_variable_reservations_while_runtime_is_fixed_only() {
+        let slots = OutputSlotSet::new([
+            OutputSlotId::new(0).expect("slot 0"),
+            OutputSlotId::new(1).expect("slot 1"),
+            OutputSlotId::new(2).expect("slot 2"),
+        ])
+        .expect("test slots");
+        let mut swapchain = AtomicOutputSwapchain::from_presented_slots(
+            slots,
+            OutputSlotId::new(0).expect("current slot"),
+            1,
+        )
+        .expect("test swapchain");
+        let slot = swapchain.acquire_render_slot().expect("render slot");
+        let fixed_target = test_target(2, 2, PresentationTargetReason::Normal);
+        let mut frame = test_frame(&swapchain, slot, fixed_target);
+        let opportunity = oblivion_one::native::buffering::PresentationOpportunity::new(
+            fixed_target.physical_opportunity().id(),
+            oblivion_one::native::presentation_timing::PresentationTiming::VrrWindow {
+                anchor: MonotonicTimestampNs::new(1),
+                earliest_present: MonotonicTimestampNs::new(2),
+                presentation_not_before: None,
+                preferred_present: MonotonicTimestampNs::new(3),
+                service_deadline: None,
+                shortest_interval: std::time::Duration::from_millis(6),
+                longest_interval: Some(std::time::Duration::from_millis(20)),
+            },
+        );
+        frame.reservation = FramePresentationReservation::Variable(
+            crate::native_output::presentation::transaction::VariablePresentationReservation::try_new(
+                opportunity,
+                PresentationTargetReason::CommitTiming,
+            )
+            .expect("VRR opportunity creates variable reservation"),
+        );
+        frame.presentation_timing = KmsPresentationTiming::Variable {
+            earliest_submit_ns: 2,
+            preferred_present_ns: 3,
+        };
+
+        let error = swapchain
+            .finish_render_owned(frame)
+            .expect_err("runtime has not activated variable presentation");
+        assert_eq!(
+            error.to_string(),
+            "variable presentation is not active in the output runtime"
+        );
+        assert_eq!(swapchain.rendering_slot(), Some(slot));
+        assert_eq!(swapchain.ready_slot(), None);
     }
 
     #[test]
@@ -2801,7 +2941,7 @@ mod tests {
                 .note_physical_primary_presentation(
                     completed
                         .frame
-                        .bound_target()
+                        .require_fixed_target()
                         .expect("bound target")
                         .physical_claim(),
                 )
@@ -2856,7 +2996,7 @@ mod tests {
             .expect("ready target replacement succeeds");
 
         let identity = swapchain.ready_identity().expect("ready identity");
-        assert_eq!(identity.target, Some(new_target));
+        assert_eq!(identity.fixed_target(), Some(new_target));
         let window = swapchain.ready_submit_window().expect("ready window");
         assert_eq!(window.target_presentation_ns(), 20);
         assert_eq!(window.earliest_submit_ns(), 15);
@@ -2918,7 +3058,7 @@ mod tests {
         assert_eq!(
             swapchain
                 .ready_identity()
-                .and_then(|identity| identity.target),
+                .and_then(|identity| identity.fixed_target()),
             Some(new_target)
         );
     }
@@ -2974,13 +3114,15 @@ mod tests {
             render_generation: 1,
             pool_generation: 1,
             reservation: FramePresentationReservation::Fixed(target),
-            submit_window: KmsSubmitWindow::try_new(
-                target.presentation_time.get(),
-                target.submit_not_before().get(),
-                0,
-                0,
-            )
-            .expect("test submit window"),
+            presentation_timing: KmsPresentationTiming::Fixed(
+                KmsSubmitWindow::try_new(
+                    target.presentation_time.get(),
+                    target.submit_not_before().get(),
+                    0,
+                    0,
+                )
+                .expect("test submit window"),
+            ),
             render_fence: test_render_fence(),
             fence_timing_evidence: None,
             scene_commit: EglSceneFrameCommit::empty_for_test(),
@@ -3140,7 +3282,10 @@ mod tests {
             .commit_deferred_o1_binding(transaction_id, target, submit_window)
             .expect("deferred frame binds once");
         assert!(!swapchain.ready_is_deferred_o1());
-        assert_eq!(swapchain.ready_identity().unwrap().target, Some(target));
+        assert_eq!(
+            swapchain.ready_identity().unwrap().fixed_target(),
+            Some(target)
+        );
         assert!(
             swapchain
                 .commit_deferred_o1_binding(transaction_id, target, submit_window)
@@ -3357,8 +3502,8 @@ mod tests {
             swapchain
                 .ready_identity()
                 .expect("ready successor")
-                .target
-                .is_none()
+                .reservation
+                .is_deferred_o1()
         );
         assert!(
             swapchain

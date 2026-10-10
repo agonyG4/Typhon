@@ -113,6 +113,86 @@ pub(crate) struct KmsSubmitWindow {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum KmsPresentationTiming {
+    Fixed(KmsSubmitWindow),
+    /// Variable submissions have only a not-before bound. The preferred time
+    /// is desired-service metadata and never becomes an expiry or deadline.
+    Variable {
+        earliest_submit_ns: u64,
+        preferred_present_ns: u64,
+    },
+}
+
+impl KmsPresentationTiming {
+    pub(crate) const fn fixed_submit_window(self) -> Option<KmsSubmitWindow> {
+        match self {
+            Self::Fixed(window) => Some(window),
+            Self::Variable { .. } => None,
+        }
+    }
+
+    pub(crate) const fn earliest_submit_ns(self) -> u64 {
+        match self {
+            Self::Fixed(window) => window.earliest_submit_ns(),
+            Self::Variable {
+                earliest_submit_ns, ..
+            } => earliest_submit_ns,
+        }
+    }
+
+    pub(crate) const fn worker_wake_at_ns(self) -> u64 {
+        match self {
+            Self::Fixed(window) => window.worker_wake_at_ns(),
+            Self::Variable {
+                earliest_submit_ns, ..
+            } => earliest_submit_ns,
+        }
+    }
+
+    pub(crate) const fn fixed_commit_complete_deadline_ns(self) -> Option<u64> {
+        match self {
+            Self::Fixed(window) => Some(window.commit_complete_deadline_ns()),
+            Self::Variable { .. } => None,
+        }
+    }
+
+    pub(crate) const fn dispatch_budget_ns(self) -> Option<u64> {
+        match self {
+            Self::Fixed(window) => Some(window.dispatch_budget_ns()),
+            Self::Variable { .. } => None,
+        }
+    }
+
+    pub(crate) const fn apply_guard_ns(self) -> Option<u64> {
+        match self {
+            Self::Fixed(window) => Some(window.apply_guard_ns()),
+            Self::Variable { .. } => None,
+        }
+    }
+
+    pub(crate) const fn preferred_present_ns(self) -> Option<u64> {
+        match self {
+            Self::Fixed(_) => None,
+            Self::Variable {
+                preferred_present_ns,
+                ..
+            } => Some(preferred_present_ns),
+        }
+    }
+
+    pub(crate) const fn is_eligible_at(self, now_ns: u64) -> bool {
+        now_ns >= self.earliest_submit_ns()
+    }
+
+    pub(crate) const fn fixed_deadline_miss_at(self, submit_returned_at_ns: u64) -> Option<bool> {
+        match self {
+            Self::Fixed(window) => Some(window.is_dispatch_miss_at(submit_returned_at_ns)),
+            Self::Variable { .. } => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct KmsSubmitWindowError {
     earliest_submit_ns: u64,
     commit_complete_deadline_ns: u64,
@@ -424,7 +504,8 @@ impl KmsPresentationTimingModel {
 mod tests {
     use super::*;
     use crate::native_output::presentation::kms_timing::{
-        KmsModeTiming, KmsPresentationOutcome, KmsPresentationTimingModel, KmsSubmitWindow,
+        KmsModeTiming, KmsPresentationOutcome, KmsPresentationTiming, KmsPresentationTimingModel,
+        KmsSubmitWindow,
     };
 
     fn mode(clock: u32, htotal: u16, vtotal: u16) -> drm_mode_modeinfo {
@@ -466,6 +547,39 @@ mod tests {
         assert_eq!(window.commit_complete_deadline_ns(), 80);
         assert_eq!(window.worker_wake_at_ns(), 60);
         assert!(!window.is_dispatch_miss_at(70));
+    }
+
+    #[test]
+    fn fixed_kms_timing_preserves_the_exact_submit_window() {
+        let window = KmsSubmitWindow::try_new(100, 40, 20, 20).unwrap();
+        let timing = KmsPresentationTiming::Fixed(window);
+
+        assert_eq!(timing.fixed_submit_window(), Some(window));
+        assert_eq!(timing.earliest_submit_ns(), 40);
+        assert_eq!(timing.worker_wake_at_ns(), 60);
+        assert_eq!(timing.fixed_commit_complete_deadline_ns(), Some(80));
+        assert_eq!(timing.dispatch_budget_ns(), Some(20));
+        assert_eq!(timing.apply_guard_ns(), Some(20));
+        assert_eq!(timing.preferred_present_ns(), None);
+    }
+
+    #[test]
+    fn variable_kms_timing_has_no_fixed_deadline_or_dispatch_window() {
+        let timing = KmsPresentationTiming::Variable {
+            earliest_submit_ns: 40,
+            preferred_present_ns: 100,
+        };
+
+        assert_eq!(timing.earliest_submit_ns(), 40);
+        assert_eq!(timing.worker_wake_at_ns(), 40);
+        assert_eq!(timing.preferred_present_ns(), Some(100));
+        assert_eq!(timing.fixed_submit_window(), None);
+        assert_eq!(timing.fixed_commit_complete_deadline_ns(), None);
+        assert_eq!(timing.dispatch_budget_ns(), None);
+        assert_eq!(timing.apply_guard_ns(), None);
+        assert!(!timing.is_eligible_at(39));
+        assert!(timing.is_eligible_at(40));
+        assert_eq!(timing.fixed_deadline_miss_at(101), None);
     }
 
     #[test]

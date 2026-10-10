@@ -10,7 +10,7 @@ use super::frame::{
 };
 use super::planner::{
     NativePresentationPath, NativePresentationPlanInput, cursor_primary_ordering_target,
-    pacing_mode_for_target, pending_target_for_scanout,
+    pacing_mode_for_target, pending_fixed_target_for_scanout,
     plan_cursor_service_opportunity_with_scene_prediction, plan_native_presentation_path,
     plan_visual_target_for_budget, prepare_presentation_target, reactive_or_commit_timing_target,
 };
@@ -459,7 +459,7 @@ impl NativeRuntime {
         let predicted_total_cost = Duration::from_nanos(prediction.total_cost_ns);
         let explicit_output = matches!(&**scanout, NativeScanoutBackend::AtomicEglGbm(_));
         let pending_target = if explicit_output {
-            pending_target_for_scanout(scanout)?
+            pending_fixed_target_for_scanout(scanout)?
         } else {
             None
         };

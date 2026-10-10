@@ -87,7 +87,7 @@ impl NativeRuntime {
             refresh_interval,
             self.presentation_timing.apply_guard_ns(),
         );
-        let pending_target = super::planner::pending_target_for_scanout(&self.scanout)?;
+        let pending_target = super::planner::pending_fixed_target_for_scanout(&self.scanout)?;
         let candidate = super::planner::plan_cursor_service_opportunity_with_scene_prediction(
             &self.presentation_deadline,
             &self.presentation_timing,

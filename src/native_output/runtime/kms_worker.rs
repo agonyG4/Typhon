@@ -22,7 +22,9 @@ use super::presentation_transactions::{
     settle_forced_shutdown_transaction_if_safe, settle_returned_cursor_sidecar,
 };
 use super::*;
+use crate::native_output::presentation::kms_timing::KmsPresentationTiming;
 use crate::native_output::presentation::plane::CursorRevision;
+use crate::native_output::presentation::transaction::FramePresentationReservation;
 use crate::native_output::scanout::AtomicEglGbmScanout;
 use oblivion_one::native::kms::{AtomicKmsError, FramebufferId, PageFlipToken};
 
@@ -242,10 +244,21 @@ pub(super) fn queue_explicit_composited_frame(
             .into());
         }
     };
-    let target = transaction
-        .descriptor()
-        .bound_target()
-        .ok_or_else(|| io::Error::other("worker composited queue transaction is unbound"))?;
+    let reservation = transaction.descriptor().reservation();
+    match reservation {
+        FramePresentationReservation::Fixed(_) => {}
+        FramePresentationReservation::Variable(_) => {
+            return Err(
+                io::Error::other("variable presentation is not active in the KMS runtime").into(),
+            );
+        }
+        FramePresentationReservation::DeferredO1(_) => {
+            return Err(io::Error::other(
+                "deferred O1 transaction must be bound before KMS submission",
+            )
+            .into());
+        }
+    }
     let token = PageFlipToken::new(allocate_native_page_flip_token())
         .expect("allocated native pageflip token is nonzero");
     let kind = AtomicCommitKind::CompositedPrimary {
@@ -335,8 +348,8 @@ pub(super) fn queue_explicit_composited_frame(
         output_generation,
         crtc_id,
         kind,
-        target,
-        submit_window,
+        reservation,
+        presentation_timing: KmsPresentationTiming::Fixed(submit_window),
         validation_base,
         queued_at: MonotonicTimestampNs::new(queued_at_ns),
         primary: KmsPrimaryUpdate::Framebuffer {
@@ -574,8 +587,8 @@ pub(super) fn queue_atomic_compatibility_frame(
         output_generation,
         crtc_id,
         kind,
-        target,
-        submit_window,
+        reservation: FramePresentationReservation::Fixed(target),
+        presentation_timing: KmsPresentationTiming::Fixed(submit_window),
         validation_base,
         queued_at: MonotonicTimestampNs::new(queued_at_ns),
         primary: KmsPrimaryUpdate::Framebuffer {
@@ -1104,7 +1117,21 @@ impl NativeRuntime {
                 self.render_journal
                     .record_submission_budget(ownership.submission_budget_ns);
                 let _output_generation = ownership.job.output_generation;
-                let target = ownership.job.target;
+                let target = match ownership.job.reservation {
+                    FramePresentationReservation::Fixed(target) => target,
+                    FramePresentationReservation::Variable(_) => {
+                        return Err(io::Error::other(
+                            "variable direct KMS ownership is not active in the runtime",
+                        )
+                        .into());
+                    }
+                    FramePresentationReservation::DeferredO1(_) => {
+                        return Err(io::Error::other(
+                            "deferred O1 KMS ownership must be bound before submission",
+                        )
+                        .into());
+                    }
+                };
                 let cursor = ownership.job.cursor.clone();
                 let sidecar_owner = ownership
                     .job

@@ -297,8 +297,8 @@ impl WorkerTimingMetrics {
         &self,
         planned_worker_wake_ns: u64,
         actual_worker_wait_returned_ns: u64,
-        commit_complete_deadline_ns: u64,
-        target_presentation_ns: u64,
+        fixed_commit_complete_deadline_ns: Option<u64>,
+        telemetry_present_ns: Option<u64>,
         submit_started_ns: u64,
         submit_returned_ns: u64,
         queue_residency_ns: u64,
@@ -308,14 +308,15 @@ impl WorkerTimingMetrics {
         dispatch_budget_ns: u64,
     ) {
         let wake_delta_ns = signed_delta(actual_worker_wait_returned_ns, planned_worker_wake_ns);
-        let submit_earliness_ns = signed_delta(target_presentation_ns, submit_started_ns);
-        let submit_return_earliness_ns = signed_delta(target_presentation_ns, submit_returned_ns);
         self.submit_wake_lateness.record(wake_delta_ns);
         self.pre_submit_duration.record(pre_submit_duration_ns);
         self.dispatch_duration.record(dispatch_duration_ns);
-        self.submit_earliness.record(submit_earliness_ns);
-        self.submit_return_earliness
-            .record(submit_return_earliness_ns);
+        if let Some(telemetry_present_ns) = telemetry_present_ns {
+            self.submit_earliness
+                .record(signed_delta(telemetry_present_ns, submit_started_ns));
+            self.submit_return_earliness
+                .record(signed_delta(telemetry_present_ns, submit_returned_ns));
+        }
         self.ioctl_duration.record(ioctl_duration_ns);
         self.queue_residency.record(queue_residency_ns);
         self.dispatch_budget_ns
@@ -323,7 +324,9 @@ impl WorkerTimingMetrics {
         if wake_delta_ns > 0 {
             self.late_before_ioctl.fetch_add(1, Ordering::Relaxed);
         }
-        if submit_returned_ns > commit_complete_deadline_ns {
+        if fixed_commit_complete_deadline_ns
+            .is_some_and(|deadline_ns| submit_returned_ns > deadline_ns)
+        {
             self.late_after_ioctl.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -433,7 +436,17 @@ mod tests {
     fn signed_timing_keeps_early_and_late_values() {
         let metrics = WorkerTimingMetrics::default();
         metrics.record_submission(
-            11_000, 10_000, 20_000, 20_000, 9_000, 21_000, 100, 300, 200, 500, 1_000,
+            11_000,
+            10_000,
+            Some(20_000),
+            Some(20_000),
+            9_000,
+            21_000,
+            100,
+            300,
+            200,
+            500,
+            1_000,
         );
         let snapshot = metrics.snapshot();
         assert_eq!(snapshot.submit_wake_lateness.last_ns, -1_000);
@@ -441,5 +454,20 @@ mod tests {
         assert_eq!(snapshot.submit_return_earliness.last_ns, -1_000);
         assert_eq!(snapshot.late_before_ioctl, 0);
         assert_eq!(snapshot.late_after_ioctl, 1);
+    }
+
+    #[test]
+    fn variable_submission_keeps_generic_telemetry_without_fixed_deadline_miss() {
+        let metrics = WorkerTimingMetrics::default();
+        metrics.record_submission(100, 100, None, Some(150), 110, 175, 40, 30, 20, 65, 500);
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.queue_residency.last_ns, 40);
+        assert_eq!(snapshot.pre_submit_duration.last_ns, 30);
+        assert_eq!(snapshot.ioctl_duration.last_ns, 20);
+        assert_eq!(snapshot.dispatch_duration.last_ns, 65);
+        assert_eq!(snapshot.submit_earliness.last_ns, 40);
+        assert_eq!(snapshot.submit_return_earliness.last_ns, -25);
+        assert_eq!(snapshot.late_after_ioctl, 0);
     }
 }

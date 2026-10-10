@@ -699,11 +699,17 @@ fn worker_queue_owns_direct_resource_before_submit() {
             direct_token: PageFlipToken::new(80).unwrap(),
             framebuffer_id: 42,
         },
-        target: test_target(),
-        submit_window: crate::native_output::presentation::kms_timing::KmsSubmitWindow::try_new(
-            0, 0, 0, 0,
-        )
-        .unwrap(),
+        reservation:
+            crate::native_output::presentation::transaction::FramePresentationReservation::Fixed(
+                test_target(),
+            ),
+        presentation_timing:
+            crate::native_output::presentation::kms_timing::KmsPresentationTiming::Fixed(
+                crate::native_output::presentation::kms_timing::KmsSubmitWindow::try_new(
+                    0, 0, 0, 0,
+                )
+                .unwrap(),
+            ),
         validation_base: KmsValidationBase::Presented {
             output_id: oblivion_one::core::OutputId::from_raw(1).expect("nonzero output id"),
             snapshot: crate::native_output::presentation::plane::PresentedPlaneSnapshot::legacy(

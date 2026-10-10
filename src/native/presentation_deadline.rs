@@ -292,6 +292,19 @@ impl PresentationDeadlinePlanner {
         }
     }
 
+    pub fn prepare_variable_presented(
+        &self,
+        presented_at: MonotonicTimestampNs,
+    ) -> Option<PreparedPhysicalPresentation> {
+        Some(PreparedPhysicalPresentation {
+            claim: PrimaryRefreshClaim {
+                sequence: self.last_presented_sequence.saturating_add(1),
+                presentation_time: presented_at,
+                clock_generation: self.clock_generation,
+            },
+        })
+    }
+
     pub fn commit_presented(&mut self, prepared: PreparedPhysicalPresentation) -> u64 {
         let logical_sequence = prepared.logical_sequence();
         self.last_presented_sequence = logical_sequence;
@@ -1030,6 +1043,37 @@ mod tests {
             planner.note_presented(MonotonicTimestampNs::new(36_363_636)),
             6
         );
+    }
+
+    #[test]
+    fn variable_presentation_advances_once_after_a_9_4_ms_165_hz_interval() {
+        let mut planner = PresentationDeadlinePlanner::new(Duration::from_nanos(6_060_606));
+        planner.note_presented(MonotonicTimestampNs::new(1_000_000_000));
+        let presented_at = MonotonicTimestampNs::new(1_009_400_000);
+
+        let prepared = planner
+            .prepare_variable_presented(presented_at)
+            .expect("actual variable pageflip can be accounted");
+
+        assert_eq!(prepared.logical_sequence(), 2);
+        assert_eq!(prepared.claim().presentation_time, presented_at);
+        assert_eq!(prepared.claim().clock_generation, 1);
+        assert_eq!(planner.commit_presented(prepared), 2);
+    }
+
+    #[test]
+    fn variable_presentation_after_100_ms_idle_advances_once() {
+        let mut planner = PresentationDeadlinePlanner::new(Duration::from_nanos(6_060_606));
+        planner.note_presented(MonotonicTimestampNs::new(1_000_000_000));
+        let presented_at = MonotonicTimestampNs::new(1_100_000_000);
+
+        let prepared = planner
+            .prepare_variable_presented(presented_at)
+            .expect("actual variable pageflip can be accounted after idle");
+
+        assert_eq!(prepared.logical_sequence(), 2);
+        assert_eq!(prepared.claim().presentation_time, presented_at);
+        assert_eq!(planner.commit_presented(prepared), 2);
     }
 
     #[test]

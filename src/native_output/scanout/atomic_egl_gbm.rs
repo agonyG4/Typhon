@@ -1614,6 +1614,9 @@ impl AtomicEglGbmScanout {
                 });
             }
             Err(error) => {
+                if gpu_sampling_started {
+                    unsafe { self.gl.finish() };
+                }
                 let failure_stage = if gpu_sampling_started {
                     OutputTransactionFailureStage::RenderExecution
                 } else {
@@ -1646,6 +1649,7 @@ impl AtomicEglGbmScanout {
                             server.restore_frame_batch_after_render_failure(batch_id);
                             self.swapchain_mut()?.cancel_render_before_gpu(slot)?;
                         }
+                        server.cancel_lifecycle_precapture_after_render_failure();
                         Ok(())
                     },
                 )
@@ -1712,7 +1716,7 @@ impl AtomicEglGbmScanout {
                 ),
                 crate::native_output::presentation::transaction::FramePresentationReservation::DeferredO1,
             ),
-            submit_window,
+            presentation_timing: crate::native_output::presentation::kms_timing::KmsPresentationTiming::Fixed(submit_window),
             render_fence: parts.render_fence,
             fence_timing_evidence: None,
             scene_commit: parts.scene_commit,
@@ -1825,7 +1829,7 @@ impl AtomicEglGbmScanout {
             id,
             transaction_id,
             reservation,
-            submit_window,
+            presentation_timing,
             scene_commit,
             surface_damage,
             protocol_batch_id,
@@ -1839,9 +1843,28 @@ impl AtomicEglGbmScanout {
             o1_admission,
             ..
         } = completed_frame;
-        let target = reservation
-            .fixed_target()
-            .ok_or_else(|| io::Error::other("completed pageflip frame is unbound"))?;
+        let target = match reservation {
+            crate::native_output::presentation::transaction::FramePresentationReservation::Fixed(
+                target,
+            ) => target,
+            crate::native_output::presentation::transaction::FramePresentationReservation::Variable(
+                _,
+            ) => {
+                return Err(io::Error::other(
+                    "variable presentation is not active in pageflip completion",
+                ));
+            }
+            crate::native_output::presentation::transaction::FramePresentationReservation::DeferredO1(
+                _,
+            ) => {
+                return Err(io::Error::other(
+                    "deferred O1 frame cannot reach pageflip completion before binding",
+                ));
+            }
+        };
+        let submit_window = presentation_timing.fixed_submit_window().ok_or_else(|| {
+            io::Error::other("completed pageflip frame has variable timing while inactive")
+        })?;
         let (fence_signal, timing_error) = complete_confirmed_pageflip_with_timing(
             timing_result
                 .map(|sample| sample.map(|evidence| (evidence.signaled_at, evidence.quality))),
@@ -1954,10 +1977,10 @@ impl AtomicEglGbmScanout {
         };
         let timing = PendingFenceTiming {
             frame_id: frame.id,
-            target: frame
-                .bound_target()
-                .ok_or_else(|| io::Error::other("pending output frame is unbound"))?,
-            submit_window: frame.submit_window,
+            target: frame.require_fixed_target()?,
+            submit_window: frame.fixed_submit_window().ok_or_else(|| {
+                io::Error::other("pending output frame has variable timing while inactive")
+            })?,
             composite_started_at: frame.composite_started_at,
             signaled_at: evidence.signaled_at,
             quality: evidence.quality,

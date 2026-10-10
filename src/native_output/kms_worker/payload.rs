@@ -5,10 +5,11 @@ use super::timing::KmsWorkerDispatchTailObservation;
 use super::{KmsBundleOwners, KmsCommitBundleIdentity};
 use crate::native_output::output::CursorFramebufferPin;
 use crate::native_output::pacing::WorkerPacingTicket;
-use crate::native_output::presentation::kms_timing::KmsSubmitWindow;
+use crate::native_output::presentation::kms_timing::{KmsPresentationTiming, KmsSubmitWindow};
 use crate::native_output::presentation::plane::{
     KmsCommitBundleId, PresentedCursorDelivery, PresentedCursorState, PresentedPlaneSnapshot,
 };
+use crate::native_output::presentation::transaction::FramePresentationReservation;
 use crate::native_output::scanout::DirectPrimaryLease;
 use crate::native_output::{
     CursorPlaneAssignment, OutputTransaction, OutputTransactionContent, OutputTransactionId,
@@ -17,8 +18,9 @@ use crate::native_output::{
 use oblivion_one::compositor::{DrmContentType, OutputPresentationMode};
 use oblivion_one::core::OutputId;
 use oblivion_one::native::{
+    buffering::PresentationOpportunity,
     kms::{AtomicCursorVisualState, FramebufferId, PageFlipToken},
-    presentation_deadline::{MonotonicTimestampNs, PresentationTarget},
+    presentation_deadline::{MonotonicTimestampNs, PresentationTarget, PresentationTargetReason},
 };
 use std::os::fd::OwnedFd;
 
@@ -32,8 +34,8 @@ pub(crate) struct KmsCommitJob {
     pub(crate) output_generation: u64,
     pub(crate) crtc_id: u32,
     pub(crate) kind: AtomicCommitKind,
-    pub(crate) target: PresentationTarget,
-    pub(crate) submit_window: KmsSubmitWindow,
+    pub(crate) reservation: FramePresentationReservation,
+    pub(crate) presentation_timing: KmsPresentationTiming,
     pub(crate) validation_base: KmsValidationBase,
     pub(crate) queued_at: MonotonicTimestampNs,
     pub(crate) primary: KmsPrimaryUpdate,
@@ -228,11 +230,54 @@ pub(crate) enum KmsCommitPayloadError {
     OwnerIdentityMismatch,
     OwnerGenerationMismatch,
     OwnerTargetMismatch,
+    DeferredO1Reservation,
+    PresentationTimingMismatch,
     ValidationBaseMismatch,
     PacingReadySubmitMismatch,
 }
 
 impl KmsCommitJob {
+    pub(crate) const fn fixed_target(&self) -> Option<PresentationTarget> {
+        self.reservation.fixed_target()
+    }
+
+    pub(crate) const fn reason(&self) -> Option<PresentationTargetReason> {
+        self.reservation.reason()
+    }
+
+    pub(crate) const fn physical_opportunity(&self) -> Option<PresentationOpportunity> {
+        self.reservation.opportunity()
+    }
+
+    pub(crate) const fn fixed_submit_window(&self) -> Option<KmsSubmitWindow> {
+        self.presentation_timing.fixed_submit_window()
+    }
+
+    pub(crate) fn validate_presentation_timing_domain(&self) -> Result<(), KmsCommitPayloadError> {
+        match (self.reservation, self.presentation_timing) {
+            (FramePresentationReservation::Fixed(_), KmsPresentationTiming::Fixed(_))
+            | (FramePresentationReservation::Variable(_), KmsPresentationTiming::Variable { .. }) => {
+                Ok(())
+            }
+            (FramePresentationReservation::DeferredO1(_), _) => {
+                Err(KmsCommitPayloadError::DeferredO1Reservation)
+            }
+            _ => Err(KmsCommitPayloadError::PresentationTimingMismatch),
+        }
+    }
+
+    pub(crate) fn validate_reservation_owner(
+        &self,
+        reservation: FramePresentationReservation,
+    ) -> Result<(), KmsCommitPayloadError> {
+        self.validate_presentation_timing_domain()?;
+        if self.reservation == reservation {
+            Ok(())
+        } else {
+            Err(KmsCommitPayloadError::OwnerTargetMismatch)
+        }
+    }
+
     pub(crate) fn presentation_mode(&self) -> OutputPresentationMode {
         self.owners
             .primary()
@@ -317,7 +362,8 @@ impl KmsCommitJob {
         if self.output_generation != transaction.output_generation() {
             return Err(KmsCommitPayloadError::GenerationMismatch);
         }
-        if Some(self.target) != transaction.bound_target() {
+        self.validate_presentation_timing_domain()?;
+        if self.reservation != transaction.reservation() {
             return Err(KmsCommitPayloadError::TargetMismatch);
         }
         match self.validation_base {
@@ -364,9 +410,7 @@ impl KmsCommitJob {
                 if owner.output_generation() != self.output_generation {
                     return Err(KmsCommitPayloadError::OwnerGenerationMismatch);
                 }
-                if owner.bound_target() != Some(self.target) {
-                    return Err(KmsCommitPayloadError::OwnerTargetMismatch);
-                }
+                self.validate_reservation_owner(owner.reservation())?;
             }
             let expected_legacy_owner = if matches!(self.kind, AtomicCommitKind::PlaneDelta { .. })
             {

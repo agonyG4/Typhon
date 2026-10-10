@@ -1286,8 +1286,14 @@ pub(super) fn finish_direct_worker_queued(
         output_generation,
         crtc_id,
         kind,
-        target: direct_target,
-        submit_window,
+        reservation:
+            crate::native_output::presentation::transaction::FramePresentationReservation::Fixed(
+                direct_target,
+            ),
+        presentation_timing:
+            crate::native_output::presentation::kms_timing::KmsPresentationTiming::Fixed(
+                submit_window,
+            ),
         validation_base: context.validation_base,
         queued_at: MonotonicTimestampNs::new(queued_at_ns),
         primary: KmsPrimaryUpdate::Framebuffer {

@@ -181,7 +181,8 @@ impl AtomicEglGbmScanout {
             .ok_or_else(|| io::Error::other("no rendered output frame is ready"))?;
         self.swapchain()?
             .ready_identity()
-            .and_then(|identity| identity.target)
+            .map(|identity| identity.require_fixed_target())
+            .transpose()?
             .ok_or_else(|| io::Error::other("unbound output frame cannot be submitted"))?;
         let (mut presentation_mode, content_type, mut presentation_validation_key) = {
             let transaction = output_transactions
@@ -334,9 +335,7 @@ impl AtomicEglGbmScanout {
         let token = PageFlipToken::new(allocate_native_page_flip_token())
             .expect("allocated native pageflip token is nonzero");
         if self.deadline_hints_enabled {
-            let target = frame
-                .bound_target()
-                .ok_or_else(|| io::Error::other("unbound output frame cannot be submitted"))?;
+            let target = frame.require_fixed_target()?;
             match frame
                 .render_fence
                 .apply_deadline_hint(target.presentation_time.get(), monotonic_now_ns()?)

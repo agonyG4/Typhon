@@ -162,6 +162,15 @@ impl O1PrepareIntent {
         }
     }
 
+    pub(crate) const fn reason(self) -> Option<PresentationTargetReason> {
+        match self.reason {
+            // ReactiveDouble is advisory and cannot describe a deferred
+            // reservation of a physical refresh opportunity.
+            PresentationTargetReason::ReactiveDouble => None,
+            reason => Some(reason),
+        }
+    }
+
     pub(crate) fn bind_target(
         self,
         claim: PrimaryRefreshClaim,
@@ -229,14 +238,15 @@ pub(crate) enum FramePresentationReservation {
 }
 
 impl FramePresentationReservation {
-    pub(crate) const fn fixed_target(self) -> Option<PresentationTarget> {
+    pub(crate) const fn reason(self) -> Option<PresentationTargetReason> {
         match self {
-            Self::Fixed(target) => Some(target),
-            Self::Variable(_) | Self::DeferredO1(_) => None,
+            Self::Fixed(target) => Some(target.reason),
+            Self::Variable(reservation) => Some(reservation.reason()),
+            Self::DeferredO1(intent) => intent.reason(),
         }
     }
 
-    pub(crate) const fn physical_opportunity(self) -> Option<PresentationOpportunity> {
+    pub(crate) const fn opportunity(self) -> Option<PresentationOpportunity> {
         match self {
             Self::Fixed(target) => Some(target.physical_opportunity()),
             Self::Variable(reservation) => Some(reservation.opportunity()),
@@ -244,9 +254,62 @@ impl FramePresentationReservation {
         }
     }
 
+    pub(crate) const fn fixed_target(self) -> Option<PresentationTarget> {
+        match self {
+            Self::Fixed(target) => Some(target),
+            Self::Variable(_) | Self::DeferredO1(_) => None,
+        }
+    }
+
+    pub(crate) const fn variable(self) -> Option<VariablePresentationReservation> {
+        match self {
+            Self::Variable(reservation) => Some(reservation),
+            Self::Fixed(_) | Self::DeferredO1(_) => None,
+        }
+    }
+
+    pub(crate) const fn physical_opportunity(self) -> Option<PresentationOpportunity> {
+        self.opportunity()
+    }
+
     pub(crate) const fn is_deferred_o1(self) -> bool {
         matches!(self, Self::DeferredO1(_))
     }
+}
+
+#[cfg(test)]
+pub(crate) fn test_deferred_o1_reservation() -> FramePresentationReservation {
+    let presented_at = MonotonicTimestampNs::new(0);
+    let target = PresentationTarget {
+        sequence: 1,
+        presentation_time: presented_at,
+        submit_not_before: presented_at,
+        render_start_deadline: presented_at,
+        refresh_interval: std::time::Duration::from_nanos(1),
+        reason: PresentationTargetReason::Normal,
+        clock_generation: 1,
+        estimated: false,
+        predicted_unreachable: false,
+        physical_claim: PrimaryRefreshClaim {
+            sequence: 1,
+            presentation_time: presented_at,
+            clock_generation: 1,
+        },
+        selection_evidence: TargetSelectionEvidence::default(),
+    };
+    let intent = O1PrepareIntent::from_target(
+        target,
+        1,
+        O1PredecessorAnchor {
+            frame_id: 1,
+            transaction_id: OutputTransactionId::new(
+                NonZeroU64::new(1).expect("test transaction ID is nonzero"),
+            ),
+            token: PageFlipToken::new(1).expect("test token is nonzero"),
+            pool_generation: 1,
+        },
+    );
+    FramePresentationReservation::DeferredO1(intent)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -866,7 +929,7 @@ impl OutputTransaction {
         self.reservation
     }
 
-    pub(crate) const fn bound_target(&self) -> Option<PresentationTarget> {
+    pub(crate) const fn fixed_target(&self) -> Option<PresentationTarget> {
         self.reservation.fixed_target()
     }
 
@@ -1371,6 +1434,75 @@ mod tests {
     }
 
     #[test]
+    fn reservation_metadata_distinguishes_variable_from_deferred_o1() {
+        let target = target();
+        let fixed = FramePresentationReservation::Fixed(target);
+        let variable_reservation = VariablePresentationReservation::try_new(
+            vrr_opportunity(),
+            PresentationTargetReason::CommitTiming,
+        )
+        .expect("VRR opportunity is accepted");
+        let variable = FramePresentationReservation::Variable(variable_reservation);
+        let deferred = FramePresentationReservation::DeferredO1(O1PrepareIntent::from_target(
+            target,
+            7,
+            O1PredecessorAnchor {
+                frame_id: 11,
+                transaction_id: OutputTransactionId::new(
+                    NonZeroU64::new(12).expect("test transaction ID"),
+                ),
+                token: PageFlipToken::new(13).expect("test pageflip token"),
+                pool_generation: 7,
+            },
+        ));
+
+        assert_eq!(
+            fixed.reason(),
+            Some(PresentationTargetReason::PredictedPressure)
+        );
+        assert_eq!(fixed.opportunity(), Some(target.physical_opportunity()));
+        assert_eq!(fixed.fixed_target(), Some(target));
+        assert_eq!(fixed.variable(), None);
+        assert!(!fixed.is_deferred_o1());
+
+        assert_eq!(
+            variable.reason(),
+            Some(PresentationTargetReason::CommitTiming)
+        );
+        assert_eq!(variable.opportunity(), Some(vrr_opportunity()));
+        assert_eq!(variable.fixed_target(), None);
+        assert_eq!(variable.variable(), Some(variable_reservation));
+        assert!(!variable.is_deferred_o1());
+
+        assert_eq!(
+            deferred.reason(),
+            Some(PresentationTargetReason::PredictedPressure)
+        );
+        assert_eq!(deferred.opportunity(), None);
+        assert_eq!(deferred.fixed_target(), None);
+        assert_eq!(deferred.variable(), None);
+        assert!(deferred.is_deferred_o1());
+
+        let mut advisory_target = target;
+        advisory_target.reason = PresentationTargetReason::ReactiveDouble;
+        let advisory_deferred =
+            FramePresentationReservation::DeferredO1(O1PrepareIntent::from_target(
+                advisory_target,
+                7,
+                O1PredecessorAnchor {
+                    frame_id: 11,
+                    transaction_id: OutputTransactionId::new(
+                        NonZeroU64::new(12).expect("test transaction ID"),
+                    ),
+                    token: PageFlipToken::new(13).expect("test pageflip token"),
+                    pool_generation: 7,
+                },
+            ));
+        assert_eq!(advisory_deferred.reason(), None);
+        assert!(advisory_deferred.is_deferred_o1());
+    }
+
+    #[test]
     fn deferred_o1_binding_creates_exact_claim_once() {
         let intent = O1PrepareIntent::from_target(
             target(),
@@ -1403,7 +1535,7 @@ mod tests {
             frame_batch_id,
         )
         .expect("deferred transaction");
-        assert!(transaction.bound_target().is_none());
+        assert!(transaction.fixed_target().is_none());
         assert_eq!(transaction.reservation().physical_opportunity(), None);
         assert_eq!(
             transaction
@@ -1446,7 +1578,7 @@ mod tests {
         transaction
             .bind_deferred_o1(claim, MonotonicTimestampNs::new(17_681_818))
             .expect("deferred transaction binds");
-        assert_eq!(transaction.bound_target().unwrap().physical_claim(), claim);
+        assert_eq!(transaction.fixed_target().unwrap().physical_claim(), claim);
         assert_eq!(
             transaction
                 .bind_deferred_o1(claim, MonotonicTimestampNs::new(17_681_818))

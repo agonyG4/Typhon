@@ -10,8 +10,10 @@ use crate::native_output::kms_worker::{
 };
 use crate::native_output::presentation::{
     cursor_trace::CursorRevealTraceSnapshot,
+    kms_timing::KmsPresentationTiming,
     plane::{CursorRevision, PresentedCursorDelivery},
     plane_policy::CursorPlaneAction,
+    transaction::FramePresentationReservation,
 };
 use crate::native_output::runtime::presentation_transactions::{
     restore_presentation_feedback_obligation, settle_failed_output_transaction,
@@ -312,8 +314,8 @@ pub(super) fn queue_plane_delta(
         output_generation,
         crtc_id,
         kind,
-        target,
-        submit_window,
+        reservation: FramePresentationReservation::Fixed(target),
+        presentation_timing: KmsPresentationTiming::Fixed(submit_window),
         validation_base,
         queued_at: MonotonicTimestampNs::new(queued_at_ns),
         primary: KmsPrimaryUpdate::Unchanged,

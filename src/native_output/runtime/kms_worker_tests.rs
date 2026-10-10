@@ -99,7 +99,8 @@ fn pacing_test_physical_identity(frame_id: u64) -> OutputFrameIdentitySnapshot {
         framebuffer_id: FramebufferId::new(frame_id as u32).expect("test framebuffer ID"),
         render_generation: frame_id,
         pool_generation: 1,
-        target: None,
+        reservation: crate::native_output::presentation::transaction::test_deferred_o1_reservation(
+        ),
     }
 }
 
@@ -121,27 +122,34 @@ fn test_uncertain_direct_job(lease: DirectPrimaryLease) -> KmsCommitJob {
             direct_token: token,
             framebuffer_id: 42,
         },
-        submit_window: crate::native_output::presentation::kms_timing::KmsSubmitWindow::try_new(
-            0, 0, 0, 0,
-        )
-        .unwrap(),
-        target: PresentationTarget {
-            sequence: 70,
-            presentation_time: MonotonicTimestampNs::new(0),
-            submit_not_before: MonotonicTimestampNs::new(0),
-            render_start_deadline: MonotonicTimestampNs::new(0),
-            refresh_interval: Duration::from_millis(16),
-            reason: PresentationTargetReason::ReactiveDouble,
-            clock_generation: 1,
-            estimated: true,
-            predicted_unreachable: false,
-            physical_claim: oblivion_one::native::presentation_deadline::PrimaryRefreshClaim {
-                sequence: 70,
-                presentation_time: MonotonicTimestampNs::new(0),
-                clock_generation: 1,
-            },
-            selection_evidence: Default::default(),
-        },
+        reservation:
+            crate::native_output::presentation::transaction::FramePresentationReservation::Fixed(
+                PresentationTarget {
+                    sequence: 70,
+                    presentation_time: MonotonicTimestampNs::new(0),
+                    submit_not_before: MonotonicTimestampNs::new(0),
+                    render_start_deadline: MonotonicTimestampNs::new(0),
+                    refresh_interval: Duration::from_millis(16),
+                    reason: PresentationTargetReason::ReactiveDouble,
+                    clock_generation: 1,
+                    estimated: true,
+                    predicted_unreachable: false,
+                    physical_claim:
+                        oblivion_one::native::presentation_deadline::PrimaryRefreshClaim {
+                            sequence: 70,
+                            presentation_time: MonotonicTimestampNs::new(0),
+                            clock_generation: 1,
+                        },
+                    selection_evidence: Default::default(),
+                },
+            ),
+        presentation_timing:
+            crate::native_output::presentation::kms_timing::KmsPresentationTiming::Fixed(
+                crate::native_output::presentation::kms_timing::KmsSubmitWindow::try_new(
+                    0, 0, 0, 0,
+                )
+                .unwrap(),
+            ),
         validation_base: KmsValidationBase::Presented {
             output_id: oblivion_one::core::OutputId::from_raw(1).expect("nonzero output id"),
             snapshot: crate::native_output::presentation::plane::PresentedPlaneSnapshot::legacy(

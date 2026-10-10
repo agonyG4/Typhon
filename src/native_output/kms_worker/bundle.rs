@@ -88,7 +88,7 @@ impl KmsBundleOwners {
         if owners
             .cursor
             .as_ref()
-            .is_some_and(|owner| owner.transaction.bound_target() != first.bound_target())
+            .is_some_and(|owner| owner.transaction.reservation() != first.reservation())
         {
             return Err(KmsBundleOwnerError::TargetMismatch);
         }

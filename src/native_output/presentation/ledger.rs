@@ -1127,7 +1127,8 @@ impl OutputTransactionLedger {
             .ok_or(OutputTransactionError::UnknownTransaction)?;
         if !expected.is_binding()
             || !replacement.is_binding()
-            || record.descriptor.bound_target() != Some(expected)
+            || record.descriptor.reservation()
+                != super::transaction::FramePresentationReservation::Fixed(expected)
             || !record
                 .descriptor
                 .replace_bound_target(expected, replacement)

@@ -450,7 +450,7 @@ impl WorkerShared {
                 && job.transaction_id == transaction_id
                 && job.output_generation == output_generation
                 && job.crtc_id == crtc_id
-                && job.target == target
+                && job.fixed_target() == Some(target)
                 && job.primary_frame_id() == Some(frame_id)
         }) {
             let job = state.queued.remove(index).expect("queued job index exists");
@@ -460,7 +460,7 @@ impl WorkerShared {
         }
         if state.queued.iter().any(|job| {
             job.kind.is_primary()
-                && job.target == target
+                && job.fixed_target() == Some(target)
                 && job.output_generation == output_generation
                 && job.crtc_id == crtc_id
         }) {
@@ -497,7 +497,7 @@ impl WorkerShared {
                 && matches!(job.primary, super::KmsPrimaryUpdate::Framebuffer { .. })
                 && job.output_generation == output_generation
                 && job.crtc_id == crtc_id
-                && job.target == target
+                && job.fixed_target() == Some(target)
             {
                 Some(AttachablePrimary {
                     transaction_id: job.owners.primary_transaction_id()?,
@@ -505,7 +505,7 @@ impl WorkerShared {
                     validation_base: job.validation_base,
                     output_generation: job.output_generation,
                     crtc_id: job.crtc_id,
-                    target: job.target,
+                    target,
                     phase: AttachablePrimaryPhase::Queued,
                 })
             } else {
@@ -1234,7 +1234,7 @@ mod cancellation_tests {
         let job = composited_job(901, 1901);
         let token = job.token;
         let transaction_id = job.transaction_id;
-        let target = job.target;
+        let target = job.fixed_target().expect("test job has fixed timing");
         let permit = shared.try_reserve().unwrap();
         permit.enqueue(job).unwrap();
 
@@ -1254,7 +1254,7 @@ mod cancellation_tests {
         let job = composited_job(903, 1903);
         let token = job.token;
         let transaction_id = job.transaction_id;
-        let target = job.target;
+        let target = job.fixed_target().expect("test job has fixed timing");
         shared.try_reserve().unwrap().enqueue(job).unwrap();
 
         assert!(matches!(

@@ -6,11 +6,16 @@ use super::{
     KmsCommitJob, KmsCommitWorkerHandle, KmsTestOnlyPolicy, KmsValidationBase, KmsWorkerEvent,
 };
 use crate::native_output::pacing::NativeFramePacing;
-use crate::native_output::presentation::kms_timing::KmsSubmitWindow;
+use crate::native_output::presentation::kms_timing::{KmsPresentationTiming, KmsSubmitWindow};
+use crate::native_output::presentation::transaction::{
+    FramePresentationReservation, VariablePresentationReservation,
+};
 use crate::native_output::runtime::AtomicCommitKind;
 use crate::native_output::scanout::{OutputFrameIdentitySnapshot, OutputFrameKey, OutputSlotId};
+use oblivion_one::native::buffering::PresentationOpportunity;
 use oblivion_one::native::kms::AtomicKmsErrorKind;
 use oblivion_one::native::presentation_deadline::{MonotonicTimestampNs, PresentationTargetReason};
+use oblivion_one::native::presentation_timing::PresentationTiming;
 use oblivion_one::native::scheduler::NativeOutputPacingMode;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -41,9 +46,22 @@ fn test_submit_window(target_presentation_ns: u64, dispatch_budget_ns: u64) -> K
         .expect("test submit window should be reachable")
 }
 
+fn set_fixed_window(job: &mut KmsCommitJob, window: KmsSubmitWindow) {
+    job.presentation_timing = KmsPresentationTiming::Fixed(window);
+}
+
+fn fixed_window(job: &KmsCommitJob) -> KmsSubmitWindow {
+    job.fixed_submit_window()
+        .expect("test job has fixed timing")
+}
+
 fn binding_test_job(token: u64) -> KmsCommitJob {
     let mut job = test_job(token);
-    job.target.reason = PresentationTargetReason::Normal;
+    let FramePresentationReservation::Fixed(mut target) = job.reservation else {
+        panic!("test job has a fixed reservation");
+    };
+    target.reason = PresentationTargetReason::Normal;
+    job.reservation = FramePresentationReservation::Fixed(target);
     job
 }
 
@@ -61,7 +79,8 @@ fn pacing_test_physical_identity(frame_id: u64) -> OutputFrameIdentitySnapshot {
         framebuffer_id: oblivion_one::native::kms::FramebufferId::new(frame_id as u32).unwrap(),
         render_generation: frame_id,
         pool_generation: 1,
-        target: None,
+        reservation: crate::native_output::presentation::transaction::test_deferred_o1_reservation(
+        ),
     }
 }
 
@@ -96,8 +115,10 @@ fn predecessor_blocked_successor_overrun_does_not_train_dispatch_tail_guard() {
     let now_ns = monotonic_now_ns_for_test();
 
     let mut predecessor = binding_test_job(7_010);
-    predecessor.submit_window =
-        test_submit_window(now_ns.saturating_add(1_000_000_000), 1_000_000_000);
+    set_fixed_window(
+        &mut predecessor,
+        test_submit_window(now_ns.saturating_add(1_000_000_000), 1_000_000_000),
+    );
     let predecessor_identity = predecessor.identity();
     let predecessor_token = predecessor.token;
     let predecessor_transaction = predecessor.transaction_id;
@@ -105,8 +126,11 @@ fn predecessor_blocked_successor_overrun_does_not_train_dispatch_tail_guard() {
     let planned_worker_wake_at = now_ns.saturating_add(50_000_000);
     let mut successor = binding_test_job(7_011);
     successor.validation_base = KmsValidationBase::Predecessor(predecessor_identity);
-    successor.submit_window = test_submit_window(planned_worker_wake_at, 0);
-    let successor_window = successor.submit_window;
+    set_fixed_window(
+        &mut successor,
+        test_submit_window(planned_worker_wake_at, 0),
+    );
+    let successor_window = fixed_window(&successor);
     let successor_queued_at = monotonic_now_ns_for_test();
     successor.queued_at = MonotonicTimestampNs::new(successor_queued_at);
 
@@ -159,6 +183,74 @@ fn predecessor_blocked_successor_overrun_does_not_train_dispatch_tail_guard() {
 }
 
 #[test]
+fn variable_worker_waits_for_earliest_submit_without_fixed_deadline_training() {
+    let executor = Arc::new(WorkerPacingTestExecutor {
+        reject_test_only: false,
+    });
+    let handle = KmsCommitWorkerHandle::start(executor).unwrap();
+    let queued_at = monotonic_now_ns_for_test();
+    let earliest_submit_ns = queued_at.saturating_add(20_000_000);
+    let preferred_present_ns = earliest_submit_ns;
+    let opportunity = PresentationOpportunity::new(
+        oblivion_one::native::buffering::PresentationOpportunityId::new(1, 80_100),
+        PresentationTiming::VrrWindow {
+            anchor: MonotonicTimestampNs::new(queued_at),
+            earliest_present: MonotonicTimestampNs::new(earliest_submit_ns),
+            presentation_not_before: None,
+            preferred_present: MonotonicTimestampNs::new(preferred_present_ns),
+            service_deadline: None,
+            shortest_interval: Duration::from_millis(6),
+            longest_interval: Some(Duration::from_millis(20)),
+        },
+    );
+    let mut job = test_job(80_100);
+    job.reservation = FramePresentationReservation::Variable(
+        VariablePresentationReservation::try_new(
+            opportunity,
+            PresentationTargetReason::CommitTiming,
+        )
+        .expect("test opportunity is variable refresh"),
+    );
+    job.presentation_timing = KmsPresentationTiming::Variable {
+        earliest_submit_ns,
+        preferred_present_ns,
+    };
+    job.queued_at = MonotonicTimestampNs::new(queued_at);
+
+    reserve_for_test(&handle, job.kind).enqueue(job).unwrap();
+    let events = wait_for_fence_event(
+        &handle,
+        80_100,
+        |event| matches!(event, KmsWorkerEvent::Submitted { ownership } if ownership.job.token.get() == 80_100),
+    );
+    let ownership = events
+        .iter()
+        .find_map(|event| match event {
+            KmsWorkerEvent::Submitted { ownership } => Some(ownership),
+            _ => None,
+        })
+        .expect("variable job was submitted");
+    assert!(ownership.actual_worker_wait_returned_at.get() >= earliest_submit_ns);
+    assert_eq!(
+        ownership
+            .job
+            .presentation_timing
+            .fixed_deadline_miss_at(preferred_present_ns.saturating_add(1)),
+        None
+    );
+    assert!(ownership.dispatch_tail_observation.is_none());
+    let metrics = handle.metrics_snapshot();
+    assert_eq!(metrics.timing.late_after_ioctl, 0);
+    assert_eq!(metrics.timing.dispatch_tail_guard_increases, 0);
+
+    handle
+        .ack_pageflip(test_job(80_100).token, test_job(80_100).transaction_id, 1)
+        .unwrap();
+    handle.request_quiesce();
+    handle.join().unwrap();
+}
+
+#[test]
 fn post_dequeue_worker_delay_remains_dispatch_tail_evidence() {
     let executor = Arc::new(WorkerPacingTestExecutor {
         reject_test_only: false,
@@ -167,7 +259,7 @@ fn post_dequeue_worker_delay_remains_dispatch_tail_evidence() {
     let now_ns = monotonic_now_ns_for_test();
     let planned_worker_wake_at = now_ns.saturating_add(50_000_000);
     let mut job = binding_test_job(7_012);
-    job.submit_window = test_submit_window(planned_worker_wake_at, 0);
+    set_fixed_window(&mut job, test_submit_window(planned_worker_wake_at, 0));
     job.queued_at = MonotonicTimestampNs::new(now_ns);
 
     let dequeue_pause = handle.pause_after_dequeue_for_test();
@@ -202,7 +294,7 @@ fn reactive_double_overrun_does_not_train_or_decay_dispatch_tail_guard() {
     let now_ns = monotonic_now_ns_for_test();
     let binding_wake_at = now_ns.saturating_add(50_000_000);
     let mut binding_miss = binding_test_job(7_013);
-    binding_miss.submit_window = test_submit_window(binding_wake_at, 0);
+    set_fixed_window(&mut binding_miss, test_submit_window(binding_wake_at, 0));
     let binding_identity = binding_miss.identity();
     let binding_pause = handle.pause_after_dequeue_for_test();
     reserve_for_test(&handle, binding_miss.kind)
@@ -225,7 +317,7 @@ fn reactive_double_overrun_does_not_train_or_decay_dispatch_tail_guard() {
     let advisory_wake_at = monotonic_now_ns_for_test().saturating_add(50_000_000);
     let mut advisory_miss = test_job(7_014);
     advisory_miss.validation_base = KmsValidationBase::Predecessor(binding_identity);
-    advisory_miss.submit_window = test_submit_window(advisory_wake_at, 0);
+    set_fixed_window(&mut advisory_miss, test_submit_window(advisory_wake_at, 0));
     let mut advisory_identity = advisory_miss.identity();
     let advisory_pause = handle.pause_after_dequeue_for_test();
     reserve_for_test(&handle, advisory_miss.kind)
@@ -256,9 +348,12 @@ fn reactive_double_overrun_does_not_train_or_decay_dispatch_tail_guard() {
     for token in 7_015..=7_046 {
         let mut clean_advisory = test_job(token);
         clean_advisory.validation_base = KmsValidationBase::Predecessor(advisory_identity);
-        clean_advisory.submit_window = test_submit_window(
-            monotonic_now_ns_for_test().saturating_add(1_000_000_000),
-            1_000_000_000,
+        set_fixed_window(
+            &mut clean_advisory,
+            test_submit_window(
+                monotonic_now_ns_for_test().saturating_add(1_000_000_000),
+                1_000_000_000,
+            ),
         );
         advisory_identity = clean_advisory.identity();
         reserve_for_test(&handle, clean_advisory.kind)

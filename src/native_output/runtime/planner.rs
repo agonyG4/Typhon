@@ -87,12 +87,12 @@ pub(crate) fn cursor_primary_ordering_target(
         .max_by_key(|target| target.physical_claim().sequence)
 }
 
-pub(super) fn pending_target_for_scanout(
+pub(super) fn pending_fixed_target_for_scanout(
     scanout: &super::super::scanout::NativeScanoutBackend,
 ) -> io::Result<Option<PresentationTarget>> {
     match scanout {
         super::super::scanout::NativeScanoutBackend::AtomicEglGbm(explicit) => {
-            Ok(explicit.swapchain()?.latest_future_primary_target())
+            explicit.swapchain()?.latest_future_fixed_target()
         }
         _ => Ok(None),
     }

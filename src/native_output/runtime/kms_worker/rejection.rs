@@ -903,15 +903,20 @@ mod ownership_tests {
                 frame_id: token,
                 framebuffer_id: 42,
             },
-            target,
-            submit_window:
-                crate::native_output::presentation::kms_timing::KmsSubmitWindow::try_new(
-                    target.presentation_time.get(),
-                    target.submit_not_before().get(),
-                    0,
-                    0,
-                )
-                .unwrap(),
+            reservation:
+                crate::native_output::presentation::transaction::FramePresentationReservation::Fixed(
+                    target,
+                ),
+            presentation_timing:
+                crate::native_output::presentation::kms_timing::KmsPresentationTiming::Fixed(
+                    crate::native_output::presentation::kms_timing::KmsSubmitWindow::try_new(
+                        target.presentation_time.get(),
+                        target.submit_not_before().get(),
+                        0,
+                        0,
+                    )
+                    .unwrap(),
+                ),
             validation_base: KmsValidationBase::Presented {
                 output_id: oblivion_one::core::OutputId::from_raw(1).expect("nonzero output id"),
                 snapshot: crate::native_output::presentation::plane::PresentedPlaneSnapshot::legacy(

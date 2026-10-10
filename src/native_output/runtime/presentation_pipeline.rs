@@ -212,8 +212,12 @@ fn commit_snapshot(
             if physical.frame.slot != slot {
                 return Err(identity_mismatch(owner, "swapchain_slot", transaction_id));
             }
-            if physical.frame.target != descriptor.bound_target() {
-                return Err(identity_mismatch(owner, "swapchain_target", transaction_id));
+            if physical.frame.reservation != descriptor.reservation() {
+                return Err(identity_mismatch(
+                    owner,
+                    "swapchain_reservation",
+                    transaction_id,
+                ));
             }
             PipelineCommitKind::CompositedPrimary {
                 transaction_id,
@@ -284,9 +288,17 @@ fn commit_snapshot(
         token: pending.token,
         output_generation: pending.generation,
         crtc_id: pending.crtc_id,
-        target: descriptor
-            .bound_target()
-            .ok_or_else(|| identity_mismatch(owner, "unbound_commit", transaction_id))?,
+        target: match descriptor.reservation() {
+            crate::native_output::presentation::transaction::FramePresentationReservation::Fixed(
+                target,
+            ) => target,
+            crate::native_output::presentation::transaction::FramePresentationReservation::Variable(
+                _,
+            ) => return Err(identity_mismatch(owner, "variable_commit_inactive", transaction_id)),
+            crate::native_output::presentation::transaction::FramePresentationReservation::DeferredO1(
+                _,
+            ) => return Err(identity_mismatch(owner, "deferred_o1_unbound", transaction_id)),
+        },
         kind,
     })
 }
@@ -590,10 +602,15 @@ pub(super) fn build_output_pipeline_snapshot_with_presented(
                 && slot == ready.slot
                 && descriptor.output_generation() == output_generation =>
             {
-                match (ready.target, descriptor.reservation()) {
-                    (Some(target), FramePresentationReservation::Fixed(bound_target))
-                        if target == bound_target =>
-                    {
+                if ready.reservation != descriptor.reservation() {
+                    return Err(identity_mismatch(
+                        "prepared_ready",
+                        "reservation",
+                        ready.transaction_id,
+                    ));
+                }
+                match descriptor.reservation() {
+                    FramePresentationReservation::Fixed(target) => {
                         validate_state(
                             record,
                             "prepared_ready",
@@ -606,7 +623,7 @@ pub(super) fn build_output_pipeline_snapshot_with_presented(
                             fence_state: PreparedFenceState::SubmitWithInFence,
                         }
                     }
-                    (None, FramePresentationReservation::DeferredO1(_)) => {
+                    FramePresentationReservation::DeferredO1(_) => {
                         validate_state(
                             record,
                             "prepared_ready_unbound",
@@ -618,10 +635,10 @@ pub(super) fn build_output_pipeline_snapshot_with_presented(
                             fence_state: PreparedFenceState::SubmitWithInFence,
                         }
                     }
-                    _ => {
+                    FramePresentationReservation::Variable(_) => {
                         return Err(identity_mismatch(
                             "prepared_ready",
-                            "reservation",
+                            "variable_reservation_inactive",
                             ready.transaction_id,
                         ));
                     }
@@ -783,7 +800,9 @@ mod tests {
             identity.transaction_id,
             output_generation,
             MonotonicTimestampNs::new(0),
-            identity.target.expect("test ready identity is bound"),
+            identity
+                .fixed_target()
+                .expect("test ready identity is bound"),
             NativeOutputPacingMode::PredictiveTriple,
             identity.frame_id,
             identity.render_generation,
@@ -1085,7 +1104,7 @@ mod tests {
                 ..
             } if transaction_id == ready.transaction_id
                 && slot == ready.slot
-                && Some(target) == ready.target
+                && Some(target) == ready.fixed_target()
         ));
     }
 
@@ -1245,7 +1264,7 @@ mod tests {
                     ready.transaction_id,
                     1,
                     MonotonicTimestampNs::new(0),
-                    ready.target.expect("test ready identity is bound"),
+                    ready.fixed_target().expect("test ready identity is bound"),
                     NativeOutputPacingMode::PredictiveTriple,
                     ready.frame_id,
                     key,

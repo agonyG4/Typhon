@@ -18,6 +18,13 @@ use std::{
     time::Duration,
 };
 
+fn fixed_target(
+    job: &KmsCommitJob,
+) -> oblivion_one::native::presentation_deadline::PresentationTarget {
+    job.fixed_target()
+        .expect("test job has a fixed reservation")
+}
+
 fn test_sidecar(job: &KmsCommitJob, id: u64, coupling: CursorSidecarCoupling) -> CursorSidecar {
     let transaction_id = crate::native_output::OutputTransactionId::new(
         std::num::NonZeroU64::new(id.saturating_mul(100)).unwrap(),
@@ -28,7 +35,7 @@ fn test_sidecar(job: &KmsCommitJob, id: u64, coupling: CursorSidecarCoupling) ->
             transaction_id,
             job.output_generation,
             oblivion_one::native::presentation_deadline::MonotonicTimestampNs::new(id),
-            job.target,
+            fixed_target(job),
             oblivion_one::native::scheduler::NativeOutputPacingMode::ReactiveDouble,
             id,
             None,
@@ -49,7 +56,7 @@ fn test_sidecar(job: &KmsCommitJob, id: u64, coupling: CursorSidecarCoupling) ->
         lease: None,
         coupling,
         created_at: oblivion_one::native::presentation_deadline::MonotonicTimestampNs::new(id),
-        deadline: job.target,
+        deadline: fixed_target(job),
         crtc_id: job.crtc_id,
         test_policy: KmsTestOnlyPolicy::Skip,
         cursor_delivery: crate::native_output::presentation::plane::PresentedCursorDelivery::Hidden,
@@ -77,7 +84,7 @@ fn commit_test_policy_preserves_and_composes_component_requirements() {
 fn embedded_primary_owner_preserves_exact_component_cursor_revision() {
     let transaction_id =
         crate::native_output::OutputTransactionId::new(std::num::NonZeroU64::new(8_001).unwrap());
-    let target = test_job(8_001).target;
+    let target = fixed_target(&test_job(8_001));
     let mut exact =
         crate::native_output::presentation::plane::CursorRevision::initial().advance_image();
     for _ in 0..98 {
@@ -178,7 +185,7 @@ fn two_owner_job(
                 id,
                 1,
                 oblivion_one::native::presentation_deadline::MonotonicTimestampNs::new(0),
-                job.target,
+                fixed_target(&job),
                 oblivion_one::native::scheduler::NativeOutputPacingMode::ReactiveDouble,
                 epoch,
                 None,
@@ -714,7 +721,7 @@ fn predecessor_validation_base_must_match_job_output_identity() {
         job.transaction_id,
         job.output_generation,
         oblivion_one::native::presentation_deadline::MonotonicTimestampNs::new(0),
-        job.target,
+        fixed_target(&job),
         oblivion_one::native::scheduler::NativeOutputPacingMode::ReactiveDouble,
         1,
         None,
@@ -833,7 +840,7 @@ fn attachable_primary_is_one_exact_pre_freeze_snapshot() {
     let handle = KmsCommitWorkerHandle::start(Arc::new(RecordingExecutor::accepting())).unwrap();
     let (job, primary_id, _) = two_owner_job(340);
     let token = job.token;
-    let target = job.target;
+    let target = fixed_target(&job);
     let pause = handle.pause_after_dequeue_for_test();
     reserve_for_test(&handle, job.kind).enqueue(job).unwrap();
     pause.wait_until_selected();
@@ -889,7 +896,7 @@ fn embedded_cursor_primary_is_attachable_and_exposes_exact_bundle_identity() {
         .unwrap();
 
     let attachable = handle
-        .attachable_primary(1, 7, test_job(344).target)
+        .attachable_primary(1, 7, fixed_target(&test_job(344)))
         .expect("embedded cursor primary must remain attachable");
     assert_eq!(attachable.transaction_id, primary_transaction);
     assert_eq!(attachable.bundle_identity, primary_identity);
@@ -940,7 +947,7 @@ fn queued_primary_snapshot_carries_its_own_validation_base() {
         .enqueue(primary)
         .unwrap();
     let attachable = handle
-        .attachable_primary(1, 7, test_job(346).target)
+        .attachable_primary(1, 7, fixed_target(&test_job(346)))
         .expect("queued primary must be attachable");
     assert_eq!(attachable.bundle_identity, primary_identity);
     assert_eq!(
@@ -1372,7 +1379,7 @@ fn impossible_cursor_delivery_payloads_are_rejected() {
             job.transaction_id,
             job.output_generation,
             oblivion_one::native::presentation_deadline::MonotonicTimestampNs::new(0),
-            job.target,
+            fixed_target(job),
             oblivion_one::native::scheduler::NativeOutputPacingMode::ReactiveDouble,
             job.token.get(),
             desired,
@@ -1461,7 +1468,7 @@ fn software_primary_presentation_requires_a_matching_primary_payload() {
         job.transaction_id,
         1,
         oblivion_one::native::presentation_deadline::MonotonicTimestampNs::new(0),
-        job.target,
+        fixed_target(&job),
         oblivion_one::native::scheduler::NativeOutputPacingMode::ReactiveDouble,
         920,
         1,
@@ -1658,7 +1665,7 @@ fn mismatched_generation_crtc_and_primary_do_not_consume_sidecar() {
             .claim_for(
                 job.output_generation + 1,
                 job.crtc_id,
-                job.target,
+                fixed_target(&job),
                 Some(required),
             )
             .is_none()
@@ -1668,7 +1675,7 @@ fn mismatched_generation_crtc_and_primary_do_not_consume_sidecar() {
             .claim_for(
                 job.output_generation,
                 job.crtc_id + 1,
-                job.target,
+                fixed_target(&job),
                 Some(required),
             )
             .is_none()
@@ -1678,7 +1685,7 @@ fn mismatched_generation_crtc_and_primary_do_not_consume_sidecar() {
             .claim_for(
                 job.output_generation,
                 job.crtc_id,
-                job.target,
+                fixed_target(&job),
                 Some(crate::native_output::OutputTransactionId::new(
                     std::num::NonZeroU64::new(999).unwrap()
                 ))
@@ -1691,7 +1698,7 @@ fn mismatched_generation_crtc_and_primary_do_not_consume_sidecar() {
             .claim_for(
                 job.output_generation,
                 job.crtc_id,
-                job.target,
+                fixed_target(&job),
                 Some(required),
             )
             .map(|sidecar| sidecar.id),
@@ -1741,7 +1748,7 @@ fn independent_sidecar_promotes_at_deadline_but_coupled_sidecar_never_does() {
     mailbox.offer(independent);
     assert_eq!(
         mailbox
-            .take_independent_due(job.output_generation, job.crtc_id, job.target)
+            .take_independent_due(job.output_generation, job.crtc_id, fixed_target(&job))
             .map(|sidecar| sidecar.id),
         Some(independent_id)
     );
@@ -1755,7 +1762,7 @@ fn independent_sidecar_promotes_at_deadline_but_coupled_sidecar_never_does() {
     mailbox.offer(coupled);
     assert!(
         mailbox
-            .take_independent_due(job.output_generation, job.crtc_id, job.target)
+            .take_independent_due(job.output_generation, job.crtc_id, fixed_target(&job))
             .is_none()
     );
     assert_eq!(

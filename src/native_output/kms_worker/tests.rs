@@ -18,6 +18,64 @@ use std::{
 };
 
 #[test]
+fn kms_job_reservation_validation_keeps_fixed_variable_and_o1_distinct() {
+    use crate::native_output::presentation::kms_timing::KmsPresentationTiming;
+    use crate::native_output::presentation::transaction::{
+        FramePresentationReservation, VariablePresentationReservation,
+    };
+    use oblivion_one::native::buffering::PresentationOpportunity;
+    use oblivion_one::native::presentation_timing::PresentationTiming;
+
+    let mut job = test_job(77_001);
+    let FramePresentationReservation::Fixed(target) = job.reservation else {
+        panic!("test job starts fixed");
+    };
+    let fixed = FramePresentationReservation::Fixed(target);
+    assert_eq!(job.validate_reservation_owner(fixed), Ok(()));
+
+    let same_id_vrr = PresentationOpportunity::new(
+        target.physical_opportunity().id(),
+        PresentationTiming::VrrWindow {
+            anchor: MonotonicTimestampNs::new(10),
+            earliest_present: MonotonicTimestampNs::new(20),
+            presentation_not_before: Some(MonotonicTimestampNs::new(40)),
+            preferred_present: MonotonicTimestampNs::new(40),
+            service_deadline: None,
+            shortest_interval: Duration::from_millis(6),
+            longest_interval: Some(Duration::from_millis(20)),
+        },
+    );
+    assert_eq!(same_id_vrr.id(), target.physical_opportunity().id());
+    let variable = FramePresentationReservation::Variable(
+        VariablePresentationReservation::try_new(
+            same_id_vrr,
+            PresentationTargetReason::CommitTiming,
+        )
+        .expect("VRR opportunity creates variable reservation"),
+    );
+    assert_ne!(fixed, variable);
+
+    job.reservation = variable;
+    job.presentation_timing = KmsPresentationTiming::Variable {
+        earliest_submit_ns: 20,
+        preferred_present_ns: 40,
+    };
+    assert_eq!(job.validate_presentation_timing_domain(), Ok(()));
+    assert_eq!(job.validate_reservation_owner(variable), Ok(()));
+    assert_eq!(
+        job.validate_reservation_owner(fixed),
+        Err(KmsCommitPayloadError::OwnerTargetMismatch)
+    );
+
+    job.reservation =
+        crate::native_output::presentation::transaction::test_deferred_o1_reservation();
+    assert_eq!(
+        job.validate_presentation_timing_domain(),
+        Err(KmsCommitPayloadError::DeferredO1Reservation)
+    );
+}
+
+#[test]
 fn worker_policy_defaults_to_auto() {
     assert_eq!(
         KmsCommitWorkerPolicy::default(),
@@ -103,27 +161,34 @@ pub(super) fn test_job(token: u64) -> KmsCommitJob {
             direct_token: oblivion_one::native::kms::PageFlipToken::new(token).unwrap(),
             framebuffer_id: 42,
         },
-        target: PresentationTarget {
-            sequence: token,
-            presentation_time: MonotonicTimestampNs::new(0),
-            submit_not_before: MonotonicTimestampNs::new(0),
-            render_start_deadline: MonotonicTimestampNs::new(0),
-            refresh_interval: Duration::from_millis(16),
-            reason: PresentationTargetReason::ReactiveDouble,
-            clock_generation: 1,
-            estimated: true,
-            predicted_unreachable: false,
-            physical_claim: oblivion_one::native::presentation_deadline::PrimaryRefreshClaim {
-                sequence: token,
-                presentation_time: MonotonicTimestampNs::new(0),
-                clock_generation: 1,
-            },
-            selection_evidence: Default::default(),
-        },
-        submit_window: crate::native_output::presentation::kms_timing::KmsSubmitWindow::try_new(
-            0, 0, 0, 0,
-        )
-        .unwrap(),
+        reservation:
+            crate::native_output::presentation::transaction::FramePresentationReservation::Fixed(
+                PresentationTarget {
+                    sequence: token,
+                    presentation_time: MonotonicTimestampNs::new(0),
+                    submit_not_before: MonotonicTimestampNs::new(0),
+                    render_start_deadline: MonotonicTimestampNs::new(0),
+                    refresh_interval: Duration::from_millis(16),
+                    reason: PresentationTargetReason::ReactiveDouble,
+                    clock_generation: 1,
+                    estimated: true,
+                    predicted_unreachable: false,
+                    physical_claim:
+                        oblivion_one::native::presentation_deadline::PrimaryRefreshClaim {
+                            sequence: token,
+                            presentation_time: MonotonicTimestampNs::new(0),
+                            clock_generation: 1,
+                        },
+                    selection_evidence: Default::default(),
+                },
+            ),
+        presentation_timing:
+            crate::native_output::presentation::kms_timing::KmsPresentationTiming::Fixed(
+                crate::native_output::presentation::kms_timing::KmsSubmitWindow::try_new(
+                    0, 0, 0, 0,
+                )
+                .unwrap(),
+            ),
         validation_base: KmsValidationBase::Presented {
             output_id: oblivion_one::core::OutputId::from_raw(1).expect("nonzero output id"),
             snapshot: crate::native_output::presentation::plane::PresentedPlaneSnapshot::legacy(
@@ -531,6 +596,7 @@ fn assert_join_completes_without_draining(handle: Arc<KmsCommitWorkerHandle>) {
 }
 
 fn test_pending_sidecar(job: &KmsCommitJob, id: u64) -> CursorSidecar {
+    let target = job.fixed_target().expect("test job has fixed timing");
     let transaction_id = OutputTransactionId::new(
         std::num::NonZeroU64::new(id.saturating_mul(100)).expect("sidecar transaction is nonzero"),
     );
@@ -540,7 +606,7 @@ fn test_pending_sidecar(job: &KmsCommitJob, id: u64) -> CursorSidecar {
             transaction_id,
             job.output_generation,
             MonotonicTimestampNs::new(id),
-            job.target,
+            target,
             oblivion_one::native::scheduler::NativeOutputPacingMode::ReactiveDouble,
             id,
             None,
@@ -561,7 +627,7 @@ fn test_pending_sidecar(job: &KmsCommitJob, id: u64) -> CursorSidecar {
         lease: None,
         coupling: CursorSidecarCoupling::Independent,
         created_at: MonotonicTimestampNs::new(id),
-        deadline: job.target,
+        deadline: target,
         crtc_id: job.crtc_id,
         test_policy: KmsTestOnlyPolicy::Skip,
         cursor_delivery: crate::native_output::presentation::plane::PresentedCursorDelivery::Hidden,
