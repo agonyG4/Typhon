@@ -242,10 +242,10 @@ pub(crate) use frame::earliest_native_deadline;
 #[cfg(test)]
 pub(crate) use frame::update_cursor_output_arbitration;
 pub(crate) use frame::{
-    NativeCursorOutputArbitration, NativeCursorPreference, NativeCursorPrimaryState,
-    NativeCursorRenderMode, NativeCursorSchedulingPolicy, NativeFrameRenderer,
-    NativePointerConstraintBackend, NativePointerConstraintBackendAction, ResolvedNativeFrameScene,
-    native_pointer_debug_log_lazy, normalize_refresh_hz,
+    FrozenNativeRenderFrame, NativeCursorOutputArbitration, NativeCursorPreference,
+    NativeCursorPrimaryState, NativeCursorRenderMode, NativeCursorSchedulingPolicy,
+    NativeFrameRenderer, NativePointerConstraintBackend, NativePointerConstraintBackendAction,
+    ResolvedNativeFrameScene, native_pointer_debug_log_lazy, normalize_refresh_hz,
 };
 #[cfg(test)]
 pub(crate) use frame::{

@@ -1312,7 +1312,8 @@ impl NativeRuntime {
             input_plan.primary.as_str()
         );
         let initial_damage = NativeOutputDamage::full_output(target.width, target.height);
-        let initial_resolved_scene = ResolvedNativeFrameScene::from_server(&server).into_owned();
+        let mut initial_resolved_scene =
+            Some(ResolvedNativeFrameScene::from_server(&server).into_owned());
         let initial_cursor_state = pre_kms_atomic_cursor.as_ref().and_then(|cursor| {
             effective_atomic_cursor_state(cursor, cursor_render_mode, initial_cursor_visible)
                 .kms_state()
@@ -1320,6 +1321,7 @@ impl NativeRuntime {
         });
         let mut initial_atomic_parts = None;
         let mut initial_surface_damage = None;
+        let mut initial_frozen_render_frame = None;
         let initial_paint = if let NativeScanoutBackend::AtomicEglGbm(explicit) = &mut scanout {
             let slot = explicit.initial_slot();
             let framebuffer = explicit.framebuffer(slot)?;
@@ -1334,7 +1336,11 @@ impl NativeRuntime {
                 framebuffer,
                 initial_cursor_state.as_ref(),
             )?;
-            let initial_surface_ids = initial_resolved_scene.surface_ids().collect::<Vec<_>>();
+            let initial_surface_ids = initial_resolved_scene
+                .as_ref()
+                .expect("initial resolved scene is present before Atomic rendering")
+                .surface_ids()
+                .collect::<Vec<_>>();
             let software_cursor_commit = cursor_render_mode
                 .is_software()
                 .then(|| server.client_cursor_render_state())
@@ -1370,15 +1376,22 @@ impl NativeRuntime {
                 server.note_client_cursor_surface_sample(software_cursor_commit.is_none());
             }
             let mut initial_gpu_sampling_started = false;
-            let parts = match explicit.render_to_slot(
-                slot,
-                0,
-                &mut frame_renderer,
-                &initial_resolved_scene,
+            let initial_scene = initial_resolved_scene
+                .take()
+                .expect("initial resolved scene is transferred into the frozen frame");
+            let mut frozen_initial = FrozenNativeRenderFrame::freeze(
+                target.width,
+                target.height,
+                initial_scene,
                 &server,
                 &input_state,
                 cursor_render_mode,
-                &initial_damage,
+                Some(initial_damage.as_renderer_damage(target.width, target.height)),
+            );
+            let parts = match explicit.render_to_slot(
+                slot,
+                0,
+                &mut frozen_initial,
                 &mut initial_gpu_sampling_started,
                 None,
             )? {
@@ -1401,15 +1414,18 @@ impl NativeRuntime {
                 parts.paint_stats(explicit.format_modifier.fourcc, target.width, target.height);
             let lifecycle =
                 oblivion_one::window_lifecycle_animation::LifecycleFrameSnapshot::qualified_from_sample(
-                    &initial_resolved_scene.lifecycle,
+                    &frozen_initial.scene.lifecycle,
                     &parts.lifecycle_evidence,
                 );
             initial_atomic_parts = Some(parts);
+            initial_frozen_render_frame = Some(frozen_initial);
             NativePaintOutcome::Rendered { stats, lifecycle }
         } else {
             match scanout.paint_server_frame(
                 &mut frame_renderer,
-                &initial_resolved_scene,
+                initial_resolved_scene.as_ref().expect(
+                    "initial resolved scene is present for synchronous compatibility painting",
+                ),
                 &server,
                 &input_state,
                 cursor_render_mode,
@@ -1455,7 +1471,9 @@ impl NativeRuntime {
                     publish_scanout_runtime_capabilities(&mut server, &scanout);
                     scanout.paint_server_frame(
                         &mut frame_renderer,
-                        &initial_resolved_scene,
+                        initial_resolved_scene.as_ref().expect(
+                            "initial resolved scene is retained for compatibility fallback",
+                        ),
                         &server,
                         &input_state,
                         cursor_render_mode,
@@ -1478,8 +1496,14 @@ impl NativeRuntime {
             }
         };
         let initial_paint_stats = initial_paint.require_rendered("initial native scanout")?;
-        #[rustfmt::skip] let mut initial_presented_scene = NativeFrameSceneSnapshot::from_resolved_frame_scene(output_id, 0, &initial_resolved_scene, NativeCursorDamageBounds::default());
+        let initial_scene_for_snapshot = initial_frozen_render_frame
+            .as_ref()
+            .map(|frozen| &frozen.scene)
+            .or_else(|| initial_resolved_scene.as_ref())
+            .expect("initial resolved scene remains owned through scene publication");
+        #[rustfmt::skip] let mut initial_presented_scene = NativeFrameSceneSnapshot::from_resolved_frame_scene(output_id, 0, initial_scene_for_snapshot, NativeCursorDamageBounds::default());
         initial_presented_scene.lifecycle = initial_lifecycle_snapshot;
+        drop(initial_frozen_render_frame);
         drop(initial_resolved_scene);
         println!("native scanout backend active: {}", scanout.kind().as_str());
         let effective_app_gpu_policy =

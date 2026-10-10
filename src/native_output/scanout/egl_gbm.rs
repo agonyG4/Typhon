@@ -3,6 +3,7 @@ use crate::egl_renderer::OutputFramebufferOrigin;
 use crate::egl_renderer::{
     CreatedGlesContext, EglContextPriorityPolicy, create_compositor_gles_context,
 };
+use crate::native_output::runtime::FrozenNativeRenderFrame;
 use oblivion_one::native::kms::KmsBackendKind;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -742,21 +743,12 @@ impl NativeEglGbmScanout {
     /// swapping, locking a front buffer, or changing page-flip state.
     pub(crate) fn capture_scene(
         &mut self,
-        renderer: &mut NativeFrameRenderer,
-        resolved_scene: &ResolvedNativeFrameScene<'_>,
+        resolved_scene: ResolvedNativeFrameScene<'static>,
         server: &OwnCompositorServer,
         input_state: &NativeInputState,
         cursor_mode: NativeCursorRenderMode,
     ) -> io::Result<Vec<u8>> {
-        self.egl
-            .make_current(
-                self.egl_display,
-                Some(self.egl_surface),
-                Some(self.egl_surface),
-                Some(self.egl_context),
-            )
-            .map_err(native_egl_io_error)?;
-        let request = renderer.egl_scene_draw_request(
+        let mut frozen_frame = FrozenNativeRenderFrame::freeze(
             self.width,
             self.height,
             resolved_scene,
@@ -765,6 +757,17 @@ impl NativeEglGbmScanout {
             cursor_mode,
             Some(OutputDamage::Full),
         );
+        self.egl
+            .make_current(
+                self.egl_display,
+                Some(self.egl_surface),
+                Some(self.egl_surface),
+                Some(self.egl_context),
+            )
+            .map_err(native_egl_io_error)?;
+        let request = frozen_frame
+            .draw_request(None)
+            .ok_or_else(|| io::Error::other("frozen capture frame request already consumed"))?;
         self.scene
             .capture_scene(
                 &self.egl,

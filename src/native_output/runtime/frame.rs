@@ -13,9 +13,10 @@ use std::{
 };
 
 use oblivion_one::compositor::{
-    AnimationTime, DecorationRenderInstance, DecorationSceneSnapshot, FullscreenRenderPlanMetrics,
-    PointerWarpOrigin, PresentationFrameSnapshot, PresentationSceneSample,
-    PresentedCanonicalSceneSnapshot, ResolvedEffectScene, SceneNodeId, WindowExitFrameEvidence,
+    AnimationTime, ClientCursorRenderState, DecorationRenderInstance, DecorationSceneSnapshot,
+    DesktopVisualState, FullscreenRenderPlanMetrics, PointerWarpOrigin, PresentationFrameSnapshot,
+    PresentationSceneSample, PresentedCanonicalSceneSnapshot, ResolvedEffectScene, SceneNodeId,
+    SurfaceResourceSyncState, WindowExitFrameEvidence,
 };
 use oblivion_one::window_lifecycle_animation::{LifecycleFrameSnapshot, LifecycleSceneSample};
 
@@ -1983,24 +1984,20 @@ impl NativeFrameRenderer {
         cursor_mode: NativeCursorRenderMode,
         current_damage: Option<OutputDamage>,
     ) -> EglSceneDrawRequest<'a> {
-        // The resolved scene and this authority lookup are borrowed from the
-        // same immutable compositor state on the native compositor thread.
-        // Keeping the lookup at this synchronous request boundary prevents a
-        // deferred renderer from pairing frozen surfaces with newer journal
-        // metadata; such a renderer would need an explicit snapshot identity.
+        // Compatibility painting remains synchronous and borrows this exact
+        // compositor state. Atomic rendering and capture use
+        // FrozenNativeRenderFrame instead.
         let cursor_visible = resolve_native_cursor_for_server(server, input_state).visible;
+        let client_cursor = cursor_mode
+            .is_software()
+            .then(|| server.client_cursor_render_state())
+            .flatten();
         let surface_resource_sync_states = server.surface_resource_sync_states(
             resolved_scene
                 .surfaces
                 .iter()
                 .map(|surface| surface.surface_id)
-                .chain(
-                    cursor_mode
-                        .is_software()
-                        .then(|| server.client_cursor_render_state())
-                        .flatten()
-                        .map(|cursor| cursor.surface.surface_id),
-                ),
+                .chain(client_cursor.map(|cursor| cursor.surface.surface_id)),
         );
         let lifecycle_surface_resource_sync_states = server.surface_resource_sync_states(
             resolved_scene
@@ -2010,40 +2007,287 @@ impl NativeFrameRenderer {
         );
         let mut surface_resource_sync_states = surface_resource_sync_states;
         surface_resource_sync_states.extend(lifecycle_surface_resource_sync_states);
-        EglSceneDrawRequest {
+        project_egl_scene_draw_request(
             width,
             height,
-            surfaces: resolved_scene.surfaces.as_ref(),
-            external_overlay_surface_ids: &resolved_scene.external_overlay_surface_ids,
-            popup_surface_ids: &resolved_scene.popup_surface_ids,
-            content_generation: native_scene_content_generation(resolved_scene.render_generation),
-            frame_id: None,
-            render_generation: Some(resolved_scene.render_generation),
-            scene_generation: resolved_scene.effects.generation,
-            scene_signature: resolved_scene.scene_identity_signature(),
-            visual_state: input_state.desktop_visual_state(cursor_mode, cursor_visible),
-            output_scale: 1.0,
-            decoration_instances: &resolved_scene.decorations,
-            presentation_visual_signature: resolved_scene
-                .presentation
-                .presentation_visual_signature(),
-            presentation_opacities: &resolved_scene.presentation.opacities,
-            presentation_clips: &resolved_scene.presentation.clips,
-            presentation_owner_root_surface_ids: resolved_scene
-                .presentation_owner_root_surface_ids
-                .as_ref(),
-            client_cursor: cursor_mode
-                .is_software()
-                .then(|| server.client_cursor_render_state())
-                .flatten(),
+            resolved_scene,
+            input_state.desktop_visual_state(cursor_mode, cursor_visible),
+            client_cursor,
             current_damage,
-            effects: &resolved_scene.effects,
             surface_resource_sync_states,
-            lifecycle: &resolved_scene.lifecycle,
-            lifecycle_surfaces: &resolved_scene.lifecycle_surfaces,
-            lifecycle_decorations: &resolved_scene.lifecycle_decorations,
+            None,
+        )
+    }
+}
+
+/// The renderer-facing identity of one frozen native frame. These are the
+/// source identities already carried by the resolved scene and its owned
+/// cursor/journal snapshots; this is diagnostic evidence, not new authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FrozenRenderSnapshotIdentity {
+    pub(crate) render_generation: u64,
+    pub(crate) scene_generation: u64,
+    pub(crate) scene_identity_signature: u64,
+    pub(crate) presentation_visual_signature: u64,
+    pub(crate) lifecycle_signature: u64,
+    pub(crate) visual_state: DesktopVisualState,
+    pub(crate) client_cursor: Option<FrozenClientCursorIdentity>,
+    pub(crate) surface_resource_sync_signature: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FrozenClientCursorIdentity {
+    pub(crate) surface_id: u32,
+    pub(crate) scene_node_id: SceneNodeId,
+    pub(crate) generation: u64,
+    pub(crate) commit_sequence: u64,
+    pub(crate) buffer_id: u64,
+}
+
+/// An owned client cursor commit. Cloning its `RenderableSurface` retains the
+/// existing Arc-backed SHM pixels or DMA-BUF descriptors instead of copying
+/// buffer storage.
+#[derive(Debug)]
+pub(crate) struct OwnedClientCursorRenderState {
+    surface: RenderableSurface,
+    scene_node_id: SceneNodeId,
+    logical_x: i32,
+    logical_y: i32,
+    hotspot_x: i32,
+    hotspot_y: i32,
+}
+
+impl OwnedClientCursorRenderState {
+    fn from_render_state(state: ClientCursorRenderState<'_>) -> Self {
+        Self {
+            surface: state.surface.clone(),
+            scene_node_id: state.scene_node_id,
+            logical_x: state.logical_x,
+            logical_y: state.logical_y,
+            hotspot_x: state.hotspot_x,
+            hotspot_y: state.hotspot_y,
         }
     }
+
+    pub(crate) fn as_render_state(&self) -> ClientCursorRenderState<'_> {
+        ClientCursorRenderState {
+            surface: &self.surface,
+            scene_node_id: self.scene_node_id,
+            logical_x: self.logical_x,
+            logical_y: self.logical_y,
+            hotspot_x: self.hotspot_x,
+            hotspot_y: self.hotspot_y,
+        }
+    }
+
+    fn identity(&self) -> FrozenClientCursorIdentity {
+        FrozenClientCursorIdentity {
+            surface_id: self.surface.surface_id,
+            scene_node_id: self.scene_node_id,
+            generation: self.surface.generation,
+            commit_sequence: self.surface.commit_sequence.0,
+            buffer_id: self.surface.buffer_id().get(),
+        }
+    }
+}
+
+/// A complete, single-use input to native scene rendering. It owns the
+/// resolved scene and every renderer-visible value formerly fetched from live
+/// compositor/input state at request construction time.
+#[derive(Debug)]
+pub(crate) struct FrozenNativeRenderFrame {
+    pub(crate) scene: ResolvedNativeFrameScene<'static>,
+    width: u32,
+    height: u32,
+    visual_state: DesktopVisualState,
+    client_cursor: Option<OwnedClientCursorRenderState>,
+    pub(crate) surface_resource_sync_states: Vec<SurfaceResourceSyncState>,
+    current_damage: Option<OutputDamage>,
+    pub(crate) identity: FrozenRenderSnapshotIdentity,
+    projection_consumed: bool,
+}
+
+impl FrozenNativeRenderFrame {
+    pub(crate) fn freeze(
+        width: u32,
+        height: u32,
+        scene: ResolvedNativeFrameScene<'static>,
+        server: &OwnCompositorServer,
+        input_state: &NativeInputState,
+        cursor_mode: NativeCursorRenderMode,
+        current_damage: Option<OutputDamage>,
+    ) -> Self {
+        // This is the final read of live cursor visibility/input state for this
+        // render request. The EGL renderer only sees the frozen values below.
+        let cursor_visible = resolve_native_cursor_for_server(server, input_state).visible;
+        let visual_state = input_state.desktop_visual_state(cursor_mode, cursor_visible);
+        let client_cursor = cursor_mode
+            .is_software()
+            .then(|| server.client_cursor_render_state())
+            .flatten()
+            .map(OwnedClientCursorRenderState::from_render_state);
+
+        let mut surface_resource_sync_states = server.surface_resource_sync_states(
+            scene
+                .surfaces
+                .iter()
+                .map(|surface| surface.surface_id)
+                .chain(
+                    client_cursor
+                        .as_ref()
+                        .map(|cursor| cursor.surface.surface_id),
+                ),
+        );
+        surface_resource_sync_states.extend(
+            server.surface_resource_sync_states(
+                scene
+                    .lifecycle_surfaces
+                    .iter()
+                    .map(|surface| surface.surface_id),
+            ),
+        );
+
+        Self::from_snapshot_parts(
+            width,
+            height,
+            scene,
+            visual_state,
+            client_cursor,
+            surface_resource_sync_states,
+            current_damage,
+        )
+    }
+
+    fn from_snapshot_parts(
+        width: u32,
+        height: u32,
+        scene: ResolvedNativeFrameScene<'static>,
+        visual_state: DesktopVisualState,
+        client_cursor: Option<OwnedClientCursorRenderState>,
+        surface_resource_sync_states: Vec<SurfaceResourceSyncState>,
+        current_damage: Option<OutputDamage>,
+    ) -> Self {
+        let identity = FrozenRenderSnapshotIdentity {
+            render_generation: scene.render_generation,
+            scene_generation: scene.effects.generation,
+            scene_identity_signature: scene.scene_identity_signature(),
+            presentation_visual_signature: scene.presentation.presentation_visual_signature(),
+            lifecycle_signature: scene.lifecycle_snapshot.signature,
+            visual_state,
+            client_cursor: client_cursor
+                .as_ref()
+                .map(OwnedClientCursorRenderState::identity),
+            surface_resource_sync_signature: surface_resource_sync_signature(
+                &surface_resource_sync_states,
+            ),
+        };
+
+        Self {
+            scene,
+            width,
+            height,
+            visual_state,
+            client_cursor,
+            surface_resource_sync_states,
+            current_damage,
+            identity,
+            projection_consumed: false,
+        }
+    }
+
+    /// Borrow the frozen scene exactly once. Damage and resource-journal
+    /// authority are transferred into the request without cloning.
+    pub(crate) fn draw_request(
+        &mut self,
+        frame_id: Option<u64>,
+    ) -> Option<EglSceneDrawRequest<'_>> {
+        if self.projection_consumed {
+            return None;
+        }
+        self.projection_consumed = true;
+
+        let scene = &self.scene;
+        let client_cursor = self
+            .client_cursor
+            .as_ref()
+            .map(OwnedClientCursorRenderState::as_render_state);
+        Some(project_egl_scene_draw_request(
+            self.width,
+            self.height,
+            scene,
+            self.visual_state,
+            client_cursor,
+            self.current_damage.take(),
+            std::mem::take(&mut self.surface_resource_sync_states),
+            frame_id,
+        ))
+    }
+}
+
+#[allow(dead_code)]
+fn assert_frozen_native_render_frame_is_send() {
+    fn assert_send<T: Send>() {}
+    assert_send::<FrozenNativeRenderFrame>();
+}
+
+#[allow(clippy::too_many_arguments)]
+fn project_egl_scene_draw_request<'a>(
+    width: u32,
+    height: u32,
+    scene: &'a ResolvedNativeFrameScene<'_>,
+    visual_state: DesktopVisualState,
+    client_cursor: Option<ClientCursorRenderState<'a>>,
+    current_damage: Option<OutputDamage>,
+    surface_resource_sync_states: Vec<SurfaceResourceSyncState>,
+    frame_id: Option<u64>,
+) -> EglSceneDrawRequest<'a> {
+    EglSceneDrawRequest {
+        width,
+        height,
+        surfaces: scene.surfaces.as_ref(),
+        external_overlay_surface_ids: &scene.external_overlay_surface_ids,
+        popup_surface_ids: scene.popup_surface_ids.as_ref(),
+        content_generation: native_scene_content_generation(scene.render_generation),
+        frame_id,
+        render_generation: Some(scene.render_generation),
+        scene_generation: scene.effects.generation,
+        scene_signature: scene.scene_identity_signature(),
+        visual_state,
+        output_scale: 1.0,
+        decoration_instances: &scene.decorations,
+        effects: &scene.effects,
+        presentation_visual_signature: scene.presentation.presentation_visual_signature(),
+        presentation_opacities: &scene.presentation.opacities,
+        presentation_clips: &scene.presentation.clips,
+        presentation_owner_root_surface_ids: scene.presentation_owner_root_surface_ids.as_ref(),
+        client_cursor,
+        current_damage,
+        surface_resource_sync_states,
+        lifecycle: &scene.lifecycle,
+        lifecycle_surfaces: &scene.lifecycle_surfaces,
+        lifecycle_decorations: &scene.lifecycle_decorations,
+    }
+}
+
+fn surface_resource_sync_signature(states: &[SurfaceResourceSyncState]) -> u64 {
+    let mut signature = 0xcbf2_9ce4_8422_2325_u64;
+    let mut mix = |value: u64| {
+        signature ^= value;
+        signature = signature.wrapping_mul(0x1000_0000_01b3);
+    };
+    for state in states {
+        mix(u64::from(state.surface_id));
+        match state.complete_since {
+            Some(commit) => {
+                mix(1);
+                mix(commit.0);
+            }
+            None => mix(0),
+        }
+        mix(state.current_commit.0);
+        mix(u64::from(state.authoritative));
+    }
+    signature
 }
 
 pub(crate) struct NativeRenderedFrame<'a> {

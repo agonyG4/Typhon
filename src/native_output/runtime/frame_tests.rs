@@ -1,3 +1,5 @@
+use super::{FrozenNativeRenderFrame, OwnedClientCursorRenderState};
+use crate::egl_renderer::OutputDamage;
 use crate::native_output::runtime::frame::{
     NativeCursorOutputArbitration, NativeCursorOutputDisposition, NativeCursorRenderMode,
     NativeCursorSchedulingPolicy, NativeFrameRenderer, ResolvedNativeFrameScene,
@@ -7,10 +9,10 @@ use crate::native_output::runtime::frame_scene_identity::{
 };
 use crate::native_output::runtime::{NativeInputState, NativeSceneSnapshot};
 use oblivion_one::compositor::{
-    AnimationTime, FullscreenRenderPlanMetrics, PresentationRect,
-    PresentationRetainedVisualPayloadId, RenderableSurface, RenderableSurfaceDamage,
-    ResolvedEffectScene, SurfaceCommitSequence, SurfaceOpaqueRegion, SurfacePlacement,
-    SurfaceRenderBackend, WindowId,
+    AnimationTime, ClientCursorRenderState, DesktopVisualState, FullscreenRenderPlanMetrics,
+    PresentationRect, PresentationRetainedVisualPayloadId, RenderableSurface,
+    RenderableSurfaceDamage, ResolvedEffectScene, SurfaceCommitSequence, SurfaceOpaqueRegion,
+    SurfacePlacement, SurfaceRenderBackend, WindowId,
 };
 use oblivion_one::compositor::{
     EffectAnchor, EffectAnchorScope, EffectSceneOrder, OwnCompositorServer, ResolvedEffectInstance,
@@ -30,6 +32,355 @@ use std::borrow::Cow;
 use std::process;
 use wayland_server::Resource;
 use wayland_server::protocol::wl_output;
+
+fn assert_send<T: Send>() {}
+
+#[test]
+fn frozen_native_render_frame_is_send() {
+    assert_send::<FrozenNativeRenderFrame>();
+}
+
+#[test]
+fn frozen_native_render_frame_keeps_scene_visual_journal_lifecycle_and_damage_at_g1() {
+    let socket_name = format!("typhon-frozen-render-g1-{}", process::id());
+    let mut server = OwnCompositorServer::bind_cpu_composition(&socket_name)
+        .expect("bind compositor for frozen render isolation regression");
+    server.install_native_frame_test_scene(
+        vec![test_surface(
+            710,
+            320,
+            200,
+            SurfacePlacement::root_at(10, 20),
+        )],
+        &[(710, WindowId::from_raw(710).expect("G1 window id"))],
+        None,
+    );
+    let scene = ResolvedNativeFrameScene::from_server_at(&server, AnimationTime::from_nanos(11))
+        .into_owned();
+    let render_generation = scene.render_generation;
+    let scene_signature = scene.scene_identity_signature();
+    let effects_generation = scene.effects.generation;
+    let presentation_signature = scene.presentation.presentation_visual_signature();
+    let lifecycle_signature = scene.lifecycle_snapshot.signature;
+    let sync_s1 = server.record_surface_damage_for_render_snapshot_test(
+        710,
+        RenderableSurfaceDamage::Full,
+        320,
+        200,
+    );
+    assert_eq!(sync_s1, 1);
+    let mut input_state = NativeInputState::new(1280, 800);
+    input_state.cursor_x = 41.0;
+    input_state.cursor_y = 52.0;
+
+    reset_snapshot_work_counters();
+    let mut frozen = FrozenNativeRenderFrame::freeze(
+        1280,
+        800,
+        scene,
+        &server,
+        &input_state,
+        NativeCursorRenderMode::Software,
+        Some(OutputDamage::Full),
+    );
+    assert_eq!(snapshot_work_counters().snapshot_owned_clones, 0);
+    let frozen_identity = frozen.identity;
+    let resource_sync_states = frozen.surface_resource_sync_states.clone();
+    let resource_sync_signature = frozen.identity.surface_resource_sync_signature;
+    assert_eq!(
+        frozen_identity.visual_state,
+        DesktopVisualState::with_cursor(41, 52)
+    );
+    assert_eq!(frozen_identity.lifecycle_signature, lifecycle_signature);
+    assert_eq!(
+        frozen_identity.surface_resource_sync_signature,
+        resource_sync_signature
+    );
+    let frozen_sync_s1 = resource_sync_states
+        .iter()
+        .find(|state| state.surface_id == 710)
+        .expect("G1 journal state is frozen");
+    assert!(frozen_sync_s1.authoritative);
+    assert_eq!(frozen_sync_s1.current_commit.0, sync_s1);
+
+    let lifecycle_bounds =
+        PresentationRect::new(10.0, 20.0, 320.0, 200.0).expect("lifecycle test bounds");
+    let lifecycle_group = LifecycleVisualGroup::from_bounds(
+        lifecycle_bounds,
+        lifecycle_bounds,
+        lifecycle_bounds,
+        lifecycle_bounds,
+        1280,
+        800,
+    )
+    .expect("lifecycle test visual group");
+    assert!(server.begin_lifecycle_lamp_for_test(
+        WindowId::from_raw(710).expect("G1 lifecycle window id"),
+        710,
+        lifecycle_group,
+    ));
+    server.install_native_frame_test_scene(
+        vec![test_surface(
+            711,
+            640,
+            400,
+            SurfacePlacement::root_at(30, 40),
+        )],
+        &[(711, WindowId::from_raw(711).expect("G2 window id"))],
+        None,
+    );
+    let sync_s2 = server.record_surface_damage_for_render_snapshot_test(
+        710,
+        RenderableSurfaceDamage::Empty,
+        320,
+        200,
+    );
+    assert_eq!(sync_s2, sync_s1 + 1);
+    input_state.cursor_x = 91.0;
+    input_state.cursor_y = 92.0;
+
+    let request = frozen
+        .draw_request(Some(17))
+        .expect("the frozen render projection is available once");
+    assert_eq!(request.frame_id, Some(17));
+    assert_eq!(
+        request.visual_state,
+        DesktopVisualState::with_cursor(41, 52)
+    );
+    assert_eq!(frozen_identity.visual_state, request.visual_state);
+    assert_eq!(
+        request
+            .surfaces
+            .iter()
+            .map(|surface| surface.surface_id)
+            .collect::<Vec<_>>(),
+        [710]
+    );
+    assert_eq!(request.render_generation, Some(render_generation));
+    assert_eq!(request.scene_signature, scene_signature);
+    assert_eq!(request.scene_generation, effects_generation);
+    assert_eq!(
+        request.presentation_visual_signature,
+        presentation_signature
+    );
+    assert_eq!(request.lifecycle.sampled_at, AnimationTime::from_nanos(11));
+    assert!(request.lifecycle.samples.is_empty());
+    assert_eq!(request.surface_resource_sync_states, resource_sync_states);
+    assert_eq!(
+        frozen_identity.surface_resource_sync_signature,
+        resource_sync_signature
+    );
+    assert_eq!(request.current_damage, Some(OutputDamage::Full));
+    assert_eq!(snapshot_work_counters().snapshot_owned_clones, 0);
+    drop(request);
+
+    assert!(
+        frozen.draw_request(None).is_none(),
+        "one frozen frame cannot replay stale damage authority"
+    );
+}
+
+#[test]
+fn owned_client_cursor_keeps_the_frozen_commit_and_placement() {
+    let socket_name = format!("typhon-frozen-cursor-commit-{}", process::id());
+    let server = OwnCompositorServer::bind_cpu_composition(&socket_name)
+        .expect("bind compositor for frozen client cursor regression");
+    let mut allocator = BufferIdAllocator::default();
+    let commit_c1 = allocator.allocate().expect("C1 buffer identity");
+    let commit_c2 = allocator.allocate().expect("C2 buffer identity");
+    let c1_buffer_id = commit_c1.id();
+    let c2_buffer_id = commit_c2.id();
+    let mut c1 = test_surface(720, 32, 32, SurfacePlacement::root_at(0, 0));
+    c1.generation = 4;
+    c1.commit_sequence = SurfaceCommitSequence(8);
+    c1.buffer = CommittedSurfaceBuffer::shm_snapshot(
+        commit_c1,
+        BufferSize::new(32, 32).expect("C1 buffer size"),
+        vec![0x11; 32 * 32],
+    );
+    let cursor = ClientCursorRenderState {
+        surface: &c1,
+        scene_node_id: oblivion_one::core::SceneNodeId::from_raw(720)
+            .expect("client cursor scene node"),
+        logical_x: 101,
+        logical_y: 202,
+        hotspot_x: 3,
+        hotspot_y: 5,
+    };
+    let owned = OwnedClientCursorRenderState::from_render_state(cursor);
+    let scene = ResolvedNativeFrameScene::from_server_at(&server, AnimationTime::from_nanos(12))
+        .into_owned();
+    let mut frozen = FrozenNativeRenderFrame::from_snapshot_parts(
+        1280,
+        800,
+        scene,
+        DesktopVisualState::wallpaper_only(),
+        Some(owned),
+        Vec::new(),
+        None,
+    );
+
+    c1.generation = 5;
+    c1.commit_sequence = SurfaceCommitSequence(9);
+    c1.buffer = CommittedSurfaceBuffer::shm_snapshot(
+        commit_c2,
+        BufferSize::new(32, 32).expect("C2 buffer size"),
+        vec![0x22; 32 * 32],
+    );
+    let request = frozen
+        .draw_request(None)
+        .expect("cursor snapshot projection is available");
+    let projected = request
+        .client_cursor
+        .expect("C1 client cursor remains visible");
+
+    assert_eq!(projected.surface.buffer_id(), c1_buffer_id);
+    assert_eq!(projected.surface.generation, 4);
+    assert_eq!(projected.surface.commit_sequence, SurfaceCommitSequence(8));
+    assert_eq!((projected.logical_x, projected.logical_y), (101, 202));
+    assert_eq!((projected.hotspot_x, projected.hotspot_y), (3, 5));
+    assert_ne!(projected.surface.buffer_id(), c1.buffer_id());
+    assert_eq!(c1.buffer_id(), c2_buffer_id);
+}
+
+#[test]
+fn freezing_a_render_frame_does_not_capture_or_complete_frame_callbacks() {
+    let socket_name = format!("typhon-frozen-callback-ownership-{}", process::id());
+    let mut server = OwnCompositorServer::bind_cpu_composition(&socket_name)
+        .expect("bind compositor for frozen frame callback regression");
+    server.install_native_frame_test_scene(
+        vec![test_surface(725, 320, 200, SurfacePlacement::root_at(0, 0))],
+        &[(
+            725,
+            WindowId::from_raw(725).expect("callback test window id"),
+        )],
+        None,
+    );
+    let (callback, _client_peer) = server.test_queue_visible_frame_callback(725);
+    assert!(server.has_pending_frame_callbacks());
+
+    let scene = ResolvedNativeFrameScene::from_server_at(&server, AnimationTime::from_nanos(14))
+        .into_owned();
+    let input_state = NativeInputState::new(1280, 800);
+    let frozen = FrozenNativeRenderFrame::freeze(
+        1280,
+        800,
+        scene,
+        &server,
+        &input_state,
+        NativeCursorRenderMode::Hardware,
+        Some(OutputDamage::Full),
+    );
+
+    assert!(server.has_pending_frame_callbacks());
+    assert!(callback.is_alive());
+    drop(frozen);
+    assert!(server.has_pending_frame_callbacks());
+    assert!(callback.is_alive());
+}
+
+#[test]
+fn frozen_draw_request_matches_the_synchronous_request_projection() {
+    let socket_name = format!("typhon-frozen-render-equivalence-{}", process::id());
+    let mut server = OwnCompositorServer::bind_cpu_composition(&socket_name)
+        .expect("bind compositor for frozen request equivalence regression");
+    server.install_native_frame_test_scene_with_server_decorations(
+        vec![test_surface(
+            730,
+            320,
+            200,
+            SurfacePlacement::root_at(40, 50),
+        )],
+        &[(730, WindowId::from_raw(730).expect("equivalence window id"))],
+        None,
+    );
+    let at = AnimationTime::from_nanos(13);
+    let old_scene = ResolvedNativeFrameScene::from_server_at(&server, at);
+    let frozen_scene = ResolvedNativeFrameScene::from_server_at(&server, at).into_owned();
+    let input_state = NativeInputState::new(1280, 800);
+    let mut renderer = NativeFrameRenderer::default();
+    let old = renderer.egl_scene_draw_request(
+        1280,
+        800,
+        &old_scene,
+        &server,
+        &input_state,
+        NativeCursorRenderMode::Software,
+        Some(OutputDamage::Full),
+    );
+    let mut frozen = FrozenNativeRenderFrame::freeze(
+        1280,
+        800,
+        frozen_scene,
+        &server,
+        &input_state,
+        NativeCursorRenderMode::Software,
+        Some(OutputDamage::Full),
+    );
+    let current = frozen
+        .draw_request(None)
+        .expect("frozen request projection is available");
+
+    assert_eq!(current.surfaces.len(), old.surfaces.len());
+    for (left, right) in current.surfaces.iter().zip(old.surfaces) {
+        assert_eq!(left.surface_id, right.surface_id);
+        assert_eq!(left.buffer_id(), right.buffer_id());
+        assert_eq!(left.generation, right.generation);
+        assert_eq!(left.commit_sequence, right.commit_sequence);
+    }
+    assert_eq!(
+        current.external_overlay_surface_ids,
+        old.external_overlay_surface_ids
+    );
+    assert_eq!(current.popup_surface_ids, old.popup_surface_ids);
+    assert_eq!(current.content_generation, old.content_generation);
+    assert_eq!(current.render_generation, old.render_generation);
+    assert_eq!(current.scene_generation, old.scene_generation);
+    assert_eq!(current.scene_signature, old.scene_signature);
+    assert_eq!(current.visual_state, old.visual_state);
+    assert_eq!(
+        current.decoration_instances.len(),
+        old.decoration_instances.len()
+    );
+    assert_eq!(
+        current
+            .decoration_instances
+            .iter()
+            .map(|item| item.scene_snapshot().identity())
+            .collect::<Vec<_>>(),
+        old.decoration_instances
+            .iter()
+            .map(|item| item.scene_snapshot().identity())
+            .collect::<Vec<_>>(),
+    );
+    assert_eq!(current.effects.signature, old.effects.signature);
+    assert_eq!(current.effects.generation, old.effects.generation);
+    assert_eq!(
+        current.presentation_visual_signature,
+        old.presentation_visual_signature
+    );
+    assert_eq!(current.presentation_opacities, old.presentation_opacities);
+    assert_eq!(current.presentation_clips, old.presentation_clips);
+    assert_eq!(
+        current.presentation_owner_root_surface_ids,
+        old.presentation_owner_root_surface_ids,
+    );
+    assert_eq!(
+        current.surface_resource_sync_states,
+        old.surface_resource_sync_states
+    );
+    assert_eq!(current.lifecycle.sampled_at, old.lifecycle.sampled_at);
+    assert_eq!(
+        current.lifecycle_surfaces.len(),
+        old.lifecycle_surfaces.len()
+    );
+    assert_eq!(
+        current.lifecycle_decorations.len(),
+        old.lifecycle_decorations.len()
+    );
+    assert_eq!(current.current_damage, old.current_damage);
+    assert_eq!(current.client_cursor.is_some(), old.client_cursor.is_some());
+}
 
 fn test_surface(
     surface_id: u32,
@@ -190,6 +541,7 @@ fn restore_filters_canonical_surfaces_from_the_frame_lifecycle_sample() {
                 payload_id: PresentationRetainedVisualPayloadId::from_origin_identity(identity),
                 kind: LifecycleVisualSourceKind::NoOwnedEffects,
                 effect_scene: std::sync::Arc::new(ResolvedEffectScene::default()),
+                render_layout: None,
             },
             effect: LifecycleEffectKind::Lamp,
             progress: 0.5,

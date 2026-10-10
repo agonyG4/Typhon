@@ -512,18 +512,17 @@ impl NativeScanoutBackend {
 
     pub(crate) fn capture_scene(
         &mut self,
-        renderer: &mut NativeFrameRenderer,
-        resolved_scene: &ResolvedNativeFrameScene<'_>,
+        resolved_scene: ResolvedNativeFrameScene<'static>,
         server: &OwnCompositorServer,
         input_state: &NativeInputState,
         cursor_mode: NativeCursorRenderMode,
     ) -> io::Result<Vec<u8>> {
         match self {
             Self::AtomicEglGbm(scanout) => {
-                scanout.capture_scene(renderer, resolved_scene, server, input_state, cursor_mode)
+                scanout.capture_scene(resolved_scene, server, input_state, cursor_mode)
             }
             Self::NativeEglGbm(scanout) => {
-                scanout.capture_scene(renderer, resolved_scene, server, input_state, cursor_mode)
+                scanout.capture_scene(resolved_scene, server, input_state, cursor_mode)
             }
             Self::Gbm(_) | Self::Dumb(_) => Err(io::Error::other(
                 "screen capture requires a GLES native scanout backend",

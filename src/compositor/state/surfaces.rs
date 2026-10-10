@@ -119,6 +119,19 @@ impl CompositorState {
             .collect()
     }
 
+    pub(in crate::compositor) fn record_surface_damage_for_render_snapshot_test(
+        &mut self,
+        surface_id: u32,
+        damage: RenderableSurfaceDamage,
+        width: u32,
+        height: u32,
+    ) -> SurfaceCommitCounter {
+        self.surface_damage_journals
+            .entry(surface_id)
+            .or_insert_with(|| SurfaceDamageJournal::new(4))
+            .record(damage, width, height)
+    }
+
     #[allow(dead_code)]
     pub(in crate::compositor) fn renderable_surface_mut(
         &mut self,

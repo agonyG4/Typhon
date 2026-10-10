@@ -1549,8 +1549,7 @@ impl NativeRuntime {
         };
         let resolved_scene = ResolvedNativeFrameScene::from_server(&self.server).into_owned();
         let payload = match self.scanout.capture_scene(
-            &mut self.frame_renderer,
-            &resolved_scene,
+            resolved_scene,
             &self.server,
             &self.input_state,
             self.cursor_render_mode,

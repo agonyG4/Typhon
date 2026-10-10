@@ -1076,7 +1076,8 @@ impl NativeRuntime {
         // coordinates or live client surface can be sampled, and protocol and
         // lifecycle obligations stay pending for the first ordinary frame
         // after publication.
-        let scene = ResolvedNativeFrameScene::for_synchronous_output_reconfiguration(&self.server);
+        let scene = ResolvedNativeFrameScene::for_synchronous_output_reconfiguration(&self.server)
+            .into_owned();
         let mut candidate_input_state = self.input_state.clone();
         candidate_input_state.reconfigure_output_bounds(target.width, target.height);
         let cursor = self.candidate_cursor_state(target);
@@ -1086,17 +1087,24 @@ impl NativeRuntime {
         };
         match &mut scanout {
             NativeScanoutBackend::AtomicEglGbm(explicit) => {
+                let mut frozen_candidate = FrozenNativeRenderFrame::freeze(
+                    target.width,
+                    target.height,
+                    scene,
+                    &self.server,
+                    &candidate_input_state,
+                    candidate_cursor_mode,
+                    Some(
+                        NativeOutputDamage::full_output(target.width, target.height)
+                            .as_renderer_damage(target.width, target.height),
+                    ),
+                );
                 let slot = explicit.initial_slot();
                 let mut gpu_sampling_started = false;
                 match explicit.render_to_slot(
                     slot,
                     self.frame_index.wrapping_add(1).max(1),
-                    &mut self.frame_renderer,
-                    &scene,
-                    &self.server,
-                    &candidate_input_state,
-                    candidate_cursor_mode,
-                    &NativeOutputDamage::full_output(target.width, target.height),
+                    &mut frozen_candidate,
                     &mut gpu_sampling_started,
                     None,
                 )? {

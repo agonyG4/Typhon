@@ -1221,6 +1221,19 @@ impl OwnCompositorServer {
         self.state.surface_resource_sync_states(surface_ids)
     }
 
+    #[doc(hidden)]
+    pub fn record_surface_damage_for_render_snapshot_test(
+        &mut self,
+        surface_id: u32,
+        damage: crate::compositor::RenderableSurfaceDamage,
+        width: u32,
+        height: u32,
+    ) -> u64 {
+        self.state
+            .record_surface_damage_for_render_snapshot_test(surface_id, damage, width, height)
+            .0
+    }
+
     pub fn native_frame_renderable_surfaces_with_metrics(
         &self,
     ) -> (Cow<'_, [RenderableSurface]>, FullscreenRenderPlanMetrics) {

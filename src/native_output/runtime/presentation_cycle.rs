@@ -1679,7 +1679,6 @@ impl NativeRuntime {
                         );
                         frame_pacing.log("render_begin", render_begin_fields);
                         #[rustfmt::skip] let render_result = explicit.render_frame(
-                            frame_renderer,
                             server,
                             output_transactions,
                             input_state,
@@ -1727,6 +1726,10 @@ impl NativeRuntime {
                             slow_cycle_trace.record_phase_duration(
                                 SlowCyclePhase::RenderTargetPreparation,
                                 durations.render_target_preparation_ns,
+                            );
+                            slow_cycle_trace.record_phase_duration(
+                                SlowCyclePhase::RenderSnapshotFreeze,
+                                durations.render_snapshot_freeze_ns,
                             );
                             slow_cycle_trace.record_phase_duration(
                                 SlowCyclePhase::SceneDrawing,

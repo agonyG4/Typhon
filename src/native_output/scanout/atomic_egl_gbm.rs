@@ -36,9 +36,9 @@ use crate::egl_renderer::{
 use crate::native_output::runtime::take_client_cursor_presentation_feedback_batch;
 use crate::native_output::runtime::{
     DirectCallbackLeakMetrics, DirectTerminalCallbackDisposition, DmabufGpuReleaseSafety,
-    direct_terminal_callback_owner_leaks, discard_presentation_feedback_obligation,
-    restore_presentation_feedback_obligation, settle_failed_output_transaction,
-    settle_no_visual_change_output_transaction,
+    FrozenNativeRenderFrame, ResolvedNativeFrameScene, direct_terminal_callback_owner_leaks,
+    discard_presentation_feedback_obligation, restore_presentation_feedback_obligation,
+    settle_failed_output_transaction, settle_no_visual_change_output_transaction,
 };
 use oblivion_one::window_lifecycle_animation::LifecycleRenderFallbacks;
 
@@ -57,6 +57,7 @@ fn elapsed_nanos(started: Instant) -> u64 {
 pub(crate) struct AtomicRenderPhaseDurations {
     pub(crate) egl_context_activation_ns: u64,
     pub(crate) render_target_preparation_ns: u64,
+    pub(crate) render_snapshot_freeze_ns: u64,
     pub(crate) scene_drawing_ns: u64,
     pub(crate) native_render_fence_export_ns: u64,
 }
@@ -907,12 +908,7 @@ impl AtomicEglGbmScanout {
         &mut self,
         slot: OutputSlotId,
         frame_id: u64,
-        renderer: &mut NativeFrameRenderer,
-        resolved_scene: &ResolvedNativeFrameScene<'_>,
-        server: &OwnCompositorServer,
-        input_state: &NativeInputState,
-        cursor_mode: NativeCursorRenderMode,
-        damage: &NativeOutputDamage,
+        frozen_frame: &mut FrozenNativeRenderFrame,
         gpu_sampling_started: &mut bool,
         mut phase_durations: Option<&mut AtomicRenderPhaseDurations>,
     ) -> io::Result<AtomicSlotRenderOutcome> {
@@ -937,16 +933,9 @@ impl AtomicEglGbmScanout {
             (slot.gl_framebuffer, slot.buffer_age(presentation_serial))
         };
         let sampleable_texture = self.slot(slot)?.texture;
-        let mut request = renderer.egl_scene_draw_request(
-            self.width,
-            self.height,
-            resolved_scene,
-            server,
-            input_state,
-            cursor_mode,
-            Some(damage.as_renderer_damage(self.width, self.height)),
-        );
-        request.frame_id = Some(frame_id);
+        let request = frozen_frame
+            .draw_request(Some(frame_id))
+            .ok_or_else(|| io::Error::other("frozen render frame request already consumed"))?;
         if let (Some(durations), Some(started)) =
             (phase_durations.as_deref_mut(), target_preparation_started)
         {
@@ -1028,16 +1017,12 @@ impl AtomicEglGbmScanout {
     /// state participates in this operation.
     pub(crate) fn capture_scene(
         &mut self,
-        renderer: &mut NativeFrameRenderer,
-        resolved_scene: &ResolvedNativeFrameScene<'_>,
+        resolved_scene: ResolvedNativeFrameScene<'static>,
         server: &OwnCompositorServer,
         input_state: &NativeInputState,
         cursor_mode: NativeCursorRenderMode,
     ) -> io::Result<Vec<u8>> {
-        self.egl
-            .make_current(self.egl_display, None, None, Some(self.egl_context))
-            .map_err(native_egl_io_error)?;
-        let request = renderer.egl_scene_draw_request(
+        let mut frozen_frame = FrozenNativeRenderFrame::freeze(
             self.width,
             self.height,
             resolved_scene,
@@ -1046,6 +1031,12 @@ impl AtomicEglGbmScanout {
             cursor_mode,
             Some(OutputDamage::Full),
         );
+        self.egl
+            .make_current(self.egl_display, None, None, Some(self.egl_context))
+            .map_err(native_egl_io_error)?;
+        let request = frozen_frame
+            .draw_request(None)
+            .ok_or_else(|| io::Error::other("frozen capture frame request already consumed"))?;
         self.scene
             .capture_scene(
                 &self.egl,
@@ -1059,7 +1050,6 @@ impl AtomicEglGbmScanout {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn render_frame(
         &mut self,
-        renderer: &mut NativeFrameRenderer,
         server: &mut OwnCompositorServer,
         output_transactions: &mut OutputTransactionLedger,
         input_state: &NativeInputState,
@@ -1424,6 +1414,7 @@ impl AtomicEglGbmScanout {
             resolved_render_generation,
             surface_damage,
             hardware_cursor_surface_id,
+            frozen_render_frame,
         ) = {
             let resolved_snapshot = resolved_scene.snapshot_owned();
             let resolved_scene_signature = resolved_scene.scene_identity_signature();
@@ -1479,15 +1470,26 @@ impl AtomicEglGbmScanout {
                         == crate::native_output::presentation::plane::PresentedCursorDelivery::Hardware,
                 );
             }
-            let outcome = self.render_to_slot(
-                slot,
-                frame_id,
-                renderer,
-                &resolved_scene,
+            let render_snapshot_freeze_started = phase_durations.as_ref().map(|_| Instant::now());
+            let mut frozen_render_frame = FrozenNativeRenderFrame::freeze(
+                self.width,
+                self.height,
+                resolved_scene,
                 &*server,
                 input_state,
                 cursor_mode,
-                &render_damage,
+                Some(render_damage.as_renderer_damage(self.width, self.height)),
+            );
+            if let (Some(durations), Some(started)) = (
+                phase_durations.as_deref_mut(),
+                render_snapshot_freeze_started,
+            ) {
+                durations.render_snapshot_freeze_ns = elapsed_nanos(started);
+            }
+            let outcome = self.render_to_slot(
+                slot,
+                frame_id,
+                &mut frozen_render_frame,
                 &mut gpu_sampling_started,
                 phase_durations.as_deref_mut(),
             );
@@ -1495,11 +1497,13 @@ impl AtomicEglGbmScanout {
                 outcome,
                 resolved_snapshot,
                 resolved_scene_signature,
-                resolved_scene.render_generation,
+                frozen_render_frame.scene.render_generation,
                 surface_damage,
                 hardware_cursor_surface_id,
+                frozen_render_frame,
             )
         };
+        let resolved_scene = &frozen_render_frame.scene;
         let parts = match render_outcome {
             Ok(AtomicSlotRenderOutcome::Rendered(parts)) => *parts,
             Ok(AtomicSlotRenderOutcome::Skipped {
