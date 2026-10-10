@@ -411,12 +411,25 @@ pub(crate) struct LifecycleMotionSample {
     pub(crate) mathematically_settled: bool,
 }
 
+/// Live compositor painter authority for one retained lifecycle window.
+///
+/// This metadata is sampled alongside animation motion and is never stored in
+/// the retained visual payload, whose contents remain frozen for its lifetime.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LifecyclePainterOrder {
+    pub scene_band: u8,
+    pub layer_rank: u8,
+    pub stack_position: u64,
+    pub stable_order: u64,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct LifecycleWindowSample {
     pub window_id: WindowId,
     pub root_surface_id: u32,
     pub presentation_identity: PresentationRetainedVisualIdentity,
     pub payload_id: PresentationRetainedVisualPayloadId,
+    pub painter_order: LifecyclePainterOrder,
     pub visual_group: LifecycleVisualGroup,
     pub visual_source: LifecycleVisualSource,
     pub effect: LifecycleEffectKind,

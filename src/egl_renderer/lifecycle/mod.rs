@@ -146,6 +146,7 @@ impl LifecycleRenderState {
         );
     }
 
+    #[cfg(test)]
     pub(super) fn draw_lamp_overlay(
         &mut self,
         context: &mut LifecycleRenderContext<'_>,
@@ -175,6 +176,7 @@ impl LifecycleRenderState {
         );
     }
 
+    #[cfg(test)]
     pub(super) fn draw_squash_overlay(
         &mut self,
         context: &mut LifecycleRenderContext<'_>,
@@ -182,6 +184,36 @@ impl LifecycleRenderState {
     ) -> RendererResult<()> {
         self.squash
             .draw_overlay(&mut self.frame, &self.visual_store, context, scissor)
+    }
+
+    /// Dispatches one repair through the ordered lifecycle coordinator.
+    /// Each retained window stays paired with its own effect renderer and
+    /// render evidence; only window groups are sorted by live painter metadata.
+    pub(super) fn draw_ordered_overlay(
+        &mut self,
+        context: &mut LifecycleRenderContext<'_>,
+        scissor: Option<OutputRect>,
+    ) -> RendererResult<()> {
+        let ordered_samples = self.frame.ordered_samples.clone();
+        for ordered in ordered_samples {
+            match ordered.sample.effect {
+                LifecycleEffectKind::Lamp => self.lamp.draw_overlay_for_sample(
+                    &mut self.frame,
+                    &self.visual_store,
+                    context,
+                    scissor,
+                    ordered.sample,
+                )?,
+                LifecycleEffectKind::Squash => self.squash.draw_overlay_for_sample(
+                    &mut self.frame,
+                    &self.visual_store,
+                    context,
+                    scissor,
+                    ordered.sample,
+                )?,
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn extend_surface_consumers(
@@ -356,8 +388,7 @@ impl LifecycleRenderState {
                     .gl
                     .scissor(rect.x, y, rect.width as i32, rect.height as i32);
             }
-            self.draw_lamp_overlay(context, Some(*rect))?;
-            self.draw_squash_overlay(context, Some(*rect))?;
+            self.draw_ordered_overlay(context, Some(*rect))?;
         }
         unsafe {
             context.gl.disable(glow::SCISSOR_TEST);

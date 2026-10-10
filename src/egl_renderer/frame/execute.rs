@@ -679,8 +679,7 @@ impl FramePipeline<'_> {
             self.prepare_lifecycle_visual_sources(plan, framebuffer_origin)?;
             for repair_index in 0..repair_count {
                 let repair = self.scene.scene_region_plan.repairs[repair_index];
-                self.draw_lamp_overlay(Some(repair))?;
-                self.draw_squash_overlay(Some(repair))?;
+                self.draw_lifecycle_overlay(Some(repair))?;
                 self.draw_command_batch(false, Some(repair))?;
             }
             self.scene.frame_stats.scissor_passes = repair_count;
@@ -693,8 +692,7 @@ impl FramePipeline<'_> {
                     }
                     self.draw_command_batch(true, None)?;
                     self.prepare_lifecycle_visual_sources(plan, framebuffer_origin)?;
-                    self.draw_lamp_overlay(None)?;
-                    self.draw_squash_overlay(None)?;
+                    self.draw_lifecycle_overlay(None)?;
                     self.draw_command_batch(false, None)?;
                 }
                 RenderExecution::Scissored {
@@ -734,23 +732,14 @@ impl FramePipeline<'_> {
                                     self.gl.scissor(x, y, width, height);
                                 }
                             }
-                            LegacySceneScissoredPhase::Lamp(index) => {
+                            LegacySceneScissoredPhase::LifecycleOverlay(index) => {
                                 let [x, y, width, height] = scissors[index];
                                 let output_rect = super::super::gl_scissor_to_output_rect(
                                     [x, y, width, height],
                                     self.scene.current_size.1,
                                     framebuffer_origin,
                                 );
-                                draw_result = self.draw_lamp_overlay(output_rect);
-                            }
-                            LegacySceneScissoredPhase::Squash(index) => {
-                                let [x, y, width, height] = scissors[index];
-                                let output_rect = super::super::gl_scissor_to_output_rect(
-                                    [x, y, width, height],
-                                    self.scene.current_size.1,
-                                    framebuffer_origin,
-                                );
-                                draw_result = self.draw_squash_overlay(output_rect);
+                                draw_result = self.draw_lifecycle_overlay(output_rect);
                             }
                             LegacySceneScissoredPhase::ExternalOverlays(index) => {
                                 let [x, y, width, height] = scissors[index];
@@ -798,7 +787,11 @@ impl FramePipeline<'_> {
         lifecycle.prepare_visual_sources(&mut context, plan, framebuffer_origin)
     }
 
-    fn draw_lamp_overlay(&mut self, scissor: Option<OutputRect>) -> RendererResult<()> {
+    // This coordinator orders WindowLifecycle overlays among themselves. The
+    // phase remains after canonical scene work and before external overlays;
+    // interleaving retained lifecycle windows with canonical surfaces is a
+    // separate scene-order architecture question.
+    fn draw_lifecycle_overlay(&mut self, scissor: Option<OutputRect>) -> RendererResult<()> {
         let Self {
             gl,
             scene,
@@ -808,20 +801,7 @@ impl FramePipeline<'_> {
             ..
         } = self;
         let mut context = LifecycleRenderContext::new(gl, scene, effects, resources.texture_view());
-        lifecycle.draw_lamp_overlay(&mut context, scissor)
-    }
-
-    fn draw_squash_overlay(&mut self, scissor: Option<OutputRect>) -> RendererResult<()> {
-        let Self {
-            gl,
-            scene,
-            effects,
-            resources,
-            lifecycle,
-            ..
-        } = self;
-        let mut context = LifecycleRenderContext::new(gl, scene, effects, resources.texture_view());
-        lifecycle.draw_squash_overlay(&mut context, scissor)
+        lifecycle.draw_ordered_overlay(&mut context, scissor)
     }
 
     fn draw_lifecycle_overlays(
@@ -1076,8 +1056,7 @@ pub(in crate::egl_renderer) enum LegacySceneScissoredPhase {
     BaseRepair(usize),
     PrepareLifecycleSources,
     RestoreRepairScissor(usize),
-    Lamp(usize),
-    Squash(usize),
+    LifecycleOverlay(usize),
     ExternalOverlays(usize),
 }
 
@@ -1097,14 +1076,13 @@ impl Iterator for LegacySceneScissoredPhasePlan {
             LegacySceneScissoredPhase::PrepareLifecycleSources
         } else {
             let offset = self.index - self.repair_count - 1;
-            let repair = offset / 4;
+            let repair = offset / 3;
             if repair >= self.repair_count {
                 return None;
             }
-            match offset % 4 {
+            match offset % 3 {
                 0 => LegacySceneScissoredPhase::RestoreRepairScissor(repair),
-                1 => LegacySceneScissoredPhase::Lamp(repair),
-                2 => LegacySceneScissoredPhase::Squash(repair),
+                1 => LegacySceneScissoredPhase::LifecycleOverlay(repair),
                 _ => LegacySceneScissoredPhase::ExternalOverlays(repair),
             }
         };

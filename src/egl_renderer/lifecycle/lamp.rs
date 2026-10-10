@@ -554,6 +554,7 @@ impl LampRenderState {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn draw_overlay(
         &mut self,
         frame: &mut LifecycleFrameState,
@@ -561,12 +562,51 @@ impl LampRenderState {
         context: &mut LifecycleRenderContext<'_>,
         scissor: Option<OutputRect>,
     ) -> RendererResult<()> {
+        self.draw_overlay_matching(frame, visual_store, context, scissor, None)
+    }
+
+    pub(super) fn draw_overlay_for_sample(
+        &mut self,
+        frame: &mut LifecycleFrameState,
+        visual_store: &LifecycleVisualStore,
+        context: &mut LifecycleRenderContext<'_>,
+        scissor: Option<OutputRect>,
+        sample: LifecycleFrameSample,
+    ) -> RendererResult<()> {
+        self.draw_overlay_matching(
+            frame,
+            visual_store,
+            context,
+            scissor,
+            Some(sample.presentation_identity),
+        )
+    }
+
+    fn draw_overlay_matching(
+        &mut self,
+        frame: &mut LifecycleFrameState,
+        visual_store: &LifecycleVisualStore,
+        context: &mut LifecycleRenderContext<'_>,
+        scissor: Option<OutputRect>,
+        presentation_identity: Option<
+            oblivion_one::presentation_animation::PresentationRetainedVisualIdentity,
+        >,
+    ) -> RendererResult<()> {
         let (Some(program), Some(uniforms)) = (self.program, self.uniform_locations) else {
-            frame.record_visible_fallbacks(
+            let visible_samples = frame.visible_samples(
                 f64::from(context.effect_runtime.effect_output_scale),
                 context.scene_state.current_size,
-                LifecycleRenderFallbackReason::LampProgramUnavailable,
             );
+            for sample in visible_samples.into_iter().filter(|sample| {
+                sample.effect == LifecycleEffectKind::Lamp
+                    && presentation_identity
+                        .is_none_or(|identity| sample.presentation_identity == identity)
+            }) {
+                frame.record_fallback(
+                    sample,
+                    LifecycleRenderFallbackReason::LampProgramUnavailable,
+                );
+            }
             return Ok(());
         };
         if self.vertices.is_empty() || self.commands.is_empty() {
@@ -596,6 +636,11 @@ impl LampRenderState {
             .commands
             .iter()
             .filter_map(|command| {
+                if presentation_identity
+                    .is_some_and(|identity| command.presentation_identity != identity)
+                {
+                    return None;
+                }
                 let sample = frame.sample_for_identity(command.presentation_identity)?;
                 let source = visual_store
                     .visual_sources

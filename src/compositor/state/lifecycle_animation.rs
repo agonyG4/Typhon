@@ -1064,11 +1064,20 @@ impl CompositorState {
                 kind,
                 effect_scene: std::sync::Arc::clone(&payload.effect_scene),
             };
+            let stable_order = payload.window_id.get() as usize;
+            let (scene_band, layer_rank, stack_position, stable_order) =
+                self.renderable_root_stack_key(payload.root_surface_id, stable_order);
             samples.push(LifecycleWindowSample {
                 window_id: payload.window_id,
                 root_surface_id: payload.root_surface_id,
                 presentation_identity: identity,
                 payload_id: payload.payload_id,
+                painter_order: crate::window_lifecycle_animation::LifecyclePainterOrder {
+                    scene_band,
+                    layer_rank,
+                    stack_position,
+                    stable_order: stable_order as u64,
+                },
                 visual_group: payload.visual_group,
                 visual_source,
                 effect: motion.effect,

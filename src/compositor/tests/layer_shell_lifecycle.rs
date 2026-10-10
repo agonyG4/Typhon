@@ -148,6 +148,7 @@ fn active_lamp(anchor_rect: PresentationRect) -> LifecycleSceneSample {
             root_surface_id: 901,
             presentation_identity,
             payload_id,
+            painter_order: Default::default(),
             visual_group,
             visual_source: LifecycleVisualSource {
                 window_id,

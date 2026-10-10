@@ -261,12 +261,43 @@ impl SquashRenderState {
             }));
     }
 
+    #[cfg(test)]
     pub(super) fn draw_overlay(
         &mut self,
         frame: &mut LifecycleFrameState,
         visual_store: &LifecycleVisualStore,
         context: &mut LifecycleRenderContext<'_>,
         scissor: Option<OutputRect>,
+    ) -> RendererResult<()> {
+        self.draw_overlay_matching(frame, visual_store, context, scissor, None)
+    }
+
+    pub(super) fn draw_overlay_for_sample(
+        &mut self,
+        frame: &mut LifecycleFrameState,
+        visual_store: &LifecycleVisualStore,
+        context: &mut LifecycleRenderContext<'_>,
+        scissor: Option<OutputRect>,
+        sample: LifecycleFrameSample,
+    ) -> RendererResult<()> {
+        self.draw_overlay_matching(
+            frame,
+            visual_store,
+            context,
+            scissor,
+            Some(sample.presentation_identity),
+        )
+    }
+
+    fn draw_overlay_matching(
+        &mut self,
+        frame: &mut LifecycleFrameState,
+        visual_store: &LifecycleVisualStore,
+        context: &mut LifecycleRenderContext<'_>,
+        scissor: Option<OutputRect>,
+        presentation_identity: Option<
+            oblivion_one::presentation_animation::PresentationRetainedVisualIdentity,
+        >,
     ) -> RendererResult<()> {
         if self.vertices.is_empty() || self.commands.is_empty() {
             return Ok(());
@@ -294,7 +325,11 @@ impl SquashRenderState {
         let active = frame
             .samples
             .iter()
-            .filter(|sample| sample.effect == LifecycleEffectKind::Squash)
+            .filter(|sample| {
+                sample.effect == LifecycleEffectKind::Squash
+                    && presentation_identity
+                        .is_none_or(|identity| sample.presentation_identity == identity)
+            })
             .copied()
             .collect::<Vec<_>>();
         let mut draw_calls = 0_usize;

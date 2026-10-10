@@ -213,6 +213,7 @@ fn lifecycle_sample(
         root_surface_id,
         presentation_identity,
         payload_id,
+        painter_order: Default::default(),
         visual_group,
         visual_source: LifecycleVisualSource {
             window_id,

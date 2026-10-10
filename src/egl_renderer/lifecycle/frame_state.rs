@@ -1,8 +1,15 @@
 use super::super::*;
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct LifecycleOrderedSample {
+    pub(super) painter_order: LifecyclePainterOrder,
+    pub(super) sample: LifecycleFrameSample,
+}
+
 #[derive(Default)]
 pub(super) struct LifecycleFrameState {
     pub(super) samples: Vec<LifecycleFrameSample>,
+    pub(super) ordered_samples: Vec<LifecycleOrderedSample>,
     pub(super) evidence: LifecycleRenderEvidence,
     pub(super) fallbacks: LifecycleRenderFallbacks,
 }
@@ -20,6 +27,17 @@ impl LifecycleFrameState {
 
     pub(super) fn begin(&mut self, snapshot: &LifecycleSceneSample) {
         self.samples = LifecycleFrameSnapshot::from_sample(snapshot).samples;
+        self.ordered_samples = snapshot
+            .samples
+            .iter()
+            .zip(self.samples.iter().copied())
+            .map(|(source, sample)| LifecycleOrderedSample {
+                painter_order: source.painter_order,
+                sample,
+            })
+            .collect();
+        self.ordered_samples
+            .sort_by_key(|ordered| ordered.painter_order);
         self.evidence.consumed.clear();
         self.fallbacks.failed.clear();
     }
@@ -72,17 +90,6 @@ impl LifecycleFrameState {
         }
     }
 
-    pub(super) fn record_visible_fallbacks(
-        &mut self,
-        output_scale: f64,
-        output_size: (u32, u32),
-        reason: LifecycleRenderFallbackReason,
-    ) {
-        for sample in self.visible_samples(output_scale, output_size) {
-            self.record_fallback(sample, reason);
-        }
-    }
-
     pub(super) fn damage_for_snapshot(
         snapshot: &LifecycleSceneSample,
         output_size: (u32, u32),
@@ -117,6 +124,7 @@ pub(super) struct LifecycleCaptureFrameSnapshot {
     evidence: LifecycleRenderEvidence,
     fallbacks: LifecycleRenderFallbacks,
     samples: Vec<LifecycleFrameSample>,
+    ordered_samples: Vec<LifecycleOrderedSample>,
 }
 
 impl LifecycleCaptureFrameSnapshot {
@@ -125,6 +133,7 @@ impl LifecycleCaptureFrameSnapshot {
             evidence: frame.evidence.clone(),
             fallbacks: frame.fallbacks.clone(),
             samples: frame.samples.clone(),
+            ordered_samples: frame.ordered_samples.clone(),
         }
     }
 
@@ -132,6 +141,7 @@ impl LifecycleCaptureFrameSnapshot {
         frame.evidence = self.evidence;
         frame.fallbacks = self.fallbacks;
         frame.samples = self.samples;
+        frame.ordered_samples = self.ordered_samples;
     }
 }
 

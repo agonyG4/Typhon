@@ -18,6 +18,7 @@ pub(in crate::egl_renderer::tests) fn lamp_test_sample(progress: f64) -> Lifecyc
             root_surface_id: 1,
             presentation_identity,
             payload_id,
+            painter_order: Default::default(),
             visual_group,
             visual_source: LifecycleVisualSource {
                 window_id,
@@ -98,6 +99,7 @@ pub(in crate::egl_renderer::tests) fn lifecycle_effect_sample(
             root_surface_id,
             presentation_identity,
             payload_id,
+            painter_order: Default::default(),
             visual_group,
             visual_source: LifecycleVisualSource {
                 window_id,

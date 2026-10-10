@@ -581,6 +581,7 @@ mod tests {
                 payload_id: oblivion_one::compositor::PresentationRetainedVisualPayloadId::from_origin_identity(
                     presentation_identity,
                 ),
+                painter_order: Default::default(),
                 visual_group: LifecycleVisualGroup::from_bounds(
                     source, source, source, anchor, 1920, 1080,
                 )
@@ -660,6 +661,7 @@ mod tests {
                 payload_id: oblivion_one::compositor::PresentationRetainedVisualPayloadId::from_origin_identity(
                     presentation_identity,
                 ),
+                painter_order: Default::default(),
                 visual_group: group,
                 visual_source: LifecycleVisualSource {
                     window_id,

@@ -181,6 +181,7 @@ fn restore_filters_canonical_surfaces_from_the_frame_lifecycle_sample() {
             root_surface_id,
             presentation_identity: identity,
             payload_id: PresentationRetainedVisualPayloadId::from_origin_identity(identity),
+            painter_order: Default::default(),
             visual_group,
             visual_source: LifecycleVisualSource {
                 window_id,

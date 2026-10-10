@@ -5,7 +5,7 @@ use crate::egl_renderer::tests::{
     test_lifecycle_identities_for_windows, test_lifecycle_identity,
     test_lifecycle_identity_sequence,
 };
-use oblivion_one::presentation_animation::PresentationRect;
+use oblivion_one::presentation_animation::{AnimationTime, PresentationRect};
 
 fn set_lamp_test_texture_filter(gl: &glow::Context, texture: glow::Texture, filter: u32) {
     unsafe {
@@ -142,6 +142,209 @@ fn draw_lamp_sampling_pass(harness: &mut GlesEffectTestHarness) {
         .lifecycle
         .draw_lamp_overlay(&mut context, None)
         .expect("Lamp sampling draw succeeds");
+}
+
+fn render_lifecycle_overlap_pixel(
+    lower_effect: LifecycleEffectKind,
+    upper_effect: LifecycleEffectKind,
+) -> [u8; 4] {
+    render_lifecycle_overlap(lower_effect, upper_effect, false, false).0
+}
+
+fn render_lifecycle_overlap(
+    lower_effect: LifecycleEffectKind,
+    upper_effect: LifecycleEffectKind,
+    omit_lower_texture: bool,
+    disable_lamp_program: bool,
+) -> (
+    [u8; 4],
+    LifecycleRenderEvidence,
+    Vec<LifecycleRenderFallbackEntry>,
+) {
+    let mut harness = GlesEffectTestHarness::new(320, 200);
+    harness.install_texture_backed_output();
+
+    // Retained identities are keyed by SceneNodeId, derived from WindowId in
+    // this fixture. The lower painter therefore has the larger identity key.
+    let lower_window = compositor::WindowId::from_raw(902).expect("lower test window");
+    let upper_window = compositor::WindowId::from_raw(901).expect("upper test window");
+    let identities = test_lifecycle_identities_for_windows(&[lower_window, upper_window]);
+    let source_rect = PresentationRect::new(40.0, 40.0, 240.0, 120.0).expect("source rect");
+    let anchor = PresentationRect::new(140.0, 80.0, 40.0, 40.0).expect("anchor rect");
+    let visual_group =
+        LifecycleVisualGroup::from_bounds(source_rect, source_rect, source_rect, anchor, 320, 200)
+            .expect("valid overlapping visual group");
+    let mut samples = Vec::new();
+    for (index, (window_id, effect)) in [(lower_window, lower_effect), (upper_window, upper_effect)]
+        .into_iter()
+        .enumerate()
+    {
+        let identity = identities[index];
+        let payload_id =
+            compositor::PresentationRetainedVisualPayloadId::from_origin_identity(identity);
+        let mut sample = lamp_test_sample(0.0).samples[0].clone();
+        sample.window_id = window_id;
+        sample.root_surface_id =
+            u32::try_from(window_id.get()).expect("test surface id fits compositor surface id");
+        sample.presentation_identity = identity;
+        sample.payload_id = payload_id;
+        sample.painter_order = LifecyclePainterOrder {
+            scene_band: 2,
+            layer_rank: 2,
+            stack_position: if window_id == lower_window { 0 } else { 1 },
+            stable_order: u64::from(window_id.get()),
+        };
+        sample.visual_group = visual_group;
+        sample.effect = effect;
+        sample.visual_source.window_id = window_id;
+        sample.visual_source.root_surface_id = sample.root_surface_id;
+        sample.visual_source.presentation_identity = identity;
+        sample.visual_source.payload_id = payload_id;
+        samples.push(sample);
+    }
+    samples.sort_by_key(|sample| sample.presentation_identity);
+    let lifecycle = LifecycleSceneSample {
+        sampled_at: AnimationTime::from_nanos(1),
+        samples,
+    };
+    harness.renderer.lifecycle.begin_frame(&lifecycle);
+    if disable_lamp_program {
+        harness.renderer.lifecycle.lamp.program = None;
+    }
+
+    for sample in &lifecycle.samples {
+        if omit_lower_texture && sample.window_id == lower_window {
+            continue;
+        }
+        let color = if sample.window_id == upper_window {
+            [0, 0, 255, 255]
+        } else {
+            [255, 0, 0, 255]
+        };
+        let texture = harness
+            .renderer
+            .effect_runtime
+            .effect_resources
+            .acquire(&harness.gl, lifecycle_transfer_test_texture_key(240, 120))
+            .expect("overlap lifecycle texture allocates");
+        let texture_id = harness
+            .renderer
+            .effect_runtime
+            .effect_resources
+            .texture(&texture)
+            .expect("overlap lifecycle texture is available");
+        let mut pixels = Vec::with_capacity(240 * 120 * 4);
+        for _ in 0..240 * 120 {
+            pixels.extend_from_slice(&color);
+        }
+        unsafe {
+            harness.gl.bind_texture(glow::TEXTURE_2D, Some(texture_id));
+            harness.gl.tex_sub_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                0,
+                0,
+                240,
+                120,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelUnpackData::Slice(Some(&pixels)),
+            );
+            harness.gl.bind_texture(glow::TEXTURE_2D, None);
+        }
+        harness
+            .renderer
+            .lifecycle
+            .visual_store
+            .resolved_visual_resources
+            .insert(
+                sample.payload_id,
+                LifecycleResolvedVisualResource {
+                    texture,
+                    source_signature: 0,
+                },
+            );
+    }
+    harness.renderer.lifecycle.rebuild_lamp_commands(
+        &lifecycle,
+        &[],
+        &[],
+        1.0,
+        (320, 200),
+        OutputFramebufferOrigin::BottomLeft,
+    );
+    harness.renderer.lifecycle.rebuild_squash_commands(
+        &lifecycle,
+        &[],
+        &[],
+        1.0,
+        (320, 200),
+        OutputFramebufferOrigin::BottomLeft,
+    );
+
+    let plan = RepaintPlan {
+        render_damage: OutputDamage::Full,
+        repair_damage: OutputDamage::Full,
+        buffer_age: None,
+        mode: RepaintMode::Full,
+        fallback_reason: Some(FullRepaintReason::CurrentDamageFull),
+        complexity_policy: PartialRepaintComplexityPolicy::Legacy,
+        complexity_action: PartialRepaintComplexityAction::NotApplicable,
+    };
+    let repairs = [
+        OutputRect {
+            x: 0,
+            y: 0,
+            width: 200,
+            height: 200,
+        },
+        OutputRect {
+            x: 120,
+            y: 0,
+            width: 200,
+            height: 200,
+        },
+    ];
+    {
+        let renderer = &mut harness.renderer;
+        let mut context = LifecycleRenderContext::new(
+            &harness.gl,
+            &mut renderer.scene_state,
+            &mut renderer.effect_runtime,
+            renderer.resources.texture_view(),
+        );
+        renderer
+            .lifecycle
+            .draw_overlays(
+                &mut context,
+                &repairs,
+                OutputFramebufferOrigin::BottomLeft,
+                &plan,
+            )
+            .expect("ordered lifecycle overlap draws");
+    }
+
+    let mut pixel = [0_u8; 4];
+    unsafe {
+        harness.gl.bind_framebuffer(
+            glow::FRAMEBUFFER,
+            harness.renderer.scene_state.active_output_framebuffer,
+        );
+        harness.gl.read_pixels(
+            160,
+            100,
+            1,
+            1,
+            glow::RGBA,
+            glow::UNSIGNED_BYTE,
+            glow::PixelPackData::Slice(Some(&mut pixel)),
+        );
+    }
+    (
+        pixel,
+        harness.renderer.lifecycle.evidence(),
+        harness.renderer.lifecycle.fallbacks().failed.clone(),
+    )
 }
 
 fn assert_lamp_textures_have_filter(
@@ -468,20 +671,145 @@ fn lamp_grid_admission_is_atomic_when_the_minimum_grid_does_not_fit() {
 
 #[test]
 fn legacy_scissored_lifecycle_phases_prepare_once_after_all_repairs() {
+    let phases = legacy_scene_scissored_phase_plan(2).collect::<Vec<_>>();
     assert_eq!(
-        legacy_scene_scissored_phase_plan(2).collect::<Vec<_>>(),
+        phases,
         vec![
             LegacySceneScissoredPhase::BaseRepair(0),
             LegacySceneScissoredPhase::BaseRepair(1),
             LegacySceneScissoredPhase::PrepareLifecycleSources,
             LegacySceneScissoredPhase::RestoreRepairScissor(0),
-            LegacySceneScissoredPhase::Lamp(0),
-            LegacySceneScissoredPhase::Squash(0),
+            LegacySceneScissoredPhase::LifecycleOverlay(0),
             LegacySceneScissoredPhase::ExternalOverlays(0),
             LegacySceneScissoredPhase::RestoreRepairScissor(1),
-            LegacySceneScissoredPhase::Lamp(1),
-            LegacySceneScissoredPhase::Squash(1),
+            LegacySceneScissoredPhase::LifecycleOverlay(1),
             LegacySceneScissoredPhase::ExternalOverlays(1),
-        ]
+        ],
+        "legacy scissored execution prepares once and draws ordered lifecycle windows once per repair"
     );
+}
+
+#[test]
+fn gles_lifecycle_lamp_below_squash_draws_squash_on_top() {
+    assert_eq!(
+        render_lifecycle_overlap_pixel(LifecycleEffectKind::Lamp, LifecycleEffectKind::Squash),
+        [0, 0, 255, 255],
+        "the upper Squash lifecycle window owns the overlapping pixel"
+    );
+}
+
+#[test]
+fn gles_lifecycle_squash_below_lamp_draws_lamp_on_top() {
+    assert_eq!(
+        render_lifecycle_overlap_pixel(LifecycleEffectKind::Squash, LifecycleEffectKind::Lamp),
+        [0, 0, 255, 255],
+        "the upper Lamp lifecycle window owns the overlapping pixel"
+    );
+}
+
+#[test]
+fn gles_lifecycle_lamp_windows_follow_compositor_order() {
+    assert_eq!(
+        render_lifecycle_overlap_pixel(LifecycleEffectKind::Lamp, LifecycleEffectKind::Lamp),
+        [0, 0, 255, 255],
+        "Lamp draws the upper compositor window last even when retained identities conflict"
+    );
+}
+
+#[test]
+fn gles_lifecycle_squash_windows_follow_compositor_order() {
+    assert_eq!(
+        render_lifecycle_overlap_pixel(LifecycleEffectKind::Squash, LifecycleEffectKind::Squash,),
+        [0, 0, 255, 255],
+        "Squash draws the upper compositor window last even when retained identities conflict"
+    );
+}
+
+#[test]
+fn gles_lifecycle_multiple_repairs_keep_order_and_isolate_fallbacks() {
+    let (pixel, evidence, fallbacks) = render_lifecycle_overlap(
+        LifecycleEffectKind::Squash,
+        LifecycleEffectKind::Lamp,
+        true,
+        false,
+    );
+    let lower_window = compositor::WindowId::from_raw(902).expect("lower test window");
+    let upper_window = compositor::WindowId::from_raw(901).expect("upper test window");
+    let identities = test_lifecycle_identities_for_windows(&[lower_window, upper_window]);
+    let lower_identity = identities[0];
+    let upper_identity = identities[1];
+    let lower_payload =
+        compositor::PresentationRetainedVisualPayloadId::from_origin_identity(lower_identity);
+    let upper_payload =
+        compositor::PresentationRetainedVisualPayloadId::from_origin_identity(upper_identity);
+
+    assert_eq!(pixel, [0, 0, 255, 255]);
+    assert!(fallbacks.iter().any(|fallback| {
+        fallback.window_id == lower_window
+            && fallback.root_surface_id == 902
+            && fallback.presentation_identity == lower_identity
+            && fallback.payload_id == lower_payload
+            && fallback.effect == LifecycleEffectKind::Squash
+    }));
+    assert!(
+        !fallbacks
+            .iter()
+            .any(|fallback| fallback.presentation_identity == upper_identity)
+    );
+    assert_eq!(
+        evidence.consumed,
+        vec![LifecycleRenderEvidenceEntry {
+            window_id: upper_window,
+            root_surface_id: 901,
+            presentation_identity: upper_identity,
+            payload_id: upper_payload,
+        }],
+        "the higher Lamp retains its own exact render evidence"
+    );
+    assert!(!evidence.contains(lower_identity, lower_payload, 902));
+}
+
+#[test]
+fn gles_lamp_fallback_does_not_mark_the_higher_squash_owner() {
+    let (pixel, evidence, fallbacks) = render_lifecycle_overlap(
+        LifecycleEffectKind::Lamp,
+        LifecycleEffectKind::Squash,
+        false,
+        true,
+    );
+    let lower_window = compositor::WindowId::from_raw(902).expect("lower test window");
+    let upper_window = compositor::WindowId::from_raw(901).expect("upper test window");
+    let identities = test_lifecycle_identities_for_windows(&[lower_window, upper_window]);
+    let lower_identity = identities[0];
+    let upper_identity = identities[1];
+    let lower_payload =
+        compositor::PresentationRetainedVisualPayloadId::from_origin_identity(lower_identity);
+    let upper_payload =
+        compositor::PresentationRetainedVisualPayloadId::from_origin_identity(upper_identity);
+
+    assert_eq!(pixel, [0, 0, 255, 255]);
+    assert!(fallbacks.iter().any(|fallback| {
+        fallback.window_id == lower_window
+            && fallback.root_surface_id == 902
+            && fallback.presentation_identity == lower_identity
+            && fallback.payload_id == lower_payload
+            && fallback.effect == LifecycleEffectKind::Lamp
+            && fallback.reason == LifecycleRenderFallbackReason::LampProgramUnavailable
+    }));
+    assert!(
+        !fallbacks
+            .iter()
+            .any(|fallback| fallback.presentation_identity == upper_identity)
+    );
+    assert_eq!(
+        evidence.consumed,
+        vec![LifecycleRenderEvidenceEntry {
+            window_id: upper_window,
+            root_surface_id: 901,
+            presentation_identity: upper_identity,
+            payload_id: upper_payload,
+        }],
+        "the higher Squash retains its own exact render evidence"
+    );
+    assert!(!evidence.contains(lower_identity, lower_payload, 902));
 }

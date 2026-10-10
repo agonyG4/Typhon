@@ -30,6 +30,7 @@ fn lifecycle_window_sample(
         root_surface_id,
         presentation_identity,
         payload_id,
+        painter_order: Default::default(),
         visual_group,
         visual_source: LifecycleVisualSource {
             window_id,
@@ -123,6 +124,39 @@ fn ssd_test_state(surface_id: u32) -> (CompositorState, WindowId) {
     (state, window_id)
 }
 
+fn append_ssd_test_window(state: &mut CompositorState, surface_id: u32) -> WindowId {
+    let window_id = state.allocate_window_id().expect("test window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_xdg(window_id, surface_id))
+        .expect("test XDG window");
+    state.append_renderable_surface(ssd_test_surface(surface_id));
+    state.surface_presentation_generations.insert(surface_id, 1);
+    state.rebuild_active_scene_view();
+    window_id
+}
+
+fn start_test_lifecycle(
+    state: &mut CompositorState,
+    window_id: WindowId,
+    root_surface_id: u32,
+    effect: LifecycleEffectKind,
+) {
+    let group = visual_group(rect(384.0, 60.0, 832.0, 640.0));
+    let mut request = lifecycle_request_with_group(
+        &mut state.presentation_animator,
+        &mut state.retained_lifecycle_payloads,
+        window_id,
+        root_surface_id,
+        group,
+        LifecycleDirection::Minimize,
+    );
+    request.effect = effect;
+    state
+        .window_lifecycle_animator
+        .start_or_reverse(request, None, AnimationTime::from_nanos(0), 1.0)
+        .expect("test lifecycle animation starts");
+}
+
 fn lifecycle_decoration_signature(
     state: &CompositorState,
     root_surface_id: u32,
@@ -177,6 +211,218 @@ fn active_lifecycle_identity(
             PresentationRetainedVisualKind::WindowLifecycle,
         )
         .expect("active Presentation lifecycle owner")
+}
+
+fn painter_ordered_windows(sample: &LifecycleSceneSample) -> Vec<WindowId> {
+    let mut windows = sample
+        .samples
+        .iter()
+        .map(|sample| (sample.painter_order, sample.window_id))
+        .collect::<Vec<_>>();
+    windows.sort_by_key(|(painter_order, _)| *painter_order);
+    windows
+        .into_iter()
+        .map(|(_, window_id)| window_id)
+        .collect()
+}
+
+#[test]
+fn lifecycle_scene_sample_orders_lamp_windows_by_compositor_stack() {
+    let (mut state, lower_identity_window) = ssd_test_state(590);
+    let higher_identity_window = append_ssd_test_window(&mut state, 591);
+    start_test_lifecycle(
+        &mut state,
+        lower_identity_window,
+        590,
+        LifecycleEffectKind::Lamp,
+    );
+    start_test_lifecycle(
+        &mut state,
+        higher_identity_window,
+        591,
+        LifecycleEffectKind::Lamp,
+    );
+    state.window_stacking = vec![higher_identity_window, lower_identity_window];
+
+    let sample = state.lifecycle_scene_sample_at(AnimationTime::from_nanos(0));
+
+    assert_eq!(
+        painter_ordered_windows(&sample),
+        vec![higher_identity_window, lower_identity_window],
+        "Lamp lifecycle windows use compositor stack order instead of retained identity order"
+    );
+}
+
+#[test]
+fn lifecycle_scene_sample_orders_squash_windows_by_compositor_stack() {
+    let (mut state, lower_identity_window) = ssd_test_state(592);
+    let higher_identity_window = append_ssd_test_window(&mut state, 593);
+    start_test_lifecycle(
+        &mut state,
+        lower_identity_window,
+        592,
+        LifecycleEffectKind::Squash,
+    );
+    start_test_lifecycle(
+        &mut state,
+        higher_identity_window,
+        593,
+        LifecycleEffectKind::Squash,
+    );
+    state.window_stacking = vec![higher_identity_window, lower_identity_window];
+
+    let sample = state.lifecycle_scene_sample_at(AnimationTime::from_nanos(0));
+
+    assert_eq!(
+        painter_ordered_windows(&sample),
+        vec![higher_identity_window, lower_identity_window],
+        "Squash lifecycle windows use compositor stack order instead of retained identity order"
+    );
+}
+
+#[test]
+fn lifecycle_scene_sample_reorders_active_payloads_without_replacing_them() {
+    let (mut state, first_window) = ssd_test_state(594);
+    let second_window = append_ssd_test_window(&mut state, 595);
+    start_test_lifecycle(&mut state, first_window, 594, LifecycleEffectKind::Lamp);
+    start_test_lifecycle(&mut state, second_window, 595, LifecycleEffectKind::Squash);
+
+    let before = state.lifecycle_scene_sample_at(AnimationTime::from_nanos(0));
+    assert_eq!(
+        painter_ordered_windows(&before),
+        vec![first_window, second_window],
+        "initial painter metadata follows the current stack"
+    );
+    let retained_before = before
+        .samples
+        .iter()
+        .map(|sample| {
+            (
+                sample.window_id,
+                sample.presentation_identity,
+                sample.payload_id,
+                sample.painter_order,
+                std::sync::Arc::clone(
+                    state
+                        .retained_lifecycle_payloads
+                        .get_exact(sample.presentation_identity)
+                        .expect("active lifecycle payload"),
+                ),
+            )
+        })
+        .collect::<Vec<_>>();
+    state.window_stacking = vec![second_window, first_window];
+
+    let after = state.lifecycle_scene_sample_at(AnimationTime::from_nanos(1));
+
+    assert_eq!(
+        painter_ordered_windows(&after),
+        vec![second_window, first_window],
+        "the next sample reflects the current stack while both animations remain active"
+    );
+    for (window_id, identity, payload_id, painter_order, payload) in retained_before {
+        let reordered = after
+            .samples
+            .iter()
+            .find(|sample| sample.window_id == window_id)
+            .expect("active lifecycle sample remains present");
+        assert_eq!(reordered.presentation_identity, identity);
+        assert_eq!(reordered.payload_id, payload_id);
+        assert_ne!(reordered.painter_order, painter_order);
+        assert!(std::sync::Arc::ptr_eq(
+            &payload,
+            state
+                .retained_lifecycle_payloads
+                .get_exact(identity)
+                .expect("same active payload remains retained")
+        ));
+    }
+}
+
+#[test]
+fn lifecycle_scene_sample_uses_scene_band_and_layer_rank_before_stack_position() {
+    let (mut state, overlay_window) = ssd_test_state(596);
+    let tiled_window = append_ssd_test_window(&mut state, 597);
+    let regular_workspace = crate::wm::WorkspaceId::new(1).expect("test workspace id");
+    {
+        let overlay = state
+            .desktop_windows
+            .get_mut(&overlay_window)
+            .expect("overlay window");
+        overlay.stack_layer = DesktopStackLayer::Popup;
+        overlay.management = Some(crate::wm::WindowManagementState::new(
+            crate::wm::WorkspaceLocation::Regular(regular_workspace),
+        ));
+        let tiled = state
+            .desktop_windows
+            .get_mut(&tiled_window)
+            .expect("tiled window");
+        tiled.stack_layer = DesktopStackLayer::Normal;
+        tiled.management = Some(
+            crate::wm::WindowManagementState::new(crate::wm::WorkspaceLocation::Regular(
+                regular_workspace,
+            ))
+            .with_layout(crate::wm::LayoutMembership::Tiled),
+        );
+    }
+    start_test_lifecycle(&mut state, overlay_window, 596, LifecycleEffectKind::Lamp);
+    start_test_lifecycle(&mut state, tiled_window, 597, LifecycleEffectKind::Lamp);
+    state.window_stacking = vec![overlay_window, tiled_window];
+
+    let sample = state.lifecycle_scene_sample_at(AnimationTime::from_nanos(0));
+    let mut expected_windows = sample
+        .samples
+        .iter()
+        .map(|sample| {
+            let stable_order = sample.window_id.get() as usize;
+            let (scene_band, layer_rank, stack_position, stable_order) =
+                state.renderable_root_stack_key(sample.root_surface_id, stable_order);
+            assert_eq!(
+                sample.painter_order,
+                crate::window_lifecycle_animation::LifecyclePainterOrder {
+                    scene_band,
+                    layer_rank,
+                    stack_position,
+                    stable_order: stable_order as u64,
+                },
+                "lifecycle metadata is derived from the canonical scene key"
+            );
+            (sample.painter_order, sample.window_id)
+        })
+        .collect::<Vec<_>>();
+    expected_windows.sort_by_key(|(key, _)| *key);
+
+    assert_eq!(
+        painter_ordered_windows(&sample),
+        expected_windows
+            .into_iter()
+            .map(|(_, window_id)| window_id)
+            .collect::<Vec<_>>(),
+        "lifecycle ordering uses the same full scene/layer/stack key as canonical surfaces"
+    );
+    let popup = sample
+        .samples
+        .iter()
+        .find(|sample| sample.window_id == overlay_window)
+        .expect("popup sample");
+    let tiled = sample
+        .samples
+        .iter()
+        .find(|sample| sample.window_id == tiled_window)
+        .expect("tiled sample");
+    assert_ne!(
+        popup.painter_order.scene_band,
+        tiled.painter_order.scene_band
+    );
+    assert_ne!(
+        popup.painter_order.layer_rank,
+        tiled.painter_order.layer_rank
+    );
+    assert_eq!(
+        painter_ordered_windows(&sample),
+        vec![tiled_window, overlay_window],
+        "the lower scene band and layer rank precede stack position"
+    );
 }
 
 #[test]

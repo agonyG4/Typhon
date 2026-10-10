@@ -24,11 +24,11 @@ use oblivion_one::{
     },
     cursor_theme::CompositorCursorImage,
     window_lifecycle_animation::{
-        LifecycleEffectKind, LifecycleFrameSample, LifecycleFrameSnapshot, LifecycleRenderEvidence,
-        LifecycleRenderEvidenceEntry, LifecycleRenderFallbackEntry, LifecycleRenderFallbackReason,
-        LifecycleRenderFallbacks, LifecycleSceneSample, LifecycleVisualSource,
-        LifecycleVisualSourceKind, lamp_motion_channels, lifecycle_visual_transition_bounds,
-        visible_lifecycle_samples,
+        LifecycleEffectKind, LifecycleFrameSample, LifecycleFrameSnapshot, LifecyclePainterOrder,
+        LifecycleRenderEvidence, LifecycleRenderEvidenceEntry, LifecycleRenderFallbackEntry,
+        LifecycleRenderFallbackReason, LifecycleRenderFallbacks, LifecycleSceneSample,
+        LifecycleVisualSource, LifecycleVisualSourceKind, lamp_motion_channels,
+        lifecycle_visual_transition_bounds, visible_lifecycle_samples,
     },
 };
 
