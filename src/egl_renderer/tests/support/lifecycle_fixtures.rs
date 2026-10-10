@@ -25,6 +25,7 @@ pub(in crate::egl_renderer::tests) fn lamp_test_sample(progress: f64) -> Lifecyc
                 root_surface_id: 1,
                 presentation_identity,
                 payload_id,
+                resource_payload_id: payload_id,
                 kind: LifecycleVisualSourceKind::NoOwnedEffects,
                 effect_scene: Arc::new(compositor::ResolvedEffectScene::default()),
                 render_layout: None,
@@ -35,6 +36,7 @@ pub(in crate::egl_renderer::tests) fn lamp_test_sample(progress: f64) -> Lifecyc
             direction: LifecycleDirection::Minimize,
             mathematically_settled: false,
         }],
+        minimized_visual_resource_payload_ids: Vec::new(),
     }
 }
 
@@ -107,6 +109,7 @@ pub(in crate::egl_renderer::tests) fn lifecycle_effect_sample(
                 root_surface_id,
                 presentation_identity,
                 payload_id,
+                resource_payload_id: payload_id,
                 kind: LifecycleVisualSourceKind::ResolvedOwnedEffects,
                 effect_scene: Arc::new(effect_scene),
                 render_layout: None,
@@ -117,6 +120,7 @@ pub(in crate::egl_renderer::tests) fn lifecycle_effect_sample(
             direction,
             mathematically_settled: false,
         }],
+        minimized_visual_resource_payload_ids: Vec::new(),
     }
 }
 

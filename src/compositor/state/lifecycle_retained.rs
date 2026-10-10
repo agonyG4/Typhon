@@ -93,6 +93,7 @@ impl PresentationRetainedVisualPayloadId {
 #[derive(Debug, Clone)]
 pub(crate) struct RetainedLifecyclePayload {
     pub(crate) payload_id: PresentationRetainedVisualPayloadId,
+    pub(crate) resource_payload_id: PresentationRetainedVisualPayloadId,
     pub(crate) window_id: WindowId,
     pub(crate) root_surface_id: u32,
     pub(crate) visual_group: LifecycleVisualGroup,
@@ -105,6 +106,7 @@ pub(crate) struct RetainedLifecyclePayload {
 pub(crate) struct RetainedLifecycleRenderSource {
     pub(crate) surface_presentation: RetainedSurfacePresentationSnapshot,
     pub(crate) render_layout: Arc<FrozenLifecycleRenderLayout>,
+    pub(crate) resource_payload_id: Option<PresentationRetainedVisualPayloadId>,
 }
 
 impl RetainedLifecycleRenderSource {
@@ -115,6 +117,23 @@ impl RetainedLifecycleRenderSource {
         Self {
             surface_presentation,
             render_layout,
+            resource_payload_id: None,
+        }
+    }
+
+    pub(crate) fn with_resource_payload_id(
+        mut self,
+        resource_payload_id: PresentationRetainedVisualPayloadId,
+    ) -> Self {
+        self.resource_payload_id = Some(resource_payload_id);
+        self
+    }
+
+    pub(crate) fn empty() -> Self {
+        Self {
+            surface_presentation: RetainedSurfacePresentationSnapshot::empty(),
+            render_layout: Arc::new(FrozenLifecycleRenderLayout::default()),
+            resource_payload_id: None,
         }
     }
 }
@@ -134,8 +153,12 @@ impl RetainedLifecyclePayload {
         {
             return None;
         }
+        let resource_payload_id = render_source.resource_payload_id.unwrap_or_else(|| {
+            PresentationRetainedVisualPayloadId::from_origin_identity(origin_identity)
+        });
         Some(Arc::new(Self {
             payload_id: PresentationRetainedVisualPayloadId::from_origin_identity(origin_identity),
+            resource_payload_id,
             window_id,
             root_surface_id,
             visual_group,

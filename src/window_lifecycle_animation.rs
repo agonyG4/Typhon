@@ -263,6 +263,68 @@ impl LifecycleVisualGroup {
         }
     }
 
+    pub fn from_resolved_effect_bounds_with_source_visual_rect(
+        effect: LifecycleEffectKind,
+        canonical_client_rect: PresentationRect,
+        canonical_visual_rect: PresentationRect,
+        presented_source_client_rect: PresentationRect,
+        presented_source_visual_rect: PresentationRect,
+        target: ResolvedLifecycleTarget,
+        output_size: (u32, u32),
+    ) -> Option<Self> {
+        let (output_width, output_height) = output_size;
+        if !valid_lamp_rects(
+            canonical_client_rect,
+            canonical_visual_rect,
+            presented_source_client_rect,
+        ) || !valid_rect(presented_source_visual_rect)
+            || !valid_rect(target.rect)
+        {
+            return None;
+        }
+        let mut group = Self::from_resolved_effect_bounds(
+            effect,
+            canonical_client_rect,
+            canonical_visual_rect,
+            presented_source_client_rect,
+            target,
+            output_width,
+            output_height,
+        )?;
+        group.presented_source_visual_rect = presented_source_visual_rect;
+        group.lamp_direction = infer_lamp_direction(
+            presented_source_visual_rect,
+            target.rect,
+            output_width,
+            output_height,
+        );
+        if effect == LifecycleEffectKind::Lamp {
+            group.portal_rect = lamp_portal_rect(
+                presented_source_visual_rect,
+                target.rect,
+                group.lamp_direction,
+            )?;
+            group.sink_rect = lamp_sink_rect(
+                target.rect,
+                group.portal_rect,
+                group.lamp_direction,
+                ASTREA_LAMP_ABSORB_DEPTH,
+                ASTREA_LAMP_SINK_THICKNESS,
+            )?;
+            group.shape_factor = lamp_shape_factor(
+                presented_source_visual_rect,
+                target.rect,
+                group.lamp_direction,
+            );
+            group.bump_distance = lamp_bump_distance(
+                presented_source_visual_rect,
+                target.rect,
+                group.lamp_direction,
+            );
+        }
+        Some(group)
+    }
+
     fn from_squash_bounds(
         canonical_client_rect: PresentationRect,
         canonical_visual_rect: PresentationRect,
@@ -389,6 +451,9 @@ pub struct LifecycleVisualSource {
     pub root_surface_id: u32,
     pub presentation_identity: PresentationRetainedVisualIdentity,
     pub payload_id: PresentationRetainedVisualPayloadId,
+    /// Renderer-owned texture identity. This may refer to an earlier settled
+    /// minimize payload when a fresh restore reuses its compositor snapshot.
+    pub resource_payload_id: PresentationRetainedVisualPayloadId,
     pub kind: LifecycleVisualSourceKind,
     pub effect_scene: Arc<ResolvedEffectScene>,
     pub render_layout: Option<Arc<crate::compositor::FrozenLifecycleRenderLayout>>,
@@ -444,6 +509,8 @@ pub struct LifecycleWindowSample {
 pub struct LifecycleSceneSample {
     pub sampled_at: AnimationTime,
     pub samples: Vec<LifecycleWindowSample>,
+    /// Resolved visual resources owned by windows that remain minimized.
+    pub minimized_visual_resource_payload_ids: Vec<PresentationRetainedVisualPayloadId>,
 }
 
 impl LifecycleSceneSample {
@@ -609,6 +676,7 @@ impl LifecycleRenderEvidence {
 pub enum LifecycleRenderFallbackReason {
     ResolvedSourceAllocation,
     ResolvedSourceCapture,
+    MinimizedSnapshotUnavailable,
     LampProgramUnavailable,
     LifecycleResourceUnavailable,
     MeshBudget,

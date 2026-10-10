@@ -713,6 +713,9 @@ fn restore_filters_canonical_surfaces_from_the_frame_lifecycle_sample() {
                 root_surface_id,
                 presentation_identity: identity,
                 payload_id: PresentationRetainedVisualPayloadId::from_origin_identity(identity),
+                resource_payload_id: PresentationRetainedVisualPayloadId::from_origin_identity(
+                    identity,
+                ),
                 kind: LifecycleVisualSourceKind::NoOwnedEffects,
                 effect_scene: std::sync::Arc::new(ResolvedEffectScene::default()),
                 render_layout: None,
@@ -723,6 +726,7 @@ fn restore_filters_canonical_surfaces_from_the_frame_lifecycle_sample() {
             direction: LifecycleDirection::Restore,
             mathematically_settled: true,
         }],
+        minimized_visual_resource_payload_ids: Vec::new(),
     };
     let resolved = ResolvedNativeFrameScene::from_server_at_with_lifecycle(
         &server,
@@ -914,6 +918,7 @@ fn snapshot_ref_preserves_constructor_popup_ids_and_order() {
             lifecycle: LifecycleSceneSample {
                 sampled_at: AnimationTime::from_nanos(0),
                 samples: Vec::new(),
+                minimized_visual_resource_payload_ids: Vec::new(),
             },
             lifecycle_surfaces: Vec::new(),
             lifecycle_decorations: Vec::new(),

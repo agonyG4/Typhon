@@ -392,6 +392,7 @@ impl<'a> ResolvedNativeFrameScene<'a> {
         let lifecycle = LifecycleSceneSample {
             sampled_at,
             samples: Vec::new(),
+            minimized_visual_resource_payload_ids: Vec::new(),
         };
 
         scene.surfaces = Cow::Owned(Vec::new());

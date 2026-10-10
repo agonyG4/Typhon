@@ -220,6 +220,7 @@ fn lifecycle_sample(
             root_surface_id,
             presentation_identity,
             payload_id,
+            resource_payload_id: payload_id,
             kind: LifecycleVisualSourceKind::NoOwnedEffects,
             effect_scene: std::sync::Arc::new(ResolvedEffectScene::default()),
             render_layout: None,
@@ -1010,6 +1011,7 @@ fn lifecycle_snapshot_signature_includes_sink_geometry() {
             1.0,
             LifecycleDirection::Minimize,
         )],
+        minimized_visual_resource_payload_ids: Vec::new(),
     };
     let mut snapshot = LifecycleFrameSnapshot::from_sample(&sample);
     let original_signature = snapshot.signature;
@@ -1048,6 +1050,7 @@ fn lifecycle_snapshot_signature_includes_payload_identity() {
             1.0,
             LifecycleDirection::Minimize,
         )],
+        minimized_visual_resource_payload_ids: Vec::new(),
     };
     let original = LifecycleFrameSnapshot::from_sample(&sample);
     let other_payload_owner = test_identity(window_id);
@@ -1816,6 +1819,7 @@ fn render_evidence_qualifies_only_consumed_transition_identities() {
                 LifecycleDirection::Minimize,
             ),
         ],
+        minimized_visual_resource_payload_ids: Vec::new(),
     };
     let evidence = LifecycleRenderEvidence::from_consumed([LifecycleRenderEvidenceEntry {
         window_id: first_window,
@@ -1858,6 +1862,7 @@ fn stale_render_evidence_does_not_qualify_a_reversed_identity() {
             lamp_opacity(0.43),
             LifecycleDirection::Restore,
         )],
+        minimized_visual_resource_payload_ids: Vec::new(),
     };
     assert_eq!(current_identity.scene_node_id(), scene_node_id);
     let old_evidence = LifecycleRenderEvidence::from_consumed([LifecycleRenderEvidenceEntry {
@@ -1903,6 +1908,7 @@ fn render_evidence_with_wrong_payload_does_not_qualify_exact_owner() {
             lamp_opacity(0.43),
             LifecycleDirection::Restore,
         )],
+        minimized_visual_resource_payload_ids: Vec::new(),
     };
     let wrong_payload = PresentationRetainedVisualPayloadId::from_origin_identity(
         retained_identity(703, 904, 1004),

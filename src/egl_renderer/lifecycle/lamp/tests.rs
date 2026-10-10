@@ -206,6 +206,7 @@ fn render_lifecycle_overlap(
     let lifecycle = LifecycleSceneSample {
         sampled_at: AnimationTime::from_nanos(1),
         samples,
+        minimized_visual_resource_payload_ids: Vec::new(),
     };
     harness.renderer.lifecycle.begin_frame(&lifecycle);
     if disable_lamp_program {

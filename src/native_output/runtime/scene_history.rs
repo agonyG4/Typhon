@@ -593,6 +593,9 @@ mod tests {
                     payload_id: oblivion_one::compositor::PresentationRetainedVisualPayloadId::from_origin_identity(
                         presentation_identity,
                     ),
+                    resource_payload_id: oblivion_one::compositor::PresentationRetainedVisualPayloadId::from_origin_identity(
+                        presentation_identity,
+                    ),
                     kind: LifecycleVisualSourceKind::NoOwnedEffects,
                     effect_scene: std::sync::Arc::new(ResolvedEffectScene::default()),
                     render_layout: None,
@@ -603,6 +606,7 @@ mod tests {
                 mathematically_settled: progress >= 1.0,
                 direction: LifecycleDirection::Minimize,
             }],
+            minimized_visual_resource_payload_ids: Vec::new(),
         })
     }
 
@@ -671,6 +675,9 @@ mod tests {
                     payload_id: oblivion_one::compositor::PresentationRetainedVisualPayloadId::from_origin_identity(
                         presentation_identity,
                     ),
+                    resource_payload_id: oblivion_one::compositor::PresentationRetainedVisualPayloadId::from_origin_identity(
+                        presentation_identity,
+                    ),
                     kind: LifecycleVisualSourceKind::NoOwnedEffects,
                     effect_scene: std::sync::Arc::new(ResolvedEffectScene::default()),
                     render_layout: None,
@@ -681,6 +688,7 @@ mod tests {
                 mathematically_settled: false,
                 direction: LifecycleDirection::Minimize,
             }],
+            minimized_visual_resource_payload_ids: Vec::new(),
         });
 
         let damage = lifecycle_damage_rects(&snapshot, 1920, 1080);

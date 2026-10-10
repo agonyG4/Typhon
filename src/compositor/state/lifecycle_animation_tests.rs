@@ -37,6 +37,7 @@ fn lifecycle_window_sample(
             root_surface_id,
             presentation_identity,
             payload_id,
+            resource_payload_id: payload_id,
             kind: LifecycleVisualSourceKind::NoOwnedEffects,
             effect_scene: std::sync::Arc::new(ResolvedEffectScene::default()),
             render_layout: None,
@@ -1770,6 +1771,131 @@ fn settled_minimize_restores_to_its_remembered_target_after_pointer_moves() {
 }
 
 #[test]
+fn settled_minimize_promotes_snapshot_and_restore_reuses_resolved_source() {
+    let (mut state, window_id) = ssd_test_state(340);
+    state.lifecycle_squash_renderer_available = Some(true);
+    let directory = std::env::temp_dir().join(format!(
+        "typhon-minimized-visual-snapshot-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos()
+    ));
+    std::fs::create_dir(&directory).expect("create animation configuration directory");
+    state.animation_control = crate::animation_control::AnimationControlState::from_store(
+        crate::animation_control::AnimationConfigurationStore::new(directory.clone())
+            .expect("create animation configuration store"),
+    );
+    let mut candidate = state.animation_control.configuration().clone();
+    candidate.overrides.insert(
+        AnimationSlot::WindowMinimize,
+        AnimationEffect::MinimizeSquash,
+    );
+    candidate.overrides.insert(
+        AnimationSlot::WindowRestore,
+        AnimationEffect::MinimizeSquash,
+    );
+    state
+        .set_animation_configuration(candidate)
+        .expect("persist lifecycle effects");
+    assert!(state.minimize_desktop_window(window_id));
+    let scene_node_id = state
+        .scene_node_id_for_window_group(window_id)
+        .expect("window lifecycle scene node");
+    let minimize_identity = active_lifecycle_identity(&state, scene_node_id);
+    let minimize_payload = state
+        .retained_lifecycle_payloads
+        .get_exact(minimize_identity)
+        .expect("minimize payload remains authoritative until presentation");
+    let resource_payload_id = minimize_payload.resource_payload_id;
+    let expected_source_client_rect = minimize_payload.visual_group.presented_source_client_rect;
+    let expected_source_visual_rect = minimize_payload.visual_group.presented_source_visual_rect;
+    assert!(
+        state
+            .window(window_id)
+            .is_some_and(|window| window.state.minimized_visual_snapshot().is_none())
+    );
+
+    let settled_at = AnimationTime::monotonic_now().expect("settled minimize time");
+    assert!(
+        state
+            .window_lifecycle_animator
+            .snap_to_endpoint(minimize_identity, settled_at)
+    );
+    let settled_sample = state.lifecycle_scene_sample_at(settled_at);
+    let unconsumed_endpoint = LifecycleFrameSnapshot::qualified_from_sample(
+        &settled_sample,
+        &LifecycleRenderEvidence::default(),
+    );
+    state.publish_presented_lifecycle(1, &unconsumed_endpoint);
+    assert!(
+        state
+            .window(window_id)
+            .is_some_and(|window| window.state.minimized_visual_snapshot().is_none())
+    );
+    assert_eq!(state.window_lifecycle_animator.active_count(), 1);
+
+    let settled = settled_sample
+        .samples
+        .first()
+        .expect("minimize endpoint sample");
+    let evidence = LifecycleRenderEvidence::from_consumed([LifecycleRenderEvidenceEntry {
+        window_id: settled.window_id,
+        root_surface_id: settled.root_surface_id,
+        presentation_identity: settled.presentation_identity,
+        payload_id: settled.payload_id,
+    }]);
+    let physically_presented =
+        LifecycleFrameSnapshot::qualified_from_sample(&settled_sample, &evidence);
+    state.publish_presented_lifecycle(2, &physically_presented);
+
+    let snapshot = state
+        .window(window_id)
+        .and_then(|window| window.state.minimized_visual_snapshot())
+        .expect("physically presented settled minimize promotes its visual");
+    assert_eq!(snapshot.resource_payload_id, resource_payload_id);
+    assert_eq!(snapshot.source_client_rect, expected_source_client_rect);
+    assert_eq!(snapshot.source_visual_rect, expected_source_visual_rect);
+    assert!(
+        state
+            .retained_lifecycle_payloads
+            .get_exact(minimize_identity)
+            .is_none()
+    );
+
+    assert!(state.restore_minimized_desktop_window(window_id));
+    let restore_identity = active_lifecycle_identity(&state, scene_node_id);
+    let restore_sample = state
+        .lifecycle_scene_sample_at(AnimationTime::monotonic_now().expect("restore sample time"));
+    let restore = restore_sample
+        .samples
+        .iter()
+        .find(|sample| sample.window_id == window_id)
+        .expect("fresh restore lifecycle starts");
+    assert_ne!(restore.payload_id, resource_payload_id);
+    assert_eq!(
+        restore.visual_source.resource_payload_id,
+        resource_payload_id
+    );
+    assert_eq!(
+        restore.visual_group.presented_source_client_rect,
+        expected_source_client_rect
+    );
+    assert_eq!(
+        restore.visual_group.presented_source_visual_rect,
+        expected_source_visual_rect
+    );
+    let entry = state
+        .retained_lifecycle_payloads
+        .get_entry_exact(restore_identity)
+        .expect("restore payload is retained");
+    assert!(entry.pre_capture.is_none());
+    assert!(entry.payload.surface_presentation.nodes.is_empty());
+    let _ = std::fs::remove_dir_all(directory);
+}
+
+#[test]
 fn old_visible_physical_lamp_prevents_no_visual_settlement() {
     let window_id = WindowId::from_raw(303).expect("valid window ID");
     let mut state = CompositorState {
@@ -1817,6 +1943,7 @@ fn old_visible_physical_lamp_prevents_no_visual_settlement() {
             1.0,
             LifecycleDirection::Minimize,
         )],
+        minimized_visual_resource_payload_ids: Vec::new(),
     };
     state
         .presented_lifecycle_physical
@@ -1887,6 +2014,7 @@ fn lifecycle_render_fallback_preserves_confirmed_physical_lamp_until_replacement
             1.0,
             LifecycleDirection::Minimize,
         )],
+        minimized_visual_resource_payload_ids: Vec::new(),
     };
     state.publish_presented_lifecycle(1, &LifecycleFrameSnapshot::from_sample(&physical));
     let confirmed = state
@@ -2040,6 +2168,7 @@ fn canonical_presentation_replaces_old_physical_lamp_after_logical_cancel() {
             1.0,
             LifecycleDirection::Minimize,
         )],
+        minimized_visual_resource_payload_ids: Vec::new(),
     };
     state
         .presented_lifecycle_physical

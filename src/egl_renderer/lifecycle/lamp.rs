@@ -500,7 +500,7 @@ impl LampRenderState {
                 frame,
                 lamp,
                 LampGridSpec {
-                    layer: EglDrawLayer::LifecycleResolvedVisual(source.payload_id),
+                    layer: EglDrawLayer::LifecycleResolvedVisual(source.resource_payload_id),
                     presentation_identity: lamp.presentation_identity,
                     bounds: EglRect::new(
                         (lamp.visual_group.canonical_visual_rect.x() * output_scale) as f32,
@@ -649,7 +649,7 @@ impl LampRenderState {
                     || source.payload_id != sample.payload_id
                     || !lifecycle_draw_layer_matches_payload(
                         command.layer,
-                        sample.payload_id,
+                        source.resource_payload_id,
                         source.kind,
                     )
                 {

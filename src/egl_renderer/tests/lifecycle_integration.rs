@@ -323,6 +323,14 @@ fn draw_scene_reconciles_canonical_and_empty_lifecycle_decoration_resources_toge
                     1,
                 ),
             ),
+        resource_payload_id:
+            oblivion_one::compositor::PresentationRetainedVisualPayloadId::from_origin_identity(
+                test_lifecycle_identity(
+                    oblivion_one::compositor::WindowId::from_raw(1)
+                        .expect("valid lifecycle window ID"),
+                    1,
+                ),
+            ),
         kind: LifecycleVisualSourceKind::ResolvedOwnedEffects,
         effect_scene: std::sync::Arc::new(oblivion_one::compositor::ResolvedEffectScene::default()),
         render_layout: None,

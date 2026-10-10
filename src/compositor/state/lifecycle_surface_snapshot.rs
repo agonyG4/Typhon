@@ -39,6 +39,17 @@ pub(crate) enum LifecycleSurfaceCaptureFailure {
 }
 
 impl RetainedSurfacePresentationSnapshot {
+    pub(crate) fn empty() -> Self {
+        Self {
+            #[cfg(test)]
+            root_key: SurfacePresentationKey {
+                surface_id: 0,
+                generation: 0,
+            },
+            nodes: Vec::new(),
+        }
+    }
+
     pub(crate) fn matches_render_layout(
         &self,
         layout: &crate::compositor::FrozenLifecycleRenderLayout,

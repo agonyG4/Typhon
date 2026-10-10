@@ -222,7 +222,7 @@ impl SquashRenderState {
             push_draw_command(
                 &mut vertices,
                 &mut commands,
-                EglDrawLayer::LifecycleResolvedVisual(sample.payload_id),
+                EglDrawLayer::LifecycleResolvedVisual(sample.visual_source.resource_payload_id),
                 EglRect::new(
                     target.x() as f32,
                     target.y() as f32,

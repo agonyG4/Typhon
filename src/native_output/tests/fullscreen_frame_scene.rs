@@ -87,6 +87,7 @@ fn solitary_fullscreen_snapshot_matches_the_filtered_renderer_scene() {
         lifecycle: LifecycleSceneSample {
             sampled_at: AnimationTime::from_nanos(0),
             samples: Vec::new(),
+            minimized_visual_resource_payload_ids: Vec::new(),
         },
         lifecycle_surfaces: Vec::new(),
         lifecycle_decorations: Vec::new(),
@@ -160,6 +161,7 @@ fn freezing_a_resolved_scene_shares_shm_payload_backing() {
         lifecycle: LifecycleSceneSample {
             sampled_at: AnimationTime::from_nanos(7),
             samples: Vec::new(),
+            minimized_visual_resource_payload_ids: Vec::new(),
         },
         lifecycle_surfaces: Vec::new(),
         lifecycle_decorations: Vec::new(),

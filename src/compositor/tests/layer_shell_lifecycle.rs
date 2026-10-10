@@ -155,6 +155,7 @@ fn active_lamp(anchor_rect: PresentationRect) -> LifecycleSceneSample {
                 root_surface_id: 901,
                 presentation_identity,
                 payload_id,
+                resource_payload_id: payload_id,
                 kind: LifecycleVisualSourceKind::NoOwnedEffects,
                 effect_scene: std::sync::Arc::new(crate::compositor::ResolvedEffectScene::default()),
                 render_layout: None,
@@ -165,6 +166,7 @@ fn active_lamp(anchor_rect: PresentationRect) -> LifecycleSceneSample {
             direction: LifecycleDirection::Minimize,
             mathematically_settled: false,
         }],
+        minimized_visual_resource_payload_ids: Vec::new(),
     }
 }
 
@@ -353,6 +355,7 @@ fn dock_promotion_is_lifecycle_scoped_and_keeps_true_overlays_ordered_after_it()
     let ordinary = server.external_overlay_surface_ids(&LifecycleSceneSample {
         sampled_at: AnimationTime::from_nanos(1),
         samples: Vec::new(),
+        minimized_visual_resource_payload_ids: Vec::new(),
     });
     let promoted = server.external_overlay_surface_ids(&active_lamp);
     let ordinary_root = server
@@ -418,6 +421,7 @@ fn dock_promotion_is_lifecycle_scoped_and_keeps_true_overlays_ordered_after_it()
     let settled = server.external_overlay_surface_ids(&LifecycleSceneSample {
         sampled_at: AnimationTime::from_nanos(2),
         samples: Vec::new(),
+        minimized_visual_resource_payload_ids: Vec::new(),
     });
     assert_eq!(settled, ordinary);
     assert!(!settled.contains(&matching_dock_root));

@@ -347,19 +347,52 @@ fn xwayland_precapture_transfers_the_exact_dmabuf_release_to_the_capture_frame()
     }
     assert_eq!(state.buffer_release_metrics.buffer_releases_completed, 3);
 
-    assert!(state.restore_minimized_desktop_window(window_id));
-    let reversed =
-        state.lifecycle_scene_sample_at(AnimationTime::monotonic_now().expect("restore sample"));
-    let reverse_sample = reversed.samples.first().expect("reversed lifecycle sample");
-    assert_eq!(reverse_sample.payload_id, lifecycle_sample.payload_id);
-    assert_ne!(reverse_sample.presentation_identity, identity);
+    let settled_at = AnimationTime::monotonic_now().expect("settled minimize time");
     assert!(
         state
-            .retained_lifecycle_payloads
-            .get_entry_exact(reverse_sample.presentation_identity)
-            .is_some_and(|entry| entry.pre_capture.is_none())
+            .window_lifecycle_animator
+            .snap_to_endpoint(identity, settled_at)
     );
-    assert!(state.lifecycle_renderable_surfaces(&reversed).is_empty());
+    let settled_sample = state.lifecycle_scene_sample_at(settled_at);
+    let settled = settled_sample
+        .samples
+        .first()
+        .expect("settled minimize sample");
+    let evidence = LifecycleRenderEvidence::from_consumed([LifecycleRenderEvidenceEntry {
+        window_id: settled.window_id,
+        root_surface_id: settled.root_surface_id,
+        presentation_identity: settled.presentation_identity,
+        payload_id: settled.payload_id,
+    }]);
+    let presented = LifecycleFrameSnapshot::qualified_from_sample(&settled_sample, &evidence);
+    state.publish_presented_lifecycle(392, &presented);
+    let visual_snapshot = state
+        .window(window_id)
+        .and_then(|window| window.state.minimized_visual_snapshot())
+        .expect("settled presentation promotes the compositor-owned visual");
+    assert_eq!(
+        visual_snapshot.resource_payload_id,
+        lifecycle_sample.visual_source.resource_payload_id
+    );
+    assert_eq!(state.lifecycle_precapture_dmabuf_release_count(), 0);
+    for obligation in &obligations {
+        assert!(!state.buffer_release_is_owned(obligation));
+    }
+
+    assert!(state.restore_minimized_desktop_window(window_id));
+    assert!(state.pending_xwayland_restores.contains_key(&window_id));
+    assert!(
+        state
+            .window(window_id)
+            .is_some_and(|window| window.state.is_minimized())
+    );
+    assert!(
+        state
+            .window(window_id)
+            .and_then(|window| window.state.minimized_visual_snapshot())
+            .is_some()
+    );
+    assert_eq!(state.lifecycle_precapture_dmabuf_release_count(), 0);
 }
 
 #[test]

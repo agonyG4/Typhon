@@ -86,6 +86,9 @@ fn lifecycle_fallback_reason_label(reason: LifecycleRenderFallbackReason) -> &'s
     match reason {
         LifecycleRenderFallbackReason::ResolvedSourceAllocation => "resolved_source_allocation",
         LifecycleRenderFallbackReason::ResolvedSourceCapture => "resolved_source_capture",
+        LifecycleRenderFallbackReason::MinimizedSnapshotUnavailable => {
+            "minimized_snapshot_unavailable"
+        }
         LifecycleRenderFallbackReason::LampProgramUnavailable => "lamp_program_unavailable",
         LifecycleRenderFallbackReason::LifecycleResourceUnavailable => {
             "lifecycle_resource_unavailable"
@@ -172,6 +175,7 @@ pub(super) struct LifecycleVisualStore {
     pub(super) resolved_visual_resources:
         HashMap<compositor::PresentationRetainedVisualPayloadId, LifecycleResolvedVisualResource>,
     captured_payloads: HashSet<compositor::PresentationRetainedVisualPayloadId>,
+    minimized_snapshot_payloads: HashSet<compositor::PresentationRetainedVisualPayloadId>,
     pub(super) visual_sources: HashMap<
         oblivion_one::presentation_animation::PresentationRetainedVisualIdentity,
         LifecycleVisualSource,
@@ -204,6 +208,11 @@ impl LifecycleVisualStore {
                 .map(|sample| sample.visual_source.clone())
                 .map(|source| (source.presentation_identity, source)),
         );
+        self.minimized_snapshot_payloads = snapshot
+            .minimized_visual_resource_payload_ids
+            .iter()
+            .copied()
+            .collect();
     }
 
     pub(super) fn rebuild_source_commands(
@@ -215,11 +224,10 @@ impl LifecycleVisualStore {
         output_size: (u32, u32),
         framebuffer_origin: OutputFramebufferOrigin,
     ) {
-        if !lifecycle
-            .samples
-            .iter()
-            .any(|sample| !self.source_vertices.contains_key(&sample.payload_id))
-        {
+        if !lifecycle.samples.iter().any(|sample| {
+            sample.visual_source.resource_payload_id == sample.payload_id
+                && !self.source_vertices.contains_key(&sample.payload_id)
+        }) {
             return;
         }
         let dynamic_assignments = lifecycle
@@ -234,6 +242,7 @@ impl LifecycleVisualStore {
             if source.root_surface_id != sample.root_surface_id
                 || source.payload_id != sample.payload_id
                 || source.presentation_identity != sample.presentation_identity
+                || source.resource_payload_id != source.payload_id
                 || self.source_vertices.contains_key(&source.payload_id)
             {
                 continue;
@@ -345,11 +354,17 @@ impl LifecycleVisualStore {
             .values()
             .map(|source| source.payload_id)
             .collect::<HashSet<_>>();
+        let mut live_resource_payload_ids = self
+            .visual_sources
+            .values()
+            .map(|source| source.resource_payload_id)
+            .collect::<HashSet<_>>();
+        live_resource_payload_ids.extend(self.minimized_snapshot_payloads.iter().copied());
         let stale = self
             .resolved_visual_resources
             .keys()
             .copied()
-            .filter(|payload_id| !live_payload_ids.contains(payload_id))
+            .filter(|payload_id| !live_resource_payload_ids.contains(payload_id))
             .collect::<Vec<_>>();
         for payload_id in stale {
             if let Some(resource) = self.resolved_visual_resources.remove(&payload_id) {
@@ -421,7 +436,7 @@ impl LifecycleVisualStore {
             };
             let ready = self
                 .resolved_visual_resources
-                .get(&source.payload_id)
+                .get(&source.resource_payload_id)
                 .is_some_and(|resource| {
                     context
                         .effect_runtime
@@ -436,6 +451,32 @@ impl LifecycleVisualStore {
                     lamp,
                     None,
                 );
+                continue;
+            }
+
+            if source.resource_payload_id != source.payload_id {
+                frame.record_fallback(
+                    lamp,
+                    LifecycleRenderFallbackReason::MinimizedSnapshotUnavailable,
+                );
+                let report_missing_snapshot = lifecycle_render_diagnostics_enabled()
+                    && !self
+                        .diagnostics_emitted
+                        .contains(&(source.payload_id, LifecycleRenderDiagnosticStage::Fallback));
+                self.trace_source_event(
+                    LifecycleRenderDiagnosticStage::Fallback,
+                    &source,
+                    lamp,
+                    Some(LifecycleRenderFallbackReason::MinimizedSnapshotUnavailable),
+                );
+                if report_missing_snapshot {
+                    eprintln!(
+                        "typhon.minimized_visual event=missing_resource window_id={} source_payload_id={} restore_payload_id={} reason=minimized_snapshot_unavailable",
+                        source.window_id.get(),
+                        source.resource_payload_id.get(),
+                        source.payload_id.get(),
+                    );
+                }
                 continue;
             }
 
@@ -515,7 +556,7 @@ impl LifecycleVisualStore {
                 continue;
             }
             self.resolved_visual_resources.insert(
-                source.payload_id,
+                source.resource_payload_id,
                 LifecycleResolvedVisualResource {
                     texture,
                     #[cfg(test)]

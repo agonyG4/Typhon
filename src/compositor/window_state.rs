@@ -5,6 +5,13 @@ use wayland_protocols::xdg::shell::server::xdg_toplevel;
 use super::{RenderableSurface, SurfacePlacement, XdgWindowGeometry};
 use crate::window_lifecycle_animation::ResolvedLifecycleTarget;
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct MinimizedVisualSnapshot {
+    pub(crate) resource_payload_id: crate::compositor::PresentationRetainedVisualPayloadId,
+    pub(crate) source_client_rect: crate::presentation_animation::PresentationRect,
+    pub(crate) source_visual_rect: crate::presentation_animation::PresentationRect,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct WindowState {
     mode: ToplevelMode,
@@ -12,6 +19,7 @@ pub(crate) struct WindowState {
     minimized_surfaces: Vec<RenderableSurface>,
     minimized: bool,
     minimized_lifecycle_target: Option<ResolvedLifecycleTarget>,
+    minimized_visual_snapshot: Option<MinimizedVisualSnapshot>,
 }
 
 impl WindowState {
@@ -43,6 +51,26 @@ impl WindowState {
         self.minimized = true;
         self.minimized_surfaces = surfaces;
         self.minimized_lifecycle_target = None;
+        self.minimized_visual_snapshot = None;
+    }
+
+    pub(super) fn minimized_visual_snapshot(&self) -> Option<MinimizedVisualSnapshot> {
+        self.minimized_visual_snapshot
+    }
+
+    pub(super) fn promote_minimized_visual_snapshot(
+        &mut self,
+        snapshot: MinimizedVisualSnapshot,
+    ) -> bool {
+        if !self.minimized {
+            return false;
+        }
+        self.minimized_visual_snapshot = Some(snapshot);
+        true
+    }
+
+    pub(super) fn clear_minimized_visual_snapshot(&mut self) -> Option<MinimizedVisualSnapshot> {
+        self.minimized_visual_snapshot.take()
     }
 
     pub(super) fn set_minimized_lifecycle_target(
@@ -69,6 +97,7 @@ impl WindowState {
 
     pub(super) fn mark_minimized_without_surfaces(&mut self) {
         self.minimized = true;
+        self.minimized_visual_snapshot = None;
     }
 
     pub(super) fn minimized_root_surface(&self, surface_id: u32) -> Option<&RenderableSurface> {
@@ -138,6 +167,7 @@ impl Default for WindowState {
             minimized_surfaces: Vec::new(),
             minimized: false,
             minimized_lifecycle_target: None,
+            minimized_visual_snapshot: None,
         }
     }
 }

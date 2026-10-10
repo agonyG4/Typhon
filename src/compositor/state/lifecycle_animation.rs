@@ -115,6 +115,10 @@ fn lifecycle_diagnostic_budget_available() -> bool {
 }
 
 impl CompositorState {
+    pub(in crate::compositor) fn lifecycle_diagnostics_enabled(&self) -> bool {
+        lifecycle_diagnostics_enabled()
+    }
+
     fn trace_lifecycle_render_terminal_event(
         &mut self,
         stage: crate::compositor::LifecycleRenderTerminalEvent,
@@ -586,6 +590,7 @@ impl CompositorState {
             now,
             speed,
             precapture_preparation,
+            None,
         );
         let (_identity, payload, reused_payload) = match admission {
             Ok(admission) => admission,
@@ -653,6 +658,7 @@ impl CompositorState {
             now,
             speed,
             None,
+            None,
         )
     }
 
@@ -677,6 +683,7 @@ impl CompositorState {
                 LifecycleAdmissionReason,
             >,
         >,
+        resolved_source_payload_id: Option<crate::compositor::PresentationRetainedVisualPayloadId>,
     ) -> Result<
         (
             crate::presentation_animation::PresentationRetainedVisualIdentity,
@@ -770,7 +777,9 @@ impl CompositorState {
                 target_provenance,
             ));
         }
-        let mut fresh_source_preparation = if previous_payload.is_none() {
+        let mut fresh_source_preparation = if previous_payload.is_none()
+            && resolved_source_payload_id.is_none()
+        {
             let preparation = match supplied_preparation.take() {
                 Some(Ok(preparation)) => preparation,
                 Some(Err(reason)) => {
@@ -832,6 +841,21 @@ impl CompositorState {
         let payload = if let Some(payload) = previous_payload {
             payload
         } else {
+            let resource_payload_id = resolved_source_payload_id.unwrap_or_else(|| {
+                crate::compositor::PresentationRetainedVisualPayloadId::from_origin_identity(
+                    identity,
+                )
+            });
+            let render_source = fresh_source_preparation
+                .as_ref()
+                .map(|preparation| {
+                    super::lifecycle_retained::RetainedLifecycleRenderSource::new(
+                        preparation.surface_presentation.clone(),
+                        std::sync::Arc::clone(&preparation.render_layout),
+                    )
+                })
+                .unwrap_or_else(super::lifecycle_retained::RetainedLifecycleRenderSource::empty)
+                .with_resource_payload_id(resource_payload_id);
             let Some(payload) = super::lifecycle_retained::RetainedLifecyclePayload::capture(
                 identity,
                 window_id,
@@ -839,19 +863,7 @@ impl CompositorState {
                 visual_group,
                 resolved_effect_scene,
                 frozen_decoration,
-                super::lifecycle_retained::RetainedLifecycleRenderSource::new(
-                    fresh_source_preparation
-                        .as_ref()
-                        .expect("fresh lifecycle captured source before reservation")
-                        .surface_presentation
-                        .clone(),
-                    std::sync::Arc::clone(
-                        &fresh_source_preparation
-                            .as_ref()
-                            .expect("fresh lifecycle captured source before reservation")
-                            .render_layout,
-                    ),
-                ),
+                render_source,
             ) else {
                 self.rollback_lifecycle_reservation(identity, previous_identity);
                 return Err(LifecycleAdmissionFailure::new(
@@ -1031,6 +1043,25 @@ impl CompositorState {
         resolved_effect_scene: ResolvedEffectScene,
         lifecycle_decorations: Vec<DecorationRenderInstance>,
     ) {
+        self.begin_lifecycle_restore_with_source(
+            window_id,
+            root_surface_id,
+            visual_group,
+            resolved_effect_scene,
+            lifecycle_decorations,
+            None,
+        );
+    }
+
+    pub(in crate::compositor) fn begin_lifecycle_restore_with_source(
+        &mut self,
+        window_id: WindowId,
+        root_surface_id: u32,
+        visual_group: Option<LifecycleVisualGroup>,
+        resolved_effect_scene: ResolvedEffectScene,
+        lifecycle_decorations: Vec<DecorationRenderInstance>,
+        resolved_source_payload_id: Option<crate::compositor::PresentationRetainedVisualPayloadId>,
+    ) {
         let Some(effect) =
             self.lifecycle_effect_kind_for_window(window_id, LifecycleDirection::Restore)
         else {
@@ -1081,7 +1112,7 @@ impl CompositorState {
         let frozen_decoration = lifecycle_decorations
             .into_iter()
             .find(|decoration| decoration.root_surface_id() == root_surface_id);
-        let admission = self.install_lifecycle_motion(
+        let admission = self.install_lifecycle_motion_with_preparation(
             scene_node_id,
             window_id,
             root_surface_id,
@@ -1094,6 +1125,8 @@ impl CompositorState {
             frozen_decoration,
             now,
             speed,
+            None,
+            resolved_source_payload_id,
         );
         let (_identity, payload, reused_payload) = match admission {
             Ok(admission) => admission,
@@ -1149,6 +1182,7 @@ impl CompositorState {
                 root_surface_id: payload.root_surface_id,
                 presentation_identity: identity,
                 payload_id: payload.payload_id,
+                resource_payload_id: payload.resource_payload_id,
                 kind,
                 effect_scene: std::sync::Arc::clone(&payload.effect_scene),
                 render_layout: Some(std::sync::Arc::clone(&payload.render_layout)),
@@ -1179,6 +1213,17 @@ impl CompositorState {
         LifecycleSceneSample {
             sampled_at: at,
             samples,
+            minimized_visual_resource_payload_ids: self
+                .desktop_windows
+                .values()
+                .filter(|window| window.state.is_minimized())
+                .filter_map(|window| {
+                    window
+                        .state
+                        .minimized_visual_snapshot()
+                        .map(|snapshot| snapshot.resource_payload_id)
+                })
+                .collect(),
         }
     }
 
@@ -1411,6 +1456,31 @@ impl CompositorState {
                     .retire_active_retained_visual_exact(identity)
             });
             if retired {
+                if lifecycle_sample.direction == LifecycleDirection::Minimize
+                    && lifecycle_sample.mathematically_settled
+                    && let Some(payload) = self
+                        .retained_lifecycle_payloads
+                        .get_exact(lifecycle_sample.presentation_identity)
+                {
+                    let minimized_snapshot = super::window_state::MinimizedVisualSnapshot {
+                        resource_payload_id: payload.resource_payload_id,
+                        source_client_rect: payload.visual_group.presented_source_client_rect,
+                        source_visual_rect: payload.visual_group.presented_source_visual_rect,
+                    };
+                    if let Some(window) = self.window_mut(lifecycle_sample.window_id)
+                        && window
+                            .state
+                            .promote_minimized_visual_snapshot(minimized_snapshot)
+                        && lifecycle_diagnostics_enabled()
+                    {
+                        eprintln!(
+                            "typhon.minimized_visual event=promoted window_id={} source_payload_id={} source_rect={:?}",
+                            lifecycle_sample.window_id.get(),
+                            minimized_snapshot.resource_payload_id.get(),
+                            minimized_snapshot.source_visual_rect,
+                        );
+                    }
+                }
                 let _ = self.retire_lifecycle_payload_exact(
                     lifecycle_sample.presentation_identity,
                     "presented",

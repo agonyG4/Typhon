@@ -301,6 +301,220 @@ fn stale_visual_eviction_releases_only_unreferenced_payload_leases() {
 }
 
 #[test]
+fn minimized_snapshot_survives_idle_frames_and_is_reused_by_restore_payload() {
+    let mut harness = GlesEffectTestHarness::new(16, 16);
+    let minimized = lamp_test_sample(0.5);
+    let minimized_sample = &minimized.samples[0];
+    let source_resource_id = minimized_sample.visual_source.resource_payload_id;
+    let restore_identity = test_lifecycle_identity_sequence(minimized_sample.window_id, 2)[1];
+    let restore_payload_id =
+        compositor::PresentationRetainedVisualPayloadId::from_origin_identity(restore_identity);
+    let second_snapshot_id = compositor::PresentationRetainedVisualPayloadId::from_origin_identity(
+        test_lifecycle_identity_sequence(minimized_sample.window_id, 3)[2],
+    );
+    let mut restore = minimized.clone();
+    restore.samples[0].presentation_identity = restore_identity;
+    restore.samples[0].payload_id = restore_payload_id;
+    restore.samples[0].direction = LifecycleDirection::Restore;
+    restore.samples[0].visual_source.presentation_identity = restore_identity;
+    restore.samples[0].visual_source.payload_id = restore_payload_id;
+    restore.samples[0].visual_source.resource_payload_id = source_resource_id;
+    restore.minimized_visual_resource_payload_ids = vec![second_snapshot_id];
+
+    let texture_key = lifecycle_transfer_test_texture_key(16, 16);
+    let baseline_leases = harness
+        .renderer
+        .effect_runtime
+        .effect_resources
+        .metrics()
+        .checked_out_texture_count;
+    let texture = harness
+        .renderer
+        .effect_runtime
+        .effect_resources
+        .acquire(&harness.gl, texture_key)
+        .expect("minimize capture texture allocates");
+    let texture_id = texture.id;
+    let second_texture = harness
+        .renderer
+        .effect_runtime
+        .effect_resources
+        .acquire(&harness.gl, texture_key)
+        .expect("second minimized snapshot texture allocates");
+    {
+        let renderer = &mut harness.renderer;
+        let store = &mut renderer.lifecycle.visual_store;
+        store.resolved_visual_resources.insert(
+            source_resource_id,
+            LifecycleResolvedVisualResource {
+                texture,
+                source_signature: 1,
+            },
+        );
+        store.resolved_visual_resources.insert(
+            second_snapshot_id,
+            LifecycleResolvedVisualResource {
+                texture: second_texture,
+                source_signature: 2,
+            },
+        );
+
+        let idle_minimized = LifecycleSceneSample {
+            sampled_at: AnimationTime::from_nanos(0),
+            samples: Vec::new(),
+            minimized_visual_resource_payload_ids: vec![source_resource_id, second_snapshot_id],
+        };
+        for _ in 0..3 {
+            store.begin_frame(&idle_minimized);
+            store.release_stale(&mut renderer.effect_runtime);
+            assert!(
+                store
+                    .resolved_visual_resources
+                    .contains_key(&source_resource_id)
+            );
+        }
+
+        store.begin_frame(&restore);
+        store.rebuild_source_commands(
+            &restore,
+            &[],
+            &[],
+            1.0,
+            (16, 16),
+            OutputFramebufferOrigin::BottomLeft,
+        );
+        assert!(!store.source_commands.contains_key(&restore_payload_id));
+        store.release_stale(&mut renderer.effect_runtime);
+        assert_eq!(store.resolved_visual_resources.len(), 2);
+        assert_eq!(
+            store.resolved_visual_resources[&source_resource_id]
+                .texture
+                .id,
+            texture_id,
+            "fresh restore owns a new lifecycle identity but samples the existing minimize texture"
+        );
+        assert!(
+            store
+                .resolved_visual_resources
+                .contains_key(&second_snapshot_id)
+        );
+
+        let mut frame = LifecycleFrameState::default();
+        frame.begin(&restore);
+        let mut context = LifecycleRenderContext::new(
+            &harness.gl,
+            &mut renderer.scene_state,
+            &mut renderer.effect_runtime,
+            renderer.resources.texture_view(),
+        );
+        store
+            .prepare_lifecycle_visual_sources(
+                &mut frame,
+                &mut context,
+                &RepaintPlan::default(),
+                OutputFramebufferOrigin::BottomLeft,
+            )
+            .expect("restore resolves the already-owned minimized texture");
+        drop(context);
+        assert!(frame.fallbacks.failed.is_empty());
+        assert!(store.is_ready(source_resource_id, &renderer.effect_runtime));
+        assert!(!store.captured_payloads.contains(&restore_payload_id));
+        assert_eq!(
+            renderer
+                .effect_runtime
+                .effect_resources
+                .metrics()
+                .checked_out_texture_count,
+            baseline_leases + 2,
+            "restore does not allocate a second resolved visual texture"
+        );
+    }
+
+    let store = &mut harness.renderer.lifecycle.visual_store;
+    store.begin_frame(&LifecycleSceneSample {
+        sampled_at: AnimationTime::from_nanos(0),
+        samples: Vec::new(),
+        minimized_visual_resource_payload_ids: vec![second_snapshot_id],
+    });
+    store.release_stale(&mut harness.renderer.effect_runtime);
+    assert!(
+        !store
+            .resolved_visual_resources
+            .contains_key(&source_resource_id)
+    );
+    assert!(
+        store
+            .resolved_visual_resources
+            .contains_key(&second_snapshot_id)
+    );
+
+    store.begin_frame(&LifecycleSceneSample {
+        sampled_at: AnimationTime::from_nanos(0),
+        samples: Vec::new(),
+        minimized_visual_resource_payload_ids: Vec::new(),
+    });
+    store.release_stale(&mut harness.renderer.effect_runtime);
+    assert!(store.resolved_visual_resources.is_empty());
+    assert_eq!(
+        harness
+            .renderer
+            .effect_runtime
+            .effect_resources
+            .metrics()
+            .checked_out_texture_count,
+        baseline_leases,
+        "the texture returns to the pool after minimized and restore references retire"
+    );
+}
+
+#[test]
+fn missing_minimized_snapshot_skips_animation_source_without_recapture() {
+    let mut harness = GlesEffectTestHarness::new(16, 16);
+    let mut restore = lamp_test_sample(0.5);
+    let minimize_payload_id = restore.samples[0].visual_source.resource_payload_id;
+    let restore_identity = test_lifecycle_identity_sequence(restore.samples[0].window_id, 2)[1];
+    let restore_payload_id =
+        compositor::PresentationRetainedVisualPayloadId::from_origin_identity(restore_identity);
+    restore.samples[0].presentation_identity = restore_identity;
+    restore.samples[0].payload_id = restore_payload_id;
+    restore.samples[0].direction = LifecycleDirection::Restore;
+    restore.samples[0].visual_source.presentation_identity = restore_identity;
+    restore.samples[0].visual_source.payload_id = restore_payload_id;
+    restore.samples[0].visual_source.resource_payload_id = minimize_payload_id;
+    restore.minimized_visual_resource_payload_ids.clear();
+
+    let mut frame = LifecycleFrameState::default();
+    frame.begin(&restore);
+    let renderer = &mut harness.renderer;
+    let store = &mut renderer.lifecycle.visual_store;
+    store.begin_frame(&restore);
+    let mut context = LifecycleRenderContext::new(
+        &harness.gl,
+        &mut renderer.scene_state,
+        &mut renderer.effect_runtime,
+        renderer.resources.texture_view(),
+    );
+    store
+        .prepare_lifecycle_visual_sources(
+            &mut frame,
+            &mut context,
+            &RepaintPlan::default(),
+            OutputFramebufferOrigin::BottomLeft,
+        )
+        .expect("missing optional snapshot is an animation fallback");
+    drop(context);
+
+    assert_eq!(frame.fallbacks.failed.len(), 1);
+    assert_eq!(
+        frame.fallbacks.failed[0].reason,
+        LifecycleRenderFallbackReason::MinimizedSnapshotUnavailable
+    );
+    assert!(store.resolved_visual_resources.is_empty());
+    assert!(!store.captured_payloads.contains(&restore_payload_id));
+    assert!(store.source_commands.get(&restore_payload_id).is_none());
+}
+
+#[test]
 fn lifecycle_output_blit_plan_clips_edges_and_keeps_texture_offsets() {
     let cases = [
         (

@@ -2332,6 +2332,9 @@ impl CompositorState {
                 return false;
             }
         }
+        let minimized_visual_snapshot = self
+            .window(window_id)
+            .and_then(|window| window.state.minimized_visual_snapshot());
         let Some(mut minimized_surfaces) = self
             .window_mut(window_id)
             .and_then(|window| window.state.restore_minimized())
@@ -2418,6 +2421,9 @@ impl CompositorState {
                 )
             })
             .is_some();
+        let settled_visual_snapshot = (!has_active_lifecycle)
+            .then_some(minimized_visual_snapshot)
+            .flatten();
         let lifecycle_effect_scene = if has_active_lifecycle {
             ResolvedEffectScene::default()
         } else {
@@ -2479,26 +2485,40 @@ impl CompositorState {
                         });
                     let visual =
                         canonical_visual_rect(canonical_client, owned_bounds, decoration_bounds)?;
-                    let presented_visual = presented_visual_rect(
-                        canonical_client,
-                        visual,
-                        xwayland_restore_source
+                    let visual_group = if let Some(snapshot) = settled_visual_snapshot {
+                        let target =
+                            self.resolve_lifecycle_target(window_id, snapshot.source_visual_rect)?;
+                        LifecycleVisualGroup::from_resolved_effect_bounds_with_source_visual_rect(
+                            restore_effect?,
+                            canonical_client,
+                            visual,
+                            snapshot.source_client_rect,
+                            snapshot.source_visual_rect,
+                            target,
+                            (self.output_size.width, self.output_size.height),
+                        )?
+                    } else {
+                        let presented_visual = presented_visual_rect(
+                            canonical_client,
+                            visual,
+                            xwayland_restore_source
+                                .map(|source| source.committed_client_rect)
+                                .unwrap_or(canonical_client),
+                        )?;
+                        let target = self.resolve_lifecycle_target(window_id, presented_visual)?;
+                        let presented_source_client = xwayland_restore_source
                             .map(|source| source.committed_client_rect)
-                            .unwrap_or(canonical_client),
-                    )?;
-                    let target = self.resolve_lifecycle_target(window_id, presented_visual)?;
-                    let presented_source_client = xwayland_restore_source
-                        .map(|source| source.committed_client_rect)
-                        .unwrap_or(canonical_client);
-                    let visual_group = LifecycleVisualGroup::from_resolved_effect_bounds(
-                        restore_effect?,
-                        canonical_client,
-                        visual,
-                        presented_source_client,
-                        target,
-                        self.output_size.width,
-                        self.output_size.height,
-                    )?;
+                            .unwrap_or(canonical_client);
+                        LifecycleVisualGroup::from_resolved_effect_bounds(
+                            restore_effect?,
+                            canonical_client,
+                            visual,
+                            presented_source_client,
+                            target,
+                            self.output_size.width,
+                            self.output_size.height,
+                        )?
+                    };
                     if let Some(source) = xwayland_restore_source {
                         self.trace_pending_xwayland_restore_lifecycle_geometry(
                             source,
@@ -2508,15 +2528,38 @@ impl CompositorState {
                     Some(visual_group)
                 })
         };
-        self.begin_lifecycle_restore(
+        self.begin_lifecycle_restore_with_source(
             window_id,
             root_surface_id,
             lifecycle_visual_group,
             lifecycle_effect_scene,
             lifecycle_decorations,
+            settled_visual_snapshot.map(|snapshot| snapshot.resource_payload_id),
         );
+        let lifecycle_diagnostics_enabled = self.lifecycle_diagnostics_enabled();
         if let Some(window) = self.window_mut(window_id) {
             window.state.clear_minimized_lifecycle_target();
+            let released_snapshot = window.state.clear_minimized_visual_snapshot();
+            if let Some(snapshot) = released_snapshot
+                && lifecycle_diagnostics_enabled
+            {
+                eprintln!(
+                    "typhon.minimized_visual event=released window_id={} source_payload_id={} reason=restore_started_or_skipped",
+                    window_id.get(),
+                    snapshot.resource_payload_id.get(),
+                );
+            }
+        }
+        if let Some(snapshot) = settled_visual_snapshot
+            && lifecycle_diagnostics_enabled
+        {
+            let destination = lifecycle_visual_group.map(|group| group.canonical_visual_rect);
+            eprintln!(
+                "typhon.minimized_visual event=restore_source window_id={} source_payload_id={} source_rect={:?} destination_rect={destination:?}",
+                window_id.get(),
+                snapshot.resource_payload_id.get(),
+                snapshot.source_visual_rect,
+            );
         }
         true
     }
