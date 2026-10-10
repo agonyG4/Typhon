@@ -37,6 +37,11 @@ use oblivion_one::window_lifecycle_animation::LifecycleRenderFallbacks;
 use super::atomic_direct::{direct_candidate_key, direct_scanout_debug};
 use super::atomic_render_domain::{AtomicRenderDomain, AtomicRenderDomainBootstrap};
 pub(crate) use super::atomic_render_domain::{AtomicRenderedFrameParts, AtomicSlotRenderOutcome};
+use super::render_worker::{
+    AtomicRenderControl, AtomicRenderTransportKind, AtomicRenderWorkerHandle,
+    AtomicRenderWorkerPolicy, AtomicRenderWorkerStartup, SequencedRenderControl,
+    apply_render_control,
+};
 use super::*;
 use crate::native_output::presentation::async_validation::CompositedPresentationValidationKey;
 use crate::native_output::presentation::transaction::{
@@ -73,9 +78,15 @@ mod worker;
 mod atomic_egl_gbm_transactions;
 
 pub(crate) struct AtomicEglGbmScanout {
-    _physical_device: gbm::Device<std::os::fd::OwnedFd>,
+    _physical_device: Option<gbm::Device<std::os::fd::OwnedFd>>,
     physical_pool: Option<AtomicPhysicalOutputPool>,
-    render_domain: AtomicRenderDomain,
+    render_transport: AtomicRenderTransport,
+    pending_render_controls: Vec<SequencedRenderControl>,
+    render_control_epoch: u64,
+    render_control_overflowed: bool,
+    render_slot_identities: Vec<(OutputSlotId, u64)>,
+    lifecycle_animation_available: bool,
+    squash_animation_available: bool,
     swapchain: Option<AtomicOutputSwapchain>,
     direct: DirectScanoutControl,
     width: u32,
@@ -287,9 +298,213 @@ fn create_physical_output_pool(
     ))
 }
 
+fn create_physical_pool_with_render_import(
+    device: &gbm::Device<std::os::fd::OwnedFd>,
+    drm: BorrowedFd<'_>,
+    width: u32,
+    height: u32,
+    format_modifier: DrmFormatModifierPair,
+    pool_generation: u64,
+    import: impl FnOnce(Vec<AtomicRenderSlotDescriptor>, &[(OutputSlotId, u64)]) -> io::Result<()>,
+) -> io::Result<AtomicPhysicalOutputPool> {
+    let mut physical_pool = Some(create_physical_output_pool(
+        device,
+        drm,
+        width,
+        height,
+        format_modifier,
+        pool_generation,
+    )?);
+    let physical_identities = physical_pool
+        .as_ref()
+        .expect("new physical pool remains owned during render import")
+        .identities();
+    let descriptors = match physical_pool
+        .as_ref()
+        .expect("new physical pool remains owned during descriptor export")
+        .export_render_slot_descriptors()
+    {
+        Ok(descriptors) => descriptors,
+        Err(error) => {
+            if let Some(pool) = physical_pool.take() {
+                pool.teardown(drm, true);
+            }
+            return Err(error);
+        }
+    };
+    if let Err(error) = import(descriptors, &physical_identities) {
+        if let Some(pool) = physical_pool.take() {
+            pool.teardown(drm, true);
+        }
+        return Err(error);
+    }
+    Ok(physical_pool.expect("successful import retains physical pool"))
+}
+
+enum AtomicRenderTransport {
+    Synchronous(AtomicRenderDomain),
+    Worker(AtomicRenderWorkerHandle),
+}
+
+const MAX_PENDING_RENDER_CONTROLS: usize = 16;
+
+fn create_synchronous_render_setup(
+    kms: &fs::File,
+    discovery: &AtomicDiscovery,
+    physical_device: &gbm::Device<std::os::fd::OwnedFd>,
+    width: u32,
+    height: u32,
+    pool_generation: u64,
+) -> io::Result<(
+    AtomicRenderTransport,
+    DrmFormatModifierPair,
+    super::atomic_render_domain::AtomicRenderDomainInfo,
+    AtomicPhysicalOutputPool,
+)> {
+    let render_fd = duplicate_fd_cloexec(kms.as_raw_fd()).map_err(io::Error::from_raw_os_error)?;
+    let render_device = gbm::Device::new(render_fd)?;
+    let bootstrap = AtomicRenderDomainBootstrap::new(render_device)?;
+    let mut probe = DeviceAllocationProbe {
+        device: physical_device,
+        width,
+        height,
+    };
+    let format_modifier = select_output_format_modifier_for_presentation(
+        oblivion_one::compositor::OutputPresentationMode::Vsync,
+        &discovery.plane_scanout_formats,
+        Some(&discovery.plane_async_scanout_formats),
+        bootstrap.renderable_dmabuf_formats(),
+        &mut probe,
+    )?;
+    let (mut domain, info) = bootstrap.initialize_renderer(width, height, format_modifier)?;
+    let pool = create_physical_pool_with_render_import(
+        physical_device,
+        kms.as_fd(),
+        width,
+        height,
+        format_modifier,
+        pool_generation,
+        |descriptors, identities| domain.install_pool(descriptors, pool_generation, identities),
+    )?;
+    Ok((
+        AtomicRenderTransport::Synchronous(domain),
+        format_modifier,
+        info,
+        pool,
+    ))
+}
+
+fn create_worker_render_setup(
+    kms: &fs::File,
+    discovery: &AtomicDiscovery,
+    physical_device: &gbm::Device<std::os::fd::OwnedFd>,
+    width: u32,
+    height: u32,
+    pool_generation: u64,
+) -> io::Result<(
+    AtomicRenderTransport,
+    DrmFormatModifierPair,
+    super::atomic_render_domain::AtomicRenderDomainInfo,
+    AtomicPhysicalOutputPool,
+)> {
+    let render_device_fd =
+        duplicate_fd_cloexec(kms.as_raw_fd()).map_err(io::Error::from_raw_os_error)?;
+    let (mut worker, renderable_formats) = AtomicRenderWorkerHandle::start(render_device_fd)?;
+    let mut probe = DeviceAllocationProbe {
+        device: physical_device,
+        width,
+        height,
+    };
+    let format_modifier = select_output_format_modifier_for_presentation(
+        oblivion_one::compositor::OutputPresentationMode::Vsync,
+        &discovery.plane_scanout_formats,
+        Some(&discovery.plane_async_scanout_formats),
+        &renderable_formats,
+        &mut probe,
+    )?;
+    let mut render_info = None;
+    let pool = create_physical_pool_with_render_import(
+        physical_device,
+        kms.as_fd(),
+        width,
+        height,
+        format_modifier,
+        pool_generation,
+        |descriptors, identities| {
+            render_info = Some(worker.initialize(
+                width,
+                height,
+                pool_generation,
+                format_modifier,
+                descriptors,
+                identities.to_vec(),
+            )?);
+            Ok(())
+        },
+    )?;
+    let render_info = render_info.expect("successful worker import returns renderer info");
+    Ok((
+        AtomicRenderTransport::Worker(worker),
+        format_modifier,
+        render_info,
+        pool,
+    ))
+}
+
 impl AtomicEglGbmScanout {
+    fn queue_render_control(&mut self, control: AtomicRenderControl) -> io::Result<()> {
+        match &mut self.render_transport {
+            AtomicRenderTransport::Synchronous(domain) => apply_render_control(domain, control),
+            AtomicRenderTransport::Worker(_) => {
+                if self.pending_render_controls.len() >= MAX_PENDING_RENDER_CONTROLS {
+                    self.render_control_overflowed = true;
+                    return Err(io::Error::other(
+                        "bounded renderer-control lane is full; refusing to drop renderer state",
+                    ));
+                }
+                self.render_control_epoch = self
+                    .render_control_epoch
+                    .checked_add(1)
+                    .ok_or_else(|| io::Error::other("renderer control epoch exhausted"))?;
+                self.pending_render_controls.push(SequencedRenderControl {
+                    epoch: self.render_control_epoch,
+                    control,
+                });
+                Ok(())
+            }
+        }
+    }
+
+    fn take_render_controls_for_job(&mut self) -> io::Result<(Vec<SequencedRenderControl>, u64)> {
+        if self.render_control_overflowed {
+            return Err(io::Error::other(
+                "renderer-control lane overflowed before worker admission",
+            ));
+        }
+        Ok((
+            std::mem::take(&mut self.pending_render_controls),
+            self.render_control_epoch,
+        ))
+    }
+
+    fn render_worker(&self) -> Option<&AtomicRenderWorkerHandle> {
+        match &self.render_transport {
+            AtomicRenderTransport::Synchronous(_) => None,
+            AtomicRenderTransport::Worker(worker) => Some(worker),
+        }
+    }
+
+    fn render_worker_mut(&mut self) -> Option<&mut AtomicRenderWorkerHandle> {
+        match &mut self.render_transport {
+            AtomicRenderTransport::Synchronous(_) => None,
+            AtomicRenderTransport::Worker(worker) => Some(worker),
+        }
+    }
+
     pub(crate) fn finish_render_work(&self) {
-        self.render_domain.finish_render_work();
+        if let AtomicRenderTransport::Synchronous(domain) = &self.render_transport {
+            domain.finish_render_work();
+        }
     }
 
     pub(crate) fn import_scaled_probe_framebuffer(
@@ -302,11 +517,11 @@ impl AtomicEglGbmScanout {
     }
 
     pub(crate) fn lifecycle_animation_available(&self) -> bool {
-        self.render_domain.lifecycle_animation_available()
+        self.lifecycle_animation_available
     }
 
     pub(crate) fn squash_animation_available(&self) -> bool {
-        self.render_domain.squash_animation_available()
+        self.squash_animation_available
     }
 
     pub(crate) fn reload_trusted_effect_registry(
@@ -317,31 +532,54 @@ impl AtomicEglGbmScanout {
         std::sync::Arc<oblivion_one::effects::EffectRegistryGeneration>,
         oblivion_one::effects::RegistryReloadError,
     > {
-        self.render_domain
-            .reload_trusted_effect_registry(registry, manifest)
+        match &mut self.render_transport {
+            AtomicRenderTransport::Synchronous(domain) => {
+                domain.reload_trusted_effect_registry(registry, manifest)
+            }
+            AtomicRenderTransport::Worker(_) => Err(
+                oblivion_one::effects::RegistryReloadError::ReservedSystemEffectName(
+                    "trusted effect reload requires an asynchronous render-worker response"
+                        .to_string(),
+                ),
+            ),
+        }
     }
 
     pub(crate) fn publish_material_effect_generation(
         &mut self,
         generation: &oblivion_one::effects::EffectRegistryGeneration,
     ) {
-        self.render_domain
-            .publish_material_effect_generation(generation);
+        let _ = self.queue_render_control(AtomicRenderControl::PublishMaterialEffectGeneration(
+            generation.clone(),
+        ));
     }
 
     pub(crate) fn publish_effect_registry_generation(
         &mut self,
         generation: oblivion_one::effects::EffectRegistryGeneration,
     ) -> Result<(), oblivion_one::effects::RegistryReloadError> {
-        self.render_domain
-            .publish_effect_registry_generation(generation)
+        match &mut self.render_transport {
+            AtomicRenderTransport::Synchronous(domain) => {
+                domain.publish_effect_registry_generation(generation)
+            }
+            AtomicRenderTransport::Worker(_) => Err(
+                oblivion_one::effects::RegistryReloadError::ReservedSystemEffectName(
+                    "trusted effect generation publication requires its asynchronous worker response"
+                        .to_string(),
+                ),
+            ),
+        }
     }
 
     pub(crate) fn set_cursor_image(
         &mut self,
         image: std::sync::Arc<oblivion_one::cursor_theme::CompositorCursorImage>,
     ) {
-        self.render_domain.set_cursor_image(image);
+        let _ = self.queue_render_control(AtomicRenderControl::SetCursorImage(image));
+    }
+
+    pub(crate) fn invalidate_presented_damage_history(&mut self) {
+        let _ = self.queue_render_control(AtomicRenderControl::InvalidatePresentedDamageHistory);
     }
     pub(crate) fn prepare_session_recovery(&self) -> io::Result<AtomicExplicitRecovery> {
         let swapchain = self.swapchain()?;
@@ -378,12 +616,16 @@ impl AtomicEglGbmScanout {
             return Ok(NativeSessionRecoveryProgress::WaitingForSuspendedFence);
         }
         while let Some(frame) = self.swapchain_mut()?.take_suspended_frame() {
-            self.render_domain.discard_rendered(frame.scene_commit);
+            let _ = self.queue_render_control(AtomicRenderControl::DiscardRendered {
+                frame: frame.scene_commit,
+            });
             drop(frame.surface_damage);
         }
         self.swapchain_mut()?.recover_suspended_slot(true)?;
         if let Some(frame) = self.swapchain_mut()?.retire_pending_after_recovery() {
-            self.render_domain.discard_rendered(frame.scene_commit);
+            let _ = self.queue_render_control(AtomicRenderControl::DiscardRendered {
+                frame: frame.scene_commit,
+            });
             drop(frame.surface_damage);
         }
         match self.direct.complete_suspended() {
@@ -473,7 +715,7 @@ impl AtomicEglGbmScanout {
         };
         validate_split_slot_pairing(
             &pool.identities(),
-            &self.render_domain.pool_identities(),
+            &self.render_slot_identities,
             pool.pool_generation(),
         )
         .expect("session recovery starts with exactly paired Atomic pools");
@@ -486,14 +728,19 @@ impl AtomicEglGbmScanout {
             .as_mut()
             .expect("physical pool was checked above")
             .rebind_pool_generation(generation);
-        self.render_domain.rebind_pool_generation(generation);
+        let _ = self.queue_render_control(AtomicRenderControl::RebindPoolGeneration(generation));
+        self.render_slot_identities = self
+            .render_slot_identities
+            .iter()
+            .map(|(id, _)| (*id, generation))
+            .collect();
         validate_split_slot_pairing(
             &self
                 .physical_pool
                 .as_ref()
                 .expect("physical pool remains installed during recovery")
                 .identities(),
-            &self.render_domain.pool_identities(),
+            &self.render_slot_identities,
             generation,
         )
         .expect("session recovery rebinds physical and render pools together");
@@ -508,7 +755,7 @@ impl AtomicEglGbmScanout {
         self.async_output_generation = generation;
         self.presentation_validation_accepted.clear();
         self.presentation_validation_rejected.clear();
-        self.render_domain.invalidate_presented_damage_history();
+        let _ = self.queue_render_control(AtomicRenderControl::InvalidatePresentedDamageHistory);
     }
 
     pub(crate) fn composited_presentation_validation_key(
@@ -667,25 +914,69 @@ impl AtomicEglGbmScanout {
         let physical_fd =
             duplicate_fd_cloexec(kms.as_raw_fd()).map_err(io::Error::from_raw_os_error)?;
         let physical_device = gbm::Device::new(physical_fd)?;
-        let render_fd =
-            duplicate_fd_cloexec(kms.as_raw_fd()).map_err(io::Error::from_raw_os_error)?;
-        let render_device = gbm::Device::new(render_fd)?;
-        let render_bootstrap = AtomicRenderDomainBootstrap::new(render_device)?;
-
-        let mut probe = DeviceAllocationProbe {
-            device: &physical_device,
-            width,
-            height,
+        let worker_policy = AtomicRenderWorkerPolicy::parse(
+            std::env::var("OBLIVION_ONE_RENDER_WORKER").ok().as_deref(),
+        )
+        .map_err(io::Error::other)?;
+        let (render_transport, format_modifier, render_info, physical_pool, worker_startup) =
+            match worker_policy {
+                AtomicRenderWorkerPolicy::Off => create_synchronous_render_setup(
+                    kms,
+                    discovery,
+                    &physical_device,
+                    width,
+                    height,
+                    pool_generation,
+                )
+                .map(|setup| {
+                    (
+                        setup.0,
+                        setup.1,
+                        setup.2,
+                        setup.3,
+                        AtomicRenderWorkerStartup::IntentionallySynchronous,
+                    )
+                })?,
+                AtomicRenderWorkerPolicy::Auto => {
+                    eprintln!(
+                        "native render worker: requested=auto effective=synchronous startup=automatic_startup_degraded reason=render_completion_continuation_not_connected"
+                    );
+                    create_synchronous_render_setup(
+                        kms,
+                        discovery,
+                        &physical_device,
+                        width,
+                        height,
+                        pool_generation,
+                    )
+                    .map(|setup| {
+                        (
+                            setup.0,
+                            setup.1,
+                            setup.2,
+                            setup.3,
+                            AtomicRenderWorkerStartup::AutomaticStartupDegraded,
+                        )
+                    })?
+                }
+                AtomicRenderWorkerPolicy::Force => {
+                    return Err(io::Error::other(
+                        "native render worker force mode is unavailable until asynchronous Atomic render settlement is connected",
+                    ));
+                }
+            };
+        let transport_kind = match &render_transport {
+            AtomicRenderTransport::Synchronous(_) => AtomicRenderTransportKind::Synchronous,
+            AtomicRenderTransport::Worker(_) => AtomicRenderTransportKind::Worker,
         };
-        let format_modifier = select_output_format_modifier_for_presentation(
-            oblivion_one::compositor::OutputPresentationMode::Vsync,
-            &discovery.plane_scanout_formats,
-            Some(&discovery.plane_async_scanout_formats),
-            render_bootstrap.renderable_dmabuf_formats(),
-            &mut probe,
-        )?;
-        let (mut render_domain, render_info) =
-            render_bootstrap.initialize_renderer(width, height, format_modifier)?;
+        let render_slot_identities = physical_pool.identities();
+        println!(
+            "native Atomic render transport: requested={} effective={} startup={} two_stage_bootstrap={}",
+            worker_policy.as_str(),
+            transport_kind.as_str(),
+            worker_startup.as_str(),
+            matches!(transport_kind, AtomicRenderTransportKind::Worker),
+        );
 
         let scanout_capabilities = discover_direct_scanout_capabilities(
             &discovery.plane_scanout_formats,
@@ -717,45 +1008,16 @@ impl AtomicEglGbmScanout {
             }),
             kms_preferred_selection.advertised_renderer_formats,
         );
-        let drm = kms.as_fd();
-        let physical_pool = create_physical_output_pool(
-            &physical_device,
-            drm,
-            width,
-            height,
-            format_modifier,
-            pool_generation,
-        )?;
-        let mut physical_pool = Some(physical_pool);
-        let physical_pool_ref = physical_pool
-            .as_ref()
-            .expect("physical pool is retained until render import finishes");
-        let physical_identities = physical_pool_ref.identities();
-        let descriptors = match physical_pool_ref.export_render_slot_descriptors() {
-            Ok(descriptors) => descriptors,
-            Err(error) => {
-                if let Some(pool) = physical_pool.take() {
-                    pool.teardown(drm, true);
-                }
-                return Err(error);
-            }
-        };
-        let render_import = render_domain.install_pool(
-            descriptors,
-            physical_pool_ref.pool_generation(),
-            &physical_identities,
-        );
-        remove_framebuffer_after_render_import_failure(render_import, || {
-            if let Some(pool) = physical_pool.take() {
-                pool.teardown(drm, true);
-            }
-        })?;
-        let physical_pool = physical_pool.expect("successful render import retains physical pool");
-
         Ok(Self {
-            _physical_device: physical_device,
+            _physical_device: Some(physical_device),
             physical_pool: Some(physical_pool),
-            render_domain,
+            render_transport,
+            pending_render_controls: Vec::new(),
+            render_control_epoch: 0,
+            render_control_overflowed: false,
+            render_slot_identities,
+            lifecycle_animation_available: render_info.lifecycle_animation_available,
+            squash_animation_available: render_info.squash_animation_available,
             swapchain: None,
             direct: DirectScanoutControl::new(kms.as_fd(), pool_generation, output_id),
             width,
@@ -805,7 +1067,12 @@ impl AtomicEglGbmScanout {
     }
 
     pub(crate) fn create_render_fence(&self) -> io::Result<NativeRenderFence> {
-        self.render_domain.create_render_fence()
+        match &self.render_transport {
+            AtomicRenderTransport::Synchronous(domain) => domain.create_render_fence(),
+            AtomicRenderTransport::Worker(_) => Err(io::Error::other(
+                "render fence creation must run as a render-worker command",
+            )),
+        }
     }
 
     pub(crate) fn duplicate_ready_render_completion_fd(&self) -> io::Result<std::os::fd::OwnedFd> {
@@ -871,13 +1138,18 @@ impl AtomicEglGbmScanout {
                 .render_target_preparation_ns
                 .saturating_add(elapsed_nanos(started));
         }
-        self.render_domain.render_to_slot(
-            target,
-            frame_id,
-            frozen_frame,
-            gpu_sampling_started,
-            phase_durations,
-        )
+        match &mut self.render_transport {
+            AtomicRenderTransport::Synchronous(domain) => domain.render_to_slot(
+                target,
+                frame_id,
+                frozen_frame,
+                gpu_sampling_started,
+                phase_durations,
+            ),
+            AtomicRenderTransport::Worker(_) => Err(io::Error::other(
+                "worker transport requires reactor-owned render dispatch",
+            )),
+        }
     }
 
     /// Capture the published scene without acquiring a physical output slot.
@@ -899,7 +1171,12 @@ impl AtomicEglGbmScanout {
             cursor_mode,
             Some(OutputDamage::Full),
         );
-        self.render_domain.capture_scene(&mut frozen_frame)
+        match &mut self.render_transport {
+            AtomicRenderTransport::Synchronous(domain) => domain.capture_scene(&mut frozen_frame),
+            AtomicRenderTransport::Worker(_) => Err(io::Error::other(
+                "screen capture must be admitted as a render-worker operation",
+            )),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1371,7 +1648,7 @@ impl AtomicEglGbmScanout {
                         // A renderer skip can still follow partial GLES work.
                         // Complete it before restoring any sampled client
                         // buffers or recycling this compositor slot.
-                        self.render_domain.finish_render_work();
+                        self.finish_render_work();
                     }
                     settle_failed_output_transaction(
                         output_transactions,
@@ -1455,7 +1732,7 @@ impl AtomicEglGbmScanout {
                 // work started, complete it before restoring frame ownership
                 // or recycling the slot.
                 if gpu_sampling_started {
-                    self.render_domain.finish_render_work();
+                    self.finish_render_work();
                 }
                 settle_failed_output_transaction(
                     output_transactions,
@@ -1480,7 +1757,7 @@ impl AtomicEglGbmScanout {
             }
             Err(error) => {
                 if gpu_sampling_started {
-                    self.render_domain.finish_render_work();
+                    self.finish_render_work();
                 }
                 let failure_stage = if gpu_sampling_started {
                     OutputTransactionFailureStage::RenderExecution
@@ -1730,12 +2007,15 @@ impl AtomicEglGbmScanout {
         let submit_window = presentation_timing.fixed_submit_window().ok_or_else(|| {
             io::Error::other("completed pageflip frame has variable timing while inactive")
         })?;
+        let render_control_result =
+            self.queue_render_control(AtomicRenderControl::CommitPresented {
+                frame: scene_commit,
+                presented_transition_damage,
+            });
         let (fence_signal, timing_error) = complete_confirmed_pageflip_with_timing(
             timing_result
                 .map(|sample| sample.map(|evidence| (evidence.signaled_at, evidence.quality))),
             || {
-                self.render_domain
-                    .commit_presented(scene_commit, presented_transition_damage);
                 if let Some(pool) = self.physical_pool.as_mut() {
                     pool.physical_slot_mut(completed.new_current)
                         .expect("validated pageflip slot remains in physical pool")
@@ -1743,6 +2023,9 @@ impl AtomicEglGbmScanout {
                 }
             },
         );
+        if let Err(error) = render_control_result {
+            return Err(error);
+        }
         if let Some(error) = timing_error {
             self.counters.render_fence_timing_unavailable += 1;
             eprintln!(
@@ -1857,7 +2140,9 @@ impl AtomicEglGbmScanout {
     }
 
     fn discard_failed_frame_resources(&mut self, frame: RenderedOutputFrame) {
-        self.render_domain.discard_rendered(frame.scene_commit);
+        let _ = self.queue_render_control(AtomicRenderControl::DiscardRendered {
+            frame: frame.scene_commit,
+        });
         drop(frame.surface_damage);
     }
 
@@ -1885,8 +2170,10 @@ impl AtomicEglGbmScanout {
         swapchain.set_current_framebuffer_id(framebuffer_id);
         self.swapchain = Some(swapchain);
         pool.physical_slot_mut(slot)?.record_presentation(0);
-        self.render_domain
-            .commit_presented(scene_commit, OutputDamage::Full);
+        let _ = self.queue_render_control(AtomicRenderControl::CommitPresented {
+            frame: scene_commit,
+            presented_transition_damage: OutputDamage::Full,
+        });
         self.direct.inhibit_until_composited_present = false;
         Ok(())
     }
@@ -1918,7 +2205,9 @@ impl AtomicEglGbmScanout {
         let mut recovered = false;
         while let Some(frame) = self.swapchain_mut()?.take_suspended_frame() {
             recovered = true;
-            self.render_domain.discard_rendered(frame.scene_commit);
+            let _ = self.queue_render_control(AtomicRenderControl::DiscardRendered {
+                frame: frame.scene_commit,
+            });
             drop(frame.surface_damage);
         }
         self.swapchain_mut()?.recover_suspended_slot(true)?;
@@ -2142,23 +2431,32 @@ impl AtomicRenderedFrameParts {
 
 impl Drop for AtomicEglGbmScanout {
     fn drop(&mut self) {
-        let render_domain = &mut self.render_domain;
-        let physical_pool = &mut self.physical_pool;
-        let physical_device = &self._physical_device;
-        let drm_cleanup_armed = self.drm_cleanup_armed;
-        teardown_render_before_physical(
-            || {
-                // Prove GLES no longer samples imported images, then destroy
-                // all EGL/GL render resources before their physical BO owners.
-                render_domain.teardown();
-            },
-            || {
-                if let Some(pool) = physical_pool.take() {
-                    // Revoked DRM skips rm_fb but still drops all GBM BOs.
-                    pool.teardown(physical_device.as_fd(), drm_cleanup_armed);
-                }
-            },
-        );
+        let render_domain_destroyed = match &mut self.render_transport {
+            AtomicRenderTransport::Synchronous(domain) => {
+                domain.teardown();
+                true
+            }
+            AtomicRenderTransport::Worker(worker) => worker.shutdown_and_join().is_ok(),
+        };
+        if render_domain_destroyed {
+            if let (Some(pool), Some(device)) =
+                (self.physical_pool.take(), self._physical_device.as_ref())
+            {
+                // Revoked DRM skips rm_fb but still drops all GBM BOs. Render
+                // imports have already been destroyed or acknowledged above.
+                pool.teardown(device.as_fd(), self.drm_cleanup_armed);
+            }
+            self._physical_device.take();
+        } else {
+            // A failed worker join leaves GPU ownership uncertain. Retain the
+            // BO and DRM device until process exit rather than risking reuse.
+            if let Some(pool) = self.physical_pool.take() {
+                std::mem::forget(pool);
+            }
+            if let Some(device) = self._physical_device.take() {
+                std::mem::forget(device);
+            }
+        }
     }
 }
 

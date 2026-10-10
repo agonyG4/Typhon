@@ -1063,10 +1063,6 @@ impl AtomicEglGbmScanout {
             self.direct.counters.direct_replacements.saturating_add(1);
     }
 
-    pub(crate) fn invalidate_presented_damage_history(&mut self) {
-        self.render_domain.invalidate_presented_damage_history();
-    }
-
     pub(crate) fn mark_composited_submission(&mut self) {
         if self.direct.ownership.presented.is_some() {
             self.direct.inhibit_until_composited_present = true;
@@ -1088,7 +1084,7 @@ impl AtomicEglGbmScanout {
             .complete_composited_transition(expected, worker_owns_current);
         if let CompositedTransitionResult::Completed { released: Some(_) } = &result {
             direct_scanout_debug("exited direct scanout to composition");
-            self.render_domain.invalidate_presented_damage_history();
+            self.invalidate_presented_damage_history();
         }
         result
     }
@@ -1290,7 +1286,7 @@ impl AtomicEglGbmScanout {
 
     pub(crate) fn direct_scanout_suspend(&mut self) -> io::Result<()> {
         self.direct.suspend()?;
-        self.render_domain.invalidate_presented_damage_history();
+        self.invalidate_presented_damage_history();
         Ok(())
     }
 }

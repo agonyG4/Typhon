@@ -161,6 +161,33 @@ state, prepares one exact job, clears the demand bit, and dispatches it. Resize
 configure/ACK state continues to advance and is never coalesced. This does not
 add a second prepared physical render job.
 
+## Phase 2B.2 implementation checkpoint
+
+The current checkout contains the bounded worker bootstrap, render command and
+completion payloads, renderer-control representation, and pure busy/demand
+state model. Worker bootstrap follows the required two-stage ownership path:
+EGL format discovery runs on `typhon-render`; the reactor then selects the
+KMS-compatible format, allocates physical BOs, and transfers owned render-slot
+descriptors back to that same worker for renderer initialization. The worker
+and transport payloads are qualified as naturally `Send`.
+
+Normal Atomic render dispatch and reactor-side completion settlement are not
+connected yet. Therefore `OBLIVION_ONE_RENDER_WORKER=auto` currently reports
+an automatic degradation and uses the synchronous transport, while `force`
+fails startup with an explicit error. This guard prevents a worker-owned EGL
+domain from being selected while `render_frame` still expects an immediate
+renderer result. Do not use `auto` as a worker A/B setting on this checkout.
+
+The remaining Phase 2B.2 work is to introduce the owned reactor continuation
+for the current `AtomicEglGbmScanout::render_frame` locals; resume the common
+Atomic outcome settlement from the worker eventfd path; register and drain the
+worker event source; and connect latest-state render demand before slot,
+transaction, frame-batch, and frozen-scene preparation. The same worker also
+needs asynchronous admission/completion for capture, trusted-effect reload,
+output candidate preparation/promotion, session rebind/quiescence, and ordered
+shutdown acknowledgement before physical pool release. Until these paths are
+connected and qualified, the only enabled runtime transport is synchronous.
+
 The three-slot bound covers output-frame terminal tokens. Other worker work
 uses separate fixed admission limits, not entries in an unbounded common queue:
 

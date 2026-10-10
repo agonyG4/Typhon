@@ -213,6 +213,8 @@ impl AtomicRenderDomainBootstrap {
             let (dmabuf_main_device_path, dmabuf_main_device) =
                 crate::egl_renderer::dmabuf::query_egl_main_device(egl, display)
                     .map_or((None, None), |(path, device)| (Some(path), Some(device)));
+            let lifecycle_animation_available = scene.lifecycle_animation_available();
+            let squash_animation_available = scene.squash_animation_available();
 
             Ok((
                 context,
@@ -225,6 +227,8 @@ impl AtomicRenderDomainBootstrap {
                     egl_vendor,
                     dmabuf_main_device,
                     dmabuf_main_device_path,
+                    lifecycle_animation_available,
+                    squash_animation_available,
                 },
             ))
         })();
@@ -264,6 +268,8 @@ pub(super) struct AtomicRenderDomainInfo {
     pub(super) egl_vendor: String,
     pub(super) dmabuf_main_device: Option<u64>,
     pub(super) dmabuf_main_device_path: Option<String>,
+    pub(super) lifecycle_animation_available: bool,
+    pub(super) squash_animation_available: bool,
 }
 
 /// Exclusive owner of EGL/GL execution state and imported output render slots.

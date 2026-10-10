@@ -24,6 +24,7 @@ mod kms_preferred;
 mod output_slot;
 #[allow(dead_code)] // Ownership primitives are wired into the explicit backend in Tasks 4 and 8.
 mod output_swapchain;
+mod render_worker;
 mod scaled_probe;
 mod worker;
 
