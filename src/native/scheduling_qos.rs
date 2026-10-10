@@ -9,6 +9,14 @@ use std::time::Duration;
 
 const REACTOR_RR_PRIORITY: i32 = 1;
 const HIGH_PRIORITY_NICE: i32 = -10;
+// Linux tracks RLIMIT_RTTIME in scheduler ticks and compares their converted
+// microsecond count with the soft and hard thresholds. The kernel checks hard
+// expiration before sending soft-limit SIGXCPU, so reserve at least two ticks
+// at generic HZ=100 (10ms each), then reserve 25% of longer finite limits for
+// signal delivery, scheduling, and the demotion syscall.
+const RTTIME_MIN_WARNING_HEADROOM_US: u64 = 20_000;
+const RTTIME_HARD_HEADROOM_NUMERATOR: u64 = 1;
+const RTTIME_HARD_HEADROOM_DENOMINATOR: u64 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SchedulingQosPolicy {
@@ -256,6 +264,14 @@ impl std::error::Error for RequiredReactorPolicyError {}
 
 trait SchedulingOperations {
     fn inspect(&mut self, tid: i32) -> Result<KernelSchedulingState, String>;
+    fn request_rtkit_high_priority_fair(&mut self, tid: i32, nice: i32) -> Result<(), String>;
+    fn request_direct_high_priority_fair(&mut self, tid: i32, nice: i32) -> Result<(), String>;
+    fn request_normal_fair(&mut self, tid: i32, nice: i32) -> Result<(), String>;
+    fn demotion_count(&self, tid: i32) -> u64;
+    fn rt_budget_overrun(&self, tid: i32) -> bool;
+}
+
+trait ReactorSchedulingOperations: SchedulingOperations {
     fn prepare_realtime_safety(&mut self, tid: i32) -> Result<(), String>;
     fn restore_realtime_safety(&mut self, tid: i32);
     fn request_realtime_round_robin(
@@ -264,40 +280,42 @@ trait SchedulingOperations {
         priority: i32,
         reset_on_fork: bool,
     ) -> Result<(), String>;
-    fn request_rtkit_high_priority_fair(&mut self, tid: i32, nice: i32) -> Result<(), String>;
-    fn request_direct_high_priority_fair(&mut self, tid: i32, nice: i32) -> Result<(), String>;
-    fn request_normal_fair(&mut self, tid: i32, nice: i32) -> Result<(), String>;
-    fn demotion_count(&self, tid: i32) -> u64;
-    fn rt_budget_overrun(&self, tid: i32) -> bool;
 }
 
+#[cfg(test)]
 fn configure_role(
     role: SchedulingThreadRole,
     mode: SchedulingQosPolicy,
     tid: i32,
     baseline_nice: i32,
-    ops: &mut impl SchedulingOperations,
+    ops: &mut impl ReactorSchedulingOperations,
 ) -> Result<SchedulingDiagnosticSnapshot, RequiredReactorPolicyError> {
     configure_role_with_rtkit(role, mode, tid, baseline_nice, true, ops)
 }
 
+#[cfg(test)]
 fn configure_role_with_rtkit(
     role: SchedulingThreadRole,
     mode: SchedulingQosPolicy,
     tid: i32,
     baseline_nice: i32,
     allow_reactor_rtkit: bool,
-    ops: &mut impl SchedulingOperations,
+    ops: &mut impl ReactorSchedulingOperations,
 ) -> Result<SchedulingDiagnosticSnapshot, RequiredReactorPolicyError> {
-    let requested_class = if mode == SchedulingQosPolicy::Off {
-        SchedulingClass::Normal
+    if role == SchedulingThreadRole::NativeReactor {
+        configure_reactor_policy_with_rtkit(mode, tid, baseline_nice, allow_reactor_rtkit, ops)
     } else {
-        SchedulingClass::requested_for(role, baseline_nice)
-    };
-    let mut degradation = Vec::new();
-    let mut backend = SchedulingBackend::Inherited;
+        Ok(configure_worker_policy(role, mode, tid, baseline_nice, ops))
+    }
+}
 
-    let mut effective = match ops.inspect(tid) {
+fn initial_kernel_state(
+    tid: i32,
+    baseline_nice: i32,
+    ops: &mut impl SchedulingOperations,
+    degradation: &mut Vec<String>,
+) -> KernelSchedulingState {
+    match ops.inspect(tid) {
         Ok(state) => state,
         Err(error) => {
             degradation.push(format!("initial scheduler query failed: {error}"));
@@ -308,170 +326,40 @@ fn configure_role_with_rtkit(
                 reset_on_fork: false,
             }
         }
+    }
+}
+
+fn configure_worker_policy(
+    role: SchedulingThreadRole,
+    mode: SchedulingQosPolicy,
+    tid: i32,
+    baseline_nice: i32,
+    ops: &mut impl SchedulingOperations,
+) -> SchedulingDiagnosticSnapshot {
+    assert_ne!(
+        role,
+        SchedulingThreadRole::NativeReactor,
+        "native reactor scheduling requires reactor-only authority"
+    );
+    let requested_class = if mode == SchedulingQosPolicy::Off {
+        SchedulingClass::Normal
+    } else {
+        SchedulingClass::requested_for(role, baseline_nice)
     };
+    let mut degradation = Vec::new();
+    let mut backend = SchedulingBackend::Inherited;
+    let mut effective = initial_kernel_state(tid, baseline_nice, ops, &mut degradation);
 
     if mode == SchedulingQosPolicy::Off {
-        return Ok(snapshot(
-            role,
-            tid,
-            requested_class,
-            effective,
-            backend,
-            ops,
-            None,
-        ));
+        return snapshot(role, tid, requested_class, effective, backend, ops, None);
     }
 
     match role {
-        SchedulingThreadRole::NativeReactor => {
-            let mut inherited_rr_safe = false;
-            if EffectiveSchedulingClass::from_kernel(effective)
-                .is_expected_reactor_rr(effective.reset_on_fork)
-            {
-                match ops.prepare_realtime_safety(tid) {
-                    Ok(()) => {
-                        backend = SchedulingBackend::Inherited;
-                        inherited_rr_safe = true;
-                    }
-                    Err(error) => {
-                        degradation
-                            .push(format!("inherited SCHED_RR safety setup failed: {error}"));
-                        let _ = ops.request_normal_fair(tid, baseline_nice);
-                        if let Ok(actual) = ops.inspect(tid) {
-                            effective = actual;
-                        }
-                        backend = SchedulingBackend::None;
-                    }
-                }
-            } else {
-                match ops.request_realtime_round_robin(tid, REACTOR_RR_PRIORITY, true) {
-                    Ok(()) => match ops.inspect(tid) {
-                        Ok(actual)
-                            if EffectiveSchedulingClass::from_kernel(actual)
-                                .is_expected_reactor_rr(actual.reset_on_fork) =>
-                        {
-                            effective = actual;
-                            backend = SchedulingBackend::Direct;
-                        }
-                        Ok(actual) => {
-                            degradation.push(format!(
-                                "SCHED_RR request did not verify (policy={} priority={} reset_on_fork={})",
-                                EffectiveSchedulingClass::from_kernel(actual).as_str(),
-                                actual.priority,
-                                actual.reset_on_fork
-                            ));
-                            // A successful syscall whose resulting state cannot
-                            // be verified must not leave either the RT policy or
-                            // its process-wide safety limit active while falling
-                            // back to FAIR.
-                            let _ = ops.request_normal_fair(tid, baseline_nice);
-                            ops.restore_realtime_safety(tid);
-                            effective = ops.inspect(tid).unwrap_or(actual);
-                        }
-                        Err(error) => {
-                            degradation.push(format!("SCHED_RR verification failed: {error}"));
-                            let _ = ops.request_normal_fair(tid, baseline_nice);
-                            ops.restore_realtime_safety(tid);
-                            if let Ok(actual) = ops.inspect(tid) {
-                                effective = actual;
-                            }
-                        }
-                    },
-                    Err(error) => {
-                        ops.restore_realtime_safety(tid);
-                        degradation.push(format!("direct SCHED_RR failed: {error}"));
-                    }
-                }
-            }
-
-            let has_verified_rr = inherited_rr_safe
-                || (backend == SchedulingBackend::Direct
-                    && EffectiveSchedulingClass::from_kernel(effective)
-                        .is_expected_reactor_rr(effective.reset_on_fork));
-            if has_verified_rr {
-                return Ok(snapshot(
-                    role,
-                    tid,
-                    requested_class,
-                    effective,
-                    backend,
-                    ops,
-                    None,
-                ));
-            }
-
-            // `require` means verified RR priority 1 with RESET_ON_FORK. Do not
-            // make a fair-policy mutation and then fail startup.
-            if mode == SchedulingQosPolicy::Require {
-                let reason = Some(join_reasons(&degradation, "required SCHED_RR unavailable"));
-                return Err(RequiredReactorPolicyError {
-                    snapshot: snapshot(
-                        role,
-                        tid,
-                        requested_class,
-                        effective,
-                        SchedulingBackend::None,
-                        ops,
-                        reason,
-                    ),
-                });
-            }
-
-            // RTKit realtime is deliberately excluded until descendant
-            // RLIMIT_RTTIME handling is safe. Its high-priority FAIR operation
-            // is an allowed, setup-only fallback.
-            let fair_nice = HIGH_PRIORITY_NICE;
-            let mut fallback_state = SchedulingFallbackState {
-                effective: &mut effective,
-                backend: &mut backend,
-                degradation: &mut degradation,
-            };
-            let fair_policy_acquired = if allow_reactor_rtkit {
-                request_and_verify_fair(
-                    ops,
-                    tid,
-                    fair_nice,
-                    baseline_nice,
-                    true,
-                    &mut fallback_state,
-                )
-            } else {
-                request_and_verify_direct_fair(
-                    ops,
-                    tid,
-                    fair_nice,
-                    baseline_nice,
-                    &mut fallback_state,
-                )
-            };
-            if fair_policy_acquired {
-                return Ok(snapshot(
-                    role,
-                    tid,
-                    requested_class,
-                    effective,
-                    backend,
-                    ops,
-                    Some(join_reasons(
-                        &degradation,
-                        "SCHED_RR unavailable; using FAIR",
-                    )),
-                ));
-            }
-        }
         SchedulingThreadRole::KmsCommit | SchedulingThreadRole::Render => {
             if EffectiveSchedulingClass::from_kernel(effective)
                 .is_fair_priority_above(baseline_nice)
             {
-                return Ok(snapshot(
-                    role,
-                    tid,
-                    requested_class,
-                    effective,
-                    SchedulingBackend::Inherited,
-                    ops,
-                    None,
-                ));
+                return snapshot(role, tid, requested_class, effective, backend, ops, None);
             }
             let mut fallback_state = SchedulingFallbackState {
                 effective: &mut effective,
@@ -488,9 +376,6 @@ fn configure_role_with_rtkit(
             );
         }
         SchedulingThreadRole::Background => {
-            // Background roles are explicitly ordinary. A role-specific
-            // background nice policy may be added later, but Phase 1 keeps the
-            // creator's ordinary nice value and never requests realtime.
             if !matches!(effective.policy, PolicyKind::Other) || effective.nice != baseline_nice {
                 if let Err(error) = ops.request_normal_fair(tid, baseline_nice) {
                     degradation.push(format!(
@@ -503,6 +388,7 @@ fn configure_role_with_rtkit(
                 backend = SchedulingBackend::Direct;
             }
         }
+        SchedulingThreadRole::NativeReactor => unreachable!(),
     }
 
     let is_high_fair =
@@ -521,7 +407,7 @@ fn configure_role_with_rtkit(
         Some(join_reasons(&degradation, "using ordinary SCHED_OTHER"))
     };
 
-    Ok(snapshot(
+    snapshot(
         role,
         tid,
         requested_class,
@@ -529,7 +415,353 @@ fn configure_role_with_rtkit(
         backend,
         ops,
         degradation_reason,
+    )
+}
+
+fn configure_reactor_policy(
+    mode: SchedulingQosPolicy,
+    tid: i32,
+    baseline_nice: i32,
+    ops: &mut impl ReactorSchedulingOperations,
+) -> Result<SchedulingDiagnosticSnapshot, RequiredReactorPolicyError> {
+    configure_reactor_policy_with_rtkit(mode, tid, baseline_nice, true, ops)
+}
+
+fn configure_reactor_policy_with_rtkit(
+    mode: SchedulingQosPolicy,
+    tid: i32,
+    baseline_nice: i32,
+    allow_reactor_rtkit: bool,
+    ops: &mut impl ReactorSchedulingOperations,
+) -> Result<SchedulingDiagnosticSnapshot, RequiredReactorPolicyError> {
+    let role = SchedulingThreadRole::NativeReactor;
+    let requested_class = if mode == SchedulingQosPolicy::Off {
+        SchedulingClass::Normal
+    } else {
+        SchedulingClass::requested_for(role, baseline_nice)
+    };
+    let mut degradation = Vec::new();
+    let mut effective = initial_kernel_state(tid, baseline_nice, ops, &mut degradation);
+    let mut backend = SchedulingBackend::Inherited;
+    if mode == SchedulingQosPolicy::Off {
+        return Ok(snapshot(
+            role,
+            tid,
+            requested_class,
+            effective,
+            backend,
+            ops,
+            None,
+        ));
+    }
+
+    let inherited_rr = EffectiveSchedulingClass::from_kernel(effective)
+        .is_expected_reactor_rr(effective.reset_on_fork);
+    let mut rr_is_verified = false;
+    let mut safety_is_active = false;
+    if inherited_rr {
+        match ops.prepare_realtime_safety(tid) {
+            Ok(()) => {
+                safety_is_active = true;
+                rr_is_verified = true;
+                backend = SchedulingBackend::Inherited;
+            }
+            Err(error) => {
+                degradation.push(format!("inherited SCHED_RR safety setup failed: {error}"));
+                normalize_reactor_for_fair_fallback(
+                    tid,
+                    baseline_nice,
+                    &mut effective,
+                    &mut degradation,
+                    &mut safety_is_active,
+                    ops,
+                );
+            }
+        }
+    } else {
+        match ops.prepare_realtime_safety(tid) {
+            Ok(()) => {
+                safety_is_active = true;
+                match ops.request_realtime_round_robin(tid, REACTOR_RR_PRIORITY, true) {
+                    Ok(()) => match ops.inspect(tid) {
+                        Ok(actual)
+                            if EffectiveSchedulingClass::from_kernel(actual)
+                                .is_expected_reactor_rr(actual.reset_on_fork) =>
+                        {
+                            effective = actual;
+                            backend = SchedulingBackend::Direct;
+                            rr_is_verified = true;
+                        }
+                        Ok(actual) => {
+                            degradation.push(format!(
+                                "SCHED_RR request did not verify (policy={} priority={} reset_on_fork={})",
+                                EffectiveSchedulingClass::from_kernel(actual).as_str(),
+                                actual.priority,
+                                actual.reset_on_fork
+                            ));
+                            effective = actual;
+                        }
+                        Err(error) => {
+                            degradation.push(format!("SCHED_RR verification failed: {error}"))
+                        }
+                    },
+                    Err(error) => degradation.push(format!("direct SCHED_RR failed: {error}")),
+                }
+            }
+            Err(error) => degradation.push(format!("direct SCHED_RR safety setup failed: {error}")),
+        }
+        if !rr_is_verified && safety_is_active {
+            normalize_reactor_for_fair_fallback(
+                tid,
+                baseline_nice,
+                &mut effective,
+                &mut degradation,
+                &mut safety_is_active,
+                ops,
+            );
+        }
+    }
+
+    if rr_is_verified {
+        return Ok(snapshot(
+            role,
+            tid,
+            requested_class,
+            effective,
+            backend,
+            ops,
+            None,
+        ));
+    }
+
+    if mode == SchedulingQosPolicy::Require {
+        let reason = Some(join_reasons(&degradation, "required SCHED_RR unavailable"));
+        return Err(RequiredReactorPolicyError {
+            snapshot: snapshot(
+                role,
+                tid,
+                requested_class,
+                effective,
+                SchedulingBackend::None,
+                ops,
+                reason,
+            ),
+        });
+    }
+
+    let mut fallback_state = SchedulingFallbackState {
+        effective: &mut effective,
+        backend: &mut backend,
+        degradation: &mut degradation,
+    };
+    let fair_policy_acquired = if allow_reactor_rtkit {
+        request_and_verify_fair(
+            ops,
+            tid,
+            HIGH_PRIORITY_NICE,
+            baseline_nice,
+            true,
+            &mut fallback_state,
+        )
+    } else {
+        request_and_verify_direct_fair(
+            ops,
+            tid,
+            HIGH_PRIORITY_NICE,
+            baseline_nice,
+            &mut fallback_state,
+        )
+    };
+    if fair_policy_acquired {
+        restore_reactor_safety_if_ordinary(tid, effective, &mut safety_is_active, ops);
+        return Ok(snapshot(
+            role,
+            tid,
+            requested_class,
+            effective,
+            backend,
+            ops,
+            Some(join_reasons(
+                &degradation,
+                "SCHED_RR unavailable; using FAIR",
+            )),
+        ));
+    }
+
+    if !matches!(effective.policy, PolicyKind::Other) || effective.nice != baseline_nice {
+        let _ = ops.request_normal_fair(tid, baseline_nice);
+        if let Ok(actual) = ops.inspect(tid) {
+            effective = actual;
+        }
+    }
+    restore_reactor_safety_if_ordinary(tid, effective, &mut safety_is_active, ops);
+    backend = SchedulingBackend::None;
+    Ok(snapshot(
+        role,
+        tid,
+        requested_class,
+        effective,
+        backend,
+        ops,
+        Some(join_reasons(&degradation, "using ordinary SCHED_OTHER")),
     ))
+}
+
+fn normalize_reactor_for_fair_fallback(
+    tid: i32,
+    baseline_nice: i32,
+    effective: &mut KernelSchedulingState,
+    degradation: &mut Vec<String>,
+    safety_is_active: &mut bool,
+    ops: &mut impl ReactorSchedulingOperations,
+) {
+    if let Err(error) = ops.request_normal_fair(tid, baseline_nice) {
+        degradation.push(format!(
+            "failed to normalize reactor before FAIR fallback: {error}"
+        ));
+    }
+    match ops.inspect(tid) {
+        Ok(actual) => *effective = actual,
+        Err(error) => degradation.push(format!("reactor normalization query failed: {error}")),
+    }
+    if matches!(effective.policy, PolicyKind::Other) {
+        restore_reactor_safety_if_ordinary(tid, *effective, safety_is_active, ops);
+    } else if *safety_is_active {
+        degradation.push(
+            "realtime safety remains active because reactor could not be normalized".to_owned(),
+        );
+    }
+}
+
+fn restore_reactor_safety_if_ordinary(
+    tid: i32,
+    effective: KernelSchedulingState,
+    safety_is_active: &mut bool,
+    ops: &mut impl ReactorSchedulingOperations,
+) {
+    if *safety_is_active && matches!(effective.policy, PolicyKind::Other) {
+        ops.restore_realtime_safety(tid);
+        *safety_is_active = false;
+    }
+}
+
+fn prepare_reactor_for_session_suspend(
+    tid: i32,
+    baseline_nice: i32,
+    ops: &mut impl ReactorSchedulingOperations,
+) -> Result<(), String> {
+    let mut state = ops.inspect(tid)?;
+    if matches!(
+        state.policy,
+        PolicyKind::RoundRobin | PolicyKind::Fifo | PolicyKind::Deadline
+    ) {
+        let request_error = ops.request_normal_fair(tid, baseline_nice).err();
+        state = ops.inspect(tid)?;
+        if !matches!(state.policy, PolicyKind::Other) {
+            return Err(format!(
+                "reactor remained {} at session suspend boundary (normalization: {})",
+                EffectiveSchedulingClass::from_kernel(state).as_str(),
+                request_error.unwrap_or_else(|| "request reported success".to_owned())
+            ));
+        }
+    }
+    if matches!(state.policy, PolicyKind::Other) {
+        // FAIR priority is safe across a potentially blocking DRM/session
+        // boundary. An RR budget is process-scoped and belongs only to this
+        // reactor, so retire it once RR has been verified absent.
+        ops.restore_realtime_safety(tid);
+        return Ok(());
+    }
+    Err("reactor scheduling state is unknown at session suspend boundary".to_owned())
+}
+
+fn reacquire_reactor_policy_after_suspend(
+    mode: SchedulingQosPolicy,
+    tid: i32,
+    baseline_nice: i32,
+    overrun: bool,
+    previous: Option<&SchedulingDiagnosticSnapshot>,
+    ops: &mut impl ReactorSchedulingOperations,
+) -> Result<SchedulingDiagnosticSnapshot, RequiredReactorPolicyError> {
+    let role = SchedulingThreadRole::NativeReactor;
+    let requested_class = if mode == SchedulingQosPolicy::Off {
+        SchedulingClass::Normal
+    } else {
+        SchedulingClass::requested_for(role, baseline_nice)
+    };
+    let mut degradation = Vec::new();
+    let mut effective = initial_kernel_state(tid, baseline_nice, ops, &mut degradation);
+
+    if overrun {
+        if matches!(
+            effective.policy,
+            PolicyKind::RoundRobin | PolicyKind::Fifo | PolicyKind::Deadline
+        ) {
+            let _ = ops.request_normal_fair(tid, baseline_nice);
+            match ops.inspect(tid) {
+                Ok(actual) => effective = actual,
+                Err(error) => {
+                    degradation.push(format!("post-overrun normalization failed: {error}"))
+                }
+            }
+        }
+        if matches!(effective.policy, PolicyKind::Other) {
+            ops.restore_realtime_safety(tid);
+        }
+        return Ok(snapshot(
+            role,
+            tid,
+            requested_class,
+            effective,
+            SchedulingBackend::None,
+            ops,
+            Some(join_reasons(
+                &degradation,
+                "RT budget overrun; realtime reacquisition suppressed",
+            )),
+        ));
+    }
+
+    if matches!(effective.policy, PolicyKind::Other) && effective.nice < baseline_nice {
+        return Ok(snapshot(
+            role,
+            tid,
+            previous
+                .map(|snapshot| snapshot.requested_class)
+                .unwrap_or(requested_class),
+            effective,
+            previous
+                .map(|snapshot| snapshot.backend)
+                .unwrap_or(SchedulingBackend::Inherited),
+            ops,
+            previous.and_then(|snapshot| snapshot.degradation_reason.clone()),
+        ));
+    }
+
+    configure_reactor_policy_with_rtkit(mode, tid, baseline_nice, false, ops)
+}
+
+fn prepare_reactor_for_shutdown(
+    tid: i32,
+    baseline_nice: i32,
+    ops: &mut impl ReactorSchedulingOperations,
+) -> Result<(), String> {
+    let request_result = ops.request_normal_fair(tid, baseline_nice);
+    let state = ops.inspect(tid)?;
+    if matches!(state.policy, PolicyKind::Other) {
+        ops.restore_realtime_safety(tid);
+    }
+    if !matches!(state.policy, PolicyKind::Other) || state.nice != baseline_nice {
+        return Err(format!(
+            "shutdown policy did not normalize to SCHED_OTHER nice {baseline_nice} (policy={} nice={}, request={})",
+            EffectiveSchedulingClass::from_kernel(state).as_str(),
+            state.nice,
+            request_result
+                .err()
+                .unwrap_or_else(|| "verified".to_owned())
+        ));
+    }
+    Ok(())
 }
 
 fn normalized_spawn_creator_state(
@@ -704,13 +936,45 @@ fn join_reasons(reasons: &[String], terminal: &str) -> String {
 
 const QOS_ENV: &str = "OBLIVION_ONE_SCHEDULING_QOS";
 const RT_BUDGET_US: u64 = 100_000;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RtTimeLimitSafetyError {
+    ZeroSoftBudget,
+    HardLimitTooSmall {
+        hard_us: u64,
+        required_headroom_us: u64,
+    },
+    SoftBudgetOutOfRange,
+}
+
+impl fmt::Display for RtTimeLimitSafetyError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ZeroSoftBudget => {
+                formatter.write_str("RLIMIT_RTTIME soft budget is zero; realtime disabled")
+            }
+            Self::HardLimitTooSmall {
+                hard_us,
+                required_headroom_us,
+            } => write!(
+                formatter,
+                "RLIMIT_RTTIME hard limit {hard_us}us cannot provide {required_headroom_us}us of SIGXCPU warning headroom; realtime disabled"
+            ),
+            Self::SoftBudgetOutOfRange => {
+                formatter.write_str("RLIMIT_RTTIME soft budget is out of range; realtime disabled")
+            }
+        }
+    }
+}
 const BROKER_QUEUE_CAPACITY: usize = 8;
 const BROKER_REPLY_TIMEOUT: Duration = Duration::from_millis(750);
 
 static MANAGER: OnceLock<QosManager> = OnceLock::new();
 static ACTIVE_REACTOR_TID: AtomicI32 = AtomicI32::new(0);
+static RT_BUDGET_REACTOR_TID: AtomicI32 = AtomicI32::new(0);
 static RT_BUDGET_OVERRUN: AtomicBool = AtomicBool::new(false);
 static RT_DEMOTION_COUNT: AtomicU64 = AtomicU64::new(0);
+static SIGXCPU_HANDLER_INSTALLED: AtomicBool = AtomicBool::new(false);
 
 struct BrokerRequest {
     tid: i32,
@@ -724,7 +988,6 @@ struct QosManager {
     original_rt_limit: Option<libc::rlimit>,
     broker: Mutex<Option<SyncSender<BrokerRequest>>>,
     snapshots: Mutex<BTreeMap<(SchedulingThreadRole, i32), SchedulingDiagnosticSnapshot>>,
-    saved_sigxcpu_action: Mutex<Option<libc::sigaction>>,
     saved_reactor_signal_mask: Mutex<Option<libc::sigset_t>>,
     budget_active: AtomicBool,
 }
@@ -757,7 +1020,6 @@ pub fn initialize_from_environment() -> Result<(), String> {
             original_rt_limit,
             broker: Mutex::new(None),
             snapshots: Mutex::new(BTreeMap::new()),
-            saved_sigxcpu_action: Mutex::new(None),
             saved_reactor_signal_mask: Mutex::new(None),
             budget_active: AtomicBool::new(false),
         })
@@ -781,6 +1043,9 @@ pub fn promote_current_reactor() -> Result<SchedulingDiagnosticSnapshot, Box<dyn
 {
     let manager = manager()?;
     let tid = unsafe { libc::gettid() };
+    if manager.policy != SchedulingQosPolicy::Off {
+        crate::compositor::pacing::prime_enabled_trace_sinks();
+    }
     // Take the registry while the current thread is still ordinary so
     // publishing verified RR state cannot block behind a lower-priority worker.
     let mut snapshots = manager
@@ -788,13 +1053,8 @@ pub fn promote_current_reactor() -> Result<SchedulingDiagnosticSnapshot, Box<dyn
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut operations = LinuxSchedulingOperations { manager };
-    let configured = configure_role(
-        SchedulingThreadRole::NativeReactor,
-        manager.policy,
-        tid,
-        manager.baseline_nice,
-        &mut operations,
-    );
+    let configured =
+        configure_reactor_policy(manager.policy, tid, manager.baseline_nice, &mut operations);
     match configured {
         Ok(snapshot) => {
             if !matches!(
@@ -804,9 +1064,7 @@ pub fn promote_current_reactor() -> Result<SchedulingDiagnosticSnapshot, Box<dyn
                 }
             ) || !snapshot.reset_on_fork_effective
             {
-                manager.restore_rt_budget();
-            } else {
-                ACTIVE_REACTOR_TID.store(tid, Ordering::SeqCst);
+                manager.restore_rt_budget_for_reactor(tid);
             }
             snapshots.insert((snapshot.role, snapshot.tid), snapshot.clone());
             Ok(snapshot)
@@ -816,8 +1074,11 @@ pub fn promote_current_reactor() -> Result<SchedulingDiagnosticSnapshot, Box<dyn
                 let tid = unsafe { libc::gettid() };
                 let _ = set_scheduler_other(tid);
                 let _ = set_nice(tid, manager.baseline_nice);
+                if matches!(inspect_kernel_state(tid), Ok(state) if matches!(state.policy, PolicyKind::Other))
+                {
+                    manager.restore_rt_budget_for_reactor(tid);
+                }
             }
-            manager.restore_rt_budget();
             snapshots.insert(
                 (error.snapshot.role, error.snapshot.tid),
                 error.snapshot.clone(),
@@ -835,28 +1096,6 @@ pub fn reacquire_current_reactor_after_session_resume()
     let manager = manager()?;
     let tid = unsafe { libc::gettid() };
     let mut operations = LinuxSchedulingOperations { manager };
-    if RT_BUDGET_OVERRUN.load(Ordering::Acquire) {
-        let effective = operations.inspect(tid).unwrap_or(KernelSchedulingState {
-            policy: PolicyKind::Unknown(-1),
-            priority: -1,
-            nice: manager.baseline_nice,
-            reset_on_fork: false,
-        });
-        let snapshot = snapshot(
-            SchedulingThreadRole::NativeReactor,
-            tid,
-            SchedulingClass::requested_for(
-                SchedulingThreadRole::NativeReactor,
-                manager.baseline_nice,
-            ),
-            effective,
-            SchedulingBackend::None,
-            &operations,
-            Some("RT budget overrun; realtime reacquisition suppressed".to_owned()),
-        );
-        manager.record(snapshot.clone());
-        return Ok(snapshot);
-    }
     let mode = if manager.policy == SchedulingQosPolicy::Require {
         SchedulingQosPolicy::Auto
     } else {
@@ -868,28 +1107,45 @@ pub fn reacquire_current_reactor_after_session_resume()
         .snapshots
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let snapshot = configure_role_with_rtkit(
-        SchedulingThreadRole::NativeReactor,
+    let previous = snapshots
+        .get(&(SchedulingThreadRole::NativeReactor, tid))
+        .cloned();
+    let snapshot = reacquire_reactor_policy_after_suspend(
         mode,
         tid,
         manager.baseline_nice,
-        false,
+        RT_BUDGET_OVERRUN.load(Ordering::Acquire),
+        previous.as_ref(),
         &mut operations,
     )
     .map_err(|error| Box::new(error) as Box<dyn std::error::Error>)?;
-    if snapshot
+    if !snapshot
         .effective_class
         .is_expected_reactor_rr(snapshot.reset_on_fork_effective)
     {
-        ACTIVE_REACTOR_TID.store(tid, Ordering::SeqCst);
-    } else {
-        manager.restore_rt_budget();
+        manager.restore_rt_budget_for_reactor(tid);
     }
     snapshots.insert((snapshot.role, snapshot.tid), snapshot.clone());
     Ok(snapshot)
 }
 
-/// Demote before controlled shutdown joins or emergency teardown.
+/// Retain safe FAIR priority over a session boundary while removing RR.
+pub fn prepare_current_reactor_for_session_suspend() -> Result<(), String> {
+    let Some(manager) = MANAGER.get() else {
+        return Ok(());
+    };
+    if manager.policy == SchedulingQosPolicy::Off {
+        return Ok(());
+    }
+    let tid = unsafe { libc::gettid() };
+    let mut operations = LinuxSchedulingOperations { manager };
+    let previous = try_reactor_snapshot(manager, tid);
+    prepare_reactor_for_session_suspend(tid, manager.baseline_nice, &mut operations)?;
+    update_reactor_snapshot(manager, tid, previous);
+    Ok(())
+}
+
+/// Normalize elevated FAIR priority and remove the RT budget before shutdown joins.
 pub fn demote_current_reactor() {
     let Some(manager) = MANAGER.get() else {
         return;
@@ -899,23 +1155,39 @@ pub fn demote_current_reactor() {
     }
     let tid = unsafe { libc::gettid() };
     let mut operations = LinuxSchedulingOperations { manager };
-    let _ = operations.request_normal_fair(tid, manager.baseline_nice);
-    ACTIVE_REACTOR_TID.store(0, Ordering::SeqCst);
-    manager.restore_rt_budget();
-    if let Ok(state) = operations.inspect(tid) {
-        let previous = manager.snapshots.lock().ok().and_then(|snapshots| {
-            snapshots
-                .get(&(SchedulingThreadRole::NativeReactor, tid))
-                .cloned()
-        });
-        if let Some(mut snapshot) = previous {
-            snapshot.effective_class = EffectiveSchedulingClass::from_kernel(state);
-            snapshot.effective_priority = state.priority;
-            snapshot.effective_nice = state.nice;
-            snapshot.demotion_count = RT_DEMOTION_COUNT.load(Ordering::Relaxed);
-            snapshot.rt_budget_overrun = RT_BUDGET_OVERRUN.load(Ordering::Relaxed);
-            manager.record(snapshot);
-        }
+    let previous = try_reactor_snapshot(manager, tid);
+    if let Err(error) = prepare_reactor_for_shutdown(tid, manager.baseline_nice, &mut operations) {
+        eprintln!("scheduling QoS: reactor shutdown normalization failed: {error}");
+    }
+    update_reactor_snapshot(manager, tid, previous);
+}
+
+fn update_reactor_snapshot(
+    manager: &QosManager,
+    tid: i32,
+    previous: Option<SchedulingDiagnosticSnapshot>,
+) {
+    if let (Some(mut snapshot), Ok(state)) = (previous, inspect_kernel_state(tid)) {
+        snapshot.effective_class = EffectiveSchedulingClass::from_kernel(state);
+        snapshot.effective_priority = state.priority;
+        snapshot.effective_nice = state.nice;
+        snapshot.reset_on_fork_effective = state.reset_on_fork;
+        snapshot.demotion_count = RT_DEMOTION_COUNT.load(Ordering::Relaxed);
+        snapshot.rt_budget_overrun = RT_BUDGET_OVERRUN.load(Ordering::Relaxed);
+        manager.record(snapshot);
+    }
+}
+
+fn try_reactor_snapshot(manager: &QosManager, tid: i32) -> Option<SchedulingDiagnosticSnapshot> {
+    match manager.snapshots.try_lock() {
+        Ok(snapshots) => snapshots
+            .get(&(SchedulingThreadRole::NativeReactor, tid))
+            .cloned(),
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned
+            .into_inner()
+            .get(&(SchedulingThreadRole::NativeReactor, tid))
+            .cloned(),
+        Err(std::sync::TryLockError::WouldBlock) => None,
     }
 }
 
@@ -927,8 +1199,7 @@ pub fn observe_rt_budget_event() -> bool {
     if !RT_BUDGET_OVERRUN.load(Ordering::Relaxed) {
         return false;
     }
-    ACTIVE_REACTOR_TID.store(0, Ordering::SeqCst);
-    manager.restore_rt_budget();
+    manager.restore_rt_budget_for_reactor(current_tid().unwrap_or(0));
     if let Ok(tid) = current_tid()
         && let Ok(state) = inspect_kernel_state(tid)
         && let Ok(mut snapshots) = manager.snapshots.try_lock()
@@ -962,17 +1233,21 @@ impl Drop for RoleRegistration {
 
 /// Configure a worker from inside that worker before it begins role work.
 pub fn register_current_thread_role(role: SchedulingThreadRole) -> RoleRegistration {
+    assert_ne!(
+        role,
+        SchedulingThreadRole::NativeReactor,
+        "reactor must use reactor-only scheduling authority"
+    );
     let tid = unsafe { libc::gettid() };
     if let Some(manager) = MANAGER.get() {
         let mut operations = LinuxSchedulingOperations { manager };
-        let snapshot = configure_role(
+        let snapshot = configure_worker_policy(
             role,
             manager.policy,
             tid,
             manager.baseline_nice,
             &mut operations,
-        )
-        .unwrap_or_else(|error| error.snapshot);
+        );
         manager.record(snapshot);
     }
     RoleRegistration { role, tid }
@@ -981,6 +1256,11 @@ pub fn register_current_thread_role(role: SchedulingThreadRole) -> RoleRegistrat
 /// Create a classified helper. A realtime creator is temporarily normalized
 /// before pthread creation so the child inherits SCHED_OTHER before Rust
 /// starts it. The child trampoline normalizes inherited nice before role work.
+///
+/// When called by the reactor after promotion, this briefly removes its RR
+/// starvation protection while pthread creation runs. Runtime call sites must
+/// therefore be limited to optional lazy helpers; latency-relevant workers
+/// should be created during bootstrap or while the reactor is demoted.
 pub fn spawn_background<T, F>(name: &'static str, work: F) -> io::Result<JoinHandle<T>>
 where
     T: Send + 'static,
@@ -998,6 +1278,11 @@ where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
 {
+    if role == SchedulingThreadRole::NativeReactor {
+        return Err(io::Error::other(
+            "the native reactor must be initialized by its runtime owner, not spawned as a helper",
+        ));
+    }
     let spawn = || {
         thread::Builder::new().name(name.to_owned()).spawn(move || {
             if let Some(manager) = MANAGER.get()
@@ -1051,7 +1336,7 @@ fn with_normalized_thread_creator<T>(
 
     let spawned = spawn();
     if can_restore_rt && ACTIVE_REACTOR_TID.load(Ordering::Acquire) != tid {
-        manager.restore_rt_budget();
+        manager.restore_rt_budget_for_reactor(tid);
         record_reactor_degradation(
             manager,
             tid,
@@ -1076,7 +1361,7 @@ fn with_normalized_thread_creator<T>(
         let _ = set_scheduler_other(tid);
         let _ = set_nice(tid, manager.baseline_nice);
         if can_restore_rt {
-            manager.restore_rt_budget();
+            manager.restore_rt_budget_for_reactor(tid);
         }
         record_reactor_degradation(
             manager,
@@ -1091,7 +1376,7 @@ fn with_normalized_thread_creator<T>(
     if can_restore_rt && ACTIVE_REACTOR_TID.load(Ordering::Acquire) != tid {
         let _ = set_scheduler_other(tid);
         let _ = set_nice(tid, manager.baseline_nice);
-        manager.restore_rt_budget();
+        manager.restore_rt_budget_for_reactor(tid);
         record_reactor_degradation(
             manager,
             tid,
@@ -1274,14 +1559,23 @@ impl QosManager {
     }
 
     fn prepare_rt_budget(&self, tid: i32) -> Result<(), String> {
+        if RT_BUDGET_OVERRUN.load(Ordering::Acquire) {
+            return Err("previous RT budget overrun permanently disabled realtime".to_owned());
+        }
         if self.budget_active.load(Ordering::Acquire) {
-            ACTIVE_REACTOR_TID.store(tid, Ordering::SeqCst);
-            return Ok(());
+            if RT_BUDGET_REACTOR_TID.load(Ordering::Acquire) == tid
+                && !RT_BUDGET_OVERRUN.load(Ordering::Acquire)
+                && ACTIVE_REACTOR_TID.load(Ordering::Acquire) == tid
+            {
+                return Ok(());
+            }
+            return Err("realtime safety budget is owned by another or demoted reactor".to_owned());
         }
         let original_rt_limit = self
             .original_rt_limit
             .ok_or_else(|| "RLIMIT_RTTIME could not be queried; realtime disabled".to_owned())?;
-        let guarded = guarded_rt_limit(original_rt_limit, RT_BUDGET_US)?;
+        let guarded =
+            guarded_rt_limit(original_rt_limit, RT_BUDGET_US).map_err(|e| e.to_string())?;
         let mut signal_set = unsafe { std::mem::zeroed::<libc::sigset_t>() };
         if unsafe { libc::sigemptyset(&mut signal_set) } != 0
             || unsafe { libc::sigaddset(&mut signal_set, libc::SIGXCPU) } != 0
@@ -1301,26 +1595,18 @@ impl QosManager {
             ));
         }
 
-        let mut previous = unsafe { std::mem::zeroed::<libc::sigaction>() };
-        let mut action = unsafe { std::mem::zeroed::<libc::sigaction>() };
-        action.sa_sigaction = sigxcpu_demote as *const () as usize;
-        action.sa_flags = libc::SA_RESTART;
-        unsafe { libc::sigemptyset(&mut action.sa_mask) };
-        // SAFETY: The handler only performs lock-free atomic operations and a
-        // direct scheduler syscall. SIGXCPU is not owned by the runtime signalfd.
-        if unsafe { libc::sigaction(libc::SIGXCPU, &action, &mut previous) } != 0 {
+        // SIGXCPU is process-directed. Keep Typhon's demotion action installed
+        // for the process lifetime so a pending group signal cannot observe a
+        // restored default disposition during teardown.
+        if let Err(error) = install_sigxcpu_handler() {
             unsafe {
                 libc::pthread_sigmask(libc::SIG_SETMASK, &previous_mask, std::ptr::null_mut());
             }
-            return Err(format!(
-                "cannot install SIGXCPU fail-safe: {}",
-                io::Error::last_os_error()
-            ));
+            return Err(error);
         }
         if unsafe { libc::setrlimit(libc::RLIMIT_RTTIME, &guarded) } != 0 {
             let error = io::Error::last_os_error();
             unsafe {
-                libc::sigaction(libc::SIGXCPU, &previous, std::ptr::null_mut());
                 libc::pthread_sigmask(libc::SIG_SETMASK, &previous_mask, std::ptr::null_mut());
             }
             return Err(format!(
@@ -1332,33 +1618,18 @@ impl QosManager {
             Err(_) => {
                 unsafe {
                     libc::setrlimit(libc::RLIMIT_RTTIME, &original_rt_limit);
-                    libc::sigaction(libc::SIGXCPU, &previous, std::ptr::null_mut());
                     libc::pthread_sigmask(libc::SIG_SETMASK, &previous_mask, std::ptr::null_mut());
                 }
                 return Err("SIGXCPU signal-mask state is poisoned".to_owned());
             }
         }
-        match self.saved_sigxcpu_action.lock() {
-            Ok(mut saved) => *saved = Some(previous),
-            Err(_) => {
-                if let Ok(mut saved_mask) = self.saved_reactor_signal_mask.lock() {
-                    saved_mask.take();
-                }
-                unsafe {
-                    libc::setrlimit(libc::RLIMIT_RTTIME, &original_rt_limit);
-                    libc::sigaction(libc::SIGXCPU, &previous, std::ptr::null_mut());
-                    libc::pthread_sigmask(libc::SIG_SETMASK, &previous_mask, std::ptr::null_mut());
-                }
-                return Err("SIGXCPU handler state is poisoned".to_owned());
-            }
-        }
-        RT_BUDGET_OVERRUN.store(false, Ordering::Relaxed);
         ACTIVE_REACTOR_TID.store(tid, Ordering::SeqCst);
+        RT_BUDGET_REACTOR_TID.store(tid, Ordering::SeqCst);
         self.budget_active.store(true, Ordering::Release);
         let unblock_result =
             unsafe { libc::pthread_sigmask(libc::SIG_UNBLOCK, &signal_set, std::ptr::null_mut()) };
         if unblock_result != 0 {
-            self.restore_rt_budget();
+            self.restore_rt_budget_for_reactor(tid);
             return Err(format!(
                 "cannot unblock SIGXCPU for the realtime reactor: {}",
                 io::Error::from_raw_os_error(unblock_result)
@@ -1367,11 +1638,15 @@ impl QosManager {
         Ok(())
     }
 
-    fn restore_rt_budget(&self) {
+    fn restore_rt_budget_for_reactor(&self, tid: i32) {
+        if tid <= 0 || RT_BUDGET_REACTOR_TID.load(Ordering::Acquire) != tid {
+            return;
+        }
+        let _ = ACTIVE_REACTOR_TID.compare_exchange(tid, 0, Ordering::SeqCst, Ordering::Relaxed);
         if !self.budget_active.swap(false, Ordering::AcqRel) {
             return;
         }
-        ACTIVE_REACTOR_TID.store(0, Ordering::SeqCst);
+        RT_BUDGET_REACTOR_TID.store(0, Ordering::SeqCst);
         let mut signal_set = unsafe { std::mem::zeroed::<libc::sigset_t>() };
         if unsafe { libc::sigemptyset(&mut signal_set) } == 0
             && unsafe { libc::sigaddset(&mut signal_set, libc::SIGXCPU) } == 0
@@ -1394,20 +1669,11 @@ impl QosManager {
                 io::Error::last_os_error()
             );
         }
-        if let Ok(mut saved) = self.saved_sigxcpu_action.lock()
-            && let Some(previous) = saved.take()
-            && unsafe { libc::sigaction(libc::SIGXCPU, &previous, std::ptr::null_mut()) } != 0
-        {
-            eprintln!(
-                "scheduling QoS: failed to restore SIGXCPU action: {}",
-                io::Error::last_os_error()
-            );
-        }
         if let Ok(mut saved_mask) = self.saved_reactor_signal_mask.lock()
             && let Some(previous_mask) = saved_mask.take()
         {
-            // Restore the prior action before unblocking/restoring the prior
-            // mask so a pending SIGXCPU follows the process's original policy.
+            // The fail-safe disposition remains installed. If SIGXCPU became
+            // pending while blocked, its handler now sees no active reactor.
             let mask_result = unsafe {
                 libc::pthread_sigmask(libc::SIG_SETMASK, &previous_mask, std::ptr::null_mut())
             };
@@ -1421,6 +1687,26 @@ impl QosManager {
     }
 }
 
+fn install_sigxcpu_handler() -> Result<(), String> {
+    if SIGXCPU_HANDLER_INSTALLED.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    let mut action = unsafe { std::mem::zeroed::<libc::sigaction>() };
+    action.sa_sigaction = sigxcpu_demote as *const () as usize;
+    action.sa_flags = libc::SA_RESTART;
+    unsafe { libc::sigemptyset(&mut action.sa_mask) };
+    // SAFETY: The handler only performs lock-free atomic operations and a
+    // direct scheduler syscall. SIGXCPU is not owned by the runtime signalfd.
+    if unsafe { libc::sigaction(libc::SIGXCPU, &action, std::ptr::null_mut()) } != 0 {
+        return Err(format!(
+            "cannot install SIGXCPU fail-safe: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    SIGXCPU_HANDLER_INSTALLED.store(true, Ordering::Release);
+    Ok(())
+}
+
 struct LinuxSchedulingOperations<'a> {
     manager: &'a QosManager,
 }
@@ -1430,12 +1716,38 @@ impl SchedulingOperations for LinuxSchedulingOperations<'_> {
         inspect_kernel_state(tid)
     }
 
+    fn request_rtkit_high_priority_fair(&mut self, tid: i32, nice: i32) -> Result<(), String> {
+        set_scheduler_other(tid)?;
+        set_nice(tid, self.manager.baseline_nice)?;
+        self.manager.request_rtkit_high_priority_fair(tid, nice)
+    }
+
+    fn request_direct_high_priority_fair(&mut self, tid: i32, nice: i32) -> Result<(), String> {
+        set_scheduler_other(tid)?;
+        set_nice(tid, nice)
+    }
+
+    fn request_normal_fair(&mut self, tid: i32, nice: i32) -> Result<(), String> {
+        set_scheduler_other(tid)?;
+        set_nice(tid, nice)
+    }
+
+    fn demotion_count(&self, _tid: i32) -> u64 {
+        RT_DEMOTION_COUNT.load(Ordering::Relaxed)
+    }
+
+    fn rt_budget_overrun(&self, _tid: i32) -> bool {
+        RT_BUDGET_OVERRUN.load(Ordering::Relaxed)
+    }
+}
+
+impl ReactorSchedulingOperations for LinuxSchedulingOperations<'_> {
     fn prepare_realtime_safety(&mut self, tid: i32) -> Result<(), String> {
         self.manager.prepare_rt_budget(tid)
     }
 
-    fn restore_realtime_safety(&mut self, _tid: i32) {
-        self.manager.restore_rt_budget();
+    fn restore_realtime_safety(&mut self, tid: i32) {
+        self.manager.restore_rt_budget_for_reactor(tid);
     }
 
     fn request_realtime_round_robin(
@@ -1444,6 +1756,9 @@ impl SchedulingOperations for LinuxSchedulingOperations<'_> {
         priority: i32,
         reset_on_fork: bool,
     ) -> Result<(), String> {
+        if RT_BUDGET_OVERRUN.load(Ordering::Acquire) {
+            return Err("RLIMIT_RTTIME overrun disabled realtime scheduling".to_owned());
+        }
         let minimum = unsafe { libc::sched_get_priority_min(libc::SCHED_RR) };
         if minimum < 0 {
             return Err(format!(
@@ -1465,39 +1780,16 @@ impl SchedulingOperations for LinuxSchedulingOperations<'_> {
             } else {
                 0
             };
-        self.manager.prepare_rt_budget(tid)?;
         if unsafe { libc::sched_setscheduler(tid, policy, &parameter) } != 0 {
-            let error = io::Error::last_os_error().to_string();
-            return Err(error);
+            return Err(io::Error::last_os_error().to_string());
+        }
+        if RT_BUDGET_OVERRUN.load(Ordering::Acquire) {
+            if set_scheduler_other(tid).is_err() {
+                unsafe { libc::_exit(128 + libc::SIGXCPU) };
+            }
+            return Err("RLIMIT_RTTIME overrun raced with realtime acquisition".to_owned());
         }
         Ok(())
-    }
-
-    fn request_rtkit_high_priority_fair(&mut self, tid: i32, nice: i32) -> Result<(), String> {
-        set_scheduler_other(tid)?;
-        self.manager.restore_rt_budget();
-        set_nice(tid, self.manager.baseline_nice)?;
-        self.manager.request_rtkit_high_priority_fair(tid, nice)
-    }
-
-    fn request_direct_high_priority_fair(&mut self, tid: i32, nice: i32) -> Result<(), String> {
-        set_scheduler_other(tid)?;
-        self.manager.restore_rt_budget();
-        set_nice(tid, nice)
-    }
-
-    fn request_normal_fair(&mut self, tid: i32, nice: i32) -> Result<(), String> {
-        set_scheduler_other(tid)?;
-        self.manager.restore_rt_budget();
-        set_nice(tid, nice)
-    }
-
-    fn demotion_count(&self, _tid: i32) -> u64 {
-        RT_DEMOTION_COUNT.load(Ordering::Relaxed)
-    }
-
-    fn rt_budget_overrun(&self, _tid: i32) -> bool {
-        RT_BUDGET_OVERRUN.load(Ordering::Relaxed)
     }
 }
 
@@ -1571,11 +1863,27 @@ fn make_thread_high_priority(tid: i32, requested_nice: i32) -> Result<i32, Strin
     })
 }
 
-extern "C" fn sigxcpu_demote(_signal: libc::c_int) {
-    let tid = ACTIVE_REACTOR_TID.swap(0, Ordering::Relaxed);
+fn claim_reactor_for_sigxcpu(
+    active_reactor_tid: &AtomicI32,
+    budget_overrun: &AtomicBool,
+) -> Option<i32> {
+    let tid = active_reactor_tid.load(Ordering::SeqCst);
     if tid <= 0 {
-        return;
+        return None;
     }
+    // Publish the sticky failure before revoking the target. A concurrent
+    // resume must not re-arm RR after observing that the signal handler has
+    // already claimed and is demoting this TID.
+    budget_overrun.store(true, Ordering::SeqCst);
+    active_reactor_tid
+        .compare_exchange(tid, 0, Ordering::SeqCst, Ordering::Relaxed)
+        .ok()
+}
+
+extern "C" fn sigxcpu_demote(_signal: libc::c_int) {
+    let Some(tid) = claim_reactor_for_sigxcpu(&ACTIVE_REACTOR_TID, &RT_BUDGET_OVERRUN) else {
+        return;
+    };
     let parameter = libc::sched_param { sched_priority: 0 };
     // SAFETY: Linux syscall used directly from the signal path; no allocation,
     // Rust mutex, logging, filesystem, or D-Bus activity occurs here.
@@ -1590,7 +1898,6 @@ extern "C" fn sigxcpu_demote(_signal: libc::c_int) {
     if result < 0 {
         unsafe { libc::_exit(128 + libc::SIGXCPU) };
     }
-    RT_BUDGET_OVERRUN.store(true, Ordering::Relaxed);
     RT_DEMOTION_COUNT.fetch_add(1, Ordering::Relaxed);
 }
 
@@ -1670,13 +1977,42 @@ fn get_rt_limit() -> Result<libc::rlimit, String> {
     Ok(limit)
 }
 
-fn guarded_rt_limit(original: libc::rlimit, budget_us: u64) -> Result<libc::rlimit, String> {
-    let requested = libc::rlim_t::try_from(budget_us).unwrap_or(libc::RLIM_INFINITY);
+fn required_rttime_warning_headroom(hard_us: u64) -> u64 {
+    hard_us
+        .saturating_mul(RTTIME_HARD_HEADROOM_NUMERATOR)
+        .div_ceil(RTTIME_HARD_HEADROOM_DENOMINATOR)
+        .max(RTTIME_MIN_WARNING_HEADROOM_US)
+}
+
+fn guarded_rt_limit(
+    original: libc::rlimit,
+    budget_us: u64,
+) -> Result<libc::rlimit, RtTimeLimitSafetyError> {
+    let requested = libc::rlim_t::try_from(budget_us)
+        .map_err(|_| RtTimeLimitSafetyError::SoftBudgetOutOfRange)?;
     let mut guarded = original;
-    guarded.rlim_cur = original.rlim_cur.min(original.rlim_max).min(requested);
-    if guarded.rlim_cur == 0 {
-        return Err("RLIMIT_RTTIME soft budget is zero; realtime disabled".to_owned());
+    let mut soft = original.rlim_cur.min(requested);
+
+    if original.rlim_max != libc::RLIM_INFINITY {
+        let hard_wide = u128::from(original.rlim_max);
+        let hard_us =
+            u64::try_from(hard_wide).map_err(|_| RtTimeLimitSafetyError::SoftBudgetOutOfRange)?;
+        let required_headroom_us = required_rttime_warning_headroom(hard_us);
+        if hard_us <= required_headroom_us {
+            return Err(RtTimeLimitSafetyError::HardLimitTooSmall {
+                hard_us,
+                required_headroom_us,
+            });
+        }
+        let safe_soft_max = libc::rlim_t::try_from(hard_us - required_headroom_us)
+            .map_err(|_| RtTimeLimitSafetyError::SoftBudgetOutOfRange)?;
+        soft = soft.min(safe_soft_max);
     }
+
+    if soft == 0 {
+        return Err(RtTimeLimitSafetyError::ZeroSoftBudget);
+    }
+    guarded.rlim_cur = soft;
     Ok(guarded)
 }
 
@@ -1690,11 +2026,17 @@ mod tests {
         rr_result: Result<(), &'static str>,
         rtkit_result: Result<(), &'static str>,
         direct_fair_result: Result<(), &'static str>,
+        safety_result: Result<(), &'static str>,
+        fair_effective_nice: Option<i32>,
         rr_applies: bool,
         rr_mutations: usize,
         fair_mutations: Vec<SchedulingBackend>,
         normal_mutations: usize,
         safety_restores: usize,
+        rt_budget_active: bool,
+        active_reactor_tid: i32,
+        budget_reactor_tid: i32,
+        sigxcpu_handler_installed: bool,
         demotions: u64,
         overrun: bool,
     }
@@ -1711,11 +2053,17 @@ mod tests {
                 rr_result: Ok(()),
                 rtkit_result: Err("RTKit unavailable"),
                 direct_fair_result: Err("setpriority denied"),
+                safety_result: Ok(()),
+                fair_effective_nice: None,
                 rr_applies: true,
                 rr_mutations: 0,
                 fair_mutations: Vec::new(),
                 normal_mutations: 0,
                 safety_restores: 0,
+                rt_budget_active: false,
+                active_reactor_tid: 0,
+                budget_reactor_tid: 0,
+                sigxcpu_handler_installed: false,
                 demotions: 0,
                 overrun: false,
             }
@@ -1727,7 +2075,7 @@ mod tests {
                 SchedulingBackend::Direct => self.direct_fair_result = Ok(()),
                 _ => unreachable!(),
             }
-            self.state.nice = nice;
+            self.fair_effective_nice = Some(nice);
             self
         }
     }
@@ -1737,49 +2085,26 @@ mod tests {
             Ok(self.state)
         }
 
-        fn prepare_realtime_safety(&mut self, _tid: i32) -> Result<(), String> {
-            Ok(())
-        }
-
-        fn restore_realtime_safety(&mut self, _tid: i32) {
-            self.safety_restores += 1;
-        }
-
-        fn request_realtime_round_robin(
-            &mut self,
-            _tid: i32,
-            priority: i32,
-            reset_on_fork: bool,
-        ) -> Result<(), String> {
-            self.rr_mutations += 1;
-            self.rr_result.map_err(str::to_owned)?;
-            if self.rr_applies {
-                self.state = KernelSchedulingState {
-                    policy: PolicyKind::RoundRobin,
-                    priority,
-                    nice: self.state.nice,
-                    reset_on_fork,
-                };
-            }
-            Ok(())
-        }
-
-        fn request_rtkit_high_priority_fair(
-            &mut self,
-            _tid: i32,
-            _nice: i32,
-        ) -> Result<(), String> {
+        fn request_rtkit_high_priority_fair(&mut self, _tid: i32, nice: i32) -> Result<(), String> {
             self.fair_mutations.push(SchedulingBackend::RealtimeKit);
-            self.rtkit_result.map_err(str::to_owned)
+            self.rtkit_result.map_err(str::to_owned)?;
+            self.state.nice = self
+                .fair_effective_nice
+                .unwrap_or_else(|| self.state.nice.min(nice));
+            Ok(())
         }
 
         fn request_direct_high_priority_fair(
             &mut self,
             _tid: i32,
-            _nice: i32,
+            nice: i32,
         ) -> Result<(), String> {
             self.fair_mutations.push(SchedulingBackend::Direct);
-            self.direct_fair_result.map_err(str::to_owned)
+            self.direct_fair_result.map_err(str::to_owned)?;
+            self.state.nice = self
+                .fair_effective_nice
+                .unwrap_or_else(|| self.state.nice.min(nice));
+            Ok(())
         }
 
         fn request_normal_fair(&mut self, _tid: i32, nice: i32) -> Result<(), String> {
@@ -1802,43 +2127,162 @@ mod tests {
         }
     }
 
+    impl ReactorSchedulingOperations for FakeOps {
+        fn prepare_realtime_safety(&mut self, tid: i32) -> Result<(), String> {
+            self.safety_result.map_err(str::to_owned)?;
+            if self.rt_budget_active && self.active_reactor_tid != tid {
+                return Err("reactor safety owned by another TID".to_owned());
+            }
+            self.rt_budget_active = true;
+            self.active_reactor_tid = tid;
+            self.budget_reactor_tid = tid;
+            self.sigxcpu_handler_installed = true;
+            Ok(())
+        }
+
+        fn restore_realtime_safety(&mut self, tid: i32) {
+            if self.rt_budget_active && self.budget_reactor_tid == tid {
+                self.safety_restores += 1;
+                self.rt_budget_active = false;
+                self.active_reactor_tid = 0;
+                self.budget_reactor_tid = 0;
+            }
+        }
+
+        fn request_realtime_round_robin(
+            &mut self,
+            _tid: i32,
+            priority: i32,
+            reset_on_fork: bool,
+        ) -> Result<(), String> {
+            self.rr_mutations += 1;
+            self.rr_result.map_err(str::to_owned)?;
+            if self.rr_applies {
+                self.state = KernelSchedulingState {
+                    policy: PolicyKind::RoundRobin,
+                    priority,
+                    nice: self.state.nice,
+                    reset_on_fork,
+                };
+            }
+            Ok(())
+        }
+    }
+
     #[test]
-    fn realtime_budget_only_lowers_soft_limit_and_respects_existing_limits() {
+    fn infinite_hard_limit_caps_soft_budget_at_requested_budget() {
         let original = libc::rlimit {
-            rlim_cur: 500_000,
-            rlim_max: 1_000_000,
+            rlim_cur: libc::RLIM_INFINITY,
+            rlim_max: libc::RLIM_INFINITY,
         };
         let guarded = guarded_rt_limit(original, RT_BUDGET_US).unwrap();
+
+        assert_eq!(guarded.rlim_cur, RT_BUDGET_US as libc::rlim_t);
+        assert_eq!(guarded.rlim_max, libc::RLIM_INFINITY);
+    }
+
+    #[test]
+    fn finite_hard_above_requested_budget_preserves_requested_soft_budget() {
+        let original = libc::rlimit {
+            rlim_cur: libc::RLIM_INFINITY,
+            rlim_max: 200_000,
+        };
+        let guarded = guarded_rt_limit(original, RT_BUDGET_US).unwrap();
+
         assert_eq!(guarded.rlim_cur, RT_BUDGET_US as libc::rlim_t);
         assert_eq!(guarded.rlim_max, original.rlim_max);
+    }
 
-        let smaller_soft = libc::rlimit {
-            rlim_cur: 50_000,
-            rlim_max: 1_000_000,
-        };
-        assert_eq!(
-            guarded_rt_limit(smaller_soft, RT_BUDGET_US)
-                .unwrap()
-                .rlim_cur,
-            smaller_soft.rlim_cur
-        );
-
-        let finite_hard = libc::rlimit {
+    #[test]
+    fn finite_hard_below_requested_budget_leaves_warning_headroom() {
+        let original = libc::rlimit {
             rlim_cur: libc::RLIM_INFINITY,
             rlim_max: 75_000,
         };
-        assert_eq!(
-            guarded_rt_limit(finite_hard, RT_BUDGET_US)
-                .unwrap()
-                .rlim_cur,
-            finite_hard.rlim_max
-        );
+        let guarded = guarded_rt_limit(original, RT_BUDGET_US).unwrap();
 
-        let disabled = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 1_000_000,
+        assert_eq!(guarded.rlim_cur, 55_000);
+        assert_eq!(guarded.rlim_max, original.rlim_max);
+    }
+
+    #[test]
+    fn smaller_existing_soft_budget_is_preserved_when_safe() {
+        let original = libc::rlimit {
+            rlim_cur: 25_000,
+            rlim_max: 75_000,
         };
-        assert!(guarded_rt_limit(disabled, RT_BUDGET_US).is_err());
+        let guarded = guarded_rt_limit(original, RT_BUDGET_US).unwrap();
+
+        assert_eq!(guarded.rlim_cur, original.rlim_cur);
+        assert_eq!(guarded.rlim_max, original.rlim_max);
+    }
+
+    #[test]
+    fn soft_equal_to_finite_hard_is_reduced_below_hard() {
+        let original = libc::rlimit {
+            rlim_cur: 75_000,
+            rlim_max: 75_000,
+        };
+        let guarded = guarded_rt_limit(original, RT_BUDGET_US).unwrap();
+
+        assert!(guarded.rlim_cur > 0);
+        assert!(guarded.rlim_cur < guarded.rlim_max);
+        assert_eq!(guarded.rlim_cur, 55_000);
+    }
+
+    #[test]
+    fn finite_hard_without_warning_interval_disables_direct_realtime() {
+        for hard in [
+            0,
+            RTTIME_MIN_WARNING_HEADROOM_US - 1,
+            RTTIME_MIN_WARNING_HEADROOM_US,
+        ] {
+            let original = libc::rlimit {
+                rlim_cur: libc::RLIM_INFINITY,
+                rlim_max: hard as libc::rlim_t,
+            };
+            assert!(guarded_rt_limit(original, RT_BUDGET_US).is_err());
+        }
+    }
+
+    #[test]
+    fn zero_soft_budget_disables_direct_realtime() {
+        let original = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: libc::RLIM_INFINITY,
+        };
+        assert!(guarded_rt_limit(original, RT_BUDGET_US).is_err());
+    }
+
+    #[test]
+    fn every_successful_finite_rt_limit_has_safe_warning_headroom() {
+        for hard in [
+            1, 19_999, 20_000, 20_001, 40_000, 75_000, 100_000, 200_000, 1_000_000,
+        ] {
+            let original = libc::rlimit {
+                rlim_cur: libc::RLIM_INFINITY,
+                rlim_max: hard as libc::rlim_t,
+            };
+            if let Ok(guarded) = guarded_rt_limit(original, RT_BUDGET_US) {
+                let warning_headroom = required_rttime_warning_headroom(hard);
+                assert!(guarded.rlim_cur > 0, "hard={hard}");
+                assert!(guarded.rlim_cur < guarded.rlim_max, "hard={hard}");
+                assert!(
+                    u128::from(guarded.rlim_max) - u128::from(guarded.rlim_cur)
+                        >= u128::from(warning_headroom),
+                    "hard={hard} soft={}",
+                    guarded.rlim_cur
+                );
+                let soft_ticks = u128::from(guarded.rlim_cur).div_ceil(10_000);
+                let hard_ticks = u128::from(guarded.rlim_max).div_ceil(10_000);
+                assert!(
+                    hard_ticks >= soft_ticks + 2,
+                    "hard={hard} soft={} soft_ticks={soft_ticks} hard_ticks={hard_ticks}",
+                    guarded.rlim_cur
+                );
+                assert_eq!(guarded.rlim_max, original.rlim_max);
+            }
+        }
     }
 
     #[test]
@@ -1894,6 +2338,308 @@ mod tests {
     }
 
     #[test]
+    fn worker_fair_transitions_cannot_disable_reactor_realtime_safety() {
+        let mut reactor = FakeOps::normal(0);
+        let reactor_snapshot = configure_reactor_policy_with_rtkit(
+            SchedulingQosPolicy::Auto,
+            700,
+            0,
+            true,
+            &mut reactor,
+        )
+        .expect("reactor RR safety is active");
+        assert_eq!(
+            reactor_snapshot.effective_class,
+            EffectiveSchedulingClass::RealtimeRoundRobin { priority: 1 }
+        );
+        assert!(reactor.rt_budget_active);
+        assert_eq!(reactor.active_reactor_tid, 700);
+        assert_eq!(reactor.budget_reactor_tid, 700);
+        assert!(reactor.sigxcpu_handler_installed);
+
+        for role in [
+            SchedulingThreadRole::KmsCommit,
+            SchedulingThreadRole::Render,
+            SchedulingThreadRole::Background,
+        ] {
+            let mut worker = FakeOps::normal(0);
+            worker.direct_fair_result = Ok(());
+            worker.rt_budget_active = reactor.rt_budget_active;
+            worker.active_reactor_tid = reactor.active_reactor_tid;
+            worker.budget_reactor_tid = reactor.budget_reactor_tid;
+            worker.sigxcpu_handler_installed = reactor.sigxcpu_handler_installed;
+            if role == SchedulingThreadRole::Background {
+                worker.state.nice = -3;
+            }
+
+            let snapshot =
+                configure_worker_policy(role, SchedulingQosPolicy::Auto, 701, 0, &mut worker);
+
+            assert_eq!(snapshot.role, role);
+            assert!(worker.rt_budget_active, "role={role:?}");
+            assert_eq!(worker.active_reactor_tid, 700, "role={role:?}");
+            assert_eq!(worker.budget_reactor_tid, 700, "role={role:?}");
+            assert!(worker.sigxcpu_handler_installed, "role={role:?}");
+            assert_eq!(worker.safety_restores, 0, "role={role:?}");
+        }
+    }
+
+    #[test]
+    fn reactor_rr_to_fair_fallback_removes_only_realtime_budget_state() {
+        let mut ops = FakeOps::normal(0).with_fair_success(SchedulingBackend::Direct, -8);
+        ops.rr_result = Err("EPERM");
+        let snapshot =
+            configure_reactor_policy_with_rtkit(SchedulingQosPolicy::Auto, 702, 0, false, &mut ops)
+                .expect("Auto falls back to FAIR");
+
+        assert_eq!(snapshot.backend, SchedulingBackend::Direct);
+        assert_eq!(snapshot.effective_nice, -8);
+        assert!(!ops.rt_budget_active);
+        assert_eq!(ops.active_reactor_tid, 0);
+        assert!(ops.sigxcpu_handler_installed);
+    }
+
+    #[test]
+    fn rtkit_and_direct_fair_protection_survive_session_suspend_and_resume() {
+        for (backend, allow_rtkit) in [
+            (SchedulingBackend::RealtimeKit, true),
+            (SchedulingBackend::Direct, false),
+        ] {
+            let mut ops = FakeOps::normal(0).with_fair_success(backend, -7);
+            ops.rr_result = Err("EPERM");
+            let startup = configure_reactor_policy_with_rtkit(
+                SchedulingQosPolicy::Auto,
+                703,
+                0,
+                allow_rtkit,
+                &mut ops,
+            )
+            .expect("FAIR fallback established at startup");
+            let startup_fair_calls = ops.fair_mutations.len();
+
+            prepare_reactor_for_session_suspend(703, 0, &mut ops)
+                .expect("FAIR is safe across a suspend boundary");
+            assert_eq!(ops.state.policy, PolicyKind::Other);
+            assert_eq!(ops.state.nice, -7);
+            assert_eq!(ops.fair_mutations.len(), startup_fair_calls);
+
+            let resumed = reacquire_reactor_policy_after_suspend(
+                SchedulingQosPolicy::Auto,
+                703,
+                0,
+                false,
+                Some(&startup),
+                &mut ops,
+            )
+            .expect("resume retains already-effective FAIR protection");
+            assert_eq!(resumed.backend, backend);
+            assert_eq!(
+                resumed.effective_class,
+                EffectiveSchedulingClass::Fair { nice: -7 }
+            );
+            assert_eq!(ops.fair_mutations.len(), startup_fair_calls);
+            assert_eq!(ops.rr_mutations, 1);
+        }
+    }
+
+    #[test]
+    fn direct_rr_is_demoted_for_suspend_and_reacquired_after_recovery() {
+        let mut ops = FakeOps::normal(0);
+        let startup =
+            configure_reactor_policy_with_rtkit(SchedulingQosPolicy::Auto, 704, 0, true, &mut ops)
+                .expect("RR acquired");
+        assert!(ops.rt_budget_active);
+
+        prepare_reactor_for_session_suspend(704, 0, &mut ops)
+            .expect("RR is removed before session suspension");
+        assert_eq!(ops.state.policy, PolicyKind::Other);
+        assert_eq!(ops.state.nice, 0);
+        assert!(!ops.rt_budget_active);
+        assert_eq!(ops.active_reactor_tid, 0);
+
+        let resumed = reacquire_reactor_policy_after_suspend(
+            SchedulingQosPolicy::Auto,
+            704,
+            0,
+            false,
+            Some(&startup),
+            &mut ops,
+        )
+        .expect("direct RR is reacquired after recovery");
+        assert_eq!(
+            resumed.effective_class,
+            EffectiveSchedulingClass::RealtimeRoundRobin { priority: 1 }
+        );
+        assert!(ops.rt_budget_active);
+        assert_eq!(ops.active_reactor_tid, 704);
+        assert_eq!(ops.rr_mutations, 2);
+    }
+
+    #[test]
+    fn rt_budget_overrun_suppresses_realtime_reacquisition_after_suspend() {
+        let mut ops = FakeOps::normal(0);
+        let startup =
+            configure_reactor_policy_with_rtkit(SchedulingQosPolicy::Auto, 705, 0, true, &mut ops)
+                .expect("RR acquired");
+        ops.overrun = true;
+        ops.state = KernelSchedulingState {
+            policy: PolicyKind::Other,
+            priority: 0,
+            nice: 0,
+            reset_on_fork: false,
+        };
+        ops.active_reactor_tid = 0;
+
+        prepare_reactor_for_session_suspend(705, 0, &mut ops)
+            .expect("suspend retires the already-demoted RT budget");
+        let rr_mutations = ops.rr_mutations;
+        let resumed = reacquire_reactor_policy_after_suspend(
+            SchedulingQosPolicy::Auto,
+            705,
+            0,
+            true,
+            Some(&startup),
+            &mut ops,
+        )
+        .expect("overrun recovery remains fail-open without RR");
+
+        assert_eq!(
+            resumed.effective_class,
+            EffectiveSchedulingClass::Fair { nice: 0 }
+        );
+        assert!(resumed.rt_budget_overrun);
+        assert!(!ops.rt_budget_active);
+        assert_eq!(ops.rr_mutations, rr_mutations);
+    }
+
+    #[test]
+    fn shutdown_normalizes_elevated_fair_policy_and_removes_rt_budget() {
+        for backend in [SchedulingBackend::RealtimeKit, SchedulingBackend::Direct] {
+            let mut ops = FakeOps::normal(0).with_fair_success(backend, -7);
+            ops.rr_result = Err("EPERM");
+            let _ = configure_reactor_policy_with_rtkit(
+                SchedulingQosPolicy::Auto,
+                706,
+                0,
+                backend == SchedulingBackend::RealtimeKit,
+                &mut ops,
+            )
+            .expect("FAIR fallback established");
+
+            prepare_reactor_for_shutdown(706, 0, &mut ops)
+                .expect("shutdown normalizes the reactor");
+            assert_eq!(ops.state.policy, PolicyKind::Other);
+            assert_eq!(ops.state.nice, 0);
+            assert!(!ops.rt_budget_active);
+            assert_eq!(ops.active_reactor_tid, 0);
+        }
+    }
+
+    #[test]
+    fn signal_cleanup_keeps_failsafe_disposition_for_pending_group_signal() {
+        let source = include_str!("scheduling_qos.rs");
+        let cleanup = source
+            .split_once("fn restore_rt_budget_for_reactor(&self, tid: i32)")
+            .expect("RT budget cleanup exists")
+            .1
+            .split_once("\n    }\n}")
+            .expect("RT budget cleanup body ends before manager impl")
+            .0;
+        assert!(cleanup.contains("pthread_sigmask"));
+        assert!(cleanup.contains("setrlimit(libc::RLIMIT_RTTIME"));
+        let active_clear = cleanup
+            .find("ACTIVE_REACTOR_TID.compare_exchange")
+            .expect("reactor authority is revoked before the prior mask is restored");
+        let limit_restore = cleanup
+            .find("setrlimit(libc::RLIMIT_RTTIME")
+            .expect("process RT limit is restored");
+        let mask_restore = cleanup
+            .find("pthread_sigmask(libc::SIG_SETMASK")
+            .expect("reactor signal mask is restored last");
+        assert!(active_clear < limit_restore && limit_restore < mask_restore);
+        assert!(
+            !cleanup.contains("sigaction("),
+            "SIGXCPU disposition must remain the fail-safe while a group signal may be pending"
+        );
+        assert!(source.contains("SIGXCPU_HANDLER_INSTALLED.store(true"));
+        assert!(source.contains("fn install_sigxcpu_handler()"));
+        let handler = source
+            .split_once("extern \"C\" fn sigxcpu_demote")
+            .expect("process-directed SIGXCPU handler exists")
+            .1
+            .split_once("\nfn inspect_kernel_state")
+            .expect("signal handler ends before scheduler inspection")
+            .0;
+        assert!(handler.contains("claim_reactor_for_sigxcpu"));
+        assert!(!handler.contains("ACTIVE_REACTOR_TID.store"));
+        let claim = source
+            .split_once("fn claim_reactor_for_sigxcpu(")
+            .expect("signal claim helper exists")
+            .1
+            .split_once("extern \"C\" fn sigxcpu_demote")
+            .expect("claim helper precedes handler")
+            .0;
+        let overrun = claim
+            .find("budget_overrun.store(true")
+            .expect("overrun becomes sticky before the target is cleared");
+        let target_clear = claim
+            .find(".compare_exchange")
+            .expect("claim atomically clears the reactor target");
+        assert!(overrun < target_clear);
+
+        let promotion = source
+            .split_once("pub fn promote_current_reactor()")
+            .expect("reactor promotion exists")
+            .1
+            .split_once("pub fn reacquire_current_reactor_after_session_resume()")
+            .expect("resume entry follows promotion")
+            .0;
+        let resume = source
+            .split_once("pub fn reacquire_current_reactor_after_session_resume()")
+            .expect("resume entry exists")
+            .1
+            .split_once("pub fn prepare_current_reactor_for_session_suspend")
+            .expect("suspend entry follows resume")
+            .0;
+        assert!(!promotion.contains("ACTIVE_REACTOR_TID.store"));
+        assert!(!resume.contains("ACTIVE_REACTOR_TID.store"));
+
+        let process = include_str!("../process.rs");
+        let signalfd = process
+            .split_once("fn create_runtime_signalfd()")
+            .expect("runtime signalfd setup exists")
+            .1;
+        assert!(!signalfd.contains("SIGXCPU"));
+        assert!(signalfd.contains("SIGCHLD"));
+        assert!(signalfd.contains("SIGTERM"));
+    }
+
+    #[test]
+    fn sigxcpu_claim_makes_overrun_sticky_before_clearing_the_reactor_tid() {
+        let active_reactor_tid = AtomicI32::new(712);
+        let budget_overrun = AtomicBool::new(false);
+
+        assert_eq!(
+            claim_reactor_for_sigxcpu(&active_reactor_tid, &budget_overrun),
+            Some(712)
+        );
+        assert!(budget_overrun.load(Ordering::Acquire));
+        assert_eq!(active_reactor_tid.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn sigxcpu_without_an_active_reactor_does_not_mark_a_budget_overrun() {
+        let active_reactor_tid = AtomicI32::new(0);
+        let budget_overrun = AtomicBool::new(false);
+
+        assert_eq!(
+            claim_reactor_for_sigxcpu(&active_reactor_tid, &budget_overrun),
+            None
+        );
+        assert!(!budget_overrun.load(Ordering::Acquire));
+    }
+
+    #[test]
     fn direct_rr_permission_failure_falls_back_without_startup_failure() {
         let mut ops = FakeOps::normal(0);
         ops.rr_result = Err("EPERM");
@@ -1912,10 +2658,50 @@ mod tests {
         assert_eq!(snapshot.requested_fallback_nice, Some(-10));
         assert_eq!(
             snapshot.effective_class,
-            EffectiveSchedulingClass::Fair { nice: -8 }
+            EffectiveSchedulingClass::Fair { nice: -10 }
         );
         assert!(snapshot.degradation_reason.is_some());
         assert_eq!(ops.safety_restores, 1);
+    }
+
+    #[test]
+    fn unsafe_finite_hard_limit_disables_direct_rr_and_auto_uses_fair() {
+        let mut ops = FakeOps::normal(0).with_fair_success(SchedulingBackend::Direct, -8);
+        ops.safety_result = Err("hard RTTIME limit lacks warning headroom");
+        let snapshot = configure_reactor_policy(SchedulingQosPolicy::Auto, 431, 0, &mut ops)
+            .expect("unsafe direct RR budget degrades to FAIR in Auto");
+
+        assert_eq!(ops.rr_mutations, 0);
+        assert!(!ops.rt_budget_active);
+        assert_eq!(snapshot.backend, SchedulingBackend::Direct);
+        assert_eq!(
+            snapshot.effective_class,
+            EffectiveSchedulingClass::Fair { nice: -8 }
+        );
+        assert!(
+            snapshot
+                .degradation_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("warning headroom"))
+        );
+    }
+
+    #[test]
+    fn unsafe_finite_hard_limit_rejects_require_without_requesting_rr() {
+        let mut ops = FakeOps::normal(0);
+        ops.safety_result = Err("hard RTTIME limit lacks warning headroom");
+        let error = configure_reactor_policy(SchedulingQosPolicy::Require, 432, 0, &mut ops)
+            .expect_err("Require rejects a reactor without a safe RT budget");
+
+        assert_eq!(ops.rr_mutations, 0);
+        assert!(!ops.rt_budget_active);
+        assert!(
+            error
+                .snapshot
+                .degradation_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("warning headroom"))
+        );
     }
 
     #[test]
@@ -2226,6 +3012,19 @@ mod tests {
             .find("work()")
             .expect("generic worker closure begins");
         assert!(child_nice < role_work && role_work < generic_work);
+
+        let factory = source
+            .split_once("pub fn spawn_role_thread")
+            .expect("classified thread factory exists")
+            .1;
+        let reject_reactor = factory
+            .find("role == SchedulingThreadRole::NativeReactor")
+            .expect("helper factory rejects reactor role");
+        let spawn = factory
+            .find("let spawn = ||")
+            .expect("helper spawn closure exists");
+        assert!(reject_reactor < spawn);
+        assert!(source.contains("briefly removes its RR starvation protection"));
     }
 
     #[test]
@@ -2297,7 +3096,8 @@ mod tests {
             );
         }
         assert!(body.contains("SYS_sched_setscheduler"));
-        assert!(body.contains("RT_BUDGET_OVERRUN.store"));
+        assert!(body.contains("claim_reactor_for_sigxcpu"));
+        assert!(source.contains("budget_overrun.store(true, Ordering::SeqCst)"));
     }
 
     #[test]
@@ -2314,6 +3114,21 @@ mod tests {
             .find("while !self.shutdown.is_complete()")
             .expect("cycle loop exists");
         assert!(promote < loop_start);
+        let qos = include_str!("scheduling_qos.rs");
+        let promotion = qos
+            .split_once("pub fn promote_current_reactor()")
+            .expect("QoS promotion entry exists")
+            .1;
+        let policy_guard = promotion
+            .find("manager.policy != SchedulingQosPolicy::Off")
+            .expect("same-binary off mode skips helper priming");
+        let trace_prime = promotion
+            .find("prime_enabled_trace_sinks()")
+            .expect("optional lazy trace workers are primed before promotion");
+        let configuration = promotion
+            .find("configure_reactor_policy(")
+            .expect("reactor promotion follows helper setup");
+        assert!(policy_guard < trace_prime && trace_prime < configuration);
         let run_cycle = cycle
             .split_once("fn run_cycle(&mut self)")
             .expect("per-cycle function exists")
@@ -2329,9 +3144,35 @@ mod tests {
         assert!(!signalfd.contains("SIGXCPU"));
         assert!(signalfd.contains("SIGCHLD"));
         assert!(signalfd.contains("SIGTERM"));
-        let qos = include_str!("scheduling_qos.rs");
         assert!(qos.contains("pthread_sigmask(libc::SIG_UNBLOCK"));
         assert!(qos.contains("libc::SIG_SETMASK"));
+
+        let worker_impl = qos
+            .split_once("impl SchedulingOperations for LinuxSchedulingOperations")
+            .expect("worker scheduling operations exist")
+            .1
+            .split_once("impl ReactorSchedulingOperations for LinuxSchedulingOperations")
+            .expect("reactor safety operations are a separate implementation")
+            .0;
+        assert!(!worker_impl.contains("restore_rt_budget"));
+        assert!(!worker_impl.contains("prepare_rt_budget"));
+        assert!(!worker_impl.contains("ACTIVE_REACTOR_TID"));
+
+        let resume = qos
+            .split_once("pub fn reacquire_current_reactor_after_session_resume()")
+            .expect("session resume QoS boundary exists")
+            .1
+            .split_once("pub fn prepare_current_reactor_for_session_suspend")
+            .expect("session suspend QoS boundary follows resume")
+            .0;
+        assert!(!resume.contains("zbus::"));
+        let suspend = cycle
+            .split_once("fn suspend_native_session")
+            .expect("session suspend path exists")
+            .1;
+        assert!(suspend.contains("prepare_current_reactor_for_session_suspend"));
+        let shutdown = include_str!("../native_output/runtime/shutdown_cycle.rs");
+        assert!(shutdown.contains("demote_current_reactor()"));
 
         let presentation = include_str!("../native_output/runtime/presentation_cycle.rs");
         assert!(presentation.contains("queue_primary_geometry_test_if_idle"));

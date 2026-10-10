@@ -1366,7 +1366,8 @@ impl NativeRuntime {
                 NativePerfField::str("explicit_sync_policy", "park_and_rearm"),
             ]
         });
-        oblivion_one::native::scheduling_qos::demote_current_reactor();
+        oblivion_one::native::scheduling_qos::prepare_current_reactor_for_session_suspend()
+            .map_err(io::Error::other)?;
         quiesce_and_acknowledge(self, |io| {
             if seat.acknowledge_disable()? {
                 io.observe(NativeIoOperation::SeatDisableAcknowledged);

@@ -18,6 +18,18 @@ pub(crate) fn client_pacing_enabled() -> bool {
     })
 }
 
+/// Start any enabled diagnostic writers before the native reactor can be
+/// promoted. Once the reactor is realtime, lazy pthread creation would need a
+/// temporary demotion to prevent scheduler inheritance.
+pub(crate) fn prime_enabled_trace_sinks() {
+    if client_pacing_enabled() {
+        let _ = client_trace_sink();
+    }
+    if commit_debug_enabled() {
+        let _ = commit_trace_sink();
+    }
+}
+
 pub(crate) fn client_pacing_now_ns() -> u64 {
     let mut time = libc::timespec {
         tv_sec: 0,

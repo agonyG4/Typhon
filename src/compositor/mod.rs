@@ -95,7 +95,7 @@ mod layer_shell;
 mod lifecycle_compatibility;
 mod output;
 pub use output::OutputRefreshRate;
-mod pacing;
+pub(crate) mod pacing;
 mod plan;
 mod popup;
 mod presentation;
