@@ -29,12 +29,18 @@ remain in their existing owners. The projection borrows the large scene
 vectors and moves the already captured journal vector and damage into one
 `EglSceneDrawRequest`; a second projection is rejected.
 
-Only one extra `RenderableSurface` clone is made for an optional client cursor.
-`RenderableSurface` cloning keeps SHM pixels in their existing `Arc<Vec<u32>>`
-and DMA-BUF planes in their existing `Arc<OwnedFd>` handles. The owned scene is
-moved into the frozen object; its scene vectors, effects, decorations,
-presentation samples, and lifecycle values are not cloned to establish the
-boundary.
+Freezing moves the existing `ResolvedNativeFrameScene<'static>` into the
+payload. The freeze path does not explicitly clone its canonical scene vectors.
+An optional software client cursor keeps one `RenderableSurface` clone; its SHM
+pixels remain in their existing `Arc<Vec<u32>>` and DMA-BUF planes retain their
+existing `Arc<OwnedFd>` handles. The renderer presentation visual signature is
+computed once and reused for both `FrozenRenderSnapshotIdentity` and the draw
+request.
+
+The focused `snapshot_owned_clones == 0` assertion proves only that freeze did
+not call `ResolvedNativeFrameScene::snapshot_owned()` and clone another
+`NativeSceneSnapshot`. It is not a measurement of all scene-owned cloning or
+allocations.
 
 ## Buffer and protocol ownership
 
@@ -104,6 +110,73 @@ KMS worker:
     timed DRM/KMS submission
 ```
 
+### Renderer control ownership
+
+Moving `GlesSceneRenderer` to the worker is not enough. The reactor currently
+mutates renderer causal state outside drawing, and those operations must cross
+an explicit renderer-control boundary:
+
+| Operation | Current source effect | Phase 2B treatment |
+| --- | --- | --- |
+| `commit_presented(frame, damage)` | Commits repaint history and damage-tracker state, publishes the presented scene key, and updates history depth after confirmed pageflip. | Lossless terminal operation. `CommitPresented(N)` must stay ordered relative to later operations that read or extend presented-damage history. |
+| `discard_rendered(frame)` | Discards the repaint plan and invalidates effect checkpoint capture contents. | Lossless terminal operation; preserve checkpoint invalidation. |
+| `frame_swap_failed()` | Resets repaint history after a failed compatibility swap. | Lossless failure control operation. |
+| `invalidate_presented_damage_history()` | Clears presented repaint history and scene key, and invalidates checkpoint capture contents. | Ordered control operation. Adjacent invalidations may be folded only when no commit, discard, or render-admission boundary lies between them. |
+| `publish_material_effect_generation(...)` | Publishes material state and invalidates presented history. | Configuration update with an invalidation side effect; a newer complete generation may replace an unobserved one only behind a revision barrier. |
+| `publish_effect_registry_generation(...)` | Compiles and publishes a registry generation, returns an error on failure, and invalidates presented history on success. | Ordered configuration operation unless Phase 2B proves coalescing preserves intermediate compile failures and the last successfully active generation. The job must name the generation it consumes. |
+| `set_cursor_image(...)` | Replaces the cursor image, updates damage tracking, marks cursor resources stale, and invalidates repaint history. | Latest-value configuration can replace an unobserved image only when the worker retains the required damage invalidation and revision ordering. |
+| `reload_trusted_effect_registry(...)` | Runs the trusted reload publisher and returns a success/error plus the resulting generation; registry publication reaches the GL renderer. | Ordered request/completion, not a fire-and-forget latest-value update. Its admission/backpressure and response ownership need a bounded policy before Phase 2B. |
+
+The lifecycle and squash capability queries are also renderer-owned facts:
+`lifecycle_animation_available()` and `squash_animation_available()` are read
+when runtime capabilities are published to the compositor during bootstrap or
+scanout replacement. The worker must report a generation-tagged capability
+snapshot during startup/reconfiguration; the reactor applies that snapshot to
+Wayland/lifecycle state. It must not synchronously query a live worker-owned
+renderer. `finish_render_work()` is a GL completion barrier and must likewise
+remain a worker-side operation with asynchronous completion if reactor code
+needs its result. The current presentation-cycle fallback paths call this
+barrier synchronously, so they must not retain a direct reactor-to-renderer
+call in Phase 2B.
+
+The physical Atomic swapchain has three slots
+(`EXPLICIT_OUTPUT_SLOT_CAPACITY == 3`), and its invariants prevent slot-role
+aliasing or ownership beyond that capacity. This supplies a source-grounded
+bound of three outstanding output-frame renderer tokens, provided Phase 2B
+keeps a slot in a renderer-control-pending role until the worker acknowledges
+that token's single terminal operation. A proposed terminal lane therefore has
+three fixed records, one per occupied slot. When all are occupied, the reactor
+does not wait: it leaves its one pending render replaceable and admits no job
+that needs another slot. A `CommitPresented` or `DiscardRendered` consumes the
+record belonging to that frame, never a record selected by “newest render.”
+This three-slot proof covers output-frame renderer tokens only. The current
+capture path is slotless and immediately discards its renderer commit; if
+capture moves to the worker, Phase 2B must keep it outside this lane or give it
+separate bounded admission and terminal ownership.
+
+The bound does not by itself bound arbitrary reload requests or prove safe
+configuration coalescing. Phase 2B may use revisioned fixed latest-value slots
+for cursor and material configuration, retaining each revision referenced by
+an admitted job and carrying invalidation across coalesced updates. Registry
+generation publication remains ordered while GL compilation can fail; skipping
+an intermediate successful publish before a later failure would change the
+active generation. The worker must apply all operations in sequence order
+relative to terminal controls and jobs. Trusted-registry reload requests still
+need a bounded request/result policy; the source reviewed here provides no
+renderer-control admission limit to reuse. Slotless capture also needs separate
+bounded admission if it moves to the worker. Until those policies and the
+revision barriers are designed and verified, complete control lane boundedness
+remains a Phase 2B design blocker. No unbounded channel or reactor wait is
+acceptable.
+
+Every future `RenderJob` envelope must pair the frozen renderer input identity
+with the physical output transaction it serves. Use source-grounded equivalents
+of `frame_id`, `transaction_id`, `output_generation`, `pool_generation`, slot
+identity, render generation, and `FrozenRenderSnapshotIdentity`. Keep this
+physical authority in the job envelope, not in `FrozenNativeRenderFrame`; it
+is needed to settle supersession, output-generation cancellation, shutdown,
+reconfiguration, and session recovery exactly.
+
 The fundamental invariant is:
 
 > **The RT reactor never waits for the render worker.**
@@ -114,7 +187,8 @@ There is no unbounded render queue: at most one job executes, and at most one
 replaceable pending job remains owned by the reactor. A pending physical render
 job may be superseded before GPU ownership starts; configure/ACK protocol state
 is never coalesced. Resize supersession must settle the displaced job before
-the newer job replaces it.
+the newer job replaces it. Renderer terminal/control operations may not be
+dropped when a newer render arrives.
 
 Each job must have one terminal result, using existing transaction/failure
 ownership where possible:

@@ -1,4 +1,6 @@
-use super::{FrozenNativeRenderFrame, OwnedClientCursorRenderState};
+use super::{
+    FrozenNativeRenderFrame, OwnedClientCursorRenderState, project_egl_scene_draw_request,
+};
 use crate::egl_renderer::OutputDamage;
 use crate::native_output::runtime::frame::{
     NativeCursorOutputArbitration, NativeCursorOutputDisposition, NativeCursorRenderMode,
@@ -83,7 +85,11 @@ fn frozen_native_render_frame_keeps_scene_visual_journal_lifecycle_and_damage_at
         NativeCursorRenderMode::Software,
         Some(OutputDamage::Full),
     );
-    assert_eq!(snapshot_work_counters().snapshot_owned_clones, 0);
+    assert_eq!(
+        snapshot_work_counters().snapshot_owned_clones,
+        0,
+        "freeze does not call snapshot_owned() and clone another NativeSceneSnapshot"
+    );
     let frozen_identity = frozen.identity;
     let resource_sync_states = frozen.surface_resource_sync_states.clone();
     let resource_sync_signature = frozen.identity.surface_resource_sync_signature;
@@ -163,6 +169,10 @@ fn frozen_native_render_frame_keeps_scene_visual_journal_lifecycle_and_damage_at
         request.presentation_visual_signature,
         presentation_signature
     );
+    assert_eq!(
+        frozen_identity.presentation_visual_signature, request.presentation_visual_signature,
+        "frozen identity and draw request share the captured signature"
+    );
     assert_eq!(request.lifecycle.sampled_at, AnimationTime::from_nanos(11));
     assert!(request.lifecycle.samples.is_empty());
     assert_eq!(request.surface_resource_sync_states, resource_sync_states);
@@ -171,7 +181,11 @@ fn frozen_native_render_frame_keeps_scene_visual_journal_lifecycle_and_damage_at
         resource_sync_signature
     );
     assert_eq!(request.current_damage, Some(OutputDamage::Full));
-    assert_eq!(snapshot_work_counters().snapshot_owned_clones, 0);
+    assert_eq!(
+        snapshot_work_counters().snapshot_owned_clones,
+        0,
+        "projection does not clone another NativeSceneSnapshot"
+    );
     drop(request);
 
     assert!(
@@ -299,7 +313,7 @@ fn frozen_draw_request_matches_the_synchronous_request_projection() {
     let frozen_scene = ResolvedNativeFrameScene::from_server_at(&server, at).into_owned();
     let input_state = NativeInputState::new(1280, 800);
     let mut renderer = NativeFrameRenderer::default();
-    let old = renderer.egl_scene_draw_request(
+    let synchronous_seed = renderer.egl_scene_draw_request(
         1280,
         800,
         &old_scene,
@@ -308,15 +322,51 @@ fn frozen_draw_request_matches_the_synchronous_request_projection() {
         NativeCursorRenderMode::Software,
         Some(OutputDamage::Full),
     );
-    let mut frozen = FrozenNativeRenderFrame::freeze(
+
+    let mut cursor_surface = test_surface(731, 32, 32, SurfacePlacement::root_at(0, 0));
+    cursor_surface.generation = 19;
+    cursor_surface.commit_sequence = SurfaceCommitSequence(27);
+    let cursor_node_id =
+        oblivion_one::core::SceneNodeId::from_raw(731).expect("equivalence cursor scene node");
+    let cursor_logical_position = (113, 227);
+    let cursor_hotspot = (4, 7);
+    let synchronous_cursor = ClientCursorRenderState {
+        surface: &cursor_surface,
+        scene_node_id: cursor_node_id,
+        logical_x: cursor_logical_position.0,
+        logical_y: cursor_logical_position.1,
+        hotspot_x: cursor_hotspot.0,
+        hotspot_y: cursor_hotspot.1,
+    };
+    let presentation_visual_signature = synchronous_seed.presentation_visual_signature;
+    let visual_state = synchronous_seed.visual_state;
+    let surface_resource_sync_states = synchronous_seed.surface_resource_sync_states;
+    // The compatibility builder supplies a borrowed ClientCursorRenderState
+    // to this same projection helper. Provide one directly so the equivalence
+    // check exercises a visible software cursor without Wayland client setup.
+    let old = project_egl_scene_draw_request(
+        1280,
+        800,
+        &old_scene,
+        presentation_visual_signature,
+        visual_state,
+        Some(synchronous_cursor),
+        Some(OutputDamage::Full),
+        surface_resource_sync_states.clone(),
+        None,
+    );
+    let mut frozen = FrozenNativeRenderFrame::from_snapshot_parts(
         1280,
         800,
         frozen_scene,
-        &server,
-        &input_state,
-        NativeCursorRenderMode::Software,
+        visual_state,
+        Some(OwnedClientCursorRenderState::from_render_state(
+            synchronous_cursor,
+        )),
+        surface_resource_sync_states,
         Some(OutputDamage::Full),
     );
+    let frozen_identity = frozen.identity;
     let current = frozen
         .draw_request(None)
         .expect("frozen request projection is available");
@@ -379,7 +429,63 @@ fn frozen_draw_request_matches_the_synchronous_request_projection() {
         old.lifecycle_decorations.len()
     );
     assert_eq!(current.current_damage, old.current_damage);
-    assert_eq!(current.client_cursor.is_some(), old.client_cursor.is_some());
+    assert_eq!(
+        frozen_identity.presentation_visual_signature,
+        current.presentation_visual_signature
+    );
+    let current_cursor = current
+        .client_cursor
+        .expect("frozen request contains the software client cursor");
+    let synchronous_cursor = old
+        .client_cursor
+        .expect("synchronous request contains the software client cursor");
+    assert_eq!(
+        current_cursor.surface.surface_id,
+        synchronous_cursor.surface.surface_id
+    );
+    assert_eq!(
+        current_cursor.scene_node_id,
+        synchronous_cursor.scene_node_id
+    );
+    assert_eq!(
+        current_cursor.surface.generation,
+        synchronous_cursor.surface.generation
+    );
+    assert_eq!(
+        current_cursor.surface.commit_sequence,
+        synchronous_cursor.surface.commit_sequence
+    );
+    assert_eq!(
+        current_cursor.surface.buffer_id(),
+        synchronous_cursor.surface.buffer_id()
+    );
+    assert_eq!(
+        (current_cursor.logical_x, current_cursor.logical_y),
+        (synchronous_cursor.logical_x, synchronous_cursor.logical_y)
+    );
+    assert_eq!(
+        (current_cursor.hotspot_x, current_cursor.hotspot_y),
+        (synchronous_cursor.hotspot_x, synchronous_cursor.hotspot_y)
+    );
+    assert_eq!(current_cursor.surface.surface_id, 731);
+    assert_eq!(current_cursor.scene_node_id, cursor_node_id);
+    assert_eq!(current_cursor.surface.generation, 19);
+    assert_eq!(
+        current_cursor.surface.commit_sequence,
+        SurfaceCommitSequence(27)
+    );
+    assert_eq!(
+        current_cursor.surface.buffer_id(),
+        cursor_surface.buffer_id()
+    );
+    assert_eq!(
+        (current_cursor.logical_x, current_cursor.logical_y),
+        cursor_logical_position
+    );
+    assert_eq!(
+        (current_cursor.hotspot_x, current_cursor.hotspot_y),
+        cursor_hotspot
+    );
 }
 
 fn test_surface(

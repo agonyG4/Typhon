@@ -2007,10 +2007,13 @@ impl NativeFrameRenderer {
         );
         let mut surface_resource_sync_states = surface_resource_sync_states;
         surface_resource_sync_states.extend(lifecycle_surface_resource_sync_states);
+        let presentation_visual_signature =
+            resolved_scene.presentation.presentation_visual_signature();
         project_egl_scene_draw_request(
             width,
             height,
             resolved_scene,
+            presentation_visual_signature,
             input_state.desktop_visual_state(cursor_mode, cursor_visible),
             client_cursor,
             current_damage,
@@ -2103,6 +2106,7 @@ pub(crate) struct FrozenNativeRenderFrame {
     client_cursor: Option<OwnedClientCursorRenderState>,
     pub(crate) surface_resource_sync_states: Vec<SurfaceResourceSyncState>,
     current_damage: Option<OutputDamage>,
+    presentation_visual_signature: u64,
     pub(crate) identity: FrozenRenderSnapshotIdentity,
     projection_consumed: bool,
 }
@@ -2167,11 +2171,12 @@ impl FrozenNativeRenderFrame {
         surface_resource_sync_states: Vec<SurfaceResourceSyncState>,
         current_damage: Option<OutputDamage>,
     ) -> Self {
+        let presentation_visual_signature = scene.presentation.presentation_visual_signature();
         let identity = FrozenRenderSnapshotIdentity {
             render_generation: scene.render_generation,
             scene_generation: scene.effects.generation,
             scene_identity_signature: scene.scene_identity_signature(),
-            presentation_visual_signature: scene.presentation.presentation_visual_signature(),
+            presentation_visual_signature,
             lifecycle_signature: scene.lifecycle_snapshot.signature,
             visual_state,
             client_cursor: client_cursor
@@ -2190,6 +2195,7 @@ impl FrozenNativeRenderFrame {
             client_cursor,
             surface_resource_sync_states,
             current_damage,
+            presentation_visual_signature,
             identity,
             projection_consumed: false,
         }
@@ -2215,6 +2221,7 @@ impl FrozenNativeRenderFrame {
             self.width,
             self.height,
             scene,
+            self.presentation_visual_signature,
             self.visual_state,
             client_cursor,
             self.current_damage.take(),
@@ -2235,6 +2242,7 @@ fn project_egl_scene_draw_request<'a>(
     width: u32,
     height: u32,
     scene: &'a ResolvedNativeFrameScene<'_>,
+    presentation_visual_signature: u64,
     visual_state: DesktopVisualState,
     client_cursor: Option<ClientCursorRenderState<'a>>,
     current_damage: Option<OutputDamage>,
@@ -2256,7 +2264,7 @@ fn project_egl_scene_draw_request<'a>(
         output_scale: 1.0,
         decoration_instances: &scene.decorations,
         effects: &scene.effects,
-        presentation_visual_signature: scene.presentation.presentation_visual_signature(),
+        presentation_visual_signature,
         presentation_opacities: &scene.presentation.opacities,
         presentation_clips: &scene.presentation.clips,
         presentation_owner_root_surface_ids: scene.presentation_owner_root_surface_ids.as_ref(),
