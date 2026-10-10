@@ -1306,6 +1306,22 @@ impl OwnCompositorServer {
     }
 
     #[doc(hidden)]
+    pub fn begin_lifecycle_lamp_for_test(
+        &mut self,
+        window_id: WindowId,
+        root_surface_id: u32,
+        visual_group: crate::window_lifecycle_animation::LifecycleVisualGroup,
+    ) -> bool {
+        self.state
+            .begin_lifecycle_lamp_for_test(window_id, root_surface_id, visual_group)
+    }
+
+    #[doc(hidden)]
+    pub fn retire_xwayland_attachment_for_test(&mut self, surface_id: u32) {
+        self.state.retire_xwayland_attachment(surface_id);
+    }
+
+    #[doc(hidden)]
     pub fn lifecycle_root_surface_for_surface(&self, surface_id: u32) -> u32 {
         self.state.root_surface_id_for_surface(surface_id)
     }
@@ -1315,6 +1331,27 @@ impl OwnCompositorServer {
         sample: &crate::window_lifecycle_animation::LifecycleSceneSample,
     ) -> Vec<RenderableSurface> {
         self.state.lifecycle_renderable_surfaces(sample)
+    }
+
+    #[doc(hidden)]
+    pub fn lifecycle_precapture_dmabuf_release_count(&self) -> usize {
+        self.state.lifecycle_precapture_dmabuf_release_count()
+    }
+
+    #[doc(hidden)]
+    pub fn settle_lifecycle_precapture_for_rendered_frame(
+        &mut self,
+        frame_batch_id: CompositorFrameBatchId,
+        snapshot: &crate::window_lifecycle_animation::LifecycleFrameSnapshot,
+    ) -> usize {
+        self.state
+            .settle_lifecycle_precapture_for_rendered_frame(frame_batch_id, snapshot)
+    }
+
+    #[doc(hidden)]
+    pub fn cancel_lifecycle_precapture_after_render_failure(&mut self) {
+        self.state
+            .cancel_lifecycle_precapture_after_render_failure();
     }
 
     #[cfg(test)]
@@ -2586,7 +2623,6 @@ impl OwnCompositorServer {
             .test_frame_batch_presentation_surface_ids(batch_id)
     }
 
-    #[cfg(test)]
     pub(super) fn test_take_native_frame_batch_for_render(
         &mut self,
         frame_id: u64,
@@ -2610,6 +2646,14 @@ impl OwnCompositorServer {
         }
         self.state
             .take_frame_batch_for_render_with_presentation_samples(frame_id, presentation_samples)
+    }
+
+    #[doc(hidden)]
+    pub fn take_frame_batch_for_render_for_test(
+        &mut self,
+        frame_id: u64,
+    ) -> CompositorFrameBatchId {
+        self.test_take_native_frame_batch_for_render(frame_id)
     }
 
     pub fn mark_prepared_frame_submitted(&mut self) {

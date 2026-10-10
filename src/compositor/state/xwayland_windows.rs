@@ -99,6 +99,7 @@ impl CompositorState {
             );
         }
 
+        self.note_lifecycle_precapture_source_withdrawal(&surface_ids);
         !withdrawn_ids.is_empty() || minimized_ids_removed
     }
 

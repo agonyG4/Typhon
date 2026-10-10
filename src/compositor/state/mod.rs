@@ -40,6 +40,7 @@ mod input_resources;
 mod lifecycle_animation;
 mod lifecycle_effects;
 mod lifecycle_physical;
+mod lifecycle_precapture;
 pub(crate) mod lifecycle_retained;
 mod lifecycle_surface_snapshot;
 #[cfg(test)]
@@ -100,7 +101,7 @@ mod xwayland_windows;
 
 pub(crate) use lifecycle_physical::PresentedLifecyclePhysicalState;
 pub use lifecycle_retained::PresentationRetainedVisualPayloadId;
-pub(crate) use lifecycle_retained::RetainedLifecyclePayloadStore;
+pub(crate) use lifecycle_retained::{LifecyclePreCaptureEvent, RetainedLifecyclePayloadStore};
 pub(crate) use lifecycle_surface_snapshot::RetainedSurfacePresentationSnapshot;
 pub(crate) use override_redirect_stack::OverrideRedirectStackSnapshotResult;
 pub(crate) use window_exit_retained::WindowExitPayloadStore;

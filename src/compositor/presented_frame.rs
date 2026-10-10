@@ -352,7 +352,17 @@ mod tests {
                     ),
                 )
                 .expect("valid test lifecycle payload");
-            assert!(payload_store.publish_exact(presentation_identity, payload));
+            assert!(
+                payload_store
+                    .publish_exact(
+                        presentation_identity,
+                        super::super::state::lifecycle_retained::RetainedLifecycleEntry {
+                            payload,
+                            pre_capture: None,
+                        },
+                    )
+                    .is_ok()
+            );
         }
         LifecycleMotionRequest {
             presentation_identity,

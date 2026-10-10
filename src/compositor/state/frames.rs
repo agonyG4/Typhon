@@ -1360,6 +1360,34 @@ impl CompositorState {
                 releases.push(held.obligation);
             }
         }
+
+        for (identity, mut entry) in self.retained_lifecycle_payloads.drain_all() {
+            self.window_lifecycle_animator.cancel(identity);
+            let _ = self
+                .presentation_animator
+                .retire_active_retained_visual_exact(identity);
+            let _ = self
+                .presentation_animator
+                .retire_retained_visual_exact(identity);
+            if let Some(mut lease) = entry.pre_capture.take() {
+                let surface_count = lease.surfaces.len();
+                let dmabuf_surface_count = lease.dmabuf_surface_count();
+                let held_release_count = lease.held_release_obligations.len();
+                for held in std::mem::take(&mut lease.held_release_obligations) {
+                    releases.push(held.obligation);
+                }
+                self.trace_lifecycle_precapture_event(
+                    super::lifecycle_retained::LifecyclePreCaptureEvent::DrainedOnShutdown,
+                    identity,
+                    &entry.payload,
+                    surface_count,
+                    dmabuf_surface_count,
+                    held_release_count,
+                    None,
+                    Some("compositor_shutdown"),
+                );
+            }
+        }
     }
 
     pub(in crate::compositor) fn note_buffer_releases_restored(
@@ -1408,6 +1436,9 @@ impl CompositorState {
                 .window_exit_payloads
                 .held_release_obligations()
                 .any(same)
+            || self
+                .retained_lifecycle_payloads
+                .holds_release_token(candidate)
     }
 
     pub(in crate::compositor) fn note_buffer_release_duplicate_attempt(&mut self) {

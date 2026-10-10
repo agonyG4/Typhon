@@ -251,7 +251,7 @@ fn resolved_effect_lifecycle_source_uses_the_captured_surface_topology() {
 }
 
 #[test]
-fn minimized_commit_keeps_live_buffer_with_captured_lifecycle_topology() {
+fn minimized_commit_keeps_the_admission_buffer_with_captured_lifecycle_topology() {
     let root_surface_id = 394;
     let child_surface_id = root_surface_id + 1;
     let (mut state, window_id) = ssd_test_state(root_surface_id);
@@ -270,6 +270,13 @@ fn minimized_commit_keeps_live_buffer_with_captured_lifecycle_topology() {
         .surface_presentation_generations
         .insert(child_surface_id, 1);
     state.rebuild_active_scene_view();
+
+    let admitted_child = state
+        .renderable_surfaces
+        .iter()
+        .find(|surface| surface.surface_id == child_surface_id)
+        .expect("admission child surface")
+        .clone();
 
     let group = visual_group(rect(384.0, 60.0, 832.0, 640.0));
     state.begin_lifecycle_minimize(
@@ -414,20 +421,36 @@ fn minimized_commit_keeps_live_buffer_with_captured_lifecycle_topology() {
     let projected_child = projected
         .iter()
         .find(|surface| surface.surface_id == child_surface_id)
-        .expect("retained child uses current minimized buffer");
+        .expect("retained child uses admission-time buffer");
     assert_eq!((projected_child.width, projected_child.height), (64, 64));
     assert_eq!(
         projected_child.placement,
         SurfacePlacement::subsurface(root_surface_id, 16, 24)
     );
-    assert_eq!(projected_child.buffer_id(), buffer_identity.id());
-    assert_eq!(projected_child.commit_sequence, SurfaceCommitSequence(5));
-    assert_eq!(projected_child.generation, 99);
+    assert_eq!(projected_child.buffer_id(), admitted_child.buffer_id());
+    assert_eq!(
+        projected_child.commit_sequence,
+        admitted_child.commit_sequence
+    );
+    assert_eq!(projected_child.generation, admitted_child.generation);
     assert_eq!(
         projected_child
             .cpu_pixels()
             .and_then(|pixels| pixels.first()),
-        Some(&0xffab_cdef)
+        admitted_child
+            .cpu_pixels()
+            .and_then(|pixels| pixels.first())
+    );
+    assert_eq!(
+        state
+            .window(window_id)
+            .expect("minimized window")
+            .state
+            .minimized_surface(child_surface_id)
+            .expect("new live minimized buffer")
+            .buffer_id(),
+        buffer_identity.id(),
+        "normal minimized state may advance independently of the lifecycle source"
     );
     assert!(std::sync::Arc::ptr_eq(
         state

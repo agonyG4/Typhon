@@ -1651,10 +1651,11 @@ impl NativeRuntime {
                         let (cursor_assignment, frozen_cursor_plane_owner) = frozen_cursor;
                         let release_safety =
                             dmabuf_gpu_release_safety(explicit, kms_commit_worker.as_ref());
-                        let dmabuf_gpu_release_lease_id = (server.pending_dmabuf_release_count()
-                            > 0)
-                        .then(|| dmabuf_gpu_release_registry.allocate_lease_id())
-                        .transpose()?;
+                        let mut dmabuf_gpu_release_lease_id =
+                            (server.pending_dmabuf_release_count() > 0
+                                || server.lifecycle_precapture_dmabuf_release_count() > 0)
+                                .then(|| dmabuf_gpu_release_registry.allocate_lease_id())
+                                .transpose()?;
                         let render_observed_at_ns = monotonic_now_ns()?;
                         let render_call_started_at_ns =
                             slow_cycle_enabled.then(monotonic_now_ns).transpose()?;
@@ -1921,6 +1922,8 @@ impl NativeRuntime {
                                 let physical_identity = match physical_identity {
                                     Ok(identity) => identity,
                                     Err(error) => {
+                                        explicit.finish_render_work();
+                                        server.cancel_lifecycle_precapture_after_render_failure();
                                         frame_pacing.note_predictive_o1_failed();
                                         frame_pacing.cancel_unsubmitted_render();
                                         return Err(Box::new(error));
@@ -1929,6 +1932,8 @@ impl NativeRuntime {
                                 if let Err(error) =
                                     frame_pacing.bind_predictive_o1(physical_identity)
                                 {
+                                    explicit.finish_render_work();
+                                    server.cancel_lifecycle_precapture_after_render_failure();
                                     frame_pacing.note_predictive_o1_failed();
                                     frame_pacing.cancel_unsubmitted_render();
                                     return Err(Box::new(io::Error::other(error)));
@@ -1937,6 +1942,18 @@ impl NativeRuntime {
                                 if let Some(advanced_intervals) = deferred_o1_binding_advanced_intervals {
                                     frame_pacing.note_predictive_binding_after_render_completion(
                                         advanced_intervals,
+                                    );
+                                }
+                                let settled_lifecycle_releases = server
+                                    .settle_lifecycle_precapture_for_rendered_frame(
+                                        protocol_batch_id,
+                                        &lifecycle_snapshot,
+                                    );
+                                if settled_lifecycle_releases > 0
+                                    && dmabuf_gpu_release_lease_id.is_none()
+                                {
+                                    dmabuf_gpu_release_lease_id = Some(
+                                        dmabuf_gpu_release_registry.allocate_lease_id()?,
                                     );
                                 }
                                 let _ = arm_composited_dmabuf_release(
@@ -2273,6 +2290,7 @@ impl NativeRuntime {
                             Ok(outcome) => outcome,
                             Err(error) => {
                                 server.restore_prepared_frame_batch_after_render_failure();
+                                server.cancel_lifecycle_precapture_after_render_failure();
                                 frame_pacing.note_predictive_o1_failed();
                                 frame_pacing.cancel_unsubmitted_render();
                                 return Err(Box::new(error));
@@ -2288,7 +2306,9 @@ impl NativeRuntime {
                         let render_end_ns = match monotonic_now_ns() {
                             Ok(now) => now,
                             Err(error) => {
+                                scanout.finish_render_work();
                                 server.restore_prepared_frame_batch_after_render_failure();
+                                server.cancel_lifecycle_precapture_after_render_failure();
                                 frame_pacing.note_predictive_o1_failed();
                                 frame_pacing.cancel_unsubmitted_render();
                                 return Err(Box::new(error));
@@ -2370,11 +2390,15 @@ impl NativeRuntime {
                             }
                         } else {
                             frame_rendered = true;
-                            #[rustfmt::skip] let resolved_scene_signature = replace_ready_scene_and_signature(scene_history, &resolved_scene, lifecycle_snapshot, *frame_index, (current_client_cursor_damage, current_software_cursor_damage));
-                            drop(resolved_scene);
                             let protocol_batch_id = server
                                 .prepared_frame_batch_id()
                                 .expect("rendered compatibility frame lost its protocol batch");
+                            let _ = server.settle_lifecycle_precapture_for_rendered_frame(
+                                protocol_batch_id,
+                                &lifecycle_snapshot,
+                            );
+                            #[rustfmt::skip] let resolved_scene_signature = replace_ready_scene_and_signature(scene_history, &resolved_scene, lifecycle_snapshot, *frame_index, (current_client_cursor_damage, current_software_cursor_damage));
+                            drop(resolved_scene);
                             server.mark_frame_callbacks_rendered(protocol_batch_id);
                             if render_ahead {
                                 server.note_frame_callbacks_deferred_ready(protocol_batch_id);

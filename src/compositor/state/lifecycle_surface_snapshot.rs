@@ -5,9 +5,11 @@ use crate::render_backend::buffer::BufferSize;
 use std::collections::{HashMap, HashSet};
 
 /// Presentation-only topology captured for one immutable lifecycle payload.
-/// Surface buffers and commit state remain owned by the live compositor.
+/// Its retained lifecycle entry owns the exact admission-time surfaces until
+/// the renderer captures them; this snapshot stores only identity and geometry.
 #[derive(Debug, Clone)]
 pub(crate) struct RetainedSurfacePresentationSnapshot {
+    #[cfg(test)]
     pub(crate) root_key: SurfacePresentationKey,
     pub(crate) nodes: Vec<RetainedSurfacePresentationNode>,
 }
@@ -15,6 +17,8 @@ pub(crate) struct RetainedSurfacePresentationSnapshot {
 #[derive(Debug, Clone)]
 pub(crate) struct RetainedSurfacePresentationNode {
     pub(crate) key: SurfacePresentationKey,
+    pub(crate) source_buffer_id: crate::render_backend::buffer::BufferId,
+    pub(crate) source_commit_sequence: crate::compositor::SurfaceCommitSequence,
     pub(crate) parent_key: Option<SurfacePresentationKey>,
     pub(crate) render_parent_key: Option<SurfacePresentationKey>,
     pub(crate) x: i32,
@@ -168,6 +172,8 @@ impl RetainedSurfacePresentationSnapshot {
                 key,
                 RetainedSurfacePresentationNode {
                     key,
+                    source_buffer_id: surface.buffer_id(),
+                    source_commit_sequence: surface.commit_sequence,
                     parent_key,
                     render_parent_key,
                     x: surface.x,
@@ -250,12 +256,17 @@ impl RetainedSurfacePresentationSnapshot {
         if !nodes.iter().any(|node| node.key == root_key) {
             return Err(LifecycleSurfaceCaptureFailure::InvalidSurfaceTopology);
         }
-        Ok(Self { root_key, nodes })
+        Ok(Self {
+            #[cfg(test)]
+            root_key,
+            nodes,
+        })
     }
 
     /// Projects current content through captured topology and captured order.
     /// A destroyed or reincarnated ancestor makes its captured descendants
     /// ineligible; no old buffer is retained to fill the gap.
+    #[cfg(test)]
     pub(crate) fn project(
         &self,
         live_surfaces: &[RenderableSurface],
@@ -357,6 +368,45 @@ impl RetainedSurfacePresentationSnapshot {
             .collect()
     }
 
+    /// Projects the exact source tree frozen with this snapshot. Unlike
+    /// `project`, this path does not consult live presentation generations or
+    /// substitute newer content for a reused surface ID.
+    pub(crate) fn project_captured_source(
+        &self,
+        captured_surfaces: &[RenderableSurface],
+    ) -> Option<Vec<RenderableSurface>> {
+        if captured_surfaces.len() != self.nodes.len() {
+            return None;
+        }
+        let mut by_surface_id = HashMap::with_capacity(captured_surfaces.len());
+        for surface in captured_surfaces {
+            if by_surface_id.insert(surface.surface_id, surface).is_some() {
+                return None;
+            }
+        }
+
+        let mut projected = Vec::with_capacity(self.nodes.len());
+        for node in &self.nodes {
+            let source = *by_surface_id.get(&node.key.surface_id)?;
+            if source.buffer_id() != node.source_buffer_id
+                || source.commit_sequence != node.source_commit_sequence
+            {
+                return None;
+            }
+            let mut source = source.clone();
+            source.x = node.x;
+            source.y = node.y;
+            source.width = node.width;
+            source.height = node.height;
+            source.placement = node.placement;
+            source.render_placement = node.render_placement;
+            source.visual_clip = node.visual_clip.clone();
+            source.render_target_size = node.render_target_size;
+            projected.push(source);
+        }
+        Some(projected)
+    }
+
     #[cfg(test)]
     pub(crate) fn test_root(surface_id: u32) -> Self {
         let root_key = SurfacePresentationKey {
@@ -364,9 +414,12 @@ impl RetainedSurfacePresentationSnapshot {
             generation: 1,
         };
         Self {
+            #[cfg(test)]
             root_key,
             nodes: vec![RetainedSurfacePresentationNode {
                 key: root_key,
+                source_buffer_id: crate::render_backend::buffer::BufferId::for_tests(1),
+                source_commit_sequence: crate::compositor::SurfaceCommitSequence(0),
                 parent_key: None,
                 render_parent_key: None,
                 x: 0,
@@ -580,6 +633,40 @@ mod tests {
             vec![42]
         );
         assert_eq!(reincarnated_parent.generation, child.generation);
+    }
+
+    #[test]
+    fn captured_source_ignores_live_generations_and_rejects_reused_surface_ids() {
+        let root = test_surface(42, SurfacePlacement::root());
+        let child = test_surface(43, SurfacePlacement::subsurface(42, 1, 2));
+        let snapshot = RetainedSurfacePresentationSnapshot::capture(
+            42,
+            &[root.clone(), child.clone()],
+            &HashMap::from([(42, 7), (43, 9)]),
+        )
+        .expect("captured source topology");
+
+        let captured = snapshot
+            .project_captured_source(&[child.clone(), root.clone()])
+            .expect("captured source remains valid without a live generation map");
+        assert_eq!(
+            captured
+                .iter()
+                .map(|surface| surface.surface_id)
+                .collect::<Vec<_>>(),
+            vec![42, 43],
+            "projection follows the captured painter order"
+        );
+        assert_eq!(captured[1].buffer_id(), child.buffer_id());
+
+        let mut reincarnated = child;
+        reincarnated.commit_sequence = SurfaceCommitSequence(3);
+        assert!(
+            snapshot
+                .project_captured_source(&[root, reincarnated])
+                .is_none(),
+            "a newer resource with a reused surface ID cannot replace admission content"
+        );
     }
 
     #[test]

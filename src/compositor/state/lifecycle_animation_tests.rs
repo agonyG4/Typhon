@@ -400,7 +400,17 @@ fn lifecycle_request_with_group(
             super::super::RetainedSurfacePresentationSnapshot::test_root(_root_surface_id),
         )
         .expect("valid test lifecycle payload");
-        assert!(payload_store.publish_exact(presentation_identity, payload));
+        assert!(
+            payload_store
+                .publish_exact(
+                    presentation_identity,
+                    super::super::lifecycle_retained::RetainedLifecycleEntry {
+                        payload,
+                        pre_capture: None,
+                    },
+                )
+                .is_ok()
+        );
     }
     LifecycleMotionRequest {
         presentation_identity,
@@ -531,6 +541,13 @@ fn xwayland_backing_replacement_preserves_frozen_lifecycle_identity_and_root() {
             .get_exact(identity)
             .expect("fresh retained payload"),
     );
+    let frozen_source_id = state
+        .retained_lifecycle_payloads
+        .get_entry_exact(identity)
+        .and_then(|entry| entry.pre_capture.as_ref())
+        .and_then(|lease| lease.surfaces.first())
+        .expect("fresh lifecycle owns its pre-capture source")
+        .buffer_id();
     assert_eq!(identity.scene_node_id(), scene_node_id);
     assert_eq!(
         identity.kind(),
@@ -607,6 +624,16 @@ fn xwayland_backing_replacement_preserves_frozen_lifecycle_identity_and_root() {
     assert_ne!(reversed_identity, identity);
     assert_eq!(reversed_payload.payload_id, frozen_payload.payload_id);
     assert!(std::sync::Arc::ptr_eq(reversed_payload, &frozen_payload));
+    assert_eq!(
+        state
+            .retained_lifecycle_payloads
+            .get_entry_exact(reversed_identity)
+            .and_then(|entry| entry.pre_capture.as_ref())
+            .and_then(|lease| lease.surfaces.first())
+            .expect("reversal transfers the pre-capture source")
+            .buffer_id(),
+        frozen_source_id
+    );
     assert_eq!(reversed_payload.root_surface_id, root_a);
     assert_eq!(
         reversed_payload.surface_presentation.root_key.surface_id,
@@ -911,7 +938,14 @@ fn unactivated_lifecycle_reservation_and_orphan_executor_do_not_drive_compositor
     assert!(
         state
             .retained_lifecycle_payloads
-            .publish_exact(identity, payload)
+            .publish_exact(
+                identity,
+                super::super::lifecycle_retained::RetainedLifecycleEntry {
+                    payload,
+                    pre_capture: None,
+                },
+            )
+            .is_ok()
     );
     let started_at = AnimationTime::monotonic_now().expect("monotonic clock");
     let sample_time = AnimationTime::from_nanos(started_at.as_nanos() + 100_000_000);
@@ -2511,6 +2545,9 @@ fn cancel_teardown_and_renderer_unavailable_retire_exact_members() {
     assert_eq!(unavailable.presented_lifecycle_physical.frame_id(), 23);
     assert!(unavailable.lifecycle_animation_has_pending_visible());
 }
+
+#[path = "lifecycle_precapture_tests.rs"]
+mod precapture_tests;
 
 #[path = "lifecycle_payload_tests.rs"]
 mod payload_tests;

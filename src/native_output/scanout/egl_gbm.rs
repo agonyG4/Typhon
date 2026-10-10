@@ -336,7 +336,52 @@ impl NativeGbmFramebufferCache {
     }
 }
 
+fn finish_render_work_on_error<T, E>(
+    result: Result<T, E>,
+    finish_render_work: impl FnOnce(),
+) -> Result<T, E> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            finish_render_work();
+            Err(error)
+        }
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_render_completion_tests {
+    use super::finish_render_work_on_error;
+    use std::cell::Cell;
+
+    #[test]
+    fn failed_post_draw_operation_finishes_render_work_before_error_propagates() {
+        let finish_count = Cell::new(0);
+        let result = finish_render_work_on_error(Err::<(), _>("swap failed"), || {
+            finish_count.set(finish_count.get() + 1);
+        });
+
+        assert_eq!(result, Err("swap failed"));
+        assert_eq!(finish_count.get(), 1);
+    }
+
+    #[test]
+    fn successful_post_draw_operation_does_not_force_render_completion() {
+        let finish_count = Cell::new(0);
+        let result = finish_render_work_on_error(Ok::<_, &str>(7), || {
+            finish_count.set(finish_count.get() + 1);
+        });
+
+        assert_eq!(result, Ok(7));
+        assert_eq!(finish_count.get(), 0);
+    }
+}
+
 impl NativeEglGbmScanout {
+    pub(crate) fn finish_render_work(&self) {
+        self.scene.finish_render_work();
+    }
+
     pub(crate) fn lifecycle_animation_available(&self) -> bool {
         self.scene.lifecycle_animation_available()
     }
@@ -586,10 +631,17 @@ impl NativeEglGbmScanout {
             Some(damage.as_renderer_damage(self.width, self.height)),
         );
         let draw_start = Instant::now();
-        let outcome = self
-            .scene
-            .draw_scene(&self.egl, self.egl_display, self.egl_surface, request)
-            .map_err(native_egl_io_error)?;
+        let outcome =
+            match self
+                .scene
+                .draw_scene(&self.egl, self.egl_display, self.egl_surface, request)
+            {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    self.scene.finish_render_work();
+                    return Err(native_egl_io_error(error));
+                }
+            };
         let draw_us = elapsed_micros(draw_start);
         let (scene_commit, lifecycle_evidence) = match outcome {
             EglFrameOutcome::Rendered {
@@ -610,6 +662,7 @@ impl NativeEglGbmScanout {
                 )));
             }
             EglFrameOutcome::LifecycleFallback { stats, fallbacks } => {
+                self.scene.finish_render_work();
                 return Ok(NativePaintOutcome::LifecycleFallback {
                     stats: native_egl_gbm_paint_stats(
                         self.format as u32,
@@ -632,14 +685,18 @@ impl NativeEglGbmScanout {
                 .to_egl_rects(self.width, self.height)
                 .is_some();
         let swap_start = Instant::now();
-        if let Err(error) = egl_swap_buffers_with_damage(
-            &self.egl,
-            self.egl_display,
-            self.egl_surface,
-            self.swap_buffers_with_damage,
-            output_damage.swap_damage(),
-            (self.width, self.height),
-        ) {
+        let swap_result = finish_render_work_on_error(
+            egl_swap_buffers_with_damage(
+                &self.egl,
+                self.egl_display,
+                self.egl_surface,
+                self.swap_buffers_with_damage,
+                output_damage.swap_damage(),
+                (self.width, self.height),
+            ),
+            || self.scene.finish_render_work(),
+        );
+        if let Err(error) = swap_result {
             self.scene.discard_rendered(scene_commit);
             self.scene.frame_swap_failed();
             return Err(native_egl_io_error(error));
@@ -653,11 +710,14 @@ impl NativeEglGbmScanout {
             .commit_presented(scene_commit, presented_transition_damage);
         let scene_stats = self.scene.last_frame_stats();
         let swap_us = elapsed_micros(swap_start);
-        let bo = unsafe { self.surface.lock_front_buffer() }.map_err(|error| {
-            io::Error::other(format!("failed to lock GBM front buffer: {error}"))
-        })?;
+        let bo = finish_render_work_on_error(unsafe { self.surface.lock_front_buffer() }, || {
+            self.scene.finish_render_work()
+        })
+        .map_err(|error| io::Error::other(format!("failed to lock GBM front buffer: {error}")))?;
         let fd = unsafe { BorrowedFd::borrow_raw(self.fd) };
-        let fb_id = self.framebuffer_cache.fb_id_for(fd, &bo)?;
+        let fb_id = finish_render_work_on_error(self.framebuffer_cache.fb_id_for(fd, &bo), || {
+            self.scene.finish_render_work()
+        })?;
         self.buffers
             .set_ready(NativePresentedGbmBuffer { _bo: bo, fb_id });
         Ok(NativePaintOutcome::Rendered {
@@ -977,6 +1037,9 @@ impl Drop for NativeEglGbmScanout {
             Some(self.egl_surface),
             Some(self.egl_context),
         );
+        // Shutdown drains client releases immediately after scanout teardown;
+        // complete any last source sampling before that ownership boundary.
+        self.scene.finish_render_work();
         self.scene.destroy(&self.egl, self.egl_display);
         let _ = self.egl.make_current(self.egl_display, None, None, None);
         let _ = self.egl.destroy_surface(self.egl_display, self.egl_surface);

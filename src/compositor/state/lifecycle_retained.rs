@@ -1,12 +1,74 @@
 use crate::compositor::state::RetainedSurfacePresentationSnapshot;
-use crate::compositor::{DecorationRenderInstance, ResolvedEffectScene, WindowId};
+use crate::compositor::{
+    DecorationRenderInstance, DmabufReleaseObligation, RenderableSurface, ResolvedEffectScene,
+    WindowId,
+};
 use crate::core::SceneNodeId;
 use crate::presentation_animation::{
     PresentationRetainedVisualIdentity, PresentationRetainedVisualKind, PresentationRevisionId,
 };
 use crate::window_lifecycle_animation::{LifecycleVisualGroup, valid_lifecycle_visual_group};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
+
+const MAX_RETAINED_LIFECYCLE_ENTRIES: usize = 256;
+pub(crate) const MAX_LIFECYCLE_PRECAPTURE_SURFACES: usize = 256;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum LifecyclePreCaptureEvent {
+    LeaseCreated,
+    SourceWithdrawnWhileLeased,
+    TransferredToFrame,
+    ReleasedAfterCapture,
+    RestoredToLiveOwner,
+    QueuedAfterCancel,
+    DrainedOnShutdown,
+}
+
+#[derive(Debug)]
+pub(crate) struct LifecycleHeldReleaseObligation {
+    pub(crate) surface_id: u32,
+    pub(crate) obligation: DmabufReleaseObligation,
+}
+
+/// Admission-time source ownership. This lease ends at successful renderer
+/// capture or lifecycle retirement; reversal moves it with its retained entry.
+#[derive(Debug)]
+pub(crate) struct LifecyclePreCaptureLease {
+    pub(crate) surfaces: Vec<RenderableSurface>,
+    pub(crate) held_release_obligations: Vec<LifecycleHeldReleaseObligation>,
+}
+
+impl LifecyclePreCaptureLease {
+    pub(crate) fn new(
+        surfaces: Vec<RenderableSurface>,
+        held_release_obligations: Vec<LifecycleHeldReleaseObligation>,
+    ) -> Option<Self> {
+        if surfaces.is_empty()
+            || surfaces.len() > MAX_LIFECYCLE_PRECAPTURE_SURFACES
+            || held_release_obligations.len() > surfaces.len()
+        {
+            return None;
+        }
+        Some(Self {
+            surfaces,
+            held_release_obligations,
+        })
+    }
+
+    pub(crate) fn dmabuf_surface_count(&self) -> usize {
+        self.surfaces
+            .iter()
+            .filter(|surface| surface.dmabuf_handle().is_some())
+            .count()
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct RetainedLifecycleEntry {
+    pub(crate) payload: Arc<RetainedLifecyclePayload>,
+    pub(crate) pre_capture: Option<LifecyclePreCaptureLease>,
+}
 
 /// Immutable-content continuity across exact retained presentation revisions.
 /// This token qualifies a frozen visual source; it is never an active owner.
@@ -26,9 +88,8 @@ impl PresentationRetainedVisualPayloadId {
     }
 }
 
-/// Frozen compositor metadata, client-surface presentation topology, and
-/// resolved owned effects for one lifecycle chain. Client surface contents
-/// remain live in the canonical compositor scene.
+/// Frozen compositor metadata, admission-time client-surface topology, and
+/// resolved owned effects for one lifecycle chain.
 #[derive(Debug, Clone)]
 pub(crate) struct RetainedLifecyclePayload {
     pub(crate) payload_id: PresentationRetainedVisualPayloadId,
@@ -71,7 +132,7 @@ impl RetainedLifecyclePayload {
 /// remains exclusively in PresentationEngine.
 #[derive(Debug, Default)]
 pub(crate) struct RetainedLifecyclePayloadStore {
-    entries: BTreeMap<PresentationRetainedVisualIdentity, Arc<RetainedLifecyclePayload>>,
+    entries: BTreeMap<PresentationRetainedVisualIdentity, RetainedLifecycleEntry>,
 }
 
 impl RetainedLifecyclePayloadStore {
@@ -79,11 +140,85 @@ impl RetainedLifecyclePayloadStore {
         &self,
         identity: PresentationRetainedVisualIdentity,
     ) -> Option<&Arc<RetainedLifecyclePayload>> {
+        self.entries.get(&identity).map(|entry| &entry.payload)
+    }
+
+    pub(crate) fn get_entry_exact(
+        &self,
+        identity: PresentationRetainedVisualIdentity,
+    ) -> Option<&RetainedLifecycleEntry> {
         self.entries.get(&identity)
     }
 
+    pub(crate) fn get_entry_exact_mut(
+        &mut self,
+        identity: PresentationRetainedVisualIdentity,
+    ) -> Option<&mut RetainedLifecycleEntry> {
+        self.entries.get_mut(&identity)
+    }
+
+    pub(crate) fn entries_for_source_withdrawal(
+        &self,
+        surface_ids: &HashSet<u32>,
+    ) -> Vec<(
+        PresentationRetainedVisualIdentity,
+        Arc<RetainedLifecyclePayload>,
+        usize,
+        usize,
+        usize,
+    )> {
+        self.entries
+            .iter()
+            .filter_map(|(identity, entry)| {
+                let lease = entry.pre_capture.as_ref()?;
+                lease
+                    .surfaces
+                    .iter()
+                    .any(|surface| surface_ids.contains(&surface.surface_id))
+                    .then(|| {
+                        (
+                            *identity,
+                            Arc::clone(&entry.payload),
+                            lease.surfaces.len(),
+                            lease.dmabuf_surface_count(),
+                            lease.held_release_obligations.len(),
+                        )
+                    })
+            })
+            .collect()
+    }
+
+    pub(crate) fn precapture_dmabuf_release_count(&self) -> usize {
+        self.entries
+            .values()
+            .filter_map(|entry| entry.pre_capture.as_ref())
+            .map(|lease| lease.held_release_obligations.len())
+            .sum()
+    }
+
+    pub(crate) fn windows_with_precapture(&self) -> Vec<WindowId> {
+        let mut windows = Vec::new();
+        for entry in self.entries.values() {
+            if entry.pre_capture.is_some() && !windows.contains(&entry.payload.window_id) {
+                windows.push(entry.payload.window_id);
+            }
+        }
+        windows
+    }
+
+    pub(crate) fn holds_release_token(&self, candidate: &DmabufReleaseObligation) -> bool {
+        self.entries.values().any(|entry| {
+            entry.pre_capture.as_ref().is_some_and(|lease| {
+                lease
+                    .held_release_obligations
+                    .iter()
+                    .any(|held| held.obligation.same_release_token(candidate))
+            })
+        })
+    }
+
     pub(crate) fn can_publish_exact(&self, identity: PresentationRetainedVisualIdentity) -> bool {
-        !self.entries.contains_key(&identity)
+        !self.entries.contains_key(&identity) && self.entries.len() < MAX_RETAINED_LIFECYCLE_ENTRIES
     }
 
     pub(crate) fn can_transfer_exact(
@@ -96,19 +231,20 @@ impl RetainedLifecyclePayloadStore {
             && self
                 .entries
                 .get(&previous_identity)
-                .is_some_and(|previous| Arc::ptr_eq(previous, payload))
+                .is_some_and(|previous| Arc::ptr_eq(&previous.payload, payload))
+            && self.entries.len() <= MAX_RETAINED_LIFECYCLE_ENTRIES
     }
 
     pub(crate) fn publish_exact(
         &mut self,
         identity: PresentationRetainedVisualIdentity,
-        payload: Arc<RetainedLifecyclePayload>,
-    ) -> bool {
-        if self.entries.contains_key(&identity) {
-            return false;
+        entry: RetainedLifecycleEntry,
+    ) -> Result<(), RetainedLifecycleEntry> {
+        if !self.can_publish_exact(identity) {
+            return Err(entry);
         }
-        self.entries.insert(identity, payload);
-        true
+        self.entries.insert(identity, entry);
+        Ok(())
     }
 
     pub(crate) fn transfer_exact(
@@ -120,25 +256,24 @@ impl RetainedLifecyclePayloadStore {
         if !self.can_transfer_exact(previous_identity, next_identity, payload) {
             return false;
         }
-        self.entries.insert(next_identity, Arc::clone(payload));
-        self.entries.remove(&previous_identity);
+        let Some(entry) = self.entries.remove(&previous_identity) else {
+            return false;
+        };
+        self.entries.insert(next_identity, entry);
         true
     }
 
     pub(crate) fn retire_exact(
         &mut self,
         identity: PresentationRetainedVisualIdentity,
-    ) -> Option<Arc<RetainedLifecyclePayload>> {
+    ) -> Option<RetainedLifecycleEntry> {
         self.entries.remove(&identity)
     }
 
     pub(crate) fn remove_scene_node(
         &mut self,
         scene_node_id: SceneNodeId,
-    ) -> Vec<(
-        PresentationRetainedVisualIdentity,
-        Arc<RetainedLifecyclePayload>,
-    )> {
+    ) -> Vec<(PresentationRetainedVisualIdentity, RetainedLifecycleEntry)> {
         let identities = self
             .entries
             .keys()
@@ -156,10 +291,7 @@ impl RetainedLifecyclePayloadStore {
 
     pub(crate) fn drain_all(
         &mut self,
-    ) -> Vec<(
-        PresentationRetainedVisualIdentity,
-        Arc<RetainedLifecyclePayload>,
-    )> {
+    ) -> Vec<(PresentationRetainedVisualIdentity, RetainedLifecycleEntry)> {
         std::mem::take(&mut self.entries).into_iter().collect()
     }
 }
@@ -212,6 +344,13 @@ mod tests {
         .expect("valid payload")
     }
 
+    fn entry(payload: Arc<RetainedLifecyclePayload>) -> RetainedLifecycleEntry {
+        RetainedLifecycleEntry {
+            payload,
+            pre_capture: None,
+        }
+    }
+
     #[test]
     fn duplicate_exact_identity_does_not_replace_immutable_payload() {
         let mut engine = PresentationEngine::default();
@@ -220,8 +359,12 @@ mod tests {
         let replacement = payload(identity, 20);
         let mut store = RetainedLifecyclePayloadStore::default();
 
-        assert!(store.publish_exact(identity, Arc::clone(&first)));
-        assert!(!store.publish_exact(identity, replacement));
+        assert!(
+            store
+                .publish_exact(identity, entry(Arc::clone(&first)))
+                .is_ok()
+        );
+        assert!(store.publish_exact(identity, entry(replacement)).is_err());
 
         assert_eq!(store.get_exact(identity).unwrap().root_surface_id, 10);
         assert!(Arc::ptr_eq(store.get_exact(identity).unwrap(), &first));
@@ -234,7 +377,11 @@ mod tests {
         let next_identity = reserve_identity(&mut engine);
         let frozen = payload(first_identity, 10);
         let mut store = RetainedLifecyclePayloadStore::default();
-        assert!(store.publish_exact(first_identity, Arc::clone(&frozen)));
+        assert!(
+            store
+                .publish_exact(first_identity, entry(Arc::clone(&frozen)))
+                .is_ok()
+        );
 
         assert!(store.transfer_exact(first_identity, next_identity, &frozen));
 
@@ -268,7 +415,11 @@ mod tests {
         assert!(
             state
                 .retained_lifecycle_payloads
-                .publish_exact(payload_only_identity, payload(payload_only_identity, 10),)
+                .publish_exact(
+                    payload_only_identity,
+                    entry(payload(payload_only_identity, 10)),
+                )
+                .is_ok()
         );
 
         let motion_only_identity = state

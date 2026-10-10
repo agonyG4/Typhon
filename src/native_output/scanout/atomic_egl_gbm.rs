@@ -224,6 +224,10 @@ impl GbmAllocationProbe for DeviceAllocationProbe<'_> {
 }
 
 impl AtomicEglGbmScanout {
+    pub(crate) fn finish_render_work(&self) {
+        unsafe { self.gl.finish() };
+    }
+
     pub(crate) fn import_scaled_probe_framebuffer(
         &self,
         candidate: &oblivion_one::compositor::DirectScanoutProbeCandidate,
@@ -1588,10 +1592,12 @@ impl AtomicEglGbmScanout {
             }) => {
                 // The lifecycle renderer may have sampled client dmabufs or
                 // partially written the acquired scanout framebuffer before
-                // reporting a recoverable representation fallback. Prove all
-                // work in this EGL context is complete before restoring any
-                // frame-owned client-buffer ownership or recycling the slot.
-                unsafe { self.gl.finish() };
+                // reporting a recoverable representation fallback. If GLES
+                // work started, complete it before restoring frame ownership
+                // or recycling the slot.
+                if gpu_sampling_started {
+                    unsafe { self.gl.finish() };
+                }
                 settle_failed_output_transaction(
                     output_transactions,
                     transaction_id,

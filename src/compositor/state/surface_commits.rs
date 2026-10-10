@@ -490,6 +490,15 @@ impl CompositorState {
             buffer_id: pending.data.buffer_id(),
             release: pending.release_target(),
         };
+        if self
+            .retained_lifecycle_payloads
+            .holds_release_token(&new_release)
+        {
+            // The lifecycle lease already owns this exact protocol token. A
+            // repeated attachment of the same DMA-BUF cannot create a second
+            // release owner while the admission-time source is outstanding.
+            return;
+        }
         self.reclassify_reactivated_dmabuf_release(&new_release);
         if let Some(previous) = self
             .active_dmabuf_buffers

@@ -1874,3 +1874,6 @@ fn egl_decoration_commands_emit_titlebar_and_button_primitives() {
         );
     }
 }
+
+#[path = "lifecycle_precapture_integration.rs"]
+mod lifecycle_precapture_integration;

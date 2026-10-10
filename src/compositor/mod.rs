@@ -730,6 +730,10 @@ pub struct CompositorState {
         crate::compositor::PresentationRetainedVisualPayloadId,
         LifecycleRenderTerminalEvent,
     )>,
+    lifecycle_precapture_diagnostic_events: HashSet<(
+        crate::compositor::PresentationRetainedVisualPayloadId,
+        state::LifecyclePreCaptureEvent,
+    )>,
     retained_lifecycle_payloads: state::RetainedLifecyclePayloadStore,
     window_exit_payloads: state::WindowExitPayloadStore,
     lifecycle_animation_renderer_available: Option<bool>,

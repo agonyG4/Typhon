@@ -208,6 +208,10 @@ pub(crate) struct GlesRendererInfo {
 }
 
 impl GlesSceneRenderer {
+    pub(crate) fn finish_render_work(&self) {
+        unsafe { self.gl.finish() };
+    }
+
     pub(crate) const fn lifecycle_animation_available(&self) -> bool {
         self.lifecycle.lamp_available()
     }
