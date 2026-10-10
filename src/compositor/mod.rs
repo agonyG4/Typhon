@@ -1024,6 +1024,8 @@ pub(in crate::compositor) struct PendingXwaylandRestore {
     pub(in crate::compositor) handle: X11WindowHandle,
     pub(in crate::compositor) minimized_target:
         Option<crate::window_lifecycle_animation::ResolvedLifecycleTarget>,
+    pub(in crate::compositor) last_source_wait_fingerprint: Option<u64>,
+    pub(in crate::compositor) suppressed_source_wait_count: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

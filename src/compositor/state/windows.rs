@@ -11,7 +11,7 @@ use crate::window_lifecycle_animation::{
 };
 use crate::wm::{LayoutMembership, WorkspaceSwitchOutcome};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum PendingXwaylandRestoreWaitReason {
     NoAssociatedSurface,
     WrongSurfaceIdentity,
@@ -40,8 +40,12 @@ impl PendingXwaylandRestoreWaitReason {
 struct PendingXwaylandRestoreWait {
     reason: PendingXwaylandRestoreWaitReason,
     surface_id: Option<u32>,
+    canonical_geometry: Option<WindowGeometry>,
     expected_rect: Option<PresentationRect>,
     committed_rect: Option<PresentationRect>,
+    canonical_placement: Option<SurfacePlacement>,
+    source_placement: Option<SurfacePlacement>,
+    source_offset: Option<(i32, i32)>,
     logical_size: Option<(u32, u32)>,
     buffer_size: Option<crate::render_backend::buffer::BufferSize>,
 }
@@ -50,14 +54,19 @@ impl PendingXwaylandRestoreWait {
     fn new(
         reason: PendingXwaylandRestoreWaitReason,
         surface_id: Option<u32>,
+        canonical_geometry: Option<WindowGeometry>,
         expected_rect: Option<PresentationRect>,
         source: Option<&RenderableSurface>,
     ) -> Self {
         Self {
             reason,
             surface_id,
+            canonical_geometry,
             expected_rect,
             committed_rect: source.and_then(pending_xwayland_restore_surface_rect),
+            canonical_placement: canonical_geometry.map(|geometry| geometry.placement),
+            source_placement: source.map(|source| source.placement),
+            source_offset: source.map(|source| (source.x, source.y)),
             logical_size: source.map(|source| (source.width, source.height)),
             buffer_size: source.map(RenderableSurface::buffer_size),
         }
@@ -96,6 +105,93 @@ fn lifecycle_rect_diagnostic_fields(prefix: &str, rect: Option<PresentationRect>
         ),
         None => format!("{prefix}_x=none {prefix}_y=none {prefix}_width=none {prefix}_height=none"),
     }
+}
+
+fn lifecycle_placement_diagnostic_fields(
+    prefix: &str,
+    placement: Option<SurfacePlacement>,
+) -> String {
+    let Some(placement) = placement else {
+        return format!(
+            "{prefix}_parent_surface_id=unavailable {prefix}_root_mode=unavailable {prefix}_local_x=unavailable {prefix}_local_y=unavailable"
+        );
+    };
+    let parent_surface_id = placement
+        .parent_surface_id
+        .map_or_else(|| "none".to_owned(), |surface_id| surface_id.to_string());
+    let root_mode = match placement.root_mode {
+        RootPlacementMode::CascadedWindow => "cascaded_window",
+        RootPlacementMode::Absolute => "absolute",
+    };
+    format!(
+        "{prefix}_parent_surface_id={parent_surface_id} {prefix}_root_mode={root_mode} {prefix}_local_x={} {prefix}_local_y={}",
+        placement.local_x, placement.local_y,
+    )
+}
+
+fn pending_xwayland_restore_wait_fingerprint(wait: PendingXwaylandRestoreWait) -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    fn rect_bits(rect: Option<PresentationRect>) -> Option<(u64, u64, u64, u64)> {
+        rect.map(|rect| {
+            (
+                rect.x().to_bits(),
+                rect.y().to_bits(),
+                rect.width().to_bits(),
+                rect.height().to_bits(),
+            )
+        })
+    }
+
+    fn placement_key(placement: Option<SurfacePlacement>) -> Option<(Option<u32>, i32, i32, u8)> {
+        placement.map(|placement| {
+            (
+                placement.parent_surface_id,
+                placement.local_x,
+                placement.local_y,
+                match placement.root_mode {
+                    RootPlacementMode::CascadedWindow => 0,
+                    RootPlacementMode::Absolute => 1,
+                },
+            )
+        })
+    }
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    wait.reason.hash(&mut hasher);
+    wait.surface_id.hash(&mut hasher);
+    wait.canonical_geometry
+        .map(|geometry| {
+            (
+                placement_key(Some(geometry.placement)),
+                geometry.width,
+                geometry.height,
+            )
+        })
+        .hash(&mut hasher);
+    rect_bits(wait.expected_rect).hash(&mut hasher);
+    rect_bits(wait.committed_rect).hash(&mut hasher);
+    placement_key(wait.canonical_placement).hash(&mut hasher);
+    placement_key(wait.source_placement).hash(&mut hasher);
+    wait.source_offset.hash(&mut hasher);
+    wait.logical_size.hash(&mut hasher);
+    wait.buffer_size
+        .map(|size| (size.width, size.height))
+        .hash(&mut hasher);
+    hasher.finish()
+}
+
+fn record_pending_xwayland_restore_wait(
+    last_fingerprint: &mut Option<u64>,
+    suppressed_count: &mut u64,
+    fingerprint: u64,
+) -> Option<u64> {
+    if *last_fingerprint == Some(fingerprint) {
+        *suppressed_count = suppressed_count.saturating_add(1);
+        return None;
+    }
+    *last_fingerprint = Some(fingerprint);
+    Some(std::mem::take(suppressed_count))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1729,10 +1825,14 @@ impl CompositorState {
         &self,
         pending: PendingXwaylandRestore,
     ) -> PendingXwaylandRestoreReadiness {
+        let canonical_geometry = self
+            .window(pending.window_id)
+            .and_then(|window| window.x11_geometry.map(|geometry| geometry.frame));
         let waiting = |reason, surface_id, expected_rect, source| {
             PendingXwaylandRestoreReadiness::Waiting(PendingXwaylandRestoreWait::new(
                 reason,
                 surface_id,
+                canonical_geometry,
                 expected_rect,
                 source,
             ))
@@ -1900,24 +2000,53 @@ impl CompositorState {
             return;
         }
         eprintln!(
-            "typhon.lifecycle_xwayland_restore event=cancelled window_id={:?} xid={} generation={} reason={}",
+            "typhon.lifecycle_xwayland_restore event=cancelled window_id={:?} xid={} generation={} reason={} repeated_waits_suppressed={}",
             pending.window_id,
             pending.handle.xid(),
             pending.handle.generation().get(),
             reason.as_str(),
+            pending.suppressed_source_wait_count,
         );
     }
 
     fn trace_pending_xwayland_restore_source_wait(
-        &self,
+        &mut self,
         pending: PendingXwaylandRestore,
         wait: PendingXwaylandRestoreWait,
     ) {
         if !lifecycle_diagnostics_enabled() {
             return;
         }
+        let fingerprint = pending_xwayland_restore_wait_fingerprint(wait);
+        let Some(repeated_waits_suppressed) = self
+            .pending_xwayland_restores
+            .get_mut(&pending.window_id)
+            .filter(|current| current.handle == pending.handle)
+            .and_then(|current| {
+                record_pending_xwayland_restore_wait(
+                    &mut current.last_source_wait_fingerprint,
+                    &mut current.suppressed_source_wait_count,
+                    fingerprint,
+                )
+            })
+        else {
+            return;
+        };
         let expected = lifecycle_rect_diagnostic_fields("expected", wait.expected_rect);
-        let committed = lifecycle_rect_diagnostic_fields("committed", wait.committed_rect);
+        let candidate =
+            lifecycle_rect_diagnostic_fields("candidate_materialized", wait.committed_rect);
+        let canonical_placement =
+            lifecycle_placement_diagnostic_fields("canonical", wait.canonical_placement);
+        let source_placement =
+            lifecycle_placement_diagnostic_fields("source", wait.source_placement);
+        let (canonical_width, canonical_height) = wait.canonical_geometry.map_or_else(
+            || ("unavailable".to_owned(), "unavailable".to_owned()),
+            |geometry| (geometry.width.to_string(), geometry.height.to_string()),
+        );
+        let (source_x, source_y) = wait.source_offset.map_or_else(
+            || ("unavailable".to_owned(), "unavailable".to_owned()),
+            |(x, y)| (x.to_string(), y.to_string()),
+        );
         let (logical_width, logical_height) = wait
             .logical_size
             .map_or(("none".to_owned(), "none".to_owned()), |(width, height)| {
@@ -1929,7 +2058,7 @@ impl CompositorState {
                 (size.width.to_string(), size.height.to_string())
             });
         eprintln!(
-            "typhon.lifecycle_xwayland_restore event=source_wait window_id={:?} xid={} generation={} surface_id={} reason={} {expected} {committed} logical_width={logical_width} logical_height={logical_height} buffer_width={buffer_width} buffer_height={buffer_height}",
+            "typhon.lifecycle_xwayland_restore event=source_wait window_id={:?} xid={} generation={} surface_id={} reason={} {canonical_placement} canonical_width={canonical_width} canonical_height={canonical_height} {source_placement} source_x={source_x} source_y={source_y} {expected} {candidate} logical_width={logical_width} logical_height={logical_height} buffer_width={buffer_width} buffer_height={buffer_height} repeated_waits_suppressed={repeated_waits_suppressed}",
             pending.window_id,
             pending.handle.xid(),
             pending.handle.generation().get(),
@@ -1939,7 +2068,11 @@ impl CompositorState {
         );
     }
 
-    fn trace_pending_xwayland_restore_source_ready(&self, source: PendingXwaylandRestoreSource) {
+    fn trace_pending_xwayland_restore_source_ready(
+        &self,
+        source: PendingXwaylandRestoreSource,
+        repeated_waits_suppressed: u64,
+    ) {
         if !lifecycle_diagnostics_enabled() {
             return;
         }
@@ -1948,7 +2081,7 @@ impl CompositorState {
         let committed =
             lifecycle_rect_diagnostic_fields("source", Some(source.committed_client_rect));
         eprintln!(
-            "typhon.lifecycle_xwayland_restore event=source_ready window_id={:?} xid={} generation={} surface_id={} source_generation={} {canonical} {committed} logical_width={} logical_height={} buffer_width={} buffer_height={} frame_width={} frame_height={}",
+            "typhon.lifecycle_xwayland_restore event=source_ready window_id={:?} xid={} generation={} surface_id={} source_generation={} {canonical} {committed} logical_width={} logical_height={} buffer_width={} buffer_height={} frame_width={} frame_height={} repeated_waits_suppressed={repeated_waits_suppressed}",
             source.window_id,
             source.handle.xid(),
             source.handle.generation().get(),
@@ -2017,6 +2150,8 @@ impl CompositorState {
                 window_id,
                 handle,
                 minimized_target,
+                last_source_wait_fingerprint: None,
+                suppressed_source_wait_count: 0,
             },
         );
         self.backend_commands.push(
@@ -2064,7 +2199,10 @@ impl CompositorState {
                 false
             }
             PendingXwaylandRestoreReadiness::Ready(source) => {
-                self.trace_pending_xwayland_restore_source_ready(source);
+                self.trace_pending_xwayland_restore_source_ready(
+                    source,
+                    pending.suppressed_source_wait_count,
+                );
                 let restored =
                     self.restore_minimized_desktop_window_with_source(window_id, Some(source));
                 if restored {
@@ -2128,11 +2266,16 @@ impl CompositorState {
                     window_id,
                     handle,
                     minimized_target: window.state.minimized_lifecycle_target(),
+                    last_source_wait_fingerprint: None,
+                    suppressed_source_wait_count: 0,
                 }
             };
             match self.resolve_pending_xwayland_restore_source(pending) {
                 PendingXwaylandRestoreReadiness::Ready(source) => {
-                    self.trace_pending_xwayland_restore_source_ready(source);
+                    self.trace_pending_xwayland_restore_source_ready(
+                        source,
+                        pending.suppressed_source_wait_count,
+                    );
                     Some(source)
                 }
                 PendingXwaylandRestoreReadiness::Waiting(wait) => {
@@ -3221,6 +3364,70 @@ mod tests {
         assert_eq!(
             unknown.normal_restore_target(),
             Some(NormalRestoreTarget::UnknownSize { placement })
+        );
+    }
+
+    #[test]
+    fn xwayland_restore_wait_diagnostics_distinguish_placement_and_deduplicate() {
+        let cascaded = SurfacePlacement::root_at(17, -11);
+        let parent_relative = SurfacePlacement::subsurface(91, 5, 7);
+        assert!(
+            lifecycle_placement_diagnostic_fields("canonical", Some(cascaded))
+                .contains("canonical_root_mode=cascaded_window")
+        );
+        assert!(
+            lifecycle_placement_diagnostic_fields("canonical", Some(cascaded))
+                .contains("canonical_local_x=17 canonical_local_y=-11")
+        );
+        assert!(
+            lifecycle_placement_diagnostic_fields("source", Some(parent_relative))
+                .contains("source_parent_surface_id=91")
+        );
+        assert!(
+            lifecycle_placement_diagnostic_fields("source", Some(parent_relative))
+                .contains("source_root_mode=cascaded_window")
+        );
+
+        let canonical_geometry = Some(WindowGeometry::new(cascaded, 800, 600));
+        let expected = Some(PresentationRect::new(137.0, 91.0, 800.0, 600.0).unwrap());
+        let first_wait = PendingXwaylandRestoreWait::new(
+            PendingXwaylandRestoreWaitReason::UnexpectedPlacement,
+            Some(25),
+            canonical_geometry,
+            expected,
+            None,
+        );
+        let mut last_fingerprint = None;
+        let mut suppressed_count = 0;
+        let mut emitted = 0;
+        for _ in 0..100 {
+            if record_pending_xwayland_restore_wait(
+                &mut last_fingerprint,
+                &mut suppressed_count,
+                pending_xwayland_restore_wait_fingerprint(first_wait),
+            )
+            .is_some()
+            {
+                emitted += 1;
+            }
+        }
+        assert_eq!(emitted, 1);
+
+        let changed_wait = PendingXwaylandRestoreWait::new(
+            PendingXwaylandRestoreWaitReason::UnexpectedPlacement,
+            Some(25),
+            canonical_geometry,
+            Some(PresentationRect::new(137.0, 91.0, 1024.0, 768.0).unwrap()),
+            None,
+        );
+        assert_eq!(
+            record_pending_xwayland_restore_wait(
+                &mut last_fingerprint,
+                &mut suppressed_count,
+                pending_xwayland_restore_wait_fingerprint(changed_wait),
+            ),
+            Some(99),
+            "a changed geometry emits once and reports the suppressed repeats"
         );
     }
 }
