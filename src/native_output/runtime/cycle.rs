@@ -752,7 +752,7 @@ impl NativeRuntime {
                 oblivion_one::native::event_loop::NativeContinuationReason::ProcessLaunchBacklog,
             )
         {
-            let launch_backlog_pending = if self.shutdown.is_running() {
+            let launch_backlog_pending = if !self.shutdown.is_running() {
                 self.fail_pending_process_launches_for_shutdown()
             } else {
                 drain_pending_process_launches_with_xwayland_environment_and_cursor(
