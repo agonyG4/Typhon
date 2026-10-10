@@ -2512,10 +2512,7 @@ mod tests {
             )
             .expect("VRR opportunity creates variable reservation"),
         );
-        frame.presentation_timing = KmsPresentationTiming::Variable {
-            earliest_submit_ns: 2,
-            preferred_present_ns: 3,
-        };
+        frame.presentation_timing = KmsPresentationTiming::variable(2);
 
         let error = swapchain
             .finish_render_owned(frame)

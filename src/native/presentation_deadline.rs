@@ -3,7 +3,9 @@
 
 use std::time::Duration;
 
-use crate::native::buffering::{OpportunityLease, OpportunityLeaseReason, PresentationOpportunity};
+use crate::native::buffering::{
+    OpportunityLease, OpportunityLeaseReason, PresentationOpportunity, PresentationOpportunityId,
+};
 
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -296,13 +298,23 @@ impl PresentationDeadlinePlanner {
         &self,
         presented_at: MonotonicTimestampNs,
     ) -> Option<PreparedPhysicalPresentation> {
+        let sequence = self.last_presented_sequence.checked_add(1)?;
         Some(PreparedPhysicalPresentation {
             claim: PrimaryRefreshClaim {
-                sequence: self.last_presented_sequence.saturating_add(1),
+                sequence,
                 presentation_time: presented_at,
                 clock_generation: self.clock_generation,
             },
         })
+    }
+
+    /// Returns the identity candidate for the next variable physical
+    /// presentation without reserving or consuming it.
+    pub fn next_variable_opportunity_id(&self) -> Option<PresentationOpportunityId> {
+        Some(PresentationOpportunityId::new(
+            self.clock_generation,
+            self.last_presented_sequence.checked_add(1)?,
+        ))
     }
 
     pub fn commit_presented(&mut self, prepared: PreparedPhysicalPresentation) -> u64 {
@@ -1074,6 +1086,54 @@ mod tests {
         assert_eq!(prepared.logical_sequence(), 2);
         assert_eq!(prepared.claim().presentation_time, presented_at);
         assert_eq!(planner.commit_presented(prepared), 2);
+    }
+
+    #[test]
+    fn variable_sequence_exhaustion_rejects_preparation_and_next_id() {
+        let mut planner = PresentationDeadlinePlanner::new(Duration::from_nanos(6_060_606));
+        planner.last_presented_sequence = u64::MAX;
+
+        assert!(
+            planner
+                .prepare_variable_presented(MonotonicTimestampNs::new(1_100_000_000))
+                .is_none()
+        );
+        assert!(planner.next_variable_opportunity_id().is_none());
+    }
+
+    #[test]
+    fn next_variable_opportunity_id_is_a_non_consuming_generation_scoped_successor() {
+        let mut planner = PresentationDeadlinePlanner::new(Duration::from_nanos(6_060_606));
+        planner.clock_generation = 9;
+        planner.last_presented_sequence = 42;
+        let expected = crate::native::buffering::PresentationOpportunityId::new(9, 43);
+
+        assert_eq!(planner.next_variable_opportunity_id(), Some(expected));
+        assert_eq!(planner.next_variable_opportunity_id(), Some(expected));
+        assert_eq!(planner.last_presented_sequence, 42);
+    }
+
+    #[test]
+    fn variable_opportunity_identity_ignores_elapsed_time_and_refresh_interval() {
+        let expected = crate::native::buffering::PresentationOpportunityId::new(1, 43);
+        let last_presented_at_ns = 1_000_000_000;
+
+        for refresh_interval_ns in [6_060_606, 9_400_000, 16_666_667] {
+            for elapsed_ns in [6_100_000, 9_400_000, 100_000_000] {
+                let mut planner =
+                    PresentationDeadlinePlanner::new(Duration::from_nanos(refresh_interval_ns));
+                planner.last_presented_sequence = 42;
+                planner.last_presented_at = Some(MonotonicTimestampNs::new(last_presented_at_ns));
+                let next_present = MonotonicTimestampNs::new(last_presented_at_ns + elapsed_ns);
+
+                let prepared = planner
+                    .prepare_variable_presented(next_present)
+                    .expect("variable physical presentation has a next sequence");
+
+                assert_eq!(prepared.claim().opportunity_id(), expected);
+                assert_eq!(planner.next_variable_opportunity_id(), Some(expected));
+            }
+        }
     }
 
     #[test]

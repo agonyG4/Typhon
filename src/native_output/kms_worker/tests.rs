@@ -56,10 +56,7 @@ fn kms_job_reservation_validation_keeps_fixed_variable_and_o1_distinct() {
     assert_ne!(fixed, variable);
 
     job.reservation = variable;
-    job.presentation_timing = KmsPresentationTiming::Variable {
-        earliest_submit_ns: 20,
-        preferred_present_ns: 40,
-    };
+    job.presentation_timing = KmsPresentationTiming::variable(20);
     assert_eq!(job.validate_presentation_timing_domain(), Ok(()));
     assert_eq!(job.validate_reservation_owner(variable), Ok(()));
     assert_eq!(
@@ -73,6 +70,54 @@ fn kms_job_reservation_validation_keeps_fixed_variable_and_o1_distinct() {
         job.validate_presentation_timing_domain(),
         Err(KmsCommitPayloadError::DeferredO1Reservation)
     );
+}
+
+#[test]
+fn worker_preferred_present_telemetry_reads_the_attached_reservation() {
+    use crate::native_output::presentation::kms_timing::KmsPresentationTiming;
+    use crate::native_output::presentation::transaction::FramePresentationReservation;
+    use crate::native_output::presentation::transaction::VariablePresentationReservation;
+    use oblivion_one::native::buffering::PresentationOpportunity;
+    use oblivion_one::native::buffering::PresentationOpportunityId;
+    use oblivion_one::native::presentation_timing::PresentationTiming;
+
+    let make_job = |preferred_present_ns| {
+        let mut job = test_job(77_002);
+        let opportunity = PresentationOpportunity::new(
+            PresentationOpportunityId::new(1, 77_002),
+            PresentationTiming::VrrWindow {
+                anchor: MonotonicTimestampNs::new(10),
+                earliest_present: MonotonicTimestampNs::new(30),
+                presentation_not_before: None,
+                preferred_present: MonotonicTimestampNs::new(preferred_present_ns),
+                service_deadline: None,
+                shortest_interval: Duration::from_millis(6),
+                longest_interval: Some(Duration::from_millis(20)),
+            },
+        );
+        job.reservation = FramePresentationReservation::Variable(
+            VariablePresentationReservation::try_new(
+                opportunity,
+                PresentationTargetReason::CommitTiming,
+            )
+            .expect("VRR opportunity creates variable reservation"),
+        );
+        job.presentation_timing = KmsPresentationTiming::variable(20);
+        job
+    };
+
+    let first = make_job(40);
+    let second = make_job(90);
+    assert_eq!(first.validate_presentation_timing_domain(), Ok(()));
+    assert_eq!(second.validate_presentation_timing_domain(), Ok(()));
+    assert_eq!(first.variable_preferred_present_ns(), Some(40));
+    assert_eq!(second.variable_preferred_present_ns(), Some(90));
+
+    let mut fixed = test_job(77_003);
+    assert_eq!(fixed.variable_preferred_present_ns(), None);
+    fixed.reservation =
+        crate::native_output::presentation::transaction::test_deferred_o1_reservation();
+    assert_eq!(fixed.variable_preferred_present_ns(), None);
 }
 
 #[test]

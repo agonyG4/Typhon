@@ -1162,10 +1162,9 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
                             Some(window.commit_complete_deadline_ns()),
                             Some(window.target_presentation_ns()),
                         ),
-                        KmsPresentationTiming::Variable {
-                            preferred_present_ns,
-                            ..
-                        } => (None, Some(preferred_present_ns)),
+                        KmsPresentationTiming::Variable { .. } => {
+                            (None, job.variable_preferred_present_ns())
+                        }
                     };
                     shared.metrics.timing.record_submission(
                         planned_worker_wake_at,

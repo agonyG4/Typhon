@@ -189,13 +189,14 @@ fn variable_worker_waits_for_earliest_submit_without_fixed_deadline_training() {
     });
     let handle = KmsCommitWorkerHandle::start(executor).unwrap();
     let queued_at = monotonic_now_ns_for_test();
-    let earliest_submit_ns = queued_at.saturating_add(20_000_000);
-    let preferred_present_ns = earliest_submit_ns;
+    let earliest_submit_ns = queued_at.saturating_add(10_000_000);
+    let earliest_present_ns = queued_at.saturating_add(15_000_000);
+    let preferred_present_ns = queued_at.saturating_add(18_000_000);
     let opportunity = PresentationOpportunity::new(
         oblivion_one::native::buffering::PresentationOpportunityId::new(1, 80_100),
         PresentationTiming::VrrWindow {
             anchor: MonotonicTimestampNs::new(queued_at),
-            earliest_present: MonotonicTimestampNs::new(earliest_submit_ns),
+            earliest_present: MonotonicTimestampNs::new(earliest_present_ns),
             presentation_not_before: None,
             preferred_present: MonotonicTimestampNs::new(preferred_present_ns),
             service_deadline: None,
@@ -211,10 +212,7 @@ fn variable_worker_waits_for_earliest_submit_without_fixed_deadline_training() {
         )
         .expect("test opportunity is variable refresh"),
     );
-    job.presentation_timing = KmsPresentationTiming::Variable {
-        earliest_submit_ns,
-        preferred_present_ns,
-    };
+    job.presentation_timing = KmsPresentationTiming::variable(earliest_submit_ns);
     job.queued_at = MonotonicTimestampNs::new(queued_at);
 
     reserve_for_test(&handle, job.kind).enqueue(job).unwrap();
@@ -231,6 +229,10 @@ fn variable_worker_waits_for_earliest_submit_without_fixed_deadline_training() {
         })
         .expect("variable job was submitted");
     assert!(ownership.actual_worker_wait_returned_at.get() >= earliest_submit_ns);
+    assert_eq!(
+        ownership.job.variable_preferred_present_ns(),
+        Some(preferred_present_ns)
+    );
     assert_eq!(
         ownership
             .job

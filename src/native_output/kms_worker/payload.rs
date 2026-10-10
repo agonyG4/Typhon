@@ -21,6 +21,7 @@ use oblivion_one::native::{
     buffering::PresentationOpportunity,
     kms::{AtomicCursorVisualState, FramebufferId, PageFlipToken},
     presentation_deadline::{MonotonicTimestampNs, PresentationTarget, PresentationTargetReason},
+    presentation_timing::PresentationTiming,
 };
 use std::os::fd::OwnedFd;
 
@@ -56,6 +57,21 @@ pub(crate) struct KmsCommitJob {
     pub(crate) pacing_ticket: Option<WorkerPacingTicket>,
     pub(crate) test_policy: KmsCommitTestPolicy,
     pub(crate) ready_submit: bool,
+}
+
+impl KmsCommitJob {
+    pub(crate) fn variable_preferred_present_ns(&self) -> Option<u64> {
+        let FramePresentationReservation::Variable(reservation) = self.reservation else {
+            return None;
+        };
+
+        match reservation.opportunity().timing() {
+            PresentationTiming::VrrWindow {
+                preferred_present, ..
+            } => Some(preferred_present.get()),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

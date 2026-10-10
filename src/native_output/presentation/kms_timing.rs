@@ -115,15 +115,17 @@ pub(crate) struct KmsSubmitWindow {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum KmsPresentationTiming {
     Fixed(KmsSubmitWindow),
-    /// Variable submissions have only a not-before bound. The preferred time
-    /// is desired-service metadata and never becomes an expiry or deadline.
+    /// Variable KMS submissions have only a service not-before bound.
     Variable {
         earliest_submit_ns: u64,
-        preferred_present_ns: u64,
     },
 }
 
 impl KmsPresentationTiming {
+    pub(crate) const fn variable(earliest_submit_ns: u64) -> Self {
+        Self::Variable { earliest_submit_ns }
+    }
+
     pub(crate) const fn fixed_submit_window(self) -> Option<KmsSubmitWindow> {
         match self {
             Self::Fixed(window) => Some(window),
@@ -167,16 +169,6 @@ impl KmsPresentationTiming {
         match self {
             Self::Fixed(window) => Some(window.apply_guard_ns()),
             Self::Variable { .. } => None,
-        }
-    }
-
-    pub(crate) const fn preferred_present_ns(self) -> Option<u64> {
-        match self {
-            Self::Fixed(_) => None,
-            Self::Variable {
-                preferred_present_ns,
-                ..
-            } => Some(preferred_present_ns),
         }
     }
 
@@ -560,19 +552,14 @@ mod tests {
         assert_eq!(timing.fixed_commit_complete_deadline_ns(), Some(80));
         assert_eq!(timing.dispatch_budget_ns(), Some(20));
         assert_eq!(timing.apply_guard_ns(), Some(20));
-        assert_eq!(timing.preferred_present_ns(), None);
     }
 
     #[test]
     fn variable_kms_timing_has_no_fixed_deadline_or_dispatch_window() {
-        let timing = KmsPresentationTiming::Variable {
-            earliest_submit_ns: 40,
-            preferred_present_ns: 100,
-        };
+        let timing = KmsPresentationTiming::variable(40);
 
         assert_eq!(timing.earliest_submit_ns(), 40);
         assert_eq!(timing.worker_wake_at_ns(), 40);
-        assert_eq!(timing.preferred_present_ns(), Some(100));
         assert_eq!(timing.fixed_submit_window(), None);
         assert_eq!(timing.fixed_commit_complete_deadline_ns(), None);
         assert_eq!(timing.dispatch_budget_ns(), None);
