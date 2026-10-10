@@ -102,6 +102,23 @@ pub(crate) struct RetainedLifecyclePayload {
     pub(crate) render_layout: Arc<FrozenLifecycleRenderLayout>,
 }
 
+pub(crate) struct RetainedLifecycleRenderSource {
+    pub(crate) surface_presentation: RetainedSurfacePresentationSnapshot,
+    pub(crate) render_layout: Arc<FrozenLifecycleRenderLayout>,
+}
+
+impl RetainedLifecycleRenderSource {
+    pub(crate) fn new(
+        surface_presentation: RetainedSurfacePresentationSnapshot,
+        render_layout: Arc<FrozenLifecycleRenderLayout>,
+    ) -> Self {
+        Self {
+            surface_presentation,
+            render_layout,
+        }
+    }
+}
+
 impl RetainedLifecyclePayload {
     pub(crate) fn capture(
         origin_identity: PresentationRetainedVisualIdentity,
@@ -110,8 +127,7 @@ impl RetainedLifecyclePayload {
         visual_group: LifecycleVisualGroup,
         effect_scene: ResolvedEffectScene,
         frozen_decoration: Option<DecorationRenderInstance>,
-        surface_presentation: RetainedSurfacePresentationSnapshot,
-        render_layout: Arc<FrozenLifecycleRenderLayout>,
+        render_source: RetainedLifecycleRenderSource,
     ) -> Option<Arc<Self>> {
         if origin_identity.kind() != PresentationRetainedVisualKind::WindowLifecycle
             || !valid_lifecycle_visual_group(visual_group)
@@ -125,8 +141,8 @@ impl RetainedLifecyclePayload {
             visual_group,
             effect_scene: Arc::new(effect_scene),
             frozen_decoration,
-            surface_presentation,
-            render_layout,
+            surface_presentation: render_source.surface_presentation,
+            render_layout: render_source.render_layout,
         }))
     }
 }
@@ -342,8 +358,10 @@ mod tests {
             visual_group,
             ResolvedEffectScene::default(),
             None,
-            RetainedSurfacePresentationSnapshot::test_root(root_surface_id),
-            Arc::new(crate::compositor::FrozenLifecycleRenderLayout::empty_for_test()),
+            RetainedLifecycleRenderSource::new(
+                RetainedSurfacePresentationSnapshot::test_root(root_surface_id),
+                Arc::new(crate::compositor::FrozenLifecycleRenderLayout::empty_for_test()),
+            ),
         )
         .expect("valid payload")
     }

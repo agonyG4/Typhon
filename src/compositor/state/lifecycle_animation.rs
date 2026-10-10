@@ -842,16 +842,18 @@ impl CompositorState {
                 visual_group,
                 resolved_effect_scene,
                 frozen_decoration,
-                fresh_source_preparation
-                    .as_ref()
-                    .expect("fresh lifecycle captured source before reservation")
-                    .surface_presentation
-                    .clone(),
-                std::sync::Arc::clone(
-                    &fresh_source_preparation
+                super::lifecycle_retained::RetainedLifecycleRenderSource::new(
+                    fresh_source_preparation
                         .as_ref()
                         .expect("fresh lifecycle captured source before reservation")
-                        .render_layout,
+                        .surface_presentation
+                        .clone(),
+                    std::sync::Arc::clone(
+                        &fresh_source_preparation
+                            .as_ref()
+                            .expect("fresh lifecycle captured source before reservation")
+                            .render_layout,
+                    ),
                 ),
             ) else {
                 self.rollback_lifecycle_reservation(identity, previous_identity);

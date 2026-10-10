@@ -347,11 +347,13 @@ mod tests {
                     lifecycle_visual_group(),
                     ResolvedEffectScene::default(),
                     None,
-                    super::super::state::RetainedSurfacePresentationSnapshot::test_root(
-                        _root_surface_id,
-                    ),
-                    std::sync::Arc::new(
-                        crate::compositor::FrozenLifecycleRenderLayout::empty_for_test(),
+                    super::super::state::lifecycle_retained::RetainedLifecycleRenderSource::new(
+                        super::super::state::RetainedSurfacePresentationSnapshot::test_root(
+                            _root_surface_id,
+                        ),
+                        std::sync::Arc::new(
+                            crate::compositor::FrozenLifecycleRenderLayout::empty_for_test(),
+                        ),
                     ),
                 )
                 .expect("valid test lifecycle payload");

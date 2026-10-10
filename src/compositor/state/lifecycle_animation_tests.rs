@@ -644,8 +644,12 @@ fn lifecycle_request_with_group(
             _visual_group,
             ResolvedEffectScene::default(),
             None,
-            super::super::RetainedSurfacePresentationSnapshot::test_root(_root_surface_id),
-            std::sync::Arc::new(crate::compositor::FrozenLifecycleRenderLayout::empty_for_test()),
+            super::super::lifecycle_retained::RetainedLifecycleRenderSource::new(
+                super::super::RetainedSurfacePresentationSnapshot::test_root(_root_surface_id),
+                std::sync::Arc::new(
+                    crate::compositor::FrozenLifecycleRenderLayout::empty_for_test(),
+                ),
+            ),
         )
         .expect("valid test lifecycle payload");
         assert!(
@@ -1180,8 +1184,10 @@ fn unactivated_lifecycle_reservation_and_orphan_executor_do_not_drive_compositor
         group,
         ResolvedEffectScene::default(),
         None,
-        super::super::RetainedSurfacePresentationSnapshot::test_root(312),
-        std::sync::Arc::new(crate::compositor::FrozenLifecycleRenderLayout::empty_for_test()),
+        super::super::lifecycle_retained::RetainedLifecycleRenderSource::new(
+            super::super::RetainedSurfacePresentationSnapshot::test_root(312),
+            std::sync::Arc::new(crate::compositor::FrozenLifecycleRenderLayout::empty_for_test()),
+        ),
     )
     .expect("test payload");
     assert!(
