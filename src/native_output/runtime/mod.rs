@@ -1046,6 +1046,10 @@ impl NativeRuntime {
 
 impl Drop for NativeRuntime {
     fn drop(&mut self) {
+        // Error exits can bypass run_native_cycle's normal final demotion.
+        // Renderer/KMS worker joins below are teardown-only blocking work and
+        // must not run while the reactor still carries its realtime policy.
+        oblivion_one::native::scheduling_qos::demote_current_reactor();
         let panic_unwinding = self.termination.record_panic_if_unwinding();
         let snapshot = self.termination_snapshot();
         self.termination.capture_pre_cleanup_snapshot(snapshot);
