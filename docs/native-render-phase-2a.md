@@ -394,6 +394,31 @@ generation rebind as ordered worker control; callers must not mutate render
 slot generations directly. Direct scanout and its framebuffer cache remain
 outside `AtomicRenderDomain`.
 
+For Phase 2B.2, output reconfiguration is a two-owner candidate transaction on
+the existing render worker. The reactor creates the candidate physical pool
+and exports its owned DMA-BUF descriptors, then dispatches one candidate
+prepare command containing a duplicated render-device fd, dimensions,
+format/modifier, pool/output generations, descriptors, and the current
+renderer revisions. The worker constructs and renders the candidate domain on
+the same thread that owns the active domain; the active domain remains usable
+until KMS has committed the candidate framebuffer. Only then does the reactor
+request candidate promotion. The worker destroys the old render domain and
+acknowledges that destruction before the reactor releases the old physical
+framebuffer IDs and GBM BOs. Candidate preparation or modeset failure follows
+the symmetric rule: the worker destroys candidate EGL/GL imports and
+acknowledges before the reactor releases candidate physical backing. There is
+one configuration candidate at a time, and no candidate is prepared while a
+normal render command is executing.
+
+The completion slot therefore needs to distinguish candidate preparation,
+promotion, and candidate destruction acknowledgements from output-frame
+completions. A candidate identity includes output and pool generations; the
+reactor rejects a completion that does not match the active output
+configuration request. Session quiescence and shutdown must also drain or
+destroy any candidate before physical-pool quarantine or teardown. These
+operations use the render worker's existing bounded command/completion
+transport and never create another render thread.
+
 Teardown is explicit: make the EGL context current, finish GLES work, delete
 render-pool GL framebuffers and textures, destroy EGLImages, drop
 `GlesSceneRenderer` resources, unbind and destroy the EGL context, terminate
