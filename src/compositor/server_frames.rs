@@ -126,6 +126,16 @@ impl OwnCompositorServer {
         )
     }
 
+    #[doc(hidden)]
+    pub fn frame_batch_has_commit_timing_claims(&self, batch_id: CompositorFrameBatchId) -> bool {
+        self.state.frame_batch_has_commit_timing_claims(batch_id)
+    }
+
+    #[doc(hidden)]
+    pub fn has_active_commit_timing_ownership(&self) -> bool {
+        self.state.has_active_commit_timing_ownership()
+    }
+
     /// Re-evaluate ordered FIFO/timing constraints after a native wake.  This
     /// publishes work through the normal surface-tree path; it does not render
     /// or submit anything itself.  The return value reports an active-scene

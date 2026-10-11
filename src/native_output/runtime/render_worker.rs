@@ -574,8 +574,11 @@ impl NativeRuntime {
                         PacingField::u64("output_frame_id", frame_id),
                         PacingField::u64("render_generation", outer.render_generation),
                         PacingField::u64("render_observed_at_ns", outer.render_observed_at_ns),
-                        PacingField::u64("target_vblank_sequence", outer.frame_target_sequence),
-                        PacingField::u64(
+                        PacingField::option_u64(
+                            "target_vblank_sequence",
+                            outer.frame_target_sequence,
+                        ),
+                        PacingField::option_u64(
                             "target_presentation_ns",
                             outer.frame_target_presentation_ns,
                         ),

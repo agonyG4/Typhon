@@ -288,13 +288,9 @@ fn commit_snapshot(
         token: pending.token,
         output_generation: pending.generation,
         crtc_id: pending.crtc_id,
-        target: match descriptor.reservation() {
-            crate::native_output::presentation::transaction::FramePresentationReservation::Fixed(
-                target,
-            ) => target,
-            crate::native_output::presentation::transaction::FramePresentationReservation::Variable(
-                _,
-            ) => return Err(identity_mismatch(owner, "variable_commit_inactive", transaction_id)),
+        reservation: match descriptor.reservation() {
+            reservation @ (crate::native_output::presentation::transaction::FramePresentationReservation::Fixed(_)
+            | crate::native_output::presentation::transaction::FramePresentationReservation::Variable(_)) => reservation,
             crate::native_output::presentation::transaction::FramePresentationReservation::DeferredO1(
                 _,
             ) => return Err(identity_mismatch(owner, "deferred_o1_unbound", transaction_id)),
@@ -619,7 +615,20 @@ pub(super) fn build_output_pipeline_snapshot_with_presented(
                         PreparedCompositedState::Ready {
                             transaction_id: ready.transaction_id,
                             slot: ready.slot,
-                            target,
+                            reservation: FramePresentationReservation::Fixed(target),
+                            fence_state: PreparedFenceState::SubmitWithInFence,
+                        }
+                    }
+                    reservation @ FramePresentationReservation::Variable(_) => {
+                        validate_state(
+                            record,
+                            "prepared_ready",
+                            OutputTransactionStateKind::Ready,
+                        )?;
+                        PreparedCompositedState::Ready {
+                            transaction_id: ready.transaction_id,
+                            slot: ready.slot,
+                            reservation,
                             fence_state: PreparedFenceState::SubmitWithInFence,
                         }
                     }
@@ -635,13 +644,6 @@ pub(super) fn build_output_pipeline_snapshot_with_presented(
                             fence_state: PreparedFenceState::SubmitWithInFence,
                         }
                     }
-                    FramePresentationReservation::Variable(_) => {
-                        return Err(identity_mismatch(
-                            "prepared_ready",
-                            "variable_reservation_inactive",
-                            ready.transaction_id,
-                        ));
-                    }
                 }
             }
             _ => {
@@ -653,10 +655,11 @@ pub(super) fn build_output_pipeline_snapshot_with_presented(
             }
         }
     } else if let Some(slot) = swapchain.rendering_slot() {
-        PreparedCompositedState::Rendering {
-            slot,
-            target: rendering_target.ok_or(PipelineSnapshotError::MissingRenderingTarget)?,
-        }
+        let reservation = swapchain
+            .rendering_reservation()
+            .or_else(|| rendering_target.map(FramePresentationReservation::Fixed))
+            .ok_or(PipelineSnapshotError::MissingRenderingTarget)?;
+        PreparedCompositedState::Rendering { slot, reservation }
     } else {
         PreparedCompositedState::None
     };
@@ -1100,11 +1103,11 @@ mod tests {
             PreparedCompositedState::Ready {
                 transaction_id,
                 slot,
-                target,
+                reservation,
                 ..
             } if transaction_id == ready.transaction_id
                 && slot == ready.slot
-                && Some(target) == ready.fixed_target()
+                && reservation == ready.reservation
         ));
     }
 

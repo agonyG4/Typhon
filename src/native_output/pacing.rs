@@ -2842,6 +2842,10 @@ impl NativeFramePacing {
         self.summary_enabled
     }
 
+    pub(crate) const fn trace_enabled(&self) -> bool {
+        self.trace.is_some()
+    }
+
     pub(crate) fn note_physical_claim_overtake_ready(&mut self) {
         if self.enabled {
             self.physical_claim_overtake_ready =

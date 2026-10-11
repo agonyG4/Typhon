@@ -294,7 +294,7 @@ impl KmsCommitWorkerHandle {
         transaction_id: OutputTransactionId,
         output_generation: u64,
         crtc_id: u32,
-        target: oblivion_one::native::presentation_deadline::PresentationTarget,
+        reservation: crate::native_output::presentation::transaction::FramePresentationReservation,
         frame_id: u64,
     ) -> KmsWorkerQueuedCancellation {
         self.shared.cancel_queued_primary(
@@ -302,7 +302,7 @@ impl KmsCommitWorkerHandle {
             transaction_id,
             output_generation,
             crtc_id,
-            target,
+            reservation,
             frame_id,
         )
     }

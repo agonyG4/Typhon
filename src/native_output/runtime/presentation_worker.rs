@@ -925,7 +925,6 @@ pub(super) fn queue_explicit_ready_for_presentation(
     transaction_id: OutputTransactionId,
     output_generation: u64,
     crtc_id: u32,
-    submit_window: KmsSubmitWindow,
     cursor_update: KmsCursorUpdate,
     cursor_delivery: crate::native_output::presentation::plane::PresentedCursorDelivery,
     primary_cursor_presentation: KmsPrimaryCursorPresentation,
@@ -944,7 +943,6 @@ pub(super) fn queue_explicit_ready_for_presentation(
         transaction_id,
         output_generation,
         crtc_id,
-        submit_window,
         cursor_update,
         cursor_delivery,
         primary_cursor_presentation,
@@ -985,10 +983,6 @@ pub(super) fn submit_explicit_ready_for_presentation(
 ) -> NativeResult<Option<(u64, u32, OutputTransactionId, bool)>> {
     if worker_mode {
         let worker = worker.ok_or_else(|| io::Error::other("worker transport has no worker"))?;
-        let submit_window = explicit
-            .swapchain()?
-            .ready_submit_window()
-            .ok_or_else(|| io::Error::other("ready explicit frame has no submit window"))?;
         let frozen_cursor_plan = explicit
             .swapchain()?
             .ready_cursor_plan()
@@ -1026,7 +1020,6 @@ pub(super) fn submit_explicit_ready_for_presentation(
             transaction_id,
             output_generation,
             crtc_id,
-            submit_window,
             cursor_update,
             frozen_cursor_delivery,
             frozen_primary_cursor_presentation,
@@ -1080,7 +1073,16 @@ pub(super) fn submit_explicit_ready_for_presentation(
         });
     }
     let (token, framebuffer_id, transaction_id) =
-        explicit.submit_ready_frame(kms_backend, server, output_transactions, vrr_policy)?;
+        match explicit.submit_ready_frame(kms_backend, server, output_transactions, vrr_policy) {
+            Ok(submitted) => submitted,
+            Err(error)
+                if error.kind() == io::ErrorKind::WouldBlock
+                    && explicit.swapchain()?.has_suspended_frame() =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(error.into()),
+        };
     if let Some(snapshot) = trace_snapshot
         && let Some(ledger) = cursor_reveal_trace.as_mut()
         && let Some(token) = PageFlipToken::new(token)

@@ -4,7 +4,6 @@ pub(crate) use oblivion_one::native::adaptive_buffering::{
     TripleCapability, TripleCapabilityBlocker,
 };
 use oblivion_one::native::kms::PageFlipToken;
-use oblivion_one::native::presentation_deadline::PresentationTarget;
 #[allow(unused_imports)]
 pub(crate) use oblivion_one::native::scheduler::PipelineWaitReason;
 use oblivion_one::native::scheduler::{
@@ -12,6 +11,7 @@ use oblivion_one::native::scheduler::{
 };
 
 use super::plane::{PlanePageflipIdentity, PresentedPlaneSnapshot};
+use crate::native_output::presentation::transaction::FramePresentationReservation;
 use crate::native_output::{DirectScanoutCandidateKey, OutputSlotId, OutputTransactionId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,7 +144,7 @@ pub(crate) struct QueuedCommitSnapshot {
     pub(crate) token: PageFlipToken,
     pub(crate) output_generation: u64,
     pub(crate) crtc_id: u32,
-    pub(crate) target: PresentationTarget,
+    pub(crate) reservation: FramePresentationReservation,
     pub(crate) kind: PipelineCommitKind,
 }
 
@@ -160,12 +160,12 @@ pub(crate) enum PreparedCompositedState {
     None,
     Rendering {
         slot: OutputSlotId,
-        target: PresentationTarget,
+        reservation: FramePresentationReservation,
     },
     Ready {
         transaction_id: OutputTransactionId,
         slot: OutputSlotId,
-        target: PresentationTarget,
+        reservation: FramePresentationReservation,
         fence_state: PreparedFenceState,
     },
     ReadyUnbound {
@@ -189,10 +189,12 @@ impl PreparedCompositedState {
         }
     }
 
-    const fn target(self) -> Option<PresentationTarget> {
+    const fn reservation(self) -> Option<FramePresentationReservation> {
         match self {
             Self::None => None,
-            Self::Rendering { target, .. } | Self::Ready { target, .. } => Some(target),
+            Self::Rendering { reservation, .. } | Self::Ready { reservation, .. } => {
+                Some(reservation)
+            }
             Self::ReadyUnbound { .. } => None,
         }
     }
@@ -305,8 +307,13 @@ impl OutputPipelineSnapshot {
     }
 
     pub(crate) fn can_pre_admit_primary(&self) -> bool {
-        matches!(self.prepared, PreparedCompositedState::Ready { .. })
-            && self.worker_queued_next.is_none()
+        matches!(
+            self.prepared,
+            PreparedCompositedState::Ready {
+                reservation: FramePresentationReservation::Fixed(_),
+                ..
+            }
+        ) && self.worker_queued_next.is_none()
             && self.future_primary_depth() <= self.future_primary_limit
             && !self.kernel_plane_delta()
     }
@@ -363,37 +370,21 @@ impl OutputPipelineSnapshot {
         if depth > 2 {
             return Err(PipelineValidationError::FuturePrimaryDepthExceeded { depth });
         }
-        let targets = [
+        let reservations = [
             self.kernel_submitted
                 .filter(|commit| commit.kind.is_primary())
-                .map(|commit| commit.target),
+                .map(|commit| commit.reservation),
             self.worker_queued_next
                 .filter(|commit| commit.kind.is_primary())
-                .map(|commit| commit.target),
-            self.prepared.target(),
+                .map(|commit| commit.reservation),
+            self.prepared.reservation(),
         ];
-        // Compare adjacent present targets, including across an empty worker slot.
-        let targets = targets.into_iter().flatten();
-        for (earlier, later) in targets.clone().zip(targets.skip(1)) {
-            let earlier_claim = earlier.physical_claim();
-            let later_claim = later.physical_claim();
-            if earlier.clock_generation != later.clock_generation
-                || earlier_claim.clock_generation != earlier.clock_generation
-                || later_claim.clock_generation != later.clock_generation
-            {
-                return Err(PipelineValidationError::TargetGenerationMismatch {
-                    earlier_generation: earlier.clock_generation,
-                    later_generation: later.clock_generation,
-                });
-            }
-            if later_claim.sequence <= earlier_claim.sequence
-                || later_claim.presentation_time <= earlier_claim.presentation_time
-            {
-                return Err(PipelineValidationError::NonMonotonicTargetOrder {
-                    earlier_sequence: earlier_claim.sequence,
-                    later_sequence: later_claim.sequence,
-                });
-            }
+        // Compare adjacent physical owners, including across an empty worker
+        // slot. Fixed-to-fixed retains its timestamp ordering guard. Any pair
+        // involving VRR is ordered by the phase-free opportunity identity.
+        let reservations = reservations.into_iter().flatten();
+        for (earlier, later) in reservations.clone().zip(reservations.skip(1)) {
+            validate_reservation_order(earlier, later)?;
         }
         Ok(())
     }
@@ -426,9 +417,18 @@ impl PresentationPipelineView for OutputPipelineSnapshot {
         match self.prepared {
             PreparedCompositedState::None => SchedulerPreparedPrimary::None,
             PreparedCompositedState::Rendering { .. } => SchedulerPreparedPrimary::Rendering,
-            PreparedCompositedState::Ready { target, .. } => {
-                SchedulerPreparedPrimary::Ready { target }
-            }
+            PreparedCompositedState::Ready {
+                reservation: FramePresentationReservation::Fixed(target),
+                ..
+            } => SchedulerPreparedPrimary::Ready { target },
+            PreparedCompositedState::Ready {
+                reservation: FramePresentationReservation::Variable(_),
+                ..
+            } => SchedulerPreparedPrimary::ReadyVariable,
+            PreparedCompositedState::Ready {
+                reservation: FramePresentationReservation::DeferredO1(_),
+                ..
+            } => SchedulerPreparedPrimary::ReadyUnbound,
             PreparedCompositedState::ReadyUnbound { .. } => SchedulerPreparedPrimary::ReadyUnbound,
         }
     }
@@ -447,5 +447,212 @@ impl PresentationPipelineView for OutputPipelineSnapshot {
 
     fn triple_capable(&self) -> bool {
         matches!(self.triple_capability, TripleCapability::Capable)
+    }
+}
+
+fn validate_reservation_order(
+    earlier: FramePresentationReservation,
+    later: FramePresentationReservation,
+) -> Result<(), PipelineValidationError> {
+    if let (
+        FramePresentationReservation::Fixed(earlier_target),
+        FramePresentationReservation::Fixed(later_target),
+    ) = (earlier, later)
+    {
+        let earlier_claim = earlier_target.physical_claim();
+        let later_claim = later_target.physical_claim();
+        if earlier_target.clock_generation != later_target.clock_generation
+            || earlier_claim.clock_generation != earlier_target.clock_generation
+            || later_claim.clock_generation != later_target.clock_generation
+        {
+            return Err(PipelineValidationError::TargetGenerationMismatch {
+                earlier_generation: earlier_target.clock_generation,
+                later_generation: later_target.clock_generation,
+            });
+        }
+        if later_claim.sequence <= earlier_claim.sequence
+            || later_claim.presentation_time <= earlier_claim.presentation_time
+        {
+            return Err(PipelineValidationError::NonMonotonicTargetOrder {
+                earlier_sequence: earlier_claim.sequence,
+                later_sequence: later_claim.sequence,
+            });
+        }
+        return Ok(());
+    }
+
+    let earlier_id = earlier
+        .physical_opportunity()
+        .map(|opportunity| opportunity.id());
+    let later_id = later
+        .physical_opportunity()
+        .map(|opportunity| opportunity.id());
+    match (earlier_id, later_id) {
+        (Some(earlier_id), Some(later_id))
+            if earlier_id.clock_generation() != later_id.clock_generation() =>
+        {
+            Err(PipelineValidationError::TargetGenerationMismatch {
+                earlier_generation: earlier_id.clock_generation(),
+                later_generation: later_id.clock_generation(),
+            })
+        }
+        (Some(earlier_id), Some(later_id)) if later_id.sequence() <= earlier_id.sequence() => {
+            Err(PipelineValidationError::NonMonotonicTargetOrder {
+                earlier_sequence: earlier_id.sequence(),
+                later_sequence: later_id.sequence(),
+            })
+        }
+        (Some(_), Some(_)) => Ok(()),
+        _ => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod variable_reservation_tests {
+    use super::*;
+    use crate::native_output::presentation::transaction::VariablePresentationReservation;
+    use oblivion_one::native::buffering::{PresentationOpportunity, PresentationOpportunityId};
+    use oblivion_one::native::presentation_deadline::{
+        MonotonicTimestampNs, PresentationTarget, PresentationTargetReason, PrimaryRefreshClaim,
+        TargetSelectionEvidence,
+    };
+    use oblivion_one::native::presentation_timing::PresentationTiming;
+    use std::num::NonZeroU64;
+
+    fn variable(sequence: u64) -> FramePresentationReservation {
+        FramePresentationReservation::Variable(
+            VariablePresentationReservation::try_new(
+                PresentationOpportunity::new(
+                    PresentationOpportunityId::new(1, sequence),
+                    PresentationTiming::VrrWindow {
+                        anchor: MonotonicTimestampNs::new(1_000_000),
+                        earliest_present: MonotonicTimestampNs::new(1_006_000),
+                        presentation_not_before: None,
+                        preferred_present: MonotonicTimestampNs::new(1_009_000),
+                        service_deadline: None,
+                        shortest_interval: std::time::Duration::from_millis(6),
+                        longest_interval: None,
+                    },
+                ),
+                PresentationTargetReason::ReactiveDouble,
+            )
+            .expect("VRR opportunity creates variable reservation"),
+        )
+    }
+
+    fn transaction_id(value: u64) -> OutputTransactionId {
+        OutputTransactionId::new(NonZeroU64::new(value).unwrap())
+    }
+
+    fn fixed(sequence: u64, presentation_ns: u64) -> FramePresentationReservation {
+        let presentation_time = MonotonicTimestampNs::new(presentation_ns);
+        FramePresentationReservation::Fixed(PresentationTarget {
+            sequence,
+            presentation_time,
+            submit_not_before: presentation_time,
+            render_start_deadline: presentation_time,
+            refresh_interval: std::time::Duration::from_millis(6),
+            reason: PresentationTargetReason::ReactiveDouble,
+            clock_generation: 1,
+            estimated: false,
+            predicted_unreachable: false,
+            physical_claim: PrimaryRefreshClaim {
+                sequence,
+                presentation_time,
+                clock_generation: 1,
+            },
+            selection_evidence: TargetSelectionEvidence::default(),
+        })
+    }
+
+    #[test]
+    fn ready_and_pending_variable_owners_count_as_real_future_primaries() {
+        let ready = OutputPipelineSnapshot {
+            output_generation: 1,
+            future_primary_limit: 1,
+            pacing_mode: NativeOutputPacingMode::ReactiveDouble,
+            presented_planes: PresentedPlaneSnapshot::initial(
+                super::super::plane::PresentedCursorState::hidden(),
+            ),
+            kernel_submitted: None,
+            worker_queued_next: None,
+            prepared: PreparedCompositedState::Ready {
+                transaction_id: transaction_id(1),
+                slot: OutputSlotId::new(1).unwrap(),
+                reservation: variable(1),
+                fence_state: PreparedFenceState::SubmitWithInFence,
+            },
+            free_compositor_slots: 2,
+            triple_capability: TripleCapability::Capable,
+        };
+        assert_eq!(
+            ready.prepared_primary(),
+            SchedulerPreparedPrimary::ReadyVariable
+        );
+        assert_eq!(ready.future_primary_depth(), 1);
+        assert!(!ready.can_render_composed());
+        assert!(!ready.can_pre_admit_primary());
+        ready
+            .validate()
+            .expect("Variable READY ownership validates");
+
+        let rendering = OutputPipelineSnapshot {
+            prepared: PreparedCompositedState::Rendering {
+                slot: OutputSlotId::new(1).unwrap(),
+                reservation: variable(1),
+            },
+            ..ready
+        };
+        assert_eq!(
+            rendering.prepared_primary(),
+            SchedulerPreparedPrimary::Rendering
+        );
+        rendering
+            .validate()
+            .expect("Variable rendering ownership validates");
+
+        let pending = OutputPipelineSnapshot {
+            prepared: PreparedCompositedState::None,
+            kernel_submitted: Some(QueuedCommitSnapshot {
+                token: PageFlipToken::new(2).unwrap(),
+                output_generation: 1,
+                crtc_id: 3,
+                reservation: variable(1),
+                kind: PipelineCommitKind::CompositedPrimary {
+                    transaction_id: transaction_id(2),
+                    frame_id: 2,
+                    slot: OutputSlotId::new(2).unwrap(),
+                    framebuffer_id: 2,
+                },
+            }),
+            ..ready
+        };
+        assert_eq!(pending.future_primary_depth(), 1);
+        assert!(!pending.can_render_composed());
+        pending
+            .validate()
+            .expect("Variable pending ownership validates");
+    }
+
+    #[test]
+    fn mixed_reservation_order_uses_opportunity_identity_while_fixed_order_keeps_time_guard() {
+        let fixed_earlier = fixed(1, 12_000_000);
+        let variable_later = variable(2);
+        assert!(
+            super::validate_reservation_order(fixed_earlier, variable_later).is_ok(),
+            "a later Variable opportunity may have a preferred time before a Fixed phase"
+        );
+
+        let variable_earlier = variable(1);
+        let fixed_later = fixed(2, 3_000_000);
+        assert!(
+            super::validate_reservation_order(variable_earlier, fixed_later).is_ok(),
+            "Variable-to-Fixed order uses generation and sequence only"
+        );
+
+        assert!(matches!(
+            super::validate_reservation_order(fixed_earlier, fixed(2, 11_000_000)),
+            Err(PipelineValidationError::NonMonotonicTargetOrder { .. })
+        ));
     }
 }

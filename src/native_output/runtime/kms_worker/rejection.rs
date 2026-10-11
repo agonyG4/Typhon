@@ -64,7 +64,10 @@ pub(in crate::native_output::runtime) fn drop_queued_worker_job_with_reason_part
         cursor.cancel_worker_submission(job.transaction_id, job.token, cursor_epoch)?;
         cursor_output_arbitration.clear_pending();
     } else {
-        if drop_reason == OutputTransactionDropReason::SafeAbandonment && job.ready_submit {
+        if drop_reason == OutputTransactionDropReason::SafeAbandonment
+            && job.ready_submit
+            && matches!(job.reservation, FramePresentationReservation::Fixed(_))
+        {
             frame_pacing.note_predictive_ready_other_safe_abandonment_physical(
                 job.pacing_ticket
                     .and_then(WorkerPacingTicket::physical_identity),
@@ -444,7 +447,7 @@ impl NativeRuntime {
 
     pub(super) fn fail_queued_worker_job(
         &mut self,
-        job: KmsCommitJob,
+        mut job: KmsCommitJob,
         error: AtomicKmsError,
         rejection_kind: WorkerRejectionKind,
     ) -> NativeResult<()> {
@@ -544,6 +547,98 @@ impl NativeRuntime {
                 self.server.scene_render_generation(),
                 NativeVisualWorkQueueReason::WorkerRequeue,
             )?;
+        }
+        let variable_composited = matches!(
+            (job.kind, job.reservation),
+            (
+                AtomicCommitKind::CompositedPrimary { .. },
+                FramePresentationReservation::Variable(_)
+            )
+        );
+        if variable_composited && !compatibility_primary {
+            if self
+                .atomic_commit_arbiter
+                .reject_worker_queued(job.token)
+                .is_none()
+            {
+                return Err(io::Error::other(
+                    "rejected Variable worker job lost its Atomic ownership",
+                )
+                .into());
+            }
+            let transfer = match &mut job.primary {
+                KmsPrimaryUpdate::Framebuffer { in_fence, .. } => self
+                    .scanout
+                    .suspend_abandon_worker_submission(job.token, in_fence),
+                KmsPrimaryUpdate::Unchanged => {
+                    let mut no_completion_fence = None;
+                    self.scanout
+                        .suspend_abandon_worker_submission(job.token, &mut no_completion_fence)
+                }
+            };
+            if let Err(error) = transfer {
+                eprintln!(
+                    "native KMS worker: rejected Variable output suspension failed; retaining emergency ownership: {error}"
+                );
+                self.emergency_quarantined_worker_jobs.push(job);
+                return Err(io::Error::other(error).into());
+            }
+            settle_dropped_output_transaction(
+                &mut self.output_transactions,
+                job.transaction_id,
+                OutputTransactionDropReason::SafeAbandonment,
+                MonotonicTimestampNs::new(monotonic_now_ns()?),
+                |obligations| {
+                    restore_presentation_feedback_obligation(&mut self.server, obligations);
+                    let batch_id = obligations.frame_batch_id().ok_or_else(|| {
+                        io::Error::other(
+                            "rejected Variable transaction has no compositor frame batch",
+                        )
+                    })?;
+                    self.server
+                        .restore_frame_batch_after_render_failure(batch_id);
+                    Ok(())
+                },
+            )?;
+            if let Some(sidecar) = sidecar_owner {
+                settle_dropped_output_transaction(
+                    &mut self.output_transactions,
+                    sidecar.transaction.id(),
+                    OutputTransactionDropReason::SafeAbandonment,
+                    MonotonicTimestampNs::new(monotonic_now_ns()?),
+                    |obligations| {
+                        restore_presentation_feedback_obligation(&mut self.server, obligations);
+                        debug_assert!(obligations.frame_batch_id().is_none());
+                        debug_assert!(obligations.direct_surface_id().is_none());
+                        Ok(())
+                    },
+                )?;
+            }
+            self.queued_redraw_requested = true;
+            queue_visual_work(
+                &mut self.frame_pacing,
+                &mut self.frame_scheduler,
+                monotonic_now_ns()?,
+                self.server.scene_render_generation(),
+                NativeVisualWorkQueueReason::QueuedRedrawRetry,
+            )?;
+            if self.output_render_fence_token.is_none()
+                && let NativeScanoutBackend::AtomicEglGbm(explicit) = &*self.scanout
+                && let Some(fd) = explicit.suspended_fence_fd()?
+            {
+                self.output_render_fence_token = Some(
+                    self.event_loop
+                        .register(fd, NativeEventSource::OutputRenderFence)?,
+                );
+            }
+            self.perf.log("native.kms_commit_worker", || {
+                vec![
+                    NativePerfField::str("event", "variable_submit_rejected_retry_fixed"),
+                    NativePerfField::u64("transaction_id", job.transaction_id.get()),
+                    NativePerfField::u64("token", job.token.get()),
+                ]
+            });
+            return Ok(());
         }
         self.atomic_commit_arbiter.reject_worker_queued(job.token);
         if matches!(job.kind, AtomicCommitKind::CompositedPrimary { .. }) {

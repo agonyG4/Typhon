@@ -76,6 +76,186 @@ fn pageflip_identity(
     }
 }
 
+fn record_variable_composited_pageflip(
+    frame: &crate::native_output::scanout::PresentedOutputFrame,
+    presented_at: MonotonicTimestampNs,
+    clock_generation: u64,
+    opportunity_sequence: u64,
+    transport: crate::native_output::kms_worker::KmsCommitWorkerTransport,
+    render_journal: &mut AdaptiveRenderJournal,
+    frame_pacing: &mut NativeFramePacing,
+) -> io::Result<()> {
+    let crate::native_output::presentation::transaction::FramePresentationReservation::Variable(
+        reservation,
+    ) = frame.reservation
+    else {
+        return Err(io::Error::other(
+            "variable pageflip accounting received a fixed reservation",
+        ));
+    };
+    let oblivion_one::native::presentation_timing::PresentationTiming::VrrWindow {
+        anchor,
+        earliest_present,
+        preferred_present,
+        ..
+    } = reservation.timing()
+    else {
+        return Err(io::Error::other(
+            "variable pageflip reservation has no VRR window",
+        ));
+    };
+    let opportunity_id = reservation.opportunity().id();
+    if opportunity_id.clock_generation() != clock_generation
+        || opportunity_id.sequence() != opportunity_sequence
+    {
+        return Err(io::Error::other(
+            "variable pageflip telemetry opportunity identity mismatch",
+        ));
+    }
+
+    render_journal.note_matching_presentation(presented_at);
+    render_journal.record_atomic_submit(
+        frame
+            .submit_returned_at
+            .get()
+            .saturating_sub(frame.submit_started_at.get()),
+    );
+    if !frame.fence_timing_accounted {
+        if let Some((signaled_at, quality)) = frame.fence_signal {
+            frame_pacing.note_fence_timestamp_quality(quality);
+            render_journal.record_render_sample(
+                render_sample_duration_ns(frame.composite_started_at, signaled_at),
+                signaled_at,
+            );
+        } else {
+            render_journal.record_render_sample(
+                render_sample_duration_ns(frame.composite_started_at, frame.rendered_at),
+                frame.rendered_at,
+            );
+        }
+    }
+
+    if frame_pacing.trace_enabled() {
+        let preferred_lateness =
+            i64::try_from(presented_at.get().abs_diff(preferred_present.get())).unwrap_or(i64::MAX);
+        let preferred_lateness = if presented_at >= preferred_present {
+            preferred_lateness
+        } else {
+            -preferred_lateness
+        };
+        frame_pacing.log(
+            "vrr_physical_present",
+            vec![
+                PacingField::u64("frame_id", frame.frame_id),
+                PacingField::u64("transaction_id", frame.transaction_id.get()),
+                PacingField::u64("clock_generation", clock_generation),
+                PacingField::u64("opportunity_sequence", opportunity_sequence),
+                PacingField::u64("anchor_ns", anchor.get()),
+                PacingField::u64("earliest_present_ns", earliest_present.get()),
+                PacingField::u64("preferred_present_ns", preferred_present.get()),
+                PacingField::u64("actual_pageflip_ns", presented_at.get()),
+                PacingField::u64(
+                    "actual_interval_ns",
+                    presented_at.get().saturating_sub(anchor.get()),
+                ),
+                PacingField::i64("preferred_lateness_ns", preferred_lateness),
+                PacingField::str(
+                    "transport",
+                    match transport {
+                        crate::native_output::kms_worker::KmsCommitWorkerTransport::Worker => {
+                            "worker"
+                        }
+                        crate::native_output::kms_worker::KmsCommitWorkerTransport::Synchronous => {
+                            "synchronous"
+                        }
+                    },
+                ),
+            ],
+        );
+    }
+    Ok(())
+}
+
+fn prepare_physical_presentation_for_reservation(
+    deadline: &oblivion_one::native::presentation_deadline::PresentationDeadlinePlanner,
+    reservation: crate::native_output::presentation::transaction::FramePresentationReservation,
+    presented_at: MonotonicTimestampNs,
+) -> io::Result<oblivion_one::native::presentation_deadline::PreparedPhysicalPresentation> {
+    match reservation {
+        crate::native_output::presentation::transaction::FramePresentationReservation::Fixed(_) => {
+            Ok(deadline.prepare_presented(presented_at))
+        }
+        crate::native_output::presentation::transaction::FramePresentationReservation::Variable(
+            variable,
+        ) => {
+            let prepared = deadline
+                .prepare_variable_presented(presented_at)
+                .ok_or_else(|| io::Error::other("variable physical opportunity sequence is exhausted"))?;
+            if prepared.claim().opportunity_id() != variable.opportunity().id() {
+                return Err(io::Error::other(
+                    "variable pageflip physical opportunity does not match its reservation",
+                ));
+            }
+            Ok(prepared)
+        }
+        crate::native_output::presentation::transaction::FramePresentationReservation::DeferredO1(
+            _,
+        ) => Err(io::Error::other(
+            "deferred O1 reservation reached a physical pageflip",
+        )),
+    }
+}
+
+fn classify_pending_fence_deadline_miss(
+    reservation: crate::native_output::presentation::transaction::FramePresentationReservation,
+    presentation_timing: crate::native_output::presentation::kms_timing::KmsPresentationTiming,
+    quality: FenceTimestampQuality,
+    signaled_at: MonotonicTimestampNs,
+    render_journal: &AdaptiveRenderJournal,
+    apply_guard_ns: u64,
+) -> io::Result<Option<ProvenDeadlineMiss>> {
+    match (reservation, presentation_timing) {
+        (
+            crate::native_output::presentation::transaction::FramePresentationReservation::Fixed(
+                target,
+            ),
+            crate::native_output::presentation::kms_timing::KmsPresentationTiming::Fixed(
+                submit_window,
+            ),
+        ) => {
+            let before =
+                render_journal.prediction_with_kms_guard(target.refresh_interval, apply_guard_ns);
+            let commit_deadline_ns = submit_window.commit_complete_deadline_ns();
+            Ok(match quality {
+                FenceTimestampQuality::ExactSyncFile if signaled_at.get() > commit_deadline_ns => {
+                    Some(ProvenDeadlineMiss::ExactRender)
+                }
+                FenceTimestampQuality::ObservedApproximate
+                    if approximate_observation_is_late(
+                        signaled_at.get(),
+                        commit_deadline_ns,
+                        before.p95_wake_lateness_ns,
+                    ) =>
+                {
+                    Some(ProvenDeadlineMiss::GuardedApproximateRender)
+                }
+                _ => None,
+            })
+        }
+        (
+            crate::native_output::presentation::transaction::FramePresentationReservation::Variable(
+                _,
+            ),
+            crate::native_output::presentation::kms_timing::KmsPresentationTiming::Variable {
+                ..
+            },
+        ) => Ok(None),
+        _ => Err(io::Error::other(
+            "pending render fence reservation and KMS timing domains differ",
+        )),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AdvisoryOpportunitySlip {
     KmsDispatch,
@@ -529,17 +709,23 @@ fn abandon_overtaken_worker_queued(
     output_transactions: &mut OutputTransactionLedger,
     emergency_worker_jobs: &mut Vec<KmsCommitJob>,
 ) -> NativeResult<()> {
-    let owner_target = owner.frame.require_fixed_target()?;
     match worker.cancel_queued_primary(
         owner.token,
         owner.frame.transaction_id,
         owner.frame.pool_generation,
         crtc_id,
-        owner_target,
+        owner.frame.reservation,
         owner.frame.frame_id,
     ) {
         KmsWorkerQueuedCancellation::Cancelled(job) => {
-            if job.ready_submit {
+            if job.ready_submit
+                && matches!(
+                    job.reservation,
+                    crate::native_output::presentation::transaction::FramePresentationReservation::Fixed(
+                        _,
+                    )
+                )
+            {
                 frame_pacing
                     .note_predictive_ready_overtaken_worker_queued_physical(Some(owner.frame));
             }
@@ -792,28 +978,14 @@ impl NativeRuntime {
                             .saturating_sub(timing.composite_started_at.get()),
                         timing.signaled_at,
                     );
-                    let before = render_journal.prediction_with_kms_guard(
-                        timing.target.refresh_interval,
+                    let observed_miss = classify_pending_fence_deadline_miss(
+                        timing.reservation,
+                        timing.presentation_timing,
+                        timing.quality,
+                        timing.signaled_at,
+                        render_journal,
                         presentation_timing.apply_guard_ns(),
-                    );
-                    let commit_deadline_ns = timing.submit_window.commit_complete_deadline_ns();
-                    let observed_miss = match timing.quality {
-                        FenceTimestampQuality::ExactSyncFile
-                            if timing.signaled_at.get() > commit_deadline_ns =>
-                        {
-                            Some(ProvenDeadlineMiss::ExactRender)
-                        }
-                        FenceTimestampQuality::ObservedApproximate
-                            if approximate_observation_is_late(
-                                timing.signaled_at.get(),
-                                commit_deadline_ns,
-                                before.p95_wake_lateness_ns,
-                            ) =>
-                        {
-                            Some(ProvenDeadlineMiss::GuardedApproximateRender)
-                        }
-                        _ => None,
-                    };
+                    )?;
                     if let Some(miss) = observed_miss {
                         pending_proven_deadline_miss.get_or_insert((timing.frame_id, miss));
                         let desired_credit_before = adaptive_buffering.desired_credit();
@@ -829,13 +1001,9 @@ impl NativeRuntime {
                         );
                     }
                     perf.log("native.render_fence", || {
-                        vec![
+                        let mut fields = vec![
                             NativePerfField::u64("frame_id", timing.frame_id),
                             NativePerfField::u64("signal_ns", timing.signaled_at.get()),
-                            NativePerfField::u64(
-                                "target_ns",
-                                timing.target.presentation_time.get(),
-                            ),
                             NativePerfField::u64(
                                 "render_fence_signal_latency_ns",
                                 timing
@@ -844,7 +1012,14 @@ impl NativeRuntime {
                                     .saturating_sub(timing.composite_started_at.get()),
                             ),
                             NativePerfField::str("quality", format!("{:?}", timing.quality)),
-                        ]
+                        ];
+                        if let Some(target) = timing.reservation.fixed_target() {
+                            fields.push(NativePerfField::u64(
+                                "target_ns",
+                                target.presentation_time.get(),
+                            ));
+                        }
+                        fields
                     });
                 }
             }
@@ -1396,8 +1571,6 @@ impl NativeRuntime {
                         event_loop.unregister(token)?;
                     }
                     let presented_at = MonotonicTimestampNs::new(presented_at_ns);
-                    let prepared_physical = presentation_deadline.prepare_presented(presented_at);
-                    let actual_logical_sequence = prepared_physical.logical_sequence();
                     let transaction_id = match atomic_completion {
                         Some(AtomicCommitCompletion::Completed {
                             kind: AtomicCommitKind::CompositedPrimary { transaction_id, .. },
@@ -1437,6 +1610,12 @@ impl NativeRuntime {
                         )
                         .into());
                     }
+                    let prepared_physical = prepare_physical_presentation_for_reservation(
+                        presentation_deadline,
+                        pending_identity.frame.reservation,
+                        presented_at,
+                    )?;
+                    let actual_logical_sequence = prepared_physical.logical_sequence();
                     let previous_assignment = presented_planes.primary;
                     let presented_transition = scene_history
                         .prepare_pageflip_transition(
@@ -1771,11 +1950,43 @@ impl NativeRuntime {
                             );
                         }
                     }
+                    if matches!(
+                        frame.reservation,
+                        crate::native_output::presentation::transaction::FramePresentationReservation::Variable(_)
+                    ) {
+                        // Variable presentation has no fixed target or commit deadline. Keep
+                        // generic service evidence, and discard any stale fixed miss evidence.
+                        pending_proven_deadline_miss.take();
+                        record_variable_composited_pageflip(
+                            &frame,
+                            presented_at,
+                            physical_claim.clock_generation,
+                            physical_claim.sequence,
+                            *kms_commit_worker_transport,
+                            render_journal,
+                            frame_pacing,
+                        )?;
+                    } else {
+                        let (target, submit_window) = match (
+                            frame.reservation,
+                            frame.presentation_timing,
+                        ) {
+                            (
+                                crate::native_output::presentation::transaction::FramePresentationReservation::Fixed(target),
+                                crate::native_output::presentation::kms_timing::KmsPresentationTiming::Fixed(submit_window),
+                            ) => (target, submit_window),
+                            _ => {
+                                return Err(io::Error::other(
+                                    "composited pageflip reservation and KMS timing domains differ",
+                                )
+                                .into());
+                            }
+                        };
                     render_journal.note_matching_presentation(presented_at);
                     render_journal.record_target_slip(
                         presented_at
                             .get()
-                            .saturating_sub(frame.target.presentation_time.get()),
+                            .saturating_sub(target.presentation_time.get()),
                     );
                     render_journal.record_atomic_submit(
                         frame
@@ -1803,16 +2014,16 @@ impl NativeRuntime {
                         None
                     } else {
                         Some(KmsPresentationOutcome::classify(
-                            &frame.submit_window,
+                            &submit_window,
                             Some(readiness.observed_at().get()),
                             frame.submit_returned_at.get(),
-                            frame.target.sequence,
+                            target.sequence,
                             actual_logical_sequence,
                         ))
                     };
                     let mut apply_guard_observation = None;
                     if let Some(outcome) = outcome {
-                        if let Some(mode_key) = frame.submit_window.mode_key() {
+                        if let Some(mode_key) = submit_window.mode_key() {
                             apply_guard_observation =
                                 Some(presentation_timing.observe_pageflip_with_evidence(
                                     *drm_file_generation,
@@ -1823,13 +2034,13 @@ impl NativeRuntime {
                     }
                     let assessment = resolve_presentation_deadline_assessment(
                         pending_miss,
-                        frame.target,
+                        target,
                         outcome,
                         readiness,
                     );
                     render_journal.record_frame_service_observation(FrameTimingObservation {
                         frame_id: frame.frame_id,
-                        target: frame.target,
+                        target: target,
                         composite_started_at: frame.composite_started_at,
                         fence_exported_at: frame.rendered_at,
                         fence_signaled_at: frame.fence_signal,
@@ -1837,12 +2048,12 @@ impl NativeRuntime {
                         submit_returned_at: Some(frame.submit_returned_at),
                     });
                     let recovery_remaining_before = render_journal
-                        .prediction(frame.target.refresh_interval)
+                        .prediction(target.refresh_interval)
                         .miss_recovery_remaining;
                     let recovery = apply_deadline_assessment(
                         assessment,
                         render_journal,
-                        frame.target.refresh_interval,
+                        target.refresh_interval,
                         dispatch_tail_observation,
                         apply_guard_observation,
                     );
@@ -1855,10 +2066,10 @@ impl NativeRuntime {
                             PacingField::str("miss_cause", miss.as_str()),
                             PacingField::str(
                                 "target_reason",
-                                target_reason_name(frame.target.reason),
+                                target_reason_name(target.reason),
                             ),
-                            PacingField::bool("target_binding", frame.target.is_binding()),
-                            PacingField::u64("target_sequence", frame.target.sequence),
+                            PacingField::bool("target_binding", target.is_binding()),
+                            PacingField::u64("target_sequence", target.sequence),
                             PacingField::u64("actual_sequence", actual_logical_sequence),
                             PacingField::str("recovery_disposition", recovery.disposition.as_str()),
                             PacingField::usize(
@@ -1872,7 +2083,7 @@ impl NativeRuntime {
                             PacingField::str(
                                 "recovery_estimator_mode_after",
                                 render_journal
-                                    .prediction(frame.target.refresh_interval)
+                                    .prediction(target.refresh_interval)
                                     .estimator_mode
                                     .as_str(),
                             ),
@@ -1958,7 +2169,7 @@ impl NativeRuntime {
                         ) {
                             recovery_fields.extend(render_readiness_diagnostic_fields(
                                 readiness,
-                                &frame.submit_window,
+                                &submit_window,
                                 frame.composite_started_at,
                                 frame.rendered_at,
                             ));
@@ -1968,7 +2179,7 @@ impl NativeRuntime {
                     if let PresentationDeadlineAssessment::Advisory(slip) = assessment {
                         frame_pacing.note_advisory_dispatch_slip();
                         let recovery_remaining_after = render_journal
-                            .prediction(frame.target.refresh_interval)
+                            .prediction(target.refresh_interval)
                             .miss_recovery_remaining;
                         let mut advisory_fields = vec![
                             PacingField::u64("frame_id", frame.frame_id),
@@ -1976,11 +2187,11 @@ impl NativeRuntime {
                             PacingField::str("slip_cause", slip.as_str()),
                             PacingField::str(
                                 "target_reason",
-                                target_reason_name(frame.target.reason),
+                                target_reason_name(target.reason),
                             ),
                             PacingField::str("target_authority", "advisory"),
-                            PacingField::bool("target_binding", frame.target.is_binding()),
-                            PacingField::u64("target_sequence", frame.target.sequence),
+                            PacingField::bool("target_binding", target.is_binding()),
+                            PacingField::u64("target_sequence", target.sequence),
                             PacingField::u64("actual_sequence", actual_logical_sequence),
                             PacingField::bool(
                                 "dispatch_evidence_available",
@@ -2012,7 +2223,7 @@ impl NativeRuntime {
                             PacingField::str(
                                 "recovery_estimator_mode_after",
                                 render_journal
-                                    .prediction(frame.target.refresh_interval)
+                                    .prediction(target.refresh_interval)
                                     .estimator_mode
                                     .as_str(),
                             ),
@@ -2063,18 +2274,18 @@ impl NativeRuntime {
                         matches!(assessment, PresentationDeadlineAssessment::None),
                     );
                     frame_pacing.note_explicit_present(ExplicitPresentationObservation {
-                        planned_sequence: frame.target.sequence,
+                        planned_sequence: target.sequence,
                         actual_sequence: actual_logical_sequence,
-                        target_ns: frame.target.presentation_time.get(),
+                        target_ns: target.presentation_time.get(),
                         presented_ns: presented_at_ns,
                         composite_started_ns: frame.composite_started_at.get(),
                         rendered_ns: frame.rendered_at.get(),
                         submit_started_ns: frame.submit_started_at.get(),
                         submit_returned_ns: frame.submit_returned_at.get(),
-                        reactive_double: frame.target.reason
+                        reactive_double: target.reason
                             == PresentationTargetReason::ReactiveDouble,
-                        target_reason: frame.target.reason,
-                        target_selection: frame.target.selection_evidence(),
+                        target_reason: target.reason,
+                        target_selection: target.selection_evidence(),
                         previous_primary_sequence: None,
                         client_commit_ns: frame.client_commit_ns,
                         callback_reaction_ns: frame.callback_reaction_ns,
@@ -2096,6 +2307,7 @@ impl NativeRuntime {
                         ),
                     });
                     *scheduled_presentation_target = None;
+                    }
                 } else {
                     complete_primary_cursor_pageflip(
                         atomic_cursor,

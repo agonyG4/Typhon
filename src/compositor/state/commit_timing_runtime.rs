@@ -444,6 +444,19 @@ impl CompositorState {
             .collect()
     }
 
+    pub(in crate::compositor) fn frame_batch_has_commit_timing_claims(
+        &self,
+        batch_id: CompositorFrameBatchId,
+    ) -> bool {
+        self.frame_batches
+            .get(&batch_id)
+            .is_none_or(|batch| !batch.commit_timing_target_claims.is_empty())
+    }
+
+    pub(in crate::compositor) fn has_active_commit_timing_ownership(&self) -> bool {
+        !self.active_commit_timing_targets.is_empty()
+    }
+
     pub(in crate::compositor) fn commit_timing_submission_is_safe_for_batch(
         &mut self,
         batch_id: CompositorFrameBatchId,

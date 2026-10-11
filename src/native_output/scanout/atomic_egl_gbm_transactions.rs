@@ -1,5 +1,8 @@
 use super::*;
-use crate::native_output::runtime::settle_failed_output_transaction;
+use crate::native_output::runtime::{
+    restore_presentation_feedback_obligation, settle_dropped_output_transaction,
+    settle_failed_output_transaction,
+};
 use oblivion_one::native::kms::AtomicFlipRequest;
 use oblivion_one::native::sync_file::SyncFileDeadlineHint;
 
@@ -10,6 +13,28 @@ const ADAPTIVE_ASYNC_FALLBACKS: &[OutputPresentationMode] = &[
 ];
 const FIXED_REFRESH_FALLBACK: &[OutputPresentationMode] = &[OutputPresentationMode::Vsync];
 const NO_PRESENTATION_FALLBACKS: &[OutputPresentationMode] = &[];
+
+fn settle_variable_rejection_for_retry(
+    server: &mut OwnCompositorServer,
+    output_transactions: &mut OutputTransactionLedger,
+    transaction_id: OutputTransactionId,
+) -> io::Result<()> {
+    settle_dropped_output_transaction(
+        output_transactions,
+        transaction_id,
+        crate::native_output::presentation::ledger::OutputTransactionDropReason::SafeAbandonment,
+        MonotonicTimestampNs::new(monotonic_now_ns()?),
+        |obligations| {
+            restore_presentation_feedback_obligation(server, obligations);
+            let batch_id = obligations.frame_batch_id().ok_or_else(|| {
+                io::Error::other("rejected Variable transaction has no compositor frame batch")
+            })?;
+            server.restore_frame_batch_after_render_failure(batch_id);
+            Ok(())
+        },
+    )
+    .map_err(|error| io::Error::other(error.to_string()))
+}
 
 fn presentation_fallback_candidates(
     mode: OutputPresentationMode,
@@ -175,15 +200,39 @@ impl AtomicEglGbmScanout {
         output_transactions: &mut OutputTransactionLedger,
         vrr_policy: VrrPolicy,
     ) -> io::Result<(u64, u32, OutputTransactionId)> {
-        let ready_transaction_id = self
+        let ready_identity = self
             .swapchain()?
-            .ready_transaction_id()
-            .ok_or_else(|| io::Error::other("no rendered output frame is ready"))?;
-        self.swapchain()?
             .ready_identity()
-            .map(|identity| identity.require_fixed_target())
-            .transpose()?
-            .ok_or_else(|| io::Error::other("unbound output frame cannot be submitted"))?;
+            .ok_or_else(|| io::Error::other("no rendered output frame is ready"))?;
+        let ready_transaction_id = ready_identity.transaction_id;
+        let variable_reservation = matches!(
+            ready_identity.reservation,
+            FramePresentationReservation::Variable(_)
+        );
+        if matches!(
+            ready_identity.reservation,
+            FramePresentationReservation::DeferredO1(_)
+        ) {
+            return Err(io::Error::other("unbound output frame cannot be submitted"));
+        }
+        let ready_timing = self
+            .swapchain()?
+            .ready_presentation_timing()
+            .ok_or_else(|| io::Error::other("ready frame has no KMS presentation timing"))?;
+        if matches!(
+            (ready_identity.reservation, ready_timing),
+            (
+                FramePresentationReservation::Variable(_),
+                KmsPresentationTiming::Fixed(_)
+            ) | (
+                FramePresentationReservation::Fixed(_),
+                KmsPresentationTiming::Variable { .. }
+            ) | (FramePresentationReservation::DeferredO1(_), _)
+        ) {
+            return Err(io::Error::other(
+                "ready frame reservation and KMS timing disagree",
+            ));
+        }
         let (mut presentation_mode, content_type, mut presentation_validation_key) = {
             let transaction = output_transactions
                 .transaction(ready_transaction_id)
@@ -214,7 +263,11 @@ impl AtomicEglGbmScanout {
         let ready_framebuffer = self.framebuffer(ready_slot)?;
         let test_token = PageFlipToken::new(allocate_native_page_flip_token())
             .expect("allocated native pageflip token is nonzero");
-        let fallback_candidates = presentation_fallback_candidates(presentation_mode).to_vec();
+        let fallback_candidates = if variable_reservation {
+            NO_PRESENTATION_FALLBACKS
+        } else {
+            presentation_fallback_candidates(presentation_mode)
+        };
         let original_mode = presentation_mode;
         let original_qualified = if original_mode == OutputPresentationMode::Vsync {
             true
@@ -258,6 +311,36 @@ impl AtomicEglGbmScanout {
         if !original_qualified {
             if let Some(key) = presentation_validation_key {
                 self.note_composited_presentation_validation(key, false);
+            }
+            if variable_reservation {
+                let output_generation = output_transactions
+                    .transaction(ready_transaction_id)
+                    .map_or(0, |record| record.descriptor().output_generation());
+                let (vrr_blocker, async_blocker) = adaptive_async_blockers(false, false);
+                log_composited_presentation_rejection(
+                    kms,
+                    vrr_policy,
+                    original_mode,
+                    OutputPresentationMode::Vsync,
+                    vrr_blocker,
+                    async_blocker,
+                    output_generation,
+                    "variable_test_only_rejected",
+                );
+                if !self.swapchain_mut()?.suspend_abandon_ready()? {
+                    return Err(io::Error::other(
+                        "rejected Variable READY ownership disappeared before suspension",
+                    ));
+                }
+                settle_variable_rejection_for_retry(
+                    server,
+                    output_transactions,
+                    ready_transaction_id,
+                )?;
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "Variable AdaptiveSync test-only validation was rejected; retrying fixed",
+                ));
             }
             let qualified_modes: Vec<_> =
                 qualified_fallbacks.iter().map(|(mode, _)| *mode).collect();
@@ -334,8 +417,9 @@ impl AtomicEglGbmScanout {
         let framebuffer = self.framebuffer(frame.slot)?;
         let token = PageFlipToken::new(allocate_native_page_flip_token())
             .expect("allocated native pageflip token is nonzero");
-        if self.deadline_hints_enabled {
-            let target = frame.require_fixed_target()?;
+        if self.deadline_hints_enabled
+            && let FramePresentationReservation::Fixed(target) = frame.reservation
+        {
             match frame
                 .render_fence
                 .apply_deadline_hint(target.presentation_time.get(), monotonic_now_ns()?)
@@ -409,7 +493,7 @@ impl AtomicEglGbmScanout {
                 return Err(error);
             }
         };
-        let retry_fence = (presentation_mode != OutputPresentationMode::Vsync)
+        let mut retry_fence = (presentation_mode != OutputPresentationMode::Vsync)
             .then(|| in_fence.try_clone().ok())
             .flatten();
         let mut submit_started_at = MonotonicTimestampNs::new(monotonic_now_ns()?);
@@ -422,6 +506,34 @@ impl AtomicEglGbmScanout {
             content_type,
         });
         let mut submit_returned_at = MonotonicTimestampNs::new(monotonic_now_ns()?);
+        if variable_reservation
+            && let Err(error) = &submission
+            && error.kind == AtomicKmsErrorKind::FlipRejected
+        {
+            if let Some(key) = presentation_validation_key {
+                self.note_composited_presentation_validation(key, false);
+            }
+            let output_generation = output_transactions
+                .transaction(transaction_id)
+                .map_or(0, |record| record.descriptor().output_generation());
+            log_composited_presentation_rejection(
+                kms,
+                vrr_policy,
+                presentation_mode,
+                OutputPresentationMode::Vsync,
+                Some(VrrBlocker::ExactKmsQualificationRejected),
+                None,
+                output_generation,
+                "variable_real_submit_rejected_retry_fixed",
+            );
+            self.swapchain_mut()?
+                .suspend_failed_submission(frame, &mut retry_fence)?;
+            settle_variable_rejection_for_retry(server, output_transactions, transaction_id)?;
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "Variable AdaptiveSync submit was rejected; retrying in fixed mode",
+            ));
+        }
         if let Err(error) = &submission
             && error.kind == AtomicKmsErrorKind::FlipRejected
             && presentation_mode != OutputPresentationMode::Vsync

@@ -17,6 +17,7 @@ pub enum SchedulerPreparedPrimary {
     Rendering,
     ReadyUnbound,
     Ready { target: PresentationTarget },
+    ReadyVariable,
 }
 
 pub trait PresentationPipelineView {
@@ -125,6 +126,7 @@ impl NativeFrameScheduler {
         let prepared = pipeline.prepared_primary();
         let ready_target = match prepared {
             SchedulerPreparedPrimary::Ready { target } => Some(target),
+            SchedulerPreparedPrimary::ReadyVariable => None,
             SchedulerPreparedPrimary::None
             | SchedulerPreparedPrimary::Rendering
             | SchedulerPreparedPrimary::ReadyUnbound => None,
@@ -189,7 +191,10 @@ impl NativeFrameScheduler {
             return SchedulerDecision::RenderAhead;
         }
 
-        if matches!(prepared, SchedulerPreparedPrimary::Ready { .. }) {
+        if matches!(
+            prepared,
+            SchedulerPreparedPrimary::Ready { .. } | SchedulerPreparedPrimary::ReadyVariable
+        ) {
             if pipeline.kernel_commit_occupied() {
                 return SchedulerDecision::WaitForPageFlip;
             }
@@ -345,6 +350,7 @@ fn ready_target_for_pipeline(
 ) -> Option<PresentationTarget> {
     match pipeline.prepared_primary() {
         SchedulerPreparedPrimary::Ready { target } => Some(target),
+        SchedulerPreparedPrimary::ReadyVariable => None,
         SchedulerPreparedPrimary::None
         | SchedulerPreparedPrimary::Rendering
         | SchedulerPreparedPrimary::ReadyUnbound => None,
@@ -584,6 +590,39 @@ mod tests {
                 kind: SchedulerWakeDeadlineKind::SubmitNotBefore,
                 at_ns: 5_000_000,
             })
+        );
+    }
+
+    #[test]
+    fn variable_ready_submits_immediately_but_never_queues_behind_pending_primary() {
+        let mut ready_scheduler = NativeFrameScheduler::new(165, 0);
+        let ready = TestPipeline {
+            prepared: SchedulerPreparedPrimary::ReadyVariable,
+            future_primary_limit: 1,
+            future_primary_depth: 1,
+            ..TestPipeline::default()
+        };
+        assert_eq!(
+            ready_scheduler.decision_with_pipeline(context(9_400_000, None), &ready),
+            SchedulerDecision::SubmitReady
+        );
+
+        let mut pending_scheduler = NativeFrameScheduler::new(165, 0);
+        pending_scheduler.note_async_submission(41, 1).unwrap();
+        let pending_with_variable_ready = TestPipeline {
+            kernel_commit_occupied: true,
+            kernel_primary_submitted: true,
+            prepared: SchedulerPreparedPrimary::ReadyVariable,
+            future_primary_limit: 1,
+            future_primary_depth: 2,
+            ..TestPipeline::default()
+        };
+        assert_eq!(
+            pending_scheduler.decision_with_pipeline(
+                context(9_400_000, Some(target(8_000_000, 9_000_000))),
+                &pending_with_variable_ready,
+            ),
+            SchedulerDecision::WaitForPageFlip
         );
     }
 

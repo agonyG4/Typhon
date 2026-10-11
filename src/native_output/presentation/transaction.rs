@@ -7,7 +7,7 @@ use oblivion_one::compositor::{
     SurfaceDamagePresentation, SurfacePresentationCommitKey,
 };
 use oblivion_one::core::OutputId;
-use oblivion_one::native::buffering::PresentationOpportunity;
+use oblivion_one::native::buffering::{PresentationOpportunity, PresentationOpportunityId};
 use oblivion_one::native::kms::AtomicCursorVisualState;
 use oblivion_one::native::kms::PageFlipToken;
 use oblivion_one::native::presentation_deadline::{
@@ -114,6 +114,7 @@ pub(crate) enum OutputTransactionBuildError {
     DirectSurfaceForCompositedContent,
     DirectSurfaceForPlaneDelta,
     VrrCannotUseDeferredO1,
+    VariableRequiresAdaptiveSync,
     PresentationFeedbackBatchForCompatibilityImmediate,
     OverlayAssignmentsUnsupported,
 }
@@ -269,7 +270,18 @@ impl FramePresentationReservation {
     }
 
     pub(crate) const fn physical_opportunity(self) -> Option<PresentationOpportunity> {
-        self.opportunity()
+        match self {
+            Self::Fixed(target) => Some(target.physical_opportunity()),
+            Self::Variable(reservation) => Some(reservation.opportunity()),
+            Self::DeferredO1(_) => None,
+        }
+    }
+
+    pub(crate) const fn physical_opportunity_id(self) -> Option<PresentationOpportunityId> {
+        match self.physical_opportunity() {
+            Some(opportunity) => Some(opportunity.id()),
+            None => None,
+        }
     }
 
     pub(crate) const fn is_deferred_o1(self) -> bool {
@@ -601,6 +613,54 @@ impl OutputTransaction {
             ),
             OutputProtocolObligations::composited(frame_batch_id),
         )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn composited_variable_with_direct_equivalence(
+        output_id: OutputId,
+        id: OutputTransactionId,
+        output_generation: u64,
+        created_at: MonotonicTimestampNs,
+        reservation: VariablePresentationReservation,
+        content_type: DrmContentType,
+        pacing_mode: NativeOutputPacingMode,
+        frame_id: u64,
+        render_generation: u64,
+        pool_generation: u64,
+        slot: OutputSlotId,
+        framebuffer_id: u32,
+        cursor: Option<CursorPlaneAssignment>,
+        frame_batch_id: CompositorFrameBatchId,
+        equivalent_direct_key: Option<DirectScanoutCandidateKey>,
+    ) -> Result<Self, OutputTransactionBuildError> {
+        let transaction = Self::build(
+            output_id,
+            id,
+            output_generation,
+            created_at,
+            FramePresentationReservation::Variable(reservation),
+            pacing_mode,
+            OutputTransactionContent::Composited {
+                frame_id,
+                render_generation,
+                pool_generation,
+                equivalent_direct_key,
+            },
+            OutputPlanePlan::new(
+                PrimaryPlaneAssignment::CompositorFramebuffer {
+                    slot,
+                    framebuffer_id,
+                },
+                cursor.unwrap_or(CursorPlaneAssignment::Unchanged),
+                Vec::new(),
+            )?,
+            OutputSynchronizationPlan::new(
+                OutputAcquirePlan::RenderFence,
+                OutputReleasePlan::OutFenceThenPageflip,
+            ),
+            OutputProtocolObligations::composited(frame_batch_id),
+        )?;
+        transaction.with_presentation_state(OutputPresentationMode::AdaptiveSync, content_type)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -988,6 +1048,11 @@ impl OutputTransaction {
         presentation_mode: OutputPresentationMode,
         content_type: DrmContentType,
     ) -> Result<Self, OutputTransactionBuildError> {
+        if matches!(self.reservation, FramePresentationReservation::Variable(_))
+            && presentation_mode != OutputPresentationMode::AdaptiveSync
+        {
+            return Err(OutputTransactionBuildError::VariableRequiresAdaptiveSync);
+        }
         if presentation_mode.uses_vrr()
             && matches!(
                 self.reservation,
@@ -1646,5 +1711,110 @@ mod tests {
                 .pacing_mode(),
             NativeOutputPacingMode::PredictiveTriple
         );
+    }
+
+    #[test]
+    fn variable_composited_transaction_requires_adaptive_sync_and_keeps_reactive_pacing() {
+        let frame_batch_id =
+            CompositorFrameBatchId::new(NonZeroU64::new(19).expect("test frame batch ID"));
+        let reservation = VariablePresentationReservation::try_new(
+            vrr_opportunity(),
+            PresentationTargetReason::ReactiveDouble,
+        )
+        .expect("test VRR opportunity");
+        let transaction = OutputTransaction::composited_variable_with_direct_equivalence(
+            OutputId::from_raw(1).expect("test output ID"),
+            OutputTransactionId::new(NonZeroU64::new(20).expect("test transaction ID")),
+            7,
+            MonotonicTimestampNs::new(1),
+            reservation,
+            DrmContentType::Graphics,
+            NativeOutputPacingMode::ReactiveDouble,
+            21,
+            22,
+            7,
+            OutputSlotId::new(0).expect("test output slot"),
+            23,
+            None,
+            frame_batch_id,
+            None,
+        )
+        .expect("variable composited transaction");
+
+        assert_eq!(
+            transaction.reservation(),
+            FramePresentationReservation::Variable(reservation)
+        );
+        assert_eq!(
+            transaction
+                .clone()
+                .with_presentation_state(
+                    OutputPresentationMode::AdaptiveSync,
+                    DrmContentType::Graphics,
+                )
+                .expect("Variable AdaptiveSync is valid")
+                .pacing_mode(),
+            NativeOutputPacingMode::ReactiveDouble
+        );
+        assert_eq!(
+            transaction
+                .clone()
+                .with_presentation_state(OutputPresentationMode::Vsync, DrmContentType::Graphics)
+                .expect_err("Variable reservation cannot change domains"),
+            OutputTransactionBuildError::VariableRequiresAdaptiveSync
+        );
+        assert_eq!(
+            transaction.reservation(),
+            FramePresentationReservation::Variable(reservation),
+            "a rejected fixed-mode fallback must leave the same physical owner Variable"
+        );
+    }
+
+    #[test]
+    fn direct_scanout_transaction_keeps_its_fixed_phase_one_reservation() {
+        let output_id = OutputId::from_raw(1).expect("test output ID");
+        let key = DirectScanoutCandidateKey {
+            output_id,
+            content: OutputContentKey::new(
+                7,
+                NonZeroU64::new(8).expect("test buffer ID"),
+                ContentEpochId::new(NonZeroU64::new(9).expect("test content epoch")),
+                1920,
+                1080,
+                0x3432_5258,
+                0,
+                0,
+                1_000,
+                0,
+            ),
+            output_generation: 7,
+            cursor_content_key: None,
+            color_epoch: 0,
+        };
+        let mut direct_target = target();
+        direct_target.clock_generation = 7;
+        direct_target.physical_claim.clock_generation = 7;
+        let transaction = OutputTransaction::direct(
+            output_id,
+            OutputTransactionId::new(NonZeroU64::new(30).expect("test transaction ID")),
+            7,
+            MonotonicTimestampNs::new(1),
+            direct_target,
+            NativeOutputPacingMode::ReactiveDouble,
+            31,
+            key,
+            32,
+            None,
+            CompositorFrameBatchId::new(NonZeroU64::new(33).expect("test frame batch ID")),
+            7,
+            OutputReleasePlan::Pageflip,
+        )
+        .expect("Direct transaction remains valid");
+
+        assert_eq!(
+            transaction.reservation(),
+            FramePresentationReservation::Fixed(direct_target)
+        );
+        assert!(transaction.reservation().variable().is_none());
     }
 }

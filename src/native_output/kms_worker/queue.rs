@@ -7,6 +7,7 @@ use super::{
     WorkerTimingSnapshot, validation_base_ready,
 };
 use crate::native_output::DirectScanoutCandidateKey;
+use crate::native_output::presentation::transaction::FramePresentationReservation;
 use oblivion_one::native::presentation_deadline::PresentationTarget;
 use std::sync::mpsc::SyncSender;
 use std::{
@@ -444,7 +445,7 @@ impl WorkerShared {
         transaction_id: crate::native_output::OutputTransactionId,
         output_generation: u64,
         crtc_id: u32,
-        target: PresentationTarget,
+        reservation: FramePresentationReservation,
         frame_id: u64,
     ) -> KmsWorkerQueuedCancellation {
         let mut state = self
@@ -457,7 +458,7 @@ impl WorkerShared {
                 && job.transaction_id == transaction_id
                 && job.output_generation == output_generation
                 && job.crtc_id == crtc_id
-                && job.fixed_target() == Some(target)
+                && job.reservation == reservation
                 && job.primary_frame_id() == Some(frame_id)
         }) {
             let job = state.queued.remove(index).expect("queued job index exists");
@@ -467,7 +468,7 @@ impl WorkerShared {
         }
         if state.queued.iter().any(|job| {
             job.kind.is_primary()
-                && job.fixed_target() == Some(target)
+                && job.reservation == reservation
                 && job.output_generation == output_generation
                 && job.crtc_id == crtc_id
         }) {
@@ -1251,11 +1252,12 @@ mod cancellation_tests {
         let job = composited_job(901, 1901);
         let token = job.token;
         let transaction_id = job.transaction_id;
-        let target = job.fixed_target().expect("test job has fixed timing");
+        let reservation = job.reservation;
         let permit = shared.try_reserve().unwrap();
         permit.enqueue(job).unwrap();
 
-        let cancellation = shared.cancel_queued_primary(token, transaction_id, 1, 7, target, 1901);
+        let cancellation =
+            shared.cancel_queued_primary(token, transaction_id, 1, 7, reservation, 1901);
         assert!(matches!(
             cancellation,
             KmsWorkerQueuedCancellation::Cancelled(_)
@@ -1271,15 +1273,15 @@ mod cancellation_tests {
         let job = composited_job(903, 1903);
         let token = job.token;
         let transaction_id = job.transaction_id;
-        let target = job.fixed_target().expect("test job has fixed timing");
+        let reservation = job.reservation;
         shared.try_reserve().unwrap().enqueue(job).unwrap();
 
         assert!(matches!(
-            shared.cancel_queued_primary(token, transaction_id, 1, 7, target, 9999),
+            shared.cancel_queued_primary(token, transaction_id, 1, 7, reservation, 9999),
             KmsWorkerQueuedCancellation::IdentityMismatch
         ));
         assert!(matches!(
-            shared.cancel_queued_primary(token, transaction_id, 1, 7, target, 1903),
+            shared.cancel_queued_primary(token, transaction_id, 1, 7, reservation, 1903),
             KmsWorkerQueuedCancellation::Cancelled(_)
         ));
     }

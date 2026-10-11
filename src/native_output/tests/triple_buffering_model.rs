@@ -44,7 +44,10 @@ fn composed_commit(
         token: token(transaction),
         output_generation: 1,
         crtc_id: 7,
-        target: target(sequence),
+        reservation:
+            crate::native_output::presentation::transaction::FramePresentationReservation::Fixed(
+                target(sequence),
+            ),
         kind: PipelineCommitKind::CompositedPrimary {
             transaction_id: transaction_id(transaction),
             frame_id: transaction,
@@ -93,7 +96,10 @@ fn ready(transaction: u64, sequence: u64, slot: u8) -> PreparedCompositedState {
     PreparedCompositedState::Ready {
         transaction_id: transaction_id(transaction),
         slot: OutputSlotId::new(slot).unwrap(),
-        target: target(sequence),
+        reservation:
+            crate::native_output::presentation::transaction::FramePresentationReservation::Fixed(
+                target(sequence),
+            ),
         fence_state:
             crate::native_output::presentation::pipeline::PreparedFenceState::SubmitWithInFence,
     }
@@ -160,7 +166,10 @@ fn pipeline_snapshot_orders_advisory_predecessor_by_physical_claim() {
         token: token(1),
         output_generation: 1,
         crtc_id: 7,
-        target: predecessor,
+        reservation:
+            crate::native_output::presentation::transaction::FramePresentationReservation::Fixed(
+                predecessor,
+            ),
         kind: PipelineCommitKind::CompositedPrimary {
             transaction_id: transaction_id(1),
             frame_id: 1,
@@ -171,7 +180,10 @@ fn pipeline_snapshot_orders_advisory_predecessor_by_physical_claim() {
     snapshot.prepared = PreparedCompositedState::Ready {
         transaction_id: transaction_id(2),
         slot: OutputSlotId::new(1).unwrap(),
-        target: successor,
+        reservation:
+            crate::native_output::presentation::transaction::FramePresentationReservation::Fixed(
+                successor,
+            ),
         fence_state:
             crate::native_output::presentation::pipeline::PreparedFenceState::SubmitWithInFence,
     };
@@ -187,7 +199,10 @@ fn pipeline_snapshot_rejects_three_future_primaries() {
     snapshot.prepared = PreparedCompositedState::Ready {
         transaction_id: transaction_id(3),
         slot: OutputSlotId::new(2).unwrap(),
-        target: target(3),
+        reservation:
+            crate::native_output::presentation::transaction::FramePresentationReservation::Fixed(
+                target(3),
+            ),
         fence_state:
             crate::native_output::presentation::pipeline::PreparedFenceState::SubmitWithInFence,
     };
@@ -293,7 +308,10 @@ fn reactive_double_rejects_pending_plus_prepared() {
     snapshot.kernel_submitted = Some(composed_commit(1, 1, 0, 10));
     snapshot.prepared = PreparedCompositedState::Rendering {
         slot: OutputSlotId::new(1).unwrap(),
-        target: target(2),
+        reservation:
+            crate::native_output::presentation::transaction::FramePresentationReservation::Fixed(
+                target(2),
+            ),
     };
 
     assert_eq!(snapshot.validate(), Ok(()));
@@ -306,7 +324,10 @@ fn plane_delta_commit_does_not_increase_future_primary_depth() {
         token: token(1),
         output_generation: 1,
         crtc_id: 7,
-        target: target(1),
+        reservation:
+            crate::native_output::presentation::transaction::FramePresentationReservation::Fixed(
+                target(1),
+            ),
         kind: PipelineCommitKind::PlaneDelta {
             transaction_id: transaction_id(1),
             cursor_epoch: 4,
@@ -325,7 +346,10 @@ fn kernel_plane_delta_allows_one_prepared_primary_but_forbids_pre_admission() {
         token: token(1),
         output_generation: 1,
         crtc_id: 7,
-        target: target(1),
+        reservation:
+            crate::native_output::presentation::transaction::FramePresentationReservation::Fixed(
+                target(1),
+            ),
         kind: PipelineCommitKind::PlaneDelta {
             transaction_id: transaction_id(1),
             cursor_epoch: 4,
@@ -351,7 +375,10 @@ fn scheduler_renders_then_holds_primary_behind_kernel_plane_delta() {
         token: token(1),
         output_generation: 1,
         crtc_id: 7,
-        target: target(1),
+        reservation:
+            crate::native_output::presentation::transaction::FramePresentationReservation::Fixed(
+                target(1),
+            ),
         kind: PipelineCommitKind::PlaneDelta {
             transaction_id: transaction_id(1),
             cursor_epoch: 5,
@@ -385,7 +412,10 @@ fn direct_active_is_derived_only_from_confirmed_primary() {
         token: token(1),
         output_generation: 1,
         crtc_id: 7,
-        target: target(1),
+        reservation:
+            crate::native_output::presentation::transaction::FramePresentationReservation::Fixed(
+                target(1),
+            ),
         kind: direct_commit,
     });
     assert!(!snapshot.direct_active());

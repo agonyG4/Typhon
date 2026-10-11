@@ -16,9 +16,128 @@ use oblivion_one::native::adaptive_buffering::{
     FrameTimingObservation, ProvenDeadlineMiss,
 };
 use oblivion_one::native::kms::FramebufferId;
-use oblivion_one::native::presentation_deadline::TargetSelectionEvidence;
+use oblivion_one::native::presentation_deadline::{
+    PresentationDeadlinePlanner, TargetSelectionEvidence,
+};
+use oblivion_one::native::presentation_timing::PresentationTiming;
 use std::num::NonZeroU64;
 use std::sync::Arc;
+
+#[test]
+fn variable_pageflip_consumes_exactly_its_reserved_id_after_short_and_long_intervals() {
+    let anchor = MonotonicTimestampNs::new(1_000_000_000);
+    let interval = std::time::Duration::from_nanos(6_060_606);
+    for elapsed_ns in [9_400_000, 100_000_000] {
+        let mut deadline = PresentationDeadlinePlanner::new(interval);
+        deadline.note_presented(anchor);
+        let expected_id = deadline
+            .next_variable_opportunity_id()
+            .expect("next sequence is available");
+        let presented_at = MonotonicTimestampNs::new(anchor.get() + elapsed_ns);
+        let opportunity = oblivion_one::native::buffering::PresentationOpportunity::new(
+            expected_id,
+            PresentationTiming::VrrWindow {
+                anchor,
+                earliest_present: MonotonicTimestampNs::new(anchor.get() + 6_060_606),
+                presentation_not_before: None,
+                preferred_present: presented_at,
+                service_deadline: None,
+                shortest_interval: interval,
+                longest_interval: None,
+            },
+        );
+        let reservation = crate::native_output::presentation::transaction::
+            VariablePresentationReservation::try_new(
+                opportunity,
+                PresentationTargetReason::ReactiveDouble,
+            )
+            .expect("VRR opportunity creates variable reservation");
+
+        let prepared = prepare_physical_presentation_for_reservation(
+            &deadline,
+            crate::native_output::presentation::transaction::FramePresentationReservation::Variable(
+                reservation,
+            ),
+            presented_at,
+        )
+        .expect("physical pageflip consumes the reserved opportunity");
+        assert_eq!(
+            prepared.claim().opportunity_id(),
+            reservation.opportunity().id()
+        );
+        assert_eq!(prepared.claim().sequence, expected_id.sequence());
+        assert_eq!(prepared.claim().presentation_time, presented_at);
+
+        deadline.commit_presented(prepared);
+        assert_eq!(
+            deadline.next_variable_opportunity_id().unwrap().sequence(),
+            expected_id.sequence() + 1
+        );
+    }
+}
+
+#[test]
+fn variable_render_fence_timing_never_produces_a_fixed_deadline_miss() {
+    let reservation =
+        crate::native_output::presentation::transaction::VariablePresentationReservation::try_new(
+            oblivion_one::native::buffering::PresentationOpportunity::new(
+                oblivion_one::native::buffering::PresentationOpportunityId::new(1, 1),
+                PresentationTiming::VrrWindow {
+                    anchor: MonotonicTimestampNs::new(1_000_000_000),
+                    earliest_present: MonotonicTimestampNs::new(1_006_060_606),
+                    presentation_not_before: None,
+                    preferred_present: MonotonicTimestampNs::new(1_009_400_000),
+                    service_deadline: None,
+                    shortest_interval: std::time::Duration::from_nanos(6_060_606),
+                    longest_interval: None,
+                },
+            ),
+            oblivion_one::native::presentation_deadline::PresentationTargetReason::ReactiveDouble,
+        )
+        .expect("VRR window creates a Variable reservation");
+    let signaled_at = MonotonicTimestampNs::new(1_100_000_000);
+    let journal = AdaptiveRenderJournal::default();
+
+    assert_eq!(
+        super::classify_pending_fence_deadline_miss(
+            crate::native_output::presentation::transaction::FramePresentationReservation::Variable(
+                reservation,
+            ),
+            crate::native_output::presentation::kms_timing::KmsPresentationTiming::variable(
+                1_050_000_000,
+            ),
+            FenceTimestampQuality::ExactSyncFile,
+            signaled_at,
+            &journal,
+            0,
+        )
+        .expect("Variable fence timing is domain-valid"),
+        None,
+        "fence lateness relative to preferred_present is not a deadline miss"
+    );
+
+    let fixed_target = reactive_test_target();
+    let fixed_window =
+        crate::native_output::presentation::kms_timing::KmsSubmitWindow::try_new(100, 0, 0, 0)
+            .expect("test fixed KMS submit window");
+    assert_eq!(
+        super::classify_pending_fence_deadline_miss(
+            crate::native_output::presentation::transaction::FramePresentationReservation::Fixed(
+                fixed_target,
+            ),
+            crate::native_output::presentation::kms_timing::KmsPresentationTiming::Fixed(
+                fixed_window,
+            ),
+            FenceTimestampQuality::ExactSyncFile,
+            MonotonicTimestampNs::new(101),
+            &journal,
+            0,
+        )
+        .expect("Fixed fence timing is domain-valid"),
+        Some(ProvenDeadlineMiss::ExactRender),
+        "Fixed deadline assessment remains active"
+    );
+}
 
 fn plane_delta_transaction(
     transaction_id: u64,

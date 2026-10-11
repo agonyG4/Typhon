@@ -246,7 +246,7 @@ pub(crate) use frame::{
     FrozenNativeRenderFrame, NativeCursorOutputArbitration, NativeCursorPreference,
     NativeCursorPrimaryState, NativeCursorRenderMode, NativeCursorSchedulingPolicy,
     NativeFrameRenderer, NativePointerConstraintBackend, NativePointerConstraintBackendAction,
-    ResolvedNativeFrameScene, native_pointer_debug_log_lazy, normalize_refresh_hz,
+    ResolvedNativeFrameScene, native_pointer_debug_log_lazy,
 };
 #[cfg(test)]
 pub(crate) use frame::{
@@ -269,8 +269,9 @@ pub(super) use presentation_pipeline::initial_presented;
 pub(crate) use presentation_transactions::{
     DirectCallbackLeakMetrics, DirectTerminalCallbackDisposition,
     direct_terminal_callback_owner_leaks, discard_presentation_feedback_obligation,
-    restore_presentation_feedback_obligation, settle_failed_output_transaction,
-    settle_no_visual_change_output_transaction, take_client_cursor_presentation_feedback_batch,
+    restore_presentation_feedback_obligation, settle_dropped_output_transaction,
+    settle_failed_output_transaction, settle_no_visual_change_output_transaction,
+    take_client_cursor_presentation_feedback_batch,
 };
 pub(crate) use session::{
     NativeSeatSwitch, NativeSessionLifecycle, NativeSessionTransition, NativeVtSwitchRequestStatus,

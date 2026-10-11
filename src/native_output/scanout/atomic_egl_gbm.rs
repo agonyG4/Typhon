@@ -12,6 +12,7 @@ use oblivion_one::compositor::{
     SurfaceDamagePresentation, SurfacePipelineEvent,
 };
 use oblivion_one::native::buffering::O1AdmissionObservation;
+use oblivion_one::native::buffering::PresentationOpportunity;
 use oblivion_one::native::kms::{AtomicDiscovery, DrmFormatModifierPair, FramebufferId};
 use oblivion_one::native::presentation_deadline::{
     MonotonicTimestampNs, PresentationTarget, PrimaryRefreshClaim,
@@ -45,9 +46,14 @@ use super::render_worker::{
 };
 use super::*;
 use crate::native_output::presentation::async_validation::CompositedPresentationValidationKey;
+use crate::native_output::presentation::kms_timing::{KmsPresentationTiming, KmsSubmitWindow};
 use crate::native_output::presentation::transaction::{
-    O1PrepareIntent, OutputPresentationStateKey, kms_presentation_state_is_represented,
+    FramePresentationReservation, O1PrepareIntent, OutputPresentationStateKey,
+    VariablePresentationReservation, kms_presentation_state_is_represented,
 };
+use oblivion_one::native::presentation_deadline::PresentationDeadlinePlanner;
+use oblivion_one::native::presentation_timing::PresentationTiming;
+use oblivion_one::native::vrr_window::{VrrWindowPlanInput, VrrWindowPlanner};
 
 fn elapsed_nanos(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
@@ -120,6 +126,113 @@ pub(crate) struct AtomicAsyncPolicyInputs {
     pub(crate) kms_lane_free: bool,
     pub(crate) confirmed_presentation_state: OutputPresentationStateKey,
     pub(crate) pending_presentation_state: Option<OutputPresentationStateKey>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PreparedCompositedPresentationState {
+    pub(crate) mode: OutputPresentationMode,
+    pub(crate) content_type: DrmContentType,
+    pub(crate) validation_key: Option<CompositedPresentationValidationKey>,
+    pub(crate) validation_accepted: bool,
+    pub(crate) confirmed_state_matches: bool,
+    pub(crate) presentation_state_transition_required: bool,
+    vrr_blocker: Option<VrrBlocker>,
+    async_blocker: Option<AsyncBlocker>,
+    combination_blocker: Option<&'static str>,
+    acquire_strategy: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PreparedCompositedReservation {
+    Fixed {
+        target: PresentationTarget,
+        submit_window: KmsSubmitWindow,
+    },
+    Variable {
+        reservation: VariablePresentationReservation,
+    },
+}
+
+impl PreparedCompositedReservation {
+    pub(crate) const fn frame_reservation(self) -> FramePresentationReservation {
+        match self {
+            Self::Fixed { target, .. } => FramePresentationReservation::Fixed(target),
+            Self::Variable { reservation } => FramePresentationReservation::Variable(reservation),
+        }
+    }
+
+    pub(crate) const fn presentation_timing(
+        self,
+        rendered_at: MonotonicTimestampNs,
+    ) -> KmsPresentationTiming {
+        match self {
+            Self::Fixed { submit_window, .. } => KmsPresentationTiming::Fixed(submit_window),
+            Self::Variable { .. } => KmsPresentationTiming::variable(rendered_at.get()),
+        }
+    }
+
+    pub(crate) const fn fixed_target(self) -> Option<PresentationTarget> {
+        match self {
+            Self::Fixed { target, .. } => Some(target),
+            Self::Variable { .. } => None,
+        }
+    }
+
+    pub(crate) const fn fixed_submit_window(self) -> Option<KmsSubmitWindow> {
+        match self {
+            Self::Fixed { submit_window, .. } => Some(submit_window),
+            Self::Variable { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct VariableCompositedAdmission {
+    pub(crate) reactive_double: bool,
+    pub(crate) desired_credit_one: bool,
+    pub(crate) render_ahead: bool,
+    pub(crate) fixed_target_owned: bool,
+    pub(crate) commit_timing_applies: bool,
+    pub(crate) deferred_o1: bool,
+}
+
+pub(crate) fn plan_composited_variable_reservation(
+    state: PreparedCompositedPresentationState,
+    admission: VariableCompositedAdmission,
+    deadline: &PresentationDeadlinePlanner,
+    anchor: Option<MonotonicTimestampNs>,
+    now: MonotonicTimestampNs,
+    shortest_interval: Duration,
+) -> Option<VariablePresentationReservation> {
+    if state.mode != OutputPresentationMode::AdaptiveSync
+        || state.validation_key.is_none()
+        || !state.validation_accepted
+        || !state.confirmed_state_matches
+        || state.presentation_state_transition_required
+        || !admission.reactive_double
+        || !admission.desired_credit_one
+        || admission.render_ahead
+        || admission.fixed_target_owned
+        || admission.commit_timing_applies
+        || admission.deferred_o1
+    {
+        return None;
+    }
+    let anchor = anchor?;
+    let opportunity_id = deadline.next_variable_opportunity_id()?;
+    let timing = VrrWindowPlanner::plan(VrrWindowPlanInput {
+        anchor,
+        now,
+        not_before: None,
+        shortest_interval,
+    })?;
+    if !matches!(timing, PresentationTiming::VrrWindow { .. }) {
+        return None;
+    }
+    VariablePresentationReservation::try_new(
+        PresentationOpportunity::new(opportunity_id, timing),
+        oblivion_one::native::presentation_deadline::PresentationTargetReason::ReactiveDouble,
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -898,16 +1011,27 @@ impl AtomicEglGbmScanout {
         (content_type, effective)
     }
 
-    pub(crate) fn requested_presentation_state_key(
+    pub(crate) fn prepare_composited_presentation_state(
         &self,
         server: &OwnCompositorServer,
         output_generation: u64,
         pacing_mode: NativeOutputPacingMode,
         async_policy_inputs: AtomicAsyncPolicyInputs,
-        cursor_visible: bool,
+        cursor: Option<&CursorPlaneAssignment>,
         vrr_policy: VrrPolicy,
-    ) -> OutputPresentationStateKey {
-        let (content_type, effective) = self.effective_presentation_for_scene(
+    ) -> PreparedCompositedPresentationState {
+        let cursor_visible = matches!(
+            cursor,
+            Some(CursorPlaneAssignment::Atomic {
+                state: Some(state),
+                ..
+            }) if state.visible
+        );
+        let cursor_state = match cursor {
+            Some(CursorPlaneAssignment::Atomic { state, .. }) => state.clone(),
+            Some(CursorPlaneAssignment::Unchanged | CursorPlaneAssignment::Disabled) | None => None,
+        };
+        let (content_type, effective_presentation) = self.effective_presentation_for_scene(
             server,
             output_generation,
             pacing_mode,
@@ -915,10 +1039,116 @@ impl AtomicEglGbmScanout {
             cursor_visible,
             vrr_policy,
         );
-        OutputPresentationStateKey {
-            mode: effective.mode,
+        let mut mode = effective_presentation.mode;
+        let mut policy_pacing_mode = pacing_mode;
+        if mode.uses_vrr() {
+            policy_pacing_mode = NativeOutputPacingMode::ReactiveDouble;
+        }
+        let acquire_strategy = match policy_pacing_mode {
+            NativeOutputPacingMode::ReactiveDouble => 0,
+            NativeOutputPacingMode::PredictiveTriple => 1,
+        };
+        let mut vrr_blocker = effective_presentation.vrr_blocker;
+        let mut async_blocker = effective_presentation.async_blocker;
+        let mut combination_blocker = None;
+        if mode != OutputPresentationMode::Vsync
+            && let Some(mut rejected_key) = self.composited_presentation_validation_key(
+                output_generation,
+                mode,
+                cursor_visible,
+                cursor_state.clone(),
+                async_policy_inputs.cursor_transition_pending,
+                false,
+                self.swapchain.is_some(),
+                content_type,
+                acquire_strategy,
+            )
+            && self.presentation_validation_is_rejected(rejected_key)
+        {
+            match mode {
+                OutputPresentationMode::AdaptiveAsync => {
+                    rejected_key.presentation_mode = OutputPresentationMode::AdaptiveSync;
+                    let adaptive_sync_key = rejected_key;
+                    rejected_key.presentation_mode = OutputPresentationMode::Async;
+                    let async_key = rejected_key;
+                    (mode, vrr_blocker, async_blocker, combination_blocker) =
+                        atomic_egl_gbm_transactions::adaptive_async_fallback_diagnostics(
+                            self.presentation_validation_is_accepted(adaptive_sync_key),
+                            self.presentation_validation_is_accepted(async_key),
+                        );
+                }
+                OutputPresentationMode::AdaptiveSync => {
+                    mode = OutputPresentationMode::Vsync;
+                    vrr_blocker = Some(VrrBlocker::ExactKmsQualificationRejected);
+                }
+                OutputPresentationMode::Async => {
+                    mode = OutputPresentationMode::Vsync;
+                    async_blocker = Some(AsyncBlocker::AsyncTestOnlyRejected);
+                }
+                OutputPresentationMode::Vsync => {}
+            }
+        }
+        let validation_key = (mode != OutputPresentationMode::Vsync)
+            .then(|| {
+                self.composited_presentation_validation_key(
+                    output_generation,
+                    mode,
+                    cursor_visible,
+                    cursor_state,
+                    async_policy_inputs.cursor_transition_pending,
+                    false,
+                    self.swapchain.is_some(),
+                    content_type,
+                    acquire_strategy,
+                )
+            })
+            .flatten();
+        let validation_accepted =
+            validation_key.is_some_and(|key| self.presentation_validation_is_accepted(key));
+        let desired_state = OutputPresentationStateKey {
+            mode,
             content_type,
             output_generation,
+        };
+        let confirmed_state_matches =
+            async_policy_inputs.confirmed_presentation_state == desired_state;
+        let presentation_state_transition_required = !kms_presentation_state_is_represented(
+            desired_state,
+            async_policy_inputs.confirmed_presentation_state,
+            async_policy_inputs.pending_presentation_state,
+        );
+        NativePerfLogger::from_env().log("native.output_presentation_policy", || {
+            vec![
+                NativePerfField::str("configured_policy", vrr_policy.as_str()),
+                NativePerfField::bool("drm_connector_capable", self.vrr_connector_capable),
+                NativePerfField::bool(
+                    "crtc_vrr_property_available",
+                    self.vrr_crtc_property_available,
+                ),
+                NativePerfField::str("effective_mode", mode.as_str()),
+                NativePerfField::str(
+                    "vrr_blocker",
+                    vrr_blocker.map_or("none", VrrBlocker::as_str),
+                ),
+                NativePerfField::str(
+                    "async_blocker",
+                    async_blocker.map_or("none", AsyncBlocker::as_str),
+                ),
+                NativePerfField::str("combination_blocker", combination_blocker.unwrap_or("none")),
+                NativePerfField::u64("output_generation", output_generation),
+            ]
+        });
+        PreparedCompositedPresentationState {
+            mode,
+            content_type,
+            validation_key,
+            validation_accepted,
+            confirmed_state_matches,
+            presentation_state_transition_required,
+            vrr_blocker,
+            async_blocker,
+            combination_blocker,
+            acquire_strategy,
         }
     }
 
@@ -1297,8 +1527,8 @@ impl AtomicEglGbmScanout {
         resolved_scene: ResolvedNativeFrameScene<'static>,
         render_generation: u64,
         output_generation: u64,
-        target: PresentationTarget,
-        submit_window: KmsSubmitWindow,
+        reservation: PreparedCompositedReservation,
+        prepared_presentation: PreparedCompositedPresentationState,
         pacing_mode: NativeOutputPacingMode,
         render_ahead: bool,
         future_primary_limit: u8,
@@ -1310,128 +1540,27 @@ impl AtomicEglGbmScanout {
         frozen_cursor_trace_reveal: Option<
             crate::native_output::presentation::plane::CursorRevealTraceSnapshot,
         >,
-        async_policy_inputs: AtomicAsyncPolicyInputs,
         dmabuf_gpu_release_safety: DmabufGpuReleaseSafety,
         dmabuf_gpu_release_lease_id: Option<oblivion_one::compositor::DmabufGpuReleaseLeaseId>,
-        vrr_policy: VrrPolicy,
         mut phase_durations: Option<&mut AtomicRenderPhaseDurations>,
     ) -> io::Result<AtomicFrameRenderOutcome> {
-        let cursor_visible = matches!(
-            cursor.as_ref(),
-            Some(CursorPlaneAssignment::Atomic {
-                state: Some(state),
-                ..
-            }) if state.visible
-        );
-        let cursor_state = match cursor.as_ref() {
-            Some(CursorPlaneAssignment::Atomic { state, .. }) => state.clone(),
-            Some(CursorPlaneAssignment::Unchanged | CursorPlaneAssignment::Disabled) | None => None,
-        };
-        let (resolved_content_type, effective_presentation) = self
-            .effective_presentation_for_scene(
-                server,
-                output_generation,
-                pacing_mode,
-                async_policy_inputs,
-                cursor_visible,
-                vrr_policy,
-            );
-        let mut presentation_mode = effective_presentation.mode;
+        let presentation_mode = prepared_presentation.mode;
+        let content_type = prepared_presentation.content_type;
+        let presentation_validation_key = prepared_presentation.validation_key;
+        let presentation_state_transition_required =
+            prepared_presentation.presentation_state_transition_required;
         let mut pacing_mode = pacing_mode;
         let mut render_ahead = render_ahead;
         if presentation_mode.uses_vrr() {
-            // Phase 1 has no VRR-aware O1 preparation. Defensively drop a
-            // stale upstream RenderAhead decision before reserving or
-            // preparing the output transaction.
             render_ahead = false;
             pacing_mode = NativeOutputPacingMode::ReactiveDouble;
         }
-        let acquire_strategy = match pacing_mode {
-            NativeOutputPacingMode::ReactiveDouble => 0,
-            NativeOutputPacingMode::PredictiveTriple => 1,
-        };
-        let content_type = resolved_content_type;
-        let mut vrr_blocker = effective_presentation.vrr_blocker;
-        let mut async_blocker = effective_presentation.async_blocker;
-        let mut combination_blocker = None;
-        if presentation_mode != OutputPresentationMode::Vsync
-            && let Some(mut rejected_key) = self.composited_presentation_validation_key(
-                output_generation,
-                presentation_mode,
-                cursor_visible,
-                cursor_state.clone(),
-                async_policy_inputs.cursor_transition_pending,
-                false,
-                self.swapchain.is_some(),
-                content_type,
-                acquire_strategy,
-            )
-            && self.presentation_validation_is_rejected(rejected_key)
-        {
-            match presentation_mode {
-                OutputPresentationMode::AdaptiveAsync => {
-                    rejected_key.presentation_mode = OutputPresentationMode::AdaptiveSync;
-                    let adaptive_sync_key = rejected_key;
-                    rejected_key.presentation_mode = OutputPresentationMode::Async;
-                    let async_key = rejected_key;
-                    (
-                        presentation_mode,
-                        vrr_blocker,
-                        async_blocker,
-                        combination_blocker,
-                    ) = atomic_egl_gbm_transactions::adaptive_async_fallback_diagnostics(
-                        self.presentation_validation_is_accepted(adaptive_sync_key),
-                        self.presentation_validation_is_accepted(async_key),
-                    );
-                }
-                OutputPresentationMode::AdaptiveSync => {
-                    presentation_mode = OutputPresentationMode::Vsync;
-                    vrr_blocker = Some(VrrBlocker::ExactKmsQualificationRejected);
-                }
-                OutputPresentationMode::Async => {
-                    presentation_mode = OutputPresentationMode::Vsync;
-                    async_blocker = Some(AsyncBlocker::AsyncTestOnlyRejected);
-                }
-                OutputPresentationMode::Vsync => {}
-            }
-        }
-        let qualified_presentation_state = OutputPresentationStateKey {
-            mode: presentation_mode,
-            content_type,
-            output_generation,
-        };
-        let presentation_state_transition_required = !kms_presentation_state_is_represented(
-            qualified_presentation_state,
-            async_policy_inputs.confirmed_presentation_state,
-            async_policy_inputs.pending_presentation_state,
-        );
         let render_damage = damage_for_physical_presentation_state(
             damage,
             presentation_state_transition_required,
             self.width,
             self.height,
         );
-        NativePerfLogger::from_env().log("native.output_presentation_policy", || {
-            vec![
-                NativePerfField::str("configured_policy", vrr_policy.as_str()),
-                NativePerfField::bool("drm_connector_capable", self.vrr_connector_capable),
-                NativePerfField::bool(
-                    "crtc_vrr_property_available",
-                    self.vrr_crtc_property_available,
-                ),
-                NativePerfField::str("effective_mode", presentation_mode.as_str()),
-                NativePerfField::str(
-                    "vrr_blocker",
-                    vrr_blocker.map_or("none", VrrBlocker::as_str),
-                ),
-                NativePerfField::str(
-                    "async_blocker",
-                    async_blocker.map_or("none", AsyncBlocker::as_str),
-                ),
-                NativePerfField::str("combination_blocker", combination_blocker.unwrap_or("none")),
-                NativePerfField::u64("output_generation", output_generation),
-            ]
-        });
         let pacing_mode = if presentation_mode.is_async() {
             NativeOutputPacingMode::ReactiveDouble
         } else {
@@ -1440,7 +1569,10 @@ impl AtomicEglGbmScanout {
         let slot_acquisition_started = phase_durations.as_ref().map(|_| Instant::now());
         let slot_result = {
             let swapchain = self.swapchain_mut()?;
-            swapchain.acquire_render_slot_for_limit(future_primary_limit)
+            swapchain.acquire_render_slot_for_reservation(
+                future_primary_limit,
+                reservation.frame_reservation(),
+            )
         };
         if let (Some(durations), Some(started)) =
             (phase_durations.as_deref_mut(), slot_acquisition_started)
@@ -1517,24 +1649,11 @@ impl AtomicEglGbmScanout {
                 return Err(io::Error::other(error));
             }
         };
-        let presentation_validation_key = (presentation_mode != OutputPresentationMode::Vsync)
-            .then(|| {
-                self.composited_presentation_validation_key(
-                    output_generation,
-                    presentation_mode,
-                    cursor_visible,
-                    cursor_state,
-                    async_policy_inputs.cursor_transition_pending,
-                    false,
-                    self.swapchain.is_some(),
-                    content_type,
-                    acquire_strategy,
-                )
-            })
-            .flatten();
         let prepare_intent = if render_ahead {
             Some(O1PrepareIntent::from_target(
-                target,
+                reservation.fixed_target().ok_or_else(|| {
+                    io::Error::other("variable composited reservation cannot prepare O1")
+                })?,
                 output_generation,
                 self.swapchain()
                     .ok()
@@ -1547,6 +1666,13 @@ impl AtomicEglGbmScanout {
             None
         };
         let transaction_created_at = MonotonicTimestampNs::new(monotonic_now_ns()?);
+        let cursor_visible = matches!(
+            &cursor,
+            Some(CursorPlaneAssignment::Atomic {
+                state: Some(state),
+                ..
+            }) if state.visible
+        );
         let transaction_result = if let Some(intent) = prepare_intent {
             OutputTransaction::composited_deferred_o1(
                 self.direct.output_id,
@@ -1563,7 +1689,7 @@ impl AtomicEglGbmScanout {
                 cursor,
                 protocol_batch_id,
             )
-        } else {
+        } else if let Some(target) = reservation.fixed_target() {
             OutputTransaction::composited_with_direct_equivalence(
                 self.direct.output_id,
                 transaction_id,
@@ -1580,6 +1706,31 @@ impl AtomicEglGbmScanout {
                 protocol_batch_id,
                 equivalent_direct_key,
             )
+        } else if let PreparedCompositedReservation::Variable { reservation } = reservation {
+            if render_ahead || o1_admission.is_some() {
+                return Err(io::Error::other(
+                    "variable composited reservation carried O1 admission state",
+                ));
+            }
+            OutputTransaction::composited_variable_with_direct_equivalence(
+                self.direct.output_id,
+                transaction_id,
+                output_generation,
+                transaction_created_at,
+                reservation,
+                content_type,
+                NativeOutputPacingMode::ReactiveDouble,
+                frame_id,
+                render_generation,
+                pool_generation,
+                slot,
+                framebuffer_id,
+                cursor,
+                protocol_batch_id,
+                equivalent_direct_key,
+            )
+        } else {
+            unreachable!("fixed composited reservation exposes its target")
         };
         let transaction = match transaction_result.and_then(|transaction| {
             transaction.with_presentation_state(presentation_mode, content_type)
@@ -1724,8 +1875,7 @@ impl AtomicEglGbmScanout {
             output_generation,
             render_generation,
             pool_generation,
-            target,
-            submit_window,
+            reservation,
             prepare_intent,
             o1_admission,
             surface_damage,
@@ -1862,8 +2012,7 @@ impl AtomicEglGbmScanout {
             output_generation,
             render_generation,
             pool_generation,
-            target,
-            submit_window,
+            reservation,
             prepare_intent,
             o1_admission,
             surface_damage,
@@ -2099,12 +2248,10 @@ impl AtomicEglGbmScanout {
             render_generation,
             pool_generation,
             reservation: prepare_intent.map_or(
-                crate::native_output::presentation::transaction::FramePresentationReservation::Fixed(
-                    target,
-                ),
+                reservation.frame_reservation(),
                 crate::native_output::presentation::transaction::FramePresentationReservation::DeferredO1,
             ),
-            presentation_timing: crate::native_output::presentation::kms_timing::KmsPresentationTiming::Fixed(submit_window),
+            presentation_timing: reservation.presentation_timing(rendered_at),
             render_fence: parts.render_fence,
             fence_timing_evidence: None,
             scene_commit: parts.scene_commit,
@@ -2231,28 +2378,21 @@ impl AtomicEglGbmScanout {
             o1_admission,
             ..
         } = completed_frame;
-        let target = match reservation {
-            crate::native_output::presentation::transaction::FramePresentationReservation::Fixed(
-                target,
-            ) => target,
-            crate::native_output::presentation::transaction::FramePresentationReservation::Variable(
-                _,
-            ) => {
-                return Err(io::Error::other(
-                    "variable presentation is not active in pageflip completion",
-                ));
-            }
-            crate::native_output::presentation::transaction::FramePresentationReservation::DeferredO1(
-                _,
-            ) => {
-                return Err(io::Error::other(
-                    "deferred O1 frame cannot reach pageflip completion before binding",
-                ));
-            }
-        };
-        let submit_window = presentation_timing.fixed_submit_window().ok_or_else(|| {
-            io::Error::other("completed pageflip frame has variable timing while inactive")
-        })?;
+        if matches!(reservation, FramePresentationReservation::DeferredO1(_)) {
+            return Err(io::Error::other(
+                "deferred O1 frame cannot reach pageflip completion before binding",
+            ));
+        }
+        match (reservation, presentation_timing) {
+            (
+                FramePresentationReservation::Fixed(_)
+                | FramePresentationReservation::DeferredO1(_),
+                KmsPresentationTiming::Fixed(_),
+            )
+            | (FramePresentationReservation::Variable(_), KmsPresentationTiming::Variable { .. }) =>
+                {}
+            _ => return Err(io::Error::other("pageflip frame timing domain is invalid")),
+        }
         let render_control_result =
             self.queue_render_control(AtomicRenderControl::CommitPresented {
                 frame: scene_commit,
@@ -2283,8 +2423,8 @@ impl AtomicEglGbmScanout {
                 frame_id: id,
                 physical_identity,
                 transaction_id,
-                target,
-                submit_window,
+                reservation,
+                presentation_timing,
                 composite_started_at,
                 rendered_at,
                 submit_started_at: completed.submit_started_at,
@@ -2372,10 +2512,8 @@ impl AtomicEglGbmScanout {
         };
         let timing = PendingFenceTiming {
             frame_id: frame.id,
-            target: frame.require_fixed_target()?,
-            submit_window: frame.fixed_submit_window().ok_or_else(|| {
-                io::Error::other("pending output frame has variable timing while inactive")
-            })?,
+            reservation: frame.reservation,
+            presentation_timing: frame.presentation_timing,
             composite_started_at: frame.composite_started_at,
             signaled_at: evidence.signaled_at,
             quality: evidence.quality,
@@ -2603,8 +2741,7 @@ pub(crate) struct AtomicRenderSettlementContext {
     pub(crate) output_generation: u64,
     pub(crate) render_generation: u64,
     pub(crate) pool_generation: u64,
-    pub(crate) target: PresentationTarget,
-    pub(crate) submit_window: KmsSubmitWindow,
+    pub(crate) reservation: PreparedCompositedReservation,
     pub(crate) prepare_intent: Option<O1PrepareIntent>,
     pub(crate) o1_admission: Option<O1AdmissionObservation>,
     pub(crate) surface_damage: SurfaceDamagePresentation,
@@ -2629,8 +2766,8 @@ pub(crate) struct AtomicRenderSettlementContext {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PendingFenceTiming {
     pub(crate) frame_id: u64,
-    pub(crate) target: PresentationTarget,
-    pub(crate) submit_window: KmsSubmitWindow,
+    pub(crate) reservation: FramePresentationReservation,
+    pub(crate) presentation_timing: KmsPresentationTiming,
     pub(crate) composite_started_at: MonotonicTimestampNs,
     pub(crate) signaled_at: MonotonicTimestampNs,
     pub(crate) quality: FenceTimestampQuality,
@@ -2648,8 +2785,8 @@ pub(crate) struct PresentedOutputFrame {
     pub(crate) frame_id: u64,
     pub(crate) physical_identity: OutputFrameIdentitySnapshot,
     pub(crate) transaction_id: OutputTransactionId,
-    pub(crate) target: PresentationTarget,
-    pub(crate) submit_window: KmsSubmitWindow,
+    pub(crate) reservation: FramePresentationReservation,
+    pub(crate) presentation_timing: KmsPresentationTiming,
     pub(crate) composite_started_at: MonotonicTimestampNs,
     pub(crate) rendered_at: MonotonicTimestampNs,
     pub(crate) submit_started_at: MonotonicTimestampNs,
@@ -2750,6 +2887,168 @@ impl Drop for AtomicEglGbmScanout {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+    use std::time::Duration;
+
+    fn adaptive_sync_validation_key() -> CompositedPresentationValidationKey {
+        CompositedPresentationValidationKey::new(
+            oblivion_one::core::OutputId::from_raw(1).expect("test output ID"),
+            9,
+            42,
+            43,
+            DrmFormatModifierPair {
+                fourcc: 0x3432_5258,
+                modifier: 0,
+            },
+            OutputPresentationMode::AdaptiveSync,
+            0,
+            false,
+            None,
+            false,
+            false,
+            true,
+            DrmContentType::Graphics,
+        )
+    }
+
+    fn prepared_adaptive_sync(
+        validation_key: Option<CompositedPresentationValidationKey>,
+        validation_accepted: bool,
+        confirmed_state_matches: bool,
+        presentation_state_transition_required: bool,
+    ) -> PreparedCompositedPresentationState {
+        PreparedCompositedPresentationState {
+            mode: OutputPresentationMode::AdaptiveSync,
+            content_type: DrmContentType::Graphics,
+            validation_key,
+            validation_accepted,
+            confirmed_state_matches,
+            presentation_state_transition_required,
+            vrr_blocker: None,
+            async_blocker: None,
+            combination_blocker: None,
+            acquire_strategy: 0,
+        }
+    }
+
+    fn reactive_double_admission() -> VariableCompositedAdmission {
+        VariableCompositedAdmission {
+            reactive_double: true,
+            desired_credit_one: true,
+            render_ahead: false,
+            fixed_target_owned: false,
+            commit_timing_applies: false,
+            deferred_o1: false,
+        }
+    }
+
+    #[test]
+    fn composited_variable_runtime_reservation_is_not_quantized_at_165_hz() {
+        let anchor = MonotonicTimestampNs::new(1_000_000_000);
+        let now = MonotonicTimestampNs::new(1_009_400_000);
+        let interval = Duration::from_nanos(6_060_606);
+        let mut deadline = PresentationDeadlinePlanner::new(interval);
+        deadline.note_presented(anchor);
+
+        let reservation = plan_composited_variable_reservation(
+            prepared_adaptive_sync(Some(adaptive_sync_validation_key()), true, true, false),
+            reactive_double_admission(),
+            &deadline,
+            Some(anchor),
+            now,
+            interval,
+        )
+        .expect("qualified steady-state AdaptiveSync is variable");
+        let PresentationTiming::VrrWindow {
+            earliest_present,
+            preferred_present,
+            presentation_not_before,
+            ..
+        } = reservation.timing()
+        else {
+            panic!("runtime reservation must retain VRR timing");
+        };
+        assert_eq!(earliest_present.get(), 1_006_060_606);
+        assert_eq!(preferred_present.get(), 1_009_400_000);
+        assert_eq!(presentation_not_before, None);
+        assert_ne!(preferred_present.get(), 1_012_121_212);
+        assert_eq!(
+            reservation.opportunity().id(),
+            oblivion_one::native::buffering::PresentationOpportunityId::new(1, 2)
+        );
+
+        let prepared = PreparedCompositedReservation::Variable { reservation };
+        assert_eq!(
+            prepared.presentation_timing(MonotonicTimestampNs::new(1_010_000_000)),
+            KmsPresentationTiming::Variable {
+                earliest_submit_ns: 1_010_000_000,
+            }
+        );
+        assert_eq!(prepared.fixed_target(), None);
+        assert_eq!(prepared.fixed_submit_window(), None);
+    }
+
+    #[test]
+    fn variable_admission_requires_exact_accepted_confirmed_adaptive_sync() {
+        let anchor = MonotonicTimestampNs::new(10_000_000);
+        let now = MonotonicTimestampNs::new(12_000_000);
+        let interval = Duration::from_nanos(6_060_606);
+        let deadline = PresentationDeadlinePlanner::new(interval);
+        let key = adaptive_sync_validation_key();
+
+        for state in [
+            prepared_adaptive_sync(None, false, true, false),
+            prepared_adaptive_sync(Some(key), false, true, false),
+            prepared_adaptive_sync(Some(key), true, false, false),
+            prepared_adaptive_sync(Some(key), true, true, true),
+        ] {
+            assert!(
+                plan_composited_variable_reservation(
+                    state,
+                    reactive_double_admission(),
+                    &deadline,
+                    Some(anchor),
+                    now,
+                    interval,
+                )
+                .is_none()
+            );
+        }
+
+        let mut async_state = prepared_adaptive_sync(Some(key), true, true, false);
+        async_state.mode = OutputPresentationMode::AdaptiveAsync;
+        assert!(
+            plan_composited_variable_reservation(
+                async_state,
+                reactive_double_admission(),
+                &deadline,
+                Some(anchor),
+                now,
+                interval,
+            )
+            .is_none()
+        );
+
+        let mut excluded = [reactive_double_admission(); 6];
+        excluded[0].reactive_double = false;
+        excluded[1].desired_credit_one = false;
+        excluded[2].render_ahead = true;
+        excluded[3].fixed_target_owned = true;
+        excluded[4].commit_timing_applies = true;
+        excluded[5].deferred_o1 = true;
+        for admission in excluded {
+            assert!(
+                plan_composited_variable_reservation(
+                    prepared_adaptive_sync(Some(key), true, true, false),
+                    admission,
+                    &deadline,
+                    Some(anchor),
+                    now,
+                    interval,
+                )
+                .is_none()
+            );
+        }
+    }
 
     #[test]
     fn render_domain_is_destroyed_before_physical_pool_release() {

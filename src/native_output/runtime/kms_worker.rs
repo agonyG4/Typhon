@@ -218,7 +218,6 @@ pub(super) fn queue_explicit_composited_frame(
     transaction_id: OutputTransactionId,
     output_generation: u64,
     crtc_id: u32,
-    submit_window: KmsSubmitWindow,
     cursor_update: KmsCursorUpdate,
     cursor_delivery: crate::native_output::presentation::plane::PresentedCursorDelivery,
     primary_cursor_presentation: KmsPrimaryCursorPresentation,
@@ -244,19 +243,33 @@ pub(super) fn queue_explicit_composited_frame(
             .into());
         }
     };
-    let reservation = transaction.descriptor().reservation();
-    match reservation {
-        FramePresentationReservation::Fixed(_) => {}
-        FramePresentationReservation::Variable(_) => {
-            return Err(
-                io::Error::other("variable presentation is not active in the KMS runtime").into(),
-            );
-        }
-        FramePresentationReservation::DeferredO1(_) => {
+    let ready_identity = explicit
+        .swapchain()?
+        .ready_identity()
+        .ok_or_else(|| io::Error::other("worker composited queue has no ready identity"))?;
+    if ready_identity.transaction_id != transaction_id {
+        return Err(
+            io::Error::other("worker ready identity belongs to another transaction").into(),
+        );
+    }
+    let reservation = ready_identity.reservation;
+    let presentation_timing = explicit
+        .swapchain()?
+        .ready_presentation_timing()
+        .ok_or_else(|| io::Error::other("worker composited queue has no ready KMS timing"))?;
+    match (reservation, presentation_timing) {
+        (FramePresentationReservation::Fixed(_), KmsPresentationTiming::Fixed(_))
+        | (FramePresentationReservation::Variable(_), KmsPresentationTiming::Variable { .. }) => {}
+        (FramePresentationReservation::DeferredO1(_), _) => {
             return Err(io::Error::other(
                 "deferred O1 transaction must be bound before KMS submission",
             )
             .into());
+        }
+        _ => {
+            return Err(
+                io::Error::other("ready reservation and KMS timing domains disagree").into(),
+            );
         }
     }
     let token = PageFlipToken::new(allocate_native_page_flip_token())
@@ -349,7 +362,7 @@ pub(super) fn queue_explicit_composited_frame(
         crtc_id,
         kind,
         reservation,
-        presentation_timing: KmsPresentationTiming::Fixed(submit_window),
+        presentation_timing,
         validation_base,
         queued_at: MonotonicTimestampNs::new(queued_at_ns),
         primary: KmsPrimaryUpdate::Framebuffer {
@@ -1117,21 +1130,6 @@ impl NativeRuntime {
                 self.render_journal
                     .record_submission_budget(ownership.submission_budget_ns);
                 let _output_generation = ownership.job.output_generation;
-                let target = match ownership.job.reservation {
-                    FramePresentationReservation::Fixed(target) => target,
-                    FramePresentationReservation::Variable(_) => {
-                        return Err(io::Error::other(
-                            "variable direct KMS ownership is not active in the runtime",
-                        )
-                        .into());
-                    }
-                    FramePresentationReservation::DeferredO1(_) => {
-                        return Err(io::Error::other(
-                            "deferred O1 KMS ownership must be bound before submission",
-                        )
-                        .into());
-                    }
-                };
                 let cursor = ownership.job.cursor.clone();
                 let sidecar_owner = ownership
                     .job
@@ -1208,6 +1206,13 @@ impl NativeRuntime {
                         )?;
                     }
                 } else if matches!(kind, AtomicCommitKind::DirectPrimary { .. }) {
+                    let FramePresentationReservation::Fixed(target) = ownership.job.reservation
+                    else {
+                        return Err(io::Error::other(
+                            "Direct Scanout worker ownership must retain its fixed target",
+                        )
+                        .into());
+                    };
                     debug_assert!(!self.scanout.direct_scanout_pending());
                     debug_assert!(direct_primary_lease.is_some());
                     let Some(direct_primary_lease) = direct_primary_lease else {

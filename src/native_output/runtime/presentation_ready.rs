@@ -228,17 +228,17 @@ pub(super) fn submit_ready_frame(
             match identity.reservation {
                 crate::native_output::presentation::transaction::FramePresentationReservation::Fixed(
                     target,
-                ) => Some((identity.protocol_batch_id, target)),
+                ) => Some((identity.protocol_batch_id, Some(target))),
                 crate::native_output::presentation::transaction::FramePresentationReservation::Variable(
                     _,
-                )
-                | crate::native_output::presentation::transaction::FramePresentationReservation::DeferredO1(
-                    _,
-                ) => None,
+                ) => Some((identity.protocol_batch_id, None)),
+                crate::native_output::presentation::transaction::FramePresentationReservation::DeferredO1(_) => None,
             }
         })
     } else {
-        server.prepared_frame_batch_id().zip(compatibility_target)
+        server
+            .prepared_frame_batch_id()
+            .zip(compatibility_target.map(Some))
     };
     let callback_batch_id = guard.map(|(batch_id, _)| batch_id);
     let Some(validation_base) = validation_base_for_submission(
@@ -260,15 +260,19 @@ pub(super) fn submit_ready_frame(
         atomic_cursor.as_ref(),
         cursor_epoch,
     );
-    if let Some((batch_id, guard_target)) = guard
-        && !server.commit_timing_submission_is_safe_for_batch(
-            batch_id,
-            guard_target.presentation_time,
-            guard_target.clock_generation,
-        )
-    {
-        server.note_frame_callback_admission_failure(batch_id);
-        return Ok(ReadySubmissionResult::Unavailable);
+    if let Some((batch_id, guard_target)) = guard {
+        let commit_timing_safe = match guard_target {
+            Some(target) => server.commit_timing_submission_is_safe_for_batch(
+                batch_id,
+                target.presentation_time,
+                target.clock_generation,
+            ),
+            None => !server.frame_batch_has_commit_timing_claims(batch_id),
+        };
+        if !commit_timing_safe {
+            server.note_frame_callback_admission_failure(batch_id);
+            return Ok(ReadySubmissionResult::Unavailable);
+        }
     }
     let (present_result, compatibility_transaction_id) =
         if let NativeScanoutBackend::AtomicEglGbm(explicit) = scanout {
@@ -327,6 +331,17 @@ pub(super) fn submit_ready_frame(
                     vrr_policy,
                 )?
             else {
+                if explicit.swapchain()?.ready_identity().is_none()
+                    && explicit.swapchain()?.has_suspended_frame()
+                {
+                    scene_history.discard_ready();
+                    if output_render_fence_token.is_none()
+                        && let Some(fd) = explicit.suspended_fence_fd()?
+                    {
+                        *output_render_fence_token =
+                            Some(event_loop.register(fd, NativeEventSource::OutputRenderFence)?);
+                    }
+                }
                 if let Some(batch_id) = callback_batch_id {
                     server.note_frame_callback_admission_failure(batch_id);
                 }

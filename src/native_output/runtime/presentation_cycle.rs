@@ -108,8 +108,8 @@ pub(super) struct AtomicRenderOuterContinuation {
     pub(super) render_ahead: bool,
     pub(super) pacing_mode: NativeOutputPacingMode,
     pub(super) can_queue_worker_next: bool,
-    pub(super) frame_target_sequence: u64,
-    pub(super) frame_target_presentation_ns: u64,
+    pub(super) frame_target_sequence: Option<u64>,
+    pub(super) frame_target_presentation_ns: Option<u64>,
     pub(super) render_observed_at_ns: u64,
     pub(super) cursor_epoch: u64,
     pub(super) coalesced_demand_count_at_dispatch: u64,
@@ -339,6 +339,7 @@ impl NativeRuntime {
             pending_proven_deadline_miss: _,
             effective_app_gpu_policy: _,
             last_rendered_scene_generation,
+            last_primary_presented_at_ns,
             last_direct_candidate_key,
             direct_fallback_tracker,
             last_refresh_sequence,
@@ -1521,26 +1522,28 @@ impl NativeRuntime {
                     confirmed_presentation_state,
                     pending_presentation_state,
                 );
-                let physical_state_may_change = match &**scanout {
+                let cursor_assignment_for_policy =
+                    effective_cursor
+                        .as_ref()
+                        .map(|state| CursorPlaneAssignment::Atomic {
+                            desired_epoch: cursor_epoch,
+                            state: Some(state.clone()),
+                        });
+                let prepared_presentation = match &**scanout {
                     NativeScanoutBackend::AtomicEglGbm(explicit) => {
-                        let desired_state = explicit.requested_presentation_state_key(
+                        Some(explicit.prepare_composited_presentation_state(
                             server,
                             *drm_file_generation,
                             pacing_mode,
                             async_policy_inputs,
-                            effective_cursor
-                                .as_ref()
-                                .is_some_and(|cursor| cursor.visible),
+                            cursor_assignment_for_policy.as_ref(),
                             vrr_policy,
-                        );
-                        !kms_presentation_state_is_represented(
-                            desired_state,
-                            confirmed_presentation_state,
-                            pending_presentation_state,
-                        )
+                        ))
                     }
-                    _ => false,
+                    _ => None,
                 };
+                let physical_state_may_change = prepared_presentation
+                    .is_some_and(|prepared| prepared.presentation_state_transition_required);
                 if let Some(start_ns) = scene_resolve_started_at_ns {
                     slow_cycle_trace.record_phase(
                         SlowCyclePhase::SceneResolveAndDamage,
@@ -1621,97 +1624,130 @@ impl NativeRuntime {
                     *queued_redraw_requested = false;
                     *last_software_cursor_damage = current_software_cursor_damage;
                 } else {
-                    #[rustfmt::skip] let atomic_kms_lane_free = !atomic_commit_arbiter.atomic_commit_pending() && !scanout.ready_frame_queued();
                     let render_buffer_snapshot = scanout.buffer_snapshot();
                     if let NativeScanoutBackend::AtomicEglGbm(explicit) = &mut **scanout {
                         let resolved_scene = resolved_scene.into_owned();
                         let mut presentation_snapshot =
                             Some(resolved_scene.presentation_snapshot.clone());
-                        let (
-                            frame_target,
-                            submit_window,
-                            frozen_cursor,
-                            frozen_cursor_trace_reveal,
-                        ) = if let Some((
-                            frame_target,
-                            submit_window,
-                            frozen_cursor,
-                            frozen_cursor_trace_reveal,
-                        )) = preadmitted_explicit_render
-                        {
-                            (
+                        let prepared_presentation = prepared_presentation.ok_or_else(|| {
+                            io::Error::other(
+                                "explicit compositor frame has no prepared presentation state",
+                            )
+                        })?;
+                        let commit_timing_applies = server.has_active_commit_timing_ownership();
+                        let fixed_target_already_owned = scheduled_presentation_target.is_some()
+                            || preadmitted_explicit_render.is_some();
+                        let (prepared_reservation, frozen_cursor, frozen_cursor_trace_reveal) =
+                            if let Some((
                                 frame_target,
                                 submit_window,
                                 frozen_cursor,
                                 frozen_cursor_trace_reveal,
-                            )
-                        } else {
-                            let frame_target = scheduled_presentation_target
-                                .take()
-                                .or_else(|| {
-                                    reactive_or_commit_timing_target(
-                                        presentation_deadline,
-                                        None,
-                                        pending_target,
-                                        MonotonicTimestampNs::new(monotonic_now_ns().ok()?),
-                                        predicted_total_cost,
-                                    )
-                                })
-                                .ok_or_else(|| {
-                                    frame_pacing.cancel_unsubmitted_render();
-                                    io::Error::other(
-                                        "explicit Atomic render started without a presentation target",
-                                    )
-                                })?;
-                            let submit_window = match presentation_timing.submit_window(
-                                frame_target.presentation_time.get(),
-                                frame_target.submit_not_before().get(),
-                                prediction.kms_dispatch_budget_ns,
-                            ) {
-                                Ok(window) => window,
-                                Err(_) => {
-                                    presentation_timing.record_unreachable_target();
-                                    presentation_deadline.clear_scheduled_target();
-                                    frame_pacing.cancel_unsubmitted_render();
-                                    *queued_redraw_requested = true;
-                                    return Ok(());
-                                }
+                            )) = preadmitted_explicit_render
+                            {
+                                (
+                                    PreparedCompositedReservation::Fixed {
+                                        target: frame_target,
+                                        submit_window,
+                                    },
+                                    frozen_cursor,
+                                    frozen_cursor_trace_reveal,
+                                )
+                            } else {
+                                let variable_reservation = plan_composited_variable_reservation(
+                                    prepared_presentation,
+                                    VariableCompositedAdmission {
+                                        reactive_double: pacing_mode
+                                            == NativeOutputPacingMode::ReactiveDouble,
+                                        desired_credit_one: desired_credit == 1,
+                                        render_ahead,
+                                        fixed_target_owned: fixed_target_already_owned,
+                                        commit_timing_applies,
+                                        deferred_o1: render_ahead,
+                                    },
+                                    presentation_deadline,
+                                    last_primary_presented_at_ns.map(MonotonicTimestampNs::new),
+                                    MonotonicTimestampNs::new(monotonic_now_ns()?),
+                                    Duration::from_nanos(output_refresh_rate.interval_ns()),
+                                );
+                                let prepared_reservation = if let Some(reservation) =
+                                    variable_reservation
+                                {
+                                    PreparedCompositedReservation::Variable { reservation }
+                                } else {
+                                    let frame_target = scheduled_presentation_target
+                                    .take()
+                                    .or_else(|| {
+                                        reactive_or_commit_timing_target(
+                                            presentation_deadline,
+                                            None,
+                                            pending_target,
+                                            MonotonicTimestampNs::new(monotonic_now_ns().ok()?),
+                                            predicted_total_cost,
+                                        )
+                                    })
+                                    .ok_or_else(|| {
+                                        frame_pacing.cancel_unsubmitted_render();
+                                        io::Error::other(
+                                            "explicit Atomic fixed render started without a presentation target",
+                                        )
+                                    })?;
+                                    let submit_window = match presentation_timing.submit_window(
+                                        frame_target.presentation_time.get(),
+                                        frame_target.submit_not_before().get(),
+                                        prediction.kms_dispatch_budget_ns,
+                                    ) {
+                                        Ok(window) => window,
+                                        Err(_) => {
+                                            presentation_timing.record_unreachable_target();
+                                            presentation_deadline.clear_scheduled_target();
+                                            frame_pacing.cancel_unsubmitted_render();
+                                            *queued_redraw_requested = true;
+                                            return Ok(());
+                                        }
+                                    };
+                                    PreparedCompositedReservation::Fixed {
+                                        target: frame_target,
+                                        submit_window,
+                                    }
+                                };
+                                let frozen_cursor = freeze_cursor_assignment_for_render(
+                                    effective_cursor.as_ref(),
+                                    cursor_epoch,
+                                    atomic_cursor.as_ref(),
+                                )?;
+                                trace_cursor_freeze(
+                                    server,
+                                    atomic_cursor.as_ref(),
+                                    frozen_cursor.0.as_ref(),
+                                    frozen_cursor.1.as_ref(),
+                                );
+                                let frozen_cursor_trace_reveal = frozen_cursor_trace_for_render(
+                                    server,
+                                    atomic_cursor.as_ref(),
+                                    effective_cursor.as_ref(),
+                                    primary_cursor,
+                                    cursor_epoch,
+                                    planned_cursor_delivery,
+                                );
+                                (
+                                    prepared_reservation,
+                                    frozen_cursor,
+                                    frozen_cursor_trace_reveal,
+                                )
                             };
-                            let frozen_cursor = freeze_cursor_assignment_for_render(
-                                effective_cursor.as_ref(),
-                                cursor_epoch,
-                                atomic_cursor.as_ref(),
-                            )?;
-                            trace_cursor_freeze(
-                                server,
-                                atomic_cursor.as_ref(),
-                                frozen_cursor.0.as_ref(),
-                                frozen_cursor.1.as_ref(),
-                            );
-                            let frozen_cursor_trace_reveal = frozen_cursor_trace_for_render(
-                                server,
-                                atomic_cursor.as_ref(),
-                                effective_cursor.as_ref(),
-                                primary_cursor,
-                                cursor_epoch,
-                                planned_cursor_delivery,
-                            );
-                            (
+                        let fixed_frame_target = prepared_reservation.fixed_target();
+                        let o1_admission = fixed_frame_target.map(|frame_target| {
+                            admission_observation_for_frame(
                                 frame_target,
-                                submit_window,
-                                frozen_cursor,
-                                frozen_cursor_trace_reveal,
+                                desired_credit,
+                                pipeline_snapshot
+                                    .as_ref()
+                                    .map_or(0, |pipeline| pipeline.future_primary_depth()),
+                                o1_demand.overlap_required_ns,
+                                scheduler_decision == SchedulerDecision::RenderAhead,
                             )
-                        };
-                        let o1_admission = Some(admission_observation_for_frame(
-                            frame_target,
-                            desired_credit,
-                            pipeline_snapshot
-                                .as_ref()
-                                .map_or(0, |pipeline| pipeline.future_primary_depth()),
-                            o1_demand.overlap_required_ns,
-                            scheduler_decision == SchedulerDecision::RenderAhead,
-                        ));
+                        });
                         presentation_deadline.clear_scheduled_target();
                         let (cursor_assignment, frozen_cursor_plane_owner) = frozen_cursor;
                         let release_safety =
@@ -1745,36 +1781,36 @@ impl NativeRuntime {
                         frame_pacing.log("render_begin", render_begin_fields);
                         let mut cursor_damage =
                             Some((current_client_cursor_damage, current_software_cursor_damage));
-                        let mut worker_outer_continuation =
-                            explicit.render_worker_active().then(|| {
-                                AtomicRenderOuterContinuation {
-                                    scene_generation,
-                                    render_generation,
-                                    output_generation: *drm_file_generation,
-                                    render_ahead,
-                                    pacing_mode,
-                                    can_queue_worker_next,
-                                    frame_target_sequence: frame_target.sequence,
-                                    frame_target_presentation_ns: frame_target
-                                        .presentation_time
-                                        .get(),
-                                    render_observed_at_ns,
-                                    cursor_epoch,
-                                    coalesced_demand_count_at_dispatch:
-                                        *render_demand_coalesced_count,
-                                    output_width: target.width,
-                                    output_height: target.height,
-                                    o1_admission,
-                                    release_safety,
-                                    release_lease_id: dmabuf_gpu_release_lease_id,
-                                    presentation_snapshot: presentation_snapshot
-                                        .take()
-                                        .expect("worker continuation owns presentation snapshot"),
-                                    cursor_damage: cursor_damage
-                                        .take()
-                                        .expect("worker continuation owns cursor damage"),
-                                }
-                            });
+                        let mut worker_outer_continuation = if explicit.render_worker_active() {
+                            Some(AtomicRenderOuterContinuation {
+                                scene_generation,
+                                render_generation,
+                                output_generation: *drm_file_generation,
+                                render_ahead,
+                                pacing_mode,
+                                can_queue_worker_next,
+                                frame_target_sequence: fixed_frame_target
+                                    .map(|frame_target| frame_target.sequence),
+                                frame_target_presentation_ns: fixed_frame_target
+                                    .map(|frame_target| frame_target.presentation_time.get()),
+                                render_observed_at_ns,
+                                cursor_epoch,
+                                coalesced_demand_count_at_dispatch: *render_demand_coalesced_count,
+                                output_width: target.width,
+                                output_height: target.height,
+                                o1_admission,
+                                release_safety,
+                                release_lease_id: dmabuf_gpu_release_lease_id,
+                                presentation_snapshot: presentation_snapshot
+                                    .take()
+                                    .expect("worker continuation owns presentation snapshot"),
+                                cursor_damage: cursor_damage
+                                    .take()
+                                    .expect("worker continuation owns cursor damage"),
+                            })
+                        } else {
+                            None
+                        };
                         #[rustfmt::skip] let render_result = explicit.render_frame(
                             server,
                             output_transactions,
@@ -1784,8 +1820,8 @@ impl NativeRuntime {
                             resolved_scene,
                             render_generation,
                             *drm_file_generation,
-                            frame_target,
-                            submit_window,
+                            prepared_reservation,
+                            prepared_presentation,
                             pacing_mode,
                             render_ahead,
                             desired_credit,
@@ -1801,15 +1837,8 @@ impl NativeRuntime {
                             ),
                             frozen_cursor_plane_owner,
                             frozen_cursor_trace_reveal,
-                            AtomicAsyncPolicyInputs::new(
-                                cursor_state_changed,
-                                atomic_kms_lane_free,
-                                confirmed_presentation_state,
-                                pending_presentation_state,
-                            ),
                             release_safety,
                             dmabuf_gpu_release_lease_id,
-                            vrr_policy,
                             render_phase_durations.as_mut(),
                         ).inspect_err(|_| {
                             frame_pacing.note_predictive_o1_failed();
@@ -2181,25 +2210,27 @@ impl NativeRuntime {
                                         server.note_frame_callbacks_deferred_ready(protocol_batch_id);
                                         frame_pacing.note_ready_frame(ready_at_ns, waits_for_target);
                                     }
-                                    match super::presentation_ready::pull_ready_frame_into_reachable_opportunity(
-                                        explicit,
-                                        output_transactions,
-                                        presentation_deadline,
-                                        presentation_timing,
-                                        frame_pacing,
-                                        MonotonicTimestampNs::new(ready_at_ns),
-                                        *drm_file_generation,
-                                        prediction.kms_dispatch_budget_ns,
-                                    )? {
-                                        super::presentation_ready::ReadyPullInResult::PulledIn => {}
-                                        super::presentation_ready::ReadyPullInResult::RejectedTooLate => {
-                                            frame_pacing.note_ready_pull_in_rejected_too_late();
-                                        }
-                                        super::presentation_ready::ReadyPullInResult::RejectedOwned => {
-                                            frame_pacing.note_ready_pull_in_rejected_owned();
-                                        }
-                                        super::presentation_ready::ReadyPullInResult::RejectedIdentity => {
-                                            frame_pacing.note_ready_pull_in_rejected_identity();
+                                    if prepared_reservation.fixed_target().is_some() {
+                                        match super::presentation_ready::pull_ready_frame_into_reachable_opportunity(
+                                            explicit,
+                                            output_transactions,
+                                            presentation_deadline,
+                                            presentation_timing,
+                                            frame_pacing,
+                                            MonotonicTimestampNs::new(ready_at_ns),
+                                            *drm_file_generation,
+                                            prediction.kms_dispatch_budget_ns,
+                                        )? {
+                                            super::presentation_ready::ReadyPullInResult::PulledIn => {}
+                                            super::presentation_ready::ReadyPullInResult::RejectedTooLate => {
+                                                frame_pacing.note_ready_pull_in_rejected_too_late();
+                                            }
+                                            super::presentation_ready::ReadyPullInResult::RejectedOwned => {
+                                                frame_pacing.note_ready_pull_in_rejected_owned();
+                                            }
+                                            super::presentation_ready::ReadyPullInResult::RejectedIdentity => {
+                                                frame_pacing.note_ready_pull_in_rejected_identity();
+                                            }
                                         }
                                     }
                                     if waits_for_target && render_ahead {
@@ -2309,34 +2340,47 @@ impl NativeRuntime {
                                     *frame_index = frame_index.saturating_add(1);
                                     }
                                 }
-                                frame_pacing.log(
-                                    "render_complete",
-                                    vec![
-                                        PacingField::u64("frame_id", frame_id),
-                                        PacingField::option_u64(
-                                            "predictive_attempt_id",
-                                            frame_pacing
-                                                .active_predictive_attempt_id()
-                                                .map(|attempt| attempt.get()),
-                                        ),
-                                        PacingField::u64("output_frame_id", frame_id),
-                                        PacingField::u64("render_generation", render_generation),
-                                        PacingField::u64(
-                                            "render_observed_at_ns",
-                                            render_observed_at_ns,
-                                        ),
-                                        PacingField::u64("render_end_ns", ready_at_ns),
-                                        PacingField::u64(
-                                            "target_vblank_sequence",
-                                            frame_target.sequence,
-                                        ),
-                                        PacingField::u64(
-                                            "target_presentation_ns",
-                                            frame_target.presentation_time.get(),
-                                        ),
-                                        PacingField::bool("render_ahead", render_ahead),
-                                    ],
-                                );
+                                let fixed_render_target = explicit
+                                    .swapchain()?
+                                    .ready_identity()
+                                    .and_then(|identity| identity.fixed_target());
+                                let mut render_fields = vec![
+                                    PacingField::u64("frame_id", frame_id),
+                                    PacingField::option_u64(
+                                        "predictive_attempt_id",
+                                        frame_pacing
+                                            .active_predictive_attempt_id()
+                                            .map(|attempt| attempt.get()),
+                                    ),
+                                    PacingField::u64("output_frame_id", frame_id),
+                                    PacingField::u64("render_generation", render_generation),
+                                    PacingField::u64(
+                                        "render_observed_at_ns",
+                                        render_observed_at_ns,
+                                    ),
+                                    PacingField::u64("render_end_ns", ready_at_ns),
+                                ];
+                                if let Some(target) = fixed_render_target {
+                                    render_fields.push(PacingField::u64(
+                                        "target_vblank_sequence",
+                                        target.sequence,
+                                    ));
+                                    render_fields.push(PacingField::u64(
+                                        "target_presentation_ns",
+                                        target.presentation_time.get(),
+                                    ));
+                                } else {
+                                    render_fields.push(PacingField::option_u64(
+                                        "target_vblank_sequence",
+                                        None,
+                                    ));
+                                    render_fields.push(PacingField::option_u64(
+                                        "target_presentation_ns",
+                                        None,
+                                    ));
+                                }
+                                render_fields.push(PacingField::bool("render_ahead", render_ahead));
+                                frame_pacing.log("render_complete", render_fields);
                                 *queued_redraw_requested = deferred_o1_safely_abandoned;
                                 *last_rendered_scene_generation = scene_generation;
                                 if !waits_for_target && !worker_mode {
