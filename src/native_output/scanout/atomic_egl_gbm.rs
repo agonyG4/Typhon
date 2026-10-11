@@ -38,8 +38,9 @@ use super::atomic_direct::{direct_candidate_key, direct_scanout_debug};
 use super::atomic_render_domain::{AtomicRenderDomain, AtomicRenderDomainBootstrap};
 pub(crate) use super::atomic_render_domain::{AtomicRenderedFrameParts, AtomicSlotRenderOutcome};
 use super::render_worker::{
-    AtomicRenderControl, AtomicRenderTransportKind, AtomicRenderWorkerEvent,
-    AtomicRenderWorkerHandle, AtomicRenderWorkerPolicy, AtomicRenderWorkerStartup,
+    AtomicRenderControl, AtomicRenderTransportKind, AtomicRenderWorkerCapture,
+    AtomicRenderWorkerEvent, AtomicRenderWorkerHandle, AtomicRenderWorkerIdentity,
+    AtomicRenderWorkerJob, AtomicRenderWorkerPolicy, AtomicRenderWorkerStartup, RenderWorkerJobId,
     SequencedRenderControl, apply_render_control,
 };
 use super::*;
@@ -455,17 +456,20 @@ impl AtomicEglGbmScanout {
     fn queue_render_control(&mut self, control: AtomicRenderControl) -> io::Result<()> {
         match &mut self.render_transport {
             AtomicRenderTransport::Synchronous(domain) => apply_render_control(domain, control),
-            AtomicRenderTransport::Worker(_) => {
+            AtomicRenderTransport::Worker(worker) => {
                 if self.pending_render_controls.len() >= MAX_PENDING_RENDER_CONTROLS {
                     self.render_control_overflowed = true;
+                    worker.fail_control_lane();
                     return Err(io::Error::other(
                         "bounded renderer-control lane is full; refusing to drop renderer state",
                     ));
                 }
-                self.render_control_epoch = self
-                    .render_control_epoch
-                    .checked_add(1)
-                    .ok_or_else(|| io::Error::other("renderer control epoch exhausted"))?;
+                let Some(next_epoch) = self.render_control_epoch.checked_add(1) else {
+                    self.render_control_overflowed = true;
+                    worker.fail_control_lane();
+                    return Err(io::Error::other("renderer control epoch exhausted"));
+                };
+                self.render_control_epoch = next_epoch;
                 self.pending_render_controls.push(SequencedRenderControl {
                     epoch: self.render_control_epoch,
                     control,
@@ -508,6 +512,10 @@ impl AtomicEglGbmScanout {
     pub(crate) fn render_worker_busy(&self) -> bool {
         self.render_worker()
             .is_some_and(AtomicRenderWorkerHandle::busy)
+    }
+
+    pub(crate) fn render_worker_active(&self) -> bool {
+        matches!(&self.render_transport, AtomicRenderTransport::Worker(_))
     }
 
     pub(crate) fn render_target_request(
@@ -969,7 +977,7 @@ impl AtomicEglGbmScanout {
                 })?,
                 AtomicRenderWorkerPolicy::Auto => {
                     eprintln!(
-                        "native render worker: requested=auto effective=synchronous startup=automatic_startup_degraded reason=render_completion_continuation_not_connected"
+                        "native render worker: requested=auto effective=synchronous startup=automatic_startup_degraded reason=worker_capture_effect_reload_output_configuration_and_session_continuations_not_fully_migrated"
                     );
                     create_synchronous_render_setup(
                         kms,
@@ -991,7 +999,7 @@ impl AtomicEglGbmScanout {
                 }
                 AtomicRenderWorkerPolicy::Force => {
                     return Err(io::Error::other(
-                        "native render worker force mode is unavailable until asynchronous Atomic render settlement is connected",
+                        "native render worker force mode is unavailable until capture, effect reload, output configuration, session recovery, and common renderer settlement are fully asynchronous",
                     ));
                 }
             };
@@ -1189,6 +1197,51 @@ impl AtomicEglGbmScanout {
             AtomicRenderTransport::Worker(_) => Err(io::Error::other(
                 "screen capture must be admitted as a render-worker operation",
             )),
+        }
+    }
+
+    pub(crate) fn freeze_capture_frame(
+        &self,
+        resolved_scene: ResolvedNativeFrameScene<'static>,
+        server: &OwnCompositorServer,
+        input_state: &NativeInputState,
+        cursor_mode: NativeCursorRenderMode,
+    ) -> FrozenNativeRenderFrame {
+        FrozenNativeRenderFrame::freeze(
+            self.width,
+            self.height,
+            resolved_scene,
+            server,
+            input_state,
+            cursor_mode,
+            Some(OutputDamage::Full),
+        )
+    }
+
+    pub(crate) fn dispatch_capture(
+        &mut self,
+        job_id: RenderWorkerJobId,
+        frozen_frame: FrozenNativeRenderFrame,
+    ) -> io::Result<u64> {
+        let (controls_before, required_control_epoch) = self.take_render_controls_for_job()?;
+        let capture = AtomicRenderWorkerCapture {
+            job_id,
+            frozen_frame,
+            required_control_epoch,
+            controls_before,
+        };
+        match self
+            .render_worker_mut()
+            .ok_or_else(|| io::Error::other("capture dispatch requires render-worker mode"))?
+            .try_dispatch_capture(capture)
+        {
+            Ok(()) => Ok(required_control_epoch),
+            Err(capture) => {
+                self.pending_render_controls = capture.controls_before;
+                Err(io::Error::other(
+                    "render worker rejected a serialized capture command",
+                ))
+            }
         }
     }
 
@@ -1660,6 +1713,72 @@ impl AtomicEglGbmScanout {
                 .saturating_add(elapsed_nanos(started));
         }
         context.render_target = target_request.as_ref().ok().copied();
+        if matches!(&self.render_transport, AtomicRenderTransport::Worker(_)) {
+            let Some(target) = context.render_target else {
+                let error = target_request.expect_err("missing target preserves its error");
+                return self.settle_render_completion(
+                    context,
+                    frozen_render_frame,
+                    Err(error),
+                    false,
+                    None,
+                    server,
+                    output_transactions,
+                );
+            };
+            let (controls_before, control_epoch) = self.take_render_controls_for_job()?;
+            let job_id = RenderWorkerJobId::new(transaction_id.get())
+                .ok_or_else(|| io::Error::other("output transaction ID is zero"))?;
+            let dispatch_at_ns = monotonic_now_ns()?;
+            let need_no_visual_release_fence = context.dmabuf_gpu_release_lease_id.is_some()
+                && server.frame_batch_dmabuf_release_count(protocol_batch_id) > 0
+                && context
+                    .dmabuf_gpu_release_safety
+                    .permits_compositor_gpu_release();
+            let identity = AtomicRenderWorkerIdentity {
+                job_id,
+                frame_id,
+                transaction_id,
+                output_generation,
+                render_generation,
+                control_epoch,
+                target,
+            };
+            let job = AtomicRenderWorkerJob {
+                job_id,
+                frame_id,
+                transaction_id,
+                output_generation,
+                render_generation,
+                target,
+                frozen_frame: frozen_render_frame,
+                need_no_visual_release_fence,
+                dispatch_at_ns,
+                required_control_epoch: control_epoch,
+                controls_before,
+            };
+            let dispatch = self
+                .render_worker_mut()
+                .ok_or_else(|| io::Error::other("worker transport disappeared"))?
+                .try_dispatch_render(job);
+            return match dispatch {
+                Ok(()) => Ok(AtomicFrameRenderOutcome::WorkerDispatched { identity, context }),
+                Err(job) => {
+                    self.pending_render_controls = job.controls_before;
+                    self.settle_render_completion(
+                        context,
+                        job.frozen_frame,
+                        Err(io::Error::other(
+                            "render worker rejected a serialized frame command",
+                        )),
+                        false,
+                        None,
+                        server,
+                        output_transactions,
+                    )
+                }
+            };
+        }
         let render_outcome = if let Some(target) = context.render_target {
             self.render_to_slot(
                 target,
@@ -1683,7 +1802,7 @@ impl AtomicEglGbmScanout {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn settle_render_completion(
+    pub(crate) fn settle_render_completion(
         &mut self,
         context: AtomicRenderSettlementContext,
         frozen_render_frame: FrozenNativeRenderFrame,
@@ -2393,6 +2512,10 @@ fn complete_confirmed_pageflip_with_timing<T>(
     reason = "the rendered result carries the complete scene identity and repaint evidence"
 )]
 pub(crate) enum AtomicFrameRenderOutcome {
+    WorkerDispatched {
+        identity: AtomicRenderWorkerIdentity,
+        context: AtomicRenderSettlementContext,
+    },
     Rendered {
         frame_id: u64,
         transaction_id: OutputTransactionId,

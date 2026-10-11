@@ -40,6 +40,7 @@ use super::presentation_worker::*;
 use super::*;
 use crate::native_output::kms_worker::{KmsCommitWorkerTransport, KmsTestOnlyPolicy};
 use oblivion_one::compositor::FrameCallbackAdmission;
+use oblivion_one::native::buffering::O1AdmissionObservation;
 use oblivion_one::native::kms::KmsBackendKind;
 use oblivion_one::native::scheduler::rendered_primary_must_wait_for_lane;
 
@@ -88,6 +89,39 @@ pub(crate) const fn primary_render_admission_blocked(
     completion_pending: bool,
 ) -> bool {
     render_worker_busy || completion_pending
+}
+
+pub(crate) const fn render_worker_received_visual_demand(
+    coalesced_count_at_dispatch: u64,
+    current_coalesced_count: u64,
+) -> bool {
+    current_coalesced_count > coalesced_count_at_dispatch
+}
+
+/// Reactor-owned evidence from the render decision that cannot be rebuilt
+/// from live compositor state after an asynchronous worker completion.
+pub(super) struct AtomicRenderOuterContinuation {
+    pub(super) scene_generation: u64,
+    pub(super) render_generation: u64,
+    pub(super) output_generation: u64,
+    pub(super) render_ahead: bool,
+    pub(super) pacing_mode: NativeOutputPacingMode,
+    pub(super) can_queue_worker_next: bool,
+    pub(super) frame_target_sequence: u64,
+    pub(super) frame_target_presentation_ns: u64,
+    pub(super) render_observed_at_ns: u64,
+    pub(super) cursor_epoch: u64,
+    pub(super) coalesced_demand_count_at_dispatch: u64,
+    pub(super) output_width: u32,
+    pub(super) output_height: u32,
+    pub(super) o1_admission: Option<O1AdmissionObservation>,
+    pub(super) release_safety: DmabufGpuReleaseSafety,
+    pub(super) release_lease_id: Option<oblivion_one::compositor::DmabufGpuReleaseLeaseId>,
+    pub(super) presentation_snapshot: oblivion_one::compositor::PresentationFrameSnapshot,
+    pub(super) cursor_damage: (
+        Option<NativeClientCursorDamageState>,
+        Option<NativeDamageRect>,
+    ),
 }
 
 /// Hardware Auto cursor work is admitted as a PlaneDelta and must not seed a
@@ -283,6 +317,9 @@ impl NativeRuntime {
             output_render_fence_token,
             kms_commit_worker,
             kms_commit_worker_transport,
+            pending_render_worker_identity,
+            pending_render_worker_context,
+            pending_render_worker_outer,
             pending_render_worker_completion,
             frame_scheduler,
             atomic_commit_arbiter,
@@ -1585,7 +1622,8 @@ impl NativeRuntime {
                     let render_buffer_snapshot = scanout.buffer_snapshot();
                     if let NativeScanoutBackend::AtomicEglGbm(explicit) = &mut **scanout {
                         let resolved_scene = resolved_scene.into_owned();
-                        let presentation_snapshot = resolved_scene.presentation_snapshot.clone();
+                        let mut presentation_snapshot =
+                            Some(resolved_scene.presentation_snapshot.clone());
                         let (
                             frame_target,
                             submit_window,
@@ -1702,6 +1740,38 @@ impl NativeRuntime {
                             render_buffer_snapshot,
                         );
                         frame_pacing.log("render_begin", render_begin_fields);
+                        let mut cursor_damage =
+                            Some((current_client_cursor_damage, current_software_cursor_damage));
+                        let mut worker_outer_continuation =
+                            explicit.render_worker_active().then(|| {
+                                AtomicRenderOuterContinuation {
+                                    scene_generation,
+                                    render_generation,
+                                    output_generation: *drm_file_generation,
+                                    render_ahead,
+                                    pacing_mode,
+                                    can_queue_worker_next,
+                                    frame_target_sequence: frame_target.sequence,
+                                    frame_target_presentation_ns: frame_target
+                                        .presentation_time
+                                        .get(),
+                                    render_observed_at_ns,
+                                    cursor_epoch,
+                                    coalesced_demand_count_at_dispatch:
+                                        *render_demand_coalesced_count,
+                                    output_width: target.width,
+                                    output_height: target.height,
+                                    o1_admission,
+                                    release_safety,
+                                    release_lease_id: dmabuf_gpu_release_lease_id,
+                                    presentation_snapshot: presentation_snapshot
+                                        .take()
+                                        .expect("worker continuation owns presentation snapshot"),
+                                    cursor_damage: cursor_damage
+                                        .take()
+                                        .expect("worker continuation owns cursor damage"),
+                                }
+                            });
                         #[rustfmt::skip] let render_result = explicit.render_frame(
                             server,
                             output_transactions,
@@ -1765,7 +1835,11 @@ impl NativeRuntime {
                             );
                         }
                         let render_outcome = render_result?;
-                        if let Some(start_ns) = render_call_started_at_ns {
+                        if !matches!(
+                            &render_outcome,
+                            AtomicFrameRenderOutcome::WorkerDispatched { .. }
+                        ) && let Some(start_ns) = render_call_started_at_ns
+                        {
                             let render_finished_at_ns = match monotonic_now_ns() {
                                 Ok(now) => now,
                                 Err(error) => {
@@ -1776,6 +1850,7 @@ impl NativeRuntime {
                             };
                             let render_call_ns = render_finished_at_ns.saturating_sub(start_ns);
                             let renderer_ns = match &render_outcome {
+                                AtomicFrameRenderOutcome::WorkerDispatched { .. } => 0,
                                 AtomicFrameRenderOutcome::Skipped { render_us, .. }
                                 | AtomicFrameRenderOutcome::RetryPresentationState { render_us }
                                 | AtomicFrameRenderOutcome::Rendered { render_us, .. }
@@ -1793,6 +1868,28 @@ impl NativeRuntime {
                             );
                         }
                         match render_outcome {
+                            AtomicFrameRenderOutcome::WorkerDispatched { identity, context } => {
+                                if pending_render_worker_identity.is_some()
+                                    || pending_render_worker_context.is_some()
+                                    || pending_render_worker_outer.is_some()
+                                    || pending_render_worker_completion.is_some()
+                                {
+                                    return Err(io::Error::other(
+                                        "Atomic render worker dispatched with a prior reactor continuation active",
+                                    )
+                                    .into());
+                                }
+                                let outer = worker_outer_continuation.take().ok_or_else(|| {
+                                    io::Error::other(
+                                        "worker dispatch has no owned outer presentation continuation",
+                                    )
+                                })?;
+                                *pending_render_worker_identity = Some(identity);
+                                *pending_render_worker_context = Some(context);
+                                *pending_render_worker_outer = Some(outer);
+                                *queued_redraw_requested = false;
+                                return Ok(());
+                            }
                             AtomicFrameRenderOutcome::Skipped {
                                 reason,
                                 render_us,
@@ -2003,14 +2100,18 @@ impl NativeRuntime {
                                     transaction_id,
                                     resolved_render_generation,
                                     resolved_snapshot,
-                                    presentation_snapshot,
+                                    presentation_snapshot
+                                        .take()
+                                        .expect("synchronous path retains presentation snapshot"),
                                     lifecycle_snapshot,
                                     resolved_scene_signature,
                                     render_damage_signature,
                                     repair_damage_signature,
                                     scene_history.presented_frame_id(),
                                     framebuffer_slot,
-                                    (current_client_cursor_damage, current_software_cursor_damage),
+                                    cursor_damage
+                                        .take()
+                                        .expect("synchronous path retains cursor damage"),
                                     repaint_stats.buffer_age,
                                 )?;
                                 render_telemetry.record_atomic(render_us, repaint_stats, *target);

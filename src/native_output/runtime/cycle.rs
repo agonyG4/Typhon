@@ -350,6 +350,11 @@ impl NativeRuntime {
 
     fn run_cycle(&mut self) -> NativeResult<()> {
         let mut cycle = self.wait_for_events_and_pageflips()?;
+        // A worker completion returns ownership to the reactor before any
+        // planner can admit work for this cycle. The planner below therefore
+        // always sees the settled swapchain/transaction state and current
+        // compositor state.
+        self.settle_pending_render_worker_completion(&mut cycle)?;
         let now_ns = monotonic_now_ns()?;
         if self
             .system_action_transport
@@ -852,7 +857,9 @@ impl NativeRuntime {
         if prepare_operation_plan.service_screen_capture {
             if self.server.has_pending_astrea_screen_capture() {
                 self.service_pending_screen_capture()?;
-                if self.server.has_pending_astrea_screen_capture() {
+                if self.server.has_pending_astrea_screen_capture()
+                    && !self.scanout.render_worker_busy()
+                {
                     self.event_loop.request_continuation(
                         oblivion_one::native::event_loop::NativeContinuationReason::ScreenCaptureBacklog,
                     )?;
@@ -1506,6 +1513,12 @@ impl NativeRuntime {
         });
     }
     pub(super) fn fail_pending_screen_captures(&mut self, reason: &str) {
+        if let Some(pending) = self.pending_render_worker_capture.as_mut()
+            && !pending.cancelled
+        {
+            pending.pending.capture.failed(reason.to_owned());
+            pending.cancelled = true;
+        }
         for _ in 0..MAX_SCREEN_CAPTURES_FAILED_PER_TURN {
             let Some(pending) = self.server.take_pending_astrea_screen_capture() else {
                 break;
@@ -1520,6 +1533,12 @@ impl NativeRuntime {
     }
 
     fn service_pending_screen_capture(&mut self) -> NativeResult<()> {
+        if self.scanout.render_worker_active() && self.scanout.render_worker_busy() {
+            // Keep the protocol request in the compositor backlog until the
+            // serialized renderer command slot is available. The completion
+            // fd will wake the reactor; no capture job is prepared here.
+            return Ok(());
+        }
         let Some(pending) = self.server.take_pending_astrea_screen_capture() else {
             return Ok(());
         };
@@ -1548,6 +1567,49 @@ impl NativeRuntime {
             }
         };
         let resolved_scene = ResolvedNativeFrameScene::from_server(&self.server).into_owned();
+        if self.scanout.render_worker_active() {
+            let job_id = super::render_worker::next_render_worker_capture_id()?;
+            let frozen_frame = match &*self.scanout {
+                crate::native_output::scanout::NativeScanoutBackend::AtomicEglGbm(scanout) => {
+                    scanout.freeze_capture_frame(
+                        resolved_scene,
+                        &self.server,
+                        &self.input_state,
+                        self.cursor_render_mode,
+                    )
+                }
+                _ => {
+                    pending.capture.failed("unsupported".to_owned());
+                    return Ok(());
+                }
+            };
+            let control_epoch = match self
+                .scanout
+                .dispatch_render_worker_capture(job_id, frozen_frame)
+            {
+                Ok(epoch) => epoch,
+                Err(error) => {
+                    eprintln!("native screen capture worker admission failed: {error}");
+                    pending.capture.failed("render_failed".to_owned());
+                    return Ok(());
+                }
+            };
+            if self.pending_render_worker_capture.is_some() {
+                pending.capture.failed("render_failed".to_owned());
+                return Err(io::Error::other(
+                    "render worker admitted a second capture continuation",
+                )
+                .into());
+            }
+            self.pending_render_worker_capture = Some(super::render_worker::PendingWorkerCapture {
+                job_id,
+                control_epoch,
+                pending,
+                dimensions,
+                cancelled: false,
+            });
+            return Ok(());
+        }
         let payload = match self.scanout.capture_scene(
             resolved_scene,
             &self.server,

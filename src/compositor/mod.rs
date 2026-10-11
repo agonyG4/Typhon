@@ -15,7 +15,7 @@ pub use clipboard_bridge::{
     NoopClipboardBridge,
 };
 use gpu_protocol_capabilities::GpuProtocolCapabilities;
-use screen_capture::AstreaScreenCapturePending;
+pub use screen_capture::AstreaScreenCapturePending;
 use std::{
     cell::Cell,
     collections::{HashMap, HashSet, VecDeque},

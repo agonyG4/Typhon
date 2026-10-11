@@ -1,6 +1,7 @@
 use super::presentation_cycle::complete_compatibility_no_visual_change;
 use super::presentation_cycle::cursor_work_requires_primary_repaint;
 use super::presentation_cycle::primary_render_admission_blocked;
+use super::presentation_cycle::render_worker_received_visual_demand;
 use super::*;
 use crate::native_output::runtime::commit_timing::logical_scene_changed;
 use crate::native_output::scanout::{NativePaintOutcome, NativePaintStats, NativeScanoutKind};
@@ -14,6 +15,13 @@ fn render_worker_admission_gate_only_blocks_new_primary_render_work() {
     assert!(!primary_render_admission_blocked(false, false));
     assert!(primary_render_admission_blocked(true, false));
     assert!(primary_render_admission_blocked(false, true));
+}
+
+#[test]
+fn render_worker_completion_uses_only_visual_demand_arriving_after_dispatch() {
+    assert!(!render_worker_received_visual_demand(12, 12));
+    assert!(render_worker_received_visual_demand(12, 13));
+    assert!(render_worker_received_visual_demand(12, 112));
 }
 
 #[test]

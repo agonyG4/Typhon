@@ -50,7 +50,7 @@ pub(crate) use output_slot::*;
 pub(crate) use output_swapchain::*;
 pub(crate) use render_worker::{
     AtomicRenderWorkerCompletion, AtomicRenderWorkerEvent, AtomicRenderWorkerIdentity,
-    completion_matches_job,
+    RenderWorkerJobId, completion_matches_job,
 };
 pub(crate) use scaled_probe::*;
 
@@ -288,6 +288,49 @@ impl NativeScanoutBackend {
         match self {
             Self::AtomicEglGbm(scanout) => scanout.try_take_render_worker_event(),
             Self::NativeEglGbm(_) | Self::Gbm(_) | Self::Dumb(_) => Ok(None),
+        }
+    }
+
+    pub(crate) fn render_worker_active(&self) -> bool {
+        matches!(self, Self::AtomicEglGbm(scanout) if scanout.render_worker_active())
+    }
+
+    pub(crate) fn dispatch_render_worker_capture(
+        &mut self,
+        job_id: RenderWorkerJobId,
+        frozen_frame: crate::native_output::runtime::FrozenNativeRenderFrame,
+    ) -> std::io::Result<u64> {
+        match self {
+            Self::AtomicEglGbm(scanout) => scanout.dispatch_capture(job_id, frozen_frame),
+            Self::NativeEglGbm(_) | Self::Gbm(_) | Self::Dumb(_) => Err(std::io::Error::other(
+                "render-worker capture requires explicit Atomic scanout",
+            )),
+        }
+    }
+
+    pub(crate) fn settle_render_worker_completion(
+        &mut self,
+        context: AtomicRenderSettlementContext,
+        frozen_frame: crate::native_output::runtime::FrozenNativeRenderFrame,
+        result: std::io::Result<AtomicSlotRenderOutcome>,
+        gpu_sampling_started: bool,
+        release_fence: Option<crate::egl_renderer::native_fence::NativeRenderFence>,
+        server: &mut OwnCompositorServer,
+        output_transactions: &mut OutputTransactionLedger,
+    ) -> std::io::Result<AtomicFrameRenderOutcome> {
+        match self {
+            Self::AtomicEglGbm(scanout) => scanout.settle_render_completion(
+                context,
+                frozen_frame,
+                result,
+                gpu_sampling_started,
+                release_fence,
+                server,
+                output_transactions,
+            ),
+            Self::NativeEglGbm(_) | Self::Gbm(_) | Self::Dumb(_) => Err(std::io::Error::other(
+                "render-worker completion cannot settle on a compatibility scanout",
+            )),
         }
     }
 

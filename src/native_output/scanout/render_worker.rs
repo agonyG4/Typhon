@@ -161,6 +161,13 @@ pub(crate) struct AtomicRenderWorkerCompletion {
     pub(crate) worker_wall_ns: u64,
 }
 
+pub(crate) struct AtomicRenderWorkerCapture {
+    pub(crate) job_id: RenderWorkerJobId,
+    pub(crate) frozen_frame: FrozenNativeRenderFrame,
+    pub(crate) required_control_epoch: u64,
+    pub(crate) controls_before: Vec<SequencedRenderControl>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct AtomicRenderWorkerIdentity {
     pub(crate) job_id: RenderWorkerJobId,
@@ -203,6 +210,11 @@ pub(crate) fn completion_matches_job(
 
 pub(crate) enum AtomicRenderWorkerEvent {
     Rendered(AtomicRenderWorkerCompletion),
+    Captured {
+        job_id: RenderWorkerJobId,
+        control_epoch: u64,
+        result: io::Result<Vec<u8>>,
+    },
     Fatal {
         job_id: Option<RenderWorkerJobId>,
         gpu_execution_uncertain: bool,
@@ -225,6 +237,7 @@ enum RenderWorkerCommand {
         response: SyncSender<io::Result<AtomicRenderDomainInfo>>,
     },
     Render(AtomicRenderWorkerJob),
+    Capture(AtomicRenderWorkerCapture),
     Shutdown,
 }
 
@@ -238,6 +251,7 @@ pub(crate) struct AtomicRenderWorkerHandle {
     busy: bool,
     initialized: bool,
     fatal: Arc<AtomicBool>,
+    control_lane_overflowed: bool,
 }
 
 impl AtomicRenderWorkerHandle {
@@ -319,6 +333,7 @@ impl AtomicRenderWorkerHandle {
                 busy: false,
                 initialized: false,
                 fatal,
+                control_lane_overflowed: false,
             },
             formats,
         ))
@@ -385,12 +400,50 @@ impl AtomicRenderWorkerHandle {
         }
     }
 
+    pub(crate) fn try_dispatch_capture(
+        &mut self,
+        capture: AtomicRenderWorkerCapture,
+    ) -> Result<(), AtomicRenderWorkerCapture> {
+        if !self.initialized || self.busy || self.fatal.load(Ordering::Acquire) {
+            return Err(capture);
+        }
+        match self
+            .commands
+            .try_send(RenderWorkerCommand::Capture(capture))
+        {
+            Ok(()) => {
+                self.busy = true;
+                Ok(())
+            }
+            Err(TrySendError::Full(RenderWorkerCommand::Capture(capture)))
+            | Err(TrySendError::Disconnected(RenderWorkerCommand::Capture(capture))) => {
+                Err(capture)
+            }
+            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
+                unreachable!("only a capture command is offered through try_dispatch_capture")
+            }
+        }
+    }
+
     pub(crate) fn drain_eventfd(&self) -> io::Result<()> {
         drain_eventfd(&self.event_fd)
     }
 
+    pub(crate) fn fail_control_lane(&mut self) {
+        self.control_lane_overflowed = true;
+        self.fatal.store(true, Ordering::Release);
+        let _ = signal_eventfd(&self.event_fd);
+    }
+
     pub(crate) fn try_take_event(&mut self) -> io::Result<Option<AtomicRenderWorkerEvent>> {
         self.drain_eventfd()?;
+        if std::mem::take(&mut self.control_lane_overflowed) {
+            return Ok(Some(AtomicRenderWorkerEvent::Fatal {
+                job_id: None,
+                gpu_execution_uncertain: self.busy,
+                reason: "control_lane_overflow",
+            }));
+        }
         match self.events.try_recv() {
             Ok(event) => {
                 self.busy = false;
@@ -570,6 +623,54 @@ fn render_worker_loop(
                     return;
                 }
             }
+            RenderWorkerCommand::Capture(mut capture) => {
+                let captured = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                    || -> io::Result<Vec<u8>> {
+                        let domain = domain.as_mut().ok_or_else(|| {
+                            io::Error::other("render worker received capture before initialization")
+                        })?;
+                        validate_render_control_batch(
+                            applied_control_epoch,
+                            &capture.controls_before,
+                            capture.required_control_epoch,
+                        )?;
+                        for control in capture.controls_before.drain(..) {
+                            apply_render_control(domain, control.control)?;
+                            applied_control_epoch = control.epoch;
+                        }
+                        match domain.capture_scene(&mut capture.frozen_frame) {
+                            Ok(payload) => Ok(payload),
+                            Err(error) => {
+                                // Capture may have sampled client buffers before
+                                // reporting a readback error. Complete GL work
+                                // before the reactor releases its capture owner.
+                                domain.finish_render_work();
+                                Err(error)
+                            }
+                        }
+                    },
+                ));
+                let event = match captured {
+                    Ok(result) => AtomicRenderWorkerEvent::Captured {
+                        job_id: capture.job_id,
+                        control_epoch: applied_control_epoch,
+                        result,
+                    },
+                    Err(_) => AtomicRenderWorkerEvent::Fatal {
+                        job_id: Some(capture.job_id),
+                        gpu_execution_uncertain: true,
+                        reason: "panic_during_capture",
+                    },
+                };
+                fatal.store(
+                    matches!(&event, AtomicRenderWorkerEvent::Fatal { .. }),
+                    Ordering::Release,
+                );
+                if publish_event(&events, &event_fd, event).is_err() {
+                    fatal.store(true, Ordering::Release);
+                    return;
+                }
+            }
             RenderWorkerCommand::Shutdown => {
                 if let Some(mut domain) = domain.take() {
                     domain.teardown();
@@ -663,6 +764,35 @@ fn drain_eventfd(fd: &OwnedFd) -> io::Result<()> {
     }
 }
 
+fn signal_eventfd(fd: &OwnedFd) -> io::Result<()> {
+    let value = 1u64;
+    loop {
+        let written = unsafe {
+            libc::write(
+                fd.as_raw_fd(),
+                (&value as *const u64).cast(),
+                std::mem::size_of::<u64>(),
+            )
+        };
+        if written == std::mem::size_of::<u64>() as isize {
+            return Ok(());
+        }
+        if written < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            if error.kind() == io::ErrorKind::WouldBlock {
+                // The eventfd is already readable, which is the only property
+                // required for a bounded fatal notification.
+                return Ok(());
+            }
+            return Err(error);
+        }
+        return Err(io::Error::other("short render eventfd write"));
+    }
+}
+
 fn publish_event(
     events: &SyncSender<AtomicRenderWorkerEvent>,
     fd: &OwnedFd,
@@ -722,6 +852,7 @@ fn validate_render_control_batch(
 fn assert_atomic_render_worker_transport_is_send() {
     fn assert_send<T: Send>() {}
     assert_send::<AtomicRenderWorkerJob>();
+    assert_send::<AtomicRenderWorkerCapture>();
     assert_send::<AtomicRenderWorkerCompletion>();
     assert_send::<AtomicRenderWorkerEvent>();
 }
@@ -842,6 +973,36 @@ mod tests {
         assert!(!admission.begin_job());
         assert!(admission.complete_job());
         assert!(admission.begin_job());
+    }
+
+    #[test]
+    fn control_lane_overflow_is_a_waking_fatal_worker_event() {
+        let (commands, _command_rx) = mpsc::sync_channel(1);
+        let (_events_tx, events) = mpsc::sync_channel(1);
+        let event_fd = Arc::new(create_eventfd().expect("eventfd"));
+        let fatal = Arc::new(AtomicBool::new(false));
+        let mut worker = AtomicRenderWorkerHandle {
+            commands,
+            events,
+            event_fd,
+            join: None,
+            busy: true,
+            initialized: true,
+            fatal: Arc::clone(&fatal),
+            control_lane_overflowed: false,
+        };
+
+        worker.fail_control_lane();
+
+        assert!(fatal.load(Ordering::Acquire));
+        assert!(matches!(
+            worker.try_take_event().expect("read fatal eventfd"),
+            Some(AtomicRenderWorkerEvent::Fatal {
+                job_id: None,
+                gpu_execution_uncertain: true,
+                reason: "control_lane_overflow",
+            })
+        ));
     }
 
     #[test]
