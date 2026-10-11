@@ -1100,9 +1100,10 @@ impl NativeRuntime {
                     ),
                 );
                 let slot = explicit.initial_slot();
+                let render_target = explicit.render_target_request(slot)?;
                 let mut gpu_sampling_started = false;
                 match explicit.render_to_slot(
-                    slot,
+                    render_target,
                     self.frame_index.wrapping_add(1).max(1),
                     &mut frozen_candidate,
                     &mut gpu_sampling_started,

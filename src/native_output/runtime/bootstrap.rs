@@ -1396,8 +1396,9 @@ impl NativeRuntime {
                 cursor_render_mode,
                 Some(initial_damage.as_renderer_damage(target.width, target.height)),
             );
+            let initial_render_target = explicit.render_target_request(slot)?;
             let parts = match explicit.render_to_slot(
-                slot,
+                initial_render_target,
                 0,
                 &mut frozen_initial,
                 &mut initial_gpu_sampling_started,

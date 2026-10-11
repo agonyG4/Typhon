@@ -510,6 +510,20 @@ impl AtomicEglGbmScanout {
             .is_some_and(AtomicRenderWorkerHandle::busy)
     }
 
+    pub(crate) fn render_target_request(
+        &self,
+        slot: OutputSlotId,
+    ) -> io::Result<RenderTargetRequest> {
+        let presentation_serial = self
+            .swapchain
+            .as_ref()
+            .map_or(0, AtomicOutputSwapchain::presentation_serial);
+        self.physical_pool
+            .as_ref()
+            .ok_or_else(|| io::Error::other("explicit physical output pool is unavailable"))?
+            .render_target_request(slot, presentation_serial)
+    }
+
     pub(crate) fn try_take_render_worker_event(
         &mut self,
     ) -> io::Result<Option<AtomicRenderWorkerEvent>> {
@@ -1131,29 +1145,12 @@ impl AtomicEglGbmScanout {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn render_to_slot(
         &mut self,
-        slot: OutputSlotId,
+        target: RenderTargetRequest,
         frame_id: u64,
         frozen_frame: &mut FrozenNativeRenderFrame,
         gpu_sampling_started: &mut bool,
-        mut phase_durations: Option<&mut AtomicRenderPhaseDurations>,
+        phase_durations: Option<&mut AtomicRenderPhaseDurations>,
     ) -> io::Result<AtomicSlotRenderOutcome> {
-        let target_preparation_started = phase_durations.as_ref().map(|_| Instant::now());
-        let presentation_serial = self
-            .swapchain
-            .as_ref()
-            .map_or(0, AtomicOutputSwapchain::presentation_serial);
-        let target = self
-            .physical_pool
-            .as_ref()
-            .ok_or_else(|| io::Error::other("explicit physical output pool is unavailable"))?
-            .render_target_request(slot, presentation_serial)?;
-        if let (Some(durations), Some(started)) =
-            (phase_durations.as_deref_mut(), target_preparation_started)
-        {
-            durations.render_target_preparation_ns = durations
-                .render_target_preparation_ns
-                .saturating_add(elapsed_nanos(started));
-        }
         match &mut self.render_transport {
             AtomicRenderTransport::Synchronous(domain) => domain.render_to_slot(
                 target,
@@ -1555,102 +1552,153 @@ impl AtomicEglGbmScanout {
         // scene encoding, fence export, and GPU work owned by this output frame.
         let callback_timing = server.frame_callback_timing_for_batch(protocol_batch_id);
         let mut gpu_sampling_started = false;
-        let (
-            render_outcome,
-            resolved_snapshot,
-            resolved_scene_signature,
-            resolved_render_generation,
-            surface_damage,
-            hardware_cursor_surface_id,
-            frozen_render_frame,
-        ) = {
-            let resolved_snapshot = resolved_scene.snapshot_owned();
-            let resolved_scene_signature = resolved_scene.scene_identity_signature();
-            let mut sampled_surface_ids = resolved_scene.surface_ids().collect::<Vec<_>>();
-            if frozen_cursor_plan.delivery
-                == crate::native_output::presentation::plane::PresentedCursorDelivery::Hardware
-                && let Some(source_key) = frozen_cursor_plane_owner
+        let resolved_snapshot = resolved_scene.snapshot_owned();
+        let resolved_scene_signature = resolved_scene.scene_identity_signature();
+        let mut sampled_surface_ids = resolved_scene.surface_ids().collect::<Vec<_>>();
+        if frozen_cursor_plan.delivery
+            == crate::native_output::presentation::plane::PresentedCursorDelivery::Hardware
+            && let Some(source_key) = frozen_cursor_plane_owner
+                .as_ref()
+                .and_then(|owner| owner.client_source_key)
+        {
+            sampled_surface_ids.push(source_key.surface_id);
+        }
+        let surface_damage = server.capture_surface_damage_presentation_for_surface_ids_and_commit(
+            sampled_surface_ids,
+            exact_cursor_commit.or_else(|| {
+                frozen_cursor_plane_owner
                     .as_ref()
                     .and_then(|owner| owner.client_source_key)
-            {
-                sampled_surface_ids.push(source_key.surface_id);
+                    .map(|source_key| {
+                        (
+                            source_key.surface_id,
+                            oblivion_one::compositor::SurfaceCommitSequence(
+                                source_key.commit_sequence,
+                            ),
+                        )
+                    })
+            }),
+        );
+        let hardware_cursor_surface_id = (frozen_cursor_plan.delivery
+            == crate::native_output::presentation::plane::PresentedCursorDelivery::Hardware)
+            .then(|| {
+                frozen_cursor_plane_owner
+                    .as_ref()
+                    .and_then(|owner| owner.client_source_key)
+                    .map(|source_key| source_key.surface_id)
+            })
+            .flatten();
+        let cursor_surface_id = match frozen_cursor_plan.delivery {
+            crate::native_output::presentation::plane::PresentedCursorDelivery::Software => {
+                exact_cursor_commit.map(|(surface_id, _)| surface_id)
             }
-            let surface_damage = server
-                .capture_surface_damage_presentation_for_surface_ids_and_commit(
-                    sampled_surface_ids,
-                    exact_cursor_commit.or_else(|| {
-                        frozen_cursor_plane_owner
-                            .as_ref()
-                            .and_then(|owner| owner.client_source_key)
-                            .map(|source_key| {
-                                (
-                                    source_key.surface_id,
-                                    oblivion_one::compositor::SurfaceCommitSequence(
-                                        source_key.commit_sequence,
-                                    ),
-                                )
-                            })
-                    }),
-                );
-            let hardware_cursor_surface_id = (frozen_cursor_plan.delivery
-                == crate::native_output::presentation::plane::PresentedCursorDelivery::Hardware)
-                .then(|| {
-                    frozen_cursor_plane_owner
-                        .as_ref()
-                        .and_then(|owner| owner.client_source_key)
-                        .map(|source_key| source_key.surface_id)
-                })
-                .flatten();
-            let cursor_surface_id = match frozen_cursor_plan.delivery {
-                crate::native_output::presentation::plane::PresentedCursorDelivery::Software => {
-                    exact_cursor_commit.map(|(surface_id, _)| surface_id)
-                }
-                crate::native_output::presentation::plane::PresentedCursorDelivery::Hardware => {
-                    hardware_cursor_surface_id
-                }
-                crate::native_output::presentation::plane::PresentedCursorDelivery::Hidden => None,
-            };
-            if let Some(surface_id) = cursor_surface_id
-                && surface_damage.contains_surface_id(surface_id)
-            {
-                server.note_client_cursor_surface_sample(
-                    frozen_cursor_plan.delivery
-                        == crate::native_output::presentation::plane::PresentedCursorDelivery::Hardware,
-                );
+            crate::native_output::presentation::plane::PresentedCursorDelivery::Hardware => {
+                hardware_cursor_surface_id
             }
-            let render_snapshot_freeze_started = phase_durations.as_ref().map(|_| Instant::now());
-            let mut frozen_render_frame = FrozenNativeRenderFrame::freeze(
-                self.width,
-                self.height,
-                resolved_scene,
-                &*server,
-                input_state,
-                cursor_mode,
-                Some(render_damage.as_renderer_damage(self.width, self.height)),
+            crate::native_output::presentation::plane::PresentedCursorDelivery::Hidden => None,
+        };
+        if let Some(surface_id) = cursor_surface_id
+            && surface_damage.contains_surface_id(surface_id)
+        {
+            server.note_client_cursor_surface_sample(
+                frozen_cursor_plan.delivery
+                    == crate::native_output::presentation::plane::PresentedCursorDelivery::Hardware,
             );
-            if let (Some(durations), Some(started)) = (
-                phase_durations.as_deref_mut(),
-                render_snapshot_freeze_started,
-            ) {
-                durations.render_snapshot_freeze_ns = elapsed_nanos(started);
-            }
-            let outcome = self.render_to_slot(
-                slot,
-                frame_id,
+        }
+        let render_snapshot_freeze_started = phase_durations.as_ref().map(|_| Instant::now());
+        let mut frozen_render_frame = FrozenNativeRenderFrame::freeze(
+            self.width,
+            self.height,
+            resolved_scene,
+            &*server,
+            input_state,
+            cursor_mode,
+            Some(render_damage.as_renderer_damage(self.width, self.height)),
+        );
+        if let (Some(durations), Some(started)) = (
+            phase_durations.as_deref_mut(),
+            render_snapshot_freeze_started,
+        ) {
+            durations.render_snapshot_freeze_ns = elapsed_nanos(started);
+        }
+        let context = AtomicRenderSettlementContext {
+            slot,
+            framebuffer_id,
+            frame_id,
+            transaction_id,
+            protocol_batch_id,
+            output_generation,
+            render_generation,
+            pool_generation,
+            target,
+            submit_window,
+            prepare_intent,
+            o1_admission,
+            surface_damage,
+            composite_started_at,
+            callback_timing,
+            hardware_cursor_surface_id,
+            frozen_cursor_plan,
+            frozen_cursor_plane_owner,
+            frozen_cursor_trace_reveal,
+            resolved_snapshot,
+            resolved_scene_signature,
+            resolved_render_generation: frozen_render_frame.scene.render_generation,
+            presentation_state_transition_required,
+            dmabuf_gpu_release_safety,
+            dmabuf_gpu_release_lease_id,
+            render_target: None,
+        };
+        let mut context = context;
+        let target_preparation_started = phase_durations.as_ref().map(|_| Instant::now());
+        let target_request = self.render_target_request(context.slot);
+        if let (Some(durations), Some(started)) =
+            (phase_durations.as_deref_mut(), target_preparation_started)
+        {
+            durations.render_target_preparation_ns = durations
+                .render_target_preparation_ns
+                .saturating_add(elapsed_nanos(started));
+        }
+        context.render_target = target_request.as_ref().ok().copied();
+        let render_outcome = if let Some(target) = context.render_target {
+            self.render_to_slot(
+                target,
+                context.frame_id,
                 &mut frozen_render_frame,
                 &mut gpu_sampling_started,
                 phase_durations.as_deref_mut(),
-            );
-            (
-                outcome,
-                resolved_snapshot,
-                resolved_scene_signature,
-                frozen_render_frame.scene.render_generation,
-                surface_damage,
-                hardware_cursor_surface_id,
-                frozen_render_frame,
             )
+        } else {
+            Err(target_request.expect_err("missing render target retains its error"))
         };
+        let AtomicRenderSettlementContext {
+            slot,
+            framebuffer_id,
+            frame_id,
+            transaction_id,
+            protocol_batch_id,
+            output_generation,
+            render_generation,
+            pool_generation,
+            target,
+            submit_window,
+            prepare_intent,
+            o1_admission,
+            surface_damage,
+            composite_started_at,
+            callback_timing,
+            hardware_cursor_surface_id,
+            frozen_cursor_plan,
+            frozen_cursor_plane_owner,
+            frozen_cursor_trace_reveal,
+            resolved_snapshot,
+            resolved_scene_signature,
+            resolved_render_generation,
+            presentation_state_transition_required,
+            dmabuf_gpu_release_safety,
+            dmabuf_gpu_release_lease_id,
+            render_target: _,
+        } = context;
         let resolved_scene = &frozen_render_frame.scene;
         let parts = match render_outcome {
             Ok(AtomicSlotRenderOutcome::Rendered(parts)) => *parts,
@@ -2354,6 +2402,42 @@ pub(crate) enum AtomicFrameRenderOutcome {
         fallbacks: LifecycleRenderFallbacks,
         render_us: u64,
     },
+}
+
+/// Reactor-owned evidence needed after the renderer returns. This contains no
+/// references to live compositor, input, transaction-ledger, or swapchain
+/// state, so it can be parked across an asynchronous render command.
+#[allow(dead_code, reason = "Phase 2B.2 reactor continuation boundary")]
+pub(crate) struct AtomicRenderSettlementContext {
+    pub(crate) slot: OutputSlotId,
+    pub(crate) framebuffer_id: u32,
+    pub(crate) frame_id: u64,
+    pub(crate) transaction_id: OutputTransactionId,
+    pub(crate) protocol_batch_id: CompositorFrameBatchId,
+    pub(crate) output_generation: u64,
+    pub(crate) render_generation: u64,
+    pub(crate) pool_generation: u64,
+    pub(crate) target: PresentationTarget,
+    pub(crate) submit_window: KmsSubmitWindow,
+    pub(crate) prepare_intent: Option<O1PrepareIntent>,
+    pub(crate) o1_admission: Option<O1AdmissionObservation>,
+    pub(crate) surface_damage: SurfaceDamagePresentation,
+    pub(crate) composite_started_at: MonotonicTimestampNs,
+    pub(crate) callback_timing: Option<oblivion_one::compositor::FrameCallbackTimingEvidence>,
+    pub(crate) hardware_cursor_surface_id: Option<u32>,
+    pub(crate) frozen_cursor_plan:
+        crate::native_output::presentation::plane::FrozenPrimaryCursorPlan,
+    pub(crate) frozen_cursor_plane_owner: Option<FrozenCursorPlaneOwner>,
+    pub(crate) frozen_cursor_trace_reveal:
+        Option<crate::native_output::presentation::plane::CursorRevealTraceSnapshot>,
+    pub(crate) resolved_snapshot: NativeSceneSnapshot,
+    pub(crate) resolved_scene_signature: u64,
+    pub(crate) resolved_render_generation: u64,
+    pub(crate) presentation_state_transition_required: bool,
+    pub(crate) dmabuf_gpu_release_safety: DmabufGpuReleaseSafety,
+    pub(crate) dmabuf_gpu_release_lease_id:
+        Option<oblivion_one::compositor::DmabufGpuReleaseLeaseId>,
+    pub(crate) render_target: Option<RenderTargetRequest>,
 }
 
 #[derive(Debug, Clone, Copy)]
