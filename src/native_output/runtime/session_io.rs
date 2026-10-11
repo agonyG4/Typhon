@@ -102,6 +102,9 @@ pub(crate) trait NativeSessionIo {
     fn rearm_explicit_sync(&mut self) -> NativeResult<()>;
     fn recover_hardware_cursor(&mut self) -> NativeResult<()>;
     fn register_drm_source(&mut self) -> NativeResult<()>;
+    fn rebind_render_generation(&mut self) -> NativeResult<()> {
+        Ok(())
+    }
     fn rearm_scheduler(&mut self) -> NativeResult<()>;
     fn resume_input(&mut self) -> NativeResult<()>;
 
@@ -158,6 +161,7 @@ fn finish_native_output_recovery(
         NativeSessionRecoveryProgress::Complete => {}
     }
     io.observe(NativeIoOperation::PresentedPlaneRebase);
+    io.rebind_render_generation()?;
     io.observe(NativeIoOperation::ExplicitSyncRearm);
     io.observe(NativeIoOperation::ExplicitSyncNotifier);
     io.rearm_explicit_sync()?;
@@ -633,7 +637,7 @@ impl NativeSessionIo for NativeRuntime {
         Ok(NativeSessionRecoveryFenceRegistration::Registered)
     }
 
-    fn rearm_explicit_sync(&mut self) -> NativeResult<()> {
+    fn rebind_render_generation(&mut self) -> NativeResult<()> {
         let generation = self
             .pending_session_recovery
             .ok_or_else(|| io::Error::other("session recovery has no prepared generation"))?
@@ -649,6 +653,14 @@ impl NativeSessionIo for NativeRuntime {
             self.kms_backend.atomic_crtc_vrr_property_available(),
         )?;
         self.observe(NativeIoOperation::RenderWorkerRebindAcknowledged);
+        Ok(())
+    }
+
+    fn rearm_explicit_sync(&mut self) -> NativeResult<()> {
+        let generation = self
+            .pending_session_recovery
+            .ok_or_else(|| io::Error::other("session recovery has no prepared generation"))?
+            .generation;
         if !apply_native_scanout_feedback(
             &mut self.server,
             &self.scanout,
@@ -1002,8 +1014,6 @@ mod tests {
             Ok(NativeSessionRecoveryFenceRegistration::Registered)
         }
         fn rearm_explicit_sync(&mut self) -> NativeResult<()> {
-            self.native_io
-                .record(NativeIoOperation::RenderWorkerRebindAcknowledged);
             self.push(Operation::ExplicitSyncRearm);
             Ok(())
         }
@@ -1013,6 +1023,11 @@ mod tests {
         }
         fn register_drm_source(&mut self) -> NativeResult<()> {
             self.push(Operation::DrmRegister);
+            Ok(())
+        }
+        fn rebind_render_generation(&mut self) -> NativeResult<()> {
+            self.native_io
+                .record(NativeIoOperation::RenderWorkerRebindAcknowledged);
             Ok(())
         }
         fn rearm_scheduler(&mut self) -> NativeResult<()> {
