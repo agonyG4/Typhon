@@ -15,6 +15,32 @@ use std::num::NonZeroU64;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::compositor) struct LifecycleVisibleSurfaceGeometry {
+    pub surface_id: u32,
+    pub raw_x: i32,
+    pub raw_y: i32,
+    pub raw_width: u32,
+    pub raw_height: u32,
+    pub render_target: crate::compositor::render::SurfaceTargetRect,
+    pub visible_target: crate::compositor::render::SurfaceTargetRect,
+    pub visual_clip: Option<crate::compositor::SurfaceVisualAperture>,
+}
+
+impl LifecycleVisibleSurfaceGeometry {
+    pub(in crate::compositor) fn presentation_rect(
+        &self,
+    ) -> Option<crate::presentation_animation::PresentationRect> {
+        let visible = self.visible_target;
+        crate::presentation_animation::PresentationRect::new(
+            f64::from(visible.x()),
+            f64::from(visible.y()),
+            f64::from(visible.width()),
+            f64::from(visible.height()),
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LifecycleAdmissionReason {
     EffectDisabled,
@@ -487,6 +513,103 @@ impl CompositorState {
         root_surface_id: u32,
     ) -> Option<PresentationRect> {
         self.current_presentation_rect_for_root(root_surface_id)
+    }
+
+    pub(in crate::compositor) fn lifecycle_visible_surface_geometry_for_root(
+        &self,
+        root_surface_id: u32,
+        scene_surfaces: &[RenderableSurface],
+    ) -> Vec<LifecycleVisibleSurfaceGeometry> {
+        let assignments =
+            crate::compositor::render::surface_render_space_assignments(scene_surfaces, 1.0);
+        scene_surfaces
+            .iter()
+            .zip(assignments)
+            .filter(|(surface, _)| {
+                self.surface_topology.root_surface_id(surface.surface_id) == root_surface_id
+            })
+            .map(|(surface, assignment)| {
+                let visual_clip = assignment.visual_clip;
+                let visible = crate::compositor::RenderSceneElement::from_surface_with_aperture(
+                    surface,
+                    assignment.target,
+                    visual_clip.clone(),
+                )
+                .visible_target();
+                LifecycleVisibleSurfaceGeometry {
+                    surface_id: surface.surface_id,
+                    raw_x: surface.x,
+                    raw_y: surface.y,
+                    raw_width: surface.width,
+                    raw_height: surface.height,
+                    render_target: assignment.target,
+                    visible_target: visible,
+                    visual_clip,
+                }
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(in crate::compositor) fn lifecycle_visible_surface_bounds_for_root(
+        &self,
+        root_surface_id: u32,
+        scene_surfaces: &[RenderableSurface],
+    ) -> Vec<PresentationRect> {
+        self.lifecycle_visible_surface_geometry_for_root(root_surface_id, scene_surfaces)
+            .into_iter()
+            .filter_map(|surface| surface.presentation_rect())
+            .collect()
+    }
+
+    pub(in crate::compositor) fn trace_lifecycle_geometry_source(
+        &self,
+        operation: &str,
+        window_id: WindowId,
+        root_surface_id: u32,
+        surfaces: &[LifecycleVisibleSurfaceGeometry],
+        group: &LifecycleVisualGroup,
+    ) {
+        if !matches!(
+            std::env::var("ASTREA_LIFECYCLE_DIAGNOSTICS").as_deref(),
+            Ok("1" | "true" | "on")
+        ) {
+            return;
+        }
+        let canonical = group.canonical_client_rect;
+        let visual = group.canonical_visual_rect;
+        for surface in surfaces {
+            let target = surface.render_target;
+            let visible = surface.visible_target;
+            eprintln!(
+                "typhon.lifecycle_geometry_source event=admission operation={} window_id={} root_surface_id={} surface_id={} raw_surface_x={} raw_surface_y={} raw_surface_width={} raw_surface_height={} render_target_x={} render_target_y={} render_target_width={} render_target_height={} visible_target_x={} visible_target_y={} visible_target_width={} visible_target_height={} visual_clip={:?} canonical_client_x={:.1} canonical_client_y={:.1} canonical_client_width={:.1} canonical_client_height={:.1} canonical_visual_x={:.1} canonical_visual_y={:.1} canonical_visual_width={:.1} canonical_visual_height={:.1}",
+                operation,
+                window_id.get(),
+                root_surface_id,
+                surface.surface_id,
+                surface.raw_x,
+                surface.raw_y,
+                surface.raw_width,
+                surface.raw_height,
+                target.x(),
+                target.y(),
+                target.width(),
+                target.height(),
+                visible.x(),
+                visible.y(),
+                visible.width(),
+                visible.height(),
+                surface.visual_clip,
+                canonical.x(),
+                canonical.y(),
+                canonical.width(),
+                canonical.height(),
+                visual.x(),
+                visual.y(),
+                visual.width(),
+                visual.height(),
+            );
+        }
     }
 
     #[cfg(test)]

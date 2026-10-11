@@ -1661,6 +1661,28 @@ impl CompositorState {
         {
             return false;
         }
+        let minimize_effect =
+            self.lifecycle_effect_kind_for_window(window_id, LifecycleDirection::Minimize);
+        let lifecycle_visible_geometry = if !has_active_lifecycle && minimize_effect.is_some() {
+            self.lifecycle_visible_surface_geometry_for_root(
+                root_surface_id,
+                &self.renderable_surfaces,
+            )
+        } else {
+            Vec::new()
+        };
+        let lifecycle_visible_bounds = lifecycle_visible_geometry
+            .iter()
+            .filter_map(|surface| surface.presentation_rect())
+            .collect::<Vec<_>>();
+        let lifecycle_decorations = if !has_active_lifecycle && minimize_effect.is_some() {
+            self.native_decoration_render_instances_for_scale(&self.renderable_surfaces, 1.0)
+                .into_iter()
+                .filter(|decoration| decoration.root_surface_id() == root_surface_id)
+                .collect()
+        } else {
+            Vec::new()
+        };
         self.clear_resize_state_for_surfaces_with_reason(
             &[root_surface_id],
             WindowInteractionEndReason::ExplicitCancel,
@@ -1673,8 +1695,6 @@ impl CompositorState {
         }
         self.clear_fullscreen_presentation_owner(root_surface_id);
 
-        let minimize_effect =
-            self.lifecycle_effect_kind_for_window(window_id, LifecycleDirection::Minimize);
         let precapture_preparation = if !has_active_lifecycle && minimize_effect.is_some() {
             Some(self.capture_lifecycle_precapture_source(window_id, root_surface_id))
         } else {
@@ -1703,28 +1723,12 @@ impl CompositorState {
             self.begin_layout_reflow_batch();
         }
 
-        // Capture only the compositor-owned SSD plan while the minimized
-        // window still has its pre-focus-change visual state. Client and
-        // subsurface content remains live in the retained surface list.
-        let lifecycle_decorations = if !has_active_lifecycle && minimize_effect.is_some() {
-            self.native_decoration_render_instances_for_scale(&minimized_surfaces, 1.0)
-        } else {
-            Vec::new()
-        };
         let lifecycle_visual_group = if has_active_lifecycle {
             None
         } else if minimize_effect.is_some() {
             presented_source_client_rect
                 .zip(canonical_client_rect)
                 .and_then(|(presented_source, canonical_client)| {
-                    let owned_bounds = minimized_surfaces.iter().filter_map(|surface| {
-                        PresentationRect::new(
-                            f64::from(surface.x),
-                            f64::from(surface.y),
-                            f64::from(surface.width),
-                            f64::from(surface.height),
-                        )
-                    });
                     let decoration_bounds = lifecycle_decorations
                         .iter()
                         .find(|decoration| decoration.root_surface_id() == root_surface_id)
@@ -1737,8 +1741,11 @@ impl CompositorState {
                                 f64::from(height),
                             )
                         });
-                    let visual =
-                        canonical_visual_rect(canonical_client, owned_bounds, decoration_bounds)?;
+                    let visual = canonical_visual_rect(
+                        canonical_client,
+                        lifecycle_visible_bounds,
+                        decoration_bounds,
+                    )?;
                     let presented_visual =
                         presented_visual_rect(canonical_client, visual, presented_source)?;
                     let target = self.resolve_lifecycle_target(window_id, presented_visual)?;
@@ -1755,6 +1762,15 @@ impl CompositorState {
         } else {
             None
         };
+        if let Some(visual_group) = lifecycle_visual_group.as_ref() {
+            self.trace_lifecycle_geometry_source(
+                "minimize",
+                window_id,
+                root_surface_id,
+                &lifecycle_visible_geometry,
+                visual_group,
+            );
+        }
 
         if let Some(window) = self.window_mut(window_id) {
             window.state.minimize(minimized_surfaces);
@@ -2441,6 +2457,18 @@ impl CompositorState {
         } else {
             Vec::new()
         };
+        let lifecycle_visible_geometry = if !has_active_lifecycle && restore_effect.is_some() {
+            self.lifecycle_visible_surface_geometry_for_root(
+                root_surface_id,
+                &self.renderable_surfaces,
+            )
+        } else {
+            Vec::new()
+        };
+        let lifecycle_visible_bounds = lifecycle_visible_geometry
+            .iter()
+            .filter_map(|surface| surface.presentation_rect())
+            .collect::<Vec<_>>();
         let lifecycle_visual_group = if has_active_lifecycle {
             lifecycle_scene_node_id
                 .and_then(|scene_node_id| self.lifecycle_visual_group_for_scene_node(scene_node_id))
@@ -2452,25 +2480,6 @@ impl CompositorState {
                     self.lifecycle_client_rect_for_surface(window_id, root_surface_id, false)
                 })
                 .and_then(|canonical_client| {
-                    let surface_origins =
-                        crate::compositor::render::surface_origins(&self.renderable_surfaces);
-                    let owned_bounds = self
-                        .renderable_surfaces
-                        .iter()
-                        .zip(surface_origins)
-                        .filter(|(surface, _)| {
-                            self.surface_topology.root_surface_id(surface.surface_id)
-                                == root_surface_id
-                        })
-                        .filter_map(|(surface, (x, y))| {
-                            PresentationRect::new(
-                                f64::from(x),
-                                f64::from(y),
-                                f64::from(surface.width),
-                                f64::from(surface.height),
-                            )
-                        })
-                        .collect::<Vec<_>>();
                     let decoration_bounds = lifecycle_decorations
                         .iter()
                         .find(|decoration| decoration.root_surface_id() == root_surface_id)
@@ -2483,8 +2492,11 @@ impl CompositorState {
                                 f64::from(height),
                             )
                         });
-                    let visual =
-                        canonical_visual_rect(canonical_client, owned_bounds, decoration_bounds)?;
+                    let visual = canonical_visual_rect(
+                        canonical_client,
+                        lifecycle_visible_bounds,
+                        decoration_bounds,
+                    )?;
                     let visual_group = if let Some(snapshot) = settled_visual_snapshot {
                         let target =
                             self.resolve_lifecycle_target(window_id, snapshot.source_visual_rect)?;
@@ -2528,6 +2540,15 @@ impl CompositorState {
                     Some(visual_group)
                 })
         };
+        if let Some(visual_group) = lifecycle_visual_group.as_ref() {
+            self.trace_lifecycle_geometry_source(
+                "restore",
+                window_id,
+                root_surface_id,
+                &lifecycle_visible_geometry,
+                visual_group,
+            );
+        }
         self.begin_lifecycle_restore_with_source(
             window_id,
             root_surface_id,

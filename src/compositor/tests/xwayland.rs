@@ -3266,6 +3266,172 @@ fn minimize_uses_managed_x11_client_rect_instead_of_backing_surface_size() {
 }
 
 #[test]
+fn minimize_lifecycle_bounds_follow_rendered_xwayland_aperture() {
+    let mut fixture = first_buffer_fixture();
+    admit_first_buffer(&mut fixture, 136, 136);
+    let handle = fake_snapshot().handle;
+    let window_id = fixture
+        .server
+        .state
+        .window_id_for_x11_handle(handle)
+        .expect("managed X11 window");
+    let managed_rect =
+        crate::presentation_animation::PresentationRect::new(136.0, 136.0, 800.0, 600.0)
+            .expect("managed client rectangle");
+    {
+        let window = fixture
+            .server
+            .state
+            .window_mut(window_id)
+            .expect("managed X11 window state");
+        window.x11_materialized_client_rect = Some(managed_rect);
+        let geometry = window.x11_geometry.as_mut().expect("X11 geometry");
+        geometry.client = X11Geometry {
+            x: 136,
+            y: 136,
+            width: 800,
+            height: 600,
+        };
+        geometry.frame.placement = SurfacePlacement::absolute_root_at(136, 136);
+        geometry.frame.width = 800;
+        geometry.frame.height = 600;
+    }
+    let backing = fixture
+        .server
+        .state
+        .renderable_surfaces
+        .iter_mut()
+        .find(|surface| surface.surface_id == fixture.surface_id)
+        .expect("backing surface");
+    backing.width = 1920;
+    backing.height = 1080;
+    backing.placement = SurfacePlacement::absolute_root_at(136, 136);
+    backing.render_placement = Some(SurfacePlacement::absolute_root_at(136, 136));
+    backing.visual_clip = Some(crate::compositor::SurfaceVisualAperture::logical_only(
+        SurfaceTargetRect::new(136, 136, 800, 600),
+    ));
+    backing.render_target_size = None;
+    fixture.server.state.install_x11_visual_geometry(
+        fixture.surface_id,
+        crate::compositor::WindowGeometry::new(
+            SurfacePlacement::absolute_root_at(136, 136),
+            800,
+            600,
+        ),
+    );
+
+    assert_eq!(
+        fixture
+            .server
+            .state
+            .lifecycle_visible_surface_bounds_for_root(
+                fixture.surface_id,
+                &fixture.server.state.renderable_surfaces
+            ),
+        vec![managed_rect],
+        "lifecycle planning derives the same visible bound as the ordinary renderer"
+    );
+    let decoration_bounds = fixture
+        .server
+        .state
+        .native_decoration_render_instances_for_scale(
+            &fixture.server.state.renderable_surfaces,
+            1.0,
+        )
+        .into_iter()
+        .find(|decoration| decoration.root_surface_id() == fixture.surface_id)
+        .and_then(|decoration| {
+            let (x, y, width, height) = decoration.scene_snapshot().bounds();
+            crate::presentation_animation::PresentationRect::new(
+                f64::from(x),
+                f64::from(y),
+                f64::from(width),
+                f64::from(height),
+            )
+        });
+    let expected_visual = crate::window_lifecycle_animation::canonical_visual_rect(
+        managed_rect,
+        [managed_rect],
+        decoration_bounds,
+    )
+    .expect("canonical lifecycle visual bounds");
+
+    let scene_directory = std::env::temp_dir().join(format!(
+        "typhon-xwayland-visible-bounds-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos()
+    ));
+    std::fs::create_dir(&scene_directory).expect("create animation configuration directory");
+    fixture.server.state.lifecycle_squash_renderer_available = Some(true);
+    fixture.server.state.animation_control =
+        crate::animation_control::AnimationControlState::from_store(
+            crate::animation_control::AnimationConfigurationStore::new(scene_directory.clone())
+                .expect("create animation configuration store"),
+        );
+    let mut candidate = fixture
+        .server
+        .state
+        .animation_control
+        .configuration()
+        .clone();
+    candidate.overrides.insert(
+        crate::animation_control::AnimationSlot::WindowMinimize,
+        crate::animation_control::AnimationEffect::MinimizeSquash,
+    );
+    fixture
+        .server
+        .state
+        .set_animation_configuration(candidate)
+        .expect("persist Squash selection");
+    let active_assignment = crate::compositor::render::surface_render_space_assignments(
+        &fixture.server.state.renderable_surfaces,
+        1.0,
+    );
+    let surface = fixture
+        .server
+        .state
+        .renderable_surfaces
+        .iter()
+        .find(|surface| surface.surface_id == fixture.surface_id)
+        .expect("backing surface");
+    let assignment = active_assignment
+        .iter()
+        .find(|assignment| assignment.target.x() == 136 && assignment.target.y() == 136)
+        .expect("active scene render assignment");
+    let element = crate::compositor::RenderSceneElement::from_surface_with_aperture(
+        surface,
+        assignment.target,
+        assignment.visual_clip.clone(),
+    );
+    assert_eq!(
+        element.visible_target(),
+        SurfaceTargetRect::new(136, 136, 800, 600),
+        "ordinary renderer exposes only the managed client aperture"
+    );
+
+    assert!(fixture.server.state.minimize_desktop_window(window_id));
+    let scene_node_id = fixture
+        .server
+        .state
+        .scene_node_id_for_window_group(window_id)
+        .expect("window lifecycle scene node");
+    let visual_group = fixture
+        .server
+        .state
+        .lifecycle_visual_group_for_scene_node(scene_node_id)
+        .expect("minimize lifecycle visual group");
+    assert_eq!(visual_group.canonical_client_rect, managed_rect);
+    assert_eq!(
+        visual_group.canonical_visual_rect, expected_visual,
+        "the Lamp footprint follows rendered visibility instead of backing size"
+    );
+    let _ = std::fs::remove_dir_all(scene_directory);
+}
+
+#[test]
 fn single_frame_x11_client_becomes_renderable_without_second_commit() {
     let mut fixture = first_buffer_fixture();
     admit_first_buffer(&mut fixture, 0, 0);

@@ -4687,6 +4687,73 @@ mod tests {
     }
 
     #[test]
+    fn frozen_lifecycle_layout_preserves_cascaded_visible_bounds_after_isolation() {
+        let first = solid_test_surface(1, 0, 0, 40, 30, 0xffff_0000);
+        let second = solid_test_surface(2, 0, 0, 40, 30, 0xff00_ff00);
+        let mut target = solid_test_surface(3, 0, 0, 100, 80, 0xff00_00ff);
+        target.placement = SurfacePlacement::root();
+        target.visual_clip = Some(SurfaceVisualAperture::logical_only(SurfaceTargetRect::new(
+            0, 0, 80, 70,
+        )));
+        let mut child = solid_test_surface(4, 5, 7, 50, 40, 0xffff_ffff);
+        child.x = 5;
+        child.y = 7;
+        child.placement = SurfacePlacement::subsurface(3, 60, 50);
+        child.visual_clip = Some(SurfaceVisualAperture::logical_only(SurfaceTargetRect::new(
+            60, 50, 30, 20,
+        )));
+
+        let scene = vec![first, second, target.clone(), child.clone()];
+        let active_assignments = surface_render_space_assignments(&scene, 1.0);
+        assert_eq!(
+            active_assignments[3].target,
+            SurfaceTargetRect::new(201, 193, 50, 40)
+        );
+        let active_visible = scene
+            .iter()
+            .zip(&active_assignments)
+            .skip(2)
+            .map(|(surface, assignment)| {
+                RenderSceneElement::from_surface_with_aperture(
+                    surface,
+                    assignment.target,
+                    assignment.visual_clip.clone(),
+                )
+                .visible_target()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(active_visible[0], SurfaceTargetRect::new(136, 136, 80, 70));
+        assert_eq!(active_visible[1], SurfaceTargetRect::new(201, 193, 25, 13));
+
+        let presentation_generations = HashMap::from([(3, 11), (4, 12)]);
+        let frozen = FrozenLifecycleRenderLayout::capture(
+            &scene,
+            &[target.clone(), child.clone()],
+            &presentation_generations,
+        )
+        .expect("capture the target root and child from the full scene");
+        let isolated = [target, child];
+        let frozen_visible = isolated
+            .iter()
+            .map(|surface| {
+                let assignment = frozen
+                    .assignment_for(surface, 1.0)
+                    .expect("resolve the exact retained presentation");
+                RenderSceneElement::from_surface_with_aperture(
+                    surface,
+                    assignment.target,
+                    assignment.visual_clip,
+                )
+                .visible_target()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(frozen_visible, active_visible);
+        assert_eq!(frozen_visible[0], SurfaceTargetRect::new(136, 136, 80, 70));
+        assert_eq!(frozen_visible[1], SurfaceTargetRect::new(201, 193, 25, 13));
+    }
+
+    #[test]
     fn active_resize_clip_preserves_csd_window_geometry_offset() {
         let surface = RenderableSurface {
             surface_id: 7,
