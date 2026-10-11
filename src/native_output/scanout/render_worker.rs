@@ -28,6 +28,9 @@ use oblivion_one::cursor_theme::CompositorCursorImage;
 use oblivion_one::effects::{EffectRegistryGeneration, PreparedEffectRegistryReload};
 use oblivion_one::native::kms::DrmFormatModifierPair;
 
+pub(crate) type AtomicRenderWorkerDiscovery =
+    Vec<oblivion_one::render_backend::egl_gles::EglGlesDmabufFormat>;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AtomicRenderWorkerPolicy {
     Off,
@@ -389,10 +392,7 @@ pub(crate) struct AtomicRenderWorkerHandle {
 impl AtomicRenderWorkerHandle {
     pub(crate) fn start(
         render_device_fd: OwnedFd,
-    ) -> io::Result<(
-        Self,
-        Vec<oblivion_one::render_backend::egl_gles::EglGlesDmabufFormat>,
-    )> {
+    ) -> io::Result<(Self, AtomicRenderWorkerDiscovery)> {
         let event_fd = Arc::new(create_eventfd()?);
         let worker_event_fd = Arc::clone(&event_fd);
         let fatal = Arc::new(AtomicBool::new(false));
@@ -1914,6 +1914,7 @@ fn validate_render_control_batch(
 #[allow(dead_code, reason = "Phase 2B.2 transport Send qualification")]
 fn assert_atomic_render_worker_transport_is_send() {
     fn assert_send<T: Send>() {}
+    assert_send::<AtomicRenderWorkerDiscovery>();
     assert_send::<AtomicRenderWorkerJob>();
     assert_send::<RenderWorkerInit>();
     assert_send::<AtomicRenderWorkerInitialFrame>();
@@ -2087,6 +2088,12 @@ mod tests {
         fn assert_send<T: Send>() {}
         assert_send::<AtomicRenderCandidateJob>();
         assert_send::<AtomicRenderWorkerEvent>();
+    }
+
+    #[test]
+    fn worker_discovery_payload_is_naturally_send() {
+        fn assert_send<T: Send>() {}
+        assert_send::<AtomicRenderWorkerDiscovery>();
     }
 
     #[test]
