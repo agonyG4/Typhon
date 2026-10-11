@@ -1116,8 +1116,7 @@ impl AtomicOutputSwapchain {
             .ready
             .as_ref()
             .ok_or_else(|| io::Error::other("no rendered output frame is ready"))?;
-        ready.validate_presentation_domain()?;
-        self.validate_later_primary_reservation(ready.reservation)?;
+        self.validate_ready_frame_for_submission(ready)?;
         self.ready
             .take()
             .ok_or_else(|| io::Error::other("no rendered output frame is ready"))
@@ -2283,7 +2282,6 @@ impl AtomicOutputSwapchain {
     }
 
     fn validate_worker_queued_frame(&self, frame: &RenderedOutputFrame) -> io::Result<()> {
-        frame.validate_presentation_domain()?;
         if self.ready.as_ref().is_some_and(|ready| {
             ready.slot != frame.slot
                 || ready.id != frame.id
@@ -2303,6 +2301,16 @@ impl AtomicOutputSwapchain {
         {
             return Err(io::Error::other(
                 "worker-queued frame identity aliases another output owner",
+            ));
+        }
+        self.validate_ready_frame_for_submission(frame)
+    }
+
+    fn validate_ready_frame_for_submission(&self, frame: &RenderedOutputFrame) -> io::Result<()> {
+        frame.validate_presentation_domain()?;
+        if frame.is_deferred_o1() {
+            return Err(io::Error::other(
+                "deferred O1 frame cannot be submitted before physical opportunity binding",
             ));
         }
         self.validate_later_primary_reservation(frame.reservation)
