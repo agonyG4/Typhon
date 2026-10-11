@@ -15,9 +15,12 @@ use crate::compositor::decoration::{
 use crate::presentation_animation::PresentationOpacity;
 use crate::render_backend::buffer::{BufferIdAllocator, BufferSize, CommittedSurfaceBuffer};
 use crate::wm::WindowDecorationPolicy;
-use crate::xwayland::xwm::{X11DecorationHints, X11FrameExtents, X11MotifDecorationHint};
+use crate::xwayland::xwm::{
+    X11DecorationHints, X11FrameExtents, X11Geometry, X11MotifDecorationHint, X11PublishedState,
+    X11WindowSnapshot, X11WindowTypes,
+};
 use crate::xwayland::{X11WindowHandle, XwaylandGeneration};
-use std::{num::NonZeroU64, time::Instant};
+use std::{borrow::Cow, num::NonZeroU64, time::Instant};
 
 const SURFACE_WIDTH: u32 = 300;
 const SURFACE_HEIGHT: u32 = 200;
@@ -50,6 +53,66 @@ fn test_surface(surface_id: u32) -> RenderableSurface {
         buffer_scale: 1,
         buffer_transform: wl_output::Transform::Normal,
         damage: RenderableSurfaceDamage::Full,
+    }
+}
+
+fn test_surface_with_size(surface_id: u32, width: u32, height: u32) -> RenderableSurface {
+    let identity = BufferIdAllocator::default()
+        .allocate()
+        .expect("test buffer identity");
+    RenderableSurface {
+        surface_id,
+        x: 0,
+        y: 0,
+        width,
+        height,
+        placement: SurfacePlacement::root(),
+        render_backend: SurfaceRenderBackend::NativeWayland,
+        render_placement: None,
+        visual_clip: None,
+        render_target_size: None,
+        generation: 1,
+        commit_sequence: SurfaceCommitSequence::initial(),
+        buffer: CommittedSurfaceBuffer::shm_snapshot(
+            identity,
+            BufferSize::new(width, height).expect("test size"),
+            vec![SURFACE_PIXEL; (width * height) as usize],
+        ),
+        viewport_source: None,
+        viewport_destination: None,
+        buffer_scale: 1,
+        buffer_transform: wl_output::Transform::Normal,
+        damage: RenderableSurfaceDamage::Full,
+    }
+}
+
+fn test_x11_snapshot_with_size(surface_id: u32, width: u32, height: u32) -> X11WindowSnapshot {
+    X11WindowSnapshot {
+        handle: x11_test_handle(),
+        surface_id,
+        kind: DesktopWindowKind::Managed,
+        window_types: X11WindowTypes::default(),
+        decoration_hints: X11DecorationHints::default(),
+        override_redirect: false,
+        geometry: X11Geometry {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        },
+        metadata: WindowMetadata::default(),
+        constraints: WindowConstraints::default(),
+        state: X11PublishedState::default(),
+        transient_for: None,
+        supports_delete: true,
+        supports_take_focus: true,
+        accepts_input: Some(true),
+        window_role: None,
+        startup_id: None,
+        user_time: None,
+        urgency: false,
+        supports_sync_request: false,
+        sync_counter: None,
     }
 }
 
@@ -1573,6 +1636,683 @@ fn physically_presented_xdg_mode_changes_keep_enter_and_exit_animations() {
             state.animation_control.curve_for(exit)
         );
     }
+}
+
+#[test]
+fn xdg_maximize_exit_first_frame_maps_the_committed_root_to_the_physical_source() {
+    let surface_id = 97;
+    let mut state = xdg_state(
+        test_surface_with_size(surface_id, 500, 500),
+        DecorationPreference::ClientSide,
+        ToplevelMode::Normal,
+    );
+    let restore_geometry =
+        WindowGeometry::new(SurfacePlacement::absolute_root_at(360, 250), 500, 500);
+    state.set_surface_placement(surface_id, restore_geometry.placement);
+    state
+        .set_test_effective_xdg_window_geometry(surface_id, XdgWindowGeometry::new(0, 0, 500, 500));
+    state.xdg_surface_lifecycles.entry(surface_id).or_default();
+    let (_display, _client) = install_test_toplevel_role(&mut state, surface_id);
+    state.presentation_animator.set_enabled(true);
+
+    let window_id = state
+        .window_id_for_surface(surface_id)
+        .expect("test window");
+    let scene_node_id = state
+        .scene_node_id_for_window_group(window_id)
+        .expect("window group node");
+    let normal_rect = state
+        .presentation_rect_for_geometry(surface_id, restore_geometry)
+        .expect("normal presentation rect");
+    state.publish_presented_window_geometry(
+        1,
+        PresentedWindowGeometry::with_scene_node(scene_node_id, surface_id, normal_rect),
+    );
+
+    let maximized_geometry =
+        state.window_geometry_for_surface_mode(surface_id, ToplevelMode::Maximized);
+    let max_rect = state
+        .presentation_rect_for_geometry(surface_id, maximized_geometry)
+        .expect("maximized presentation rect");
+    state.presentation_animator.set_enabled(false);
+    assert!(state.set_root_window_mode(surface_id, ToplevelMode::Maximized));
+    assert!(
+        !state
+            .presentation_animator
+            .has_geometry_track(scene_node_id),
+        "disabled maximize entry is classified as Immediate"
+    );
+    let maximize_configure_serial = state
+        .toplevel_visual_geometries
+        .get(&surface_id)
+        .and_then(|visual| visual.xdg_mode_transition_fence)
+        .expect("maximize response fence")
+        .configure_serial;
+    acknowledge_test_xdg_configure(&mut state, surface_id, maximize_configure_serial);
+    let maximize_commit = state.allocate_surface_commit_sequence();
+    let mut committed_maximized_surface = test_surface_with_size(
+        surface_id,
+        maximized_geometry.width,
+        maximized_geometry.height,
+    );
+    committed_maximized_surface.generation = 2;
+    committed_maximized_surface.commit_sequence = maximize_commit;
+    committed_maximized_surface.placement = maximized_geometry.placement;
+    state.renderable_surfaces[0] = committed_maximized_surface;
+    state.set_test_effective_xdg_window_geometry(
+        surface_id,
+        XdgWindowGeometry::new(
+            0,
+            0,
+            maximized_geometry.width as i32,
+            maximized_geometry.height as i32,
+        ),
+    );
+    state.update_toplevel_visual_render_assignment_after_root_commit(surface_id, maximize_commit);
+    state.rebuild_active_scene_view();
+    state.advance_render_generation(RenderGenerationCause::SurfaceCommit);
+    state.presentation_animator.set_enabled(true);
+    let maximize_scene = state.canonical_presentation_scene();
+    let maximize_targets = state.native_frame_presentation_targets_for_scene(&maximize_scene);
+    let settled_maximize_sample = state.presentation_scene_sample_for_targets_at_with_source(
+        AnimationTime::monotonic_now().expect("monotonic maximize sample time"),
+        crate::presentation_animation::PresentationSampleTimeSource::ScheduledTarget,
+        &maximize_targets,
+    );
+    let settled_maximize_snapshot = crate::presentation_animation::PresentationFrameSnapshot::
+        from_sample_with_presented_windows(
+            &settled_maximize_sample,
+            state.presented_window_geometries_for_targets(
+                &settled_maximize_sample,
+                &maximize_targets,
+            ),
+        );
+    let settled_maximize_rect = settled_maximize_snapshot
+        .presented_window_geometry(surface_id)
+        .expect("settled maximize frame geometry")
+        .presented_rect();
+    assert_eq!(
+        settled_maximize_snapshot.sample_time_source,
+        crate::presentation_animation::PresentationSampleTimeSource::ScheduledTarget
+    );
+    assert_eq!(settled_maximize_rect, max_rect,);
+    state.publish_presented_window_geometry(
+        2,
+        PresentedWindowGeometry::with_scene_node(scene_node_id, surface_id, settled_maximize_rect),
+    );
+
+    let last_physical = state
+        .presented_window_geometry(surface_id)
+        .expect("maximized geometry was physically published")
+        .presented_rect();
+
+    assert!(state.restore_normal_root_window(surface_id));
+    let current_visual_geometry = state
+        .current_visual_root_window_geometry(surface_id)
+        .expect("restore destination geometry");
+    assert_eq!(current_visual_geometry, restore_geometry);
+    let restore_configure_serial = state
+        .toplevel_visual_geometries
+        .get(&surface_id)
+        .and_then(|visual| visual.xdg_mode_transition_fence)
+        .expect("restore response fence remains pending for the slow client")
+        .configure_serial;
+    assert_ne!(restore_configure_serial, maximize_configure_serial);
+
+    let started_at = state
+        .presentation_animator
+        .track_started_at_for_scene_node(scene_node_id)
+        .expect("MaximizeExit track start");
+    let first_restore_frame_id = 3;
+    let first_restore_render_generation = state.render_generation;
+    let first_restore_scene_generation = state.scene_render_generation;
+    let canonical_scene = state.canonical_presentation_scene();
+    let targets = state.native_frame_presentation_targets_for_scene(&canonical_scene);
+    let presentation = state.presentation_scene_sample_for_targets_at_with_source(
+        started_at,
+        crate::presentation_animation::PresentationSampleTimeSource::MonotonicFallback,
+        &targets,
+    );
+    let frame_presentation = crate::presentation_animation::PresentationFrameSnapshot::
+        from_sample_with_presented_windows(
+            &presentation,
+            state.presented_window_geometries_for_targets(&presentation, &targets),
+        );
+    let transform = frame_presentation
+        .transform_for_root(surface_id)
+        .expect("first resolved restore frame carries MaximizeExit");
+    let projected_surfaces = state.apply_presentation_to_native_frame_surfaces(
+        Cow::Borrowed(canonical_scene.surfaces.as_ref()),
+        canonical_scene.presentation_owner_root_surface_ids.as_ref(),
+        &presentation,
+    );
+    let projected_root = projected_surfaces
+        .iter()
+        .find(|surface| surface.surface_id == surface_id)
+        .expect("projected root surface");
+    let committed_root_extent = (projected_root.width, projected_root.height);
+    let render_target_size = projected_root.render_target_size;
+    let render_placement = projected_root.render_placement;
+
+    assert_eq!(frame_presentation.sampled_at, started_at);
+    assert_eq!(
+        frame_presentation.sample_time_source,
+        crate::presentation_animation::PresentationSampleTimeSource::MonotonicFallback
+    );
+    assert!(frame_presentation.sampled_at >= settled_maximize_snapshot.sampled_at);
+    assert_eq!(frame_presentation.output_id, presentation.output_id);
+    assert!(first_restore_render_generation > 0);
+    assert!(first_restore_scene_generation > 0);
+    assert_eq!(
+        transform.scene_node_id, scene_node_id,
+        "frame identity: render_generation={} scene_generation={} root_surface_id={} scene_node_id={:?}",
+        state.render_generation, state.scene_render_generation, surface_id, transform.scene_node_id,
+    );
+    assert_eq!(
+        transform.canonical_rect,
+        state
+            .presentation_rect_for_geometry(surface_id, restore_geometry)
+            .unwrap()
+    );
+    assert_eq!(transform.presented_rect, last_physical);
+    assert!(!transform.mathematically_settled);
+    assert_eq!(
+        committed_root_extent,
+        (maximized_geometry.width, maximized_geometry.height)
+    );
+    assert_eq!(
+        render_target_size,
+        BufferSize::new(maximized_geometry.width, maximized_geometry.height),
+        "the first rendered root extent must match the physically presented maximize source; frame_id={} render_generation={} scene_generation={} sampled_at={:?} sample_time_source={:?} transaction={:?} revision={:?} presented_rect={:?} render_placement={:?} current_visual_geometry={:?}",
+        first_restore_frame_id,
+        first_restore_render_generation,
+        first_restore_scene_generation,
+        frame_presentation.sampled_at,
+        frame_presentation.sample_time_source,
+        transform.transaction_id,
+        transform.revision_id,
+        transform.presented_rect,
+        render_placement,
+        current_visual_geometry,
+    );
+    assert_eq!(render_placement, Some(maximized_geometry.placement));
+
+    state.publish_presented_window_geometry(
+        first_restore_frame_id,
+        PresentedWindowGeometry::with_scene_node(
+            scene_node_id,
+            surface_id,
+            transform.presented_rect,
+        ),
+    );
+    assert_eq!(
+        state
+            .presented_window_geometry(surface_id)
+            .unwrap()
+            .presented_rect(),
+        last_physical,
+        "the first physically publishable restore frame must freeze the source geometry"
+    );
+
+    acknowledge_test_xdg_configure(&mut state, surface_id, restore_configure_serial);
+    let restore_commit = state.allocate_surface_commit_sequence();
+    let mut committed_restore_surface = test_surface_with_size(surface_id, 500, 500);
+    committed_restore_surface.generation = 3;
+    committed_restore_surface.commit_sequence = restore_commit;
+    committed_restore_surface.placement = restore_geometry.placement;
+    state.renderable_surfaces[0] = committed_restore_surface;
+    state
+        .set_test_effective_xdg_window_geometry(surface_id, XdgWindowGeometry::new(0, 0, 500, 500));
+    state.update_toplevel_visual_render_assignment_after_root_commit(surface_id, restore_commit);
+    state.rebuild_active_scene_view();
+    state.advance_render_generation(RenderGenerationCause::SurfaceCommit);
+
+    let fast_response_at = AnimationTime::from_nanos(started_at.as_nanos() + 10_000_000);
+    let fast_response_scene = state.canonical_presentation_scene();
+    let fast_response_targets =
+        state.native_frame_presentation_targets_for_scene(&fast_response_scene);
+    let fast_response_sample = state.presentation_scene_sample_for_targets_at_with_source(
+        fast_response_at,
+        crate::presentation_animation::PresentationSampleTimeSource::ScheduledTarget,
+        &fast_response_targets,
+    );
+    let fast_response_snapshot = crate::presentation_animation::PresentationFrameSnapshot::
+        from_sample_with_presented_windows(
+            &fast_response_sample,
+            state.presented_window_geometries_for_targets(
+                &fast_response_sample,
+                &fast_response_targets,
+            ),
+        );
+    let fast_response_transform = fast_response_sample
+        .transform_for_root(surface_id)
+        .expect("post-ACK restore frame keeps the active transition");
+    let fast_response_surfaces = state.apply_presentation_to_native_frame_surfaces(
+        Cow::Borrowed(fast_response_scene.surfaces.as_ref()),
+        fast_response_scene
+            .presentation_owner_root_surface_ids
+            .as_ref(),
+        &fast_response_sample,
+    );
+    let fast_response_root = fast_response_surfaces
+        .iter()
+        .find(|surface| surface.surface_id == surface_id)
+        .expect("post-ACK root surface");
+    assert_eq!(
+        fast_response_root.render_target_size,
+        BufferSize::new(
+            fast_response_transform.presented_rect.width().round() as u32,
+            fast_response_transform.presented_rect.height().round() as u32,
+        ),
+        "after the matching client commit, the physical surface follows the same frame-local window transform"
+    );
+    assert_eq!(
+        fast_response_sample
+            .transform_for_root(surface_id)
+            .expect("post-ACK transition transform")
+            .revision_id,
+        transform.revision_id,
+    );
+    assert_eq!(
+        fast_response_transform.transaction_id,
+        transform.transaction_id
+    );
+    assert_eq!(
+        fast_response_snapshot.sample_time_source,
+        crate::presentation_animation::PresentationSampleTimeSource::ScheduledTarget
+    );
+    assert!(fast_response_snapshot.sampled_at >= frame_presentation.sampled_at);
+    assert_ne!(
+        fast_response_transform.presented_rect,
+        transform.presented_rect
+    );
+    let fast_response_presented = fast_response_snapshot
+        .presented_window_geometry(surface_id)
+        .expect("post-ACK physical candidate geometry")
+        .presented_rect();
+    state.publish_presented_window_geometry(
+        4,
+        PresentedWindowGeometry::with_scene_node(
+            scene_node_id,
+            surface_id,
+            fast_response_presented,
+        ),
+    );
+    assert_eq!(
+        state
+            .presented_window_geometry(surface_id)
+            .unwrap()
+            .presented_rect(),
+        fast_response_presented,
+        "the later physical candidate freezes the later sample for the same presentation revision"
+    );
+}
+
+#[test]
+fn x11_maximize_exit_first_frame_maps_the_committed_root_to_the_physical_source() {
+    let surface_id = 98;
+    let mut state = CompositorState::new(None);
+    let window_id = state.allocate_window_id().expect("window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_x11(
+            window_id,
+            test_x11_snapshot_with_size(surface_id, 1280, 800),
+        ))
+        .expect("insert X11 window");
+    state.append_renderable_surface(test_surface_with_size(surface_id, 1280, 800));
+    let restore_geometry =
+        WindowGeometry::new(SurfacePlacement::absolute_root_at(360, 250), 500, 500);
+    let window = state.window_mut(window_id).expect("X11 window");
+    window.state.capture_restore_geometry(restore_geometry);
+    window.state.set_mode(ToplevelMode::Maximized);
+    state.rebuild_active_scene_view();
+    state.presentation_animator.set_enabled(true);
+
+    let scene_node_id = state
+        .scene_node_id_for_window_group(window_id)
+        .expect("X11 window group node");
+    let physical_source = state
+        .presentation_rect_for_geometry(
+            surface_id,
+            WindowGeometry::new(SurfacePlacement::absolute_root_at(0, 0), 1280, 800),
+        )
+        .expect("physical maximize geometry");
+    state.publish_presented_window_geometry(
+        1,
+        PresentedWindowGeometry::with_scene_node(scene_node_id, surface_id, physical_source),
+    );
+
+    assert!(state.restore_normal_root_window(surface_id));
+    let started_at = state
+        .presentation_animator
+        .track_started_at_for_scene_node(scene_node_id)
+        .expect("X11 MaximizeExit track start");
+    let canonical_scene = state.canonical_presentation_scene();
+    let targets = state.native_frame_presentation_targets_for_scene(&canonical_scene);
+    let sample = state.presentation_scene_sample_for_targets_at_with_source(
+        started_at,
+        crate::presentation_animation::PresentationSampleTimeSource::MonotonicFallback,
+        &targets,
+    );
+    let snapshot = crate::presentation_animation::PresentationFrameSnapshot::
+        from_sample_with_presented_windows(
+            &sample,
+            state.presented_window_geometries_for_targets(&sample, &targets),
+        );
+    let transform = snapshot
+        .transform_for_root(surface_id)
+        .expect("first X11 restore frame carries MaximizeExit");
+    let projected_surfaces = state.apply_presentation_to_native_frame_surfaces(
+        Cow::Borrowed(canonical_scene.surfaces.as_ref()),
+        canonical_scene.presentation_owner_root_surface_ids.as_ref(),
+        &sample,
+    );
+    let projected_root = projected_surfaces
+        .iter()
+        .find(|surface| surface.surface_id == surface_id)
+        .expect("projected X11 root surface");
+
+    assert_eq!(snapshot.sampled_at, started_at);
+    assert_eq!(
+        snapshot.sample_time_source,
+        crate::presentation_animation::PresentationSampleTimeSource::MonotonicFallback
+    );
+    assert_eq!(transform.scene_node_id, scene_node_id);
+    assert_eq!(transform.presented_rect, physical_source);
+    assert_eq!(
+        transform.canonical_rect,
+        state
+            .presentation_rect_for_geometry(surface_id, restore_geometry)
+            .expect("X11 restore target")
+    );
+    assert!(!transform.mathematically_settled);
+    assert_eq!((projected_root.width, projected_root.height), (1280, 800));
+    assert_eq!(
+        projected_root.render_target_size,
+        BufferSize::new(1280, 800),
+        "X11 committed content must begin at the physically presented maximize extent"
+    );
+}
+
+#[test]
+fn fullscreen_exit_first_frame_maps_the_committed_root_to_the_physical_source() {
+    let surface_id = 99;
+    let mut state = xdg_state(
+        test_surface_with_size(surface_id, 500, 500),
+        DecorationPreference::ClientSide,
+        ToplevelMode::Normal,
+    );
+    let restore_geometry =
+        WindowGeometry::new(SurfacePlacement::absolute_root_at(360, 250), 500, 500);
+    state.set_surface_placement(surface_id, restore_geometry.placement);
+    state
+        .set_test_effective_xdg_window_geometry(surface_id, XdgWindowGeometry::new(0, 0, 500, 500));
+    state.xdg_surface_lifecycles.entry(surface_id).or_default();
+    let (_display, _client) = install_test_toplevel_role(&mut state, surface_id);
+    let window_id = state
+        .window_id_for_surface(surface_id)
+        .expect("test window");
+    let scene_node_id = state
+        .scene_node_id_for_window_group(window_id)
+        .expect("window group node");
+
+    state.presentation_animator.set_enabled(false);
+    assert!(state.set_root_window_mode(surface_id, ToplevelMode::Fullscreen));
+    let fullscreen_geometry =
+        state.window_geometry_for_surface_mode(surface_id, ToplevelMode::Fullscreen);
+    let fullscreen_configure_serial = state
+        .toplevel_visual_geometries
+        .get(&surface_id)
+        .and_then(|visual| visual.xdg_mode_transition_fence)
+        .expect("fullscreen response fence")
+        .configure_serial;
+    acknowledge_test_xdg_configure(&mut state, surface_id, fullscreen_configure_serial);
+    let fullscreen_commit = state.allocate_surface_commit_sequence();
+    let mut committed_fullscreen_surface = test_surface_with_size(
+        surface_id,
+        fullscreen_geometry.width,
+        fullscreen_geometry.height,
+    );
+    committed_fullscreen_surface.generation = 2;
+    committed_fullscreen_surface.commit_sequence = fullscreen_commit;
+    committed_fullscreen_surface.placement = fullscreen_geometry.placement;
+    state.renderable_surfaces[0] = committed_fullscreen_surface;
+    state.set_test_effective_xdg_window_geometry(
+        surface_id,
+        XdgWindowGeometry::new(
+            0,
+            0,
+            fullscreen_geometry.width as i32,
+            fullscreen_geometry.height as i32,
+        ),
+    );
+    state.update_toplevel_visual_render_assignment_after_root_commit(surface_id, fullscreen_commit);
+    state.rebuild_active_scene_view();
+    state.advance_render_generation(RenderGenerationCause::SurfaceCommit);
+    state.presentation_animator.set_enabled(true);
+
+    let physical_source = state
+        .presentation_rect_for_geometry(surface_id, fullscreen_geometry)
+        .expect("physical fullscreen geometry");
+    state.publish_presented_window_geometry(
+        1,
+        PresentedWindowGeometry::with_scene_node(scene_node_id, surface_id, physical_source),
+    );
+    assert!(state.restore_after_fullscreen_root_window_from(
+        surface_id,
+        WindowModeRequestSource::OtherInternal,
+    ));
+    let started_at = state
+        .presentation_animator
+        .track_started_at_for_scene_node(scene_node_id)
+        .expect("FullscreenExit track start");
+    let canonical_scene = state.canonical_presentation_scene();
+    let targets = state.native_frame_presentation_targets_for_scene(&canonical_scene);
+    let sample = state.presentation_scene_sample_for_targets_at_with_source(
+        started_at,
+        crate::presentation_animation::PresentationSampleTimeSource::MonotonicFallback,
+        &targets,
+    );
+    let snapshot = crate::presentation_animation::PresentationFrameSnapshot::
+        from_sample_with_presented_windows(
+            &sample,
+            state.presented_window_geometries_for_targets(&sample, &targets),
+        );
+    let transform = snapshot
+        .transform_for_root(surface_id)
+        .expect("first fullscreen restore frame carries FullscreenExit");
+    let projected_surfaces = state.apply_presentation_to_native_frame_surfaces(
+        Cow::Borrowed(canonical_scene.surfaces.as_ref()),
+        canonical_scene.presentation_owner_root_surface_ids.as_ref(),
+        &sample,
+    );
+    let projected_root = projected_surfaces
+        .iter()
+        .find(|surface| surface.surface_id == surface_id)
+        .expect("projected fullscreen root surface");
+
+    assert_eq!(snapshot.sampled_at, started_at);
+    assert_eq!(
+        snapshot.sample_time_source,
+        crate::presentation_animation::PresentationSampleTimeSource::MonotonicFallback
+    );
+    assert_eq!(transform.scene_node_id, scene_node_id);
+    assert_eq!(transform.presented_rect, physical_source);
+    assert_eq!(
+        transform.canonical_rect,
+        state
+            .presentation_rect_for_geometry(surface_id, restore_geometry)
+            .expect("fullscreen return target")
+    );
+    assert!(!transform.mathematically_settled);
+    assert_eq!(
+        (projected_root.width, projected_root.height),
+        (fullscreen_geometry.width, fullscreen_geometry.height)
+    );
+    assert_eq!(
+        projected_root.render_target_size,
+        BufferSize::new(fullscreen_geometry.width, fullscreen_geometry.height),
+        "fullscreen committed content must begin at the physically presented fullscreen extent"
+    );
+}
+
+#[test]
+fn xdg_mode_animation_reversals_start_at_the_last_physical_sample() {
+    let surface_id = 100;
+    let mut state = xdg_state(
+        test_surface_with_size(surface_id, 500, 500),
+        DecorationPreference::ClientSide,
+        ToplevelMode::Normal,
+    );
+    let restore_geometry =
+        WindowGeometry::new(SurfacePlacement::absolute_root_at(360, 250), 500, 500);
+    state.set_surface_placement(surface_id, restore_geometry.placement);
+    state
+        .set_test_effective_xdg_window_geometry(surface_id, XdgWindowGeometry::new(0, 0, 500, 500));
+    state.xdg_surface_lifecycles.entry(surface_id).or_default();
+    let (_display, _client) = install_test_toplevel_role(&mut state, surface_id);
+    state.presentation_animator.set_enabled(true);
+    let window_id = state
+        .window_id_for_surface(surface_id)
+        .expect("test window");
+    let scene_node_id = state
+        .scene_node_id_for_window_group(window_id)
+        .expect("window group node");
+    let normal_rect = state
+        .presentation_rect_for_geometry(surface_id, restore_geometry)
+        .expect("normal presentation rect");
+    state.publish_presented_window_geometry(
+        1,
+        PresentedWindowGeometry::with_scene_node(scene_node_id, surface_id, normal_rect),
+    );
+
+    let enter_started_at = AnimationTime::from_nanos(1_000_000_000);
+    state.layout_animation_epoch = Some(enter_started_at);
+    assert!(state.set_root_window_mode(surface_id, ToplevelMode::Maximized));
+    let enter_sample_at = AnimationTime::from_nanos(enter_started_at.as_nanos() + 20_000_000);
+    let enter_scene = state.canonical_presentation_scene();
+    let enter_targets = state.native_frame_presentation_targets_for_scene(&enter_scene);
+    let enter_sample = state.presentation_scene_sample_for_targets_at_with_source(
+        enter_sample_at,
+        crate::presentation_animation::PresentationSampleTimeSource::ScheduledTarget,
+        &enter_targets,
+    );
+    let enter_snapshot = crate::presentation_animation::PresentationFrameSnapshot::
+        from_sample_with_presented_windows(
+            &enter_sample,
+            state.presented_window_geometries_for_targets(&enter_sample, &enter_targets),
+        );
+    let enter_transform = enter_snapshot
+        .transform_for_root(surface_id)
+        .expect("in-flight MaximizeEnter sample");
+    assert_ne!(
+        enter_transform.presented_rect,
+        enter_transform.canonical_rect
+    );
+    state.publish_presented_window_geometry(
+        2,
+        PresentedWindowGeometry::with_scene_node(
+            scene_node_id,
+            surface_id,
+            enter_transform.presented_rect,
+        ),
+    );
+
+    state.layout_animation_epoch = Some(enter_sample_at);
+    assert!(state.restore_normal_root_window(surface_id));
+    let exit_started_at = state
+        .presentation_animator
+        .track_started_at_for_scene_node(scene_node_id)
+        .expect("reversed MaximizeExit start");
+    assert_eq!(exit_started_at, enter_sample_at);
+    let exit_start_scene = state.canonical_presentation_scene();
+    let exit_start_targets = state.native_frame_presentation_targets_for_scene(&exit_start_scene);
+    let exit_start_sample = state.presentation_scene_sample_for_targets_at_with_source(
+        exit_started_at,
+        crate::presentation_animation::PresentationSampleTimeSource::MonotonicFallback,
+        &exit_start_targets,
+    );
+    let exit_start_snapshot = crate::presentation_animation::PresentationFrameSnapshot::
+        from_sample_with_presented_windows(
+            &exit_start_sample,
+            state.presented_window_geometries_for_targets(
+                &exit_start_sample,
+                &exit_start_targets,
+            ),
+        );
+    assert_eq!(
+        exit_start_snapshot
+            .transform_for_root(surface_id)
+            .expect("reversed exit frame")
+            .presented_rect,
+        state
+            .presented_window_geometry(surface_id)
+            .expect("last physically presented maximize-enter frame")
+            .presented_rect(),
+        "ScheduledTarget to MonotonicFallback keeps the physical animation state"
+    );
+    assert!(exit_start_snapshot.sampled_at >= enter_snapshot.sampled_at);
+
+    let exit_sample_at = AnimationTime::from_nanos(exit_started_at.as_nanos() + 20_000_000);
+    let exit_scene = state.canonical_presentation_scene();
+    let exit_targets = state.native_frame_presentation_targets_for_scene(&exit_scene);
+    let exit_sample = state.presentation_scene_sample_for_targets_at_with_source(
+        exit_sample_at,
+        crate::presentation_animation::PresentationSampleTimeSource::ScheduledTarget,
+        &exit_targets,
+    );
+    let exit_snapshot = crate::presentation_animation::PresentationFrameSnapshot::
+        from_sample_with_presented_windows(
+            &exit_sample,
+            state.presented_window_geometries_for_targets(&exit_sample, &exit_targets),
+        );
+    let exit_transform = exit_snapshot
+        .transform_for_root(surface_id)
+        .expect("in-flight MaximizeExit sample");
+    assert_ne!(exit_transform.presented_rect, exit_transform.canonical_rect);
+    state.publish_presented_window_geometry(
+        3,
+        PresentedWindowGeometry::with_scene_node(
+            scene_node_id,
+            surface_id,
+            exit_transform.presented_rect,
+        ),
+    );
+
+    state.layout_animation_epoch = Some(exit_sample_at);
+    assert!(state.set_root_window_mode(surface_id, ToplevelMode::Maximized));
+    let reentered_at = state
+        .presentation_animator
+        .track_started_at_for_scene_node(scene_node_id)
+        .expect("reversed MaximizeEnter start");
+    assert_eq!(reentered_at, exit_sample_at);
+    let reentered_scene = state.canonical_presentation_scene();
+    let reentered_targets = state.native_frame_presentation_targets_for_scene(&reentered_scene);
+    let reentered_sample = state.presentation_scene_sample_for_targets_at_with_source(
+        reentered_at,
+        crate::presentation_animation::PresentationSampleTimeSource::MonotonicFallback,
+        &reentered_targets,
+    );
+    let reentered_snapshot = crate::presentation_animation::PresentationFrameSnapshot::
+        from_sample_with_presented_windows(
+            &reentered_sample,
+            state.presented_window_geometries_for_targets(
+                &reentered_sample,
+                &reentered_targets,
+            ),
+        );
+    assert_eq!(
+        reentered_snapshot
+            .transform_for_root(surface_id)
+            .expect("reversed enter frame")
+            .presented_rect,
+        state
+            .presented_window_geometry(surface_id)
+            .expect("last physically presented maximize-exit frame")
+            .presented_rect(),
+        "restore reversal starts at the last physically presented exit geometry"
+    );
+    assert!(reentered_snapshot.sampled_at >= exit_snapshot.sampled_at);
 }
 
 fn x11_state(surface: RenderableSurface) -> CompositorState {

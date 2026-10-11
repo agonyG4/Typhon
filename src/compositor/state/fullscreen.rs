@@ -919,6 +919,23 @@ impl CompositorState {
         let canonical_origins = render::surface_origins(surfaces.as_ref());
         let mut presented_origins = HashMap::new();
         for transform in &sample.transforms {
+            let committed_window_extent = self
+                .current_root_window_geometry(transform.root_surface_id)
+                .map(|geometry| (geometry.width, geometry.height))
+                .or_else(|| {
+                    surfaces
+                        .iter()
+                        .find(|surface| surface.surface_id == transform.root_surface_id)
+                        .map(|surface| (surface.width, surface.height))
+                });
+            let (scale_x, scale_y) = committed_window_extent
+                .filter(|(width, height)| *width > 0 && *height > 0)
+                .map_or((1.0, 1.0), |(width, height)| {
+                    (
+                        transform.canonical_rect.width() / f64::from(width),
+                        transform.canonical_rect.height() / f64::from(height),
+                    )
+                });
             for (index, (surface, owner_root_surface_id)) in surfaces
                 .iter()
                 .zip(presentation_owner_root_surface_ids.iter().copied())
@@ -930,11 +947,20 @@ impl CompositorState {
                 let Some(origin) = canonical_origins.get(index).copied() else {
                     continue;
                 };
+                // A mode transition can change the semantic window extent
+                // before the XDG client commits content at that size. Map the
+                // still-committed surface tree into the destination window
+                // space first, then apply the frame-local presentation
+                // transform. Keep `surface.width` and `surface.height` as the
+                // client-owned committed extent; only the render target below
+                // is projected.
                 let Some(canonical_rect) = PresentationRect::new(
-                    f64::from(origin.0),
-                    f64::from(origin.1),
-                    f64::from(surface.width),
-                    f64::from(surface.height),
+                    transform.canonical_rect.x()
+                        + (f64::from(origin.0) - transform.canonical_rect.x()) * scale_x,
+                    transform.canonical_rect.y()
+                        + (f64::from(origin.1) - transform.canonical_rect.y()) * scale_y,
+                    f64::from(surface.width) * scale_x,
+                    f64::from(surface.height) * scale_y,
                 ) else {
                     continue;
                 };
