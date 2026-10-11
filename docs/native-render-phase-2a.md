@@ -170,29 +170,30 @@ event source when a worker transport is present, and its completion identity is
 checked against the single executing-job identity before retaining the result
 in the reactor's one-entry completion slot. Worker-busy presentation planning
 records only redraw demand before scene, slot, transaction, frame-batch, or
-frozen-payload preparation. Worker bootstrap follows the required two-stage ownership path:
-EGL format discovery runs on `typhon-render`; the reactor then selects the
-KMS-compatible format, allocates physical BOs, and transfers owned render-slot
-descriptors back to that same worker for renderer initialization. The worker
-and transport payloads are qualified as naturally `Send`.
+frozen-payload preparation. Worker bootstrap follows the required two-stage
+ownership path: EGL format discovery runs on `typhon-render`; the reactor then
+selects the KMS-compatible format, allocates physical BOs, and transfers owned
+render-slot descriptors back to that same worker for renderer initialization.
+The worker and transport payloads are qualified as naturally `Send`.
 
-Normal Atomic render dispatch and reactor-side completion settlement are not
-connected yet. Therefore `OBLIVION_ONE_RENDER_WORKER=auto` currently reports
-an automatic degradation and uses the synchronous transport, while `force`
-fails startup with an explicit error. This guard prevents a worker-owned EGL
-domain from being selected while `render_frame` still expects an immediate
-renderer result. Do not use `auto` as a worker A/B setting on this checkout.
+The current source also has the reactor continuation and common Atomic outcome
+settlement connected to the worker eventfd path. Screen capture and trusted
+effect reload have one-at-a-time asynchronous worker admissions. Session
+suspend stops new admission, drains the executing render continuation after
+reactor demotion, and acknowledges render-pool generation rebind before the
+reactor is rearmed.
 
-The remaining Phase 2B.2 work is to introduce the owned reactor continuation
-for the current `AtomicEglGbmScanout::render_frame` and outer presentation-cycle
-locals, then resume the common Atomic outcome settlement from the worker
-eventfd path. That continuation is not yet connected, so the completion slot is
-only a bounded transport boundary and cannot yet admit a render. The same
-worker also needs asynchronous admission/completion for capture, trusted-effect
-reload, output candidate preparation/promotion, session rebind/quiescence, and
-ordered shutdown acknowledgement before physical pool release. Until these
-paths are connected and qualified, the only enabled runtime transport is
-synchronous.
+The worker is still not an effective runtime transport. `auto` reports an
+automatic startup degradation and uses the synchronous transport; `force`
+fails startup. The remaining gating path is output-configuration candidate
+preparation, promotion, and retirement: it still creates and renders the
+candidate synchronously. Worker-mode output configuration must prepare the
+candidate on the existing `typhon-render` thread, retain the old render domain
+until KMS commits, then acknowledge old-domain destruction before releasing the
+old physical pool. Failure paths also need candidate-destruction acknowledgments
+before dropping candidate GBM BOs. Until this path is asynchronous and the
+same-checkout binary build is qualified, do not use `auto` as a hardware A/B
+setting.
 
 The three-slot bound covers output-frame terminal tokens. Other worker work
 uses separate fixed admission limits, not entries in an unbounded common queue:

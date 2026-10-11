@@ -87,8 +87,9 @@ pub(crate) const fn primary_redraw_requested(
 pub(crate) const fn primary_render_admission_blocked(
     render_worker_busy: bool,
     completion_pending: bool,
+    admission_stopped: bool,
 ) -> bool {
-    render_worker_busy || completion_pending
+    render_worker_busy || completion_pending || admission_stopped
 }
 
 pub(crate) const fn render_worker_received_visual_demand(
@@ -321,6 +322,7 @@ impl NativeRuntime {
             pending_render_worker_context,
             pending_render_worker_outer,
             pending_render_worker_completion,
+            render_worker_admission_stopped,
             frame_scheduler,
             atomic_commit_arbiter,
             emergency_quarantined_worker_jobs,
@@ -1200,6 +1202,7 @@ impl NativeRuntime {
             if primary_render_admission_blocked(
                 worker_busy,
                 pending_render_worker_completion.is_some(),
+                *render_worker_admission_stopped,
             ) {
                 if worker_busy {
                     // Ready-frame/KMS service above remains live. Only new

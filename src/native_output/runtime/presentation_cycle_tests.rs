@@ -12,9 +12,10 @@ static NEXT_COMPATIBILITY_SKIP_SOCKET: AtomicU64 = AtomicU64::new(0);
 
 #[test]
 fn render_worker_admission_gate_only_blocks_new_primary_render_work() {
-    assert!(!primary_render_admission_blocked(false, false));
-    assert!(primary_render_admission_blocked(true, false));
-    assert!(primary_render_admission_blocked(false, true));
+    assert!(!primary_render_admission_blocked(false, false, false));
+    assert!(primary_render_admission_blocked(true, false, false));
+    assert!(primary_render_admission_blocked(false, true, false));
+    assert!(primary_render_admission_blocked(false, false, true));
 }
 
 #[test]

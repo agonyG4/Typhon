@@ -745,11 +745,11 @@ impl AtomicEglGbmScanout {
         generation: u64,
         vrr_connector_capable: bool,
         vrr_crtc_property_available: bool,
-    ) {
+    ) -> io::Result<()> {
         self.vrr_connector_capable = vrr_connector_capable;
         self.vrr_crtc_property_available = vrr_crtc_property_available;
         let Some(pool) = self.physical_pool.as_ref() else {
-            return;
+            return Ok(());
         };
         validate_split_slot_pairing(
             &pool.identities(),
@@ -766,7 +766,7 @@ impl AtomicEglGbmScanout {
             .as_mut()
             .expect("physical pool was checked above")
             .rebind_pool_generation(generation);
-        let _ = self.queue_render_control(AtomicRenderControl::RebindPoolGeneration(generation));
+        self.queue_render_control(AtomicRenderControl::RebindPoolGeneration(generation))?;
         self.render_slot_identities = self
             .render_slot_identities
             .iter()
@@ -793,7 +793,20 @@ impl AtomicEglGbmScanout {
         self.async_output_generation = generation;
         self.presentation_validation_accepted.clear();
         self.presentation_validation_rejected.clear();
-        let _ = self.queue_render_control(AtomicRenderControl::InvalidatePresentedDamageHistory);
+        self.queue_render_control(AtomicRenderControl::InvalidatePresentedDamageHistory)?;
+        if matches!(&self.render_transport, AtomicRenderTransport::Worker(_)) {
+            let (controls, required_epoch) = self.take_render_controls_for_job()?;
+            let applied_epoch = self
+                .render_worker_mut()
+                .ok_or_else(|| io::Error::other("render worker disappeared during session rebind"))?
+                .apply_controls_while_quiesced(controls, required_epoch)?;
+            if applied_epoch != required_epoch {
+                return Err(io::Error::other(
+                    "render worker acknowledged a stale session rebind control epoch",
+                ));
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn composited_presentation_validation_key(

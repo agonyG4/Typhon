@@ -737,6 +737,7 @@ impl NativeRuntime {
             kms_commit_worker,
             kms_commit_worker_reactor_token,
             render_worker_reactor_token,
+            render_worker_admission_stopped: false,
             pending_render_worker_identity: None,
             pending_render_worker_context: None,
             pending_render_worker_outer: None,

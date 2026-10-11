@@ -25,8 +25,10 @@ pub(crate) enum NativeIoOperation {
     RawInputDiscard,
     RawInputAction,
     ExplicitSyncPark,
+    RenderWorkerQuiesce,
     KmsWorkerQuiesce,
     KmsWorkerJoin,
+    RenderWorkerRebindAcknowledged,
     KmsWorkerForceShutdownAbandon,
     ExplicitSyncRearm,
     ExplicitSyncNotifier,
@@ -75,6 +77,9 @@ pub(crate) trait NativeSessionIo {
 
     fn suspend_input(&mut self) -> NativeResult<()>;
     fn park_explicit_sync(&mut self) -> NativeResult<()>;
+    fn quiesce_render_worker(&mut self) -> NativeResult<()> {
+        Ok(())
+    }
     fn quiesce_kms_worker(&mut self) -> NativeResult<()> {
         Ok(())
     }
@@ -113,6 +118,8 @@ pub(crate) fn quiesce_and_acknowledge<I: NativeSessionIo>(
     io.suspend_input()?;
     io.observe(NativeIoOperation::ExplicitSyncPark);
     io.park_explicit_sync()?;
+    io.observe(NativeIoOperation::RenderWorkerQuiesce);
+    io.quiesce_render_worker()?;
     io.observe(NativeIoOperation::KmsWorkerQuiesce);
     io.quiesce_kms_worker()?;
     io.observe(NativeIoOperation::KmsWorkerJoin);
@@ -245,6 +252,77 @@ impl NativeSessionIo for NativeRuntime {
             self.acquire_watches
                 .park_for_session_suspend(&mut self.event_loop)?,
         );
+        Ok(())
+    }
+
+    fn quiesce_render_worker(&mut self) -> NativeResult<()> {
+        self.render_worker_admission_stopped = true;
+        if !self.scanout.render_worker_active() {
+            return Ok(());
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while self.scanout.render_worker_busy() {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "render worker did not quiesce within the session suspend bound",
+                )
+                .into());
+            }
+            let Some(fd) = self.scanout.render_worker_event_fd() else {
+                return Err(io::Error::other(
+                    "active render worker has no registered completion eventfd",
+                )
+                .into());
+            };
+            let timeout_ms = deadline
+                .saturating_duration_since(now)
+                .as_millis()
+                .clamp(1, 100) as i32;
+            let mut descriptor = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // The reactor was demoted before session quiescence. This bounded
+            // wait returns only worker events so their ordinary settlement can
+            // return slot and protocol ownership before output quarantine.
+            let ready = unsafe { libc::poll(&mut descriptor, 1, timeout_ms) };
+            if ready < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error.into());
+            }
+            if ready == 0 {
+                continue;
+            }
+            self.process_render_worker_events()?;
+            let mut cycle =
+                NativeCycleState::for_worker_quiescence(self.scanout.page_flip_pending());
+            self.settle_pending_render_worker_completion(&mut cycle)?;
+        }
+
+        if self.pending_render_worker_completion.is_some() {
+            let mut cycle =
+                NativeCycleState::for_worker_quiescence(self.scanout.page_flip_pending());
+            self.settle_pending_render_worker_completion(&mut cycle)?;
+        }
+        if self.pending_render_worker_identity.is_some()
+            || self.pending_render_worker_context.is_some()
+            || self.pending_render_worker_outer.is_some()
+            || self.pending_render_worker_completion.is_some()
+            || self.pending_render_worker_capture.is_some()
+            || self.pending_worker_effect_reload.is_some()
+        {
+            return Err(io::Error::other(
+                "render worker quiesced with reactor continuation ownership still pending",
+            )
+            .into());
+        }
         Ok(())
     }
 
@@ -556,7 +634,8 @@ impl NativeSessionIo for NativeRuntime {
             generation,
             self.kms_backend.atomic_connector_vrr_capable(),
             self.kms_backend.atomic_crtc_vrr_property_available(),
-        );
+        )?;
+        self.observe(NativeIoOperation::RenderWorkerRebindAcknowledged);
         if !apply_native_scanout_feedback(
             &mut self.server,
             &self.scanout,
@@ -690,6 +769,7 @@ mod tests {
         SeatDispatch,
         InputSuspend,
         ExplicitSyncPark,
+        RenderWorkerQuiesce,
         KmsWorkerQuiesce,
         KmsWorkerJoin,
         PageflipQuarantine,
@@ -846,6 +926,10 @@ mod tests {
             self.push(Operation::ExplicitSyncPark);
             Ok(())
         }
+        fn quiesce_render_worker(&mut self) -> NativeResult<()> {
+            self.push(Operation::RenderWorkerQuiesce);
+            Ok(())
+        }
         fn quiesce_kms_worker(&mut self) -> NativeResult<()> {
             self.push(Operation::KmsWorkerQuiesce);
             Ok(())
@@ -905,6 +989,8 @@ mod tests {
             Ok(NativeSessionRecoveryFenceRegistration::Registered)
         }
         fn rearm_explicit_sync(&mut self) -> NativeResult<()> {
+            self.native_io
+                .record(NativeIoOperation::RenderWorkerRebindAcknowledged);
             self.push(Operation::ExplicitSyncRearm);
             Ok(())
         }
@@ -982,6 +1068,7 @@ mod tests {
                 Operation::SeatDispatch,
                 Operation::InputSuspend,
                 Operation::ExplicitSyncPark,
+                Operation::RenderWorkerQuiesce,
                 Operation::KmsWorkerQuiesce,
                 Operation::KmsWorkerJoin,
                 Operation::PageflipQuarantine,
@@ -1133,7 +1220,23 @@ mod tests {
             .iter()
             .position(|operation| *operation == NativeIoOperation::ExplicitSyncRearm)
             .expect("recovery must observe explicit-sync rearm");
+        let renderer_rebind = recorder
+            .native_io
+            .operations()
+            .iter()
+            .position(|operation| *operation == NativeIoOperation::RenderWorkerRebindAcknowledged)
+            .expect("recovery must acknowledge renderer generation rebind");
         assert!(baseline < rearm);
+        assert!(renderer_rebind < rearm);
+        assert!(
+            rearm
+                < recorder
+                    .native_io
+                    .operations()
+                    .iter()
+                    .position(|operation| *operation == NativeIoOperation::SchedulerRearm)
+                    .expect("scheduler must rearm after the renderer is coherent")
+        );
     }
 
     #[test]

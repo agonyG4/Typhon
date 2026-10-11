@@ -1401,6 +1401,7 @@ impl NativeRuntime {
     }
 
     fn finish_native_session_recovery(&mut self) -> NativeResult<()> {
+        self.render_worker_admission_stopped = false;
         self.session.finish_resume();
         self.reconcile_dmem_foreground();
         oblivion_one::native::scheduling_qos::reacquire_current_reactor_after_session_resume()

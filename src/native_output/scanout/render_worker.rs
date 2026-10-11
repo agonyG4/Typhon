@@ -18,7 +18,7 @@ use std::{
         mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
     },
     thread::JoinHandle,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use crate::egl_renderer::native_fence::NativeRenderFence;
@@ -256,6 +256,11 @@ enum RenderWorkerCommand {
     Render(AtomicRenderWorkerJob),
     Capture(AtomicRenderWorkerCapture),
     ReloadEffects(AtomicRenderWorkerEffectReload),
+    ApplyControls {
+        controls: Vec<SequencedRenderControl>,
+        required_control_epoch: u64,
+        response: SyncSender<io::Result<u64>>,
+    },
     Shutdown,
 }
 
@@ -464,6 +469,71 @@ impl AtomicRenderWorkerHandle {
             }
             Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
                 unreachable!("only a reload command is offered through try_dispatch_effect_reload")
+            }
+        }
+    }
+
+    /// Applies already-ordered controls while session recovery has stopped
+    /// admission and the render worker is known idle. The bounded reply wait
+    /// is reserved for this non-realtime lifecycle path; normal rendering
+    /// always carries controls with its next nonblocking command.
+    pub(crate) fn apply_controls_while_quiesced(
+        &mut self,
+        controls: Vec<SequencedRenderControl>,
+        required_control_epoch: u64,
+    ) -> io::Result<u64> {
+        if !self.initialized || self.busy || self.fatal.load(Ordering::Acquire) {
+            return Err(io::Error::other(
+                "renderer controls require an initialized, quiesced render worker",
+            ));
+        }
+        let (response_tx, response_rx) = mpsc::sync_channel(1);
+        let command = RenderWorkerCommand::ApplyControls {
+            controls,
+            required_control_epoch,
+            response: response_tx,
+        };
+        if let Err(error) = self.commands.try_send(command) {
+            let reason = match error {
+                TrySendError::Full(_) => "render worker command slot was unexpectedly full",
+                TrySendError::Disconnected(_) => "render worker disconnected during control rebind",
+            };
+            self.fail_control_lane();
+            return Err(io::Error::other(reason));
+        }
+        self.busy = true;
+        match response_rx.recv_timeout(Duration::from_secs(3)) {
+            Ok(Ok(applied_epoch)) if applied_epoch == required_control_epoch => {
+                self.busy = false;
+                Ok(applied_epoch)
+            }
+            Ok(Ok(applied_epoch)) => {
+                self.busy = false;
+                self.fail_control_lane();
+                Err(io::Error::other(format!(
+                    "renderer control rebind acknowledged epoch {applied_epoch}, expected {required_control_epoch}"
+                )))
+            }
+            Ok(Err(error)) => {
+                self.busy = false;
+                self.fail_control_lane();
+                Err(error)
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // The worker may still own GL/EGL state. Keep `busy` set and
+                // report fatal uncertainty so no render or physical teardown
+                // can assume the rebind completed.
+                self.fail_control_lane();
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "render worker did not acknowledge quiesced renderer controls",
+                ))
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                self.fail_control_lane();
+                Err(io::Error::other(
+                    "render worker dropped quiesced renderer control acknowledgment",
+                ))
             }
         }
     }
@@ -784,6 +854,66 @@ fn render_worker_loop(
                 if publish_event(&events, &event_fd, event).is_err() {
                     fatal.store(true, Ordering::Release);
                     return;
+                }
+            }
+            RenderWorkerCommand::ApplyControls {
+                controls,
+                required_control_epoch,
+                response,
+            } => {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                    || -> io::Result<u64> {
+                        let domain = domain.as_mut().ok_or_else(|| {
+                            io::Error::other(
+                                "render worker received recovery controls before initialization",
+                            )
+                        })?;
+                        validate_render_control_batch(
+                            applied_control_epoch,
+                            &controls,
+                            required_control_epoch,
+                        )?;
+                        for control in controls {
+                            apply_render_control(domain, control.control)?;
+                            applied_control_epoch = control.epoch;
+                        }
+                        Ok(applied_control_epoch)
+                    },
+                ));
+                match result {
+                    Ok(Ok(applied_epoch)) => {
+                        let _ = response.send(Ok(applied_epoch));
+                    }
+                    Ok(Err(error)) => {
+                        fatal.store(true, Ordering::Release);
+                        let _ = response.send(Err(io::Error::other(error.to_string())));
+                        let _ = publish_event(
+                            &events,
+                            &event_fd,
+                            AtomicRenderWorkerEvent::Fatal {
+                                job_id: None,
+                                gpu_execution_uncertain: true,
+                                reason: "quiesced_control_application_failed",
+                            },
+                        );
+                        return;
+                    }
+                    Err(_) => {
+                        fatal.store(true, Ordering::Release);
+                        let _ = response.send(Err(io::Error::other(
+                            "render worker panicked while applying quiesced controls",
+                        )));
+                        let _ = publish_event(
+                            &events,
+                            &event_fd,
+                            AtomicRenderWorkerEvent::Fatal {
+                                job_id: None,
+                                gpu_execution_uncertain: true,
+                                reason: "panic_during_quiesced_control_application",
+                            },
+                        );
+                        return;
+                    }
                 }
             }
             RenderWorkerCommand::Shutdown => {
@@ -1147,6 +1277,31 @@ mod tests {
         });
 
         assert!(rejected.is_err());
+        assert!(worker.busy());
+    }
+
+    #[test]
+    fn session_control_ack_refuses_to_wait_while_worker_is_busy() {
+        let (commands, _command_rx) = mpsc::sync_channel(1);
+        let (_events_tx, events) = mpsc::sync_channel(1);
+        let event_fd = Arc::new(create_eventfd().expect("eventfd"));
+        let fatal = Arc::new(AtomicBool::new(false));
+        let mut worker = AtomicRenderWorkerHandle {
+            commands,
+            events,
+            event_fd,
+            join: None,
+            busy: true,
+            initialized: true,
+            fatal,
+            control_lane_overflowed: false,
+        };
+
+        let error = worker
+            .apply_controls_while_quiesced(Vec::new(), 0)
+            .expect_err("recovery control waits require a quiescent worker");
+
+        assert!(error.to_string().contains("quiesced render worker"));
         assert!(worker.busy());
     }
 

@@ -349,6 +349,47 @@ pub(super) struct NativeCycleMicroturnBaseline {
 }
 
 impl NativeCycleState {
+    pub(super) fn for_worker_quiescence(pageflip_pending: bool) -> Self {
+        Self {
+            wakeup: NativeWakeup {
+                reasons: Default::default(),
+                continuation: Default::default(),
+                ready_sources: 0,
+                blocked_ns: 0,
+                timer_lateness_ns: None,
+                explicit_sync_acquire_tokens: Vec::new(),
+                dmabuf_gpu_release_tokens: Vec::new(),
+                xwayland_events: Vec::new(),
+                control_events: Vec::new(),
+                system_action_events: Default::default(),
+                cursor_io_events: Vec::new(),
+                keyboard_persistence_events: Vec::new(),
+                controller_monitor_ready: false,
+                controller_device_events: Vec::new(),
+            },
+            work_class: NativeWorkClass::NoOutputWork,
+            fast_path_completed: false,
+            pageflip_drain_us: 0,
+            pageflip_completed: false,
+            completed_pageflip_token: None,
+            frame_completed: false,
+            frame_rendered: false,
+            frame_submitted: false,
+            presentation_admitted: false,
+            present_us: 0,
+            pageflip_pending_at_tick: pageflip_pending,
+            tick_us: 0,
+            accepted: 0,
+            redraw_requested: false,
+            skipped_input_repaints: 0,
+            input_drain_us: 0,
+            raw_input_events: 0,
+            coalesced_input_events: 0,
+            cursor_motion_sample_id: None,
+            shutdown_requested: false,
+        }
+    }
+
     pub(super) const fn microturn_baseline(&self) -> NativeCycleMicroturnBaseline {
         NativeCycleMicroturnBaseline {
             work_class: self.work_class,
@@ -735,6 +776,7 @@ pub(crate) struct NativeRuntime {
     kms_commit_worker: Option<super::kms_worker::KmsCommitWorkerHandle>,
     kms_commit_worker_reactor_token: Option<ReactorToken>,
     render_worker_reactor_token: Option<ReactorToken>,
+    render_worker_admission_stopped: bool,
     pending_render_worker_identity: Option<super::scanout::AtomicRenderWorkerIdentity>,
     pending_render_worker_context: Option<super::scanout::AtomicRenderSettlementContext>,
     pending_render_worker_outer: Option<presentation_cycle::AtomicRenderOuterContinuation>,

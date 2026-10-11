@@ -821,18 +821,19 @@ impl NativeScanoutBackend {
         generation: u64,
         vrr_connector_capable: bool,
         vrr_crtc_property_available: bool,
-    ) {
+    ) -> io::Result<()> {
         match self {
             Self::AtomicEglGbm(scanout) => scanout.rebind_session_generation(
                 generation,
                 vrr_connector_capable,
                 vrr_crtc_property_available,
-            ),
+            )?,
             Self::NativeEglGbm(scanout) => scanout.rebind_session_generation(generation),
             Self::Gbm(scanout) => scanout.rebind_session_generation(generation),
             Self::Dumb(_) => {}
         }
         self.invalidate_direct_validation_cache();
+        Ok(())
     }
 
     pub(crate) fn invalidate_direct_validation_cache(&mut self) {

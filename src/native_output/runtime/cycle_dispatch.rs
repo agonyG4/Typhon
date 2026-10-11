@@ -1241,11 +1241,13 @@ impl NativeRuntime {
                 ));
             }
             if self.scanout.render_worker_active() {
-                if !super::render_worker::effect_reload_admission_available(
-                    true,
-                    self.scanout.render_worker_busy(),
-                    self.pending_worker_effect_reload.is_some(),
-                ) {
+                if self.render_worker_admission_stopped
+                    || !super::render_worker::effect_reload_admission_available(
+                        true,
+                        self.scanout.render_worker_busy(),
+                        self.pending_worker_effect_reload.is_some(),
+                    )
+                {
                     return Some(ControlResponse::failure(
                         request.id,
                         ControlError::new(
