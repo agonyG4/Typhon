@@ -1,5 +1,6 @@
 use super::presentation_cycle::complete_compatibility_no_visual_change;
 use super::presentation_cycle::cursor_work_requires_primary_repaint;
+use super::presentation_cycle::primary_render_admission_blocked;
 use super::*;
 use crate::native_output::runtime::commit_timing::logical_scene_changed;
 use crate::native_output::scanout::{NativePaintOutcome, NativePaintStats, NativeScanoutKind};
@@ -7,6 +8,13 @@ use oblivion_one::compositor::{DesktopFrameCopyKind, DesktopSceneRebuildKind};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_COMPATIBILITY_SKIP_SOCKET: AtomicU64 = AtomicU64::new(0);
+
+#[test]
+fn render_worker_admission_gate_only_blocks_new_primary_render_work() {
+    assert!(!primary_render_admission_blocked(false, false));
+    assert!(primary_render_admission_blocked(true, false));
+    assert!(primary_render_admission_blocked(false, true));
+}
 
 #[test]
 fn auto_hardware_cursor_deadline_does_not_queue_primary_render_work() {

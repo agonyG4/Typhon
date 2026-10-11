@@ -83,6 +83,13 @@ pub(crate) const fn primary_redraw_requested(
         || (cursor_deadline_due && client_cursor_software_work)
 }
 
+pub(crate) const fn primary_render_admission_blocked(
+    render_worker_busy: bool,
+    completion_pending: bool,
+) -> bool {
+    render_worker_busy || completion_pending
+}
+
 /// Hardware Auto cursor work is admitted as a PlaneDelta and must not seed a
 /// primary scene render. Software fallback and legacy policy work keep their
 /// existing visual repaint path.
@@ -350,15 +357,6 @@ impl NativeRuntime {
         let cursor_planning_started_at_ns =
             slow_cycle_enabled.then(monotonic_now_ns).transpose()?;
         #[rustfmt::skip] synchronize_active_cursor_image(server, cursor_manager, cursor_image, frame_renderer, scanout, queued_redraw_requested);
-        if scanout.render_worker_busy() || pending_render_worker_completion.is_some() {
-            // The worker owns the only rendering slot and this frame has not
-            // crossed protocol/frame-batch admission. Keep only redraw demand;
-            // the normal planner will resolve the newest compositor state
-            // after the executing result is settled.
-            *queued_redraw_requested = true;
-            *render_demand_coalesced_count = render_demand_coalesced_count.saturating_add(1);
-            return Ok(());
-        }
         let (client_cursor, client_surface_content_active, cursor_visible) =
             resolve_native_cursor_visibility(server, input_state);
         #[rustfmt::skip] prepare_legacy_cursor_for_frame(legacy_cursor, kms, target.crtc_id, cursor_image, cursor_render_mode, cursor_manager, server.client_cursor_surface_active(), perf)?;
@@ -1161,6 +1159,21 @@ impl NativeRuntime {
             scheduler_decision,
             SchedulerDecision::Render | SchedulerDecision::RenderAhead
         ) {
+            let worker_busy = scanout.render_worker_busy();
+            if primary_render_admission_blocked(
+                worker_busy,
+                pending_render_worker_completion.is_some(),
+            ) {
+                if worker_busy {
+                    // Ready-frame/KMS service above remains live. Only new
+                    // primary preparation is coalesced while the sole render
+                    // slot belongs to the worker.
+                    *queued_redraw_requested = true;
+                    *render_demand_coalesced_count =
+                        render_demand_coalesced_count.saturating_add(1);
+                }
+                return Ok(());
+            }
             let render_ahead = scheduler_decision == SchedulerDecision::RenderAhead;
             let mut direct_submitted = false;
             let mut direct_suppressed = false;
