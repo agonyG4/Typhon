@@ -168,6 +168,7 @@ pub(crate) struct AtomicRenderWorkerIdentity {
     pub(crate) transaction_id: OutputTransactionId,
     pub(crate) output_generation: u64,
     pub(crate) render_generation: u64,
+    pub(crate) control_epoch: u64,
     pub(crate) target: RenderTargetRequest,
 }
 
@@ -179,6 +180,7 @@ impl AtomicRenderWorkerCompletion {
             transaction_id: self.transaction_id,
             output_generation: self.output_generation,
             render_generation: self.render_generation,
+            control_epoch: self.control_epoch,
             target: self.target,
         }
     }
@@ -193,6 +195,7 @@ pub(crate) fn completion_matches_job(
         && expected.transaction_id.get() == actual.transaction_id.get()
         && expected.output_generation == actual.output_generation
         && expected.render_generation == actual.render_generation
+        && expected.control_epoch == actual.control_epoch
         && expected.target.slot.get() == actual.target.slot.get()
         && expected.target.pool_generation == actual.target.pool_generation
         && expected.target.buffer_age == actual.target.buffer_age
@@ -876,6 +879,7 @@ mod tests {
             transaction_id: OutputTransactionId::new(NonZeroU64::new(13).unwrap()),
             output_generation: 14,
             render_generation: 15,
+            control_epoch: 17,
             target: RenderTargetRequest {
                 slot: super::super::OutputSlotId::new(1).unwrap(),
                 pool_generation: 16,
@@ -922,6 +926,13 @@ mod tests {
         assert!(!completion_matches_job(
             identity,
             AtomicRenderWorkerIdentity {
+                control_epoch: 20,
+                ..identity
+            }
+        ));
+        assert!(!completion_matches_job(
+            identity,
+            AtomicRenderWorkerIdentity {
                 target: RenderTargetRequest {
                     slot: super::super::OutputSlotId::new(2).unwrap(),
                     ..identity.target
@@ -934,6 +945,16 @@ mod tests {
             AtomicRenderWorkerIdentity {
                 target: RenderTargetRequest {
                     pool_generation: 19,
+                    ..identity.target
+                },
+                ..identity
+            }
+        ));
+        assert!(!completion_matches_job(
+            identity,
+            AtomicRenderWorkerIdentity {
+                target: RenderTargetRequest {
+                    buffer_age: crate::egl_renderer::BufferAge::Value(3),
                     ..identity.target
                 },
                 ..identity
