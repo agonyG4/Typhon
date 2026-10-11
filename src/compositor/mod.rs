@@ -129,6 +129,7 @@ mod toplevel_collection;
 mod toplevel_publication;
 mod toplevel_publication_state;
 mod window_backend;
+mod x11_geometry_policy;
 pub use effect_backdrop_reuse::EffectBackdropReuse;
 mod window_state;
 mod workspace_protocol;

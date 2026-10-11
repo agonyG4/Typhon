@@ -1071,12 +1071,18 @@ impl super::super::CompositorState {
         let Some(window) = self.window(window_id) else {
             return [0; 4];
         };
-        let decoration_mode =
-            self.effective_decoration_mode_for_window(window, window.state.mode());
+        self.x11_decoration_frame_extents_for_window(window, window.state.mode())
+    }
+
+    pub(in crate::compositor) fn x11_decoration_frame_extents_for_window(
+        &self,
+        window: &DesktopWindow,
+        mode: ToplevelMode,
+    ) -> [u32; 4] {
+        let decoration_mode = self.effective_decoration_mode_for_window(window, mode);
         if decoration_mode != DecorationMode::ServerSide {
             return [0; 4];
         }
-        let mode = window.state.mode();
         let chrome_policy = window
             .management
             .map_or(crate::wm::WindowChromePolicy::Full, |management| {

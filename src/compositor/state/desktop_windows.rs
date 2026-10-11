@@ -16,6 +16,16 @@ fn rectangles_overlap(
         && i64::from(right_y) < left_bottom
 }
 
+fn clamp_i64_to_i32(value: i64) -> i32 {
+    i32::try_from(value).unwrap_or_else(|_| {
+        if value.is_negative() {
+            i32::MIN
+        } else {
+            i32::MAX
+        }
+    })
+}
+
 impl CompositorState {
     /// Resolve stored placement representation into a self-contained output
     /// rectangle. Cascaded placement needs the live root ordering; if the
@@ -135,15 +145,21 @@ impl CompositorState {
         }
         let previous_x11_geometry = window.x11_geometry;
         let previous_materialized_client_rect = window.x11_materialized_client_rect;
+        let initial_frame_extents = match window.backend {
+            WindowBackend::X11(_) => {
+                self.x11_decoration_frame_extents_for_window(&window, window.state.mode())
+            }
+            WindowBackend::Xdg(_) => [0; 4],
+        };
         let initial_placement = match window.backend {
-            WindowBackend::Xdg(_) => Some(self.allocate_initial_frame(None, (800, 600))),
+            WindowBackend::Xdg(_) => Some(self.allocate_initial_frame(None, (800, 600), [0; 4])),
             WindowBackend::X11(_) => match window.x11_placement_policy {
                 Some(X11PlacementPolicy::CompositorManaged) => {
                     let size = window
                         .x11_geometry
                         .map(|geometry| (geometry.frame.width.max(1), geometry.frame.height.max(1)))
                         .unwrap_or((1, 1));
-                    Some(self.allocate_initial_frame(None, size))
+                    Some(self.allocate_initial_frame(None, size, initial_frame_extents))
                 }
                 Some(
                     X11PlacementPolicy::ClientPositioned
@@ -208,6 +224,7 @@ impl CompositorState {
         &self,
         excluded: Option<WindowId>,
         (width, height): (u32, u32),
+        extents: [u32; 4],
     ) -> SurfacePlacement {
         let width = width.max(1);
         let height = height.max(1);
@@ -228,10 +245,25 @@ impl CompositorState {
             .saturating_add(occupied.len())
             .saturating_add(64);
         let usable = self.usable_output_geometry();
-        let min_x = usable.x as i32;
-        let min_y = usable.y as i32;
-        let max_x = (usable.x + (usable.width - f64::from(width)).max(0.0)) as i32;
-        let max_y = (usable.y + (usable.height - f64::from(height)).max(0.0)) as i32;
+        let [left, right, top, bottom] = extents.map(i64::from);
+        let usable_left = usable.x.ceil() as i64;
+        let usable_top = usable.y.ceil() as i64;
+        let usable_right = (usable.x + usable.width).floor() as i64;
+        let usable_bottom = (usable.y + usable.height).floor() as i64;
+        let min_x = clamp_i64_to_i32(usable_left.saturating_add(left));
+        let min_y = clamp_i64_to_i32(usable_top.saturating_add(top));
+        let max_x = clamp_i64_to_i32(
+            usable_right
+                .saturating_sub(right)
+                .saturating_sub(i64::from(width))
+                .max(i64::from(min_x)),
+        );
+        let max_y = clamp_i64_to_i32(
+            usable_bottom
+                .saturating_sub(bottom)
+                .saturating_sub(i64::from(height))
+                .max(i64::from(min_y)),
+        );
         let mut visible_fallback = None;
         let mut distinct_visible_fallback = None;
         for ordinal in 0..=candidate_count {
@@ -239,7 +271,14 @@ impl CompositorState {
             let x = x.clamp(min_x, max_x);
             let y = y.clamp(min_y, max_y);
             let candidate = (x, y, width, height);
-            visible_fallback.get_or_insert(candidate);
+            let frame_candidate = (
+                x.saturating_sub(i32::try_from(left).unwrap_or(i32::MAX)),
+                y.saturating_sub(i32::try_from(top).unwrap_or(i32::MAX)),
+                width.saturating_add(u32::try_from(left.saturating_add(right)).unwrap_or(u32::MAX)),
+                height
+                    .saturating_add(u32::try_from(top.saturating_add(bottom)).unwrap_or(u32::MAX)),
+            );
+            visible_fallback.get_or_insert((x, y, width, height));
             if distinct_visible_fallback.is_none()
                 && occupied
                     .iter()
@@ -249,7 +288,7 @@ impl CompositorState {
             }
             if !occupied
                 .iter()
-                .any(|existing| rectangles_overlap(candidate, *existing))
+                .any(|existing| rectangles_overlap(frame_candidate, *existing))
             {
                 return SurfacePlacement::absolute_root_at(x, y);
             }
@@ -519,26 +558,126 @@ impl CompositorState {
             .allocate_window_id()
             .map_err(|_| X11WindowAdmissionError::WindowIdExhausted)?;
         let handle = snapshot.handle;
-        let geometry = snapshot.geometry;
+        let requested_geometry = snapshot.geometry;
         let requested_state = snapshot.state;
-        self.insert_desktop_window(DesktopWindow::new_x11(window_id, snapshot))
-            .map_err(|_| X11WindowAdmissionError::DuplicateRootSurface)?;
-        let initial_geometry = self
-            .window(window_id)
-            .and_then(|window| window.x11_geometry)
-            .map(|state| crate::xwayland::xwm::X11Geometry {
-                x: state.frame.placement.local_x,
-                y: state.frame.placement.local_y,
-                ..geometry
-            })
-            .unwrap_or(geometry);
-        let _ = self.set_x11_geometry_from_source(
-            handle,
-            initial_geometry,
-            X11GeometryAuthoritySource::InitialManage,
+        let mut initial_window = DesktopWindow::new_x11(window_id, snapshot);
+        let usable_area = self.usable_output_geometry();
+        let frame_extents =
+            self.x11_decoration_frame_extents_for_window(&initial_window, ToplevelMode::Normal);
+        let normalized_geometry = crate::xwayland::xwm::icccm::apply_configure_request(
+            requested_geometry,
+            requested_geometry,
+            crate::xwayland::xwm::X11ConfigureFlags::all(),
+            initial_window.constraints,
         );
+        let policy = crate::compositor::x11_geometry_policy::ManagedX11GeometryPolicy {
+            role: initial_window.x11_role,
+            placement: initial_window.x11_placement_policy,
+            mode: ToplevelMode::Normal,
+            tiled: false,
+            usable_area,
+            frame_extents,
+        };
+        let policy_result =
+            crate::compositor::x11_geometry_policy::apply_managed_x11_geometry_policy(
+                normalized_geometry,
+                normalized_geometry,
+                crate::xwayland::xwm::X11ConfigureFlags::all(),
+                &policy,
+            );
+        let mut accepted_geometry = policy_result.accepted;
+        let compositor_managed = initial_window.kind == DesktopWindowKind::Managed
+            && initial_window.is_normal_x11_role()
+            && initial_window.x11_placement_policy == Some(X11PlacementPolicy::CompositorManaged);
+        let placement = if compositor_managed {
+            let placement = self.allocate_initial_frame(
+                None,
+                (accepted_geometry.width, accepted_geometry.height),
+                frame_extents,
+            );
+            accepted_geometry.x = placement.local_x;
+            accepted_geometry.y = placement.local_y;
+            placement
+        } else {
+            SurfacePlacement::absolute_root_at(accepted_geometry.x, accepted_geometry.y)
+        };
+        if let Some(geometry) = initial_window.x11_geometry.as_mut() {
+            geometry.client = accepted_geometry;
+            geometry.frame = WindowGeometry::new(
+                placement,
+                accepted_geometry.width.max(1),
+                accepted_geometry.height.max(1),
+            );
+        }
+        initial_window.x11_materialized_client_rect =
+            crate::presentation_animation::PresentationRect::new(
+                f64::from(accepted_geometry.x),
+                f64::from(accepted_geometry.y),
+                f64::from(accepted_geometry.width.max(1)),
+                f64::from(accepted_geometry.height.max(1)),
+            );
+        self.insert_desktop_window(initial_window)
+            .map_err(|_| X11WindowAdmissionError::DuplicateRootSurface)?;
+        let mut constraint_reasons = Vec::new();
+        if normalized_geometry != requested_geometry {
+            constraint_reasons.push("icccm");
+        }
+        constraint_reasons.extend(policy_result.reasons);
+        if compositor_managed {
+            constraint_reasons.push("compositor_initial_placement");
+        }
+        let constraint_reason = if constraint_reasons.is_empty() {
+            "none".to_owned()
+        } else {
+            constraint_reasons.join("+")
+        };
+        if super::windows::lifecycle_diagnostics_enabled() {
+            let role = self
+                .window(window_id)
+                .and_then(|window| window.x11_role)
+                .map_or_else(|| "unknown".to_owned(), |role| format!("{role:?}"));
+            let placement_policy = self
+                .window(window_id)
+                .and_then(|window| window.x11_placement_policy)
+                .map_or_else(|| "unknown".to_owned(), |policy| format!("{policy:?}"));
+            let visible_mode = if requested_state.fullscreen {
+                ToplevelMode::Fullscreen
+            } else if requested_state.maximized {
+                ToplevelMode::Maximized
+            } else {
+                ToplevelMode::Normal
+            };
+            let [left, right, top, bottom] = frame_extents;
+            eprintln!(
+                "typhon.x11_geometry event=initial_acceptance window_id={} xid={} role={} placement_policy={} requested_x={} requested_y={} requested_width={} requested_height={} icccm_x={} icccm_y={} icccm_width={} icccm_height={} accepted_x={} accepted_y={} accepted_width={} accepted_height={} usable_x={:.1} usable_y={:.1} usable_width={:.1} usable_height={:.1} frame_extents_left={} frame_extents_right={} frame_extents_top={} frame_extents_bottom={} accepted_mode=Normal visible_mode={visible_mode:?} constraint_reason={constraint_reason}",
+                window_id.get(),
+                handle.xid(),
+                role,
+                placement_policy,
+                requested_geometry.x,
+                requested_geometry.y,
+                requested_geometry.width,
+                requested_geometry.height,
+                normalized_geometry.x,
+                normalized_geometry.y,
+                normalized_geometry.width,
+                normalized_geometry.height,
+                accepted_geometry.x,
+                accepted_geometry.y,
+                accepted_geometry.width,
+                accepted_geometry.height,
+                usable_area.x,
+                usable_area.y,
+                usable_area.width,
+                usable_area.height,
+                left,
+                right,
+                top,
+                bottom,
+            );
+        }
         self.rebuild_x11_transient_relationships();
-        self.apply_initial_x11_state(handle, requested_state, geometry);
+        self.apply_initial_x11_state(handle, requested_state, accepted_geometry);
         Ok(window_id)
     }
 
@@ -584,11 +723,17 @@ impl CompositorState {
             if let Some(window) = self.window_mut(window_id) {
                 window.state.set_mode(mode);
             }
-            let _ = self.set_x11_frame_geometry_from_source(
-                window_id,
-                restore_geometry,
-                X11GeometryAuthoritySource::InitialManage,
-            );
+            let current_frame = self
+                .window(window_id)
+                .and_then(|window| window.x11_geometry)
+                .map(|geometry| geometry.frame);
+            if current_frame != Some(restore_geometry) {
+                let _ = self.set_x11_frame_geometry_from_source(
+                    window_id,
+                    restore_geometry,
+                    X11GeometryAuthoritySource::InitialManage,
+                );
+            }
             self.set_surface_placement_with_cause(
                 root_surface_id,
                 floating_placement,
@@ -784,6 +929,13 @@ impl CompositorState {
         let Some(client) = client else {
             return;
         };
+        let frame_extents = self
+            .window(window_id)
+            .and_then(|window| match window.backend {
+                WindowBackend::X11(handle) => Some(self.x11_decoration_frame_extents(handle)),
+                WindowBackend::Xdg(_) => None,
+            })
+            .unwrap_or([0; 4]);
         let placement = match new_policy {
             Some(X11PlacementPolicy::CompositorManaged) => {
                 if old_policy == Some(X11PlacementPolicy::CompositorManaged) {
@@ -793,12 +945,14 @@ impl CompositorState {
                             self.allocate_initial_frame(
                                 Some(window_id),
                                 (client.width.max(1), client.height.max(1)),
+                                frame_extents,
                             )
                         })
                 } else {
                     self.allocate_initial_frame(
                         Some(window_id),
                         (client.width.max(1), client.height.max(1)),
+                        frame_extents,
                     )
                 }
             }
@@ -1247,12 +1401,20 @@ impl CompositorState {
         else {
             return false;
         };
+        let frame_extents = self
+            .window(window_id)
+            .and_then(|window| match window.backend {
+                WindowBackend::X11(handle) => Some(self.x11_decoration_frame_extents(handle)),
+                WindowBackend::Xdg(_) => None,
+            })
+            .unwrap_or([0; 4]);
         let placement = match placement_policy {
             Some(X11PlacementPolicy::CompositorManaged) => {
                 persisted_placement.unwrap_or_else(|| {
                     self.allocate_initial_frame(
                         None,
                         (geometry.width.max(1), geometry.height.max(1)),
+                        frame_extents,
                     )
                 })
             }
@@ -1825,7 +1987,7 @@ impl CompositorState {
                 window, ..
             }
             | crate::compositor::window_backend::WindowBackendCommand::Close { window }
-            | crate::compositor::window_backend::WindowBackendCommand::Map { window }
+            | crate::compositor::window_backend::WindowBackendCommand::SetMapped { window, .. }
             | crate::compositor::window_backend::WindowBackendCommand::SetActivated { window, .. }
             | crate::compositor::window_backend::WindowBackendCommand::Restack { window }
             | crate::compositor::window_backend::WindowBackendCommand::PublishState { window, .. }

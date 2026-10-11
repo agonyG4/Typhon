@@ -107,7 +107,7 @@ fn pending_xwayland_restore_canonical_rect(
     Ok(rect)
 }
 
-fn lifecycle_diagnostics_enabled() -> bool {
+pub(super) fn lifecycle_diagnostics_enabled() -> bool {
     matches!(
         std::env::var("ASTREA_LIFECYCLE_DIAGNOSTICS").as_deref(),
         Ok("1" | "true" | "on")

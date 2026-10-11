@@ -47,6 +47,8 @@ impl OwnCompositorServer {
     ) {
         let window_id = self.state.window_id_for_x11_handle(window);
         let managed = window_id.and_then(|id| self.state.window(id));
+        let pending_restore =
+            window_id.is_some_and(|id| self.state.pending_xwayland_restores.contains_key(&id));
         let root_surface_id = managed.map(|window| window.root_surface_id);
         let visual_geometry = root_surface_id
             .and_then(|surface_id| self.state.current_visual_root_window_geometry(surface_id))
@@ -126,6 +128,51 @@ impl OwnCompositorServer {
                 .optional("visual_geometry", visual_geometry)
                 .optional("committed_content_extent", committed_content_extent)
         });
+        if pending_restore
+            && matches!(
+                std::env::var("ASTREA_LIFECYCLE_DIAGNOSTICS").as_deref(),
+                Ok("1" | "true" | "on")
+            )
+        {
+            let [left, right, top, bottom] = normalization.frame_extents;
+            let mapping_lifecycle = managed.map_or("unknown", |window| {
+                if window.state.is_minimized() {
+                    "iconic_restore_pending"
+                } else {
+                    "normal_restore_pending"
+                }
+            });
+            let accepted = normalization.accepted_geometry;
+            let icccm = normalization.icccm_geometry;
+            eprintln!(
+                "typhon.x11_geometry event=configure_request_during_restore window_id={} xid={} generation={} surface_id={} pending_restore=true logical_minimized={} mapping_lifecycle={} frame_extents_left={} frame_extents_right={} frame_extents_top={} frame_extents_bottom={} raw_x={} raw_y={} raw_width={} raw_height={} icccm_x={} icccm_y={} icccm_width={} icccm_height={} wm_accepted_x={} wm_accepted_y={} wm_accepted_width={} wm_accepted_height={} constraint_reason={}",
+                window_id.map_or_else(|| "none".to_owned(), |id| id.get().to_string()),
+                window.xid(),
+                window.generation().get(),
+                managed
+                    .and_then(|managed| managed.x11_surface_id)
+                    .map_or_else(|| "none".to_owned(), |surface_id| surface_id.to_string()),
+                managed.is_some_and(|window| window.state.is_minimized()),
+                mapping_lifecycle,
+                left,
+                right,
+                top,
+                bottom,
+                request.requested.x,
+                request.requested.y,
+                request.requested.width,
+                request.requested.height,
+                icccm.x,
+                icccm.y,
+                icccm.width,
+                icccm.height,
+                accepted.x,
+                accepted.y,
+                accepted.width,
+                accepted.height,
+                normalization.constraint_reason,
+            );
+        }
     }
 
     pub(super) fn x11_configure_request_geometry(
@@ -146,25 +193,25 @@ impl OwnCompositorServer {
         );
         let usable_area = self.state.usable_output_geometry();
         let frame_extents = self.state.x11_decoration_frame_extents(window);
-        let managed_policy = self
+        let managed = self
             .state
             .window_id_for_x11_handle(window)
             .and_then(|window_id| self.state.window(window_id))
-            .filter(|managed| {
-                managed.kind == crate::compositor::DesktopWindowKind::Managed
-                    && managed.is_normal_x11_role()
-                    && managed.x11_placement_policy
-                        == Some(crate::compositor::X11PlacementPolicy::CompositorManaged)
-            })
-            .map(|managed| {
-                (
-                    managed.id,
-                    managed.state.mode(),
-                    managed.management.is_some_and(|management| {
-                        management.layout() == crate::wm::LayoutMembership::Tiled
-                    }),
-                )
-            });
+            .filter(|managed| managed.kind == crate::compositor::DesktopWindowKind::Managed);
+        let policy = crate::compositor::x11_geometry_policy::ManagedX11GeometryPolicy {
+            role: managed.and_then(|window| window.x11_role),
+            placement: managed.and_then(|window| window.x11_placement_policy),
+            mode: managed.map_or(crate::compositor::ToplevelMode::Normal, |window| {
+                window.state.mode()
+            }),
+            tiled: managed.is_some_and(|window| {
+                window.management.is_some_and(|management| {
+                    management.layout() == crate::wm::LayoutMembership::Tiled
+                })
+            }),
+            usable_area,
+            frame_extents,
+        };
 
         let mut reasons = Vec::new();
         if (request.fields.x && icccm_geometry.x != request.requested.x)
@@ -175,31 +222,18 @@ impl OwnCompositorServer {
             reasons.push("icccm");
         }
 
-        let accepted_geometry = match managed_policy {
-            Some((_, mode, _)) if mode != crate::compositor::ToplevelMode::Normal => {
-                reasons.push("mode_authority");
-                current
-            }
-            Some((_, _, true)) => {
-                reasons.push("layout_authority");
-                current
-            }
-            Some((_, _, false)) => {
-                let (geometry, work_area_reasons) = constrain_managed_x11_request(
-                    icccm_geometry,
-                    request.fields,
-                    usable_area,
-                    frame_extents,
-                );
-                reasons.extend(work_area_reasons);
-                geometry
-            }
-            None => icccm_geometry,
-        };
+        let policy_result =
+            crate::compositor::x11_geometry_policy::apply_managed_x11_geometry_policy(
+                icccm_geometry,
+                current,
+                request.fields,
+                &policy,
+            );
+        reasons.extend(policy_result.reasons);
 
         X11ConfigureRequestGeometry {
             icccm_geometry,
-            accepted_geometry,
+            accepted_geometry: policy_result.accepted,
             constraint_reason: if reasons.is_empty() {
                 "none".to_string()
             } else {
@@ -643,105 +677,4 @@ impl OwnCompositorServer {
             })
             .collect()
     }
-}
-
-fn constrain_managed_x11_request(
-    mut geometry: X11Geometry,
-    fields: crate::xwayland::xwm::X11ConfigureFlags,
-    usable_area: crate::compositor::OutputRect,
-    extents: [u32; 4],
-) -> (X11Geometry, Vec<&'static str>) {
-    let usable_left = usable_area.x.ceil() as i64;
-    let usable_top = usable_area.y.ceil() as i64;
-    let usable_right = (usable_area.x + usable_area.width).floor() as i64;
-    let usable_bottom = (usable_area.y + usable_area.height).floor() as i64;
-    let [left, right, top, bottom] = extents.map(i64::from);
-    let maximum_width = usable_right
-        .saturating_sub(usable_left)
-        .saturating_sub(left)
-        .saturating_sub(right)
-        .max(1);
-    let maximum_height = usable_bottom
-        .saturating_sub(usable_top)
-        .saturating_sub(top)
-        .saturating_sub(bottom)
-        .max(1);
-    let mut reasons = Vec::new();
-
-    let original_width = geometry.width;
-    geometry.width =
-        u32::try_from(i64::from(geometry.width).min(maximum_width)).unwrap_or(u32::MAX);
-    if geometry.width != original_width {
-        reasons.push("usable_width");
-    }
-    let original_height = geometry.height;
-    geometry.height =
-        u32::try_from(i64::from(geometry.height).min(maximum_height)).unwrap_or(u32::MAX);
-    if geometry.height != original_height {
-        reasons.push("usable_height");
-    }
-
-    let original_x = geometry.x;
-    if fields.x {
-        let minimum_x = usable_left.saturating_add(left);
-        let maximum_x = usable_right
-            .saturating_sub(right)
-            .saturating_sub(i64::from(geometry.width))
-            .max(minimum_x);
-        geometry.x = clamp_i64_to_i32(i64::from(geometry.x).clamp(minimum_x, maximum_x));
-    } else {
-        let available_width = usable_right
-            .saturating_sub(right)
-            .saturating_sub(i64::from(geometry.x))
-            .max(1);
-        let accepted_width =
-            u32::try_from(i64::from(geometry.width).min(available_width)).unwrap_or(u32::MAX);
-        if accepted_width != geometry.width {
-            geometry.width = accepted_width;
-            if !reasons.contains(&"usable_width") {
-                reasons.push("usable_width");
-            }
-        }
-    }
-    if geometry.x != original_x {
-        reasons.push("usable_position");
-    }
-
-    let original_y = geometry.y;
-    if fields.y {
-        let minimum_y = usable_top.saturating_add(top);
-        let maximum_y = usable_bottom
-            .saturating_sub(bottom)
-            .saturating_sub(i64::from(geometry.height))
-            .max(minimum_y);
-        geometry.y = clamp_i64_to_i32(i64::from(geometry.y).clamp(minimum_y, maximum_y));
-    } else {
-        let available_height = usable_bottom
-            .saturating_sub(bottom)
-            .saturating_sub(i64::from(geometry.y))
-            .max(1);
-        let accepted_height =
-            u32::try_from(i64::from(geometry.height).min(available_height)).unwrap_or(u32::MAX);
-        if accepted_height != geometry.height {
-            geometry.height = accepted_height;
-            if !reasons.contains(&"usable_height") {
-                reasons.push("usable_height");
-            }
-        }
-    }
-    if geometry.y != original_y {
-        reasons.push("usable_position");
-    }
-
-    (geometry, reasons)
-}
-
-fn clamp_i64_to_i32(value: i64) -> i32 {
-    i32::try_from(value).unwrap_or_else(|_| {
-        if value.is_negative() {
-            i32::MIN
-        } else {
-            i32::MAX
-        }
-    })
 }

@@ -2658,6 +2658,210 @@ fn restore_adopts_active_xwayland_surface_after_old_surface_is_retired() {
 }
 
 #[test]
+fn x11_window_ready_admits_oversized_initial_geometry_through_managed_policy() {
+    let mut fixture = first_buffer_fixture();
+    assert!(fixture.server.state.set_output_size(1_920, 1_080));
+    let mut snapshot = fake_snapshot();
+    snapshot.surface_id = fixture.surface_id;
+    snapshot.geometry = X11Geometry {
+        x: -1_000,
+        y: -500,
+        width: 1_920,
+        height: 1_080,
+    };
+    let handle = snapshot.handle;
+
+    let commands = fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::WindowReady(snapshot));
+
+    let window_id = fixture
+        .server
+        .state
+        .window_id_for_x11_handle(handle)
+        .expect("normal X11 window admitted");
+    let window = fixture
+        .server
+        .state
+        .window(window_id)
+        .expect("admitted window");
+    let accepted = window.x11_geometry.expect("accepted X11 geometry");
+    let materialized = window
+        .x11_materialized_client_rect
+        .expect("accepted client rectangle");
+    let usable = fixture.server.state.usable_output_geometry();
+    let extents = fixture.server.state.x11_decoration_frame_extents(handle);
+    let [left, right, top, bottom] = extents.map(i64::from);
+
+    assert!(
+        accepted.client.height < 1_080,
+        "initial height must be constrained"
+    );
+    assert_eq!(accepted.client.width, 1_920);
+    assert_eq!(accepted.client.width, accepted.frame.width);
+    assert_eq!(accepted.client.height, accepted.frame.height);
+    assert_eq!(
+        materialized,
+        crate::compositor::PresentationRect::new(
+            f64::from(accepted.client.x),
+            f64::from(accepted.client.y),
+            f64::from(accepted.client.width),
+            f64::from(accepted.client.height),
+        )
+        .expect("accepted rectangle is valid")
+    );
+    assert!(i64::from(accepted.client.x) - left >= usable.x.ceil() as i64);
+    assert!(
+        i64::from(accepted.client.x) + i64::from(accepted.client.width) + right
+            <= (usable.x + usable.width).floor() as i64
+    );
+    assert!(i64::from(accepted.client.y) - top >= usable.y.ceil() as i64);
+    assert!(
+        i64::from(accepted.client.y) + i64::from(accepted.client.height) + bottom
+            <= (usable.y + usable.height).floor() as i64
+    );
+    assert_eq!(
+        commands
+            .iter()
+            .filter(|command| matches!(
+                command,
+                XwmCommand::ConfigureFrame { window, geometry, frame_extents }
+                    if *window == handle && *geometry == accepted.client && *frame_extents == extents
+            ))
+            .count(),
+        1,
+        "admission must publish one accepted ConfigureFrame authority"
+    );
+}
+
+#[test]
+fn initial_fullscreen_keeps_a_constrained_normal_restore_geometry() {
+    let mut fixture = first_buffer_fixture();
+    assert!(fixture.server.state.set_output_size(1_920, 1_080));
+    let mut snapshot = fake_snapshot();
+    snapshot.surface_id = fixture.surface_id;
+    snapshot.geometry = X11Geometry {
+        x: -900,
+        y: -700,
+        width: 1_920,
+        height: 1_080,
+    };
+    snapshot.state.fullscreen = true;
+    let handle = snapshot.handle;
+
+    fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::WindowReady(snapshot));
+
+    let window_id = fixture
+        .server
+        .state
+        .window_id_for_x11_handle(handle)
+        .expect("fullscreen X11 window admitted");
+    let window = fixture
+        .server
+        .state
+        .window(window_id)
+        .expect("admitted window");
+    assert_eq!(
+        window.state.mode(),
+        crate::compositor::ToplevelMode::Fullscreen
+    );
+    let visible = window.x11_geometry.expect("fullscreen X11 geometry").frame;
+    assert_eq!((visible.width, visible.height), (1_920, 1_080));
+    let restore = window
+        .state
+        .restore_geometry()
+        .expect("normal restore geometry captured before fullscreen");
+    let extents = fixture.server.state.x11_decoration_frame_extents(handle);
+    let [left, right, top, bottom] = extents.map(i64::from);
+    assert!(restore.width < 1_920 || restore.height < 1_080);
+    assert!(i64::from(restore.width) + left + right <= 1_920);
+    assert!(i64::from(restore.height) + top + bottom <= 1_080);
+}
+
+#[test]
+fn initial_maximized_keeps_a_constrained_normal_restore_geometry() {
+    let mut fixture = first_buffer_fixture();
+    assert!(fixture.server.state.set_output_size(1_920, 1_080));
+    let mut snapshot = fake_snapshot();
+    snapshot.surface_id = fixture.surface_id;
+    snapshot.geometry = X11Geometry {
+        x: -900,
+        y: -700,
+        width: 1_920,
+        height: 1_080,
+    };
+    snapshot.state.maximized = true;
+    let handle = snapshot.handle;
+
+    fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::WindowReady(snapshot));
+
+    let window_id = fixture
+        .server
+        .state
+        .window_id_for_x11_handle(handle)
+        .expect("maximized X11 window admitted");
+    let window = fixture
+        .server
+        .state
+        .window(window_id)
+        .expect("admitted window");
+    assert_eq!(
+        window.state.mode(),
+        crate::compositor::ToplevelMode::Maximized
+    );
+    let restore = window
+        .state
+        .restore_geometry()
+        .expect("normal restore geometry captured before maximize");
+    let extents = fixture.server.state.x11_decoration_frame_extents(handle);
+    let [left, right, top, bottom] = extents.map(i64::from);
+    assert!(i64::from(restore.width) + left + right <= 1_920);
+    assert!(i64::from(restore.height) + top + bottom <= 1_080);
+}
+
+#[test]
+fn client_positioned_initial_x11_geometry_skips_managed_work_area_clamping() {
+    let mut fixture = first_buffer_fixture();
+    assert!(fixture.server.state.set_output_size(1_920, 1_080));
+    let mut snapshot = fake_snapshot();
+    snapshot.surface_id = fixture.surface_id;
+    snapshot.window_types = X11WindowTypes::new(vec![X11WindowType::PopupMenu]);
+    snapshot.geometry = X11Geometry {
+        x: -120,
+        y: -80,
+        width: 2_000,
+        height: 1_200,
+    };
+    let handle = snapshot.handle;
+
+    fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::WindowReady(snapshot));
+
+    let window_id = fixture
+        .server
+        .state
+        .window_id_for_x11_handle(handle)
+        .expect("client-positioned X11 window admitted");
+    let window = fixture
+        .server
+        .state
+        .window(window_id)
+        .expect("admitted popup");
+    assert_eq!(
+        window.x11_placement_policy,
+        Some(crate::compositor::X11PlacementPolicy::ClientPositioned)
+    );
+    let geometry = window.x11_geometry.expect("popup geometry").client;
+    assert_eq!((geometry.x, geometry.y), (-120, -80));
+    assert_eq!((geometry.width, geometry.height), (2_000, 1_200));
+}
+
+#[test]
 fn x11_window_ready_initial_focus_activates_normal_toplevel() {
     let mut fixture = first_buffer_fixture();
     let mut snapshot = fake_snapshot();
