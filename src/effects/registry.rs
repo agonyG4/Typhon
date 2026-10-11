@@ -283,6 +283,21 @@ pub struct EffectRegistryGeneration {
     pub shaders: BTreeMap<ShaderModuleId, TrustedShaderAsset>,
 }
 
+/// An immutable trusted-effect candidate that is not yet visible to frame
+/// execution. Renderer publication must succeed before this value is
+/// committed to [`TrustedEffectRegistry`].
+#[derive(Debug)]
+pub struct PreparedEffectRegistryReload {
+    previous_generation: u64,
+    generation: EffectRegistryGeneration,
+}
+
+impl PreparedEffectRegistryReload {
+    pub fn generation(&self) -> &EffectRegistryGeneration {
+        &self.generation
+    }
+}
+
 impl EffectRegistryGeneration {
     pub fn with_builtin_background_blur() -> Self {
         Self::with_builtin_background_material(
@@ -386,6 +401,44 @@ impl TrustedEffectRegistry {
             .read()
             .expect("effect registry lock is not poisoned")
             .clone()
+    }
+
+    /// Build and validate a candidate without publishing it. This lets an
+    /// asynchronous renderer compile shader modules before the reactor makes
+    /// the new generation authoritative.
+    pub fn prepare_reload(
+        &self,
+        manifest: EffectManifest,
+    ) -> Result<PreparedEffectRegistryReload, RegistryReloadError> {
+        let previous = self.current();
+        let mut generation = build_generation(manifest, previous.generation.saturating_add(1))?;
+        inherit_builtin_material(&mut generation, &previous)?;
+        Ok(PreparedEffectRegistryReload {
+            previous_generation: previous.generation,
+            generation,
+        })
+    }
+
+    /// Publish a prepared candidate only if the authoritative generation has
+    /// not changed while an asynchronous renderer was compiling it.
+    pub fn publish_prepared_reload(
+        &self,
+        prepared: PreparedEffectRegistryReload,
+    ) -> Result<Arc<EffectRegistryGeneration>, RegistryReloadError> {
+        let mut current = self
+            .current
+            .write()
+            .expect("effect registry lock is not poisoned");
+        let actual = current.generation;
+        if actual != prepared.previous_generation {
+            return Err(RegistryReloadError::GenerationConflict {
+                expected: prepared.previous_generation,
+                actual,
+            });
+        }
+        let generation = Arc::new(prepared.generation);
+        *current = generation.clone();
+        Ok(generation)
     }
 
     /// Prepare a new immutable generation that changes only the canonical
@@ -501,11 +554,9 @@ pub fn reload_with_publisher<P>(
 where
     P: EffectGenerationPublisher,
 {
-    let previous = registry.current();
-    let mut candidate = build_generation(manifest, previous.generation.saturating_add(1))?;
-    inherit_builtin_material(&mut candidate, &previous)?;
-    publisher.publish_effect_generation(candidate.clone())?;
-    Ok(registry.publish(candidate))
+    let prepared = registry.prepare_reload(manifest)?;
+    publisher.publish_effect_generation(prepared.generation().clone())?;
+    registry.publish_prepared_reload(prepared)
 }
 
 fn inherit_builtin_material(
@@ -534,6 +585,7 @@ pub enum RegistryReloadError {
     UndefinedUniformParameter(EffectParameterId),
     ShaderModuleCollision(ShaderModuleId),
     ReservedShaderModuleId(ShaderModuleId),
+    GenerationConflict { expected: u64, actual: u64 },
     ShaderCompile { module: ShaderModuleId, log: String },
 }
 
@@ -1054,6 +1106,36 @@ mod tests {
         assert_eq!(generation.generation, 1);
         assert_eq!(publisher.published, vec![generation.generation]);
         assert_eq!(registry.current().generation, generation.generation);
+    }
+
+    #[test]
+    fn prepared_reload_stays_non_authoritative_until_explicit_publication() {
+        let registry = TrustedEffectRegistry::new();
+        let prepared = registry.prepare_reload(manifest()).unwrap();
+        let candidate_generation = prepared.generation().generation;
+
+        assert_eq!(registry.current().generation, 0);
+
+        let published = registry.publish_prepared_reload(prepared).unwrap();
+
+        assert_eq!(published.generation, candidate_generation);
+        assert_eq!(registry.current().generation, candidate_generation);
+    }
+
+    #[test]
+    fn prepared_reload_refuses_to_overwrite_a_newer_registry_generation() {
+        let registry = TrustedEffectRegistry::new();
+        let prepared = registry.prepare_reload(manifest()).unwrap();
+        registry.reload(manifest(), |_| Ok(())).unwrap();
+
+        assert!(matches!(
+            registry.publish_prepared_reload(prepared),
+            Err(RegistryReloadError::GenerationConflict {
+                expected: 0,
+                actual: 1,
+            })
+        ));
+        assert_eq!(registry.current().generation, 1);
     }
 
     #[test]
