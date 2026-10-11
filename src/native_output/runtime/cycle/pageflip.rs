@@ -76,9 +76,130 @@ fn pageflip_identity(
     }
 }
 
+const DRM_TIMESTAMP_QUANTIZATION_NS: u64 = 1_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PageflipTimestampUncertainty {
+    BoundedNs(u64),
+    Unbounded,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PageflipTimestampEstimate {
+    presented_at: MonotonicTimestampNs,
+    uncertainty: PageflipTimestampUncertainty,
+}
+
+fn estimate_pageflip_timestamp(
+    clock: oblivion_one::native::drm::DrmTimestampClock,
+    seconds: u32,
+    microseconds: u32,
+    drm_sampled_at_us: u64,
+    monotonic_before_sample_ns: u64,
+    monotonic_after_sample_ns: u64,
+    compositor_receive_ns: u64,
+) -> PageflipTimestampEstimate {
+    let event_timestamp_us = u64::from(seconds)
+        .saturating_mul(1_000_000)
+        .saturating_add(u64::from(microseconds));
+    let sample_delay_ns = drm_sampled_at_us
+        .saturating_sub(event_timestamp_us)
+        .saturating_mul(DRM_TIMESTAMP_QUANTIZATION_NS);
+    let receive_based_estimate =
+        MonotonicTimestampNs::new(compositor_receive_ns.saturating_sub(sample_delay_ns));
+
+    if clock == oblivion_one::native::drm::DrmTimestampClock::Realtime
+        || drm_sampled_at_us < event_timestamp_us
+        || monotonic_after_sample_ns < monotonic_before_sample_ns
+    {
+        return PageflipTimestampEstimate {
+            presented_at: receive_based_estimate,
+            uncertainty: PageflipTimestampUncertainty::Unbounded,
+        };
+    }
+
+    // DRM pageflip timestamps and the sampled DRM clock both have microsecond
+    // resolution. Bracket the current CLOCK_MONOTONIC sample to bound the
+    // clock-domain mapping, then account for at most 999ns of relative
+    // truncation between the two microsecond values.
+    let bracket_ns = monotonic_after_sample_ns - monotonic_before_sample_ns;
+    let half_bracket_ns = bracket_ns / 2 + bracket_ns % 2;
+    let uncertainty_ns =
+        half_bracket_ns.saturating_add(DRM_TIMESTAMP_QUANTIZATION_NS.saturating_sub(1));
+    let sample_midpoint_ns = monotonic_before_sample_ns.saturating_add(bracket_ns / 2);
+    PageflipTimestampEstimate {
+        presented_at: MonotonicTimestampNs::new(sample_midpoint_ns.saturating_sub(sample_delay_ns)),
+        uncertainty: PageflipTimestampUncertainty::BoundedNs(uncertainty_ns),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VariablePhysicalTimeViolation {
+    MissingVrrWindow,
+    TimestampUncertaintyUnavailable {
+        actual_ns: u64,
+        required_lower_bound_ns: u64,
+    },
+    EarlierThanLowerBound {
+        actual_ns: u64,
+        required_lower_bound_ns: u64,
+        uncertainty_ns: u64,
+    },
+}
+
+fn variable_presentation_lower_bound(
+    reservation: crate::native_output::presentation::transaction::FramePresentationReservation,
+) -> Option<MonotonicTimestampNs> {
+    let crate::native_output::presentation::transaction::FramePresentationReservation::Variable(
+        variable,
+    ) = reservation
+    else {
+        return None;
+    };
+    let oblivion_one::native::presentation_timing::PresentationTiming::VrrWindow {
+        earliest_present,
+        presentation_not_before,
+        ..
+    } = variable.timing()
+    else {
+        return None;
+    };
+    Some(
+        presentation_not_before
+            .unwrap_or(earliest_present)
+            .max(earliest_present),
+    )
+}
+
+fn validate_variable_physical_time(
+    reservation: crate::native_output::presentation::transaction::FramePresentationReservation,
+    timestamp: PageflipTimestampEstimate,
+) -> Result<(), VariablePhysicalTimeViolation> {
+    let Some(required_lower_bound) = variable_presentation_lower_bound(reservation) else {
+        return Err(VariablePhysicalTimeViolation::MissingVrrWindow);
+    };
+    let actual_ns = timestamp.presented_at.get();
+    let PageflipTimestampUncertainty::BoundedNs(uncertainty_ns) = timestamp.uncertainty else {
+        return Err(
+            VariablePhysicalTimeViolation::TimestampUncertaintyUnavailable {
+                actual_ns,
+                required_lower_bound_ns: required_lower_bound.get(),
+            },
+        );
+    };
+    if actual_ns.saturating_add(uncertainty_ns) < required_lower_bound.get() {
+        return Err(VariablePhysicalTimeViolation::EarlierThanLowerBound {
+            actual_ns,
+            required_lower_bound_ns: required_lower_bound.get(),
+            uncertainty_ns,
+        });
+    }
+    Ok(())
+}
+
 fn record_variable_composited_pageflip(
     frame: &crate::native_output::scanout::PresentedOutputFrame,
-    presented_at: MonotonicTimestampNs,
+    timestamp: PageflipTimestampEstimate,
     clock_generation: u64,
     opportunity_sequence: u64,
     transport: crate::native_output::kms_worker::KmsCommitWorkerTransport,
@@ -93,6 +214,12 @@ fn record_variable_composited_pageflip(
             "variable pageflip accounting received a fixed reservation",
         ));
     };
+    validate_variable_physical_time(frame.reservation, timestamp).map_err(|violation| {
+        io::Error::other(format!(
+            "invalid Variable physical pageflip evidence: {violation:?}"
+        ))
+    })?;
+    let presented_at = timestamp.presented_at;
     let oblivion_one::native::presentation_timing::PresentationTiming::VrrWindow {
         anchor,
         earliest_present,
@@ -114,26 +241,7 @@ fn record_variable_composited_pageflip(
     }
 
     render_journal.note_matching_presentation(presented_at);
-    render_journal.record_atomic_submit(
-        frame
-            .submit_returned_at
-            .get()
-            .saturating_sub(frame.submit_started_at.get()),
-    );
-    if !frame.fence_timing_accounted {
-        if let Some((signaled_at, quality)) = frame.fence_signal {
-            frame_pacing.note_fence_timestamp_quality(quality);
-            render_journal.record_render_sample(
-                render_sample_duration_ns(frame.composite_started_at, signaled_at),
-                signaled_at,
-            );
-        } else {
-            render_journal.record_render_sample(
-                render_sample_duration_ns(frame.composite_started_at, frame.rendered_at),
-                frame.rendered_at,
-            );
-        }
-    }
+    record_composited_service_costs(frame, transport, render_journal, frame_pacing);
 
     if frame_pacing.trace_enabled() {
         let preferred_lateness =
@@ -176,27 +284,76 @@ fn record_variable_composited_pageflip(
     Ok(())
 }
 
+fn record_composited_service_costs(
+    frame: &crate::native_output::scanout::PresentedOutputFrame,
+    transport: crate::native_output::kms_worker::KmsCommitWorkerTransport,
+    render_journal: &mut AdaptiveRenderJournal,
+    frame_pacing: &mut NativeFramePacing,
+) {
+    if transport == crate::native_output::kms_worker::KmsCommitWorkerTransport::Synchronous {
+        render_journal.record_atomic_submit(
+            frame
+                .submit_returned_at
+                .get()
+                .saturating_sub(frame.submit_started_at.get()),
+        );
+    }
+    if !frame.fence_timing_accounted {
+        if let Some((signaled_at, quality)) = frame.fence_signal {
+            frame_pacing.note_fence_timestamp_quality(quality);
+            render_journal.record_render_sample(
+                render_sample_duration_ns(frame.composite_started_at, signaled_at),
+                signaled_at,
+            );
+        } else {
+            render_journal.record_render_sample(
+                render_sample_duration_ns(frame.composite_started_at, frame.rendered_at),
+                frame.rendered_at,
+            );
+        }
+    }
+}
+
+fn prepare_variable_physical_claim(
+    deadline: &oblivion_one::native::presentation_deadline::PresentationDeadlinePlanner,
+    variable: crate::native_output::presentation::transaction::VariablePresentationReservation,
+    presented_at: MonotonicTimestampNs,
+) -> io::Result<oblivion_one::native::presentation_deadline::PreparedPhysicalPresentation> {
+    let prepared = deadline
+        .prepare_variable_presented(presented_at)
+        .ok_or_else(|| io::Error::other("variable physical opportunity sequence is exhausted"))?;
+    if prepared.claim().opportunity_id() != variable.opportunity().id() {
+        return Err(io::Error::other(
+            "variable pageflip physical opportunity does not match its reservation",
+        ));
+    }
+    Ok(prepared)
+}
+
 fn prepare_physical_presentation_for_reservation(
     deadline: &oblivion_one::native::presentation_deadline::PresentationDeadlinePlanner,
     reservation: crate::native_output::presentation::transaction::FramePresentationReservation,
-    presented_at: MonotonicTimestampNs,
+    timestamp: PageflipTimestampEstimate,
 ) -> io::Result<oblivion_one::native::presentation_deadline::PreparedPhysicalPresentation> {
     match reservation {
         crate::native_output::presentation::transaction::FramePresentationReservation::Fixed(_) => {
-            Ok(deadline.prepare_presented(presented_at))
+            Ok(deadline.prepare_presented(timestamp.presented_at))
         }
         crate::native_output::presentation::transaction::FramePresentationReservation::Variable(
             variable,
         ) => {
-            let prepared = deadline
-                .prepare_variable_presented(presented_at)
-                .ok_or_else(|| io::Error::other("variable physical opportunity sequence is exhausted"))?;
-            if prepared.claim().opportunity_id() != variable.opportunity().id() {
-                return Err(io::Error::other(
-                    "variable pageflip physical opportunity does not match its reservation",
-                ));
-            }
-            Ok(prepared)
+            validate_variable_physical_time(
+                crate::native_output::presentation::transaction::FramePresentationReservation::Variable(
+                    variable,
+                ),
+                timestamp,
+            )
+            .map_err(|violation| {
+                io::Error::other(format!(
+                    "invalid Variable physical pageflip evidence: {violation:?}"
+                ))
+            })?;
+            prepare_variable_physical_claim(deadline, variable, timestamp.presented_at)
         }
         crate::native_output::presentation::transaction::FramePresentationReservation::DeferredO1(
             _,
@@ -1451,17 +1608,26 @@ impl NativeRuntime {
                 })
                 .with_presentation_mode(presentation_mode);
                 pageflip_presentation = Some(presentation);
+                let monotonic_before_sample_ns = monotonic_now_ns()?;
                 let compositor_receive_us = sample_clock_microseconds(*drm_timestamp_clock)?;
+                let monotonic_after_sample_ns = monotonic_now_ns()?;
                 let kernel_timestamp_us = u64::from(pageflip.timestamp.seconds)
                     .saturating_mul(1_000_000)
                     .saturating_add(u64::from(pageflip.timestamp.microseconds));
-                let receive_delay_us = compositor_receive_us.saturating_sub(kernel_timestamp_us);
-                let presented_at_ns =
-                    compositor_receive_ns.saturating_sub(receive_delay_us.saturating_mul(1_000));
+                let timestamp_estimate = estimate_pageflip_timestamp(
+                    *drm_timestamp_clock,
+                    pageflip.timestamp.seconds,
+                    pageflip.timestamp.microseconds,
+                    compositor_receive_us,
+                    monotonic_before_sample_ns,
+                    monotonic_after_sample_ns,
+                    compositor_receive_ns,
+                );
+                let presented_at = timestamp_estimate.presented_at;
+                let presented_at_ns = presented_at.get();
                 *last_primary_presented_at_ns = Some(presented_at_ns);
                 let mut completed_physical_identity = None;
                 if direct_pending {
-                    let presented_at = MonotonicTimestampNs::new(presented_at_ns);
                     let prepared_physical = presentation_deadline.prepare_presented(presented_at);
                     let actual_logical_sequence = prepared_physical.logical_sequence();
                     let transaction_id = match atomic_completion {
@@ -1570,7 +1736,6 @@ impl NativeRuntime {
                     if let Some(token) = output_render_fence_token.take() {
                         event_loop.unregister(token)?;
                     }
-                    let presented_at = MonotonicTimestampNs::new(presented_at_ns);
                     let transaction_id = match atomic_completion {
                         Some(AtomicCommitCompletion::Completed {
                             kind: AtomicCommitKind::CompositedPrimary { transaction_id, .. },
@@ -1597,7 +1762,7 @@ impl NativeRuntime {
                             crate::native_output::presentation::kms_timing::KmsPresentationTiming::Variable { .. } => None,
                         });
                     let dispatch_budget_after_adaptation_ns =
-                        submitted_ownership.map(|ownership| ownership.submission_budget_ns);
+                        submitted_ownership.and_then(|ownership| ownership.submission_budget_ns);
                     let pending_identity =
                         explicit.swapchain()?.pending_identity().ok_or_else(|| {
                             io::Error::other("composited pageflip has no pending identity")
@@ -1610,11 +1775,100 @@ impl NativeRuntime {
                         )
                         .into());
                     }
-                    let prepared_physical = prepare_physical_presentation_for_reservation(
-                        presentation_deadline,
-                        pending_identity.frame.reservation,
-                        presented_at,
-                    )?;
+                    let variable_physical_violation = match pending_identity.frame.reservation {
+                        crate::native_output::presentation::transaction::FramePresentationReservation::Variable(
+                            _,
+                        ) => validate_variable_physical_time(
+                            pending_identity.frame.reservation,
+                            timestamp_estimate,
+                        )
+                        .err(),
+                        crate::native_output::presentation::transaction::FramePresentationReservation::Fixed(
+                            _,
+                        )
+                        | crate::native_output::presentation::transaction::FramePresentationReservation::DeferredO1(
+                            _,
+                        ) => None,
+                    };
+                    if let Some(violation) = variable_physical_violation {
+                        let required_lower_bound_ns =
+                            variable_presentation_lower_bound(pending_identity.frame.reservation)
+                                .map(MonotonicTimestampNs::get);
+                        let timestamp_uncertainty_ns = match timestamp_estimate.uncertainty {
+                            PageflipTimestampUncertainty::BoundedNs(value) => Some(value),
+                            PageflipTimestampUncertainty::Unbounded => None,
+                        };
+                        let reason = format!("{violation:?}");
+                        frame_pacing.log(
+                            "vrr_physical_lower_bound_violation",
+                            vec![
+                                PacingField::u64("transaction_id", transaction_id.get()),
+                                PacingField::u64("output_generation", *drm_file_generation),
+                                PacingField::u64("actual_pageflip_ns", presented_at_ns),
+                                PacingField::option_u64(
+                                    "required_lower_bound_ns",
+                                    required_lower_bound_ns,
+                                ),
+                                PacingField::option_u64(
+                                    "timestamp_uncertainty_ns",
+                                    timestamp_uncertainty_ns,
+                                ),
+                                PacingField::str("reason", reason.clone()),
+                            ],
+                        );
+                        perf.log("native.vrr_physical_lower_bound_violation", || {
+                            vec![
+                                NativePerfField::u64("transaction_id", transaction_id.get()),
+                                NativePerfField::u64("output_generation", *drm_file_generation),
+                                NativePerfField::u64("actual_pageflip_ns", presented_at_ns),
+                                NativePerfField::str(
+                                    "required_lower_bound_ns",
+                                    required_lower_bound_ns.map_or_else(
+                                        || "unavailable".to_owned(),
+                                        |value| value.to_string(),
+                                    ),
+                                ),
+                                NativePerfField::str(
+                                    "timestamp_uncertainty_ns",
+                                    timestamp_uncertainty_ns.map_or_else(
+                                        || "unbounded".to_owned(),
+                                        |value| value.to_string(),
+                                    ),
+                                ),
+                                NativePerfField::str("reason", reason),
+                            ]
+                        });
+                        explicit.reject_variable_pageflip_for_generation(*drm_file_generation);
+                        if let Some(key) = output_transactions
+                            .transaction_including_terminal(transaction_id)
+                            .and_then(|record| record.descriptor().presentation_validation_key())
+                        {
+                            explicit.note_composited_presentation_validation(key, false);
+                        }
+                        *queued_redraw_requested = true;
+                        *last_primary_presented_at_ns = Some(compositor_receive_ns);
+                    }
+                    let claim_time = if variable_physical_violation.is_some() {
+                        MonotonicTimestampNs::new(compositor_receive_ns)
+                    } else {
+                        presented_at
+                    };
+                    let prepared_physical = match pending_identity.frame.reservation {
+                        crate::native_output::presentation::transaction::FramePresentationReservation::Variable(
+                            variable,
+                        ) if variable_physical_violation.is_some() => {
+                            prepare_variable_physical_claim(
+                                presentation_deadline,
+                                variable,
+                                claim_time,
+                            )?
+                        }
+                        reservation => prepare_physical_presentation_for_reservation(
+                            presentation_deadline,
+                            reservation,
+                            timestamp_estimate,
+                        )?,
+                    };
                     let actual_logical_sequence = prepared_physical.logical_sequence();
                     let previous_assignment = presented_planes.primary;
                     let presented_transition = scene_history
@@ -1772,7 +2026,13 @@ impl NativeRuntime {
                             )?;
                         }
                     }
-                    presentation_deadline.commit_presented(prepared_physical);
+                    if variable_physical_violation.is_some() {
+                        let conservative_anchor = presentation_deadline
+                            .prepare_presented(MonotonicTimestampNs::new(compositor_receive_ns));
+                        presentation_deadline.commit_presented(conservative_anchor);
+                    } else {
+                        presentation_deadline.commit_presented(prepared_physical);
+                    }
                     self.presentation_trace.push(
                         PresentationTransactionEvent::PresentedTransition {
                             transaction_id,
@@ -1955,17 +2215,26 @@ impl NativeRuntime {
                         crate::native_output::presentation::transaction::FramePresentationReservation::Variable(_)
                     ) {
                         // Variable presentation has no fixed target or commit deadline. Keep
-                        // generic service evidence, and discard any stale fixed miss evidence.
+                        // domain-neutral service evidence, and discard any stale fixed miss evidence.
                         pending_proven_deadline_miss.take();
-                        record_variable_composited_pageflip(
-                            &frame,
-                            presented_at,
-                            physical_claim.clock_generation,
-                            physical_claim.sequence,
-                            *kms_commit_worker_transport,
-                            render_journal,
-                            frame_pacing,
-                        )?;
+                        if variable_physical_violation.is_some() {
+                            record_composited_service_costs(
+                                &frame,
+                                *kms_commit_worker_transport,
+                                render_journal,
+                                frame_pacing,
+                            );
+                        } else {
+                            record_variable_composited_pageflip(
+                                &frame,
+                                timestamp_estimate,
+                                physical_claim.clock_generation,
+                                physical_claim.sequence,
+                                *kms_commit_worker_transport,
+                                render_journal,
+                                frame_pacing,
+                            )?;
+                        }
                     } else {
                         let (target, submit_window) = match (
                             frame.reservation,
@@ -1988,12 +2257,16 @@ impl NativeRuntime {
                             .get()
                             .saturating_sub(target.presentation_time.get()),
                     );
-                    render_journal.record_atomic_submit(
-                        frame
-                            .submit_returned_at
-                            .get()
-                            .saturating_sub(frame.submit_started_at.get()),
-                    );
+                    if *kms_commit_worker_transport
+                        == crate::native_output::kms_worker::KmsCommitWorkerTransport::Synchronous
+                    {
+                        render_journal.record_atomic_submit(
+                            frame
+                                .submit_returned_at
+                                .get()
+                                .saturating_sub(frame.submit_started_at.get()),
+                        );
+                    }
                     let pending_miss = pending_proven_deadline_miss
                         .take()
                         .and_then(|(frame_id, miss)| (frame_id == frame.frame_id).then_some(miss));

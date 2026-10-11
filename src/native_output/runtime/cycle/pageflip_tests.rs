@@ -23,6 +23,235 @@ use oblivion_one::native::presentation_timing::PresentationTiming;
 use std::num::NonZeroU64;
 use std::sync::Arc;
 
+fn pageflip_timestamp(
+    presented_at: MonotonicTimestampNs,
+    uncertainty_ns: u64,
+) -> PageflipTimestampEstimate {
+    PageflipTimestampEstimate {
+        presented_at,
+        uncertainty: PageflipTimestampUncertainty::BoundedNs(uncertainty_ns),
+    }
+}
+
+fn variable_reservation(
+    opportunity_id: oblivion_one::native::buffering::PresentationOpportunityId,
+    anchor: MonotonicTimestampNs,
+    earliest_present: MonotonicTimestampNs,
+    presentation_not_before: Option<MonotonicTimestampNs>,
+) -> crate::native_output::presentation::transaction::VariablePresentationReservation {
+    let opportunity = oblivion_one::native::buffering::PresentationOpportunity::new(
+        opportunity_id,
+        PresentationTiming::VrrWindow {
+            anchor,
+            earliest_present,
+            presentation_not_before,
+            preferred_present: presentation_not_before.unwrap_or(earliest_present),
+            service_deadline: None,
+            shortest_interval: std::time::Duration::from_nanos(6_060_606),
+            longest_interval: None,
+        },
+    );
+    crate::native_output::presentation::transaction::VariablePresentationReservation::try_new(
+        opportunity,
+        PresentationTargetReason::ReactiveDouble,
+    )
+    .expect("VRR opportunity creates variable reservation")
+}
+
+#[test]
+fn variable_pageflip_rejects_physical_time_before_its_reserved_lower_bound() {
+    let anchor = MonotonicTimestampNs::new(1_000_000_000);
+    let mut deadline = PresentationDeadlinePlanner::new(std::time::Duration::from_nanos(6_060_606));
+    deadline.note_presented(anchor);
+    let opportunity_id = deadline
+        .next_variable_opportunity_id()
+        .expect("next sequence is available");
+    let earliest_present = MonotonicTimestampNs::new(anchor.get() + 6_060_606);
+    let presentation_not_before = MonotonicTimestampNs::new(anchor.get() + 8_000_000);
+    let reservation = variable_reservation(
+        opportunity_id,
+        anchor,
+        earliest_present,
+        Some(presentation_not_before),
+    );
+    let materially_early = MonotonicTimestampNs::new(anchor.get() + 7_000_000);
+
+    let result = prepare_physical_presentation_for_reservation(
+        &deadline,
+        crate::native_output::presentation::transaction::FramePresentationReservation::Variable(
+            reservation,
+        ),
+        pageflip_timestamp(materially_early, 2_999),
+    );
+
+    assert!(
+        result.is_err(),
+        "the client not-before bound must be enforced for physical pageflips"
+    );
+}
+
+#[test]
+fn variable_pageflip_accepts_a_timestamp_at_its_lower_bound() {
+    let anchor = MonotonicTimestampNs::new(1_000_000_000);
+    let lower_bound = MonotonicTimestampNs::new(anchor.get() + 8_000_000);
+    let reservation = variable_reservation(
+        oblivion_one::native::buffering::PresentationOpportunityId::new(1, 1),
+        anchor,
+        MonotonicTimestampNs::new(anchor.get() + 6_000_000),
+        Some(lower_bound),
+    );
+
+    assert_eq!(
+        validate_variable_physical_time(
+            crate::native_output::presentation::transaction::FramePresentationReservation::Variable(
+                reservation,
+            ),
+            pageflip_timestamp(lower_bound, 0),
+        ),
+        Ok(())
+    );
+}
+
+#[test]
+fn variable_pageflip_accepts_early_estimate_inside_derived_timestamp_uncertainty() {
+    let anchor = MonotonicTimestampNs::new(1_000_000_000);
+    let lower_bound = MonotonicTimestampNs::new(anchor.get() + 8_000_000);
+    let reservation = variable_reservation(
+        oblivion_one::native::buffering::PresentationOpportunityId::new(1, 1),
+        anchor,
+        lower_bound,
+        None,
+    );
+    let estimate = PageflipTimestampEstimate {
+        presented_at: MonotonicTimestampNs::new(lower_bound.get() - 1_000),
+        uncertainty: PageflipTimestampUncertainty::BoundedNs(2_999),
+    };
+
+    assert_eq!(
+        validate_variable_physical_time(
+            crate::native_output::presentation::transaction::FramePresentationReservation::Variable(
+                reservation,
+            ),
+            estimate,
+        ),
+        Ok(())
+    );
+}
+
+#[test]
+fn variable_pageflip_lower_bound_uses_later_presentation_not_before() {
+    let anchor = MonotonicTimestampNs::new(1_000_000_000);
+    let earliest_present = MonotonicTimestampNs::new(anchor.get() + 6_060_606);
+    let presentation_not_before = MonotonicTimestampNs::new(anchor.get() + 8_000_000);
+    let reservation = variable_reservation(
+        oblivion_one::native::buffering::PresentationOpportunityId::new(1, 1),
+        anchor,
+        earliest_present,
+        Some(presentation_not_before),
+    );
+    let frame_reservation =
+        crate::native_output::presentation::transaction::FramePresentationReservation::Variable(
+            reservation,
+        );
+
+    assert_eq!(
+        variable_presentation_lower_bound(frame_reservation),
+        Some(presentation_not_before)
+    );
+    assert!(matches!(
+        validate_variable_physical_time(
+            frame_reservation,
+            pageflip_timestamp(earliest_present, 0),
+        ),
+        Err(VariablePhysicalTimeViolation::EarlierThanLowerBound {
+            required_lower_bound_ns,
+            ..
+        }) if required_lower_bound_ns == presentation_not_before.get()
+    ));
+}
+
+#[test]
+fn variable_pageflip_uses_earliest_as_lower_bound_when_not_before_is_absent() {
+    let anchor = MonotonicTimestampNs::new(1_000_000_000);
+    let earliest_present = MonotonicTimestampNs::new(anchor.get() + 6_060_606);
+    let reservation = variable_reservation(
+        oblivion_one::native::buffering::PresentationOpportunityId::new(1, 1),
+        anchor,
+        earliest_present,
+        None,
+    );
+    let frame_reservation =
+        crate::native_output::presentation::transaction::FramePresentationReservation::Variable(
+            reservation,
+        );
+
+    assert_eq!(
+        variable_presentation_lower_bound(frame_reservation),
+        Some(earliest_present)
+    );
+    assert_eq!(
+        validate_variable_physical_time(frame_reservation, pageflip_timestamp(earliest_present, 0),),
+        Ok(())
+    );
+}
+
+#[test]
+fn monotonic_pageflip_timestamp_uncertainty_uses_bracket_and_microsecond_resolution() {
+    let estimate = estimate_pageflip_timestamp(
+        oblivion_one::native::drm::DrmTimestampClock::Monotonic,
+        1,
+        100_000,
+        1_100_100,
+        1_000_000_000,
+        1_000_004_000,
+        1_000_000_000,
+    );
+
+    assert_eq!(
+        estimate.presented_at,
+        MonotonicTimestampNs::new(999_902_000)
+    );
+    assert_eq!(
+        estimate.uncertainty,
+        PageflipTimestampUncertainty::BoundedNs(2_999)
+    );
+}
+
+#[test]
+fn realtime_pageflip_timestamp_has_unbounded_monotonic_mapping_uncertainty() {
+    let estimate = estimate_pageflip_timestamp(
+        oblivion_one::native::drm::DrmTimestampClock::Realtime,
+        1,
+        100_000,
+        1_100_100,
+        1_000_000_000,
+        1_000_004_000,
+        1_000_000_000,
+    );
+
+    assert_eq!(
+        estimate.uncertainty,
+        PageflipTimestampUncertainty::Unbounded
+    );
+    let anchor = MonotonicTimestampNs::new(1_000_000_000);
+    let lower_bound = MonotonicTimestampNs::new(anchor.get() + 8_000_000);
+    let reservation = variable_reservation(
+        oblivion_one::native::buffering::PresentationOpportunityId::new(1, 1),
+        anchor,
+        lower_bound,
+        None,
+    );
+    assert!(matches!(
+        validate_variable_physical_time(
+            crate::native_output::presentation::transaction::FramePresentationReservation::Variable(
+                reservation,
+            ),
+            estimate,
+        ),
+        Err(VariablePhysicalTimeViolation::TimestampUncertaintyUnavailable { .. })
+    ));
+}
+
 #[test]
 fn variable_pageflip_consumes_exactly_its_reserved_id_after_short_and_long_intervals() {
     let anchor = MonotonicTimestampNs::new(1_000_000_000);
@@ -58,7 +287,7 @@ fn variable_pageflip_consumes_exactly_its_reserved_id_after_short_and_long_inter
             crate::native_output::presentation::transaction::FramePresentationReservation::Variable(
                 reservation,
             ),
-            presented_at,
+            pageflip_timestamp(presented_at, 2_999),
         )
         .expect("physical pageflip consumes the reserved opportunity");
         assert_eq!(

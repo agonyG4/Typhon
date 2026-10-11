@@ -257,7 +257,7 @@ pub struct AdaptiveRenderJournal {
     worker_submit_wake_lateness_samples_ns: VecDeque<u64>,
     worker_pre_submit_samples_ns: VecDeque<u64>,
     worker_dispatch_samples_ns: VecDeque<u64>,
-    submission_budget_samples_ns: VecDeque<u64>,
+    fixed_submission_budget_samples_ns: VecDeque<u64>,
     target_slip_samples_ns: VecDeque<u64>,
     paired_service_samples_ns: VecDeque<u64>,
     ewma_render_ns: u64,
@@ -279,7 +279,7 @@ impl Default for AdaptiveRenderJournal {
             worker_submit_wake_lateness_samples_ns: VecDeque::with_capacity(SAMPLE_CAPACITY),
             worker_pre_submit_samples_ns: VecDeque::with_capacity(SAMPLE_CAPACITY),
             worker_dispatch_samples_ns: VecDeque::with_capacity(SAMPLE_CAPACITY),
-            submission_budget_samples_ns: VecDeque::with_capacity(SAMPLE_CAPACITY),
+            fixed_submission_budget_samples_ns: VecDeque::with_capacity(SAMPLE_CAPACITY),
             target_slip_samples_ns: VecDeque::with_capacity(SAMPLE_CAPACITY),
             paired_service_samples_ns: VecDeque::with_capacity(SAMPLE_CAPACITY),
             ewma_render_ns: 0,
@@ -330,20 +330,17 @@ impl AdaptiveRenderJournal {
         push_bounded(&mut self.worker_queue_residency_samples_ns, sample_ns);
     }
 
-    pub fn record_worker_submit_wake_lateness(&mut self, sample_ns: u64) {
+    pub fn record_fixed_timed_wake(&mut self, sample_ns: u64) {
         push_bounded(&mut self.worker_submit_wake_lateness_samples_ns, sample_ns);
     }
 
-    pub fn record_worker_pre_submit(&mut self, sample_ns: u64) {
-        push_bounded(&mut self.worker_pre_submit_samples_ns, sample_ns);
+    pub fn record_worker_service(&mut self, pre_submit_ns: u64, dispatch_ns: u64) {
+        push_bounded(&mut self.worker_pre_submit_samples_ns, pre_submit_ns);
+        push_bounded(&mut self.worker_dispatch_samples_ns, dispatch_ns);
     }
 
-    pub fn record_worker_dispatch(&mut self, sample_ns: u64) {
-        push_bounded(&mut self.worker_dispatch_samples_ns, sample_ns);
-    }
-
-    pub fn record_submission_budget(&mut self, sample_ns: u64) {
-        push_bounded(&mut self.submission_budget_samples_ns, sample_ns);
+    pub fn record_fixed_submission_budget(&mut self, sample_ns: u64) {
+        push_bounded(&mut self.fixed_submission_budget_samples_ns, sample_ns);
     }
 
     pub fn record_target_slip(&mut self, sample_ns: u64) {
@@ -487,10 +484,10 @@ impl AdaptiveRenderJournal {
         let measured_dispatch_budget = p95_worker_wake
             .saturating_add(p95_worker_dispatch.max(p95_ioctl))
             .saturating_add(50_000);
-        let exported_submission_budget = nearest_rank(&self.submission_budget_samples_ns, 95);
+        let exported_submission_budget = nearest_rank(&self.fixed_submission_budget_samples_ns, 95);
         let kms_dispatch_budget = if exported_submission_budget != 0 {
             exported_submission_budget
-        } else if self.atomic_submit_samples_ns.len() < WARM_PAIRED_MIN_SAMPLES {
+        } else if self.fixed_submission_budget_samples_ns.len() < WARM_PAIRED_MIN_SAMPLES {
             measured_dispatch_budget.max(250_000)
         } else {
             measured_dispatch_budget
@@ -499,7 +496,7 @@ impl AdaptiveRenderJournal {
         let dynamic_margin = p95_wake.saturating_add(250_000).clamp(500_000, ceiling);
         let main_event_loop_wake_guard = if self.wake_lateness_samples_ns.len()
             < WARM_PAIRED_MIN_SAMPLES
-            || self.atomic_submit_samples_ns.len() < WARM_PAIRED_MIN_SAMPLES
+            || self.fixed_submission_budget_samples_ns.len() < WARM_PAIRED_MIN_SAMPLES
         {
             dynamic_margin.max(1_000_000)
         } else {
@@ -990,6 +987,25 @@ mod tests {
         assert_eq!(prediction.total_cost_ns, 5_250_000);
     }
 
+    #[test]
+    fn variable_only_history_preserves_the_first_fixed_cold_start_floor() {
+        let mut journal = AdaptiveRenderJournal::default();
+        for sample in 0..=SAMPLE_CAPACITY {
+            let at = MonotonicTimestampNs::new(1_000_000_000 + sample as u64 * 6_000_000);
+            journal.record_render_sample(80_000, at);
+            journal.record_atomic_submit(15_000);
+            journal.record_worker_service(10_000, 25_000);
+        }
+
+        let prediction = journal.prediction(Duration::from_nanos(6_060_606));
+
+        assert_eq!(
+            prediction.estimator_mode,
+            PredictionEstimatorMode::ColdStart
+        );
+        assert_eq!(prediction.kms_dispatch_budget_ns, 250_000);
+    }
+
     fn service_target() -> PresentationTarget {
         let timestamp = MonotonicTimestampNs::new(10_000_000);
         PresentationTarget {
@@ -1045,7 +1061,7 @@ mod tests {
             journal.record_render_sample(render_sample_ns, MonotonicTimestampNs::new(base_ns));
             journal.record_wake_lateness(wake_lateness_ns);
             journal.record_atomic_submit(ioctl_ns);
-            journal.record_submission_budget(kms_dispatch_budget_ns);
+            journal.record_fixed_submission_budget(kms_dispatch_budget_ns);
             journal.record_frame_service_observation(service_observation(
                 base_ns,
                 base_ns + paired_render_service_ns,
@@ -1119,8 +1135,7 @@ mod tests {
         for sample in 0..20 {
             journal.record_render_sample(1_000_000, MonotonicTimestampNs::new(sample + 1));
             journal.record_wake_lateness(4_000_000);
-            journal.record_worker_pre_submit(3_000_000);
-            journal.record_worker_dispatch(2_000_000);
+            journal.record_worker_service(3_000_000, 2_000_000);
             journal.record_frame_service_observation(service_observation(
                 10_000_000 + sample * 10_000_000,
                 14_000_000 + sample * 10_000_000,
@@ -1413,6 +1428,7 @@ mod tests {
         for _ in 0..20 {
             journal.record_wake_lateness(4_000_000);
             journal.record_atomic_submit(100_000);
+            journal.record_fixed_submission_budget(150_000);
         }
         let prediction = journal.prediction(Duration::from_millis(4));
         assert_eq!(prediction.main_event_loop_wake_guard_ns, 1_000_000);
@@ -1720,9 +1736,9 @@ mod tests {
             journal.record_render_sample(sample, at);
             journal.record_wake_lateness(sample + 1_000);
             journal.record_worker_queue_residency(sample + 2_000);
-            journal.record_worker_submit_wake_lateness(sample + 3_000);
+            journal.record_fixed_timed_wake(sample + 3_000);
             journal.record_atomic_submit(sample + 4_000);
-            journal.record_submission_budget(sample + 5_000);
+            journal.record_fixed_submission_budget(sample + 5_000);
             journal.record_target_slip(sample + 6_000);
         }
 
@@ -1737,7 +1753,10 @@ mod tests {
             SAMPLE_CAPACITY
         );
         assert_eq!(journal.atomic_submit_samples_ns.len(), SAMPLE_CAPACITY);
-        assert_eq!(journal.submission_budget_samples_ns.len(), SAMPLE_CAPACITY);
+        assert_eq!(
+            journal.fixed_submission_budget_samples_ns.len(),
+            SAMPLE_CAPACITY
+        );
         assert_eq!(journal.target_slip_samples_ns.len(), SAMPLE_CAPACITY);
 
         let prediction = journal.prediction(Duration::from_millis(10));

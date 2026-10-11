@@ -61,17 +61,19 @@ impl Default for KmsWorkerDispatchModel {
 }
 
 impl KmsWorkerDispatchModel {
-    pub(crate) fn record(
+    pub(crate) fn record_worker_service(
         &mut self,
-        wake_lateness_ns: u64,
         pre_submit_ns: u64,
         ioctl_duration_ns: u64,
         dispatch_duration_ns: u64,
     ) {
-        push_bounded(&mut self.wake_lateness_ns, wake_lateness_ns);
         push_bounded(&mut self.pre_submit_ns, pre_submit_ns);
         push_bounded(&mut self.ioctl_duration_ns, ioctl_duration_ns);
         push_bounded(&mut self.dispatch_duration_ns, dispatch_duration_ns);
+    }
+
+    pub(crate) fn record_fixed_timed_wake(&mut self, lateness_ns: u64) {
+        push_bounded(&mut self.wake_lateness_ns, lateness_ns);
     }
 
     pub(crate) fn budget(&self) -> KmsWorkerDispatchBudget {
@@ -194,15 +196,39 @@ mod tests {
     fn dispatch_budget_uses_the_measured_full_dispatch_interval() {
         let mut model = KmsWorkerDispatchModel::default();
 
-        model.record(10, 100, 200, 1_000);
+        model.record_fixed_timed_wake(10);
+        model.record_worker_service(100, 200, 1_000);
 
         assert_eq!(model.budget().dispatch_budget_ns, 51_010);
     }
 
     #[test]
+    fn variable_service_samples_do_not_evict_fixed_timed_wake_evidence() {
+        let mut model = KmsWorkerDispatchModel::default();
+        for _ in 0..SAMPLE_CAPACITY {
+            model.record_fixed_timed_wake(400_000);
+            model.record_worker_service(20_000, 30_000, 50_000);
+        }
+        let fixed_wake_lateness = model.budget().wake_lateness_ns;
+        assert_eq!(fixed_wake_lateness, 400_000);
+
+        // Variable jobs train service cost but have no fixed planned wake sample.
+        for _ in 0..=SAMPLE_CAPACITY {
+            model.record_worker_service(10_000, 15_000, 25_000);
+        }
+
+        let first_binding_fixed_budget = model.budget();
+        assert_eq!(
+            first_binding_fixed_budget.wake_lateness_ns,
+            fixed_wake_lateness
+        );
+        assert_eq!(first_binding_fixed_budget.dispatch_budget_ns, 475_000);
+    }
+
+    #[test]
     fn proven_dispatch_deadline_miss_teaches_the_next_budget_immediately() {
         let mut model = KmsWorkerDispatchModel::default();
-        model.record(0, 0, 100_000, 100_000);
+        model.record_worker_service(0, 100_000, 100_000);
         let before = model.budget().dispatch_budget_ns;
 
         model.observe_submission_deadline(1_000_000, 1_012_230, true, true);
@@ -217,7 +243,7 @@ mod tests {
     #[test]
     fn late_payload_does_not_train_dispatch_tail_guard() {
         let mut model = KmsWorkerDispatchModel::default();
-        model.record(0, 0, 100_000, 100_000);
+        model.record_worker_service(0, 100_000, 100_000);
         let before_guard = model.adaptive_tail_guard_ns();
 
         let observation = model.observe_submission_deadline(1_000_000, 1_012_230, false, true);

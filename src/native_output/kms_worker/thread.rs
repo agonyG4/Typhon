@@ -1115,10 +1115,12 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
                         .submit_duration_ns_max
                         .fetch_max(submit_duration_ns, std::sync::atomic::Ordering::Relaxed);
                     let queue_wait_ns = submit_started_at.saturating_sub(job.queued_at.get());
-                    let submit_wake_lateness_ns = if wait_armed {
-                        actual_worker_wait_returned_at.saturating_sub(planned_worker_wake_at)
-                    } else {
-                        0
+                    let fixed_timed_wake_lateness_ns = match job.presentation_timing {
+                        KmsPresentationTiming::Fixed(_) if wait_armed => Some(
+                            actual_worker_wait_returned_at.saturating_sub(planned_worker_wake_at),
+                        ),
+                        KmsPresentationTiming::Fixed(_)
+                        | KmsPresentationTiming::Variable { .. } => None,
                     };
                     let pre_submit_duration_ns =
                         pre_submit_completed_at.saturating_sub(pre_submit_started_at);
@@ -1134,8 +1136,10 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
                         | FramePresentationReservation::DeferredO1(_) => false,
                     };
                     let dequeued_before_planned_wake = dequeued_at.get() <= planned_worker_wake_at;
-                    dispatch_model.record(
-                        submit_wake_lateness_ns,
+                    if let Some(lateness_ns) = fixed_timed_wake_lateness_ns {
+                        dispatch_model.record_fixed_timed_wake(lateness_ns);
+                    }
+                    dispatch_model.record_worker_service(
                         pre_submit_duration_ns,
                         submit_duration_ns,
                         dispatch_duration_ns,
@@ -1156,7 +1160,10 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
                         observation
                     });
                     let dispatch_budget: super::KmsWorkerDispatchBudget = dispatch_model.budget();
-                    let submission_budget_ns = dispatch_budget.dispatch_budget_ns;
+                    let dispatch_budget_ns = dispatch_budget.dispatch_budget_ns;
+                    let fixed_submission_budget_ns =
+                        matches!(job.presentation_timing, KmsPresentationTiming::Fixed(_))
+                            .then_some(dispatch_budget_ns);
                     let (fixed_deadline_ns, telemetry_present_ns) = match job.presentation_timing {
                         KmsPresentationTiming::Fixed(window) => (
                             Some(window.commit_complete_deadline_ns()),
@@ -1177,7 +1184,7 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
                         pre_submit_duration_ns,
                         submit_duration_ns,
                         dispatch_duration_ns,
-                        submission_budget_ns,
+                        dispatch_budget_ns,
                     );
                     shared
                         .metrics
@@ -1202,11 +1209,11 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
                             submit_started_at: MonotonicTimestampNs::new(submit_started_at),
                             submit_returned_at: MonotonicTimestampNs::new(submit_returned_at),
                             queue_residency_ns: queue_wait_ns,
-                            submit_wake_lateness_ns,
+                            submit_wake_lateness_ns: fixed_timed_wake_lateness_ns,
                             pre_submit_duration_ns,
                             ioctl_duration_ns: submit_duration_ns,
                             dispatch_duration_ns,
-                            submission_budget_ns,
+                            submission_budget_ns: fixed_submission_budget_ns,
                             dispatch_tail_observation: dispatch_tail,
                         },
                     };

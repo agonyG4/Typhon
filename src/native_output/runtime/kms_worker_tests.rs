@@ -665,11 +665,11 @@ fn promotion_failure_quarantine_retains_complete_submitted_ownership() {
         submit_started_at: MonotonicTimestampNs::new(1),
         submit_returned_at: MonotonicTimestampNs::new(2),
         queue_residency_ns: 0,
-        submit_wake_lateness_ns: 0,
+        submit_wake_lateness_ns: Some(0),
         pre_submit_duration_ns: 0,
         ioctl_duration_ns: 1,
         dispatch_duration_ns: 1,
-        submission_budget_ns: 1_000_000,
+        submission_budget_ns: Some(1_000_000),
         dispatch_tail_observation: None,
     };
     let mut emergency = Vec::new();

@@ -73,10 +73,9 @@ fn populated_render_prediction_does_not_allocate() {
         journal.record_wake_lateness(value);
         journal.record_atomic_submit(value);
         journal.record_worker_queue_residency(value);
-        journal.record_worker_submit_wake_lateness(value);
-        journal.record_worker_pre_submit(value);
-        journal.record_worker_dispatch(value);
-        journal.record_submission_budget(value);
+        journal.record_fixed_timed_wake(value);
+        journal.record_worker_service(value, value);
+        journal.record_fixed_submission_budget(value);
         journal.record_target_slip(value);
     }
     let allocations = allocations_during(|| {
@@ -89,7 +88,8 @@ fn populated_render_prediction_does_not_allocate() {
 fn populated_worker_dispatch_budget_does_not_allocate() {
     let mut model = worker_timing::KmsWorkerDispatchModel::default();
     for value in 1..=241 {
-        model.record(value, value * 2, value * 3, value * 4);
+        model.record_fixed_timed_wake(value);
+        model.record_worker_service(value * 2, value * 3, value * 4);
     }
     let allocations = allocations_during(|| {
         black_box(black_box(&model).budget());

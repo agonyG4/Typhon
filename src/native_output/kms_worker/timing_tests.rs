@@ -31,8 +31,10 @@ fn worker_timing_records_submit_ack_delay() {
 #[test]
 fn worker_dispatch_budget_uses_actual_wake_and_post_wake_dispatch() {
     let mut model = KmsWorkerDispatchModel::default();
-    model.record(10_000, 40_000, 60_000, 100_000);
-    model.record(20_000, 50_000, 70_000, 120_000);
+    model.record_fixed_timed_wake(10_000);
+    model.record_worker_service(40_000, 60_000, 100_000);
+    model.record_fixed_timed_wake(20_000);
+    model.record_worker_service(50_000, 70_000, 120_000);
 
     let budget = model.budget();
 
@@ -45,7 +47,7 @@ fn worker_dispatch_budget_uses_actual_wake_and_post_wake_dispatch() {
 #[test]
 fn worker_dispatch_budget_does_not_include_queue_residency() {
     let mut model = KmsWorkerDispatchModel::default();
-    model.record(0, 100_000, 200_000, 300_000);
+    model.record_worker_service(100_000, 200_000, 300_000);
 
     assert_eq!(model.budget().dispatch_budget_ns, 350_000);
 }
@@ -53,7 +55,7 @@ fn worker_dispatch_budget_does_not_include_queue_residency() {
 #[test]
 fn dispatch_tail_deadline_hole_is_not_render_readiness_miss() {
     let mut model = KmsWorkerDispatchModel::default();
-    model.record(0, 0, 100_000, 100_000);
+    model.record_worker_service(0, 100_000, 100_000);
     let window = KmsSubmitWindow::try_new(10_000_000, 0, model.budget().dispatch_budget_ns, 0)
         .expect("test window is reachable");
     let payload_ready_at_ns = 1_000_000;
@@ -76,7 +78,7 @@ fn dispatch_tail_deadline_hole_is_not_render_readiness_miss() {
 #[test]
 fn late_payload_dispatch_overrun_does_not_update_tail_metrics() {
     let mut model = KmsWorkerDispatchModel::default();
-    model.record(0, 0, 100_000, 100_000);
+    model.record_worker_service(0, 100_000, 100_000);
     let metrics = WorkerTimingMetrics::default();
 
     let observation = model.observe_submission_deadline(1_000_000, 1_012_230, false, true);

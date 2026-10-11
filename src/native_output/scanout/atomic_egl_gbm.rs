@@ -80,6 +80,44 @@ pub(crate) struct AtomicRenderPhaseDurations {
     pub(crate) native_render_fence_export_ns: u64,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct VariablePageflipQualification {
+    rejected_output_generation: Option<u64>,
+}
+
+impl VariablePageflipQualification {
+    fn reject_generation(&mut self, output_generation: u64) {
+        self.rejected_output_generation = Some(output_generation);
+    }
+
+    fn rejects_mode(self, mode: OutputPresentationMode, output_generation: u64) -> bool {
+        mode.uses_vrr() && self.rejected_output_generation == Some(output_generation)
+    }
+
+    fn clear(&mut self) {
+        self.rejected_output_generation = None;
+    }
+}
+
+#[cfg(test)]
+mod variable_pageflip_qualification_tests {
+    use super::*;
+
+    #[test]
+    fn early_variable_pageflip_rejects_vrr_for_its_output_generation() {
+        let mut qualification = VariablePageflipQualification::default();
+        qualification.reject_generation(7);
+
+        assert!(qualification.rejects_mode(OutputPresentationMode::AdaptiveSync, 7));
+        assert!(qualification.rejects_mode(OutputPresentationMode::AdaptiveAsync, 7));
+        assert!(!qualification.rejects_mode(OutputPresentationMode::AdaptiveSync, 8));
+        assert!(!qualification.rejects_mode(OutputPresentationMode::Vsync, 7));
+
+        qualification.clear();
+        assert!(!qualification.rejects_mode(OutputPresentationMode::AdaptiveSync, 7));
+    }
+}
+
 #[cfg(test)]
 mod confirmed_pageflip_tests;
 mod direct;
@@ -123,6 +161,7 @@ pub(crate) struct AtomicEglGbmScanout {
     async_output_generation: u64,
     presentation_validation_accepted: HashSet<CompositedPresentationValidationKey>,
     presentation_validation_rejected: HashSet<CompositedPresentationValidationKey>,
+    variable_pageflip_qualification: VariablePageflipQualification,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1008,6 +1047,7 @@ impl AtomicEglGbmScanout {
         self.async_output_generation = generation;
         self.presentation_validation_accepted.clear();
         self.presentation_validation_rejected.clear();
+        self.variable_pageflip_qualification.clear();
         self.queue_render_control(AtomicRenderControl::InvalidatePresentedDamageHistory)?;
         if matches!(&self.render_transport, AtomicRenderTransport::Worker(_)) {
             let (controls, required_epoch) = self.take_render_controls_for_job()?;
@@ -1153,6 +1193,13 @@ impl AtomicEglGbmScanout {
         let mut vrr_blocker = effective_presentation.vrr_blocker;
         let mut async_blocker = effective_presentation.async_blocker;
         let mut combination_blocker = None;
+        if self
+            .variable_pageflip_qualification
+            .rejects_mode(mode, output_generation)
+        {
+            mode = OutputPresentationMode::Vsync;
+            vrr_blocker = Some(VrrBlocker::ExactKmsQualificationRejected);
+        }
         if mode != OutputPresentationMode::Vsync
             && let Some(mut rejected_key) = self.composited_presentation_validation_key(
                 output_generation,
@@ -1279,6 +1326,13 @@ impl AtomicEglGbmScanout {
         } else {
             self.presentation_validation_accepted.remove(&key);
             self.presentation_validation_rejected.insert(key);
+        }
+    }
+
+    pub(crate) fn reject_variable_pageflip_for_generation(&mut self, output_generation: u64) {
+        if self.async_output_generation == output_generation {
+            self.variable_pageflip_qualification
+                .reject_generation(output_generation);
         }
     }
 
@@ -1832,6 +1886,7 @@ impl AtomicEglGbmScanout {
             async_output_generation: pool_generation,
             presentation_validation_accepted: HashSet::new(),
             presentation_validation_rejected: HashSet::new(),
+            variable_pageflip_qualification: VariablePageflipQualification::default(),
         })
     }
 

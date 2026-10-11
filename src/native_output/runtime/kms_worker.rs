@@ -1122,13 +1122,18 @@ impl NativeRuntime {
                 self.render_journal
                     .record_worker_queue_residency(ownership.queue_residency_ns);
                 self.render_journal
-                    .record_worker_submit_wake_lateness(ownership.submit_wake_lateness_ns);
-                self.render_journal
-                    .record_worker_pre_submit(ownership.pre_submit_duration_ns);
-                self.render_journal
-                    .record_worker_dispatch(ownership.dispatch_duration_ns);
-                self.render_journal
-                    .record_submission_budget(ownership.submission_budget_ns);
+                    .record_atomic_submit(ownership.ioctl_duration_ns);
+                self.render_journal.record_worker_service(
+                    ownership.pre_submit_duration_ns,
+                    ownership.dispatch_duration_ns,
+                );
+                if let Some(lateness_ns) = ownership.submit_wake_lateness_ns {
+                    self.render_journal.record_fixed_timed_wake(lateness_ns);
+                }
+                if let Some(budget_ns) = ownership.submission_budget_ns {
+                    self.render_journal
+                        .record_fixed_submission_budget(budget_ns);
+                }
                 let _output_generation = ownership.job.output_generation;
                 let cursor = ownership.job.cursor.clone();
                 let sidecar_owner = ownership

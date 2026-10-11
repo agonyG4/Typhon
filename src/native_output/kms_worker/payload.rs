@@ -162,11 +162,11 @@ pub(crate) struct KmsSubmittedOwnership {
     pub(crate) submit_started_at: MonotonicTimestampNs,
     pub(crate) submit_returned_at: MonotonicTimestampNs,
     pub(crate) queue_residency_ns: u64,
-    pub(crate) submit_wake_lateness_ns: u64,
+    pub(crate) submit_wake_lateness_ns: Option<u64>,
     pub(crate) pre_submit_duration_ns: u64,
     pub(crate) ioctl_duration_ns: u64,
     pub(crate) dispatch_duration_ns: u64,
-    pub(crate) submission_budget_ns: u64,
+    pub(crate) submission_budget_ns: Option<u64>,
     pub(crate) dispatch_tail_observation: Option<KmsWorkerDispatchTailObservation>,
 }
 
