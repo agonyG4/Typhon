@@ -7057,7 +7057,7 @@ mod tests {
             buffer_transform: wl_output::Transform::Normal,
             damage: crate::compositor::RenderableSurfaceDamage::full(),
         };
-        let assignment = surface_render_space_assignments(&[surface.clone()], 1.0)
+        let assignment = surface_render_space_assignments(std::slice::from_ref(&surface), 1.0)
             .into_iter()
             .next()
             .expect("surface assignment");
