@@ -26,6 +26,22 @@ fn render_worker_completion_uses_only_visual_demand_arriving_after_dispatch() {
 }
 
 #[test]
+fn synchronous_and_worker_rendered_outcomes_share_reactor_settlement_core() {
+    let synchronous_path = include_str!("presentation_cycle.rs");
+    let worker_path = include_str!("render_worker.rs");
+    let shared_path = include_str!("presentation_worker.rs");
+
+    assert!(shared_path.contains("fn settle_atomic_rendered_outcome("));
+    assert!(shared_path.contains("fn settle_atomic_nonrendered_outcome("));
+    assert!(synchronous_path.contains("settle_atomic_rendered_outcome("));
+    assert!(worker_path.contains("settle_atomic_rendered_outcome("));
+    assert!(synchronous_path.contains("settle_atomic_nonrendered_outcome("));
+    assert!(worker_path.contains("settle_atomic_nonrendered_outcome("));
+    assert!(!synchronous_path.contains("record_atomic_rendered_scene("));
+    assert!(!worker_path.contains("record_atomic_rendered_scene("));
+}
+
+#[test]
 fn auto_hardware_cursor_deadline_does_not_queue_primary_render_work() {
     let cursor_work_pending =
         cursor_work_requires_primary_repaint(NativeCursorSchedulingPolicy::Auto, true, true, false);

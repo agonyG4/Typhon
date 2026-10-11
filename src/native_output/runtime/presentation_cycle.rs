@@ -42,7 +42,6 @@ use crate::native_output::kms_worker::{KmsCommitWorkerTransport, KmsTestOnlyPoli
 use oblivion_one::compositor::FrameCallbackAdmission;
 use oblivion_one::native::buffering::O1AdmissionObservation;
 use oblivion_one::native::kms::KmsBackendKind;
-use oblivion_one::native::scheduler::rendered_primary_must_wait_for_lane;
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn complete_compatibility_no_visual_change(
@@ -116,13 +115,11 @@ pub(super) struct AtomicRenderOuterContinuation {
     pub(super) output_width: u32,
     pub(super) output_height: u32,
     pub(super) o1_admission: Option<O1AdmissionObservation>,
-    pub(super) release_safety: DmabufGpuReleaseSafety,
-    pub(super) release_lease_id: Option<oblivion_one::compositor::DmabufGpuReleaseLeaseId>,
-    pub(super) presentation_snapshot: oblivion_one::compositor::PresentationFrameSnapshot,
-    pub(super) cursor_damage: (
+    pub(super) presentation_snapshot: Option<oblivion_one::compositor::PresentationFrameSnapshot>,
+    pub(super) cursor_damage: Option<(
         Option<NativeClientCursorDamageState>,
         Option<NativeDamageRect>,
-    ),
+    )>,
 }
 
 /// Hardware Auto cursor work is admitted as a PlaneDelta and must not seed a
@@ -1752,11 +1749,11 @@ impl NativeRuntime {
                         let (cursor_assignment, frozen_cursor_plane_owner) = frozen_cursor;
                         let release_safety =
                             dmabuf_gpu_release_safety(explicit, kms_commit_worker.as_ref());
-                        let mut dmabuf_gpu_release_lease_id =
-                            (server.pending_dmabuf_release_count() > 0
-                                || server.lifecycle_precapture_dmabuf_release_count() > 0)
-                                .then(|| dmabuf_gpu_release_registry.allocate_lease_id())
-                                .transpose()?;
+                        let dmabuf_gpu_release_lease_id = (server.pending_dmabuf_release_count()
+                            > 0
+                            || server.lifecycle_precapture_dmabuf_release_count() > 0)
+                            .then(|| dmabuf_gpu_release_registry.allocate_lease_id())
+                            .transpose()?;
                         let render_observed_at_ns = monotonic_now_ns()?;
                         let render_call_started_at_ns =
                             slow_cycle_enabled.then(monotonic_now_ns).transpose()?;
@@ -1781,36 +1778,34 @@ impl NativeRuntime {
                         frame_pacing.log("render_begin", render_begin_fields);
                         let mut cursor_damage =
                             Some((current_client_cursor_damage, current_software_cursor_damage));
-                        let mut worker_outer_continuation = if explicit.render_worker_active() {
-                            Some(AtomicRenderOuterContinuation {
-                                scene_generation,
-                                render_generation,
-                                output_generation: *drm_file_generation,
-                                render_ahead,
-                                pacing_mode,
-                                can_queue_worker_next,
-                                frame_target_sequence: fixed_frame_target
-                                    .map(|frame_target| frame_target.sequence),
-                                frame_target_presentation_ns: fixed_frame_target
-                                    .map(|frame_target| frame_target.presentation_time.get()),
-                                render_observed_at_ns,
-                                cursor_epoch,
-                                coalesced_demand_count_at_dispatch: *render_demand_coalesced_count,
-                                output_width: target.width,
-                                output_height: target.height,
-                                o1_admission,
-                                release_safety,
-                                release_lease_id: dmabuf_gpu_release_lease_id,
-                                presentation_snapshot: presentation_snapshot
+                        let mut worker_outer_continuation = Some(AtomicRenderOuterContinuation {
+                            scene_generation,
+                            render_generation,
+                            output_generation: *drm_file_generation,
+                            render_ahead,
+                            pacing_mode,
+                            can_queue_worker_next,
+                            frame_target_sequence: fixed_frame_target
+                                .map(|frame_target| frame_target.sequence),
+                            frame_target_presentation_ns: fixed_frame_target
+                                .map(|frame_target| frame_target.presentation_time.get()),
+                            render_observed_at_ns,
+                            cursor_epoch,
+                            coalesced_demand_count_at_dispatch: *render_demand_coalesced_count,
+                            output_width: target.width,
+                            output_height: target.height,
+                            o1_admission,
+                            presentation_snapshot: Some(
+                                presentation_snapshot
                                     .take()
-                                    .expect("worker continuation owns presentation snapshot"),
-                                cursor_damage: cursor_damage
+                                    .expect("Atomic continuation owns presentation snapshot"),
+                            ),
+                            cursor_damage: Some(
+                                cursor_damage
                                     .take()
-                                    .expect("worker continuation owns cursor damage"),
-                            })
-                        } else {
-                            None
-                        };
+                                    .expect("Atomic continuation owns cursor damage"),
+                            ),
+                        });
                         #[rustfmt::skip] let render_result = explicit.render_frame(
                             server,
                             output_transactions,
@@ -1922,252 +1917,102 @@ impl NativeRuntime {
                                 *queued_redraw_requested = false;
                                 return Ok(());
                             }
-                            AtomicFrameRenderOutcome::Skipped {
-                                reason,
-                                render_us,
-                                dmabuf_gpu_release,
-                            } => {
-                                frame_pacing.note_predictive_o1_other_safe_abandonment();
-                                frame_pacing.cancel_unsubmitted_render();
-                                if let Some((lease_id, release_fence)) = dmabuf_gpu_release {
-                                    let completion_fd = release_fence.duplicate_completion_fd();
-                                    match completion_fd {
-                                        Ok(completion_fd) => {
-                                            match dmabuf_gpu_release_registry.register_with_origin(
-                                                lease_id,
-                                                completion_fd,
-                                                event_loop,
-                                                DmabufGpuReleaseOrigin::NoVisual,
-                                                0,
-                                                monotonic_now_ns().unwrap_or(0),
-                                            ) {
-                                                Ok(_) => {
-                                                    dmabuf_gpu_release_registry
-                                                        .note_no_visual_fence_only();
-                                                    if server.explicit_release_signal_retry_count()
-                                                        == 0
-                                                    {
-                                                        dmabuf_gpu_release_registry
-                                                            .complete_retry();
-                                                    } else {
-                                                        dmabuf_gpu_release_registry.retry_after_failure(
-                                                            DmabufReleaseRetryReason::ExplicitReleaseSignalFailed,
-                                                            monotonic_now_ns()?,
-                                                        );
-                                                    }
-                                                }
-                                                Err(_) => {
-                                                    dmabuf_gpu_release_registry
-                                                        .note_registration_failure();
-                                                    server
-                                                        .requeue_dmabuf_gpu_release_lease(lease_id);
-                                                    dmabuf_gpu_release_registry.retry_after_failure(
-                                                        DmabufReleaseRetryReason::ReactorRegistrationFailed,
-                                                        monotonic_now_ns()?,
-                                                    );
-                                                }
-                                            }
-                                        }
-                                        Err(_) => {
-                                            dmabuf_gpu_release_registry
-                                                .note_completion_fd_failure();
-                                            server.requeue_dmabuf_gpu_release_lease(lease_id);
-                                            dmabuf_gpu_release_registry.retry_after_failure(
-                                                DmabufReleaseRetryReason::CompletionFdDuplicationFailed,
-                                                monotonic_now_ns()?,
-                                            );
-                                        }
-                                    }
-                                } else if server.explicit_release_signal_retry_count() > 0 {
-                                    dmabuf_gpu_release_registry.retry_after_failure(
-                                        DmabufReleaseRetryReason::ExplicitReleaseSignalFailed,
-                                        monotonic_now_ns()?,
-                                    );
-                                } else if server.retryable_deferred_dmabuf_release_count() > 0 {
-                                    let reason = if release_safety.permits_compositor_gpu_release()
-                                    {
-                                        DmabufReleaseRetryReason::NoGpuProofAvailable
-                                    } else {
-                                        DmabufReleaseRetryReason::DirectKmsOwnershipBlocked
-                                    };
-                                    dmabuf_gpu_release_registry
-                                        .retry_after_failure(reason, monotonic_now_ns()?);
-                                }
-                                render_telemetry.record_skipped(render_us);
-                                frame_scheduler.note_immediate_completion();
-                                frame_completed = true;
-                                retire_logical_scene_generation(
-                                    last_rendered_scene_generation,
-                                    scene_generation,
-                                    true,
-                                );
-                                presentation_deadline.clear_scheduled_target();
-                                *scheduled_presentation_target = None;
-                                *queued_redraw_requested = false;
-                                perf.log("native.atomic_render_skipped", || {
-                                    vec![
-                                        NativePerfField::str("reason", format!("{reason:?}")),
-                                        NativePerfField::u64("render_us", render_us),
-                                        NativePerfField::u64("scene_generation", scene_generation),
-                                        NativePerfField::u64("cursor_epoch", cursor_epoch),
-                                        NativePerfField::usize("accepted_clients", accepted),
-                                        NativePerfField::bool(
-                                            "pending_frame_work",
-                                            pending_frame_work,
-                                        ),
-                                        NativePerfField::str("output_damage", "empty"),
-                                    ]
-                                });
+                            nonrendered @ (AtomicFrameRenderOutcome::Skipped { .. }
+                            | AtomicFrameRenderOutcome::RetryPresentationState {
+                                ..
                             }
-                            AtomicFrameRenderOutcome::RetryPresentationState { render_us } => {
-                                frame_pacing.note_predictive_o1_other_safe_abandonment();
-                                frame_pacing.cancel_unsubmitted_render();
-                                render_telemetry.record_skipped(render_us);
-                                frame_scheduler.note_immediate_completion();
-                                frame_completed = true;
-                                *queued_redraw_requested = true;
-                                *last_acquire_ready_at_ns = None;
-                                presentation_deadline.clear_scheduled_target();
-                                *scheduled_presentation_target = None;
-                                perf.log("native.atomic_presentation_state_retry", || {
-                                    vec![
-                                        NativePerfField::u64("render_us", render_us),
-                                        NativePerfField::u64("scene_generation", scene_generation),
-                                        NativePerfField::str("output_damage", "forced-full"),
-                                    ]
-                                });
-                            }
-                            AtomicFrameRenderOutcome::LifecycleFallback {
-                                fallbacks,
-                                render_us,
-                            } => {
-                                let fallback_count = fallbacks.failed.len();
-                                for fallback in fallbacks.failed {
-                                    server.apply_lifecycle_render_fallback(fallback);
-                                }
-                                frame_pacing.note_predictive_o1_other_safe_abandonment();
-                                frame_pacing.cancel_unsubmitted_render();
-                                frame_scheduler.note_immediate_completion();
-                                frame_completed = true;
-                                *queued_redraw_requested = true;
-                                *last_acquire_ready_at_ns = None;
-                                perf.log("native.atomic_lifecycle_fallback", || {
-                                    vec![
-                                        NativePerfField::usize("fallbacks", fallback_count),
-                                        NativePerfField::u64("render_us", render_us),
-                                        NativePerfField::bool(
-                                            "physical_lifecycle_ledger_changed",
-                                            false,
-                                        ),
-                                    ]
-                                });
+                            | AtomicFrameRenderOutcome::LifecycleFallback {
+                                ..
+                            }) => {
+                                let outer = worker_outer_continuation.as_ref().ok_or_else(|| {
+                                    io::Error::other(
+                                        "Atomic render lost its non-rendered settlement context",
+                                    )
+                                })?;
+                                settle_atomic_nonrendered_outcome(
+                                    AtomicNonRenderedOutcomeContext {
+                                        server: &mut *server,
+                                        frame_pacing: &mut *frame_pacing,
+                                        frame_scheduler: &mut *frame_scheduler,
+                                        dmabuf_gpu_release_registry:
+                                            &mut *dmabuf_gpu_release_registry,
+                                        event_loop: &mut *event_loop,
+                                        render_telemetry: &mut *render_telemetry,
+                                        last_rendered_scene_generation:
+                                            &mut *last_rendered_scene_generation,
+                                        presentation_deadline: &mut *presentation_deadline,
+                                        scheduled_presentation_target:
+                                            &mut *scheduled_presentation_target,
+                                        queued_redraw_requested: &mut *queued_redraw_requested,
+                                        last_acquire_ready_at_ns: &mut *last_acquire_ready_at_ns,
+                                        render_demand_coalesced_count:
+                                            *render_demand_coalesced_count,
+                                        frame_completed: &mut frame_completed,
+                                        perf,
+                                        release_safety,
+                                        accepted_clients: Some(accepted),
+                                        pending_frame_work: Some(pending_frame_work),
+                                    },
+                                    outer,
+                                    nonrendered,
+                                )?;
                             }
                             #[rustfmt::skip]
                             AtomicFrameRenderOutcome::Rendered { frame_id, transaction_id, protocol_batch_id, render_us, repaint_stats, lifecycle_snapshot, resolved_snapshot, resolved_scene_signature, render_damage_signature, repair_damage_signature, resolved_render_generation, framebuffer_slot, deferred_o1_binding_advanced_intervals, deferred_o1_binding_failure } => {
                                 if slow_cycle_enabled {
                                     slow_cycle_trace.note_compositor_render_us(render_us);
                                 }
-                                let physical_identity = match explicit.swapchain() {
-                                    Ok(swapchain) => swapchain.ready_identity().ok_or_else(|| {
+                                let outer = worker_outer_continuation
+                                    .as_mut()
+                                    .ok_or_else(|| {
                                         io::Error::other(
-                                            "rendered Atomic frame has no physical identity",
+                                            "Atomic render lost its rendered-scene settlement context",
                                         )
-                                    }),
-                                    Err(error) => Err(error),
-                                };
-                                let physical_identity = match physical_identity {
-                                    Ok(identity) => identity,
-                                    Err(error) => {
-                                        explicit.finish_render_work();
-                                        server.cancel_lifecycle_precapture_after_render_failure();
-                                        frame_pacing.note_predictive_o1_failed();
-                                        frame_pacing.cancel_unsubmitted_render();
-                                        return Err(Box::new(error));
-                                    }
-                                };
-                                if let Err(error) =
-                                    frame_pacing.bind_predictive_o1(physical_identity)
-                                {
-                                    explicit.finish_render_work();
-                                    server.cancel_lifecycle_precapture_after_render_failure();
-                                    frame_pacing.note_predictive_o1_failed();
-                                    frame_pacing.cancel_unsubmitted_render();
-                                    return Err(Box::new(io::Error::other(error)));
-                                }
-                                frame_pacing.note_render_ready();
-                                if let Some(advanced_intervals) = deferred_o1_binding_advanced_intervals {
-                                    frame_pacing.note_predictive_binding_after_render_completion(
-                                        advanced_intervals,
-                                    );
-                                }
-                                let settled_lifecycle_releases = server
-                                    .settle_lifecycle_precapture_for_rendered_frame(
+                                    })?;
+                                let settled = settle_atomic_rendered_outcome(
+                                    AtomicRenderedOutcomeContext {
+                                        explicit: &mut *explicit,
+                                        server: &mut *server,
+                                        frame_pacing: &mut *frame_pacing,
+                                        frame_scheduler: &mut *frame_scheduler,
+                                        dmabuf_gpu_release_registry:
+                                            &mut *dmabuf_gpu_release_registry,
+                                        event_loop: &mut *event_loop,
+                                        scene_history: &mut *scene_history,
+                                        presentation_trace: &mut *presentation_trace,
+                                        render_telemetry: &mut *render_telemetry,
+                                        frame_rendered: &mut frame_rendered,
+                                        release_safety,
+                                        release_lease_id: dmabuf_gpu_release_lease_id,
+                                        finish_render_work_on_failure: true,
+                                        atomic_commit_pending: atomic_commit_arbiter
+                                            .atomic_commit_pending(),
+                                    },
+                                    outer,
+                                    AtomicFrameRenderOutcome::Rendered {
+                                        frame_id,
+                                        transaction_id,
                                         protocol_batch_id,
-                                        &lifecycle_snapshot,
-                                    );
-                                if settled_lifecycle_releases > 0
-                                    && dmabuf_gpu_release_lease_id.is_none()
-                                {
-                                    dmabuf_gpu_release_lease_id = Some(
-                                        dmabuf_gpu_release_registry.allocate_lease_id()?,
-                                    );
-                                }
-                                let _ = arm_composited_dmabuf_release(
-                                    dmabuf_gpu_release_registry,
-                                    server,
-                                    explicit,
-                                    release_safety,
-                                    event_loop,
-                                    protocol_batch_id,
-                                    dmabuf_gpu_release_lease_id,
-                                    transaction_id,
-                                )?;
-                                if o1_admission.is_some_and(|admission| admission.used_extra_credit) {
-                                    frame_pacing.note_o1_credit2_extra_credit_consumed();
-                                }
-                                record_atomic_rendered_scene(
-                                    scene_history,
-                                    presentation_trace,
-                                    frame_id,
-                                    transaction_id,
-                                    resolved_render_generation,
-                                    resolved_snapshot,
-                                    presentation_snapshot
-                                        .take()
-                                        .expect("synchronous path retains presentation snapshot"),
-                                    lifecycle_snapshot,
-                                    resolved_scene_signature,
-                                    render_damage_signature,
-                                    repair_damage_signature,
-                                    scene_history.presented_frame_id(),
-                                    framebuffer_slot,
-                                    cursor_damage
-                                        .take()
-                                        .expect("synchronous path retains cursor damage"),
-                                    repaint_stats.buffer_age,
-                                )?;
-                                render_telemetry.record_atomic(render_us, repaint_stats, *target);
-                                frame_scheduler.consume_visual_work();
-                                frame_rendered = true;
-                                let trace_timestamp_ns = monotonic_now_ns()?;
-                                presentation_trace.push(
-                                    PresentationTransactionEvent::TransactionBuilt {
-                                        transaction_id,
-                                        timestamp_ns: trace_timestamp_ns,
+                                        render_us,
+                                        repaint_stats,
+                                        lifecycle_snapshot,
+                                        resolved_snapshot,
+                                        resolved_scene_signature,
+                                        render_damage_signature,
+                                        repair_damage_signature,
+                                        resolved_render_generation,
+                                        framebuffer_slot,
+                                        deferred_o1_binding_advanced_intervals,
+                                        deferred_o1_binding_failure,
                                     },
-                                );
-                                presentation_trace.push(
-                                    PresentationTransactionEvent::AcquireReady {
-                                        transaction_id,
-                                        timestamp_ns: trace_timestamp_ns,
-                                    },
-                                );
-                                let ready_at_ns = monotonic_now_ns()?;
-                                let waits_for_target = rendered_primary_must_wait_for_lane(
-                                    render_ahead,
-                                    atomic_commit_arbiter.atomic_commit_pending(),
-                                    can_queue_worker_next,
-                                );
+                                )?;
+                                let frame_id = settled.frame_id;
+                                let transaction_id = settled.transaction_id;
+                                let protocol_batch_id = settled.protocol_batch_id;
+                                let deferred_o1_binding_failure =
+                                    settled.deferred_o1_binding_failure;
+                                let ready_at_ns = settled.ready_at_ns;
+                                let waits_for_target = settled.waits_for_target;
                                 let mut deferred_o1_safely_abandoned = false;
                                 if let Some(failure) = deferred_o1_binding_failure {
                                     debug_assert!(render_ahead && waits_for_target);

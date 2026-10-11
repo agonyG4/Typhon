@@ -128,6 +128,375 @@ pub(super) fn record_atomic_rendered_scene(
     )
 }
 
+pub(super) struct AtomicRenderedOutcomeContext<'a> {
+    pub(super) explicit: &'a mut crate::native_output::scanout::AtomicEglGbmScanout,
+    pub(super) server: &'a mut OwnCompositorServer,
+    pub(super) frame_pacing: &'a mut NativeFramePacing,
+    pub(super) frame_scheduler: &'a mut NativeFrameScheduler,
+    pub(super) dmabuf_gpu_release_registry: &'a mut DmabufGpuReleaseRegistry,
+    pub(super) event_loop: &'a mut NativeEventLoop,
+    pub(super) scene_history: &'a mut NativeSceneHistory,
+    pub(super) presentation_trace: &'a mut PresentationTransactionTraceRing,
+    pub(super) render_telemetry: &'a mut NativeRenderTelemetry,
+    pub(super) frame_rendered: &'a mut bool,
+    pub(super) release_safety: DmabufGpuReleaseSafety,
+    pub(super) release_lease_id: Option<oblivion_one::compositor::DmabufGpuReleaseLeaseId>,
+    pub(super) finish_render_work_on_failure: bool,
+    pub(super) atomic_commit_pending: bool,
+}
+
+pub(super) struct AtomicRenderedOutcomeSettlement {
+    pub(super) frame_id: u64,
+    pub(super) transaction_id: OutputTransactionId,
+    pub(super) protocol_batch_id: oblivion_one::compositor::CompositorFrameBatchId,
+    pub(super) deferred_o1_binding_failure:
+        Option<crate::native_output::scanout::DeferredO1BindingFailure>,
+    pub(super) ready_at_ns: u64,
+    pub(super) waits_for_target: bool,
+}
+
+pub(super) fn settle_atomic_rendered_outcome(
+    context: AtomicRenderedOutcomeContext<'_>,
+    outer: &mut super::presentation_cycle::AtomicRenderOuterContinuation,
+    outcome: crate::native_output::scanout::AtomicFrameRenderOutcome,
+) -> NativeResult<AtomicRenderedOutcomeSettlement> {
+    let crate::native_output::scanout::AtomicFrameRenderOutcome::Rendered {
+        frame_id,
+        transaction_id,
+        protocol_batch_id,
+        render_us,
+        repaint_stats,
+        lifecycle_snapshot,
+        resolved_snapshot,
+        resolved_scene_signature,
+        render_damage_signature,
+        repair_damage_signature,
+        resolved_render_generation,
+        framebuffer_slot,
+        deferred_o1_binding_advanced_intervals,
+        deferred_o1_binding_failure,
+    } = outcome
+    else {
+        return Err(
+            io::Error::other("common rendered settlement received a non-rendered outcome").into(),
+        );
+    };
+
+    let physical_identity = match context.explicit.swapchain() {
+        Ok(swapchain) => swapchain
+            .ready_identity()
+            .ok_or_else(|| io::Error::other("rendered Atomic frame has no physical identity")),
+        Err(error) => Err(error),
+    };
+    let physical_identity = match physical_identity {
+        Ok(identity) => identity,
+        Err(error) => {
+            if context.finish_render_work_on_failure {
+                context.explicit.finish_render_work();
+            }
+            context
+                .server
+                .cancel_lifecycle_precapture_after_render_failure();
+            context.frame_pacing.note_predictive_o1_failed();
+            context.frame_pacing.cancel_unsubmitted_render();
+            return Err(Box::new(error));
+        }
+    };
+    if let Err(error) = context.frame_pacing.bind_predictive_o1(physical_identity) {
+        if context.finish_render_work_on_failure {
+            context.explicit.finish_render_work();
+        }
+        context
+            .server
+            .cancel_lifecycle_precapture_after_render_failure();
+        context.frame_pacing.note_predictive_o1_failed();
+        context.frame_pacing.cancel_unsubmitted_render();
+        return Err(io::Error::other(error).into());
+    }
+    context.frame_pacing.note_render_ready();
+    if let Some(advanced_intervals) = deferred_o1_binding_advanced_intervals {
+        context
+            .frame_pacing
+            .note_predictive_binding_after_render_completion(advanced_intervals);
+    }
+    let settled_lifecycle_releases = context
+        .server
+        .settle_lifecycle_precapture_for_rendered_frame(protocol_batch_id, &lifecycle_snapshot);
+    let mut lease_id = context.release_lease_id;
+    if settled_lifecycle_releases > 0 && lease_id.is_none() {
+        lease_id = Some(context.dmabuf_gpu_release_registry.allocate_lease_id()?);
+    }
+    let _ = arm_composited_dmabuf_release(
+        context.dmabuf_gpu_release_registry,
+        context.server,
+        context.explicit,
+        context.release_safety,
+        context.event_loop,
+        protocol_batch_id,
+        lease_id,
+        transaction_id,
+    )?;
+    if outer
+        .o1_admission
+        .is_some_and(|admission| admission.used_extra_credit)
+    {
+        context.frame_pacing.note_o1_credit2_extra_credit_consumed();
+    }
+    let presentation = outer
+        .presentation_snapshot
+        .take()
+        .ok_or_else(|| io::Error::other("Atomic render continuation lost presentation snapshot"))?;
+    let cursor = outer
+        .cursor_damage
+        .take()
+        .ok_or_else(|| io::Error::other("Atomic render continuation lost cursor damage"))?;
+    let presented_frame_id = context.scene_history.presented_frame_id();
+    record_atomic_rendered_scene(
+        context.scene_history,
+        context.presentation_trace,
+        frame_id,
+        transaction_id,
+        resolved_render_generation,
+        resolved_snapshot,
+        presentation,
+        lifecycle_snapshot,
+        resolved_scene_signature,
+        render_damage_signature,
+        repair_damage_signature,
+        presented_frame_id,
+        framebuffer_slot,
+        cursor,
+        repaint_stats.buffer_age,
+    )?;
+    context.render_telemetry.record_rendered(
+        render_us,
+        repaint_stats,
+        outer.output_width,
+        outer.output_height,
+    );
+    context.frame_scheduler.consume_visual_work();
+    *context.frame_rendered = true;
+
+    let trace_timestamp_ns = monotonic_now_ns()?;
+    context
+        .presentation_trace
+        .push(PresentationTransactionEvent::TransactionBuilt {
+            transaction_id,
+            timestamp_ns: trace_timestamp_ns,
+        });
+    context
+        .presentation_trace
+        .push(PresentationTransactionEvent::AcquireReady {
+            transaction_id,
+            timestamp_ns: trace_timestamp_ns,
+        });
+    let waits_for_target = oblivion_one::native::scheduler::rendered_primary_must_wait_for_lane(
+        outer.render_ahead,
+        context.atomic_commit_pending,
+        outer.can_queue_worker_next,
+    );
+    let ready_at_ns = monotonic_now_ns()?;
+    Ok(AtomicRenderedOutcomeSettlement {
+        frame_id,
+        transaction_id,
+        protocol_batch_id,
+        deferred_o1_binding_failure,
+        ready_at_ns,
+        waits_for_target,
+    })
+}
+
+pub(super) struct AtomicNonRenderedOutcomeContext<'a> {
+    pub(super) server: &'a mut OwnCompositorServer,
+    pub(super) frame_pacing: &'a mut NativeFramePacing,
+    pub(super) frame_scheduler: &'a mut NativeFrameScheduler,
+    pub(super) dmabuf_gpu_release_registry: &'a mut DmabufGpuReleaseRegistry,
+    pub(super) event_loop: &'a mut NativeEventLoop,
+    pub(super) render_telemetry: &'a mut NativeRenderTelemetry,
+    pub(super) last_rendered_scene_generation: &'a mut u64,
+    pub(super) presentation_deadline:
+        &'a mut oblivion_one::native::presentation_deadline::PresentationDeadlinePlanner,
+    pub(super) scheduled_presentation_target:
+        &'a mut Option<crate::native_output::PresentationTarget>,
+    pub(super) queued_redraw_requested: &'a mut bool,
+    pub(super) last_acquire_ready_at_ns: &'a mut Option<u64>,
+    pub(super) render_demand_coalesced_count: u64,
+    pub(super) frame_completed: &'a mut bool,
+    pub(super) perf: crate::native_output::NativePerfLogger,
+    pub(super) release_safety: DmabufGpuReleaseSafety,
+    pub(super) accepted_clients: Option<usize>,
+    pub(super) pending_frame_work: Option<bool>,
+}
+
+pub(super) fn settle_atomic_nonrendered_outcome(
+    context: AtomicNonRenderedOutcomeContext<'_>,
+    outer: &super::presentation_cycle::AtomicRenderOuterContinuation,
+    outcome: crate::native_output::scanout::AtomicFrameRenderOutcome,
+) -> NativeResult<()> {
+    match outcome {
+        crate::native_output::scanout::AtomicFrameRenderOutcome::Skipped {
+            reason,
+            render_us,
+            dmabuf_gpu_release,
+        } => {
+            context
+                .frame_pacing
+                .note_predictive_o1_other_safe_abandonment();
+            context.frame_pacing.cancel_unsubmitted_render();
+            if let Some((lease_id, release_fence)) = dmabuf_gpu_release {
+                let completion_fd = release_fence.duplicate_completion_fd();
+                match completion_fd {
+                    Ok(completion_fd) => {
+                        match context.dmabuf_gpu_release_registry.register_with_origin(
+                            lease_id,
+                            completion_fd,
+                            context.event_loop,
+                            DmabufGpuReleaseOrigin::NoVisual,
+                            0,
+                            monotonic_now_ns().unwrap_or(0),
+                        ) {
+                            Ok(_) => {
+                                context
+                                    .dmabuf_gpu_release_registry
+                                    .note_no_visual_fence_only();
+                                if context.server.explicit_release_signal_retry_count() == 0 {
+                                    context.dmabuf_gpu_release_registry.complete_retry();
+                                } else {
+                                    context.dmabuf_gpu_release_registry.retry_after_failure(
+                                        DmabufReleaseRetryReason::ExplicitReleaseSignalFailed,
+                                        monotonic_now_ns()?,
+                                    );
+                                }
+                            }
+                            Err(_) => {
+                                context
+                                    .dmabuf_gpu_release_registry
+                                    .note_registration_failure();
+                                context.server.requeue_dmabuf_gpu_release_lease(lease_id);
+                                context.dmabuf_gpu_release_registry.retry_after_failure(
+                                    DmabufReleaseRetryReason::ReactorRegistrationFailed,
+                                    monotonic_now_ns()?,
+                                );
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        context
+                            .dmabuf_gpu_release_registry
+                            .note_completion_fd_failure();
+                        context.server.requeue_dmabuf_gpu_release_lease(lease_id);
+                        context.dmabuf_gpu_release_registry.retry_after_failure(
+                            DmabufReleaseRetryReason::CompletionFdDuplicationFailed,
+                            monotonic_now_ns()?,
+                        );
+                    }
+                }
+            } else if context.server.explicit_release_signal_retry_count() > 0 {
+                context.dmabuf_gpu_release_registry.retry_after_failure(
+                    DmabufReleaseRetryReason::ExplicitReleaseSignalFailed,
+                    monotonic_now_ns()?,
+                );
+            } else if context.server.retryable_deferred_dmabuf_release_count() > 0 {
+                let retry_reason = if context.release_safety.permits_compositor_gpu_release() {
+                    DmabufReleaseRetryReason::NoGpuProofAvailable
+                } else {
+                    DmabufReleaseRetryReason::DirectKmsOwnershipBlocked
+                };
+                context
+                    .dmabuf_gpu_release_registry
+                    .retry_after_failure(retry_reason, monotonic_now_ns()?);
+            }
+            context.render_telemetry.record_skipped(render_us);
+            context.frame_scheduler.note_immediate_completion();
+            *context.frame_completed = true;
+            super::commit_timing::retire_logical_scene_generation(
+                context.last_rendered_scene_generation,
+                outer.scene_generation,
+                true,
+            );
+            context.presentation_deadline.clear_scheduled_target();
+            *context.scheduled_presentation_target = None;
+            if context.render_demand_coalesced_count == outer.coalesced_demand_count_at_dispatch {
+                *context.queued_redraw_requested = false;
+            }
+            context.perf.log("native.atomic_render_skipped", || {
+                let mut fields = vec![
+                    NativePerfField::str("reason", format!("{reason:?}")),
+                    NativePerfField::u64("render_us", render_us),
+                    NativePerfField::u64("scene_generation", outer.scene_generation),
+                    NativePerfField::u64("cursor_epoch", outer.cursor_epoch),
+                ];
+                if let Some(accepted_clients) = context.accepted_clients {
+                    fields.push(NativePerfField::usize("accepted_clients", accepted_clients));
+                }
+                if let Some(pending_frame_work) = context.pending_frame_work {
+                    fields.push(NativePerfField::bool(
+                        "pending_frame_work",
+                        pending_frame_work,
+                    ));
+                }
+                fields.push(NativePerfField::str("output_damage", "empty"));
+                fields
+            });
+        }
+        crate::native_output::scanout::AtomicFrameRenderOutcome::RetryPresentationState {
+            render_us,
+        } => {
+            context
+                .frame_pacing
+                .note_predictive_o1_other_safe_abandonment();
+            context.frame_pacing.cancel_unsubmitted_render();
+            context.render_telemetry.record_skipped(render_us);
+            context.frame_scheduler.note_immediate_completion();
+            *context.frame_completed = true;
+            *context.queued_redraw_requested = true;
+            *context.last_acquire_ready_at_ns = None;
+            context.presentation_deadline.clear_scheduled_target();
+            *context.scheduled_presentation_target = None;
+            context
+                .perf
+                .log("native.atomic_presentation_state_retry", || {
+                    vec![
+                        NativePerfField::u64("render_us", render_us),
+                        NativePerfField::u64("scene_generation", outer.scene_generation),
+                        NativePerfField::str("output_damage", "forced-full"),
+                    ]
+                });
+        }
+        crate::native_output::scanout::AtomicFrameRenderOutcome::LifecycleFallback {
+            fallbacks,
+            render_us,
+        } => {
+            let fallback_count = fallbacks.failed.len();
+            for fallback in fallbacks.failed {
+                context.server.apply_lifecycle_render_fallback(fallback);
+            }
+            context
+                .frame_pacing
+                .note_predictive_o1_other_safe_abandonment();
+            context.frame_pacing.cancel_unsubmitted_render();
+            context.frame_scheduler.note_immediate_completion();
+            *context.frame_completed = true;
+            *context.queued_redraw_requested = true;
+            *context.last_acquire_ready_at_ns = None;
+            context.perf.log("native.atomic_lifecycle_fallback", || {
+                vec![
+                    NativePerfField::usize("fallbacks", fallback_count),
+                    NativePerfField::u64("render_us", render_us),
+                    NativePerfField::bool("physical_lifecycle_ledger_changed", false),
+                ]
+            });
+        }
+        _ => {
+            return Err(io::Error::other(
+                "common non-rendered settlement received a rendered or dispatched outcome",
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn resolve_scene_and_damage<'a>(
     direct: bool,
     width: u32,
