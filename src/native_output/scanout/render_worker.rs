@@ -439,13 +439,14 @@ impl AtomicRenderWorkerHandle {
                 });
                 if let Err(panic) = loop_result {
                     worker_fatal.store(true, Ordering::Release);
+                    let fatal = panic.fatal_event_evidence();
                     let _ = publish_event(
                         &panic_events,
                         &panic_fd,
                         AtomicRenderWorkerEvent::Fatal {
                             job_id: None,
-                            gpu_execution_uncertain: true,
-                            reason: panic.reason(),
+                            gpu_execution_uncertain: fatal.gpu_execution_uncertain,
+                            reason: fatal.reason,
                         },
                     );
                 }

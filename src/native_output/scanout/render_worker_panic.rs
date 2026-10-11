@@ -3,10 +3,19 @@ pub(super) enum RenderWorkerPanic {
     Caught,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct WorkerLoopFatalEventEvidence {
+    pub(super) reason: &'static str,
+    pub(super) gpu_execution_uncertain: bool,
+}
+
 impl RenderWorkerPanic {
-    pub(super) const fn reason(self) -> &'static str {
+    pub(super) const fn fatal_event_evidence(self) -> WorkerLoopFatalEventEvidence {
         match self {
-            Self::Caught => "worker_loop_panic",
+            Self::Caught => WorkerLoopFatalEventEvidence {
+                reason: "worker_loop_panic",
+                gpu_execution_uncertain: true,
+            },
         }
     }
 }
@@ -27,6 +36,8 @@ mod tests {
         let result = catch_render_worker_loop(|| panic!("injected worker panic"));
 
         assert_eq!(result, Err(RenderWorkerPanic::Caught));
-        assert_eq!(RenderWorkerPanic::Caught.reason(), "worker_loop_panic");
+        let fatal = RenderWorkerPanic::Caught.fatal_event_evidence();
+        assert_eq!(fatal.reason, "worker_loop_panic");
+        assert!(fatal.gpu_execution_uncertain);
     }
 }
