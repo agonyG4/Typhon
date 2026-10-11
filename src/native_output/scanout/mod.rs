@@ -48,6 +48,10 @@ pub(crate) use kms_preferred::*;
 pub(crate) use output_slot::*;
 #[allow(unused_imports)]
 pub(crate) use output_swapchain::*;
+pub(crate) use render_worker::{
+    AtomicRenderWorkerCompletion, AtomicRenderWorkerEvent, AtomicRenderWorkerIdentity,
+    completion_matches_job,
+};
 pub(crate) use scaled_probe::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -264,6 +268,29 @@ pub(crate) struct AtomicExplicitRecovery {
 }
 
 impl NativeScanoutBackend {
+    pub(crate) fn render_worker_event_fd(&self) -> Option<i32> {
+        match self {
+            Self::AtomicEglGbm(scanout) => scanout.render_worker_event_fd(),
+            Self::NativeEglGbm(_) | Self::Gbm(_) | Self::Dumb(_) => None,
+        }
+    }
+
+    pub(crate) fn render_worker_busy(&self) -> bool {
+        match self {
+            Self::AtomicEglGbm(scanout) => scanout.render_worker_busy(),
+            Self::NativeEglGbm(_) | Self::Gbm(_) | Self::Dumb(_) => false,
+        }
+    }
+
+    pub(crate) fn try_take_render_worker_event(
+        &mut self,
+    ) -> std::io::Result<Option<AtomicRenderWorkerEvent>> {
+        match self {
+            Self::AtomicEglGbm(scanout) => scanout.try_take_render_worker_event(),
+            Self::NativeEglGbm(_) | Self::Gbm(_) | Self::Dumb(_) => Ok(None),
+        }
+    }
+
     pub(crate) fn import_scaled_probe_framebuffer(
         &self,
         candidate: &oblivion_one::compositor::DirectScanoutProbeCandidate,

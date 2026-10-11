@@ -283,6 +283,7 @@ impl NativeWorkDomains {
             || state.recovery_required;
         let presentation = reasons.drm()
             || reasons.kms_commit_worker()
+            || reasons.render_worker()
             || reasons.output_render_fence()
             || wakeup
                 .continuation
@@ -360,6 +361,7 @@ mod tests {
     const DMABUF_GPU_RELEASE: u32 = 1 << 16;
     const CONTROLLER: u32 = 1 << 20;
     const SYSTEM_ACTION: u32 = 1 << 21;
+    const RENDER_WORKER: u32 = 1 << 22;
 
     fn wakeup(bits: u32) -> NativeWakeup {
         NativeWakeup {
@@ -569,6 +571,17 @@ mod tests {
         assert!(!domains.scene);
         assert!(plan.presentation_due);
         assert!(!plan.visual_scene_debt);
+        assert!(!plan.service_acquire_and_prepare);
+    }
+
+    #[test]
+    fn render_worker_completion_wakeup_reenters_presentation_planning() {
+        let domains = NativeWorkDomains::classify(&wakeup(RENDER_WORKER), &state());
+        let plan = domains.operation_plan();
+
+        assert!(domains.presentation);
+        assert!(plan.presentation_due);
+        assert!(!domains.scene);
         assert!(!plan.service_acquire_and_prepare);
     }
 

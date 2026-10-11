@@ -482,6 +482,10 @@ impl NativeRuntime {
                 event_loop.register(worker.event_fd(), NativeEventSource::KmsCommitWorker)
             })
             .transpose()?;
+        let render_worker_reactor_token = scanout
+            .render_worker_event_fd()
+            .map(|fd| event_loop.register(fd, NativeEventSource::RenderWorker))
+            .transpose()?;
         if let Some(session) = seat_session.as_ref() {
             event_loop.register(session.event_fd()?, NativeEventSource::Seat)?;
         }
@@ -732,6 +736,9 @@ impl NativeRuntime {
             output_render_fence_token: None,
             kms_commit_worker,
             kms_commit_worker_reactor_token,
+            render_worker_reactor_token,
+            pending_render_worker_identity: None,
+            pending_render_worker_completion: None,
             cursor_io_worker: Some(cursor_io_worker),
             cursor_io_worker_reactor_token,
             pending_cursor_job: None,
@@ -787,6 +794,7 @@ impl NativeRuntime {
             last_software_cursor_damage,
             last_client_cursor_path,
             queued_redraw_requested,
+            render_demand_coalesced_count: 0,
             frame_index,
             known_toplevels,
             pending_launches,

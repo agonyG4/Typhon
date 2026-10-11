@@ -38,9 +38,9 @@ use super::atomic_direct::{direct_candidate_key, direct_scanout_debug};
 use super::atomic_render_domain::{AtomicRenderDomain, AtomicRenderDomainBootstrap};
 pub(crate) use super::atomic_render_domain::{AtomicRenderedFrameParts, AtomicSlotRenderOutcome};
 use super::render_worker::{
-    AtomicRenderControl, AtomicRenderTransportKind, AtomicRenderWorkerHandle,
-    AtomicRenderWorkerPolicy, AtomicRenderWorkerStartup, SequencedRenderControl,
-    apply_render_control,
+    AtomicRenderControl, AtomicRenderTransportKind, AtomicRenderWorkerEvent,
+    AtomicRenderWorkerHandle, AtomicRenderWorkerPolicy, AtomicRenderWorkerStartup,
+    SequencedRenderControl, apply_render_control,
 };
 use super::*;
 use crate::native_output::presentation::async_validation::CompositedPresentationValidationKey;
@@ -499,6 +499,22 @@ impl AtomicEglGbmScanout {
             AtomicRenderTransport::Synchronous(_) => None,
             AtomicRenderTransport::Worker(worker) => Some(worker),
         }
+    }
+
+    pub(crate) fn render_worker_event_fd(&self) -> Option<i32> {
+        self.render_worker().map(AtomicRenderWorkerHandle::event_fd)
+    }
+
+    pub(crate) fn render_worker_busy(&self) -> bool {
+        self.render_worker()
+            .is_some_and(AtomicRenderWorkerHandle::busy)
+    }
+
+    pub(crate) fn try_take_render_worker_event(
+        &mut self,
+    ) -> io::Result<Option<AtomicRenderWorkerEvent>> {
+        self.render_worker_mut()
+            .map_or(Ok(None), AtomicRenderWorkerHandle::try_take_event)
     }
 
     pub(crate) fn finish_render_work(&self) {

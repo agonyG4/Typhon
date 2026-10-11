@@ -165,7 +165,12 @@ add a second prepared physical render job.
 
 The current checkout contains the bounded worker bootstrap, render command and
 completion payloads, renderer-control representation, and pure busy/demand
-state model. Worker bootstrap follows the required two-stage ownership path:
+state model. The render-worker eventfd is registered as a dedicated native
+event source when a worker transport is present, and its completion identity is
+checked against the single executing-job identity before retaining the result
+in the reactor's one-entry completion slot. Worker-busy presentation planning
+records only redraw demand before scene, slot, transaction, frame-batch, or
+frozen-payload preparation. Worker bootstrap follows the required two-stage ownership path:
 EGL format discovery runs on `typhon-render`; the reactor then selects the
 KMS-compatible format, allocates physical BOs, and transfers owned render-slot
 descriptors back to that same worker for renderer initialization. The worker
@@ -179,14 +184,15 @@ domain from being selected while `render_frame` still expects an immediate
 renderer result. Do not use `auto` as a worker A/B setting on this checkout.
 
 The remaining Phase 2B.2 work is to introduce the owned reactor continuation
-for the current `AtomicEglGbmScanout::render_frame` locals; resume the common
-Atomic outcome settlement from the worker eventfd path; register and drain the
-worker event source; and connect latest-state render demand before slot,
-transaction, frame-batch, and frozen-scene preparation. The same worker also
-needs asynchronous admission/completion for capture, trusted-effect reload,
-output candidate preparation/promotion, session rebind/quiescence, and ordered
-shutdown acknowledgement before physical pool release. Until these paths are
-connected and qualified, the only enabled runtime transport is synchronous.
+for the current `AtomicEglGbmScanout::render_frame` and outer presentation-cycle
+locals, then resume the common Atomic outcome settlement from the worker
+eventfd path. That continuation is not yet connected, so the completion slot is
+only a bounded transport boundary and cannot yet admit a render. The same
+worker also needs asynchronous admission/completion for capture, trusted-effect
+reload, output candidate preparation/promotion, session rebind/quiescence, and
+ordered shutdown acknowledgement before physical pool release. Until these
+paths are connected and qualified, the only enabled runtime transport is
+synchronous.
 
 The three-slot bound covers output-frame terminal tokens. Other worker work
 uses separate fixed admission limits, not entries in an unbounded common queue:

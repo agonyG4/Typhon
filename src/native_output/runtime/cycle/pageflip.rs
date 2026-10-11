@@ -628,6 +628,9 @@ impl NativeRuntime {
             // before the DRM pageflip validation below runs.
             self.process_kms_worker_events()?;
         }
+        if wakeup.reasons.render_worker() {
+            self.process_render_worker_events()?;
+        }
         self.termination.set_phase(RuntimePhase::RuntimeCycle);
         self.retire_settled_output_terminals();
         let deferred_worker_pageflip = self.deferred_worker_pageflip.take();

@@ -276,6 +276,7 @@ impl NativeRuntime {
             output_render_fence_token,
             kms_commit_worker,
             kms_commit_worker_transport,
+            pending_render_worker_completion,
             frame_scheduler,
             atomic_commit_arbiter,
             emergency_quarantined_worker_jobs,
@@ -301,6 +302,7 @@ impl NativeRuntime {
             last_software_cursor_damage,
             last_client_cursor_path,
             queued_redraw_requested,
+            render_demand_coalesced_count,
             frame_index,
             known_toplevels: _,
             pending_launches: _,
@@ -348,6 +350,15 @@ impl NativeRuntime {
         let cursor_planning_started_at_ns =
             slow_cycle_enabled.then(monotonic_now_ns).transpose()?;
         #[rustfmt::skip] synchronize_active_cursor_image(server, cursor_manager, cursor_image, frame_renderer, scanout, queued_redraw_requested);
+        if scanout.render_worker_busy() || pending_render_worker_completion.is_some() {
+            // The worker owns the only rendering slot and this frame has not
+            // crossed protocol/frame-batch admission. Keep only redraw demand;
+            // the normal planner will resolve the newest compositor state
+            // after the executing result is settled.
+            *queued_redraw_requested = true;
+            *render_demand_coalesced_count = render_demand_coalesced_count.saturating_add(1);
+            return Ok(());
+        }
         let (client_cursor, client_surface_content_active, cursor_visible) =
             resolve_native_cursor_visibility(server, input_state);
         #[rustfmt::skip] prepare_legacy_cursor_for_frame(legacy_cursor, kms, target.crtc_id, cursor_image, cursor_render_mode, cursor_manager, server.client_cursor_surface_active(), perf)?;

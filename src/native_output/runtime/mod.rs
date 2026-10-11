@@ -163,6 +163,7 @@ mod presentation_protocol;
 mod presentation_ready;
 mod presentation_transactions;
 mod presentation_worker;
+mod render_worker;
 mod resource_efficiency;
 mod scene_history;
 mod scene_liveness;
@@ -733,6 +734,9 @@ pub(crate) struct NativeRuntime {
     output_render_fence_token: Option<ReactorToken>,
     kms_commit_worker: Option<super::kms_worker::KmsCommitWorkerHandle>,
     kms_commit_worker_reactor_token: Option<ReactorToken>,
+    render_worker_reactor_token: Option<ReactorToken>,
+    pending_render_worker_identity: Option<super::scanout::AtomicRenderWorkerIdentity>,
+    pending_render_worker_completion: Option<super::scanout::AtomicRenderWorkerCompletion>,
     cursor_io_worker: Option<oblivion_one::cursor_manager::CursorIoWorker>,
     cursor_io_worker_reactor_token: Option<ReactorToken>,
     pending_cursor_job: Option<PendingCursorJob>,
@@ -795,6 +799,7 @@ pub(crate) struct NativeRuntime {
     last_software_cursor_damage: Option<NativeDamageRect>,
     last_client_cursor_path: Option<NativeClientCursorPath>,
     queued_redraw_requested: bool,
+    render_demand_coalesced_count: u64,
     frame_index: u64,
     known_toplevels: usize,
     pending_launches: VecDeque<NativeAppLaunchPerf>,
@@ -1060,6 +1065,11 @@ impl Drop for NativeRuntime {
             self.termination.record_cleanup_error(&error);
         }
         if let Some(token) = self.cursor_io_worker_reactor_token.take() {
+            if let Err(error) = self.event_loop.unregister(token) {
+                self.termination.record_cleanup_error(&error);
+            }
+        }
+        if let Some(token) = self.render_worker_reactor_token.take() {
             if let Err(error) = self.event_loop.unregister(token) {
                 self.termination.record_cleanup_error(&error);
             }

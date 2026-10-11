@@ -11,6 +11,7 @@ const MAX_READY_EVENTS: usize = 64;
 pub enum NativeEventSource {
     Drm,
     KmsCommitWorker,
+    RenderWorker,
     CursorIoWorker,
     KeyboardPersistenceWorker,
     OutputConfigurationPersistenceWorker,
@@ -102,6 +103,7 @@ impl WakeReasons {
     const XWAYLAND_STDERR: u32 = 1 << 12;
     const CONTROL: u32 = 1 << 14;
     const SYSTEM_ACTION: u32 = 1 << 21;
+    const RENDER_WORKER: u32 = 1 << 22;
 
     pub const fn drm(self) -> bool {
         self.0 & Self::DRM != 0
@@ -109,6 +111,10 @@ impl WakeReasons {
 
     pub const fn kms_commit_worker(self) -> bool {
         self.0 & Self::KMS_COMMIT_WORKER != 0
+    }
+
+    pub const fn render_worker(self) -> bool {
+        self.0 & Self::RENDER_WORKER != 0
     }
 
     pub const fn cursor_io_worker(self) -> bool {
@@ -200,6 +206,7 @@ impl WakeReasons {
         self.0 |= match source {
             NativeEventSource::Drm => Self::DRM,
             NativeEventSource::KmsCommitWorker => Self::KMS_COMMIT_WORKER,
+            NativeEventSource::RenderWorker => Self::RENDER_WORKER,
             NativeEventSource::CursorIoWorker => Self::CURSOR_IO_WORKER,
             NativeEventSource::KeyboardPersistenceWorker => Self::KEYBOARD_PERSISTENCE_WORKER,
             NativeEventSource::OutputConfigurationPersistenceWorker => {
@@ -1324,6 +1331,26 @@ mod tests {
 
         assert!(wakeup.reasons.kms_commit_worker());
         assert!(!wakeup.reasons.drm());
+    }
+
+    #[test]
+    fn render_worker_eventfd_sets_dedicated_wakeup_reason() {
+        let worker = event_fd();
+        let mut event_loop = NativeEventLoop::new().unwrap();
+        let token = event_loop
+            .register(worker.as_raw_fd(), NativeEventSource::RenderWorker)
+            .unwrap();
+        assert_eq!(
+            event_loop.source_for_token(token),
+            Some(NativeEventSource::RenderWorker)
+        );
+
+        signal(worker.as_raw_fd());
+        let wakeup = event_loop.wait().unwrap();
+
+        assert!(wakeup.reasons.render_worker());
+        assert!(!wakeup.reasons.drm());
+        assert!(!wakeup.reasons.kms_commit_worker());
     }
 
     #[test]

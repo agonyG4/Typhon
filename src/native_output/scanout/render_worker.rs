@@ -161,6 +161,43 @@ pub(crate) struct AtomicRenderWorkerCompletion {
     pub(crate) worker_wall_ns: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AtomicRenderWorkerIdentity {
+    pub(crate) job_id: RenderWorkerJobId,
+    pub(crate) frame_id: u64,
+    pub(crate) transaction_id: OutputTransactionId,
+    pub(crate) output_generation: u64,
+    pub(crate) render_generation: u64,
+    pub(crate) target: RenderTargetRequest,
+}
+
+impl AtomicRenderWorkerCompletion {
+    pub(crate) const fn identity(&self) -> AtomicRenderWorkerIdentity {
+        AtomicRenderWorkerIdentity {
+            job_id: self.job_id,
+            frame_id: self.frame_id,
+            transaction_id: self.transaction_id,
+            output_generation: self.output_generation,
+            render_generation: self.render_generation,
+            target: self.target,
+        }
+    }
+}
+
+pub(crate) fn completion_matches_job(
+    expected: AtomicRenderWorkerIdentity,
+    actual: AtomicRenderWorkerIdentity,
+) -> bool {
+    expected.job_id.get() == actual.job_id.get()
+        && expected.frame_id == actual.frame_id
+        && expected.transaction_id.get() == actual.transaction_id.get()
+        && expected.output_generation == actual.output_generation
+        && expected.render_generation == actual.render_generation
+        && expected.target.slot.get() == actual.target.slot.get()
+        && expected.target.pool_generation == actual.target.pool_generation
+        && expected.target.buffer_age == actual.target.buffer_age
+}
+
 pub(crate) enum AtomicRenderWorkerEvent {
     Rendered(AtomicRenderWorkerCompletion),
     Fatal {
@@ -475,7 +512,7 @@ fn render_worker_loop(
                     let no_visual_release_fence = if need_no_visual_release_fence
                         && matches!(&result, Ok(AtomicSlotRenderOutcome::Skipped { .. }))
                     {
-                        domain.create_render_fence().ok()
+                        Some(domain.create_render_fence()?)
                     } else {
                         None
                     };
@@ -750,6 +787,7 @@ impl RenderWorkerAdmission {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::num::NonZeroU64;
 
     #[test]
     fn worker_policy_defaults_off_and_parses_explicit_modes() {
@@ -828,5 +866,78 @@ mod tests {
             },
         ];
         assert!(validate_render_control_batch(7, &out_of_order, 9).is_err());
+    }
+
+    #[test]
+    fn completion_identity_rejects_stale_job_and_generation_mismatches() {
+        let identity = AtomicRenderWorkerIdentity {
+            job_id: RenderWorkerJobId::new(10).unwrap(),
+            frame_id: 12,
+            transaction_id: OutputTransactionId::new(NonZeroU64::new(13).unwrap()),
+            output_generation: 14,
+            render_generation: 15,
+            target: RenderTargetRequest {
+                slot: super::super::OutputSlotId::new(1).unwrap(),
+                pool_generation: 16,
+                buffer_age: crate::egl_renderer::BufferAge::Value(2),
+            },
+        };
+
+        assert!(completion_matches_job(identity, identity));
+        assert!(!completion_matches_job(
+            identity,
+            AtomicRenderWorkerIdentity {
+                job_id: RenderWorkerJobId::new(11).unwrap(),
+                ..identity
+            }
+        ));
+        assert!(!completion_matches_job(
+            identity,
+            AtomicRenderWorkerIdentity {
+                frame_id: 20,
+                ..identity
+            }
+        ));
+        assert!(!completion_matches_job(
+            identity,
+            AtomicRenderWorkerIdentity {
+                transaction_id: OutputTransactionId::new(NonZeroU64::new(21).unwrap()),
+                ..identity
+            }
+        ));
+        assert!(!completion_matches_job(
+            identity,
+            AtomicRenderWorkerIdentity {
+                output_generation: 17,
+                ..identity
+            }
+        ));
+        assert!(!completion_matches_job(
+            identity,
+            AtomicRenderWorkerIdentity {
+                render_generation: 18,
+                ..identity
+            }
+        ));
+        assert!(!completion_matches_job(
+            identity,
+            AtomicRenderWorkerIdentity {
+                target: RenderTargetRequest {
+                    slot: super::super::OutputSlotId::new(2).unwrap(),
+                    ..identity.target
+                },
+                ..identity
+            }
+        ));
+        assert!(!completion_matches_job(
+            identity,
+            AtomicRenderWorkerIdentity {
+                target: RenderTargetRequest {
+                    pool_generation: 19,
+                    ..identity.target
+                },
+                ..identity
+            }
+        ));
     }
 }
