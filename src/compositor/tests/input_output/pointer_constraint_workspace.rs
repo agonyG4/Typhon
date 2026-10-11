@@ -191,10 +191,9 @@ fn compositor_move_suspends_active_persistent_locked_pointer_without_hint_warp()
         capture_xdg_role_snapshot(&commands, fixture.surface.id().protocol_id()).surface_id;
     let (start_x, start_y) = capture_last_pointer_position(&commands);
     let pointer_before = (start_x, start_y);
-    assert!(capture_cursor_hidden_by_pointer_lock(&commands));
     assert!(
-        !capture_interaction_cursor_state(&commands).visible,
-        "the active lock should hide the client cursor before takeover"
+        capture_interaction_cursor_state(&commands).visible,
+        "pointer lock leaves the fallback cursor visible before takeover"
     );
     let root_x_before = capture_renderable_surface_snapshot(&commands)
         .into_iter()
@@ -218,7 +217,7 @@ fn compositor_move_suspends_active_persistent_locked_pointer_without_hint_warp()
     assert!(cursor.override_active);
     assert!(
         cursor.visible,
-        "interaction cursor must override the lock-hidden cursor"
+        "the compositor interaction cursor remains visible during takeover"
     );
     assert_eq!(
         (cursor.pointer_x, cursor.pointer_y),
@@ -234,9 +233,9 @@ fn compositor_move_suspends_active_persistent_locked_pointer_without_hint_warp()
             restore_origin: None,
         } if *id == backend_id
     )));
-    assert!(requests.iter().any(|request| matches!(
+    assert!(requests.iter().all(|request| !matches!(
         request,
-        PointerConstraintBackendRequest::ApplyCursorVisibility { visible: true }
+        PointerConstraintBackendRequest::ApplyCursorVisibility { .. }
     )));
     fixture.queue.roundtrip(&mut fixture.state).unwrap();
     assert_eq!(fixture.state.unlocked_count, 1);
@@ -300,10 +299,9 @@ fn compositor_move_suspends_active_persistent_locked_pointer_without_hint_warp()
     );
     let cursor_after_reactivation = capture_interaction_cursor_state(&commands);
     assert!(!cursor_after_reactivation.override_active);
-    assert!(capture_cursor_hidden_by_pointer_lock(&commands));
     assert!(
-        !cursor_after_reactivation.visible,
-        "the reactivated client lock should restore its normal hidden-cursor policy"
+        cursor_after_reactivation.visible,
+        "reactivating the persistent lock does not hide the ordinary cursor"
     );
 
     commands.send(ServerCommand::Stop).unwrap();
@@ -1205,7 +1203,7 @@ fn persistent_locked_pointer_releases_when_workspace_owner_departs() {
     assert!(!snapshot.defunct);
     assert_ne!(capture_pointer_focus_surface_id(&commands), old_focus);
     assert!(capture_pending_locked_pointer_reveal(&commands));
-    assert!(capture_cursor_hidden_by_pointer_lock(&commands));
+    assert!(capture_interaction_cursor_state(&commands).visible);
     assert!(
         capture_pointer_constraint_backend_requests(&commands)
             .iter()

@@ -111,6 +111,11 @@ The following remain adapter/model foundations rather than end-to-end support:
 - runtime RandR publication: inactive foundation; no live output publication;
 - X11 cursor ownership integration: inactive foundation.
 
+The compositor-facing Wayland cursor selected by an XWayland client remains
+governed by its ordinary Wayland cursor state while a pointer constraint is
+active. Pointer lock affects motion routing only; it does not provide X11 cursor
+ownership integration or change the inactive-foundation status above.
+
 The compositor's canonical Wayland selection state remains authoritative for
 publication to Wayland clients. Bidirectional CLIPBOARD/PRIMARY transport is
 implementation-active; native interoperability qualification remains pending

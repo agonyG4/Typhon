@@ -567,9 +567,6 @@ impl CompositorState {
         if self.interaction_cursor_override.is_some() {
             return None;
         }
-        if self.cursor_visibility.lock_hidden_constraint_id.is_some() {
-            return None;
-        }
         if self.cursor_visibility.client_hidden_pointer.is_some() {
             return None;
         }
@@ -586,13 +583,6 @@ impl CompositorState {
             hotspot_x: active.hotspot_x,
             hotspot_y: active.hotspot_y,
         })
-    }
-
-    pub(in crate::compositor) fn active_client_cursor_has_content(&self) -> bool {
-        self.focused_client_cursor
-            .as_ref()
-            .and_then(ClientCursorChoice::surface)
-            .is_some_and(|active| self.client_cursor_surfaces.contains_key(&active.surface_id))
     }
 
     pub(in crate::compositor) fn client_cursor_surface_active(&self) -> bool {

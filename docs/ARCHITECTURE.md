@@ -64,10 +64,10 @@ the module tree and keeps production modules below the configured size limits.
 
 `PointerConstraintRuntimeState` is the single persistent owner of protocol
 constraint records, pre-commit surface mutations, active lock/confine routing,
-backend constraint identities, generation counters, and lock-release reveal
-tracking. Surface-commit mutations transfer into `SurfaceTransactionState` as
-captured transaction data and return to the runtime owner when publication
-makes them effective:
+backend constraint identities, generation counters, and lock-release
+position-settlement tracking. Surface-commit mutations transfer into
+`SurfaceTransactionState` as captured transaction data and return to the
+runtime owner when publication makes them effective:
 
 ```text
 pointer constraint protocol request
@@ -85,6 +85,19 @@ The runtime owner does not own pointer focus, spatial caches, cursor
 visibility, or the native request transport queue. Absolute-motion filtering
 uses the matching active backend identity and generation from the runtime
 owner; relative-pointer routing remains in input dispatch.
+
+The existing `pending_locked_pointer_reveal` name is retained for a follow-up
+rename to settlement: it tracks final pointer-position settlement after
+unlock, not cursor visibility. Its generation-qualified backend restore,
+client-warp observation, and dispatch grace behavior remain independent of
+cursor-source selection.
+
+Pointer constraints control pointer motion and routing. They do not control
+cursor image visibility. Cursor visibility is selected independently from
+client cursor state, compositor interaction overrides, DnD state, and fallback
+policy. A locked pointer suppresses absolute pointer motion while relative
+motion continues, but the selected client cursor surface or shape remains
+visible unless an independent cursor request or override changes it.
 
 ## Effective XDG window geometry
 

@@ -709,8 +709,9 @@ fn destroyed_committed_constraint_releases_request_slot_before_next_surface_comm
     assert!(connection.protocol_error().is_none());
 }
 
-#[test]
-fn committed_constraint_replacement_applies_retirement_and_installation_in_one_commit() {
+fn run_persistent_lock_replacement_preserves_cursor_visibility_and_generation_identity(
+    hide_cursor: bool,
+) {
     let socket_name = unique_socket_name();
     let capabilities = InputProtocolCapabilities {
         pointer_constraints: true,
@@ -747,6 +748,18 @@ fn committed_constraint_replacement_applies_retirement_and_installation_in_one_c
         .unwrap();
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
+    if hide_cursor {
+        let enter_serial = state.pointer_enter_serial.expect("pointer enter serial");
+        pointer.set_cursor(enter_serial, None, 0, 0);
+        connection.flush().unwrap();
+        wait_for_server_commands(&commands);
+        queue.roundtrip(&mut state).unwrap();
+        let hide_requests = capture_pointer_constraint_backend_requests(&commands);
+        assert!(hide_requests.iter().any(|request| matches!(
+            request,
+            PointerConstraintBackendRequest::ApplyCursorVisibility { visible: false }
+        )));
+    }
 
     let lock_a = constraints.lock_pointer(
         &surface,
@@ -761,9 +774,13 @@ fn committed_constraint_replacement_applies_retirement_and_installation_in_one_c
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
     let a_id = activate_locked_backend(&commands, &mut state, &mut queue);
+    assert_eq!(
+        capture_interaction_cursor_state(&commands).visible,
+        !hide_cursor
+    );
     lock_a.destroy();
 
-    let _confine_b = constraints.confine_pointer(
+    let lock_b = constraints.lock_pointer(
         &surface,
         &pointer,
         None,
@@ -777,7 +794,7 @@ fn committed_constraint_replacement_applies_retirement_and_installation_in_one_c
     assert!(before_commit.iter().all(|request| {
         !matches!(
             request,
-            PointerConstraintBackendRequest::ActivateConfined { .. }
+            PointerConstraintBackendRequest::ActivateLocked { .. }
         )
     }));
 
@@ -785,6 +802,14 @@ fn committed_constraint_replacement_applies_retirement_and_installation_in_one_c
     connection.flush().unwrap();
     wait_for_server_commands(&commands);
     let mut transition_requests = capture_pointer_constraint_backend_requests(&commands);
+    assert_eq!(
+        capture_interaction_cursor_state(&commands).visible,
+        !hide_cursor
+    );
+    assert!(transition_requests.iter().all(|request| !matches!(
+        request,
+        PointerConstraintBackendRequest::ApplyCursorVisibility { .. }
+    )));
     assert!(transition_requests.iter().any(|request| matches!(
         request,
         PointerConstraintBackendRequest::Deactivate { id, .. } if *id == a_id
@@ -792,7 +817,7 @@ fn committed_constraint_replacement_applies_retirement_and_installation_in_one_c
     let mut b_id = transition_requests
         .iter()
         .find_map(|request| match request {
-            PointerConstraintBackendRequest::ActivateConfined { id, .. } => Some(*id),
+            PointerConstraintBackendRequest::ActivateLocked { id, .. } => Some(*id),
             _ => None,
         });
     commands
@@ -804,7 +829,7 @@ fn committed_constraint_replacement_applies_retirement_and_installation_in_one_c
         b_id = transition_requests
             .iter()
             .find_map(|request| match request {
-                PointerConstraintBackendRequest::ActivateConfined { id, .. } => Some(*id),
+                PointerConstraintBackendRequest::ActivateLocked { id, .. } => Some(*id),
                 _ => None,
             });
     }
@@ -814,12 +839,21 @@ fn committed_constraint_replacement_applies_retirement_and_installation_in_one_c
         .unwrap();
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
+    assert_eq!(
+        capture_interaction_cursor_state(&commands).visible,
+        !hide_cursor
+    );
+    let activation_ack_requests = capture_pointer_constraint_backend_requests(&commands);
+    assert!(activation_ack_requests.iter().all(|request| !matches!(
+        request,
+        PointerConstraintBackendRequest::ApplyCursorVisibility { .. }
+    )));
 
     let b_snapshot = capture_pointer_constraint_snapshot(&commands, b_id.constraint_id)
         .expect("constraint B must remain current");
     assert!(b_snapshot.committed);
     assert!(!b_snapshot.backend_pending);
-    assert_eq!(state.confined_count, 1);
+    assert_eq!(state.locked_count, 2);
     let a_snapshot = capture_pointer_constraint_snapshot(&commands, a_id.constraint_id)
         .expect("constraint A tombstone must remain to reject stale completions");
     assert!(!a_snapshot.committed);
@@ -838,13 +872,58 @@ fn committed_constraint_replacement_applies_retirement_and_installation_in_one_c
     queue.roundtrip(&mut state).unwrap();
     let b_after_stale = capture_pointer_constraint_snapshot(&commands, b_id.constraint_id)
         .expect("stale A completion must not remove B");
+    assert!(b_after_stale.active);
+
+    lock_b.destroy();
+    surface.commit();
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    let unlock_requests = capture_pointer_constraint_backend_requests(&commands);
+    assert!(unlock_requests.iter().any(|request| matches!(
+        request,
+        PointerConstraintBackendRequest::Deactivate { id, .. } if *id == b_id
+    )));
+    assert_eq!(
+        capture_interaction_cursor_state(&commands).visible,
+        !hide_cursor
+    );
+    assert!(unlock_requests.iter().all(|request| !matches!(
+        request,
+        PointerConstraintBackendRequest::ApplyCursorVisibility { .. }
+    )));
+    commands
+        .send(ServerCommand::PointerConstraintBackendDeactivated(b_id))
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    let unlock_ack_requests = capture_pointer_constraint_backend_requests(&commands);
+    assert_eq!(
+        capture_interaction_cursor_state(&commands).visible,
+        !hide_cursor
+    );
+    assert!(unlock_ack_requests.iter().all(|request| !matches!(
+        request,
+        PointerConstraintBackendRequest::ApplyCursorVisibility { .. }
+    )));
+
     commands.send(ServerCommand::Stop).unwrap();
     server_thread.join().unwrap();
 
     assert!(b_after_stale.committed);
     assert!(!b_after_stale.backend_pending);
-    assert_eq!(state.confined_count, 1);
+    assert_eq!(state.locked_count, 2);
     assert!(connection.protocol_error().is_none());
+}
+
+#[test]
+fn persistent_lock_replacement_preserves_cursor_visibility_and_generation_identity() {
+    run_persistent_lock_replacement_preserves_cursor_visibility_and_generation_identity(false);
+}
+
+#[test]
+fn persistent_lock_replacement_preserves_explicitly_hidden_cursor() {
+    run_persistent_lock_replacement_preserves_cursor_visibility_and_generation_identity(true);
 }
 
 #[test]

@@ -18,6 +18,12 @@ pub(super) enum ClientEvent {
         pointer_enter_count: usize,
         pointer_leave_count: usize,
     },
+    LockRequested,
+    CursorState {
+        pointer_motion_count: usize,
+        relative_motion_count: usize,
+        locked_count: usize,
+    },
     Finished {
         pointer_motion_count: usize,
         pointer_surface_x: Option<f64>,
@@ -41,6 +47,10 @@ pub(super) enum ClientEvent {
 #[allow(dead_code)]
 pub(super) enum ClientCommand {
     SetCursor,
+    LockPointer,
+    HideCursor,
+    ReplaceCursor,
+    CaptureCursorState,
     CaptureActive,
     BeginXdgMove,
     CaptureButtons,

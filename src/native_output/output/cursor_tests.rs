@@ -641,55 +641,70 @@ fn client_shape_motion_does_not_churn_visibility_revision() {
 }
 
 #[test]
-fn pointer_lock_replacement_keeps_shape_hidden_until_final_unlock() {
+fn pointer_lock_replacement_preserves_visible_shape_without_visibility_churn() {
     let visible_shape = NativeCursorSourceInput {
         client_shape_active: true,
         theme_fallback_visible: false,
         ..Default::default()
-    };
-    let locked_shape = NativeCursorSourceInput {
-        pointer_lock_hidden: true,
-        ..visible_shape
     };
     let mut cursor = test_cursor();
 
     cursor.set_visible(resolve_native_cursor_source(visible_shape).visible);
     let visible_revision = cursor.desired_revision().visibility;
 
-    let lock_a = locked_shape;
-    let lock_b = locked_shape;
-    cursor.set_visible(resolve_native_cursor_source(lock_a).visible);
-    let locked_visibility = cursor.desired_revision().visibility;
-    assert_ne!(locked_visibility, visible_revision);
+    // Pointer locks do not enter cursor-source inputs. Replacing A with B
+    // therefore leaves the independently selected client shape unchanged.
+    cursor.set_visible(resolve_native_cursor_source(visible_shape).visible);
+    assert_eq!(cursor.desired_revision().visibility, visible_revision);
+    assert!(cursor.desired().visible);
 
-    // The compositor applies Retire(A) + Install(B) as one effective
-    // transition. The native side must observe the still-hidden committed
-    // state throughout the replacement.
-    cursor.set_visible(resolve_native_cursor_source(lock_b).visible);
-    assert_eq!(cursor.desired_revision().visibility, locked_visibility);
+    // Retiring A and installing B must not change the independently selected
+    // client shape or its native visibility revision.
+    cursor.set_visible(resolve_native_cursor_source(visible_shape).visible);
+    assert_eq!(cursor.desired_revision().visibility, visible_revision);
+    assert!(cursor.desired().visible);
 
     for position in 0..32 {
         cursor.set_position(position, position);
-        cursor.set_visible(resolve_native_cursor_source(lock_b).visible);
+        cursor.set_visible(resolve_native_cursor_source(visible_shape).visible);
     }
-    assert_eq!(cursor.desired_revision().visibility, locked_visibility);
+    assert_eq!(cursor.desired_revision().visibility, visible_revision);
 
     cursor.set_visible(resolve_native_cursor_source(visible_shape).visible);
-    let revealed_visibility = cursor.desired_revision().visibility;
-    assert_ne!(revealed_visibility, locked_visibility);
+    assert_eq!(cursor.desired_revision().visibility, visible_revision);
     assert!(cursor.desired().visible);
 }
 
 #[test]
-fn session_recovery_uses_effective_shape_visibility() {
-    let shape = NativeCursorSourceInput {
+fn pointer_lock_replacement_preserves_explicitly_hidden_cursor() {
+    let hidden_shape = NativeCursorSourceInput {
+        client_explicitly_hidden: true,
         client_shape_active: true,
         theme_fallback_visible: false,
         ..Default::default()
     };
-    let locked_shape = NativeCursorSourceInput {
-        pointer_lock_hidden: true,
-        ..shape
+    let mut cursor = test_cursor();
+
+    cursor.set_visible(resolve_native_cursor_source(hidden_shape).visible);
+    let hidden_revision = cursor.desired_revision().visibility;
+    assert!(!cursor.desired().visible);
+
+    cursor.set_visible(resolve_native_cursor_source(hidden_shape).visible);
+    assert_eq!(cursor.desired_revision().visibility, hidden_revision);
+    cursor.set_visible(resolve_native_cursor_source(hidden_shape).visible);
+    assert_eq!(cursor.desired_revision().visibility, hidden_revision);
+    cursor.set_visible(resolve_native_cursor_source(hidden_shape).visible);
+
+    assert_eq!(cursor.desired_revision().visibility, hidden_revision);
+    assert!(!cursor.desired().visible);
+}
+
+#[test]
+fn session_recovery_keeps_client_shape_hardware_eligible() {
+    let shape = NativeCursorSourceInput {
+        client_shape_active: true,
+        theme_fallback_visible: false,
+        ..Default::default()
     };
     let mut cursor = test_cursor();
     cursor.set_visible(true);
@@ -701,15 +716,6 @@ fn session_recovery_uses_effective_shape_visibility() {
             resolve_native_cursor_source(shape).visible,
         )
         .hardware_usable()
-    );
-    assert!(
-        effective_atomic_cursor_state(
-            &cursor,
-            NativeCursorRenderMode::Hardware,
-            resolve_native_cursor_source(locked_shape).visible,
-        )
-        .kms_state()
-        .is_none()
     );
 }
 

@@ -8,10 +8,6 @@ impl CompositorState {
             .locked_surface_for_absolute_motion()
     }
 
-    pub(in crate::compositor) fn cursor_hidden_by_pointer_lock(&self) -> bool {
-        self.cursor_visibility.lock_hidden_constraint_id.is_some()
-    }
-
     pub(in crate::compositor) fn active_locked_pointer_binding(
         &self,
     ) -> Option<ActiveLockedPointerRouting> {

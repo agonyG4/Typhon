@@ -107,7 +107,6 @@ impl CompositorState {
             .as_ref()
             .and_then(ClientCursorChoice::surface)
             .is_some_and(|active| active.surface_id == surface_id)
-            && self.cursor_visibility.lock_hidden_constraint_id.is_none()
         {
             self.queue_frame_callbacks_for_surface(surface_id, frame_callbacks);
         } else {

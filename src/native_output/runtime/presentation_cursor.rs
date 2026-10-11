@@ -127,7 +127,7 @@ pub(super) fn resolve_native_cursor_visibility<'a>(
                 )
             });
             format!(
-                "event=cursor_source_resolved constraint={}/{} source={:?} cursor_visible={} logical_pointer=({},{}) client_surface_content_active={} client_surface_active={} client_cursor_explicitly_hidden={} pointer_lock_hidden={} interaction_override_active={} theme_fallback_visible={} client_surface={:?}",
+                "event=cursor_source_resolved constraint={}/{} source={:?} cursor_visible={} logical_pointer=({},{}) client_surface_content_active={} client_surface_active={} client_cursor_explicitly_hidden={} interaction_override_active={} theme_fallback_visible={} client_surface={:?}",
                 reveal.map_or(0, |reveal| reveal.constraint.constraint_id),
                 reveal.map_or(0, |reveal| reveal.constraint.generation),
                 resolved_cursor.source,
@@ -137,7 +137,6 @@ pub(super) fn resolve_native_cursor_visibility<'a>(
                 client_surface_content_active,
                 source_input.client_surface_active,
                 source_input.client_explicitly_hidden,
-                source_input.pointer_lock_hidden,
                 source_input.interaction_override_active,
                 source_input.theme_fallback_visible,
                 client

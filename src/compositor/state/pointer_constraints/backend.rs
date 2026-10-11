@@ -434,11 +434,6 @@ impl CompositorState {
                 activation_anchor.x,
                 activation_anchor.y
             ));
-            self.cursor_visibility.lock_hidden_constraint_id = Some(constraint_id);
-            if self.active_client_cursor_has_content() {
-                self.advance_render_generation(RenderGenerationCause::CursorState);
-            }
-            self.sync_cursor_visibility_request();
             let (surface_x, surface_y) = self
                 .pointer_target_at(activation_anchor.x, activation_anchor.y)
                 .filter(|target| same_surface_resource(&target.surface, &surface))
@@ -819,8 +814,6 @@ impl CompositorState {
             .then_some(PointerWarpOrigin::LockedPointerCursorHint);
         if was_active {
             self.invalidate_locked_relative_recipient_cache();
-            let locked_unlock_transition = mode == PointerConstraintMode::Locked
-                && self.cursor_visibility.lock_hidden_constraint_id == Some(constraint_id);
             if queue_backend_deactivate {
                 pointer_debug_log(format!(
                     "backend deactivate queued id={} generation={} reason=constraint_deactivate",
@@ -853,7 +846,7 @@ impl CompositorState {
                     PointerConstraintMode::None => {}
                 }
             }
-            if locked_unlock_transition && pointer.is_alive() && surface.is_alive() {
+            if mode == PointerConstraintMode::Locked && pointer.is_alive() && surface.is_alive() {
                 self.begin_pending_locked_pointer_reveal(
                     backend_id,
                     pointer,
@@ -886,19 +879,6 @@ impl CompositorState {
                     backend_id.constraint_id, backend_id.generation
                 ));
             }
-        }
-        if self.cursor_visibility.lock_hidden_constraint_id == Some(constraint_id)
-            && self
-                .pointer_constraint_runtime
-                .pending_locked_pointer_reveal
-                .as_ref()
-                .is_none_or(|pending| pending.backend_id.constraint_id != constraint_id)
-        {
-            self.cursor_visibility.lock_hidden_constraint_id = None;
-            if self.active_client_cursor_has_content() {
-                self.advance_render_generation(RenderGenerationCause::CursorState);
-            }
-            self.sync_cursor_visibility_request();
         }
     }
 

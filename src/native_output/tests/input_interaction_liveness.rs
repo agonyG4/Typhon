@@ -2,7 +2,13 @@ use super::input::{pump_native_input_server_until, spawn_native_input_resize_cli
 use super::input_protocol::{ClientCommand, ClientEvent};
 use super::input_xwayland_client::spawn_native_input_xwayland_client;
 use super::*;
-use oblivion_one::compositor::{DesktopWindowKind, WindowConstraints, WindowMetadata};
+use crate::native_output::runtime::{
+    NativePointerConstraintBackend, NativeResolvedCursorSource, resolve_native_cursor_for_server,
+};
+use oblivion_one::compositor::{
+    DesktopWindowKind, OutputPosition, PointerMotionSample, RelativePointerMotion,
+    WindowConstraints, WindowMetadata,
+};
 use oblivion_one::xwayland::xwm::{
     X11Geometry, X11MoveResizeDirection, X11MoveResizeRequest, X11PublishedState,
     X11WindowSnapshot, X11WindowTypes, XwmEvent,
@@ -341,6 +347,229 @@ fn client_owned_x11_release_uses_production_native_routing() {
     assert_eq!(metrics.window_interaction_trigger_releases, 104);
     assert_eq!(metrics.window_interaction_client_releases_forwarded, 104);
     assert_eq!(metrics.window_interaction_release_target_missing, 0);
+    client_commands.send(ClientCommand::Finish).unwrap();
+    assert!(matches!(
+        pump_native_input_server_until(&mut server, &client_events),
+        ClientEvent::Finished { .. }
+    ));
+}
+
+#[test]
+fn xwayland_client_cursor_remains_visible_and_relative_input_flows_while_locked() {
+    let socket_name = format!(
+        "typhon-native-input-xwayland-lock-cursor-{}",
+        std::process::id()
+    );
+    let mut server = OwnCompositorServer::bind_native_base(&socket_name).unwrap();
+    let generation = XwaylandGeneration::new(NonZeroU64::new(1).unwrap());
+    let (server_stream, client_stream) = UnixStream::pair().unwrap();
+    server
+        .insert_xwayland_client(server_stream, generation)
+        .unwrap();
+    let (client_commands, client_events) = spawn_native_input_xwayland_client(client_stream);
+
+    assert!(matches!(
+        pump_native_input_server_until(&mut server, &client_events),
+        ClientEvent::ReadyForPointer
+    ));
+    let serial = NonZeroU64::new((u64::from(0x3333_4444_u32) << 32) | 0x1111_2222).unwrap();
+    let surface_id = server
+        .take_xwayland_association_events()
+        .into_iter()
+        .find_map(|event| match event {
+            oblivion_one::xwayland::XwaylandAssociationEvent::Committed {
+                generation: event_generation,
+                serial: event_serial,
+                surface_id,
+            } if event_generation == generation && event_serial == serial => Some(surface_id),
+            _ => None,
+        })
+        .expect("XWayland surface association");
+    let handle = X11WindowHandle::new(generation, 0x100);
+    server.apply_xwayland_window_event(XwmEvent::WindowReady(X11WindowSnapshot {
+        handle,
+        surface_id,
+        kind: DesktopWindowKind::Managed,
+        window_types: X11WindowTypes::default(),
+        decoration_hints: Default::default(),
+        override_redirect: false,
+        geometry: X11Geometry {
+            x: 80,
+            y: 80,
+            width: 160,
+            height: 120,
+        },
+        metadata: WindowMetadata::default(),
+        constraints: WindowConstraints::default(),
+        state: X11PublishedState::default(),
+        transient_for: None,
+        supports_delete: true,
+        supports_take_focus: true,
+        accepts_input: Some(true),
+        window_role: None,
+        startup_id: None,
+        user_time: None,
+        urgency: false,
+        supports_sync_request: false,
+        sync_counter: None,
+    }));
+
+    server.send_pointer_motion(92.0, 86.0);
+    client_commands.send(ClientCommand::SetCursor).unwrap();
+    assert!(matches!(
+        pump_native_input_server_until(&mut server, &client_events),
+        ClientEvent::CursorReady {
+            pointer_enter_count: 1,
+            ..
+        }
+    ));
+    let initial_cursor =
+        resolve_native_cursor_for_server(&server, &NativeInputState::new(320, 200));
+    assert_eq!(
+        initial_cursor.source,
+        NativeResolvedCursorSource::ClientSurface
+    );
+    assert!(initial_cursor.visible);
+    let render_state = server
+        .client_cursor_render_state()
+        .expect("XWayland cursor surface is active");
+    assert_eq!((render_state.logical_x, render_state.logical_y), (89, 82));
+    // The client cursor owns the cursor image, so the theme cursor is already
+    // disabled independently of pointer constraints.
+    let _ = server.take_pointer_constraint_backend_requests();
+
+    client_commands.send(ClientCommand::LockPointer).unwrap();
+    assert_eq!(
+        pump_native_input_server_until(&mut server, &client_events),
+        ClientEvent::LockRequested
+    );
+    let mut backend = NativePointerConstraintBackend::new();
+    let mut activated = None;
+    for request in server.take_pointer_constraint_backend_requests() {
+        let action = backend.handle_request(request, OutputPosition { x: 92.0, y: 86.0 });
+        if let Some(constraint) = action.activated {
+            activated = Some(constraint);
+        }
+    }
+    let locked = activated.expect("native backend acknowledges Locked activation");
+    assert_eq!(
+        locked.mode,
+        oblivion_one::compositor::PointerConstraintMode::Locked
+    );
+    server.pointer_constraint_backend_activated_at(locked.id, locked.anchor);
+    assert!(backend.active_locked());
+    assert!(
+        server
+            .take_pointer_constraint_backend_requests()
+            .iter()
+            .all(|request| !matches!(
+                request,
+                oblivion_one::compositor::PointerConstraintBackendRequest::ApplyCursorVisibility { .. }
+            )),
+        "lock activation alone must not request a cursor visibility transition"
+    );
+
+    client_commands
+        .send(ClientCommand::CaptureCursorState)
+        .unwrap();
+    let baseline = match pump_native_input_server_until(&mut server, &client_events) {
+        ClientEvent::CursorState {
+            pointer_motion_count,
+            relative_motion_count,
+            locked_count,
+        } => {
+            assert_eq!(locked_count, 1, "client receives Locked activation");
+            (pointer_motion_count, relative_motion_count)
+        }
+        other => panic!("unexpected client event: {other:?}"),
+    };
+    let locked_cursor = resolve_native_cursor_for_server(&server, &NativeInputState::new(320, 200));
+    assert_eq!(
+        locked_cursor.source,
+        NativeResolvedCursorSource::ClientSurface
+    );
+    assert!(locked_cursor.visible);
+    let locked_render_state = server
+        .client_cursor_render_state()
+        .expect("client cursor surface remains renderable while locked");
+    assert_eq!(
+        (locked_render_state.logical_x, locked_render_state.logical_y),
+        (89, 82)
+    );
+
+    server.send_pointer_motion_sample(PointerMotionSample {
+        timestamp_usec: 10,
+        absolute: Some(OutputPosition { x: 120.0, y: 110.0 }),
+        relative: Some(RelativePointerMotion {
+            dx: 3.0,
+            dy: 4.0,
+            dx_unaccelerated: 3.0,
+            dy_unaccelerated: 4.0,
+        }),
+    });
+    assert_eq!(server.last_pointer_position(), (92.0, 86.0));
+    client_commands
+        .send(ClientCommand::CaptureCursorState)
+        .unwrap();
+    match pump_native_input_server_until(&mut server, &client_events) {
+        ClientEvent::CursorState {
+            pointer_motion_count,
+            relative_motion_count,
+            locked_count,
+        } => {
+            assert_eq!(
+                pointer_motion_count, baseline.0,
+                "absolute motion stays suppressed"
+            );
+            assert_eq!(
+                relative_motion_count,
+                baseline.1 + 1,
+                "relative motion continues"
+            );
+            assert_eq!(locked_count, 1);
+        }
+        other => panic!("unexpected client event: {other:?}"),
+    }
+
+    client_commands.send(ClientCommand::HideCursor).unwrap();
+    assert!(matches!(
+        pump_native_input_server_until(&mut server, &client_events),
+        ClientEvent::CursorState {
+            locked_count: 1,
+            ..
+        }
+    ));
+    let hidden_cursor = resolve_native_cursor_for_server(&server, &NativeInputState::new(320, 200));
+    assert_eq!(hidden_cursor.source, NativeResolvedCursorSource::Hidden);
+    assert!(!hidden_cursor.visible);
+    assert!(server.client_cursor_render_state().is_none());
+
+    client_commands.send(ClientCommand::ReplaceCursor).unwrap();
+    assert!(matches!(
+        pump_native_input_server_until(&mut server, &client_events),
+        ClientEvent::CursorState {
+            locked_count: 1,
+            ..
+        }
+    ));
+    let replaced_cursor =
+        resolve_native_cursor_for_server(&server, &NativeInputState::new(320, 200));
+    assert_eq!(
+        replaced_cursor.source,
+        NativeResolvedCursorSource::ClientSurface
+    );
+    assert!(replaced_cursor.visible);
+    let replaced_render_state = server
+        .client_cursor_render_state()
+        .expect("client can show a cursor surface while remaining locked");
+    assert_eq!(
+        (
+            replaced_render_state.logical_x,
+            replaced_render_state.logical_y
+        ),
+        (91, 84)
+    );
+
     client_commands.send(ClientCommand::Finish).unwrap();
     assert!(matches!(
         pump_native_input_server_until(&mut server, &client_events),

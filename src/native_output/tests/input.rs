@@ -29,6 +29,14 @@ use wayland_client::{
         wl_surface as client_wl_surface,
     },
 };
+use wayland_protocols::wp::pointer_constraints::zv1::client::{
+    zwp_locked_pointer_v1 as client_zwp_locked_pointer_v1,
+    zwp_pointer_constraints_v1 as client_zwp_pointer_constraints_v1,
+};
+use wayland_protocols::wp::relative_pointer::zv1::client::{
+    zwp_relative_pointer_manager_v1 as client_zwp_relative_pointer_manager_v1,
+    zwp_relative_pointer_v1 as client_zwp_relative_pointer_v1,
+};
 use wayland_protocols::xdg::shell::client::{
     xdg_surface as client_xdg_surface, xdg_toplevel as client_xdg_toplevel,
     xdg_wm_base as client_xdg_wm_base,
@@ -3992,6 +4000,8 @@ fn native_input_active_resize_updates_compositor_and_exact_client_cursor_motion(
 pub(super) struct NativeInputClientState {
     pub(super) pointer_enter_serial: Option<u32>,
     pub(super) pointer_motion_count: usize,
+    pub(super) relative_motion_count: usize,
+    pub(super) locked_count: usize,
     pub(super) pointer_enter_count: usize,
     pub(super) pointer_leave_count: usize,
     pub(super) pointer_surface_x: Option<f64>,
@@ -4040,6 +4050,8 @@ native_input_noop_dispatch!(client_wl_surface::WlSurface);
 native_input_noop_dispatch!(client_wl_shm::WlShm);
 native_input_noop_dispatch!(client_wl_shm_pool::WlShmPool);
 native_input_noop_dispatch!(client_wl_buffer::WlBuffer);
+native_input_noop_dispatch!(client_zwp_pointer_constraints_v1::ZwpPointerConstraintsV1);
+native_input_noop_dispatch!(client_zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1);
 native_input_noop_dispatch!(client_xdg_toplevel::XdgToplevel);
 native_input_noop_dispatch!(client_xwayland_shell_v1::XwaylandShellV1);
 native_input_noop_dispatch!(client_xwayland_surface_v1::XwaylandSurfaceV1);
@@ -4148,6 +4160,39 @@ impl Dispatch<client_wl_pointer::WlPointer, ()> for NativeInputClientState {
                 _ => {}
             },
             _ => {}
+        }
+    }
+}
+
+impl Dispatch<client_zwp_locked_pointer_v1::ZwpLockedPointerV1, ()> for NativeInputClientState {
+    fn event(
+        state: &mut Self,
+        _: &client_zwp_locked_pointer_v1::ZwpLockedPointerV1,
+        event: client_zwp_locked_pointer_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if matches!(event, client_zwp_locked_pointer_v1::Event::Locked) {
+            state.locked_count += 1;
+        }
+    }
+}
+
+impl Dispatch<client_zwp_relative_pointer_v1::ZwpRelativePointerV1, ()> for NativeInputClientState {
+    fn event(
+        state: &mut Self,
+        _: &client_zwp_relative_pointer_v1::ZwpRelativePointerV1,
+        event: client_zwp_relative_pointer_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if matches!(
+            event,
+            client_zwp_relative_pointer_v1::Event::RelativeMotion { .. }
+        ) {
+            state.relative_motion_count += 1;
         }
     }
 }
@@ -4278,7 +4323,11 @@ pub(super) fn spawn_native_input_resize_client(
                         .unwrap();
                     break;
                 }
-                ClientCommand::SetCursor => panic!("cursor was already set"),
+                ClientCommand::SetCursor
+                | ClientCommand::LockPointer
+                | ClientCommand::HideCursor
+                | ClientCommand::ReplaceCursor
+                | ClientCommand::CaptureCursorState => panic!("unexpected XDG test client command"),
             }
         }
     });
@@ -4349,6 +4398,10 @@ pub(super) fn spawn_native_input_keyboard_client(
                     break;
                 }
                 ClientCommand::SetCursor
+                | ClientCommand::LockPointer
+                | ClientCommand::HideCursor
+                | ClientCommand::ReplaceCursor
+                | ClientCommand::CaptureCursorState
                 | ClientCommand::CaptureActive
                 | ClientCommand::BeginXdgMove
                 | ClientCommand::CaptureButtons => {

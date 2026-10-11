@@ -1246,6 +1246,13 @@ Keyboard and pointer are the intended current desktop input classes.
 
 Absolute motion, relative motion, pointer lock/confine and one-shot warp are modeled separately. A locked pointer suppresses absolute movement while preserving relative deltas. Constraint activation is tied to committed surface/focus state; stale serials and wrong-client resources do not gain authority.
 
+Pointer constraints control pointer motion and routing; they do not control
+cursor image visibility. Cursor visibility is selected independently from
+client cursor state, compositor interaction overrides, DnD state, and fallback
+policy. A client cursor surface, cursor shape, or theme fallback remains
+eligible while locked, and an explicit `wl_pointer.set_cursor(NULL)` remains
+authoritative.
+
 Backend activation/deactivation and compositor protocol state have explicit reconciliation paths so a backend failure cannot leave a protocol constraint permanently “active” in semantic state.
 
 ### 17.3 Focus and grabs
@@ -1258,7 +1265,7 @@ Client shortcut inhibition changes ordinary compositor shortcut routing for the 
 
 ### 17.5 Cursor
 
-Client cursor resources, protocol cursor-shape state, compositor resize/move cursor policy and native hardware/software rendering are different layers. The compositor selects desired logical cursor; native output decides whether it can be a hardware cursor for the exact KMS state. Software fallback is an explicit presentation choice.
+Client cursor resources, protocol cursor-shape state, compositor resize/move cursor policy and native hardware/software rendering are different layers. The compositor selects desired logical cursor; native output decides whether it can be a hardware cursor for the exact KMS state. Pointer lock does not enter this cursor-source selection. Software fallback is an explicit presentation choice.
 
 ### 17.6 Unsupported classes
 

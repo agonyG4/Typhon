@@ -72,7 +72,7 @@ impl CompositorState {
             self.pointer_constraint_runtime.last_cursor_reveal_authority = None;
         }
         pointer_debug_log(format!(
-            "pointer.unlock transition_begin id={} generation={} fallback=({}) epoch={} cursor_kept_hidden=true",
+            "pointer.unlock transition_begin id={} generation={} fallback=({}) epoch={} cursor_visibility_unchanged=true",
             backend_id.constraint_id,
             backend_id.generation,
             fallback_position
@@ -82,7 +82,7 @@ impl CompositorState {
         ));
         crate::pointer_debug::cursor_presentation_log_lazy(|| {
             format!(
-                "event=unlock_reveal_begin constraint={}/{} dispatch_epoch={} fallback_position={} fallback=({},{}) fallback_origin={} pointer_position=({},{}) lock_hidden_constraint={}",
+                "event=unlock_reveal_begin constraint={}/{} dispatch_epoch={} fallback_position={} fallback=({},{}) fallback_origin={} pointer_position=({},{})",
                 backend_id.constraint_id,
                 backend_id.generation,
                 self.pointer_constraint_runtime.dispatch_epoch,
@@ -91,10 +91,7 @@ impl CompositorState {
                 fallback_position.map_or(0.0, |position| position.y),
                 fallback_origin.map_or("none", PointerWarpOrigin::as_str),
                 self.last_pointer_x,
-                self.last_pointer_y,
-                self.cursor_visibility
-                    .lock_hidden_constraint_id
-                    .map_or_else(|| "none".to_string(), |id| id.to_string())
+                self.last_pointer_y
             )
         });
         self.pointer_constraint_runtime
@@ -276,14 +273,6 @@ impl CompositorState {
         else {
             return;
         };
-        if self.cursor_visibility.lock_hidden_constraint_id
-            == Some(pending.backend_id.constraint_id)
-        {
-            self.cursor_visibility.lock_hidden_constraint_id = None;
-            if self.active_client_cursor_has_content() {
-                self.advance_render_generation(RenderGenerationCause::CursorState);
-            }
-        }
         let final_position = pending
             .client_warp_position
             .or(pending.fallback_position)
@@ -342,7 +331,6 @@ impl CompositorState {
                 self.pointer_constraint_runtime.dispatch_epoch
             )
         });
-        self.sync_cursor_visibility_request();
     }
 
     pub(in crate::compositor) fn finalize_pending_locked_pointer_reveal_after_dispatch(&mut self) {

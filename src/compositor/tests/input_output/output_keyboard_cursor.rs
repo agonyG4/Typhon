@@ -1346,6 +1346,84 @@ fn visible_cursor_surface_frame_callback_waits_for_frame_completion() {
 }
 
 #[test]
+fn locked_client_cursor_surface_keeps_frame_callback_eligible() {
+    let socket_name = unique_socket_name();
+    let capabilities = InputProtocolCapabilities {
+        pointer_constraints: true,
+        ..InputProtocolCapabilities::desktop_baseline()
+    };
+    let server =
+        OwnCompositorServer::bind_with_input_capabilities(&socket_name, capabilities).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let stream = UnixStream::connect(&socket_path).unwrap();
+    let connection = Connection::from_socket(stream).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let pointer = seat.get_pointer(&qh, ());
+    let constraints: client_zwp_pointer_constraints_v1::ZwpPointerConstraintsV1 =
+        globals.bind(&qh, 1..=1, ()).unwrap();
+    let (surface, _xdg_surface, _toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 160, 120).unwrap();
+    surface.commit();
+    connection.flush().unwrap();
+
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state).unwrap();
+    commands
+        .send(ServerCommand::PointerMotion {
+            x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 20.0,
+            y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 14.0,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    let serial = state.pointer_enter_serial.expect("pointer focus serial");
+
+    let _lock = constraints.lock_pointer(
+        &surface,
+        &pointer,
+        None,
+        client_zwp_pointer_constraints_v1::Lifetime::Persistent,
+        &qh,
+        (),
+    );
+    surface.commit();
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    activate_backend_locked_pointer(&commands, &mut state, &mut queue).unwrap();
+
+    let cursor_surface = compositor.create_surface(&qh, ());
+    pointer.set_cursor(serial, Some(&cursor_surface), 1, 1);
+    cursor_surface.frame(&qh, ());
+    commit_test_buffered_surface(&cursor_surface, &shm, &qh, 24, 24).unwrap();
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    let callback_pending_before_frame = capture_pending_frame_callbacks(&commands);
+    let cursor = capture_client_cursor_snapshot(&commands);
+
+    commands.send(ServerCommand::FinishFrame).unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    let callback_pending_after_frame = capture_pending_frame_callbacks(&commands);
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    assert!(
+        cursor.is_some(),
+        "cursor surface remains active while locked"
+    );
+    assert!(callback_pending_before_frame);
+    assert!(!callback_pending_after_frame);
+}
+
+#[test]
 fn active_client_cursor_motion_advances_overlay_generation_without_mapping_surface() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();

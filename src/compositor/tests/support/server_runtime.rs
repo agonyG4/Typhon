@@ -369,7 +369,6 @@ pub(in crate::compositor::tests) enum ServerCommand {
     ),
     CaptureClientCursorSnapshot(Sender<Option<ClientCursorSnapshot>>),
     CaptureInteractionCursorState(Sender<InteractionCursorStateSnapshot>),
-    CaptureCursorHiddenByPointerLock(Sender<bool>),
     CaptureClipboardState(Sender<ClipboardStateSnapshot>),
     CaptureDndActionSnapshot {
         offer_id: u32,
@@ -1874,9 +1873,6 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                             pointer_x,
                             pointer_y,
                         });
-                    }
-                    ServerCommand::CaptureCursorHiddenByPointerLock(reply) => {
-                        let _ = reply.send(server.cursor_hidden_by_pointer_lock());
                     }
                     ServerCommand::CaptureClipboardState(reply) => {
                         let _ = reply.send(ClipboardStateSnapshot {
@@ -3580,18 +3576,6 @@ pub(in crate::compositor::tests) fn capture_interaction_cursor_state(
     receiver
         .recv_timeout(Duration::from_secs(1))
         .expect("server should report interaction cursor state")
-}
-
-pub(in crate::compositor::tests) fn capture_cursor_hidden_by_pointer_lock(
-    commands: &Sender<ServerCommand>,
-) -> bool {
-    let (reply, receiver) = mpsc::channel();
-    commands
-        .send(ServerCommand::CaptureCursorHiddenByPointerLock(reply))
-        .unwrap();
-    receiver
-        .recv_timeout(Duration::from_secs(1))
-        .expect("server should report effective pointer-lock cursor hiding")
 }
 
 pub(in crate::compositor::tests) fn capture_xdg_role_snapshot(

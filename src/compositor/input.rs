@@ -193,6 +193,8 @@ pub struct PointerConstraintBackendId {
     pub generation: u64,
 }
 
+/// Diagnostic snapshot for unlock settlement tracing; it does not select a
+/// cursor source or control cursor visibility.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CursorRevealAuthority {
     pub constraint: PointerConstraintBackendId,

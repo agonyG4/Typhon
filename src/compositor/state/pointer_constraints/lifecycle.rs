@@ -25,27 +25,21 @@ impl CompositorState {
 
     pub(in crate::compositor) fn sync_cursor_visibility_request(&mut self) {
         self.refresh_presentation_feedback_eligibility();
-        // Preserve the existing move/resize takeover rule: an interaction
-        // cursor stays visible while a locked pointer is being suspended.
-        // Otherwise pointer lock hides the cursor; active Wayland DnD then
-        // overrides ordinary client cursor ownership and theme fallback.
         let desired_visible = self.interaction_cursor_override.is_some()
-            || (self.cursor_visibility.lock_hidden_constraint_id.is_none()
-                && (self.wayland_pointer_dnd_session_active()
-                    || self.cursor_visibility.theme_fallback_visible()));
+            || self.wayland_pointer_dnd_session_active()
+            || self.cursor_visibility.theme_fallback_visible();
         if self.cursor_visibility.visible == desired_visible {
             return;
         }
         self.cursor_visibility.visible = desired_visible;
         pointer_debug_log(format!(
-            "cursor visibility backend_request visible={} client_hidden={} lock_hidden={:?}",
+            "cursor visibility backend_request visible={} client_hidden={}",
             desired_visible,
             self.cursor_visibility
                 .client_hidden_pointer
                 .as_ref()
                 .map(|pointer| pointer.id().protocol_id())
                 .map_or_else(|| "none".to_string(), |id| id.to_string()),
-            self.cursor_visibility.lock_hidden_constraint_id
         ));
         self.pending_pointer_constraint_backend_requests.push(
             PointerConstraintBackendRequest::ApplyCursorVisibility {

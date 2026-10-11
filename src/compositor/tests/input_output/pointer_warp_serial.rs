@@ -452,12 +452,10 @@ fn v11_lock_restore_uses_warp_without_relative_motion() {
             f64::from(render::FIRST_SURFACE_OFFSET.1) + restore_local.1,
         )
     );
-    assert!(reveal_requests.iter().any(|request| {
-        matches!(
-            request,
-            PointerConstraintBackendRequest::ApplyCursorVisibility { visible: true }
-        )
-    }));
+    assert!(reveal_requests.iter().all(|request| !matches!(
+        request,
+        PointerConstraintBackendRequest::ApplyCursorVisibility { .. }
+    )));
     assert!(!capture_pending_locked_pointer_reveal(&fixture.commands));
 }
 
@@ -540,15 +538,11 @@ fn v11_client_warp_after_backend_ack_settles_unlock() {
             )
         )
     });
-    let visible_index = final_requests.iter().position(|request| {
-        matches!(
-            request,
-            PointerConstraintBackendRequest::ApplyCursorVisibility { visible: true }
-        )
-    });
     assert!(warp_index.is_some());
-    assert!(visible_index.is_some());
-    assert!(warp_index.unwrap() < visible_index.unwrap());
+    assert!(final_requests.iter().all(|request| !matches!(
+        request,
+        PointerConstraintBackendRequest::ApplyCursorVisibility { .. }
+    )));
 }
 
 #[test]
@@ -622,9 +616,9 @@ fn pending_unlock_accepts_same_client_cross_surface_warp() {
             y: final_pointer_position.1,
         })
     );
-    assert!(settlement_requests.iter().any(|request| matches!(
+    assert!(settlement_requests.iter().all(|request| !matches!(
         request,
-        PointerConstraintBackendRequest::ApplyCursorVisibility { visible: true }
+        PointerConstraintBackendRequest::ApplyCursorVisibility { .. }
     )));
     assert_eq!(
         fixture.state.pointer_event_log,

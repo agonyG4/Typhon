@@ -21,7 +21,6 @@ pub(in crate::compositor) fn coalesce_output_row_rects(rects: Vec<OutputRect>) -
 pub(crate) struct CursorVisibilityState {
     pub(crate) client_hidden_pointer: Option<wl_pointer::WlPointer>,
     pub(crate) client_cursor_pointer: Option<wl_pointer::WlPointer>,
-    pub(crate) lock_hidden_constraint_id: Option<u64>,
     pub(crate) visible: bool,
 }
 
@@ -30,7 +29,6 @@ impl Default for CursorVisibilityState {
         Self {
             client_hidden_pointer: None,
             client_cursor_pointer: None,
-            lock_hidden_constraint_id: None,
             visible: true,
         }
     }
@@ -40,9 +38,7 @@ impl CursorVisibilityState {
     /// Visibility requested from the backend for the compositor theme cursor.
     /// Client-owned cursor presentation is intentionally represented as false.
     pub(in crate::compositor) fn theme_fallback_visible(&self) -> bool {
-        self.client_hidden_pointer.is_none()
-            && self.client_cursor_pointer.is_none()
-            && self.lock_hidden_constraint_id.is_none()
+        self.client_hidden_pointer.is_none() && self.client_cursor_pointer.is_none()
     }
 }
 

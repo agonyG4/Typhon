@@ -985,14 +985,18 @@ fn backend_reported_deactivation_does_not_queue_duplicate_release() {
             _ => None,
         })
         .expect("expected locked backend activation request");
-    assert!(!capture_cursor_hidden_by_pointer_lock(&commands));
+    assert!(capture_interaction_cursor_state(&commands).visible);
     commands
         .send(ServerCommand::PointerConstraintBackendActivated(backend_id))
         .unwrap();
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
-    let _ = capture_pointer_constraint_backend_requests(&commands);
-    assert!(capture_cursor_hidden_by_pointer_lock(&commands));
+    let activation_requests = capture_pointer_constraint_backend_requests(&commands);
+    assert!(capture_interaction_cursor_state(&commands).visible);
+    assert!(activation_requests.iter().all(|request| !matches!(
+        request,
+        PointerConstraintBackendRequest::ApplyCursorVisibility { .. }
+    )));
 
     commands
         .send(ServerCommand::PointerConstraintBackendDeactivated(
@@ -1740,16 +1744,12 @@ fn locked_unlock_does_not_reveal_committed_hint_before_followup_warp() {
             } if (*x, *y) == (origin_x + 30.0, origin_y)
         )
     });
-    let visible_index = settlement_requests.iter().position(|request| {
-        matches!(
-            request,
-            PointerConstraintBackendRequest::ApplyCursorVisibility { visible: true }
-        )
-    });
     assert!(warp_index.is_some());
-    assert!(visible_index.is_some());
     assert_eq!(warp_index, Some(0));
-    assert_eq!(visible_index, Some(0));
+    assert!(settlement_requests.iter().all(|request| !matches!(
+        request,
+        PointerConstraintBackendRequest::ApplyCursorVisibility { .. }
+    )));
 }
 
 #[test]
@@ -1858,12 +1858,10 @@ fn locked_unlock_reveals_committed_hint_after_dispatch_fallback_without_warp() {
     commands.send(ServerCommand::Stop).unwrap();
     server_thread.join().unwrap();
 
-    assert!(fallback_requests.iter().any(|request| {
-        matches!(
-            request,
-            PointerConstraintBackendRequest::ApplyCursorVisibility { visible: true }
-        )
-    }));
+    assert!(fallback_requests.iter().all(|request| !matches!(
+        request,
+        PointerConstraintBackendRequest::ApplyCursorVisibility { .. }
+    )));
     assert!(!pending_after_fallback);
     assert_eq!(final_position, (origin_x + 120.0, origin_y));
     assert!(state.pointer_event_log.is_empty());
@@ -1871,7 +1869,7 @@ fn locked_unlock_reveals_committed_hint_after_dispatch_fallback_without_warp() {
 }
 
 #[test]
-fn locked_unlock_set_cursor_none_keeps_builtin_cursor_hidden() {
+fn locked_unlock_set_cursor_none_preserves_settlement_and_hiding() {
     let socket_name = unique_socket_name();
     let capabilities = InputProtocolCapabilities {
         pointer_constraints: true,
@@ -1947,6 +1945,7 @@ fn locked_unlock_set_cursor_none_keeps_builtin_cursor_hidden() {
     connection.flush().unwrap();
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
+    assert!(!capture_interaction_cursor_state(&commands).visible);
     assert!(
         capture_pending_locked_pointer_reveal(&commands),
         "set_cursor(NULL) must not settle pointer position"
@@ -1966,6 +1965,7 @@ fn locked_unlock_set_cursor_none_keeps_builtin_cursor_hidden() {
     queue.roundtrip(&mut state).unwrap();
     let (pending_after_warp, requests) =
         capture_pending_locked_pointer_reveal_and_backend_requests(&commands);
+    assert!(!capture_interaction_cursor_state(&commands).visible);
     commands.send(ServerCommand::Stop).unwrap();
     server_thread.join().unwrap();
 

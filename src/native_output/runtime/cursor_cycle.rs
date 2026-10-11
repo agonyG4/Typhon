@@ -157,7 +157,6 @@ pub(crate) const fn resolve_client_cursor_path(
 pub(crate) struct NativeCursorSourceInput {
     pub(crate) interaction_override_active: bool,
     pub(crate) wayland_dnd_active: bool,
-    pub(crate) pointer_lock_hidden: bool,
     pub(crate) client_explicitly_hidden: bool,
     pub(crate) client_surface_active: bool,
     pub(crate) client_surface_content_active: bool,
@@ -193,13 +192,9 @@ pub(crate) struct NativeResolvedCursor {
 pub(crate) const fn resolve_native_cursor_source(
     input: NativeCursorSourceInput,
 ) -> NativeResolvedCursor {
-    // Preserve the existing compositor move/resize takeover precedence over
-    // pointer lock. Otherwise a hidden lock beats DnD, followed by client
-    // surface/shape requests and the ordinary theme fallback.
+    // Pointer constraints do not participate in cursor source selection.
     let source = if input.interaction_override_active {
         NativeResolvedCursorSource::InteractionOverride
-    } else if input.pointer_lock_hidden {
-        NativeResolvedCursorSource::Hidden
     } else if input.wayland_dnd_active {
         NativeResolvedCursorSource::WaylandDnd
     } else if input.client_explicitly_hidden {
@@ -231,7 +226,6 @@ pub(crate) fn native_cursor_source_input(
     NativeCursorSourceInput {
         interaction_override_active: server.interaction_cursor_override_active(),
         wayland_dnd_active: server.wayland_pointer_dnd_cursor_active(),
-        pointer_lock_hidden: server.cursor_hidden_by_pointer_lock(),
         client_explicitly_hidden: server.client_cursor_explicitly_hidden(),
         client_surface_active: server.client_cursor_surface_active(),
         client_surface_content_active: server.client_cursor_render_state().is_some(),
@@ -551,25 +545,6 @@ mod tests {
             ),
             (
                 NativeCursorSourceInput {
-                    pointer_lock_hidden: true,
-                    client_shape_active: true,
-                    ..Default::default()
-                },
-                NativeResolvedCursorSource::Hidden,
-                false,
-            ),
-            (
-                NativeCursorSourceInput {
-                    pointer_lock_hidden: true,
-                    client_surface_active: true,
-                    client_surface_content_active: true,
-                    ..Default::default()
-                },
-                NativeResolvedCursorSource::Hidden,
-                false,
-            ),
-            (
-                NativeCursorSourceInput {
                     interaction_override_active: true,
                     client_explicitly_hidden: true,
                     ..Default::default()
@@ -580,7 +555,6 @@ mod tests {
             (
                 NativeCursorSourceInput {
                     interaction_override_active: true,
-                    pointer_lock_hidden: true,
                     client_shape_active: true,
                     ..Default::default()
                 },
@@ -599,15 +573,6 @@ mod tests {
                 },
                 NativeResolvedCursorSource::WaylandDnd,
                 true,
-            ),
-            (
-                NativeCursorSourceInput {
-                    wayland_dnd_active: true,
-                    pointer_lock_hidden: true,
-                    ..Default::default()
-                },
-                NativeResolvedCursorSource::Hidden,
-                false,
             ),
             (
                 NativeCursorSourceInput {
