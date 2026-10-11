@@ -90,6 +90,34 @@ pub(super) struct GlesEffectTestHarness {
 
 impl GlesEffectTestHarness {
     pub(super) fn new(width: u32, height: u32) -> Self {
+        Self::new_with_capabilities(
+            width,
+            height,
+            EglPartialRepaintCapabilities {
+                buffer_age: false,
+                partial_render_repair: false,
+                swap_buffers_with_damage: false,
+            },
+        )
+    }
+
+    pub(super) fn new_with_partial_repaint(width: u32, height: u32) -> Self {
+        Self::new_with_capabilities(
+            width,
+            height,
+            EglPartialRepaintCapabilities {
+                buffer_age: true,
+                partial_render_repair: true,
+                swap_buffers_with_damage: true,
+            },
+        )
+    }
+
+    fn new_with_capabilities(
+        width: u32,
+        height: u32,
+        repaint_capabilities: EglPartialRepaintCapabilities,
+    ) -> Self {
         let egl_test_lock = egl_test_lock();
         const EGL_PLATFORM_SURFACELESS_MESA: egl::Enum = 0x31dd;
         let egl = unsafe { EglInstance::load_required() }
@@ -157,11 +185,7 @@ impl GlesEffectTestHarness {
             width,
             height,
             None,
-            EglPartialRepaintCapabilities {
-                buffer_age: false,
-                partial_render_repair: false,
-                swap_buffers_with_damage: false,
-            },
+            repaint_capabilities,
             cursor_image,
         )
         .expect("test GLES renderer creates");

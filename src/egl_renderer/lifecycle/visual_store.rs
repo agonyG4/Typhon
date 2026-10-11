@@ -76,6 +76,7 @@ fn diagnostic_layer_for_draw_layer(layer: EglDrawLayer) -> LifecycleDiagnosticLa
         EglDrawLayer::Surface(_) => LifecycleDiagnosticLayer::Surface,
         EglDrawLayer::DecorationAsset(_) => LifecycleDiagnosticLayer::DecorationAsset,
         EglDrawLayer::SolidRgba(_) => LifecycleDiagnosticLayer::Decoration,
+        EglDrawLayer::LifecycleOverlay(_) => LifecycleDiagnosticLayer::ResolvedVisual,
         EglDrawLayer::LifecycleResolvedVisual(_)
         | EglDrawLayer::Solid(_)
         | EglDrawLayer::Cursor => LifecycleDiagnosticLayer::ResolvedVisual,

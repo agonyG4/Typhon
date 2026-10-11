@@ -91,6 +91,7 @@ impl SceneTextureSources<'_> {
                 self.ordinary.texture_for_decoration_asset(asset_id)
             }
             EglDrawLayer::Surface(surface_id) => self.ordinary.texture_for_surface(surface_id),
+            EglDrawLayer::LifecycleOverlay(_) => None,
             EglDrawLayer::LifecycleResolvedVisual(payload_id) => self
                 .lifecycle
                 .get(&payload_id)
@@ -531,6 +532,115 @@ impl SceneRenderState {
         self.scene_command_topology_generation =
             self.scene_command_topology_generation.wrapping_add(1);
         self.refresh_capture_command_metadata();
+    }
+
+    pub(in crate::egl_renderer) fn rebuild_lifecycle_marker_commands(
+        &mut self,
+        lifecycle: &LifecycleSceneSample,
+        insertions: &[(
+            oblivion_one::presentation_animation::PresentationRetainedVisualIdentity,
+            usize,
+        )],
+        output_scale: f64,
+    ) {
+        if insertions.is_empty()
+            && !self
+                .commands
+                .iter()
+                .any(|command| matches!(command.layer, EglDrawLayer::LifecycleOverlay(_)))
+        {
+            return;
+        }
+        let mut base_commands = Vec::with_capacity(self.commands.len());
+        let mut base_opacities = Vec::with_capacity(self.presentation_opacities.len());
+        let mut had_markers = false;
+        for (command_index, command) in self.commands.drain(..).enumerate() {
+            if matches!(command.layer, EglDrawLayer::LifecycleOverlay(_)) {
+                had_markers = true;
+                continue;
+            }
+            base_commands.push(command);
+            base_opacities.push(
+                self.presentation_opacities
+                    .get(command_index)
+                    .copied()
+                    .unwrap_or(1.0),
+            );
+        }
+
+        let scale = output_scale.max(0.01);
+        let mut seen_identities = std::collections::HashSet::with_capacity(insertions.len());
+        let mut markers = insertions
+            .iter()
+            .filter_map(|(identity, insertion_group)| {
+                if !seen_identities.insert(*identity) {
+                    return None;
+                }
+                let sample = lifecycle
+                    .samples
+                    .iter()
+                    .find(|sample| sample.presentation_identity == *identity)?;
+                let bounds = lifecycle_visual_transition_bounds(
+                    sample.effect,
+                    sample.visual_group,
+                    sample.progress,
+                )?;
+                Some((
+                    *insertion_group,
+                    EglDrawCommand {
+                        layer: EglDrawLayer::LifecycleOverlay(*identity),
+                        visual_group: None,
+                        bounds: EglRect::new(
+                            (bounds.x() * scale) as f32,
+                            (bounds.y() * scale) as f32,
+                            (bounds.width() * scale) as f32,
+                            (bounds.height() * scale) as f32,
+                        ),
+                        opaque_regions: Vec::new(),
+                        presentation_clip: None,
+                        vertex_start: 0,
+                        vertex_count: 0,
+                        sampling: SurfaceSampling::ExactNearest,
+                    },
+                ))
+            })
+            .collect::<Vec<_>>();
+        markers.sort_by_key(|(insertion_group, _)| *insertion_group);
+
+        let mut commands = Vec::with_capacity(base_commands.len().saturating_add(markers.len()));
+        let mut opacities = Vec::with_capacity(commands.capacity());
+        let mut next_marker = 0usize;
+        for (command_index, command) in base_commands.into_iter().enumerate() {
+            if let Some(group) = command.visual_group {
+                let group_index =
+                    usize::try_from(group.get().saturating_sub(1)).unwrap_or(usize::MAX);
+                while markers
+                    .get(next_marker)
+                    .is_some_and(|(insertion_group, _)| *insertion_group <= group_index)
+                {
+                    commands.push(markers[next_marker].1.clone());
+                    opacities.push(1.0);
+                    next_marker = next_marker.saturating_add(1);
+                }
+            }
+            commands.push(command);
+            opacities.push(base_opacities.get(command_index).copied().unwrap_or(1.0));
+        }
+        while next_marker < markers.len() {
+            commands.push(markers[next_marker].1.clone());
+            opacities.push(1.0);
+            next_marker = next_marker.saturating_add(1);
+        }
+        self.commands = commands;
+        self.presentation_opacities = opacities;
+        if had_markers || !markers.is_empty() {
+            // Lifecycle pixels can change while canonical surfaces stay fixed.
+            // Treat every active marker frame as a topology boundary so cached
+            // replay plans cannot silently retain a prior marker position.
+            self.scene_command_topology_generation =
+                self.scene_command_topology_generation.wrapping_add(1);
+            self.refresh_capture_command_metadata();
+        }
     }
 
     pub(in crate::egl_renderer) fn ensure_capture_command_metadata(&mut self) {

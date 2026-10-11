@@ -21,6 +21,7 @@ pub(in crate::egl_renderer) struct EffectExecutionContext<'a> {
     pub(super) scene: &'a mut SceneRenderState,
     pub(super) runtime: &'a mut EffectRuntime,
     sources: SceneTextureSources<'a>,
+    lifecycle_dispatch: Option<crate::egl_renderer::lifecycle::LifecycleReplayDispatcher<'a>>,
 }
 
 impl<'a> EffectExecutionContext<'a> {
@@ -30,13 +31,52 @@ impl<'a> EffectExecutionContext<'a> {
         runtime: &'a mut EffectRuntime,
         sources: SceneTextureSources<'a>,
     ) -> Self {
+        Self::new_with_lifecycle_dispatch(gl, scene, runtime, sources, None)
+    }
+
+    pub(in crate::egl_renderer) fn new_with_lifecycle_dispatch(
+        gl: &'a glow::Context,
+        scene: &'a mut SceneRenderState,
+        runtime: &'a mut EffectRuntime,
+        sources: SceneTextureSources<'a>,
+        lifecycle_dispatch: Option<crate::egl_renderer::lifecycle::LifecycleReplayDispatcher<'a>>,
+    ) -> Self {
         scene.ensure_capture_command_metadata();
         Self {
             gl,
             scene,
             runtime,
             sources,
+            lifecycle_dispatch,
         }
+    }
+
+    pub(super) fn disable_lifecycle_replay(&mut self) {
+        self.lifecycle_dispatch = None;
+    }
+
+    fn dispatch_lifecycle_overlay(
+        &mut self,
+        identity: oblivion_one::presentation_animation::PresentationRetainedVisualIdentity,
+        scissor: Option<OutputRect>,
+    ) -> RendererResult<()> {
+        let Some(dispatcher) = self.lifecycle_dispatch.as_mut() else {
+            return Ok(());
+        };
+        let mut lifecycle_context = crate::egl_renderer::lifecycle::LifecycleRenderContext::new(
+            self.gl,
+            self.scene,
+            self.runtime,
+            self.sources.ordinary,
+        );
+        let result = dispatcher.draw_marker(&mut lifecycle_context, identity, scissor);
+        unsafe {
+            self.gl.use_program(Some(self.scene.program));
+            self.gl.active_texture(glow::TEXTURE0);
+            self.gl
+                .bind_vertex_array(Some(self.scene.scene_vertex_array));
+        }
+        result
     }
 
     pub(super) fn texture_for_layer(&self, layer: EglDrawLayer) -> Option<glow::Texture> {
@@ -417,7 +457,7 @@ impl EffectExecutionContext<'_> {
             } else {
                 self.scene.scene_region_plan.commands[planned_index]
             };
-            let command = &self.scene.commands[planned.command_index];
+            let command = self.scene.commands[planned.command_index].clone();
             commands_considered += 1;
             let bypass_presentation_clip = self
                 .scene
@@ -456,6 +496,49 @@ impl EffectExecutionContext<'_> {
             });
             if !has_active_clip {
                 commands_rejected_outside_damage += planned.clips_len;
+                continue;
+            }
+            if let EglDrawLayer::LifecycleOverlay(identity) = command.layer {
+                for clip_offset in 0..planned.clips_len {
+                    let clip_index = planned.clips_start + clip_offset;
+                    let repair = if effect_plan {
+                        let repair_index =
+                            self.scene.effect_region_plan.clip_repair_indices[clip_index];
+                        self.scene.effect_region_plan.repairs[repair_index]
+                    } else {
+                        let repair_index =
+                            self.scene.scene_region_plan.clip_repair_indices[clip_index];
+                        self.scene.scene_region_plan.repairs[repair_index]
+                    };
+                    let effective_scissor = match output_clip {
+                        Some(clip) => intersect_output_rect(repair, clip),
+                        None => Some(repair),
+                    };
+                    let Some(effective_scissor) = effective_scissor else {
+                        continue;
+                    };
+                    match scissor_mode {
+                        RegionPlanScissorMode::Framebuffer(origin) => {
+                            self.set_scene_scissor_with_origin(Some(effective_scissor), origin);
+                        }
+                        RegionPlanScissorMode::CaptureTarget {
+                            target_domain,
+                            target_size,
+                            ..
+                        } => {
+                            self.set_capture_target_scissor(repair, target_domain, target_size);
+                            if output_clip.is_some() && effective_scissor != repair {
+                                self.set_scene_scissor_with_origin(
+                                    Some(effective_scissor),
+                                    framebuffer_origin,
+                                );
+                            }
+                        }
+                    }
+                    if command.bounds.intersects_output_rect(effective_scissor) {
+                        self.dispatch_lifecycle_overlay(identity, Some(effective_scissor))?;
+                    }
+                }
                 continue;
             }
             let Some(texture) = self.texture_for_layer(command.layer) else {
@@ -898,21 +981,19 @@ impl EffectExecutionContext<'_> {
         } else {
             self.scene.presentation_opacity_location
         };
-        let (vertices, commands) = if scene {
-            (&self.scene.vertices, &self.scene.commands)
+        let (vertices_len, commands_len) = if scene {
+            (self.scene.vertices.len(), self.scene.commands.len())
         } else {
-            (&self.scene.cursor_vertices, &self.scene.cursor_commands)
+            (
+                self.scene.cursor_vertices.len(),
+                self.scene.cursor_commands.len(),
+            )
         };
-        let presentation_opacities = if scene {
-            &self.scene.presentation_opacities
-        } else {
-            &self.scene.cursor_presentation_opacities
-        };
-        if vertices.is_empty() || commands.is_empty() {
+        if vertices_len == 0 || commands_len == 0 {
             return Ok(());
         }
 
-        let required_size = vertices.len() * std::mem::size_of::<EglTexturedVertex>();
+        let required_size = vertices_len * std::mem::size_of::<EglTexturedVertex>();
         let mut upload_bytes = 0;
         let mut uploaded = false;
         let vertex_array = if scene {
@@ -930,7 +1011,7 @@ impl EffectExecutionContext<'_> {
                     self.gl.buffer_sub_data_u8_slice(
                         glow::ARRAY_BUFFER,
                         0,
-                        bytemuck::cast_slice(vertices.as_slice()),
+                        bytemuck::cast_slice(self.scene.vertices.as_slice()),
                     );
                 }
                 self.scene.scene_geometry_dirty = false;
@@ -952,7 +1033,7 @@ impl EffectExecutionContext<'_> {
                     self.gl.buffer_sub_data_u8_slice(
                         glow::ARRAY_BUFFER,
                         0,
-                        bytemuck::cast_slice(vertices.as_slice()),
+                        bytemuck::cast_slice(self.scene.cursor_vertices.as_slice()),
                     );
                 }
                 self.scene.overlay_geometry_dirty = false;
@@ -972,12 +1053,20 @@ impl EffectExecutionContext<'_> {
         let mut missing_required_decoration_resources: usize = 0;
         let mut texture_binds = 0;
         let mut draw_calls = 0;
-        for (command_index, command) in commands.iter().enumerate() {
+        for command_index in 0..commands_len {
             if command_range
                 .is_some_and(|(start, end)| command_index < start || command_index >= end)
             {
                 continue;
             }
+            let Some(command) = (if scene {
+                self.scene.commands.get(command_index)
+            } else {
+                self.scene.cursor_commands.get(command_index)
+            })
+            .cloned() else {
+                continue;
+            };
             commands_considered += 1;
             let bypass_presentation_clip = self
                 .scene
@@ -1022,6 +1111,10 @@ impl EffectExecutionContext<'_> {
                     }
                 }
             }
+            if let EglDrawLayer::LifecycleOverlay(identity) = command.layer {
+                self.dispatch_lifecycle_overlay(identity, effective_scissor)?;
+                continue;
+            }
             let Some(texture) = self.texture_for_layer(command.layer) else {
                 if Self::is_required_decoration_layer(command.layer) {
                     missing_required_decoration_resources =
@@ -1045,10 +1138,13 @@ impl EffectExecutionContext<'_> {
                         if self.scene.capture_unattenuated_visual_group == command.visual_group {
                             1.0
                         } else {
-                            presentation_opacities
-                                .get(command_index)
-                                .copied()
-                                .unwrap_or(1.0)
+                            if scene {
+                                self.scene.presentation_opacities.get(command_index)
+                            } else {
+                                self.scene.cursor_presentation_opacities.get(command_index)
+                            }
+                            .copied()
+                            .unwrap_or(1.0)
                         };
                     self.gl.uniform_1_f32(Some(location), presentation_opacity);
                 }

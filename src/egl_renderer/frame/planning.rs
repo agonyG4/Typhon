@@ -342,6 +342,11 @@ impl FramePipeline<'_> {
                 framebuffer_origin,
             );
         }
+        self.scene.rebuild_lifecycle_marker_commands(
+            request.lifecycle,
+            request.lifecycle_marker_insertions,
+            request.output_scale,
+        );
         self.scene.rebuild_overlay_commands(
             frame.width,
             frame.height,

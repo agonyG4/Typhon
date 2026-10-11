@@ -349,6 +349,54 @@ fn composition_position_keeps_before_target_effects_below_the_target() {
 }
 
 #[test]
+fn lifecycle_marker_between_surface_anchors_stays_inside_the_composed_range() {
+    let identity = oblivion_one::presentation_animation::PresentationEngine::enabled()
+        .begin_retained_visual(
+            oblivion_one::core::SceneNodeId::from_raw(930).expect("scene node"),
+            oblivion_one::presentation_animation::PresentationRetainedVisualKind::WindowLifecycle,
+            oblivion_one::presentation_animation::AnimationTime::from_nanos(1),
+        )
+        .expect("lifecycle identity");
+    let command = |layer| EglDrawCommand {
+        layer,
+        visual_group: None,
+        bounds: EglRect::new(0.0, 0.0, 80.0, 60.0),
+        opaque_regions: Vec::new(),
+        presentation_clip: None,
+        vertex_start: 0,
+        vertex_count: 6,
+        sampling: SurfaceSampling::ExactNearest,
+    };
+    let mut marker = command(EglDrawLayer::Cursor);
+    marker.layer = EglDrawLayer::LifecycleOverlay(identity);
+    marker.vertex_count = 0;
+    let commands = vec![
+        command(EglDrawLayer::Surface(10)),
+        marker,
+        command(EglDrawLayer::Surface(20)),
+    ];
+    let after_lower = composition_range(
+        &commands,
+        oblivion_one::compositor::EffectAnchor::AfterSurface(10),
+        None,
+        oblivion_one::compositor::EffectAnchorScope::Surface,
+    );
+    let before_upper = composition_range(
+        &commands,
+        oblivion_one::compositor::EffectAnchor::BeforeSurface(20),
+        None,
+        oblivion_one::compositor::EffectAnchorScope::Surface,
+    );
+
+    assert_eq!(after_lower, (1, 1));
+    assert_eq!(before_upper, (2, 2));
+    assert!(matches!(
+        commands[after_lower.0].layer,
+        EglDrawLayer::LifecycleOverlay(marker_identity) if marker_identity == identity
+    ));
+}
+
+#[test]
 fn checkpoint_backdrop_capture_preserves_before_surface_exclusion() {
     let command = |layer| EglDrawCommand {
         layer,

@@ -60,9 +60,14 @@ impl FramePipeline<'_> {
             fallback_reason: "none",
             ..PrecomputedWindowBlurFrameTelemetry::default()
         };
-        let draw_result = match &planned.execution_plan {
+        let baseline_result = if self.lifecycle.has_active_samples() {
+            self.execute_lifecycle_free_baseline(planned, framebuffer_origin)
+        } else {
+            Ok(())
+        };
+        let draw_result = baseline_result.and_then(|()| match &planned.execution_plan {
             oblivion_one::effects::FrameExecutionPlan::LegacyScene => {
-                self.draw_textured_layers(&planned.plan, framebuffer_origin)
+                self.draw_textured_layers(&planned.plan, framebuffer_origin, true, true)
             }
             oblivion_one::effects::FrameExecutionPlan::EffectGraph(graph) => {
                 let demand = planned
@@ -260,11 +265,11 @@ impl FramePipeline<'_> {
                             self.effects.failed_effect_generation =
                                 Some(self.effects.effect_registry_generation);
                         }
-                        self.draw_textured_layers(&planned.plan, framebuffer_origin)
+                        self.draw_textured_layers(&planned.plan, framebuffer_origin, true, true)
                     }
                 }
             }
-        };
+        });
         if matches!(
             &planned.execution_plan,
             oblivion_one::effects::FrameExecutionPlan::LegacyScene
@@ -325,6 +330,125 @@ impl FramePipeline<'_> {
             stats: self.scene.frame_stats,
             lifecycle_evidence: self.lifecycle.evidence(),
         }
+    }
+
+    fn execute_lifecycle_free_baseline(
+        &mut self,
+        planned: &PlannedFrame,
+        framebuffer_origin: super::super::OutputFramebufferOrigin,
+    ) -> RendererResult<()> {
+        match &planned.execution_plan {
+            oblivion_one::effects::FrameExecutionPlan::LegacyScene => {
+                self.draw_textured_layers(&planned.plan, framebuffer_origin, false, false)?;
+            }
+            oblivion_one::effects::FrameExecutionPlan::EffectGraph(graph) => {
+                let demand = planned
+                    .effect_execution_demand
+                    .as_ref()
+                    .expect("effect graph execution must have an execution demand");
+                let selection = planned
+                    .effect_selection
+                    .as_ref()
+                    .expect("effect graph execution must have an execution selection");
+                let optimized_consumer_selected = planned
+                    .precomputed_backdrop
+                    .as_ref()
+                    .is_some_and(|precomputed| {
+                        precomputed.consumers.iter().any(|consumer| {
+                            selection.executed_instances.contains(&consumer.instance)
+                        })
+                    });
+                let baseline_result = if optimized_consumer_selected {
+                    let exact_graph = match planned.exact_execution_plan.as_ref() {
+                        Some(oblivion_one::effects::FrameExecutionPlan::EffectGraph(graph)) => {
+                            graph
+                        }
+                        _ => {
+                            return Err(std::io::Error::other(
+                                "optimized lifecycle baseline has no exact effect graph",
+                            )
+                            .into());
+                        }
+                    };
+                    let exact_demand = planned
+                        .exact_effect_execution_demand
+                        .as_ref()
+                        .expect("optimized lifecycle baseline requires exact demand");
+                    let exact_selection = planned
+                        .exact_effect_selection
+                        .as_ref()
+                        .expect("optimized lifecycle baseline requires exact selection");
+                    self.execute_effect_graph_lifecycle_free(
+                        exact_graph,
+                        framebuffer_origin,
+                        &planned.plan,
+                        exact_demand,
+                        exact_selection,
+                    )
+                } else {
+                    self.execute_effect_graph_lifecycle_free(
+                        graph,
+                        framebuffer_origin,
+                        &planned.plan,
+                        demand,
+                        selection,
+                    )
+                };
+                if baseline_result.is_err() {
+                    // The normal effect path owns effect failure reporting and
+                    // will use its existing legacy fallback if needed. Seed
+                    // retained source capture with the same canonical-only
+                    // fallback scene in the meantime.
+                    self.effects
+                        .effect_resources
+                        .invalidate_checkpoint_capture_contents();
+                    self.draw_textured_layers(&planned.plan, framebuffer_origin, false, false)?;
+                }
+            }
+        }
+        self.prepare_lifecycle_visual_sources(&planned.plan, framebuffer_origin)
+    }
+
+    fn execute_effect_graph_lifecycle_free(
+        &mut self,
+        graph: &CompiledFrameGraph,
+        framebuffer_origin: super::super::OutputFramebufferOrigin,
+        repaint_plan: &RepaintPlan,
+        demand: &oblivion_one::effects::EffectExecutionDemand,
+        selection: &EffectExecutionSelection,
+    ) -> RendererResult<()> {
+        let mut prepared = {
+            let mut context = self.effect_execution_context_with_lifecycle_replay(false);
+            super::super::effects::prepare_effect_graph_execution_with_external_bindings(
+                &mut context,
+                graph,
+                framebuffer_origin,
+                repaint_plan,
+                demand,
+                selection,
+                *super::super::effects::effect_debug_config(),
+                None,
+                HashMap::new(),
+            )?
+        };
+        let composition_target = prepared.composition_target();
+        let result = {
+            let mut context = self.effect_execution_context_with_lifecycle_replay(false);
+            super::super::effects::execute_prepared_effect_graph_core(&mut context, &mut prepared)
+        };
+        let result = {
+            let mut context = self.effect_execution_context_with_lifecycle_replay(false);
+            super::super::effects::finish_prepared_effect_graph_execution(
+                &mut context,
+                prepared,
+                result,
+            )
+        };
+        if result.is_ok() {
+            self.scene
+                .establish_scene_state_for_framebuffer(self.gl, composition_target.framebuffer);
+        }
+        result.map(|_| ())
     }
 
     pub(super) fn execute_effect_graph_with_overlays(
@@ -405,11 +529,6 @@ impl FramePipeline<'_> {
                 if self.effects.effect_trace.enabled() {
                     self.effects.effect_trace.overlay_boundary("begin");
                 }
-                self.draw_lifecycle_overlays(
-                    prepared.overlay_rects(),
-                    framebuffer_origin,
-                    repaint_plan,
-                )?;
                 self.draw_effect_overlays(prepared.overlay_rects(), framebuffer_origin)?;
                 if self.effects.effect_trace.enabled() {
                     self.effects.effect_trace.overlay_boundary("end");
@@ -521,10 +640,34 @@ impl FramePipeline<'_> {
     }
 
     fn effect_execution_context(&mut self) -> EffectExecutionContext<'_> {
-        let texture_sources: SceneTextureSources<'_> = self
-            .lifecycle
-            .texture_sources(self.resources.texture_view());
-        EffectExecutionContext::new(self.gl, self.scene, self.effects, texture_sources)
+        self.effect_execution_context_with_lifecycle_replay(true)
+    }
+
+    fn effect_execution_context_with_lifecycle_replay(
+        &mut self,
+        replay_lifecycle: bool,
+    ) -> EffectExecutionContext<'_> {
+        let Self {
+            gl,
+            scene,
+            effects,
+            resources,
+            lifecycle,
+            ..
+        } = self;
+        let (lifecycle_resources, lifecycle_dispatch) = lifecycle.replay_dispatch_parts();
+        let lifecycle_dispatch = replay_lifecycle.then_some(lifecycle_dispatch);
+        let texture_sources = SceneTextureSources {
+            ordinary: resources.texture_view(),
+            lifecycle: lifecycle_resources,
+        };
+        EffectExecutionContext::new_with_lifecycle_dispatch(
+            gl,
+            scene,
+            effects,
+            texture_sources,
+            lifecycle_dispatch,
+        )
     }
 
     fn emit_precomputed_window_blur_telemetry(
@@ -634,6 +777,8 @@ impl FramePipeline<'_> {
         &mut self,
         plan: &RepaintPlan,
         framebuffer_origin: super::super::OutputFramebufferOrigin,
+        replay_lifecycle: bool,
+        draw_external_overlays: bool,
     ) -> RendererResult<()> {
         self.scene
             .establish_scene_state_for_framebuffer(self.gl, self.scene.active_output_framebuffer);
@@ -672,15 +817,13 @@ impl FramePipeline<'_> {
                 }
             }
             self.scene.set_scene_scissor(self.gl, None);
-            self.effect_execution_context().draw_scene_region_plan()?;
-
-            // Lifecycle source capture observes the complete repaired base
-            // scene, matching the legacy phase boundary.
-            self.prepare_lifecycle_visual_sources(plan, framebuffer_origin)?;
-            for repair_index in 0..repair_count {
-                let repair = self.scene.scene_region_plan.repairs[repair_index];
-                self.draw_lifecycle_overlay(Some(repair))?;
-                self.draw_command_batch(false, Some(repair))?;
+            self.effect_execution_context_with_lifecycle_replay(replay_lifecycle)
+                .draw_scene_region_plan()?;
+            if draw_external_overlays {
+                for repair_index in 0..repair_count {
+                    let repair = self.scene.scene_region_plan.repairs[repair_index];
+                    self.draw_command_batch(false, Some(repair), replay_lifecycle)?;
+                }
             }
             self.scene.frame_stats.scissor_passes = repair_count;
         } else {
@@ -690,10 +833,10 @@ impl FramePipeline<'_> {
                         self.gl.disable(glow::SCISSOR_TEST);
                         self.gl.clear(glow::COLOR_BUFFER_BIT);
                     }
-                    self.draw_command_batch(true, None)?;
-                    self.prepare_lifecycle_visual_sources(plan, framebuffer_origin)?;
-                    self.draw_lifecycle_overlay(None)?;
-                    self.draw_command_batch(false, None)?;
+                    self.draw_command_batch(true, None, replay_lifecycle)?;
+                    if draw_external_overlays {
+                        self.draw_command_batch(false, None, replay_lifecycle)?;
+                    }
                 }
                 RenderExecution::Scissored {
                     scissors,
@@ -719,12 +862,10 @@ impl FramePipeline<'_> {
                                     self.scene.current_size.1,
                                     framebuffer_origin,
                                 );
-                                draw_result = self.draw_command_batch(true, output_rect);
-                            }
-                            LegacySceneScissoredPhase::PrepareLifecycleSources => {
                                 draw_result =
-                                    self.prepare_lifecycle_visual_sources(plan, framebuffer_origin);
+                                    self.draw_command_batch(true, output_rect, replay_lifecycle);
                             }
+                            LegacySceneScissoredPhase::PrepareLifecycleSources => {}
                             LegacySceneScissoredPhase::RestoreRepairScissor(index) => {
                                 let [x, y, width, height] = scissors[index];
                                 unsafe {
@@ -732,23 +873,21 @@ impl FramePipeline<'_> {
                                     self.gl.scissor(x, y, width, height);
                                 }
                             }
-                            LegacySceneScissoredPhase::LifecycleOverlay(index) => {
-                                let [x, y, width, height] = scissors[index];
-                                let output_rect = super::super::gl_scissor_to_output_rect(
-                                    [x, y, width, height],
-                                    self.scene.current_size.1,
-                                    framebuffer_origin,
-                                );
-                                draw_result = self.draw_lifecycle_overlay(output_rect);
-                            }
+                            LegacySceneScissoredPhase::LifecycleOverlay(_) => {}
                             LegacySceneScissoredPhase::ExternalOverlays(index) => {
-                                let [x, y, width, height] = scissors[index];
-                                let output_rect = super::super::gl_scissor_to_output_rect(
-                                    [x, y, width, height],
-                                    self.scene.current_size.1,
-                                    framebuffer_origin,
-                                );
-                                draw_result = self.draw_command_batch(false, output_rect);
+                                if draw_external_overlays {
+                                    let [x, y, width, height] = scissors[index];
+                                    let output_rect = super::super::gl_scissor_to_output_rect(
+                                        [x, y, width, height],
+                                        self.scene.current_size.1,
+                                        framebuffer_origin,
+                                    );
+                                    draw_result = self.draw_command_batch(
+                                        false,
+                                        output_rect,
+                                        replay_lifecycle,
+                                    );
+                                }
                             }
                         }
                     }
@@ -787,41 +926,6 @@ impl FramePipeline<'_> {
         lifecycle.prepare_visual_sources(&mut context, plan, framebuffer_origin)
     }
 
-    // This coordinator orders WindowLifecycle overlays among themselves. The
-    // phase remains after canonical scene work and before external overlays;
-    // interleaving retained lifecycle windows with canonical surfaces is a
-    // separate scene-order architecture question.
-    fn draw_lifecycle_overlay(&mut self, scissor: Option<OutputRect>) -> RendererResult<()> {
-        let Self {
-            gl,
-            scene,
-            effects,
-            resources,
-            lifecycle,
-            ..
-        } = self;
-        let mut context = LifecycleRenderContext::new(gl, scene, effects, resources.texture_view());
-        lifecycle.draw_ordered_overlay(&mut context, scissor)
-    }
-
-    fn draw_lifecycle_overlays(
-        &mut self,
-        rects: &[OutputRect],
-        framebuffer_origin: super::super::OutputFramebufferOrigin,
-        plan: &RepaintPlan,
-    ) -> RendererResult<()> {
-        let Self {
-            gl,
-            scene,
-            effects,
-            resources,
-            lifecycle,
-            ..
-        } = self;
-        let mut context = LifecycleRenderContext::new(gl, scene, effects, resources.texture_view());
-        lifecycle.draw_overlays(&mut context, rects, framebuffer_origin, plan)
-    }
-
     fn draw_effect_overlays(
         &mut self,
         rects: &[OutputRect],
@@ -835,8 +939,9 @@ impl FramePipeline<'_> {
         &mut self,
         scene: bool,
         scissor: Option<OutputRect>,
+        replay_lifecycle: bool,
     ) -> RendererResult<()> {
-        self.effect_execution_context()
+        self.effect_execution_context_with_lifecycle_replay(replay_lifecycle)
             .draw_command_batch(scene, scissor)
     }
 }

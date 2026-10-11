@@ -180,6 +180,7 @@ pub(crate) fn execute_effect_graph_for_lifecycle(
     demand: &EffectExecutionDemand,
     selection: &EffectExecutionSelection,
 ) -> RendererResult<EffectExecutionStats> {
+    renderer.disable_lifecycle_replay();
     let mut prepared = prepare_lifecycle_effect_graph_execution(
         renderer,
         graph,

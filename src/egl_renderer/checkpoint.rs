@@ -103,7 +103,9 @@ impl EglCheckpointSceneCausalSnapshot {
                     | EglDrawLayer::DecorationAsset(_) => {
                         Some(EglCheckpointPixelSourceIdentity::Layer(command.layer))
                     }
-                    EglDrawLayer::LifecycleResolvedVisual(_) | EglDrawLayer::Cursor => None,
+                    EglDrawLayer::LifecycleOverlay(_)
+                    | EglDrawLayer::LifecycleResolvedVisual(_)
+                    | EglDrawLayer::Cursor => None,
                 };
                 EglCheckpointCommandCausalSnapshot {
                     layer: command.layer,

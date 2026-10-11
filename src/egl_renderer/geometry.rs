@@ -379,6 +379,9 @@ impl SceneRegionPlan {
             return;
         }
         self.command_count = commands.len();
+        let has_lifecycle_markers = commands
+            .iter()
+            .any(|command| matches!(command.layer, EglDrawLayer::LifecycleOverlay(_)));
 
         self.repairs.extend_from_slice(repairs);
         self.stats.normalized_rects = repairs.len();
@@ -402,7 +405,7 @@ impl SceneRegionPlan {
         }
 
         for selection_index in (0..selection.len(commands.len())).rev() {
-            if self.repair_scratch.iter().all(|state| state.terminated) {
+            if self.repair_scratch.iter().all(|state| state.terminated) && !has_lifecycle_markers {
                 break;
             }
             self.stats.outer_commands_visited += 1;
@@ -425,13 +428,14 @@ impl SceneRegionPlan {
             };
             let clips_start = self.clip_repair_indices.len();
             let mut drawable = false;
+            let lifecycle_marker = matches!(command.layer, EglDrawLayer::LifecycleOverlay(_));
             for (repair_index, state) in self.repair_scratch.iter_mut().enumerate() {
-                if state.terminated {
+                if state.terminated && !lifecycle_marker {
                     continue;
                 }
                 let repair_stats = &mut self.stats.repairs[repair_index];
                 repair_stats.commands_visited += 1;
-                if state.remaining.is_empty() {
+                if state.remaining.is_empty() && !lifecycle_marker {
                     repair_stats.early_terminated = true;
                     state.terminated = true;
                     continue;
@@ -441,7 +445,12 @@ impl SceneRegionPlan {
                     repair_stats.commands_rejected_outside_remaining += 1;
                     continue;
                 };
-                if !state.remaining.intersects(visible_bounds) {
+                let intersects_repair = if lifecycle_marker {
+                    state.repair.intersection(visible_bounds).is_some()
+                } else {
+                    state.remaining.intersects(visible_bounds)
+                };
+                if !intersects_repair {
                     repair_stats.commands_rejected_outside_remaining += 1;
                     continue;
                 }
@@ -457,7 +466,8 @@ impl SceneRegionPlan {
                     self.consumer_plan.add_surface(surface_id);
                 }
 
-                if occlusion_policy == OcclusionPolicy::Disabled
+                if lifecycle_marker
+                    || occlusion_policy == OcclusionPolicy::Disabled
                     || state.remaining.occlusion_disabled
                 {
                     continue;
@@ -594,13 +604,33 @@ pub(super) fn plan_visibility(
     let mut remaining = EglVisibleRegion::new(repair);
     stats.peak_region_pieces = remaining.len;
 
+    for (index, command) in commands.iter().enumerate() {
+        if !matches!(command.layer, EglDrawLayer::LifecycleOverlay(_)) {
+            continue;
+        }
+        stats.commands_visited += 1;
+        if command
+            .visible_bounds()
+            .is_some_and(|bounds| repair.intersection(bounds).is_some())
+        {
+            decisions[index] = EglVisibilityDecision::Drawable;
+            stats.commands_drawable += 1;
+        } else {
+            decisions[index] = EglVisibilityDecision::OutsideRemaining;
+            stats.commands_rejected_outside_remaining += 1;
+        }
+    }
+
     for index in (0..commands.len()).rev() {
+        let command = &commands[index];
+        if matches!(command.layer, EglDrawLayer::LifecycleOverlay(_)) {
+            continue;
+        }
         stats.commands_visited += 1;
         if remaining.is_empty() {
             stats.early_terminated = true;
             break;
         }
-        let command = &commands[index];
         let Some(visible_bounds) = command.visible_bounds() else {
             decisions[index] = EglVisibilityDecision::OutsideRemaining;
             stats.commands_rejected_outside_remaining += 1;
@@ -891,6 +921,7 @@ pub(super) enum EglDrawLayer {
     SolidRgba(u32),
     DecorationAsset(u64),
     Surface(u32),
+    LifecycleOverlay(oblivion_one::presentation_animation::PresentationRetainedVisualIdentity),
     LifecycleResolvedVisual(oblivion_one::compositor::PresentationRetainedVisualPayloadId),
     Cursor,
 }
@@ -1321,6 +1352,37 @@ mod tests {
             vertex_count: 6,
             sampling: SurfaceSampling::ScaledLinear,
         }
+    }
+
+    #[test]
+    fn lifecycle_marker_remains_in_scene_region_plan_when_covered() {
+        let identity = oblivion_one::presentation_animation::PresentationEngine::enabled()
+            .begin_retained_visual(
+                oblivion_one::core::SceneNodeId::from_raw(920).expect("scene node"),
+                oblivion_one::presentation_animation::PresentationRetainedVisualKind::WindowLifecycle,
+                oblivion_one::presentation_animation::AnimationTime::from_nanos(1),
+            )
+            .expect("lifecycle identity");
+        let bounds = EglRect::new(0.0, 0.0, 100.0, 100.0);
+        let mut marker = test_command(bounds, Vec::new());
+        marker.layer = EglDrawLayer::LifecycleOverlay(identity);
+        marker.visual_group = None;
+        marker.vertex_count = 0;
+        let commands = vec![
+            test_command(bounds, Vec::new()),
+            marker,
+            test_command(bounds, vec![bounds]),
+        ];
+        let repairs = [OutputRect::new(0, 0, 100, 100)];
+        let mut plan = SceneRegionPlan::default();
+
+        plan.build(&commands, &repairs);
+
+        assert_eq!(plan.fallback, None);
+        assert!(
+            plan.has_command_clip(1, 0),
+            "covered lifecycle markers still need exact physical dispatch"
+        );
     }
 
     fn legacy_repair_plans(

@@ -58,6 +58,10 @@ impl LifecycleRenderState {
         self.lamp.program.is_some()
     }
 
+    pub(super) fn has_active_samples(&self) -> bool {
+        !self.frame.samples.is_empty()
+    }
+
     pub(super) fn capture_snapshot(&self) -> LifecycleCaptureSnapshot {
         LifecycleCaptureSnapshot {
             frame: LifecycleCaptureFrameSnapshot::take(&self.frame),
@@ -78,6 +82,32 @@ impl LifecycleRenderState {
             ordinary,
             lifecycle: &self.visual_store.resolved_visual_resources,
         }
+    }
+
+    pub(super) fn replay_dispatch_parts<'a>(
+        &'a mut self,
+    ) -> (
+        &'a HashMap<
+            compositor::PresentationRetainedVisualPayloadId,
+            LifecycleResolvedVisualResource,
+        >,
+        LifecycleReplayDispatcher<'a>,
+    ) {
+        let Self {
+            frame,
+            visual_store,
+            lamp,
+            squash,
+        } = self;
+        (
+            &visual_store.resolved_visual_resources,
+            LifecycleReplayDispatcher {
+                frame,
+                visual_store,
+                lamp,
+                squash,
+            },
+        )
     }
 
     pub(super) fn begin_frame(&mut self, snapshot: &LifecycleSceneSample) {
@@ -399,6 +429,42 @@ impl LifecycleRenderState {
     pub(super) fn destroy_gl_resources(&mut self, gl: &glow::Context) {
         self.lamp.destroy_gl_resources(gl);
         self.squash.destroy_gl_resources(gl);
+    }
+}
+
+pub(super) struct LifecycleReplayDispatcher<'a> {
+    frame: &'a mut LifecycleFrameState,
+    visual_store: &'a LifecycleVisualStore,
+    lamp: &'a mut LampRenderState,
+    squash: &'a mut SquashRenderState,
+}
+
+impl LifecycleReplayDispatcher<'_> {
+    pub(super) fn draw_marker(
+        &mut self,
+        context: &mut LifecycleRenderContext<'_>,
+        identity: oblivion_one::presentation_animation::PresentationRetainedVisualIdentity,
+        scissor: Option<OutputRect>,
+    ) -> RendererResult<()> {
+        let Some(sample) = self.frame.sample_for_identity(identity) else {
+            return Ok(());
+        };
+        match sample.effect {
+            LifecycleEffectKind::Lamp => self.lamp.draw_overlay_for_sample(
+                self.frame,
+                self.visual_store,
+                context,
+                scissor,
+                sample,
+            ),
+            LifecycleEffectKind::Squash => self.squash.draw_overlay_for_sample(
+                self.frame,
+                self.visual_store,
+                context,
+                scissor,
+                sample,
+            ),
+        }
     }
 }
 

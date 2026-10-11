@@ -920,6 +920,7 @@ fn snapshot_ref_preserves_constructor_popup_ids_and_order() {
                 samples: Vec::new(),
                 minimized_visual_resource_payload_ids: Vec::new(),
             },
+            lifecycle_marker_insertions: Vec::new(),
             lifecycle_surfaces: Vec::new(),
             lifecycle_decorations: Vec::new(),
             lifecycle_snapshot: LifecycleFrameSnapshot::default(),

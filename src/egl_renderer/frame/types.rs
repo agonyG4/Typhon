@@ -237,6 +237,10 @@ pub struct EglSceneDrawRequest<'a> {
     pub(crate) current_damage: Option<OutputDamage>,
     pub(crate) surface_resource_sync_states: Vec<SurfaceResourceSyncState>,
     pub lifecycle: &'a LifecycleSceneSample,
+    pub(crate) lifecycle_marker_insertions: &'a [(
+        oblivion_one::presentation_animation::PresentationRetainedVisualIdentity,
+        usize,
+    )],
     pub lifecycle_surfaces: &'a [RenderableSurface],
     pub lifecycle_decorations: &'a [DecorationRenderInstance],
 }

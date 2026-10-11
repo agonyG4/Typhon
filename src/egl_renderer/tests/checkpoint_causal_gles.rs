@@ -1481,3 +1481,66 @@ fn checkpoint_causal_invalidation_and_serial_gaps_fail_closed() {
     let skipped_serial = effects::checkpoint_causal_stability_plan(&harness.renderer, &graph);
     assert!(!skipped_serial.captures[&capture.id].source_unchanged);
 }
+
+#[test]
+fn moving_lifecycle_marker_stops_checkpoint_prefix_reuse_above_it() {
+    let identity = test_lifecycle_identity(
+        oblivion_one::compositor::WindowId::from_raw(920).expect("lifecycle test window"),
+        1,
+    );
+    let mut vertices = Vec::new();
+    let mut commands = Vec::new();
+    push_draw_command(
+        &mut vertices,
+        &mut commands,
+        EglDrawLayer::SolidRgba(0xff20_3040),
+        EglRect::new(0.0, 0.0, 32.0, 32.0),
+        32,
+        32,
+        OutputFramebufferOrigin::BottomLeft,
+    );
+    let marker_index = commands.len();
+    commands.push(EglDrawCommand {
+        layer: EglDrawLayer::LifecycleOverlay(identity),
+        visual_group: None,
+        bounds: EglRect::new(4.0, 4.0, 12.0, 12.0),
+        opaque_regions: Vec::new(),
+        presentation_clip: None,
+        vertex_start: vertices.len() as u32,
+        vertex_count: 0,
+        sampling: SurfaceSampling::ExactNearest,
+    });
+    push_draw_command(
+        &mut vertices,
+        &mut commands,
+        EglDrawLayer::Surface(920),
+        EglRect::new(0.0, 0.0, 32.0, 32.0),
+        32,
+        32,
+        OutputFramebufferOrigin::BottomLeft,
+    );
+    let previous = EglCheckpointSceneCausalSnapshot::new(
+        (32, 32),
+        &commands,
+        &vertices,
+        &[surface_signature(920, 1)],
+        &[1.0; 3],
+        &HashMap::new(),
+    );
+    let mut changed_commands = commands;
+    changed_commands[marker_index].bounds = EglRect::new(8.0, 4.0, 12.0, 12.0);
+    let current = EglCheckpointSceneCausalSnapshot::new(
+        (32, 32),
+        &changed_commands,
+        &vertices,
+        &[surface_signature(920, 1)],
+        &[1.0; 3],
+        &HashMap::new(),
+    );
+
+    assert_eq!(
+        previous.unchanged_command_prefix_len(&current),
+        marker_index,
+        "checkpoint pixel reuse must stop before the moving lifecycle marker"
+    );
+}

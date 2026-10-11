@@ -1,6 +1,1347 @@
 use super::*;
 
 #[test]
+fn egl_lifecycle_lamp_below_canonical_opaque_window_respects_painter_order() {
+    let mut harness = GlesEffectTestHarness::new(320, 200);
+    harness.install_texture_backed_output();
+
+    let mut buffer_ids = BufferIdAllocator::default();
+    let lower = lifecycle_test_surface(630, 0, 0, 320, 200, 0xff22_3322, &mut buffer_ids);
+    let retained = lifecycle_test_surface(631, 60, 40, 180, 110, 0xffee_2211, &mut buffer_ids);
+    let upper = lifecycle_test_surface(632, 100, 0, 100, 70, 0xff11_22ee, &mut buffer_ids);
+    let lower_window = oblivion_one::compositor::WindowId::from_raw(1).expect("lower window");
+    let retained_window = oblivion_one::compositor::WindowId::from_raw(2).expect("retained window");
+    let upper_window = oblivion_one::compositor::WindowId::from_raw(3).expect("upper window");
+    let socket_name = format!(
+        "typhon-lifecycle-canonical-overlap-egl-{}",
+        std::process::id()
+    );
+    let mut server =
+        oblivion_one::compositor::OwnCompositorServer::bind_cpu_composition(&socket_name)
+            .expect("test compositor binds");
+    let windows = [
+        (lower.surface_id, lower_window),
+        (retained.surface_id, retained_window),
+        (upper.surface_id, upper_window),
+    ];
+    server.install_native_frame_test_scene_with_server_decorations(
+        vec![lower.clone(), retained.clone(), upper.clone()],
+        &windows,
+        None,
+    );
+    let lifecycle_decorations =
+        server.native_decoration_render_instances(std::slice::from_ref(&retained));
+    assert_eq!(lifecycle_decorations.len(), 1);
+    server.install_native_frame_test_scene_with_server_decorations(
+        vec![lower.clone(), upper.clone()],
+        &windows,
+        None,
+    );
+
+    let mut resolved = crate::native_output::ResolvedNativeFrameScene::from_server_at(
+        &server,
+        AnimationTime::from_nanos(0),
+    );
+    resolved.surfaces = std::borrow::Cow::Owned(vec![lower.clone(), upper.clone()]);
+    resolved.surface_scene_node_ids =
+        std::borrow::Cow::Owned(resolved.surface_scene_node_ids.as_ref().to_vec());
+    resolved.presentation_owner_root_surface_ids = std::borrow::Cow::Owned(
+        resolved
+            .presentation_owner_root_surface_ids
+            .as_ref()
+            .to_vec(),
+    );
+    resolved.popup_surface_ids =
+        std::borrow::Cow::Owned(resolved.popup_surface_ids.as_ref().to_vec());
+    resolved.lifecycle_surfaces = vec![retained.clone()];
+    resolved.lifecycle = lifecycle_effect_sample(
+        0.0,
+        LifecycleDirection::Minimize,
+        retained.surface_id,
+        1,
+        ResolvedEffectScene::default(),
+    );
+    resolved.lifecycle.samples[0].window_id = retained_window;
+    resolved.lifecycle.samples[0].visual_source.window_id = retained_window;
+    resolved.lifecycle.samples[0].visual_group = LifecycleVisualGroup::from_bounds(
+        PresentationRect::new(60.0, 40.0, 180.0, 110.0).expect("canonical client rect"),
+        PresentationRect::new(40.0, 20.0, 220.0, 160.0).expect("canonical visual rect"),
+        PresentationRect::new(60.0, 40.0, 180.0, 110.0).expect("presented client rect"),
+        PresentationRect::new(220.0, 130.0, 60.0, 40.0).expect("anchor rect"),
+        320,
+        200,
+    )
+    .expect("decorated lifecycle visual group");
+    resolved.lifecycle_decorations = lifecycle_decorations;
+    assert_eq!(resolved.lifecycle_decorations.len(), 1);
+    let (scene_band, layer_rank, stack_position, stable_order) =
+        server.native_scene_root_stack_key(retained.surface_id, 1);
+    resolved.lifecycle.samples[0].painter_order = LifecyclePainterOrder {
+        scene_band,
+        layer_rank,
+        stack_position,
+        stable_order: stable_order as u64,
+    };
+    resolved.lifecycle.samples[0].visual_source.kind = LifecycleVisualSourceKind::NoOwnedEffects;
+    let canonical_groups = oblivion_one::compositor::WindowVisualGroup::stack_order_with_popups(
+        resolved.surfaces.as_ref(),
+        &resolved.decorations,
+        resolved.popup_surface_ids.as_ref(),
+    );
+    let lifecycle_order = oblivion_one::compositor::window_exit_stack_order_key(
+        scene_band,
+        layer_rank,
+        stack_position,
+        true,
+        usize::try_from(stable_order).unwrap_or(usize::MAX),
+    );
+    let insertion_group = canonical_groups
+        .iter()
+        .enumerate()
+        .position(|(group_index, group)| {
+            let (band, rank, position, _) =
+                server.native_scene_root_stack_key(group.root_surface_id(), group_index);
+            oblivion_one::compositor::window_exit_stack_order_key(
+                band,
+                rank,
+                position,
+                false,
+                group_index,
+            ) > lifecycle_order
+        })
+        .unwrap_or(canonical_groups.len());
+    let presentation_identity = resolved.lifecycle.samples[0].presentation_identity;
+    resolved.lifecycle_marker_insertions = vec![(presentation_identity, insertion_group)];
+    resolved.lifecycle_snapshot =
+        oblivion_one::window_lifecycle_animation::LifecycleFrameSnapshot::from_sample(
+            &resolved.lifecycle,
+        );
+
+    let input_state = crate::native_output::NativeInputState::new(320, 200);
+    let mut frame_renderer = crate::native_output::NativeFrameRenderer::default();
+    let request = frame_renderer.egl_scene_draw_request(
+        320,
+        200,
+        &resolved,
+        &server,
+        &input_state,
+        crate::native_output::NativeCursorRenderMode::Hardware,
+        Some(OutputDamage::Full),
+    );
+    let target = EglOutputRenderTarget {
+        framebuffer: harness
+            .test_output_framebuffer
+            .expect("output has an FBO-backed render target"),
+        sampleable_texture: harness.test_output_texture,
+        width: 320,
+        height: 200,
+        buffer_age: BufferAge::Unsupported,
+        framebuffer_origin: OutputFramebufferOrigin::BottomLeft,
+    };
+    let outcome = harness
+        .renderer
+        .draw_scene_to_target(&harness.egl, harness.display, target, request)
+        .expect("canonical overlap frame draws");
+    assert!(matches!(outcome, EglFrameOutcome::Rendered { .. }));
+
+    harness.renderer.bind_active_output_framebuffer();
+    let pixels = read_effect_test_pixels(&harness.gl, 320, 200);
+    let commands = &harness.renderer.scene_state.commands;
+    let lower_index = commands
+        .iter()
+        .position(|command| command.layer == EglDrawLayer::Surface(630))
+        .expect("lower canonical window command");
+    let marker_command = commands
+        .iter()
+        .find(|command| command.layer == EglDrawLayer::LifecycleOverlay(presentation_identity))
+        .expect("frame-local lifecycle marker");
+    let marker_index = commands
+        .iter()
+        .position(|command| command.layer == EglDrawLayer::LifecycleOverlay(presentation_identity))
+        .expect("frame-local lifecycle marker");
+    let upper_command = commands
+        .iter()
+        .find(|command| command.layer == EglDrawLayer::Surface(632))
+        .expect("upper canonical window command");
+    let upper_index = commands
+        .iter()
+        .position(|command| command.layer == EglDrawLayer::Surface(632))
+        .expect("upper canonical window command");
+    assert!(lower_index < marker_index && marker_index < upper_index);
+    let overlap_left = marker_command
+        .bounds
+        .x()
+        .max(upper_command.bounds.x())
+        .max(0.0);
+    let overlap_top = marker_command
+        .bounds
+        .y()
+        .max(upper_command.bounds.y())
+        .max(0.0);
+    let overlap_right = (marker_command.bounds.x() + marker_command.bounds.width())
+        .min(upper_command.bounds.x() + upper_command.bounds.width())
+        .min(320.0);
+    let overlap_bottom = (marker_command.bounds.y() + marker_command.bounds.height())
+        .min(upper_command.bounds.y() + upper_command.bounds.height())
+        .min(200.0);
+    assert!(
+        overlap_left < overlap_right && overlap_top < overlap_bottom,
+        "retained marker and upper canonical window must overlap inside the output"
+    );
+    let overlap_x = ((overlap_left + overlap_right) * 0.5).floor() as u32;
+    let overlap_y = ((overlap_top + overlap_bottom) * 0.5).floor() as u32;
+    let overlap = effect_test_pixel(&pixels, 320, overlap_x, 200 - 1 - overlap_y);
+    assert!(
+        overlap[2] > overlap[0].saturating_mul(2),
+        "the opaque upper canonical window must win above the retained Lamp at ({overlap_x}, {overlap_y}): {overlap:?}"
+    );
+
+    let payload_id = resolved.lifecycle.samples[0].payload_id;
+    let retained_surface_snapshot_id = resolved.lifecycle_surfaces[0].buffer_id();
+    let lifecycle_snapshot_signature = resolved.lifecycle_snapshot.signature;
+    let frozen_ssd = format!("{:?}", resolved.lifecycle_decorations[0].scene_snapshot());
+    let source_signature = harness
+        .renderer
+        .lifecycle
+        .resolved_visual_source_signature(payload_id)
+        .expect("retained lifecycle source was materialized");
+    let retained_texture = harness
+        .renderer
+        .lifecycle
+        .resolved_visual_texture(payload_id)
+        .expect("retained lifecycle texture exists")
+        .clone();
+    let retained_pixels_before = read_effect_texture_pixels(
+        &mut harness,
+        &retained_texture,
+        retained_texture.key.width,
+        retained_texture.key.height,
+    );
+    let canonical_surfaces = resolved.surfaces.as_ref().to_vec();
+    let retained_lifecycle = resolved.lifecycle.clone();
+    let retained_surfaces = resolved.lifecycle_surfaces.clone();
+    let frozen_decorations = resolved.lifecycle_decorations.clone();
+    drop(resolved);
+    server.install_native_frame_test_scene_with_server_decorations(
+        canonical_surfaces.clone(),
+        &[
+            (lower.surface_id, lower_window),
+            (upper.surface_id, upper_window),
+            (retained.surface_id, retained_window),
+        ],
+        None,
+    );
+    let mut resolved = crate::native_output::ResolvedNativeFrameScene::from_server_at(
+        &server,
+        AnimationTime::from_nanos(1),
+    );
+    resolved.surfaces = std::borrow::Cow::Owned(canonical_surfaces);
+    resolved.lifecycle = retained_lifecycle;
+    resolved.lifecycle_snapshot =
+        oblivion_one::window_lifecycle_animation::LifecycleFrameSnapshot::from_sample(
+            &resolved.lifecycle,
+        );
+    resolved.lifecycle_surfaces = retained_surfaces;
+    resolved.lifecycle_decorations = frozen_decorations;
+    set_test_lifecycle_marker_insertions(&server, &mut resolved);
+    assert_eq!(
+        resolved.lifecycle.samples[0].presentation_identity,
+        presentation_identity
+    );
+    assert_eq!(resolved.lifecycle.samples[0].payload_id, payload_id);
+    assert_eq!(
+        resolved.lifecycle_snapshot.signature, lifecycle_snapshot_signature,
+        "stack movement preserves the frozen lifecycle snapshot"
+    );
+    assert_eq!(
+        resolved.lifecycle_surfaces[0].buffer_id(),
+        retained_surface_snapshot_id
+    );
+    assert_eq!(
+        format!("{:?}", resolved.lifecycle_decorations[0].scene_snapshot()),
+        frozen_ssd,
+        "stack movement keeps the frozen SSD snapshot"
+    );
+
+    let request = frame_renderer.egl_scene_draw_request(
+        320,
+        200,
+        &resolved,
+        &server,
+        &input_state,
+        crate::native_output::NativeCursorRenderMode::Hardware,
+        Some(OutputDamage::Full),
+    );
+    let outcome = harness
+        .renderer
+        .draw_scene_to_target(&harness.egl, harness.display, target, request)
+        .expect("reordered lifecycle frame draws");
+    let moved_evidence = match outcome {
+        EglFrameOutcome::Rendered {
+            lifecycle_evidence, ..
+        } => lifecycle_evidence,
+        EglFrameOutcome::LifecycleFallback { fallbacks, .. } => {
+            panic!("reordered lifecycle sample fell back: {fallbacks:?}")
+        }
+        EglFrameOutcome::Skipped { reason, .. } => {
+            panic!("full reordered lifecycle frame was skipped: {reason:?}")
+        }
+    };
+    assert!(moved_evidence.contains(presentation_identity, payload_id, retained.surface_id));
+    let commands = &harness.renderer.scene_state.commands;
+    let moved_marker_index = commands
+        .iter()
+        .position(|command| command.layer == EglDrawLayer::LifecycleOverlay(presentation_identity))
+        .expect("reordered frame has one lifecycle marker");
+    let moved_upper_index = commands
+        .iter()
+        .position(|command| command.layer == EglDrawLayer::Surface(632))
+        .expect("upper canonical window remains present");
+    assert!(moved_upper_index < moved_marker_index);
+    harness.renderer.bind_active_output_framebuffer();
+    let moved_pixels = read_effect_test_pixels(&harness.gl, 320, 200);
+    let moved_overlap = effect_test_pixel(&moved_pixels, 320, overlap_x, 200 - 1 - overlap_y);
+    assert!(
+        moved_overlap[0] > moved_overlap[2].saturating_mul(2),
+        "moving the retained owner above the upper window moves its marker above it: {moved_overlap:?}"
+    );
+    assert_eq!(
+        harness
+            .renderer
+            .lifecycle
+            .resolved_visual_source_signature(payload_id),
+        Some(source_signature),
+        "stack movement reuses the retained source"
+    );
+    assert_eq!(
+        read_effect_texture_pixels(
+            &mut harness,
+            &retained_texture,
+            retained_texture.key.width,
+            retained_texture.key.height,
+        ),
+        retained_pixels_before,
+        "stack movement does not recapture the retained source"
+    );
+}
+
+fn render_lifecycle_overlap_pixel(
+    effect: LifecycleEffectKind,
+    retained_above: bool,
+    surface_id_base: u32,
+    name: &str,
+    partial_repaint: bool,
+) -> ([u8; 4], GlesSceneFrameStats) {
+    let mut harness = if partial_repaint {
+        GlesEffectTestHarness::new_with_partial_repaint(320, 200)
+    } else {
+        GlesEffectTestHarness::new(320, 200)
+    };
+    harness.install_texture_backed_output();
+
+    let mut buffer_ids = BufferIdAllocator::default();
+    let lower = lifecycle_test_surface(
+        surface_id_base,
+        0,
+        0,
+        320,
+        200,
+        0xff22_3322,
+        &mut buffer_ids,
+    );
+    let retained = lifecycle_test_surface(
+        surface_id_base + 1,
+        60,
+        40,
+        180,
+        110,
+        0xffee_2211,
+        &mut buffer_ids,
+    );
+    let upper = lifecycle_test_surface(
+        surface_id_base + 2,
+        100,
+        0,
+        100,
+        70,
+        0xff11_22ee,
+        &mut buffer_ids,
+    );
+    let lower_window = oblivion_one::compositor::WindowId::from_raw(1).expect("lower window");
+    let retained_window = oblivion_one::compositor::WindowId::from_raw(2).expect("retained");
+    let upper_window = oblivion_one::compositor::WindowId::from_raw(3).expect("upper window");
+    let stack = if retained_above {
+        vec![
+            (lower.surface_id, lower_window),
+            (upper.surface_id, upper_window),
+            (retained.surface_id, retained_window),
+        ]
+    } else {
+        vec![
+            (lower.surface_id, lower_window),
+            (retained.surface_id, retained_window),
+            (upper.surface_id, upper_window),
+        ]
+    };
+    let socket_name = format!("typhon-lifecycle-{name}-egl-{}", std::process::id());
+    let mut server =
+        oblivion_one::compositor::OwnCompositorServer::bind_cpu_composition(&socket_name)
+            .expect("test compositor binds");
+    server.install_native_frame_test_scene_with_server_decorations(
+        vec![lower.clone(), retained.clone(), upper.clone()],
+        &stack,
+        None,
+    );
+    let lifecycle_decorations = if partial_repaint {
+        Vec::new()
+    } else {
+        server.native_decoration_render_instances(std::slice::from_ref(&retained))
+    };
+    server.install_native_frame_test_scene_with_server_decorations(
+        vec![lower.clone(), upper.clone()],
+        &stack,
+        None,
+    );
+
+    let mut resolved = crate::native_output::ResolvedNativeFrameScene::from_server_at(
+        &server,
+        AnimationTime::from_nanos(0),
+    );
+    resolved.surfaces = std::borrow::Cow::Owned(vec![lower.clone(), upper.clone()]);
+    resolved.lifecycle_surfaces = vec![retained.clone()];
+    resolved.lifecycle = lifecycle_effect_sample(
+        0.0,
+        LifecycleDirection::Minimize,
+        retained.surface_id,
+        1,
+        ResolvedEffectScene::default(),
+    );
+    {
+        let sample = &mut resolved.lifecycle.samples[0];
+        sample.window_id = retained_window;
+        sample.visual_source.window_id = retained_window;
+        sample.visual_source.kind = LifecycleVisualSourceKind::NoOwnedEffects;
+        sample.effect = effect;
+        if !partial_repaint {
+            sample.visual_group = LifecycleVisualGroup::from_bounds(
+                PresentationRect::new(60.0, 40.0, 180.0, 110.0).expect("canonical client rect"),
+                PresentationRect::new(40.0, 20.0, 220.0, 160.0).expect("canonical visual rect"),
+                PresentationRect::new(60.0, 40.0, 180.0, 110.0)
+                    .expect("presented client rect"),
+                PresentationRect::new(220.0, 130.0, 60.0, 40.0).expect("anchor rect"),
+                320,
+                200,
+            )
+            .expect("decorated lifecycle visual group");
+        }
+    }
+    resolved.lifecycle_decorations = lifecycle_decorations;
+    set_test_lifecycle_marker_insertions(&server, &mut resolved);
+    resolved.lifecycle_snapshot =
+        oblivion_one::window_lifecycle_animation::LifecycleFrameSnapshot::from_sample(
+            &resolved.lifecycle,
+        );
+    let identity = resolved.lifecycle.samples[0].presentation_identity;
+    let payload_id = resolved.lifecycle.samples[0].payload_id;
+
+    let input_state = crate::native_output::NativeInputState::new(320, 200);
+    let mut frame_renderer = crate::native_output::NativeFrameRenderer::default();
+    let output_framebuffer = harness
+        .test_output_framebuffer
+        .expect("output has an FBO-backed render target");
+    let output_texture = harness.test_output_texture;
+    let target_for_age = |buffer_age| EglOutputRenderTarget {
+        framebuffer: output_framebuffer,
+        sampleable_texture: output_texture,
+        width: 320,
+        height: 200,
+        buffer_age,
+        framebuffer_origin: OutputFramebufferOrigin::BottomLeft,
+    };
+    if partial_repaint {
+        let first_request = frame_renderer.egl_scene_draw_request(
+            320,
+            200,
+            &resolved,
+            &server,
+            &input_state,
+            crate::native_output::NativeCursorRenderMode::Hardware,
+            Some(OutputDamage::Full),
+        );
+        let first_outcome = harness
+            .renderer
+            .draw_scene_to_target(
+                &harness.egl,
+                harness.display,
+                target_for_age(BufferAge::Unsupported),
+                first_request,
+            )
+            .expect("initial full repaint frame draws");
+        let EglFrameOutcome::Rendered { commit, .. } = first_outcome else {
+            panic!("initial lifecycle frame must render before partial repair");
+        };
+        harness
+            .renderer
+            .commit_presented(commit, OutputDamage::Full);
+    }
+    let damage = if partial_repaint {
+        OutputDamage::rects(
+            320,
+            200,
+            [
+                OutputRect::new(230, 130, 30, 20),
+                OutputRect::new(40, 40, 20, 20),
+            ],
+        )
+    } else {
+        OutputDamage::Full
+    };
+    let request = frame_renderer.egl_scene_draw_request(
+        320,
+        200,
+        &resolved,
+        &server,
+        &input_state,
+        crate::native_output::NativeCursorRenderMode::Hardware,
+        Some(damage),
+    );
+    let target = target_for_age(if partial_repaint {
+        BufferAge::Value(1)
+    } else {
+        BufferAge::Unsupported
+    });
+    let outcome = harness
+        .renderer
+        .draw_scene_to_target(&harness.egl, harness.display, target, request)
+        .expect("canonical overlap frame draws");
+    let (evidence, stats, repair_rect_count, repaint_mode, repaint_plan_debug) = match outcome {
+        EglFrameOutcome::Rendered {
+            commit,
+            stats,
+            lifecycle_evidence,
+            ..
+        } => (
+            lifecycle_evidence,
+            stats,
+            commit.repaint_plan.repair_damage.rect_count(),
+            commit.repaint_plan.mode,
+            format!("{:?}", commit.repaint_plan),
+        ),
+        EglFrameOutcome::LifecycleFallback { fallbacks, .. } => {
+            panic!("valid overlap lifecycle fell back: {fallbacks:?}")
+        }
+        EglFrameOutcome::Skipped { reason, .. } => {
+            panic!("full overlap lifecycle frame was skipped: {reason:?}")
+        }
+    };
+    assert!(evidence.contains(identity, payload_id, retained.surface_id));
+    if partial_repaint {
+        assert!(repair_rect_count > 0);
+        assert_eq!(
+            repaint_mode,
+            crate::egl_renderer::damage::RepaintMode::Partial,
+            "partial damage request produced a non-partial plan: {repaint_plan_debug}"
+        );
+        if matches!(
+            std::env::var("TYPHON_SCENE_EXECUTION_MODE").as_deref(),
+            Ok("legacy")
+        ) {
+            assert_eq!(stats.base_region_legacy_mode_frames, 1);
+        }
+    }
+    let commands = &harness.renderer.scene_state.commands;
+    let lower_index = commands
+        .iter()
+        .position(|command| command.layer == EglDrawLayer::Surface(lower.surface_id))
+        .expect("lower canonical command");
+    let marker_index = commands
+        .iter()
+        .position(|command| command.layer == EglDrawLayer::LifecycleOverlay(identity))
+        .expect("canonical lifecycle marker");
+    let marker_command = commands
+        .iter()
+        .find(|command| command.layer == EglDrawLayer::LifecycleOverlay(identity))
+        .expect("canonical lifecycle marker");
+    let upper_index = commands
+        .iter()
+        .position(|command| command.layer == EglDrawLayer::Surface(upper.surface_id))
+        .expect("upper canonical command");
+    let upper_command = commands
+        .iter()
+        .find(|command| command.layer == EglDrawLayer::Surface(upper.surface_id))
+        .expect("upper canonical command");
+    assert!(lower_index < marker_index);
+    assert_eq!(
+        marker_index < upper_index,
+        !retained_above,
+        "lifecycle marker must occupy the selected compositor stack position"
+    );
+    let overlap_left = marker_command.bounds.x().max(upper_command.bounds.x()).max(0.0);
+    let overlap_top = marker_command.bounds.y().max(upper_command.bounds.y()).max(0.0);
+    let overlap_right = (marker_command.bounds.x() + marker_command.bounds.width())
+        .min(upper_command.bounds.x() + upper_command.bounds.width())
+        .min(320.0);
+    let overlap_bottom = (marker_command.bounds.y() + marker_command.bounds.height())
+        .min(upper_command.bounds.y() + upper_command.bounds.height())
+        .min(200.0);
+    assert!(overlap_left < overlap_right && overlap_top < overlap_bottom);
+    let overlap_x = ((overlap_left + overlap_right) * 0.5).floor() as u32;
+    let overlap_y = ((overlap_top + overlap_bottom) * 0.5).floor() as u32;
+    harness.renderer.bind_active_output_framebuffer();
+    let pixels = read_effect_test_pixels(&harness.gl, 320, 200);
+    let overlap = effect_test_pixel(&pixels, 320, overlap_x, 200 - 1 - overlap_y);
+    if partial_repaint {
+        let second_repair_overlap = effect_test_pixel(&pixels, 320, overlap_x, 200 - 1 - overlap_y);
+        assert!(
+            second_repair_overlap[2] > second_repair_overlap[0].saturating_mul(2),
+            "the second repair must replay the upper canonical window after the lifecycle marker: {second_repair_overlap:?}"
+        );
+    }
+    (overlap, stats)
+}
+
+#[test]
+fn egl_lifecycle_squash_below_canonical_opaque_window_respects_painter_order() {
+    let (overlap, _) = render_lifecycle_overlap_pixel(
+        LifecycleEffectKind::Squash,
+        false,
+        642,
+        "squash-below-canonical",
+        false,
+    );
+    assert!(
+        overlap[2] > overlap[0].saturating_mul(2),
+        "the upper canonical window must win above the retained Squash: {overlap:?}"
+    );
+}
+
+#[test]
+fn egl_lifecycle_above_canonical_opaque_window_respects_painter_order() {
+    let (overlap, _) = render_lifecycle_overlap_pixel(
+        LifecycleEffectKind::Lamp,
+        true,
+        645,
+        "above-canonical",
+        false,
+    );
+    assert!(
+        overlap[0] > overlap[2].saturating_mul(2),
+        "the retained Lamp above the canonical window must win: {overlap:?}"
+    );
+}
+
+#[test]
+fn egl_lifecycle_marker_uses_top_level_region_replay() {
+    let (overlap, stats) = render_lifecycle_overlap_pixel(
+        LifecycleEffectKind::Lamp,
+        false,
+        648,
+        "top-level-region-replay",
+        false,
+    );
+    assert!(
+        overlap[2] > overlap[0].saturating_mul(2),
+        "the top-level region replay must preserve canonical/lifecycle painter order: {overlap:?}"
+    );
+    if matches!(
+        std::env::var("TYPHON_SCENE_EXECUTION_MODE").as_deref(),
+        Ok("legacy")
+    ) {
+        return;
+    }
+    assert_eq!(stats.base_region_plan_builds, 1);
+    assert_eq!(stats.base_region_legacy_mode_frames, 0);
+    assert_eq!(stats.base_region_legacy_fallbacks, 0);
+    assert_eq!(stats.scissor_passes, 1);
+}
+
+#[test]
+fn egl_lifecycle_scissored_replay_preserves_order_for_multiple_repairs() {
+    let (overlap, _) = render_lifecycle_overlap_pixel(
+        LifecycleEffectKind::Lamp,
+        false,
+        651,
+        "multiple-scissored-repairs",
+        true,
+    );
+    assert!(
+        overlap[2] > overlap[0].saturating_mul(2),
+        "the first repair must leave the upper canonical window above lifecycle: {overlap:?}"
+    );
+}
+
+#[test]
+fn egl_lifecycle_marker_replays_without_canonical_vertices_in_full_repaint() {
+    let mut harness = GlesEffectTestHarness::new(320, 200);
+    harness.install_texture_backed_output();
+
+    let mut buffer_ids = BufferIdAllocator::default();
+    let retained = lifecycle_test_surface(633, 60, 40, 180, 110, 0xffee_2211, &mut buffer_ids);
+    let window_id = oblivion_one::compositor::WindowId::from_raw(1).expect("window id");
+    let socket_name = format!("typhon-lifecycle-marker-only-egl-{}", std::process::id());
+    let mut server =
+        oblivion_one::compositor::OwnCompositorServer::bind_cpu_composition(&socket_name)
+            .expect("test compositor binds");
+    server.install_native_frame_test_scene_with_server_decorations(
+        vec![retained.clone()],
+        &[(retained.surface_id, window_id)],
+        None,
+    );
+    let lifecycle_decorations =
+        server.native_decoration_render_instances(std::slice::from_ref(&retained));
+    server.install_native_frame_test_scene_with_server_decorations(
+        Vec::new(),
+        &[(retained.surface_id, window_id)],
+        None,
+    );
+
+    let mut resolved = crate::native_output::ResolvedNativeFrameScene::from_server_at(
+        &server,
+        AnimationTime::from_nanos(0),
+    );
+    resolved.surfaces = std::borrow::Cow::Owned(Vec::new());
+    resolved.lifecycle_surfaces = vec![retained.clone()];
+    resolved.lifecycle = lifecycle_effect_sample(
+        0.0,
+        LifecycleDirection::Minimize,
+        retained.surface_id,
+        1,
+        ResolvedEffectScene::default(),
+    );
+    resolved.lifecycle.samples[0].visual_group = LifecycleVisualGroup::from_bounds(
+        PresentationRect::new(60.0, 40.0, 180.0, 110.0).expect("canonical client rect"),
+        PresentationRect::new(40.0, 20.0, 220.0, 160.0).expect("canonical visual rect"),
+        PresentationRect::new(60.0, 40.0, 180.0, 110.0).expect("presented client rect"),
+        PresentationRect::new(220.0, 130.0, 60.0, 40.0).expect("anchor rect"),
+        320,
+        200,
+    )
+    .expect("decorated lifecycle visual group");
+    resolved.lifecycle_decorations = lifecycle_decorations;
+    let sample = &mut resolved.lifecycle.samples[0];
+    sample.window_id = window_id;
+    sample.visual_source.window_id = window_id;
+    sample.visual_source.kind = LifecycleVisualSourceKind::NoOwnedEffects;
+    let (scene_band, layer_rank, stack_position, stable_order) =
+        server.native_scene_root_stack_key(retained.surface_id, 0);
+    sample.painter_order = LifecyclePainterOrder {
+        scene_band,
+        layer_rank,
+        stack_position,
+        stable_order: stable_order as u64,
+    };
+    let identity = sample.presentation_identity;
+    resolved.lifecycle_marker_insertions = vec![(identity, 0)];
+    resolved.lifecycle_snapshot =
+        oblivion_one::window_lifecycle_animation::LifecycleFrameSnapshot::from_sample(
+            &resolved.lifecycle,
+        );
+
+    let input_state = crate::native_output::NativeInputState::new(320, 200);
+    let mut frame_renderer = crate::native_output::NativeFrameRenderer::default();
+    let request = frame_renderer.egl_scene_draw_request(
+        320,
+        200,
+        &resolved,
+        &server,
+        &input_state,
+        crate::native_output::NativeCursorRenderMode::Hardware,
+        Some(OutputDamage::Full),
+    );
+    let target = EglOutputRenderTarget {
+        framebuffer: harness
+            .test_output_framebuffer
+            .expect("output has an FBO-backed render target"),
+        sampleable_texture: harness.test_output_texture,
+        width: 320,
+        height: 200,
+        buffer_age: BufferAge::Unsupported,
+        framebuffer_origin: OutputFramebufferOrigin::BottomLeft,
+    };
+    let outcome = harness
+        .renderer
+        .draw_scene_to_target(&harness.egl, harness.display, target, request)
+        .expect("marker-only lifecycle frame draws");
+    let evidence = match outcome {
+        EglFrameOutcome::Rendered {
+            lifecycle_evidence, ..
+        } => lifecycle_evidence,
+        EglFrameOutcome::LifecycleFallback { fallbacks, .. } => {
+            panic!("valid marker-only lifecycle fell back: {fallbacks:?}")
+        }
+        EglFrameOutcome::Skipped { reason, .. } => {
+            panic!("full marker-only lifecycle repaint was skipped: {reason:?}")
+        }
+    };
+    assert!(evidence.contains(identity, resolved.lifecycle.samples[0].payload_id, 633));
+    assert!(harness.renderer.scene_state.commands.iter().all(|command| {
+        !matches!(command.layer, EglDrawLayer::Surface(_))
+    }));
+    assert!(
+        harness
+            .renderer
+            .scene_state
+            .commands
+            .iter()
+            .any(|command| command.layer == EglDrawLayer::LifecycleOverlay(identity))
+    );
+
+    harness.renderer.bind_active_output_framebuffer();
+    let pixels = read_effect_test_pixels(&harness.gl, 320, 200);
+    let retained_red_pixel = pixels
+        .chunks_exact(4)
+        .find(|pixel| pixel[0] > pixel[1].saturating_mul(2));
+    assert!(
+        retained_red_pixel.is_some(),
+        "the lifecycle marker must draw without canonical scene vertices"
+    );
+}
+
+#[test]
+fn egl_lifecycle_pixels_participate_in_output_postprocess() {
+    let mut harness = GlesEffectTestHarness::new(320, 200);
+    harness.install_texture_backed_output();
+
+    let program_id = EffectProgramId::new(9_003).expect("postprocess test program id");
+    let source = oblivion_one::effects::EffectNodeId::new(1).expect("source node id");
+    let transformed = oblivion_one::effects::EffectNodeId::new(2).expect("matrix node id");
+    let program = oblivion_one::effects::EffectProgram {
+        id: program_id,
+        nodes: vec![
+            oblivion_one::effects::EffectNode::source(
+                source,
+                oblivion_one::effects::EffectSource::TargetContent,
+            ),
+            oblivion_one::effects::EffectNode::color_matrix(
+                transformed,
+                source,
+                oblivion_one::effects::ColorMatrixSpec {
+                    matrix: [
+                        0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0,
+                        1.0,
+                    ],
+                    bias: [0.0; 4],
+                },
+            )
+            .expect("channel-swap matrix validates"),
+        ],
+        output: transformed,
+        working_space: EffectWorkingSpace::OutputEncodedSrgb,
+        alpha_mode: EffectAlphaMode::Preserve,
+        outsets: oblivion_one::effects::EffectOutsets::ZERO,
+        frame_demand: EffectFrameDemand::OnDamage,
+        failure_policy: EffectFailurePolicy::Passthrough,
+    };
+    let mut registry = oblivion_one::effects::EffectRegistry::empty();
+    registry
+        .insert(oblivion_one::effects::validate_effect_program(program).unwrap())
+        .expect("postprocess test program registers");
+    harness.renderer.set_effect_registry(registry);
+
+    let mut buffer_ids = BufferIdAllocator::default();
+    let background = lifecycle_test_surface(634, 0, 0, 320, 200, 0xff00_10ee, &mut buffer_ids);
+    let retained = lifecycle_test_surface(635, 60, 40, 180, 110, 0xffee_0010, &mut buffer_ids);
+    let background_window = oblivion_one::compositor::WindowId::from_raw(1).expect("background");
+    let retained_window = oblivion_one::compositor::WindowId::from_raw(2).expect("retained");
+    let socket_name = format!(
+        "typhon-lifecycle-output-postprocess-egl-{}",
+        std::process::id()
+    );
+    let mut server =
+        oblivion_one::compositor::OwnCompositorServer::bind_cpu_composition(&socket_name)
+            .expect("test compositor binds");
+    let windows = [
+        (background.surface_id, background_window),
+        (retained.surface_id, retained_window),
+    ];
+    server.install_native_frame_test_scene_with_server_decorations(
+        vec![background.clone(), retained.clone()],
+        &windows,
+        None,
+    );
+    server.install_native_frame_test_scene_with_server_decorations(
+        vec![background.clone()],
+        &windows,
+        None,
+    );
+
+    let mut resolved = crate::native_output::ResolvedNativeFrameScene::from_server_at(
+        &server,
+        AnimationTime::from_nanos(0),
+    );
+    resolved.surfaces = std::borrow::Cow::Owned(vec![background]);
+    resolved.lifecycle_surfaces = vec![retained.clone()];
+    resolved.lifecycle = lifecycle_effect_sample(
+        0.0,
+        LifecycleDirection::Minimize,
+        retained.surface_id,
+        1,
+        ResolvedEffectScene::default(),
+    );
+    let sample = &mut resolved.lifecycle.samples[0];
+    sample.window_id = retained_window;
+    sample.visual_source.window_id = retained_window;
+    sample.visual_source.kind = LifecycleVisualSourceKind::NoOwnedEffects;
+    let (scene_band, layer_rank, stack_position, stable_order) =
+        server.native_scene_root_stack_key(retained.surface_id, 1);
+    sample.painter_order = LifecyclePainterOrder {
+        scene_band,
+        layer_rank,
+        stack_position,
+        stable_order: stable_order as u64,
+    };
+    let identity = sample.presentation_identity;
+    let canonical_groups = oblivion_one::compositor::WindowVisualGroup::stack_order_with_popups(
+        resolved.surfaces.as_ref(),
+        &resolved.decorations,
+        resolved.popup_surface_ids.as_ref(),
+    );
+    let lifecycle_order = oblivion_one::compositor::window_exit_stack_order_key(
+        scene_band,
+        layer_rank,
+        stack_position,
+        true,
+        usize::try_from(stable_order).unwrap_or(usize::MAX),
+    );
+    let insertion_group = canonical_groups
+        .iter()
+        .enumerate()
+        .position(|(group_index, group)| {
+            let (band, rank, position, _) =
+                server.native_scene_root_stack_key(group.root_surface_id(), group_index);
+            oblivion_one::compositor::window_exit_stack_order_key(
+                band,
+                rank,
+                position,
+                false,
+                group_index,
+            ) > lifecycle_order
+        })
+        .unwrap_or(canonical_groups.len());
+    resolved.lifecycle_marker_insertions = vec![(identity, insertion_group)];
+    resolved.lifecycle_snapshot =
+        oblivion_one::window_lifecycle_animation::LifecycleFrameSnapshot::from_sample(
+            &resolved.lifecycle,
+        );
+
+    let bounds = EffectRect::new(0, 0, 320, 200).expect("postprocess output bounds");
+    let anchor = oblivion_one::compositor::EffectAnchor::OutputPostProcess;
+    resolved.effects = ResolvedEffectScene::new(
+        1,
+        vec![oblivion_one::compositor::ResolvedEffectInstance {
+            id: oblivion_one::effects::EffectInstanceId::new(1).expect("effect instance id"),
+            program: program_id,
+            anchor,
+            target_bounds: bounds,
+            region: EffectRegion::from_rect(bounds),
+            parameter_block: EffectParameterBlock::default(),
+            coverage: None,
+            signature: 1,
+            frame_demand: EffectFrameDemand::OnDamage,
+            visual_group: None,
+            anchor_scope: oblivion_one::compositor::EffectAnchorScope::VisualGroup,
+            backdrop_reuse: oblivion_one::compositor::EffectBackdropReuse::Exact,
+            scene_order: oblivion_one::compositor::EffectSceneOrder::for_anchor(anchor),
+        }],
+    );
+
+    let input_state = crate::native_output::NativeInputState::new(320, 200);
+    let mut frame_renderer = crate::native_output::NativeFrameRenderer::default();
+    let request = frame_renderer.egl_scene_draw_request(
+        320,
+        200,
+        &resolved,
+        &server,
+        &input_state,
+        crate::native_output::NativeCursorRenderMode::Hardware,
+        Some(OutputDamage::Full),
+    );
+    let target = EglOutputRenderTarget {
+        framebuffer: harness
+            .test_output_framebuffer
+            .expect("output has an FBO-backed render target"),
+        sampleable_texture: harness.test_output_texture,
+        width: 320,
+        height: 200,
+        buffer_age: BufferAge::Unsupported,
+        framebuffer_origin: OutputFramebufferOrigin::BottomLeft,
+    };
+    let outcome = harness
+        .renderer
+        .draw_scene_to_target(&harness.egl, harness.display, target, request)
+        .expect("lifecycle postprocess frame draws");
+    assert!(matches!(outcome, EglFrameOutcome::Rendered { .. }));
+    harness.renderer.bind_active_output_framebuffer();
+    let pixels = read_effect_test_pixels(&harness.gl, 320, 200);
+    let lifecycle_pixel = effect_test_pixel(&pixels, 320, 100, 200 - 1 - 90);
+    assert!(
+        lifecycle_pixel[2] > lifecycle_pixel[0].saturating_mul(2)
+            && lifecycle_pixel[2] > lifecycle_pixel[1].saturating_mul(2),
+        "the output-postprocess channel swap must turn the retained red lifecycle pixel blue: {lifecycle_pixel:?}"
+    );
+}
+
+#[test]
+fn egl_canonical_backdrop_blur_captures_lifecycle_pixels_below_its_anchor() {
+    let mut harness = GlesEffectTestHarness::new(320, 200);
+    harness.install_texture_backed_output();
+
+    let mut buffer_ids = BufferIdAllocator::default();
+    let lower = lifecycle_test_surface(636, 0, 0, 320, 200, 0xff10_10ee, &mut buffer_ids);
+    let retained = lifecycle_test_surface_with_row_colors(
+        637,
+        60,
+        40,
+        180,
+        110,
+        [0xffee_2211, 0xff12_ea14, 0xff12_22ee],
+        &mut buffer_ids,
+    );
+    let upper = lifecycle_test_surface(638, 100, 70, 100, 70, 0x4000_0000, &mut buffer_ids);
+    let lower_window = oblivion_one::compositor::WindowId::from_raw(1).expect("lower window");
+    let retained_window = oblivion_one::compositor::WindowId::from_raw(2).expect("retained window");
+    let upper_window = oblivion_one::compositor::WindowId::from_raw(3).expect("upper window");
+    let socket_name = format!(
+        "typhon-lifecycle-backdrop-capture-egl-{}",
+        std::process::id()
+    );
+    let mut server =
+        oblivion_one::compositor::OwnCompositorServer::bind_cpu_composition(&socket_name)
+            .expect("test compositor binds");
+    let windows = [
+        (lower.surface_id, lower_window),
+        (retained.surface_id, retained_window),
+        (upper.surface_id, upper_window),
+    ];
+    server.install_native_frame_test_scene(
+        vec![lower.clone(), retained.clone(), upper.clone()],
+        &windows,
+        None,
+    );
+    server.install_native_frame_test_scene(vec![lower.clone(), upper.clone()], &windows, None);
+
+    let blur_bounds = EffectRect::new(100, 70, 100, 70).expect("upper blur bounds");
+    let (mut backdrop_scene, registry) = moving_blur_scene_with_spec(blur_bounds, 24.0, 3, 1.0);
+    let upper_anchor = oblivion_one::compositor::EffectAnchor::BeforeSurface(upper.surface_id);
+    let backdrop = backdrop_scene
+        .instances
+        .first_mut()
+        .expect("canonical backdrop blur instance");
+    backdrop.anchor = upper_anchor;
+    backdrop.scene_order = oblivion_one::compositor::EffectSceneOrder::for_anchor(upper_anchor);
+    backdrop.backdrop_reuse = oblivion_one::compositor::EffectBackdropReuse::Exact;
+    harness.renderer.set_effect_registry(registry);
+
+    let mut resolved = crate::native_output::ResolvedNativeFrameScene::from_server_at(
+        &server,
+        AnimationTime::from_nanos(0),
+    );
+    resolved.surfaces = std::borrow::Cow::Owned(vec![lower, upper]);
+    resolved.effects = backdrop_scene;
+    resolved.lifecycle_surfaces = vec![retained.clone()];
+    resolved.lifecycle = lifecycle_effect_sample(
+        0.0,
+        LifecycleDirection::Minimize,
+        retained.surface_id,
+        1,
+        ResolvedEffectScene::default(),
+    );
+    let sample = &mut resolved.lifecycle.samples[0];
+    sample.window_id = retained_window;
+    sample.visual_source.window_id = retained_window;
+    sample.visual_source.kind = LifecycleVisualSourceKind::NoOwnedEffects;
+    let (scene_band, layer_rank, stack_position, stable_order) =
+        server.native_scene_root_stack_key(retained.surface_id, 1);
+    sample.painter_order = LifecyclePainterOrder {
+        scene_band,
+        layer_rank,
+        stack_position,
+        stable_order: stable_order as u64,
+    };
+    let identity = sample.presentation_identity;
+    let canonical_groups = oblivion_one::compositor::WindowVisualGroup::stack_order_with_popups(
+        resolved.surfaces.as_ref(),
+        &resolved.decorations,
+        resolved.popup_surface_ids.as_ref(),
+    );
+    let lifecycle_order = oblivion_one::compositor::window_exit_stack_order_key(
+        scene_band,
+        layer_rank,
+        stack_position,
+        true,
+        usize::try_from(stable_order).unwrap_or(usize::MAX),
+    );
+    let insertion_group = canonical_groups
+        .iter()
+        .enumerate()
+        .position(|(group_index, group)| {
+            let (band, rank, position, _) =
+                server.native_scene_root_stack_key(group.root_surface_id(), group_index);
+            oblivion_one::compositor::window_exit_stack_order_key(
+                band,
+                rank,
+                position,
+                false,
+                group_index,
+            ) > lifecycle_order
+        })
+        .unwrap_or(canonical_groups.len());
+    resolved.lifecycle_marker_insertions = vec![(identity, insertion_group)];
+    resolved.lifecycle_snapshot =
+        oblivion_one::window_lifecycle_animation::LifecycleFrameSnapshot::from_sample(
+            &resolved.lifecycle,
+        );
+
+    let input_state = crate::native_output::NativeInputState::new(320, 200);
+    let mut frame_renderer = crate::native_output::NativeFrameRenderer::default();
+    let request = frame_renderer.egl_scene_draw_request(
+        320,
+        200,
+        &resolved,
+        &server,
+        &input_state,
+        crate::native_output::NativeCursorRenderMode::Hardware,
+        Some(OutputDamage::Full),
+    );
+    let target = EglOutputRenderTarget {
+        framebuffer: harness
+            .test_output_framebuffer
+            .expect("output has an FBO-backed render target"),
+        sampleable_texture: harness.test_output_texture,
+        width: 320,
+        height: 200,
+        buffer_age: BufferAge::Unsupported,
+        framebuffer_origin: OutputFramebufferOrigin::BottomLeft,
+    };
+    let outcome = harness
+        .renderer
+        .draw_scene_to_target(&harness.egl, harness.display, target, request)
+        .expect("canonical backdrop blur frame draws");
+    assert!(matches!(outcome, EglFrameOutcome::Rendered { .. }));
+    let commands = &harness.renderer.scene_state.commands;
+    let lower_index = commands
+        .iter()
+        .position(|command| command.layer == EglDrawLayer::Surface(636))
+        .expect("lower canonical surface command");
+    let marker_index = commands
+        .iter()
+        .position(|command| command.layer == EglDrawLayer::LifecycleOverlay(identity))
+        .expect("canonical lifecycle marker");
+    let upper_index = commands
+        .iter()
+        .position(|command| command.layer == EglDrawLayer::Surface(638))
+        .expect("upper blur owner command");
+    assert!(lower_index < marker_index && marker_index < upper_index);
+
+    let payload_id = resolved.lifecycle.samples[0].payload_id;
+    let source_texture = harness
+        .renderer
+        .lifecycle
+        .resolved_visual_texture(payload_id)
+        .expect("lifecycle source visual is captured")
+        .clone();
+    let source_pixels = read_effect_texture_pixels(
+        &mut harness,
+        &source_texture,
+        source_texture.key.width,
+        source_texture.key.height,
+    );
+    let source_top = effect_test_pixel(
+        &source_pixels,
+        source_texture.key.width,
+        90,
+        source_texture.key.height - 1 - 75,
+    );
+    let source_band_probes = [10, 35, 55, 75, 95].map(|row| {
+        effect_test_pixel(
+            &source_pixels,
+            source_texture.key.width,
+            90,
+            source_texture.key.height - 1 - row,
+        )
+    });
+    assert!(
+        source_top[0] > source_top[1].saturating_mul(2),
+        "source red-edge probe at x=90,row=75 must be red; dimensions={}x{}, samples={source_band_probes:?}",
+        source_texture.key.width,
+        source_texture.key.height,
+    );
+
+    harness.renderer.bind_active_output_framebuffer();
+    let output_pixels = read_effect_test_pixels(&harness.gl, 320, 200);
+    let blurred_lifecycle_edge = effect_test_pixel(&output_pixels, 320, 150, 200 - 1 - 75);
+    assert!(
+        blurred_lifecycle_edge[0] > 36 && blurred_lifecycle_edge[2] < 218,
+        "the blue backdrop blur must mix the red lifecycle edge below its anchor: source={source_top:?}, output={blurred_lifecycle_edge:?}"
+    );
+}
+
+#[test]
+fn lifecycle_owned_effect_capture_does_not_replay_another_main_frame_marker() {
+    let mut harness = GlesEffectTestHarness::new(320, 200);
+    harness.install_texture_backed_output();
+
+    let mut buffer_ids = BufferIdAllocator::default();
+    let background = lifecycle_test_surface(639, 0, 0, 320, 200, 0xff00_10ee, &mut buffer_ids);
+    let retained = lifecycle_test_surface(640, 60, 40, 180, 110, 0xffee_1010, &mut buffer_ids);
+    let other = lifecycle_test_surface(641, 60, 40, 180, 110, 0xff10_ee10, &mut buffer_ids);
+    let first_window = oblivion_one::compositor::WindowId::from_raw(1).expect("first window");
+    let other_window = oblivion_one::compositor::WindowId::from_raw(2).expect("other window");
+    let background_window = oblivion_one::compositor::WindowId::from_raw(3).expect("background");
+    let socket_name = format!(
+        "typhon-lifecycle-no-recursive-marker-egl-{}",
+        std::process::id()
+    );
+    let mut server =
+        oblivion_one::compositor::OwnCompositorServer::bind_cpu_composition(&socket_name)
+            .expect("test compositor binds");
+    let windows = [
+        (background.surface_id, background_window),
+        (retained.surface_id, first_window),
+        (other.surface_id, other_window),
+    ];
+    server.install_native_frame_test_scene(
+        vec![background.clone(), retained.clone(), other.clone()],
+        &windows,
+        None,
+    );
+    server.install_native_frame_test_scene(vec![background.clone()], &windows, None);
+
+    let mut resolved = crate::native_output::ResolvedNativeFrameScene::from_server_at(
+        &server,
+        AnimationTime::from_nanos(0),
+    );
+    resolved.surfaces = std::borrow::Cow::Owned(vec![background]);
+    resolved.lifecycle_surfaces = vec![retained.clone(), other.clone()];
+    resolved.lifecycle = lifecycle_effect_sample(
+        0.0,
+        LifecycleDirection::Minimize,
+        retained.surface_id,
+        1,
+        lifecycle_blur_effect_scene(
+            retained.surface_id,
+            oblivion_one::effects::builtin_background_blur_program_id(),
+        ),
+    );
+    let first_identity = resolved.lifecycle.samples[0].presentation_identity;
+    let first_payload = resolved.lifecycle.samples[0].payload_id;
+
+    let other_identity = test_lifecycle_identity_sequence(other_window, 2)[1];
+    let other_payload =
+        oblivion_one::compositor::PresentationRetainedVisualPayloadId::from_origin_identity(
+            other_identity,
+        );
+    let mut other_sample = lifecycle_effect_sample(
+        0.0,
+        LifecycleDirection::Minimize,
+        other.surface_id,
+        2,
+        ResolvedEffectScene::default(),
+    )
+    .samples
+    .remove(0);
+    other_sample.window_id = other_window;
+    other_sample.presentation_identity = other_identity;
+    other_sample.payload_id = other_payload;
+    other_sample.visual_source.window_id = other_window;
+    other_sample.visual_source.presentation_identity = other_identity;
+    other_sample.visual_source.payload_id = other_payload;
+    other_sample.visual_source.resource_payload_id = other_payload;
+    other_sample.visual_source.kind = LifecycleVisualSourceKind::ResolvedOwnedEffects;
+    other_sample.effect = LifecycleEffectKind::Squash;
+    resolved.lifecycle.samples.push(other_sample);
+    set_test_lifecycle_marker_insertions(&server, &mut resolved);
+    resolved.lifecycle_snapshot =
+        oblivion_one::window_lifecycle_animation::LifecycleFrameSnapshot::from_sample(
+            &resolved.lifecycle,
+        );
+
+    let input_state = crate::native_output::NativeInputState::new(320, 200);
+    let mut frame_renderer = crate::native_output::NativeFrameRenderer::default();
+    let request = frame_renderer.egl_scene_draw_request(
+        320,
+        200,
+        &resolved,
+        &server,
+        &input_state,
+        crate::native_output::NativeCursorRenderMode::Hardware,
+        Some(OutputDamage::Full),
+    );
+    let target = EglOutputRenderTarget {
+        framebuffer: harness
+            .test_output_framebuffer
+            .expect("output has an FBO-backed render target"),
+        sampleable_texture: harness.test_output_texture,
+        width: 320,
+        height: 200,
+        buffer_age: BufferAge::Unsupported,
+        framebuffer_origin: OutputFramebufferOrigin::BottomLeft,
+    };
+    let outcome = harness
+        .renderer
+        .draw_scene_to_target(&harness.egl, harness.display, target, request)
+        .expect("nested lifecycle source capture draws");
+    let evidence = match outcome {
+        EglFrameOutcome::Rendered {
+            lifecycle_evidence, ..
+        } => lifecycle_evidence,
+        EglFrameOutcome::LifecycleFallback { fallbacks, .. } => {
+            panic!("valid nested lifecycle capture fell back: {fallbacks:?}")
+        }
+        EglFrameOutcome::Skipped { reason, .. } => {
+            panic!("full nested lifecycle frame was skipped: {reason:?}")
+        }
+    };
+    assert!(evidence.contains(first_identity, first_payload, retained.surface_id));
+    assert!(evidence.contains(other_identity, other_payload, other.surface_id));
+
+    let main_commands = &harness.renderer.scene_state.commands;
+    assert!(
+        main_commands
+            .iter()
+            .any(|command| { command.layer == EglDrawLayer::LifecycleOverlay(other_identity) })
+    );
+    let source_commands = harness
+        .renderer
+        .lifecycle
+        .source_commands_for_payload(first_payload)
+        .expect("retained effect source commands are prepared");
+    assert!(
+        source_commands
+            .iter()
+            .any(|command| command.layer == EglDrawLayer::Surface(retained.surface_id))
+    );
+    assert!(
+        !source_commands
+            .iter()
+            .any(|command| matches!(command.layer, EglDrawLayer::LifecycleOverlay(_)))
+    );
+
+    let source_texture = harness
+        .renderer
+        .lifecycle
+        .resolved_visual_texture(first_payload)
+        .expect("retained effect source is resolved")
+        .clone();
+    let source_pixels = read_effect_texture_pixels(
+        &mut harness,
+        &source_texture,
+        source_texture.key.width,
+        source_texture.key.height,
+    );
+    let captured = effect_test_pixel(
+        &source_pixels,
+        source_texture.key.width,
+        90,
+        source_texture.key.height - 1 - 55,
+    );
+    assert!(
+        captured[1] < captured[0].max(captured[2]),
+        "the other active green lifecycle marker must not enter the retained source capture: {captured:?}"
+    );
+}
+
+#[test]
 fn draw_scene_reconciles_canonical_and_empty_lifecycle_decoration_resources_together() {
     let _egl_test_lock = egl_test_lock();
     const EGL_PLATFORM_SURFACELESS_MESA: egl::Enum = 0x31dd;
@@ -285,6 +1626,7 @@ fn draw_scene_reconciles_canonical_and_empty_lifecycle_decoration_resources_toge
     );
 
     resolved.lifecycle = lamp_test_sample(0.5);
+    set_test_lifecycle_marker_insertions(&server, &mut resolved);
     renderer.lifecycle.disable_lamp_for_test();
     let request = frame_renderer.egl_scene_draw_request(
         320,
@@ -432,9 +1774,21 @@ fn egl_lifecycle_background_blur_renders_reverses_and_keeps_real_capture_failure
     let mut server =
         oblivion_one::compositor::OwnCompositorServer::bind_cpu_composition(&socket_name)
             .expect("test compositor binds");
+    let windows = [
+        (
+            background.surface_id,
+            oblivion_one::compositor::WindowId::from_raw(2).expect("background window"),
+        ),
+        (retained_window.surface_id, window_id),
+    ];
+    server.install_native_frame_test_scene_with_server_decorations(
+        vec![background.clone(), retained_window.clone()],
+        &windows,
+        None,
+    );
     server.install_native_frame_test_scene_with_server_decorations(
         vec![background.clone()],
-        &[(background.surface_id, window_id)],
+        &windows,
         None,
     );
     let mut resolved = crate::native_output::ResolvedNativeFrameScene::from_server_at(
@@ -451,6 +1805,11 @@ fn egl_lifecycle_background_blur_renders_reverses_and_keeps_real_capture_failure
     );
     resolved.lifecycle =
         lifecycle_effect_sample(0.45, LifecycleDirection::Minimize, 604, 1, blur_scene);
+    set_test_lifecycle_marker_insertions(&server, &mut resolved);
+    resolved.lifecycle_snapshot =
+        oblivion_one::window_lifecycle_animation::LifecycleFrameSnapshot::from_sample(
+            &resolved.lifecycle,
+        );
     let identity = resolved.lifecycle.samples[0].presentation_identity;
     let payload_id = resolved.lifecycle.samples[0].payload_id;
     let source_scene = Arc::clone(&resolved.lifecycle.samples[0].visual_source.effect_scene);
@@ -647,7 +2006,13 @@ fn egl_lifecycle_background_blur_renders_reverses_and_keeps_real_capture_failure
         .visual_source
         .presentation_identity = failed_identity;
     failed_lifecycle.samples[0].visual_source.payload_id = failed_payload;
+    failed_lifecycle.samples[0].visual_source.resource_payload_id = failed_payload;
     resolved.lifecycle = failed_lifecycle;
+    set_test_lifecycle_marker_insertions(&server, &mut resolved);
+    resolved.lifecycle_snapshot =
+        oblivion_one::window_lifecycle_animation::LifecycleFrameSnapshot::from_sample(
+            &resolved.lifecycle,
+        );
     let failed_identity = resolved.lifecycle.samples[0].presentation_identity;
     let failed_payload = resolved.lifecycle.samples[0].payload_id;
     effects::clear_effect_trace_test_events();
@@ -718,7 +2083,13 @@ fn egl_lifecycle_lamp_freezes_ordinary_surface_content_for_the_retained_payload(
             .expect("test compositor binds");
     server.install_native_frame_test_scene_with_server_decorations(
         vec![background.clone()],
-        &[(background.surface_id, window_id)],
+        &[
+            (
+                background.surface_id,
+                oblivion_one::compositor::WindowId::from_raw(2).expect("background window"),
+            ),
+            (retained.surface_id, window_id),
+        ],
         None,
     );
 
@@ -736,6 +2107,7 @@ fn egl_lifecycle_lamp_freezes_ordinary_surface_content_for_the_retained_payload(
         ResolvedEffectScene::default(),
     );
     resolved.lifecycle.samples[0].visual_source.kind = LifecycleVisualSourceKind::NoOwnedEffects;
+    set_test_lifecycle_marker_insertions(&server, &mut resolved);
     let sample = &resolved.lifecycle.samples[0];
     let identity = sample.presentation_identity;
     let payload_id = sample.payload_id;
@@ -950,7 +2322,13 @@ fn egl_lifecycle_squash_captures_ordinary_surface_content_for_its_payload() {
             .expect("test compositor binds");
     server.install_native_frame_test_scene_with_server_decorations(
         vec![background.clone()],
-        &[(background.surface_id, window_id)],
+        &[
+            (
+                background.surface_id,
+                oblivion_one::compositor::WindowId::from_raw(2).expect("background window"),
+            ),
+            (retained.surface_id, window_id),
+        ],
         None,
     );
     let mut resolved = crate::native_output::ResolvedNativeFrameScene::from_server_at(
@@ -968,6 +2346,7 @@ fn egl_lifecycle_squash_captures_ordinary_surface_content_for_its_payload() {
     );
     resolved.lifecycle.samples[0].effect = LifecycleEffectKind::Squash;
     resolved.lifecycle.samples[0].visual_source.kind = LifecycleVisualSourceKind::NoOwnedEffects;
+    set_test_lifecycle_marker_insertions(&server, &mut resolved);
     let identity = resolved.lifecycle.samples[0].presentation_identity;
     let payload_id = resolved.lifecycle.samples[0].payload_id;
     let input_state = crate::native_output::NativeInputState::new(320, 200);
@@ -1089,7 +2468,13 @@ fn egl_lifecycle_missing_root_source_fails_with_renderer_fallback() {
             .expect("test compositor binds");
     server.install_native_frame_test_scene_with_server_decorations(
         vec![background.clone()],
-        &[(background.surface_id, window_id)],
+        &[
+            (
+                background.surface_id,
+                oblivion_one::compositor::WindowId::from_raw(2).expect("background window"),
+            ),
+            (622, window_id),
+        ],
         None,
     );
     let mut resolved = crate::native_output::ResolvedNativeFrameScene::from_server_at(
@@ -1106,6 +2491,7 @@ fn egl_lifecycle_missing_root_source_fails_with_renderer_fallback() {
         ResolvedEffectScene::default(),
     );
     resolved.lifecycle.samples[0].visual_source.kind = LifecycleVisualSourceKind::NoOwnedEffects;
+    set_test_lifecycle_marker_insertions(&server, &mut resolved);
     let identity = resolved.lifecycle.samples[0].presentation_identity;
     let payload_id = resolved.lifecycle.samples[0].payload_id;
     let input_state = crate::native_output::NativeInputState::new(320, 200);
@@ -1216,6 +2602,7 @@ fn assert_lifecycle_resolved_visual_isolation_for_origin(
         200,
     )
     .expect("expanded lifecycle visual group");
+    set_test_lifecycle_marker_insertions(&server, &mut resolved);
     assert_eq!(
         resolved.lifecycle.samples[0]
             .visual_group
@@ -1449,6 +2836,7 @@ fn egl_lifecycle_resolved_visual_preserves_premultiplied_alpha() {
         200,
     )
     .expect("expanded alpha visual group");
+    set_test_lifecycle_marker_insertions(&server, &mut resolved);
     let payload_id = resolved.lifecycle.samples[0].payload_id;
     let input_state = crate::native_output::NativeInputState::new(320, 200);
     let mut frame_renderer = crate::native_output::NativeFrameRenderer::default();
@@ -1536,9 +2924,21 @@ fn egl_lifecycle_background_blur_renders_retained_content_on_top_left_scanout() 
     let mut server =
         oblivion_one::compositor::OwnCompositorServer::bind_cpu_composition(&socket_name)
             .expect("test compositor binds");
+    let windows = [
+        (
+            background.surface_id,
+            oblivion_one::compositor::WindowId::from_raw(2).expect("background window"),
+        ),
+        (614, window_id),
+    ];
+    server.install_native_frame_test_scene_with_server_decorations(
+        vec![background.clone(), retained_window.clone()],
+        &windows,
+        None,
+    );
     server.install_native_frame_test_scene_with_server_decorations(
         vec![background.clone()],
-        &[(background.surface_id, window_id)],
+        &windows,
         None,
     );
     let mut resolved = crate::native_output::ResolvedNativeFrameScene::from_server_at(
@@ -1563,6 +2963,11 @@ fn egl_lifecycle_background_blur_renders_retained_content_on_top_left_scanout() 
             oblivion_one::effects::builtin_background_blur_program_id(),
         ),
     );
+    set_test_lifecycle_marker_insertions(&server, &mut resolved);
+    resolved.lifecycle_snapshot =
+        oblivion_one::window_lifecycle_animation::LifecycleFrameSnapshot::from_sample(
+            &resolved.lifecycle,
+        );
     let identity = resolved.lifecycle.samples[0].presentation_identity;
     let payload_id = resolved.lifecycle.samples[0].payload_id;
     let input_state = crate::native_output::NativeInputState::new(320, 200);
@@ -1634,28 +3039,26 @@ fn egl_lifecycle_background_blur_renders_retained_content_on_top_left_scanout() 
         .filter(|(_, event)| event.starts_with("event=effect_graph_release_end "))
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
+    assert!(graph_begins.len() >= 2, "source and frame effect graphs: {trace:?}");
+    assert_eq!(graph_ends.len(), graph_begins.len(), "graph executions: {trace:?}");
     assert_eq!(
+        graph_release_begins.len(),
         graph_begins.len(),
-        2,
-        "outer and lifecycle graphs: {trace:?}"
+        "graph releases: {trace:?}"
     );
-    assert_eq!(graph_ends.len(), 2, "outer and lifecycle graphs: {trace:?}");
-    assert!(
-        graph_begins[0] < graph_begins[1]
-            && graph_begins[1] < graph_ends[0]
-            && graph_ends[0] < graph_ends[1],
-        "lifecycle graph execution must nest inside the outer graph phase: {trace:?}"
+    assert_eq!(
+        graph_release_ends.len(),
+        graph_begins.len(),
+        "graph releases: {trace:?}"
     );
-    assert_eq!(graph_release_begins.len(), 2, "graph releases: {trace:?}");
-    assert_eq!(graph_release_ends.len(), 2, "graph releases: {trace:?}");
-    assert!(
-        graph_ends[0] < graph_release_begins[0]
-            && graph_release_begins[0] < graph_release_ends[0]
-            && graph_release_ends[0] < graph_ends[1]
-            && graph_ends[1] < graph_release_begins[1]
-            && graph_release_begins[1] < graph_release_ends[1],
-        "the nested graph must release its leases before the outer graph ends, and the outer graph releases afterward: {trace:?}"
-    );
+    for graph_index in 0..graph_begins.len() {
+        assert!(
+            graph_begins[graph_index] < graph_ends[graph_index]
+                && graph_ends[graph_index] < graph_release_begins[graph_index]
+                && graph_release_begins[graph_index] < graph_release_ends[graph_index],
+            "each effect graph must finish and release its leases: {trace:?}"
+        );
+    }
     let (checkpoint_entries, _) = harness
         .renderer
         .effect_runtime

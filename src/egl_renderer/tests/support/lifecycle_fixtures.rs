@@ -124,6 +124,56 @@ pub(in crate::egl_renderer::tests) fn lifecycle_effect_sample(
     }
 }
 
+pub(in crate::egl_renderer::tests) fn set_test_lifecycle_marker_insertions(
+    server: &oblivion_one::compositor::OwnCompositorServer,
+    scene: &mut crate::native_output::ResolvedNativeFrameScene<'_>,
+) {
+    let groups = oblivion_one::compositor::WindowVisualGroup::stack_order_with_popups(
+        scene.surfaces.as_ref(),
+        &scene.decorations,
+        scene.popup_surface_ids.as_ref(),
+    );
+    let group_orders = groups
+        .iter()
+        .enumerate()
+        .map(|(group_index, group)| {
+            let (scene_band, layer_rank, stack_position, _) =
+                server.native_scene_root_stack_key(group.root_surface_id(), group_index);
+            oblivion_one::compositor::window_exit_stack_order_key(
+                scene_band,
+                layer_rank,
+                stack_position,
+                false,
+                group_index,
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut insertions = Vec::with_capacity(scene.lifecycle.samples.len());
+    for (stable_order, sample) in scene.lifecycle.samples.iter_mut().enumerate() {
+        let (scene_band, layer_rank, stack_position, stack_stable_order) =
+            server.native_scene_root_stack_key(sample.root_surface_id, stable_order);
+        sample.painter_order = oblivion_one::window_lifecycle_animation::LifecyclePainterOrder {
+            scene_band,
+            layer_rank,
+            stack_position,
+            stable_order: stack_stable_order as u64,
+        };
+        let marker_order = oblivion_one::compositor::window_exit_stack_order_key(
+            scene_band,
+            layer_rank,
+            stack_position,
+            true,
+            usize::try_from(stack_stable_order).unwrap_or(usize::MAX),
+        );
+        let insertion_group = group_orders
+            .iter()
+            .position(|group_order| *group_order > marker_order)
+            .unwrap_or(group_orders.len());
+        insertions.push((sample.presentation_identity, insertion_group));
+    }
+    scene.lifecycle_marker_insertions = insertions;
+}
+
 pub(in crate::egl_renderer::tests) fn lifecycle_test_surface(
     surface_id: u32,
     x: i32,

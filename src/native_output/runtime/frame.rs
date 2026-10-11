@@ -96,6 +96,10 @@ pub(crate) struct ResolvedNativeFrameScene<'a> {
     pub(crate) presentation: PresentationSceneSample,
     pub(crate) presentation_snapshot: PresentationFrameSnapshot,
     pub(crate) lifecycle: LifecycleSceneSample,
+    pub(crate) lifecycle_marker_insertions: Vec<(
+        oblivion_one::presentation_animation::PresentationRetainedVisualIdentity,
+        usize,
+    )>,
     pub(crate) lifecycle_surfaces: Vec<RenderableSurface>,
     pub(crate) lifecycle_decorations: Vec<DecorationRenderInstance>,
     pub(crate) lifecycle_snapshot: LifecycleFrameSnapshot,
@@ -409,6 +413,7 @@ impl<'a> ResolvedNativeFrameScene<'a> {
         scene.presentation = presentation;
         scene.presentation_snapshot = PresentationFrameSnapshot::from_sample(&scene.presentation);
         scene.lifecycle = lifecycle;
+        scene.lifecycle_marker_insertions.clear();
         scene.lifecycle_surfaces = Vec::new();
         scene.lifecycle_decorations = Vec::new();
         scene.lifecycle_snapshot = LifecycleFrameSnapshot::from_sample(&scene.lifecycle);
@@ -525,6 +530,17 @@ impl<'a> ResolvedNativeFrameScene<'a> {
         let lifecycle_snapshot = LifecycleFrameSnapshot::from_sample(&lifecycle);
         let popup_surface_ids = Cow::Borrowed(server.popup_surface_ids());
         let external_overlay_surface_ids = server.external_overlay_surface_ids(&lifecycle);
+        let lifecycle_marker_insertions = lifecycle_marker_insertions(
+            server,
+            surfaces.as_ref(),
+            all_canonical_ordered_owners.as_ref(),
+            &decorations,
+            popup_surface_ids.as_ref(),
+            &external_overlay_surface_ids,
+            &lifecycle,
+            canonical_owner_roots.as_ref(),
+            &exits,
+        );
         let render_generation = server.scene_render_generation();
         let effect_registry_generation = server.trusted_effect_registry().current();
         let effect_scene_started = crate::pointer_debug::cursor_responsiveness_trace_enabled()
@@ -695,6 +711,7 @@ impl<'a> ResolvedNativeFrameScene<'a> {
             presentation,
             presentation_snapshot,
             lifecycle,
+            lifecycle_marker_insertions,
             lifecycle_surfaces,
             lifecycle_decorations,
             lifecycle_snapshot,
@@ -722,6 +739,7 @@ impl<'a> ResolvedNativeFrameScene<'a> {
             presentation: self.presentation,
             presentation_snapshot: self.presentation_snapshot,
             lifecycle: self.lifecycle,
+            lifecycle_marker_insertions: self.lifecycle_marker_insertions,
             lifecycle_surfaces: self.lifecycle_surfaces,
             lifecycle_decorations: self.lifecycle_decorations,
             lifecycle_snapshot: self.lifecycle_snapshot,
@@ -2246,6 +2264,122 @@ fn assert_frozen_native_render_frame_is_send() {
     assert_send::<FrozenNativeRenderFrame>();
 }
 
+fn lifecycle_marker_insertions(
+    server: &OwnCompositorServer,
+    surfaces: &[RenderableSurface],
+    owner_roots: &[u32],
+    decorations: &[DecorationRenderInstance],
+    popup_surface_ids: &[u32],
+    external_overlay_surface_ids: &[u32],
+    lifecycle: &LifecycleSceneSample,
+    canonical_owner_roots: &[u32],
+    exits: &[oblivion_one::compositor::WindowExitRenderGroup],
+) -> Vec<(
+    oblivion_one::presentation_animation::PresentationRetainedVisualIdentity,
+    usize,
+)> {
+    assert_eq!(surfaces.len(), owner_roots.len());
+    let (base_surfaces, base_owner_roots): (Vec<_>, Vec<_>) = surfaces
+        .iter()
+        .zip(owner_roots.iter().copied())
+        .filter(|(surface, _)| !external_overlay_surface_ids.contains(&surface.surface_id))
+        .map(|(surface, owner_root)| (surface.clone(), owner_root))
+        .unzip();
+    let groups = oblivion_one::compositor::WindowVisualGroup::stack_order_with_popups(
+        &base_surfaces,
+        decorations,
+        popup_surface_ids,
+    );
+
+    let mut root_orders = std::collections::HashMap::new();
+    let mut canonical_roots = Vec::new();
+    for root_surface_id in canonical_owner_roots.iter().copied() {
+        if canonical_roots.contains(&root_surface_id) {
+            continue;
+        }
+        canonical_roots.push(root_surface_id);
+        let stable_order = canonical_roots.len().saturating_sub(1);
+        let (scene_band, layer_rank, stack_position, _) =
+            server.native_scene_root_stack_key(root_surface_id, stable_order);
+        root_orders.insert(
+            root_surface_id,
+            oblivion_one::compositor::window_exit_stack_order_key(
+                scene_band,
+                layer_rank,
+                stack_position,
+                false,
+                stable_order,
+            ),
+        );
+    }
+    for (stable_order, exit) in exits.iter().enumerate() {
+        let painter = exit.content.painter_order;
+        root_orders.insert(
+            exit.content.root_surface_id,
+            oblivion_one::compositor::window_exit_stack_order_key(
+                painter.scene_band,
+                painter.layer_rank,
+                painter.stack_position,
+                true,
+                stable_order,
+            ),
+        );
+    }
+
+    let group_orders = groups
+        .iter()
+        .enumerate()
+        .map(|(group_index, group)| {
+            let owner_root = base_owner_roots
+                .get(
+                    base_surfaces
+                        .iter()
+                        .position(|surface| surface.surface_id == group.root_surface_id())
+                        .unwrap_or(usize::MAX),
+                )
+                .copied()
+                .unwrap_or_else(|| group.root_surface_id());
+            root_orders.get(&owner_root).copied().unwrap_or_else(|| {
+                let (scene_band, layer_rank, stack_position, _) =
+                    server.native_scene_root_stack_key(owner_root, group_index);
+                oblivion_one::compositor::window_exit_stack_order_key(
+                    scene_band,
+                    layer_rank,
+                    stack_position,
+                    false,
+                    group_index,
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let mut placements = lifecycle
+        .samples
+        .iter()
+        .map(|sample| {
+            let order = sample.painter_order;
+            let stable_order = usize::try_from(order.stable_order).unwrap_or(usize::MAX);
+            let marker_order = oblivion_one::compositor::window_exit_stack_order_key(
+                order.scene_band,
+                order.layer_rank,
+                order.stack_position,
+                true,
+                stable_order,
+            );
+            let insertion_group = group_orders
+                .iter()
+                .position(|group_order| *group_order > marker_order)
+                .unwrap_or(group_orders.len());
+            (sample.presentation_identity, insertion_group, marker_order)
+        })
+        .collect::<Vec<_>>();
+    placements.sort_by_key(|(_, insertion_group, marker_order)| (*insertion_group, *marker_order));
+    placements
+        .into_iter()
+        .map(|(identity, insertion_group, _)| (identity, insertion_group))
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn project_egl_scene_draw_request<'a>(
     width: u32,
@@ -2281,6 +2415,7 @@ fn project_egl_scene_draw_request<'a>(
         current_damage,
         surface_resource_sync_states,
         lifecycle: &scene.lifecycle,
+        lifecycle_marker_insertions: &scene.lifecycle_marker_insertions,
         lifecycle_surfaces: &scene.lifecycle_surfaces,
         lifecycle_decorations: &scene.lifecycle_decorations,
     }
