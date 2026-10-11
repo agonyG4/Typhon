@@ -1671,6 +1671,28 @@ impl AtomicEglGbmScanout {
         } else {
             Err(target_request.expect_err("missing render target retains its error"))
         };
+        self.settle_render_completion(
+            context,
+            frozen_render_frame,
+            render_outcome,
+            gpu_sampling_started,
+            None,
+            server,
+            output_transactions,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn settle_render_completion(
+        &mut self,
+        context: AtomicRenderSettlementContext,
+        frozen_render_frame: FrozenNativeRenderFrame,
+        render_outcome: io::Result<AtomicSlotRenderOutcome>,
+        gpu_sampling_started: bool,
+        release_fence_from_worker: Option<NativeRenderFence>,
+        server: &mut OwnCompositorServer,
+        output_transactions: &mut OutputTransactionLedger,
+    ) -> io::Result<AtomicFrameRenderOutcome> {
         let AtomicRenderSettlementContext {
             slot,
             framebuffer_id,
@@ -1747,7 +1769,7 @@ impl AtomicEglGbmScanout {
                     && server.frame_batch_dmabuf_release_count(protocol_batch_id) > 0
                     && dmabuf_gpu_release_safety.permits_compositor_gpu_release()
                 {
-                    self.create_render_fence().ok()
+                    release_fence_from_worker.or_else(|| self.create_render_fence().ok())
                 } else {
                     None
                 };
