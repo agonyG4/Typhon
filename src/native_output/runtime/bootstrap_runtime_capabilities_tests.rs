@@ -3,8 +3,8 @@ const BOOTSTRAP_SOURCE: &str = include_str!("bootstrap.rs");
 #[test]
 fn initial_paint_fallback_republishes_capabilities_from_replacement_scanout() {
     let initial_install = BOOTSTRAP_SOURCE
-        .split_once("let initial_material_generation")
-        .expect("initial scanout setup must publish its material generation")
+        .split_once("let atomic_discovery = match &startup_plan")
+        .expect("initial scanout setup must identify its selected KMS pipeline")
         .0;
     assert!(
         initial_install.contains("publish_scanout_runtime_capabilities(&mut server, &scanout);")
@@ -17,7 +17,7 @@ fn initial_paint_fallback_republishes_capabilities_from_replacement_scanout() {
         .split_once("fn keyboard_persistence_snapshot(")
         .expect("scanout capability publisher must end before the next helper")
         .0;
-    assert!(publisher.contains("set_lifecycle_animation_renderer_available"));
+    assert!(publisher.contains("set_lifecycle_animation_renderer_capabilities"));
     assert!(publisher.contains("set_material_runtime_capabilities"));
     assert!(publisher.contains("set_material_program_rendering_available"));
     assert!(publisher.contains("material_program_rendering_available()"));

@@ -3250,7 +3250,7 @@ mod tests {
     #[test]
     fn direct_scanout_scene_diagnostic_is_derived_only_in_doctor_dispatch() {
         let source = include_str!("cycle_dispatch.rs");
-        let scene_analysis_call = ["self.server", "direct_scanout_scene_analysis()"].concat();
+        let scene_analysis_call = ["self.server.", "direct_scanout_scene_analysis()"].concat();
 
         assert_eq!(source.matches(&scene_analysis_call).count(), 1);
         assert!(

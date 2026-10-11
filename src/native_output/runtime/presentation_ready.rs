@@ -18,6 +18,7 @@ use oblivion_one::native::presentation_deadline::{
     MonotonicTimestampNs, PresentationDeadlinePlanner, ReadyPresentationServiceEstimate,
 };
 
+#[derive(Debug, Eq, PartialEq)]
 pub(super) enum ReadyPullInResult {
     PulledIn,
     RejectedTooLate,
@@ -826,16 +827,16 @@ mod tests {
             &presentation_deadline,
             &presentation_timing,
             &mut frame_pacing,
-            MonotonicTimestampNs::new(1_005_500_000),
+            MonotonicTimestampNs::new(1_003_000_000),
             1,
             300_000,
         )
         .unwrap();
-        assert!(matches!(pull_in, ReadyPullInResult::PulledIn));
+        assert_eq!(pull_in, ReadyPullInResult::PulledIn);
 
         let expected_target = presentation_deadline
             .ready_target_pull_in(
-                MonotonicTimestampNs::new(1_005_500_000),
+                MonotonicTimestampNs::new(1_003_000_000),
                 ReadyPresentationServiceEstimate::new(
                     300_000,
                     presentation_timing.apply_guard_ns(),
@@ -864,7 +865,7 @@ mod tests {
             ready_window.target_presentation_ns(),
             expected_target.presentation_time.get()
         );
-        assert_eq!(ready_window.earliest_submit_ns(), 1_005_500_000);
+        assert_eq!(ready_window.earliest_submit_ns(), 1_003_000_000);
 
         // This is the lane-free handoff: the active pacing identity is
         // reserved only after the READY target has been replaced.

@@ -2242,9 +2242,10 @@ mod tests {
     #[test]
     fn render_worker_source_uses_render_role_and_has_no_unsafe_send_override() {
         let source = include_str!("render_worker.rs");
+        let production_source = source.split("#[cfg(test)]").next().unwrap_or(source);
         assert!(source.contains("\"typhon-render\""));
         assert!(source.contains("SchedulingThreadRole::Render"));
-        assert!(!source.contains("unsafe impl Send"));
+        assert!(!production_source.contains("unsafe impl Send"));
         assert!(source.contains("sync_channel(1)"));
     }
 
