@@ -1661,6 +1661,7 @@ impl CompositorState {
         {
             return false;
         }
+        self.trace_x11_mapping_state(window_id, "minimize_requested");
         let minimize_effect =
             self.lifecycle_effect_kind_for_window(window_id, LifecycleDirection::Minimize);
         let lifecycle_visible_geometry = if !has_active_lifecycle && minimize_effect.is_some() {
@@ -1713,7 +1714,10 @@ impl CompositorState {
         self.renderable_surfaces = visible_surfaces;
         self.rebuild_renderable_surface_index();
 
-        if minimized_surfaces.is_empty() {
+        let x11_window = self
+            .window(window_id)
+            .is_some_and(|window| matches!(window.backend, WindowBackend::X11(_)));
+        if minimized_surfaces.is_empty() && !x11_window {
             self.reconcile_idle_inhibition();
             return false;
         }
@@ -1795,6 +1799,7 @@ impl CompositorState {
             lifecycle_decorations,
             precapture_preparation,
         );
+        self.queue_x11_mapping_transition(window_id, false);
         self.refresh_active_scene_surface_order();
         self.deactivate_pointer_constraints_for_departing_window_ids(
             &[window_id],
@@ -2114,6 +2119,7 @@ impl CompositorState {
         source: PendingXwaylandRestoreSource,
         repeated_waits_suppressed: u64,
     ) {
+        self.trace_x11_mapping_state(source.window_id, "restore_source_ready");
         if !lifecycle_diagnostics_enabled() {
             return;
         }
@@ -2174,6 +2180,65 @@ impl CompositorState {
         );
     }
 
+    fn trace_x11_mapping_state(&self, window_id: WindowId, event: &'static str) {
+        if !lifecycle_diagnostics_enabled() {
+            return;
+        }
+        let Some(window) = self.window(window_id) else {
+            return;
+        };
+        let WindowBackend::X11(handle) = window.backend else {
+            return;
+        };
+        let geometry = window.x11_geometry.map(|state| state.client);
+        let [left, right, top, bottom] = self.x11_decoration_frame_extents(handle);
+        eprintln!(
+            "typhon.x11_mapping event={event} window_id={} xid={} generation={} surface_id={} logical_minimized={} pending_restore={} frame_extents_left={} frame_extents_right={} frame_extents_top={} frame_extents_bottom={} managed_x={} managed_y={} managed_width={} managed_height={}",
+            window_id.get(),
+            handle.xid(),
+            handle.generation().get(),
+            window
+                .x11_surface_id
+                .map_or_else(|| "none".to_owned(), |surface_id| surface_id.to_string()),
+            window.state.is_minimized(),
+            self.pending_xwayland_restores.contains_key(&window_id),
+            left,
+            right,
+            top,
+            bottom,
+            geometry.map_or_else(|| "none".to_owned(), |value| value.x.to_string()),
+            geometry.map_or_else(|| "none".to_owned(), |value| value.y.to_string()),
+            geometry.map_or_else(|| "none".to_owned(), |value| value.width.to_string()),
+            geometry.map_or_else(|| "none".to_owned(), |value| value.height.to_string()),
+        );
+    }
+
+    fn queue_x11_mapping_transition(&mut self, window_id: WindowId, mapped: bool) {
+        if !self
+            .window(window_id)
+            .is_some_and(|window| matches!(window.backend, WindowBackend::X11(_)))
+        {
+            return;
+        }
+        self.backend_commands.push(
+            crate::compositor::window_backend::WindowBackendCommand::SetMapped {
+                window: window_id,
+                mapped,
+            },
+        );
+        if mapped {
+            self.trace_x11_mapping_state(window_id, "frame_extents_at_map");
+        }
+        self.trace_x11_mapping_state(
+            window_id,
+            if mapped {
+                "wm_map_queued"
+            } else {
+                "wm_unmap_queued"
+            },
+        );
+    }
+
     fn defer_xwayland_restore_until_source(
         &mut self,
         window_id: WindowId,
@@ -2194,9 +2259,6 @@ impl CompositorState {
                 last_source_wait_fingerprint: None,
                 suppressed_source_wait_count: 0,
             },
-        );
-        self.backend_commands.push(
-            crate::compositor::window_backend::WindowBackendCommand::Map { window: window_id },
         );
         if lifecycle_diagnostics_enabled() {
             eprintln!(
@@ -2265,6 +2327,15 @@ impl CompositorState {
         else {
             return false;
         };
+        let is_minimized = self
+            .window(window_id)
+            .is_some_and(|window| window.state.is_minimized());
+        if is_minimized {
+            self.trace_x11_mapping_state(window_id, "restore_requested");
+        }
+        if is_minimized && !self.pending_xwayland_restores.contains_key(&window_id) {
+            self.queue_x11_mapping_transition(window_id, true);
+        }
         let xwayland_restore_source = if let Some(source) = resolved_xwayland_source {
             let source_matches_current_state = self.window(window_id).is_some_and(|window| {
                 window.id == source.window_id
@@ -2398,12 +2469,6 @@ impl CompositorState {
                 ));
                 self.refresh_active_scene_surface_tree(source.surface_id);
             }
-        } else if let Some(window) = self.window(window_id)
-            && matches!(window.backend, WindowBackend::X11(_))
-        {
-            self.backend_commands.push(
-                crate::compositor::window_backend::WindowBackendCommand::Map { window: window_id },
-            );
         }
         self.queue_backend_state(window_id);
         self.mark_astrea_toplevel_dirty(window_id);

@@ -1364,8 +1364,10 @@ fn activating_associationless_iconic_x11_window_requests_remap_and_cancels_on_re
             .into_iter()
             .any(|command| matches!(
                 command,
-                crate::compositor::window_backend::WindowBackendCommand::Map { window }
-                    if window == window_id
+                crate::compositor::window_backend::WindowBackendCommand::SetMapped {
+                    window,
+                    mapped: true,
+                } if window == window_id
             ))
     );
     assert!(fixture.server.state.pending_x11_activation.is_some());
@@ -1862,8 +1864,10 @@ fn xwayland_minimize_restore_waits_for_replacement_content_and_keeps_window_iden
             .iter()
             .filter(|command| matches!(
                 command,
-                crate::compositor::window_backend::WindowBackendCommand::Map { window }
-                    if *window == window_id
+                crate::compositor::window_backend::WindowBackendCommand::SetMapped {
+                    window,
+                    mapped: true,
+                } if *window == window_id
             ))
             .count(),
         1,
@@ -2859,6 +2863,374 @@ fn client_positioned_initial_x11_geometry_skips_managed_work_area_clamping() {
     let geometry = window.x11_geometry.expect("popup geometry").client;
     assert_eq!((geometry.x, geometry.y), (-120, -80));
     assert_eq!((geometry.width, geometry.height), (2_000, 1_200));
+}
+
+#[test]
+fn compositor_minimize_unmaps_once_and_restore_maps_with_live_association() {
+    let mut fixture = first_buffer_fixture();
+    let mut snapshot = fake_snapshot();
+    snapshot.surface_id = fixture.surface_id;
+    let handle = snapshot.handle;
+    fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::WindowReady(snapshot));
+    let window_id = fixture
+        .server
+        .state
+        .window_id_for_x11_handle(handle)
+        .expect("normal X11 window admitted");
+    assert!(
+        !fixture
+            .server
+            .state
+            .restore_minimized_desktop_window(window_id)
+    );
+    assert!(
+        fixture
+            .server
+            .take_xwayland_backend_commands(0)
+            .iter()
+            .all(|command| !matches!(command, XwmCommand::Map(window) if *window == handle)),
+        "a restore request for an already Normal window must not queue Map"
+    );
+    fixture
+        .server
+        .set_lifecycle_animation_renderer_available(false);
+
+    assert!(fixture.server.state.minimize_desktop_window(window_id));
+    let minimized = fixture.server.take_xwayland_backend_commands(0);
+    assert_eq!(
+        minimized
+            .iter()
+            .filter(|command| matches!(command, XwmCommand::Unmap(window) if *window == handle))
+            .count(),
+        1,
+        "compositor minimize must queue one physical X11 unmap without animation"
+    );
+    assert!(minimized.iter().any(|command| matches!(
+        command,
+        XwmCommand::SetState { window, state, .. }
+            if *window == handle && state.hidden
+    )));
+    assert!(!fixture.server.state.minimize_desktop_window(window_id));
+    assert_eq!(
+        fixture.server.state.window_id_for_x11_handle(handle),
+        Some(window_id),
+        "WM-owned unmap must preserve managed window identity"
+    );
+    assert!(
+        fixture
+            .server
+            .state
+            .desktop_windows
+            .contains_key(&window_id)
+    );
+    assert!(fixture.server.state.window_stacking.contains(&window_id));
+
+    assert!(
+        fixture
+            .server
+            .state
+            .restore_minimized_desktop_window(window_id)
+    );
+    let restored = fixture.server.take_xwayland_backend_commands(1);
+    assert_eq!(
+        restored
+            .iter()
+            .filter(|command| matches!(command, XwmCommand::Map(window) if *window == handle))
+            .count(),
+        1,
+        "restore must map even while the old Wayland association still exists"
+    );
+    assert_eq!(
+        fixture.server.state.window_id_for_x11_handle(handle),
+        Some(window_id)
+    );
+    assert!(
+        fixture
+            .server
+            .state
+            .restore_minimized_desktop_window(window_id)
+    );
+    assert!(
+        fixture
+            .server
+            .state
+            .pending_xwayland_restores
+            .contains_key(&window_id),
+        "a repeated request remains attached to the pending source handoff"
+    );
+    assert!(
+        fixture
+            .server
+            .take_xwayland_backend_commands(2)
+            .iter()
+            .all(|command| !matches!(command, XwmCommand::Map(window) if *window == handle))
+    );
+}
+
+#[test]
+fn compositor_minimize_unmaps_managed_x11_without_renderable_surfaces() {
+    let mut fixture = first_buffer_fixture();
+    let mut snapshot = fake_snapshot();
+    snapshot.surface_id = fixture.surface_id;
+    let handle = snapshot.handle;
+    fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::WindowReady(snapshot));
+    let window_id = fixture
+        .server
+        .state
+        .window_id_for_x11_handle(handle)
+        .expect("normal X11 window admitted");
+    fixture
+        .server
+        .set_lifecycle_animation_renderer_available(false);
+    fixture.server.state.renderable_surfaces.clear();
+    fixture.server.state.rebuild_renderable_surface_index();
+
+    assert!(fixture.server.state.minimize_desktop_window(window_id));
+    let commands = fixture.server.take_xwayland_backend_commands(0);
+    assert_eq!(
+        commands
+            .iter()
+            .filter(|command| matches!(command, XwmCommand::Unmap(window) if *window == handle))
+            .count(),
+        1,
+        "a managed X11 window must unmap even when no surface can be rendered"
+    );
+    assert!(commands.iter().any(|command| matches!(
+        command,
+        XwmCommand::SetState { window, state, .. }
+            if *window == handle && state.hidden
+    )));
+    assert!(
+        fixture
+            .server
+            .state
+            .window(window_id)
+            .is_some_and(|window| window.state.is_minimized())
+    );
+    assert_eq!(
+        fixture.server.state.window_id_for_x11_handle(handle),
+        Some(window_id)
+    );
+}
+
+#[test]
+fn rapid_minimize_restore_queues_map_after_unmap_without_losing_identity() {
+    let mut fixture = first_buffer_fixture();
+    let mut snapshot = fake_snapshot();
+    snapshot.surface_id = fixture.surface_id;
+    let handle = snapshot.handle;
+    fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::WindowReady(snapshot));
+    let window_id = fixture
+        .server
+        .state
+        .window_id_for_x11_handle(handle)
+        .expect("normal X11 window admitted");
+
+    assert!(fixture.server.state.minimize_desktop_window(window_id));
+    assert!(
+        fixture
+            .server
+            .state
+            .restore_minimized_desktop_window(window_id)
+    );
+    let commands = fixture.server.take_xwayland_backend_commands(2);
+    let mapping = commands
+        .iter()
+        .filter_map(|command| match command {
+            XwmCommand::Unmap(window) if *window == handle => Some("unmap"),
+            XwmCommand::Map(window) if *window == handle => Some("map"),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(mapping, ["unmap", "map"]);
+    assert_eq!(
+        fixture.server.state.window_id_for_x11_handle(handle),
+        Some(window_id),
+        "rapid reversal must preserve the persistent X11 window identity"
+    );
+    assert!(
+        fixture
+            .server
+            .state
+            .pending_xwayland_restores
+            .contains_key(&window_id),
+        "the Map request keeps restore active while replacement content is pending"
+    );
+    assert!(
+        fixture
+            .server
+            .state
+            .window(window_id)
+            .expect("reversed X11 window")
+            .state
+            .is_minimized(),
+        "the visible restore handoff remains pending until valid XWayland content arrives"
+    );
+}
+
+#[test]
+fn managed_configure_after_remap_uses_preserved_frame_extents_and_geometry_policy() {
+    let mut fixture = first_buffer_fixture();
+    assert!(fixture.server.state.set_output_size(1_920, 1_080));
+    let mut snapshot = fake_snapshot();
+    snapshot.surface_id = fixture.surface_id;
+    snapshot.geometry = X11Geometry {
+        x: 80,
+        y: 80,
+        width: 800,
+        height: 600,
+    };
+    let handle = snapshot.handle;
+    fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::WindowReady(snapshot));
+    let window_id = fixture
+        .server
+        .state
+        .window_id_for_x11_handle(handle)
+        .expect("normal X11 window admitted");
+    fixture
+        .server
+        .set_lifecycle_animation_renderer_available(false);
+    let extents_before = fixture.server.state.x11_decoration_frame_extents(handle);
+    assert!(extents_before.iter().any(|extent| *extent != 0));
+
+    assert!(fixture.server.state.minimize_desktop_window(window_id));
+    let minimize = fixture.server.take_xwayland_backend_commands(0);
+    assert!(minimize.iter().any(|command| matches!(
+        command,
+        XwmCommand::Unmap(window) if *window == handle
+    )));
+    assert!(
+        fixture
+            .server
+            .state
+            .restore_minimized_desktop_window(window_id)
+    );
+    let restore = fixture.server.take_xwayland_backend_commands(1);
+    assert!(restore.iter().any(|command| matches!(
+        command,
+        XwmCommand::Map(window) if *window == handle
+    )));
+    assert_eq!(
+        fixture.server.state.x11_decoration_frame_extents(handle),
+        extents_before,
+        "remapping must preserve the managed frame extents"
+    );
+    assert!(restore.iter().all(|command| !matches!(
+        command,
+        XwmCommand::SetFrameExtents(window, _)
+            if *window == handle
+    )));
+
+    let commands = fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::ConfigureRequested {
+            window: handle,
+            request: X11ConfigureRequest {
+                requested: X11Geometry {
+                    x: 0,
+                    y: 0,
+                    width: 1_920,
+                    height: 1_080,
+                },
+                fields: X11ConfigureFlags {
+                    width: true,
+                    height: true,
+                    ..X11ConfigureFlags::default()
+                },
+                client_event_sequence: None,
+                border_width: 0,
+                sibling: None,
+                stack_mode: None,
+            },
+        });
+    let accepted = match commands.as_slice() {
+        [XwmCommand::Configure { geometry, .. }] => *geometry,
+        other => panic!("expected one accepted post-remap Configure, got {other:?}"),
+    };
+    let usable = fixture.server.state.usable_output_geometry();
+    let [left, right, top, bottom] = extents_before.map(i64::from);
+    assert!(accepted.width < 1_920 || accepted.height < 1_080);
+    assert!(i64::from(accepted.x) - left >= usable.x.ceil() as i64);
+    assert!(
+        i64::from(accepted.x) + i64::from(accepted.width) + right
+            <= (usable.x + usable.width).floor() as i64
+    );
+    assert!(i64::from(accepted.y) - top >= usable.y.ceil() as i64);
+    assert!(
+        i64::from(accepted.y) + i64::from(accepted.height) + bottom
+            <= (usable.y + usable.height).floor() as i64
+    );
+    assert_eq!(
+        fixture.server.state.x11_authoritative_geometry(handle),
+        Some(accepted),
+        "the request must pass through managed geometry authority after remap"
+    );
+}
+
+#[test]
+fn client_hidden_request_uses_the_compositor_mapping_transition_once() {
+    let mut fixture = first_buffer_fixture();
+    let mut snapshot = fake_snapshot();
+    snapshot.surface_id = fixture.surface_id;
+    let handle = snapshot.handle;
+    fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::WindowReady(snapshot));
+    let window_id = fixture
+        .server
+        .state
+        .window_id_for_x11_handle(handle)
+        .expect("normal X11 window admitted");
+
+    let immediate = fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::StateRequested {
+            window: handle,
+            request: crate::xwayland::xwm::X11StateRequest {
+                action: crate::xwayland::xwm::X11StateAction::Add,
+                first: Some(crate::xwayland::xwm::X11StateAtom::Hidden),
+                second: None,
+            },
+        });
+    assert!(
+        immediate
+            .iter()
+            .all(|command| !matches!(command, XwmCommand::Unmap(_))),
+        "StateRequested must not issue a second direct unmap"
+    );
+    let backend = fixture.server.take_xwayland_backend_commands(0);
+    assert_eq!(
+        backend
+            .iter()
+            .filter(|command| matches!(command, XwmCommand::Unmap(window) if *window == handle))
+            .count(),
+        1,
+        "client Hidden and compositor minimize must converge on one backend transition"
+    );
+    assert!(backend.iter().any(|command| matches!(
+        command,
+        XwmCommand::SetState { window, state, .. }
+            if *window == handle && state.hidden
+    )));
+    assert!(
+        fixture
+            .server
+            .state
+            .window(window_id)
+            .is_some_and(|window| window.state.is_minimized())
+    );
+    assert_eq!(
+        fixture.server.state.window_id_for_x11_handle(handle),
+        Some(window_id)
+    );
 }
 
 #[test]

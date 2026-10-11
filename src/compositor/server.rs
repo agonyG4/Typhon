@@ -1001,23 +1001,8 @@ impl OwnCompositorServer {
                 Vec::new()
             }
             XwmEvent::StateRequested { window, request } => {
-                let was_hidden = self
-                    .state
-                    .window_id_for_x11_handle(window)
-                    .and_then(|id| self.state.window(id))
-                    .is_some_and(|window| window.state.is_minimized());
-                let Some(state) = self.state.apply_x11_state_request(window, request) else {
-                    return Vec::new();
-                };
-                let mut commands = Vec::with_capacity(1);
-                if state.hidden != was_hidden {
-                    commands.push(if state.hidden {
-                        XwmCommand::Unmap(window)
-                    } else {
-                        XwmCommand::Map(window)
-                    });
-                }
-                commands
+                let _ = self.state.apply_x11_state_request(window, request);
+                Vec::new()
             }
             XwmEvent::FocusRequested {
                 window,

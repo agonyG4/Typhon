@@ -309,11 +309,17 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
             let was_ready = record.snapshot.is_some()
                 || matches!(record.lifecycle, X11WindowLifecycle::Renderable);
             let association = record.association;
+            let restore_in_progress =
+                record.map_authorized || record.map_operation_pending || record.mapped_notified;
             if xwm
                 .windows
                 .consume_wm_unmap(handle)
                 .map_err(XwmError::InvalidCommand)?
             {
+                trace_x11_mapping_event(xwm, "wm_unmap_confirmed", handle, restore_in_progress);
+                if restore_in_progress {
+                    trace_x11_mapping_event(xwm, "late_unmap_consumed", handle, true);
+                }
                 trace_window_state(
                     xwm,
                     "wm_unmap_confirmation_consumed",
@@ -530,6 +536,41 @@ fn normalize(xwm: &mut Xwm, event: Event) -> Result<(), XwmError> {
         _ => {}
     }
     Ok(())
+}
+
+fn trace_x11_mapping_event(
+    xwm: &Xwm,
+    event: &'static str,
+    handle: X11WindowHandle,
+    pending_restore: bool,
+) {
+    if !matches!(
+        std::env::var("ASTREA_LIFECYCLE_DIAGNOSTICS").as_deref(),
+        Ok("1" | "true" | "on")
+    ) {
+        return;
+    }
+    let Some(record) = xwm.windows.get(handle) else {
+        return;
+    };
+    let surface_id = record.association.map_or_else(
+        || "none".to_owned(),
+        |association| association.surface_id.to_string(),
+    );
+    eprintln!(
+        "typhon.x11_mapping event={event} window_id=unavailable xid={} generation={} surface_id={} logical_minimized={} pending_restore={} xwm_lifecycle={:?} inflight_wm_unmaps={} managed_x={} managed_y={} managed_width={} managed_height={}",
+        handle.xid(),
+        handle.generation().get(),
+        surface_id,
+        record.lifecycle == X11WindowLifecycle::Iconic,
+        pending_restore,
+        record.lifecycle,
+        record.inflight_wm_unmaps,
+        record.geometry.x,
+        record.geometry.y,
+        record.geometry.width,
+        record.geometry.height,
+    );
 }
 fn int64_to_u64(value: Int64) -> u64 {
     if value.hi < 0 {

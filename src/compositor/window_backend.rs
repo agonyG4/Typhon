@@ -22,8 +22,9 @@ pub(crate) enum WindowBackendCommand {
     Close {
         window: WindowId,
     },
-    Map {
+    SetMapped {
         window: WindowId,
+        mapped: bool,
     },
     SetActivated {
         window: WindowId,

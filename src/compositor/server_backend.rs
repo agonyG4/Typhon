@@ -572,12 +572,19 @@ impl OwnCompositorServer {
                     };
                     Some(XwmCommand::Close(handle))
                 }
-                crate::compositor::window_backend::WindowBackendCommand::Map { window } => {
+                crate::compositor::window_backend::WindowBackendCommand::SetMapped {
+                    window,
+                    mapped,
+                } => {
                     let handle = match self.state.window(window)?.backend {
                         super::WindowBackend::X11(handle) => handle,
                         super::WindowBackend::Xdg(_) => return None,
                     };
-                    Some(XwmCommand::Map(handle))
+                    Some(if mapped {
+                        XwmCommand::Map(handle)
+                    } else {
+                        XwmCommand::Unmap(handle)
+                    })
                 }
                 crate::compositor::window_backend::WindowBackendCommand::SetActivated {
                     window,
@@ -639,7 +646,6 @@ impl OwnCompositorServer {
                             hidden: minimized,
                             activated,
                         },
-                        frame_extents: self.state.x11_decoration_frame_extents(handle),
                     })
                 }
                 crate::compositor::window_backend::WindowBackendCommand::SetWorkspace {

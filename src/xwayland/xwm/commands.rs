@@ -42,6 +42,7 @@ impl XwmCommand {
             Self::Unmap(_) => "Unmap",
             Self::Configure { .. } => "Configure",
             Self::ConfigureFrame { .. } => "ConfigureFrame",
+            Self::SetFrameExtents(..) => "SetFrameExtents",
             Self::ConfigureNotify { .. } => "ConfigureNotify",
             Self::Stack { .. } => "Stack",
             Self::Focus { .. } => "Focus",
@@ -73,6 +74,7 @@ impl XwmCommand {
             Self::RaiseAndSync { window, .. }
             | Self::Configure { window, .. }
             | Self::ConfigureFrame { window, .. }
+            | Self::SetFrameExtents(window, _)
             | Self::ConfigureNotify { window, .. }
             | Self::Stack { window, .. }
             | Self::SetState { window, .. }
@@ -219,6 +221,10 @@ pub(crate) fn execute(xwm: &mut Xwm, command: XwmCommand) -> Result<XwmCommandOu
 
     match command {
         XwmCommand::Map(handle) => {
+            let remapping_iconic = xwm
+                .windows
+                .get(handle)
+                .is_some_and(|record| record.lifecycle == X11WindowLifecycle::Iconic);
             if xwm
                 .windows
                 .get(handle)
@@ -236,9 +242,6 @@ pub(crate) fn execute(xwm: &mut Xwm, command: XwmCommand) -> Result<XwmCommandOu
                 return Ok(command_outcome(pruned_handles));
             }
             xwm.connection
-                .map_window(handle.xid())
-                .map_err(XwmError::Connection)?;
-            xwm.connection
                 .change_property32(
                     PropMode::REPLACE,
                     handle.xid(),
@@ -248,22 +251,26 @@ pub(crate) fn execute(xwm: &mut Xwm, command: XwmCommand) -> Result<XwmCommandOu
                 )
                 .map_err(XwmError::Connection)?;
             xwm.connection
-                .change_property32(
-                    PropMode::REPLACE,
-                    handle.xid(),
-                    xwm.atoms.get(XwmAtomName::NetFrameExtents),
-                    AtomEnum::CARDINAL,
-                    &[0, 0, 0, 0],
-                )
+                .map_window(handle.xid())
                 .map_err(XwmError::Connection)?;
             xwm.note_family_order(&[handle]);
             set_lifecycle_map_commanded(xwm, handle);
+            trace_x11_mapping_command(xwm, "wm_map_commanded", handle, remapping_iconic);
         }
         XwmCommand::Unmap(handle) => {
             let surface_id = xwm
                 .windows
                 .get(handle)
                 .and_then(|record| record.association.map(|association| association.surface_id));
+            xwm.connection
+                .change_property32(
+                    PropMode::REPLACE,
+                    handle.xid(),
+                    xwm.atoms.get(XwmAtomName::WmState),
+                    xwm.atoms.get(XwmAtomName::WmState),
+                    &[3, 0],
+                )
+                .map_err(XwmError::Connection)?;
             xwm.connection
                 .unmap_window(handle.xid())
                 .map_err(XwmError::Connection)?;
@@ -274,6 +281,7 @@ pub(crate) fn execute(xwm: &mut Xwm, command: XwmCommand) -> Result<XwmCommandOu
             xwm.windows
                 .mark_wm_unmap_requested(handle)
                 .map_err(XwmError::InvalidCommand)?;
+            trace_x11_mapping_command(xwm, "wm_unmap_commanded", handle, false);
         }
         XwmCommand::Configure {
             window,
@@ -330,15 +338,7 @@ pub(crate) fn execute(xwm: &mut Xwm, command: XwmCommand) -> Result<XwmCommandOu
             geometry,
             frame_extents,
         } => {
-            xwm.connection
-                .change_property32(
-                    PropMode::REPLACE,
-                    window.xid(),
-                    xwm.atoms.get(XwmAtomName::NetFrameExtents),
-                    AtomEnum::CARDINAL,
-                    &frame_extents,
-                )
-                .map_err(XwmError::Connection)?;
+            publish_frame_extents(xwm, window, frame_extents)?;
             let cookie = xwm
                 .connection
                 .configure_window(
@@ -355,6 +355,9 @@ pub(crate) fn execute(xwm: &mut Xwm, command: XwmCommand) -> Result<XwmCommandOu
                 ConfigureSource::Compositor,
                 configure_cookie_sequence,
             );
+        }
+        XwmCommand::SetFrameExtents(window, frame_extents) => {
+            publish_frame_extents(xwm, window, frame_extents)?
         }
         XwmCommand::ConfigureNotify { window, geometry } => {
             let event = xproto::ConfigureNotifyEvent {
@@ -494,20 +497,7 @@ pub(crate) fn execute(xwm: &mut Xwm, command: XwmCommand) -> Result<XwmCommandOu
                     .map_err(XwmError::Connection)?;
             }
         }
-        XwmCommand::SetState {
-            window,
-            state,
-            frame_extents,
-        } => {
-            xwm.connection
-                .change_property32(
-                    PropMode::REPLACE,
-                    window.xid(),
-                    xwm.atoms.get(XwmAtomName::NetFrameExtents),
-                    AtomEnum::CARDINAL,
-                    &frame_extents,
-                )
-                .map_err(XwmError::Connection)?;
+        XwmCommand::SetState { window, state } => {
             publish_state(xwm, window, state)?;
         }
         XwmCommand::SyncClientLists {
@@ -1346,6 +1336,58 @@ fn publish_state(
     Ok(())
 }
 
+fn publish_frame_extents(
+    xwm: &mut Xwm,
+    handle: super::X11WindowHandle,
+    frame_extents: [u32; 4],
+) -> Result<(), XwmError> {
+    xwm.connection
+        .change_property32(
+            PropMode::REPLACE,
+            handle.xid(),
+            xwm.atoms.get(XwmAtomName::NetFrameExtents),
+            AtomEnum::CARDINAL,
+            &frame_extents,
+        )
+        .map_err(XwmError::Connection)?;
+    Ok(())
+}
+
 fn set_lifecycle_map_commanded(xwm: &mut Xwm, handle: super::X11WindowHandle) {
     let _ = xwm.windows.mark_map_commanded(handle);
+}
+
+fn trace_x11_mapping_command(
+    xwm: &Xwm,
+    event: &'static str,
+    handle: super::X11WindowHandle,
+    pending_restore: bool,
+) {
+    if !matches!(
+        std::env::var("ASTREA_LIFECYCLE_DIAGNOSTICS").as_deref(),
+        Ok("1" | "true" | "on")
+    ) {
+        return;
+    }
+    let Some(record) = xwm.windows.get(handle) else {
+        return;
+    };
+    let surface_id = record.association.map_or_else(
+        || "none".to_owned(),
+        |association| association.surface_id.to_string(),
+    );
+    eprintln!(
+        "typhon.x11_mapping event={event} window_id=unavailable xid={} generation={} surface_id={} logical_minimized={} pending_restore={} xwm_lifecycle={:?} inflight_wm_unmaps={} managed_x={} managed_y={} managed_width={} managed_height={} frame_extents_mutation=none",
+        handle.xid(),
+        handle.generation().get(),
+        surface_id,
+        record.lifecycle == X11WindowLifecycle::Iconic,
+        pending_restore,
+        record.lifecycle,
+        record.inflight_wm_unmaps,
+        record.geometry.x,
+        record.geometry.y,
+        record.geometry.width,
+        record.geometry.height,
+    );
 }

@@ -87,6 +87,11 @@ impl OwnCompositorServer {
                         geometry,
                         frame_extents: self.state.x11_decoration_frame_extents(handle),
                     });
+                } else {
+                    commands.push(XwmCommand::SetFrameExtents(
+                        handle,
+                        self.state.x11_decoration_frame_extents(handle),
+                    ));
                 }
                 if !self.state.defer_client_list_sync() {
                     commands.push(self.sync_xwayland_client_lists());
