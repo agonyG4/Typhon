@@ -263,13 +263,13 @@ impl AtomicRenderDomainBootstrap {
     }
 }
 
-pub(super) struct AtomicRenderDomainInfo {
-    pub(super) dmabuf_feedback: super::EglGlesDmabufFeedback,
-    pub(super) egl_vendor: String,
-    pub(super) dmabuf_main_device: Option<u64>,
-    pub(super) dmabuf_main_device_path: Option<String>,
-    pub(super) lifecycle_animation_available: bool,
-    pub(super) squash_animation_available: bool,
+pub(crate) struct AtomicRenderDomainInfo {
+    pub(crate) dmabuf_feedback: super::EglGlesDmabufFeedback,
+    pub(crate) egl_vendor: String,
+    pub(crate) dmabuf_main_device: Option<u64>,
+    pub(crate) dmabuf_main_device_path: Option<String>,
+    pub(crate) lifecycle_animation_available: bool,
+    pub(crate) squash_animation_available: bool,
 }
 
 /// Exclusive owner of EGL/GL execution state and imported output render slots.
@@ -286,6 +286,20 @@ pub(super) struct AtomicRenderDomain {
 }
 
 impl AtomicRenderDomain {
+    pub(super) fn activate_context(&self) -> io::Result<()> {
+        let native_display = self
+            .native_display
+            .as_ref()
+            .ok_or_else(|| io::Error::other("Atomic EGL display is unavailable"))?;
+        let context = self
+            .egl_context
+            .ok_or_else(|| io::Error::other("Atomic EGL context is unavailable"))?;
+        native_display
+            .egl
+            .make_current(native_display.display, None, None, Some(context))
+            .map_err(native_egl_io_error)
+    }
+
     pub(super) fn install_pool(
         &mut self,
         descriptors: Vec<AtomicRenderSlotDescriptor>,

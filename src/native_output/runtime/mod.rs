@@ -784,6 +784,7 @@ pub(crate) struct NativeRuntime {
     pending_render_worker_completion: Option<super::scanout::AtomicRenderWorkerCompletion>,
     pending_render_worker_capture: Option<render_worker::PendingWorkerCapture>,
     pending_worker_effect_reload: Option<render_worker::PendingWorkerEffectReload>,
+    pending_dmabuf_release_fence: Option<(crate::native_output::scanout::RenderWorkerJobId, u64)>,
     cursor_io_worker: Option<oblivion_one::cursor_manager::CursorIoWorker>,
     cursor_io_worker_reactor_token: Option<ReactorToken>,
     pending_cursor_job: Option<PendingCursorJob>,
@@ -893,6 +894,66 @@ pub(super) fn reload_trusted_effects_from_disk(
     Ok(Some(
         oblivion_one::control_snapshots::TrustedEffectsReloadSnapshot {
             manifest_path: path.display().to_string(),
+            generation: generation.generation,
+            effect_count: generation.effects.len(),
+        },
+    ))
+}
+
+/// Bootstrap variant: when the explicit Atomic render worker is active, all
+/// shader publication still runs on that worker. The caller is pre-event-loop
+/// and may wait for its bounded startup reply before the first frame is drawn.
+pub(super) fn reload_initial_trusted_effects_from_disk(
+    scanout: &mut NativeScanoutBackend,
+    server: &mut OwnCompositorServer,
+) -> Result<Option<oblivion_one::control_snapshots::TrustedEffectsReloadSnapshot>, String> {
+    let Some((path, manifest)) = oblivion_one::effects::load_default_trusted_effect_manifest()
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(None);
+    };
+
+    let (manifest_path, generation) = match scanout {
+        NativeScanoutBackend::AtomicEglGbm(explicit) if explicit.render_worker_active() => {
+            let job_id =
+                render_worker::next_render_worker_job_id().map_err(|error| error.to_string())?;
+            let reload = explicit.reload_effect_registry_before_event_loop(
+                job_id,
+                server.trusted_effect_registry().current(),
+                path.display().to_string(),
+                manifest,
+            )?;
+            let Some(reload) = reload else {
+                return Err(String::from(
+                    "render worker returned no prepared generation for the startup manifest",
+                ));
+            };
+            let generation = server
+                .trusted_effect_registry()
+                .publish_prepared_reload(reload.prepared)
+                .map_err(|error| {
+                    format!(
+                        "render worker installed a startup effect generation that could not become authoritative: {error}"
+                    )
+                })?;
+            (reload.manifest_path, generation)
+        }
+        _ => {
+            let generation = scanout
+                .reload_trusted_effect_registry(server.trusted_effect_registry(), manifest)
+                .map_err(|error| error.to_string())?;
+            (path.display().to_string(), generation)
+        }
+    };
+
+    let previous_scene_generation = server.scene_render_generation();
+    server.reconcile_trusted_effect_bindings();
+    if server.scene_render_generation() == previous_scene_generation {
+        server.note_trusted_effect_registry_reload();
+    }
+    Ok(Some(
+        oblivion_one::control_snapshots::TrustedEffectsReloadSnapshot {
+            manifest_path,
             generation: generation.generation,
             effect_count: generation.effects.len(),
         },
@@ -1102,6 +1163,11 @@ impl Drop for NativeRuntime {
         }
         self.termination.set_phase(RuntimePhase::EmergencyCleanup);
         self.fail_pending_screen_captures("session_inactive");
+        if self.scanout.render_worker_active()
+            && let Err(error) = self.quiesce_render_worker_for_teardown()
+        {
+            self.termination.record_cleanup_error(error.as_ref());
+        }
         self.dmem_foreground.shutdown();
         frame::dump_effect_owner_diagnostics();
         self.slow_cycle_trace.dump();

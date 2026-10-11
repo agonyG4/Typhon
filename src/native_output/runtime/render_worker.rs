@@ -712,6 +712,35 @@ impl NativeRuntime {
                         oblivion_one::native::event_loop::NativeContinuationReason::FrameScheduler,
                     )?;
                 }
+                crate::native_output::scanout::AtomicRenderWorkerEvent::CandidatePrepared {
+                    identity,
+                    result,
+                } => {
+                    if self.pending_render_worker_identity.is_some()
+                        || self.pending_render_worker_context.is_some()
+                        || self.pending_render_worker_outer.is_some()
+                        || self.pending_render_worker_completion.is_some()
+                        || self.pending_render_worker_capture.is_some()
+                        || self.pending_worker_effect_reload.is_some()
+                    {
+                        return Err(io::Error::other(
+                            "output candidate completion arrived while another render continuation owns the worker",
+                        )
+                        .into());
+                    }
+                    self.render_worker_candidate_prepared(identity, result)?;
+                }
+                crate::native_output::scanout::AtomicRenderWorkerEvent::CandidatePromoted {
+                    identity,
+                } => self.render_worker_candidate_promoted(identity)?,
+                crate::native_output::scanout::AtomicRenderWorkerEvent::CandidateDiscarded {
+                    identity,
+                } => self.render_worker_candidate_discarded(identity)?,
+                crate::native_output::scanout::AtomicRenderWorkerEvent::ReleaseFenceReady {
+                    job_id,
+                    control_epoch,
+                    result,
+                } => self.render_worker_release_fence_ready(job_id, control_epoch, result)?,
                 crate::native_output::scanout::AtomicRenderWorkerEvent::Captured {
                     job_id,
                     control_epoch,

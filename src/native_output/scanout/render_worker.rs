@@ -2,7 +2,7 @@
 
 use super::atomic_render_domain::{
     AtomicRenderDomain, AtomicRenderDomainBootstrap, AtomicRenderDomainInfo,
-    AtomicSlotRenderOutcome,
+    AtomicRenderedFrameParts, AtomicSlotRenderOutcome,
 };
 use crate::native_output::{
     runtime::FrozenNativeRenderFrame,
@@ -124,6 +124,43 @@ pub(crate) struct AtomicRenderWorkerJob {
     pub(crate) controls_before: Vec<SequencedRenderControl>,
 }
 
+/// The first output frame is rendered during process bootstrap, before the
+/// reactor enters its event loop. It still executes on the worker thread, but
+/// its completion uses a bounded startup reply instead of reactor eventfd
+/// settlement because no output transaction exists yet.
+pub(crate) struct AtomicRenderWorkerInitialFrame {
+    pub(crate) target: RenderTargetRequest,
+    pub(crate) frame_id: u64,
+    pub(crate) frozen_frame: FrozenNativeRenderFrame,
+    pub(crate) required_control_epoch: u64,
+    pub(crate) controls_before: Vec<SequencedRenderControl>,
+}
+
+type AtomicRenderWorkerInitialFrameResult =
+    io::Result<(AtomicSlotRenderOutcome, FrozenNativeRenderFrame)>;
+
+/// A candidate output pool is imported and rendered on the existing render
+/// thread. The reactor keeps the matching physical pool until a discard or
+/// promotion acknowledgement proves its EGL imports have been destroyed or
+/// become the active domain.
+pub(crate) struct AtomicRenderCandidateJob {
+    pub(crate) identity: AtomicRenderCandidateIdentity,
+    pub(crate) render_device_fd: OwnedFd,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) format_modifier: DrmFormatModifierPair,
+    pub(crate) descriptors: Vec<AtomicRenderSlotDescriptor>,
+    pub(crate) physical_slot_identities: Vec<(super::OutputSlotId, u64)>,
+    pub(crate) target: RenderTargetRequest,
+    pub(crate) frame_id: u64,
+    pub(crate) frozen_frame: FrozenNativeRenderFrame,
+    pub(crate) material_generation: EffectRegistryGeneration,
+    pub(crate) effect_generation: EffectRegistryGeneration,
+    pub(crate) cursor_image: Arc<CompositorCursorImage>,
+    pub(crate) required_control_epoch: u64,
+    pub(crate) controls_before: Vec<SequencedRenderControl>,
+}
+
 pub(crate) enum AtomicRenderControl {
     CommitPresented {
         frame: EglSceneFrameCommit,
@@ -168,9 +205,16 @@ pub(crate) struct AtomicRenderWorkerCapture {
     pub(crate) controls_before: Vec<SequencedRenderControl>,
 }
 
+pub(crate) struct AtomicRenderWorkerReleaseFence {
+    pub(crate) job_id: RenderWorkerJobId,
+    pub(crate) required_control_epoch: u64,
+    pub(crate) controls_before: Vec<SequencedRenderControl>,
+}
+
 pub(crate) struct AtomicRenderWorkerEffectReload {
     pub(crate) job_id: RenderWorkerJobId,
     pub(crate) previous_generation: Arc<EffectRegistryGeneration>,
+    pub(crate) manifest: Option<(String, oblivion_one::effects::EffectManifest)>,
     pub(crate) required_control_epoch: u64,
     pub(crate) controls_before: Vec<SequencedRenderControl>,
 }
@@ -189,6 +233,41 @@ pub(crate) struct AtomicRenderWorkerIdentity {
     pub(crate) render_generation: u64,
     pub(crate) control_epoch: u64,
     pub(crate) target: RenderTargetRequest,
+}
+
+/// Exact identity for a render-domain candidate which is being prepared for
+/// output reconfiguration. Candidate domains and their physical pools may
+/// coexist with the active generation, so the acknowledgement must name both
+/// the job and the slot-pool generation it imported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AtomicRenderCandidateIdentity {
+    pub(crate) job_id: RenderWorkerJobId,
+    pub(crate) output_generation: u64,
+    pub(crate) pool_generation: u64,
+    pub(crate) slot: super::OutputSlotId,
+}
+
+impl AtomicRenderCandidateIdentity {
+    pub(crate) const fn new(
+        job_id: RenderWorkerJobId,
+        output_generation: u64,
+        pool_generation: u64,
+        slot: super::OutputSlotId,
+    ) -> Self {
+        Self {
+            job_id,
+            output_generation,
+            pool_generation,
+            slot,
+        }
+    }
+
+    pub(crate) const fn matches(self, actual: Self) -> bool {
+        self.job_id.get() == actual.job_id.get()
+            && self.output_generation == actual.output_generation
+            && self.pool_generation == actual.pool_generation
+            && self.slot.get() == actual.slot.get()
+    }
 }
 
 impl AtomicRenderWorkerCompletion {
@@ -222,6 +301,21 @@ pub(crate) fn completion_matches_job(
 
 pub(crate) enum AtomicRenderWorkerEvent {
     Rendered(AtomicRenderWorkerCompletion),
+    CandidatePrepared {
+        identity: AtomicRenderCandidateIdentity,
+        result: io::Result<(Box<AtomicRenderedFrameParts>, AtomicRenderDomainInfo)>,
+    },
+    CandidatePromoted {
+        identity: AtomicRenderCandidateIdentity,
+    },
+    CandidateDiscarded {
+        identity: AtomicRenderCandidateIdentity,
+    },
+    ReleaseFenceReady {
+        job_id: RenderWorkerJobId,
+        control_epoch: u64,
+        result: io::Result<NativeRenderFence>,
+    },
     Captured {
         job_id: RenderWorkerJobId,
         control_epoch: u64,
@@ -246,6 +340,9 @@ struct RenderWorkerInit {
     format_modifier: DrmFormatModifierPair,
     descriptors: Vec<AtomicRenderSlotDescriptor>,
     physical_slot_identities: Vec<(super::OutputSlotId, u64)>,
+    material_generation: Arc<EffectRegistryGeneration>,
+    effect_generation: Arc<EffectRegistryGeneration>,
+    cursor_image: Arc<CompositorCursorImage>,
 }
 
 enum RenderWorkerCommand {
@@ -254,6 +351,18 @@ enum RenderWorkerCommand {
         response: SyncSender<io::Result<AtomicRenderDomainInfo>>,
     },
     Render(AtomicRenderWorkerJob),
+    RenderInitialFrame {
+        initial: AtomicRenderWorkerInitialFrame,
+        response: SyncSender<AtomicRenderWorkerInitialFrameResult>,
+    },
+    CreateReleaseFence(AtomicRenderWorkerReleaseFence),
+    PrepareCandidate(AtomicRenderCandidateJob),
+    PromoteCandidate {
+        identity: AtomicRenderCandidateIdentity,
+        controls_before: Vec<SequencedRenderControl>,
+        required_control_epoch: u64,
+    },
+    DiscardCandidate(AtomicRenderCandidateIdentity),
     Capture(AtomicRenderWorkerCapture),
     ReloadEffects(AtomicRenderWorkerEffectReload),
     ApplyControls {
@@ -373,6 +482,9 @@ impl AtomicRenderWorkerHandle {
         format_modifier: DrmFormatModifierPair,
         descriptors: Vec<AtomicRenderSlotDescriptor>,
         physical_slot_identities: Vec<(super::OutputSlotId, u64)>,
+        material_generation: Arc<EffectRegistryGeneration>,
+        effect_generation: Arc<EffectRegistryGeneration>,
+        cursor_image: Arc<CompositorCursorImage>,
     ) -> io::Result<AtomicRenderDomainInfo> {
         let (response_tx, response_rx) = mpsc::sync_channel(1);
         self.commands
@@ -384,6 +496,9 @@ impl AtomicRenderWorkerHandle {
                     format_modifier,
                     descriptors,
                     physical_slot_identities,
+                    material_generation,
+                    effect_generation,
+                    cursor_image,
                 },
                 response: response_tx,
             })
@@ -423,6 +538,143 @@ impl AtomicRenderWorkerHandle {
         }
     }
 
+    /// Bootstrap-only render admission. The process has not entered the
+    /// realtime reactor yet, so startup may await its single bounded reply.
+    pub(crate) fn render_initial_frame(
+        &mut self,
+        initial: AtomicRenderWorkerInitialFrame,
+    ) -> AtomicRenderWorkerInitialFrameResult {
+        if !self.initialized || self.busy || self.fatal.load(Ordering::Acquire) {
+            return Err(io::Error::other(
+                "initial render requires an idle initialized render worker",
+            ));
+        }
+        let (response, reply) = mpsc::sync_channel(1);
+        if let Err(error) = self
+            .commands
+            .try_send(RenderWorkerCommand::RenderInitialFrame { initial, response })
+        {
+            return Err(io::Error::other(match error {
+                TrySendError::Full(_) => "render worker command slot is full during initial render",
+                TrySendError::Disconnected(_) => "render worker disconnected during initial render",
+            }));
+        }
+        self.busy = true;
+        match reply.recv_timeout(Duration::from_secs(30)) {
+            Ok(result) => {
+                self.busy = false;
+                result
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                self.fatal.store(true, Ordering::Release);
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "render worker initial frame exceeded the startup bound",
+                ))
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                self.fatal.store(true, Ordering::Release);
+                Err(io::Error::other(
+                    "render worker dropped its initial-frame startup reply",
+                ))
+            }
+        }
+    }
+
+    pub(crate) fn try_prepare_candidate(
+        &mut self,
+        candidate: AtomicRenderCandidateJob,
+    ) -> Result<(), AtomicRenderCandidateJob> {
+        if !self.initialized || self.busy || self.fatal.load(Ordering::Acquire) {
+            return Err(candidate);
+        }
+        match self
+            .commands
+            .try_send(RenderWorkerCommand::PrepareCandidate(candidate))
+        {
+            Ok(()) => {
+                self.busy = true;
+                Ok(())
+            }
+            Err(TrySendError::Full(RenderWorkerCommand::PrepareCandidate(candidate)))
+            | Err(TrySendError::Disconnected(RenderWorkerCommand::PrepareCandidate(candidate))) => {
+                Err(candidate)
+            }
+            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
+                unreachable!("only candidate preparation is offered through this method")
+            }
+        }
+    }
+
+    pub(crate) fn try_promote_candidate(
+        &mut self,
+        identity: AtomicRenderCandidateIdentity,
+        controls_before: Vec<SequencedRenderControl>,
+        required_control_epoch: u64,
+    ) -> Result<(), (io::Error, Vec<SequencedRenderControl>)> {
+        if !self.initialized || self.busy || self.fatal.load(Ordering::Acquire) {
+            return Err((
+                io::Error::other("render candidate promotion requires an idle initialized worker"),
+                controls_before,
+            ));
+        }
+        match self
+            .commands
+            .try_send(RenderWorkerCommand::PromoteCandidate {
+                identity,
+                controls_before,
+                required_control_epoch,
+            }) {
+            Ok(()) => {
+                self.busy = true;
+                Ok(())
+            }
+            Err(TrySendError::Full(RenderWorkerCommand::PromoteCandidate {
+                controls_before,
+                ..
+            })) => Err((
+                io::Error::other("render worker command slot is full during candidate promotion"),
+                controls_before,
+            )),
+            Err(TrySendError::Disconnected(RenderWorkerCommand::PromoteCandidate {
+                controls_before,
+                ..
+            })) => Err((
+                io::Error::other("render worker disconnected during candidate promotion"),
+                controls_before,
+            )),
+            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
+                unreachable!("candidate promotion preserves its command on rejection")
+            }
+        }
+    }
+
+    pub(crate) fn try_discard_candidate(
+        &mut self,
+        identity: AtomicRenderCandidateIdentity,
+    ) -> io::Result<()> {
+        if !self.initialized || self.busy || self.fatal.load(Ordering::Acquire) {
+            return Err(io::Error::other(
+                "render candidate discard requires an idle initialized worker",
+            ));
+        }
+        self.commands
+            .try_send(RenderWorkerCommand::DiscardCandidate(identity))
+            .map_err(|error| {
+                let reason = match error {
+                    TrySendError::Full(_) => {
+                        "render worker command slot is full during candidate discard"
+                    }
+                    TrySendError::Disconnected(_) => {
+                        "render worker disconnected during candidate discard"
+                    }
+                };
+                io::Error::other(reason)
+            })?;
+        self.busy = true;
+        Ok(())
+    }
+
     pub(crate) fn try_dispatch_capture(
         &mut self,
         capture: AtomicRenderWorkerCapture,
@@ -448,6 +700,31 @@ impl AtomicRenderWorkerHandle {
         }
     }
 
+    pub(crate) fn try_dispatch_release_fence(
+        &mut self,
+        request: AtomicRenderWorkerReleaseFence,
+    ) -> Result<(), AtomicRenderWorkerReleaseFence> {
+        if !self.initialized || self.busy || self.fatal.load(Ordering::Acquire) {
+            return Err(request);
+        }
+        match self
+            .commands
+            .try_send(RenderWorkerCommand::CreateReleaseFence(request))
+        {
+            Ok(()) => {
+                self.busy = true;
+                Ok(())
+            }
+            Err(TrySendError::Full(RenderWorkerCommand::CreateReleaseFence(request)))
+            | Err(TrySendError::Disconnected(RenderWorkerCommand::CreateReleaseFence(request))) => {
+                Err(request)
+            }
+            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
+                unreachable!("only release-fence requests use this method")
+            }
+        }
+    }
+
     pub(crate) fn try_dispatch_effect_reload(
         &mut self,
         reload: AtomicRenderWorkerEffectReload,
@@ -469,6 +746,74 @@ impl AtomicRenderWorkerHandle {
             }
             Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
                 unreachable!("only a reload command is offered through try_dispatch_effect_reload")
+            }
+        }
+    }
+
+    /// Bootstrap may await trusted shader publication before the event loop
+    /// starts. The worker still performs all GL compilation; only the bounded
+    /// startup reply is synchronous on the pre-reactor caller.
+    pub(crate) fn reload_effects_before_event_loop(
+        &mut self,
+        reload: AtomicRenderWorkerEffectReload,
+    ) -> Result<Option<PreparedWorkerEffectReload>, String> {
+        if !self.initialized || self.busy || self.fatal.load(Ordering::Acquire) {
+            return Err(String::from(
+                "startup effect reload requires an idle initialized render worker",
+            ));
+        }
+        let expected_job_id = reload.job_id;
+        let expected_epoch = reload.required_control_epoch;
+        self.commands
+            .try_send(RenderWorkerCommand::ReloadEffects(reload))
+            .map_err(|error| match error {
+                TrySendError::Full(_) => {
+                    String::from("render worker command slot is full during startup effect reload")
+                }
+                TrySendError::Disconnected(_) => {
+                    String::from("render worker disconnected during startup effect reload")
+                }
+            })?;
+        self.busy = true;
+        match self.events.recv_timeout(Duration::from_secs(30)) {
+            Ok(event) => {
+                self.drain_eventfd().map_err(|error| {
+                    self.fatal.store(true, Ordering::Release);
+                    format!("failed to drain startup render-worker eventfd: {error}")
+                })?;
+                self.busy = false;
+                match event {
+                    AtomicRenderWorkerEvent::EffectsReloaded {
+                        job_id,
+                        control_epoch,
+                        result,
+                    } if job_id == expected_job_id && control_epoch == expected_epoch => result,
+                    AtomicRenderWorkerEvent::Fatal { reason, .. } => {
+                        self.fatal.store(true, Ordering::Release);
+                        Err(format!(
+                            "render worker failed during startup effect reload: {reason}"
+                        ))
+                    }
+                    _ => {
+                        self.fatal.store(true, Ordering::Release);
+                        Err(String::from(
+                            "render worker returned an unexpected startup effect-reload event",
+                        ))
+                    }
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                self.fatal.store(true, Ordering::Release);
+                self.fail_control_lane();
+                Err(String::from(
+                    "render worker startup effect reload exceeded the 30 second bound",
+                ))
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                self.fatal.store(true, Ordering::Release);
+                Err(String::from(
+                    "render worker dropped its startup effect-reload completion",
+                ))
             }
         }
     }
@@ -573,10 +918,33 @@ impl AtomicRenderWorkerHandle {
         let Some(join) = self.join.take() else {
             return Ok(());
         };
-        // Teardown is outside normal operation. If a render is still running,
-        // the bounded command slot accepts Shutdown behind it; physical BOs
-        // remain owned by the caller until this acknowledgement/join returns.
-        let _ = self.commands.send(RenderWorkerCommand::Shutdown);
+        // Shutdown is a bounded lifecycle operation. A wedged GPU call must
+        // not make teardown wait forever; on timeout the caller retains the
+        // physical BOs and this JoinHandle detaches the still-owning thread.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            match self.commands.try_send(RenderWorkerCommand::Shutdown) {
+                Ok(()) | Err(TrySendError::Disconnected(_)) => break,
+                Err(TrySendError::Full(_)) => {
+                    if Instant::now() >= deadline {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "render worker shutdown command did not enter its bounded lane",
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+        }
+        while !join.is_finished() {
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "render worker did not destroy its render domain before shutdown timeout",
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
         join.join()
             .map_err(|_| io::Error::other("render worker panicked during teardown"))
     }
@@ -597,6 +965,7 @@ fn render_worker_loop(
 ) {
     let mut bootstrap = Some(bootstrap);
     let mut domain: Option<AtomicRenderDomain> = None;
+    let mut candidate_domain: Option<(AtomicRenderCandidateIdentity, AtomicRenderDomain)> = None;
     let mut applied_control_epoch = 0u64;
     while let Ok(command) = commands.recv() {
         match command {
@@ -608,16 +977,29 @@ fn render_worker_loop(
                     return;
                 };
                 let result = (|| {
-                    let (mut initialized, info) = bootstrap.initialize_renderer(
-                        init.width,
-                        init.height,
-                        init.format_modifier,
-                    )?;
+                    let RenderWorkerInit {
+                        width,
+                        height,
+                        pool_generation,
+                        format_modifier,
+                        descriptors,
+                        physical_slot_identities,
+                        material_generation,
+                        effect_generation,
+                        cursor_image,
+                    } = init;
+                    let (mut initialized, info) =
+                        bootstrap.initialize_renderer(width, height, format_modifier)?;
                     initialized.install_pool(
-                        init.descriptors,
-                        init.pool_generation,
-                        &init.physical_slot_identities,
+                        descriptors,
+                        pool_generation,
+                        &physical_slot_identities,
                     )?;
+                    initialized.publish_material_effect_generation(&material_generation);
+                    initialized
+                        .publish_effect_registry_generation((*effect_generation).clone())
+                        .map_err(|error| io::Error::other(error.to_string()))?;
+                    initialized.set_cursor_image(cursor_image);
                     domain = Some(initialized);
                     Ok(info)
                 })();
@@ -658,7 +1040,11 @@ fn render_worker_loop(
                         required_control_epoch,
                     )?;
                     for control in controls_before {
-                        apply_render_control(domain, control.control)?;
+                        apply_worker_control(
+                            domain,
+                            candidate_domain.as_mut().map(|(_, domain)| domain),
+                            control.control,
+                        )?;
                         applied_control_epoch = control.epoch;
                     }
                     let result = domain.render_to_slot(
@@ -681,7 +1067,7 @@ fn render_worker_loop(
                     let no_visual_release_fence = if need_no_visual_release_fence
                         && matches!(&result, Ok(AtomicSlotRenderOutcome::Skipped { .. }))
                     {
-                        Some(domain.create_render_fence()?)
+                        domain.create_render_fence().ok()
                     } else {
                         None
                     };
@@ -736,6 +1122,377 @@ fn render_worker_loop(
                     return;
                 }
             }
+            RenderWorkerCommand::RenderInitialFrame { initial, response } => {
+                let AtomicRenderWorkerInitialFrame {
+                    target,
+                    frame_id,
+                    mut frozen_frame,
+                    required_control_epoch,
+                    controls_before,
+                } = initial;
+                let mut gpu_sampling_started = false;
+                let rendered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                    || -> io::Result<AtomicSlotRenderOutcome> {
+                        let domain = domain.as_mut().ok_or_else(|| {
+                            io::Error::other(
+                                "render worker received initial frame before initialization",
+                            )
+                        })?;
+                        validate_render_control_batch(
+                            applied_control_epoch,
+                            &controls_before,
+                            required_control_epoch,
+                        )?;
+                        for control in controls_before {
+                            apply_worker_control(
+                                domain,
+                                candidate_domain.as_mut().map(|(_, domain)| domain),
+                                control.control,
+                            )?;
+                            applied_control_epoch = control.epoch;
+                        }
+                        let result = domain.render_to_slot(
+                            target,
+                            frame_id,
+                            &mut frozen_frame,
+                            &mut gpu_sampling_started,
+                            None,
+                        );
+                        if !matches!(&result, Ok(AtomicSlotRenderOutcome::Rendered(_)))
+                            && gpu_sampling_started
+                        {
+                            domain.finish_render_work();
+                        }
+                        result
+                    },
+                ));
+                match rendered {
+                    Ok(Ok(outcome)) => {
+                        if response.send(Ok((outcome, frozen_frame))).is_err() {
+                            fatal.store(true, Ordering::Release);
+                            let _ = publish_event(
+                                &events,
+                                &event_fd,
+                                AtomicRenderWorkerEvent::Fatal {
+                                    job_id: None,
+                                    gpu_execution_uncertain: gpu_sampling_started,
+                                    reason: "initial_render_reply_disconnected",
+                                },
+                            );
+                            return;
+                        }
+                    }
+                    Ok(Err(error)) => {
+                        fatal.store(true, Ordering::Release);
+                        let _ = response.send(Err(error));
+                        let _ = publish_event(
+                            &events,
+                            &event_fd,
+                            AtomicRenderWorkerEvent::Fatal {
+                                job_id: None,
+                                gpu_execution_uncertain: gpu_sampling_started,
+                                reason: "initial_render_failed",
+                            },
+                        );
+                        return;
+                    }
+                    Err(_) => {
+                        fatal.store(true, Ordering::Release);
+                        let _ = response.send(Err(io::Error::other(
+                            "render worker panicked during initial frame rendering",
+                        )));
+                        let _ = publish_event(
+                            &events,
+                            &event_fd,
+                            AtomicRenderWorkerEvent::Fatal {
+                                job_id: None,
+                                gpu_execution_uncertain: true,
+                                reason: "panic_during_initial_render",
+                            },
+                        );
+                        return;
+                    }
+                }
+            }
+            RenderWorkerCommand::CreateReleaseFence(request) => {
+                let AtomicRenderWorkerReleaseFence {
+                    job_id,
+                    required_control_epoch,
+                    controls_before,
+                } = request;
+                let fenced = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                    || -> io::Result<io::Result<NativeRenderFence>> {
+                        let active = domain.as_mut().ok_or_else(|| {
+                            io::Error::other(
+                                "release-fence request arrived before renderer initialization",
+                            )
+                        })?;
+                        validate_render_control_batch(
+                            applied_control_epoch,
+                            &controls_before,
+                            required_control_epoch,
+                        )?;
+                        for control in controls_before {
+                            apply_worker_control(
+                                active,
+                                candidate_domain.as_mut().map(|(_, domain)| domain),
+                                control.control,
+                            )?;
+                            applied_control_epoch = control.epoch;
+                        }
+                        Ok(active.create_render_fence())
+                    },
+                ));
+                let event = match fenced {
+                    Ok(Ok(result)) => AtomicRenderWorkerEvent::ReleaseFenceReady {
+                        job_id,
+                        control_epoch: applied_control_epoch,
+                        result,
+                    },
+                    Ok(Err(_)) => {
+                        fatal.store(true, Ordering::Release);
+                        AtomicRenderWorkerEvent::Fatal {
+                            job_id: Some(job_id),
+                            gpu_execution_uncertain: true,
+                            reason: "release_fence_control_application_failed",
+                        }
+                    }
+                    Err(_) => AtomicRenderWorkerEvent::Fatal {
+                        job_id: Some(job_id),
+                        gpu_execution_uncertain: true,
+                        reason: "panic_during_release_fence_export",
+                    },
+                };
+                fatal.store(
+                    matches!(&event, AtomicRenderWorkerEvent::Fatal { .. }),
+                    Ordering::Release,
+                );
+                if publish_event(&events, &event_fd, event).is_err() {
+                    fatal.store(true, Ordering::Release);
+                    return;
+                }
+            }
+            RenderWorkerCommand::PrepareCandidate(candidate) => {
+                let AtomicRenderCandidateJob {
+                    identity,
+                    render_device_fd,
+                    width,
+                    height,
+                    format_modifier,
+                    descriptors,
+                    physical_slot_identities,
+                    target,
+                    frame_id,
+                    mut frozen_frame,
+                    material_generation,
+                    effect_generation,
+                    cursor_image,
+                    required_control_epoch,
+                    controls_before,
+                } = candidate;
+                let mut gpu_sampling_started = false;
+                let prepared = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                    || -> io::Result<(
+                        AtomicRenderDomain,
+                        Box<AtomicRenderedFrameParts>,
+                        AtomicRenderDomainInfo,
+                    )> {
+                        let active = domain.as_mut().ok_or_else(|| {
+                            io::Error::other("candidate preparation arrived before renderer initialization")
+                        })?;
+                        if candidate_domain.is_some() {
+                            return Err(io::Error::other(
+                                "render worker already owns an output candidate domain",
+                            ));
+                        }
+                        validate_render_control_batch(
+                            applied_control_epoch,
+                            &controls_before,
+                            required_control_epoch,
+                        )?;
+                        for control in controls_before {
+                            apply_worker_control(active, None, control.control)?;
+                            applied_control_epoch = control.epoch;
+                        }
+
+                        let device = gbm::Device::new(render_device_fd)?;
+                        let bootstrap = AtomicRenderDomainBootstrap::new(device)?;
+                        let (mut candidate, info) = bootstrap.initialize_renderer(
+                            width,
+                            height,
+                            format_modifier,
+                        )?;
+                        candidate.install_pool(
+                            descriptors,
+                            identity.pool_generation,
+                            &physical_slot_identities,
+                        )?;
+                        candidate.publish_material_effect_generation(&material_generation);
+                        candidate
+                            .publish_effect_registry_generation(effect_generation)
+                            .map_err(|error| io::Error::other(error.to_string()))?;
+                        candidate.set_cursor_image(cursor_image);
+                        match candidate.render_to_slot(
+                            target,
+                            frame_id,
+                            &mut frozen_frame,
+                            &mut gpu_sampling_started,
+                            None,
+                        )? {
+                            AtomicSlotRenderOutcome::Rendered(frame) => {
+                                Ok((candidate, frame, info))
+                            }
+                            AtomicSlotRenderOutcome::Skipped { reason, .. } => {
+                                if gpu_sampling_started {
+                                    candidate.finish_render_work();
+                                }
+                                Err(io::Error::other(format!(
+                                    "candidate full repaint skipped: {reason:?}"
+                                )))
+                            }
+                            AtomicSlotRenderOutcome::LifecycleFallback { fallbacks, .. } => {
+                                if gpu_sampling_started {
+                                    candidate.finish_render_work();
+                                }
+                                Err(io::Error::other(format!(
+                                    "candidate full repaint lifecycle fallback: {fallbacks:?}"
+                                )))
+                            }
+                        }
+                    },
+                ));
+                let event = match prepared {
+                    Ok(Ok((candidate, frame, info))) => {
+                        if candidate_domain.is_some() {
+                            drop(candidate);
+                            AtomicRenderWorkerEvent::Fatal {
+                                job_id: Some(identity.job_id),
+                                gpu_execution_uncertain: gpu_sampling_started,
+                                reason: "duplicate_candidate_domain",
+                            }
+                        } else {
+                            candidate_domain = Some((identity, candidate));
+                            AtomicRenderWorkerEvent::CandidatePrepared {
+                                identity,
+                                result: Ok((frame, info)),
+                            }
+                        }
+                    }
+                    Ok(Err(error)) => AtomicRenderWorkerEvent::CandidatePrepared {
+                        identity,
+                        result: Err(error),
+                    },
+                    Err(_) => AtomicRenderWorkerEvent::Fatal {
+                        job_id: Some(identity.job_id),
+                        gpu_execution_uncertain: gpu_sampling_started,
+                        reason: "panic_during_candidate_preparation",
+                    },
+                };
+                fatal.store(
+                    matches!(&event, AtomicRenderWorkerEvent::Fatal { .. }),
+                    Ordering::Release,
+                );
+                if publish_event(&events, &event_fd, event).is_err() {
+                    fatal.store(true, Ordering::Release);
+                    return;
+                }
+            }
+            RenderWorkerCommand::PromoteCandidate {
+                identity,
+                controls_before,
+                required_control_epoch,
+            } => {
+                let promoted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                    || -> io::Result<()> {
+                        let active = domain.as_mut().ok_or_else(|| {
+                            io::Error::other(
+                                "candidate promotion arrived before renderer initialization",
+                            )
+                        })?;
+                        validate_render_control_batch(
+                            applied_control_epoch,
+                            &controls_before,
+                            required_control_epoch,
+                        )?;
+                        for control in controls_before {
+                            apply_worker_control(
+                                active,
+                                candidate_domain.as_mut().map(|(_, domain)| domain),
+                                control.control,
+                            )?;
+                            applied_control_epoch = control.epoch;
+                        }
+                        let (actual, _) = candidate_domain.as_ref().ok_or_else(|| {
+                            io::Error::other("candidate promotion has no prepared render domain")
+                        })?;
+                        if !identity.matches(*actual) {
+                            return Err(io::Error::other(
+                                "candidate promotion identity does not match prepared render domain",
+                            ));
+                        }
+                        Ok(())
+                    },
+                ));
+                let event = match promoted {
+                    Ok(Ok(())) => {
+                        let (actual, mut next_domain) = candidate_domain
+                            .take()
+                            .expect("validated candidate remains owned during promotion");
+                        let Some(mut old_domain) = domain.take() else {
+                            fatal.store(true, Ordering::Release);
+                            return;
+                        };
+                        old_domain.teardown();
+                        domain = Some(std::mem::replace(&mut next_domain, old_domain));
+                        drop(next_domain);
+                        AtomicRenderWorkerEvent::CandidatePromoted { identity: actual }
+                    }
+                    Ok(Err(_)) | Err(_) => {
+                        fatal.store(true, Ordering::Release);
+                        AtomicRenderWorkerEvent::Fatal {
+                            job_id: Some(identity.job_id),
+                            gpu_execution_uncertain: true,
+                            reason: "candidate_promotion_failed",
+                        }
+                    }
+                };
+                if publish_event(&events, &event_fd, event).is_err() {
+                    fatal.store(true, Ordering::Release);
+                    return;
+                }
+            }
+            RenderWorkerCommand::DiscardCandidate(identity) => {
+                let discarded = candidate_domain.take().ok_or_else(|| {
+                    io::Error::other("candidate discard arrived without a prepared render domain")
+                });
+                let event = match discarded {
+                    Ok((actual, mut candidate)) if identity.matches(actual) => {
+                        candidate.teardown();
+                        AtomicRenderWorkerEvent::CandidateDiscarded { identity: actual }
+                    }
+                    Ok((actual, candidate)) => {
+                        candidate_domain = Some((actual, candidate));
+                        fatal.store(true, Ordering::Release);
+                        AtomicRenderWorkerEvent::Fatal {
+                            job_id: Some(identity.job_id),
+                            gpu_execution_uncertain: true,
+                            reason: "candidate_discard_identity_mismatch",
+                        }
+                    }
+                    Err(_) => {
+                        fatal.store(true, Ordering::Release);
+                        AtomicRenderWorkerEvent::Fatal {
+                            job_id: Some(identity.job_id),
+                            gpu_execution_uncertain: true,
+                            reason: "candidate_discard_without_candidate",
+                        }
+                    }
+                };
+                if publish_event(&events, &event_fd, event).is_err() {
+                    fatal.store(true, Ordering::Release);
+                    return;
+                }
+            }
             RenderWorkerCommand::Capture(mut capture) => {
                 let captured = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
                     || -> io::Result<Vec<u8>> {
@@ -748,7 +1505,11 @@ fn render_worker_loop(
                             capture.required_control_epoch,
                         )?;
                         for control in capture.controls_before.drain(..) {
-                            apply_render_control(domain, control.control)?;
+                            apply_worker_control(
+                                domain,
+                                candidate_domain.as_mut().map(|(_, domain)| domain),
+                                control.control,
+                            )?;
                             applied_control_epoch = control.epoch;
                         }
                         match domain.capture_scene(&mut capture.frozen_frame) {
@@ -788,6 +1549,7 @@ fn render_worker_loop(
                 let AtomicRenderWorkerEffectReload {
                     job_id,
                     previous_generation,
+                    manifest,
                     required_control_epoch,
                     controls_before,
                 } = reload;
@@ -804,14 +1566,25 @@ fn render_worker_loop(
                             required_control_epoch,
                         )?;
                         for control in controls_before {
-                            apply_render_control(domain, control.control)?;
+                            apply_worker_control(
+                                domain,
+                                candidate_domain.as_mut().map(|(_, domain)| domain),
+                                control.control,
+                            )?;
                             applied_control_epoch = control.epoch;
                         }
                         let reload_result = (|| {
-                            let Some((path, manifest)) =
-                                oblivion_one::effects::load_default_trusted_effect_manifest()
-                                    .map_err(|error| error.to_string())?
-                            else {
+                            let loaded_manifest = match manifest {
+                                Some((path, manifest)) => Some((path, manifest)),
+                                None => {
+                                    oblivion_one::effects::load_default_trusted_effect_manifest()
+                                        .map_err(|error| error.to_string())?
+                                        .map(|(path, manifest)| {
+                                            (path.display().to_string(), manifest)
+                                        })
+                                }
+                            };
+                            let Some((manifest_path, manifest)) = loaded_manifest else {
                                 return Ok(None);
                             };
                             let prepared = PreparedEffectRegistryReload::from_previous(
@@ -823,7 +1596,7 @@ fn render_worker_loop(
                                 .publish_effect_registry_generation(prepared.generation().clone())
                                 .map_err(|error| error.to_string())?;
                             Ok(Some(PreparedWorkerEffectReload {
-                                manifest_path: path.display().to_string(),
+                                manifest_path,
                                 prepared,
                             }))
                         })();
@@ -874,7 +1647,11 @@ fn render_worker_loop(
                             required_control_epoch,
                         )?;
                         for control in controls {
-                            apply_render_control(domain, control.control)?;
+                            apply_worker_control(
+                                domain,
+                                candidate_domain.as_mut().map(|(_, domain)| domain),
+                                control.control,
+                            )?;
                             applied_control_epoch = control.epoch;
                         }
                         Ok(applied_control_epoch)
@@ -917,6 +1694,9 @@ fn render_worker_loop(
                 }
             }
             RenderWorkerCommand::Shutdown => {
+                if let Some((_, mut candidate)) = candidate_domain.take() {
+                    candidate.teardown();
+                }
                 if let Some(mut domain) = domain.take() {
                     domain.teardown();
                 }
@@ -930,6 +1710,7 @@ pub(super) fn apply_render_control(
     domain: &mut AtomicRenderDomain,
     control: AtomicRenderControl,
 ) -> Result<(), io::Error> {
+    domain.activate_context()?;
     match control {
         AtomicRenderControl::CommitPresented {
             frame,
@@ -951,6 +1732,43 @@ pub(super) fn apply_render_control(
             domain.rebind_pool_generation(generation);
         }
         AtomicRenderControl::FinishRenderWork => domain.finish_render_work(),
+    }
+    Ok(())
+}
+
+fn mirrored_candidate_control(control: &AtomicRenderControl) -> Option<AtomicRenderControl> {
+    match control {
+        AtomicRenderControl::InvalidatePresentedDamageHistory => {
+            Some(AtomicRenderControl::InvalidatePresentedDamageHistory)
+        }
+        AtomicRenderControl::PublishMaterialEffectGeneration(generation) => Some(
+            AtomicRenderControl::PublishMaterialEffectGeneration(generation.clone()),
+        ),
+        AtomicRenderControl::PublishEffectRegistryGeneration(generation) => Some(
+            AtomicRenderControl::PublishEffectRegistryGeneration(generation.clone()),
+        ),
+        AtomicRenderControl::SetCursorImage(image) => {
+            Some(AtomicRenderControl::SetCursorImage(Arc::clone(image)))
+        }
+        AtomicRenderControl::RebindPoolGeneration(generation) => {
+            Some(AtomicRenderControl::RebindPoolGeneration(*generation))
+        }
+        AtomicRenderControl::FinishRenderWork => Some(AtomicRenderControl::FinishRenderWork),
+        AtomicRenderControl::CommitPresented { .. }
+        | AtomicRenderControl::DiscardRendered { .. }
+        | AtomicRenderControl::FrameSwapFailed => None,
+    }
+}
+
+fn apply_worker_control(
+    active: &mut AtomicRenderDomain,
+    candidate: Option<&mut AtomicRenderDomain>,
+    control: AtomicRenderControl,
+) -> io::Result<()> {
+    let candidate_control = mirrored_candidate_control(&control);
+    apply_render_control(active, control)?;
+    if let (Some(candidate), Some(candidate_control)) = (candidate, candidate_control) {
+        apply_render_control(candidate, candidate_control)?;
     }
     Ok(())
 }
@@ -1097,10 +1915,14 @@ fn validate_render_control_batch(
 fn assert_atomic_render_worker_transport_is_send() {
     fn assert_send<T: Send>() {}
     assert_send::<AtomicRenderWorkerJob>();
+    assert_send::<RenderWorkerInit>();
+    assert_send::<AtomicRenderWorkerInitialFrame>();
+    assert_send::<AtomicRenderWorkerInitialFrameResult>();
     assert_send::<AtomicRenderWorkerCapture>();
     assert_send::<AtomicRenderWorkerEffectReload>();
     assert_send::<PreparedWorkerEffectReload>();
     assert_send::<AtomicRenderWorkerCompletion>();
+    assert_send::<AtomicRenderWorkerReleaseFence>();
     assert_send::<AtomicRenderWorkerEvent>();
 }
 
@@ -1119,6 +1941,7 @@ impl AtomicRenderTransportKind {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RenderWorkerAdmission {
     busy: bool,
@@ -1126,6 +1949,7 @@ pub(crate) struct RenderWorkerAdmission {
     coalesced_demand_count: u64,
 }
 
+#[cfg(test)]
 impl RenderWorkerAdmission {
     pub(crate) const fn busy(self) -> bool {
         self.busy
@@ -1223,6 +2047,49 @@ mod tests {
     }
 
     #[test]
+    fn candidate_completion_requires_matching_job_output_and_pool_identity() {
+        let expected = AtomicRenderCandidateIdentity::new(
+            RenderWorkerJobId::new(7).expect("nonzero job ID"),
+            11,
+            13,
+            super::super::OutputSlotId::new(0).expect("slot zero"),
+        );
+
+        assert!(expected.matches(expected));
+        assert!(!expected.matches(AtomicRenderCandidateIdentity::new(
+            RenderWorkerJobId::new(8).expect("nonzero job ID"),
+            11,
+            13,
+            super::super::OutputSlotId::new(0).expect("slot zero"),
+        )));
+        assert!(!expected.matches(AtomicRenderCandidateIdentity::new(
+            RenderWorkerJobId::new(7).expect("nonzero job ID"),
+            12,
+            13,
+            super::super::OutputSlotId::new(0).expect("slot zero"),
+        )));
+        assert!(!expected.matches(AtomicRenderCandidateIdentity::new(
+            RenderWorkerJobId::new(7).expect("nonzero job ID"),
+            11,
+            14,
+            super::super::OutputSlotId::new(0).expect("slot zero"),
+        )));
+        assert!(!expected.matches(AtomicRenderCandidateIdentity::new(
+            RenderWorkerJobId::new(7).expect("nonzero job ID"),
+            11,
+            13,
+            super::super::OutputSlotId::new(1).expect("slot one"),
+        )));
+    }
+
+    #[test]
+    fn candidate_worker_payloads_are_naturally_send() {
+        fn assert_send<T: Send>() {}
+        assert_send::<AtomicRenderCandidateJob>();
+        assert_send::<AtomicRenderWorkerEvent>();
+    }
+
+    #[test]
     fn control_lane_overflow_is_a_waking_fatal_worker_event() {
         let (commands, _command_rx) = mpsc::sync_channel(1);
         let (_events_tx, events) = mpsc::sync_channel(1);
@@ -1272,6 +2139,7 @@ mod tests {
         let rejected = worker.try_dispatch_effect_reload(AtomicRenderWorkerEffectReload {
             job_id: RenderWorkerJobId::new(1).expect("nonzero job id"),
             previous_generation: Arc::new(EffectRegistryGeneration::empty()),
+            manifest: None,
             controls_before: Vec::new(),
             required_control_epoch: 0,
         });
@@ -1330,6 +2198,47 @@ mod tests {
             },
         ];
         assert!(validate_render_control_batch(7, &out_of_order, 9).is_err());
+    }
+
+    #[test]
+    fn controls_created_during_one_render_are_first_visible_to_the_next_job() {
+        let j100_controls: Vec<SequencedRenderControl> = Vec::new();
+        validate_render_control_batch(0, &j100_controls, 0)
+            .expect("J100 retains its dispatch-time control epoch");
+
+        let queued_during_j100 = [SequencedRenderControl {
+            epoch: 1,
+            control: AtomicRenderControl::InvalidatePresentedDamageHistory,
+        }];
+        validate_render_control_batch(0, &queued_during_j100, 1)
+            .expect("the later command carries the newly queued control");
+    }
+
+    #[test]
+    fn render_worker_command_lane_is_fixed_capacity_one_and_nonblocking() {
+        let (commands, receiver) = mpsc::sync_channel(1);
+        commands
+            .try_send(100_u64)
+            .expect("first command is admitted");
+        assert!(matches!(
+            commands.try_send(101_u64),
+            Err(TrySendError::Full(101))
+        ));
+        assert_eq!(receiver.try_recv(), Ok(100));
+    }
+
+    #[test]
+    fn physical_swapchain_bounds_terminal_output_tokens_to_three_slots() {
+        assert_eq!(super::super::EXPLICIT_OUTPUT_SLOT_CAPACITY, 3);
+    }
+
+    #[test]
+    fn render_worker_source_uses_render_role_and_has_no_unsafe_send_override() {
+        let source = include_str!("render_worker.rs");
+        assert!(source.contains("\"typhon-render\""));
+        assert!(source.contains("SchedulingThreadRole::Render"));
+        assert!(!source.contains("unsafe impl Send"));
+        assert!(source.contains("sync_channel(1)"));
     }
 
     #[test]

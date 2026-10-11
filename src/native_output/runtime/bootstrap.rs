@@ -744,6 +744,7 @@ impl NativeRuntime {
             pending_render_worker_completion: None,
             pending_render_worker_capture: None,
             pending_worker_effect_reload: None,
+            pending_dmabuf_release_fence: None,
             cursor_io_worker: Some(cursor_io_worker),
             cursor_io_worker_reactor_token,
             pending_cursor_job: None,
@@ -1047,6 +1048,7 @@ impl NativeRuntime {
             scanout_plan.primary.as_str()
         );
         let scanout_target = scanout_plan.primary.as_str();
+        let initial_renderer_generation = server.trusted_effect_registry().current();
         let connector_id = ConnectorId::new(target.connector_id)
             .ok_or_else(|| io::Error::other("selected connector ID is zero"))?;
         let crtc_id = CrtcId::new(target.crtc_id)
@@ -1100,6 +1102,8 @@ impl NativeRuntime {
                         target.height,
                         drm_file_generation,
                         output_id,
+                        std::sync::Arc::clone(&initial_renderer_generation),
+                        cursor_image.clone(),
                     )?;
                     let startup_plan = build_native_kms_startup_plan(
                         kms_policy,
@@ -1173,13 +1177,14 @@ impl NativeRuntime {
             (startup_plan, scanout)
         };
         publish_scanout_runtime_capabilities(&mut server, &scanout);
-        let initial_material_generation = server.trusted_effect_registry().current();
-        scanout.publish_material_effect_generation(&initial_material_generation);
+        if !scanout.render_worker_active() {
+            scanout.publish_material_effect_generation(&initial_renderer_generation);
+        }
         let atomic_discovery = match &startup_plan {
             NativeKmsStartupPlan::Atomic { discovery } => Some(discovery.as_ref()),
             NativeKmsStartupPlan::Legacy { .. } => None,
         };
-        match super::reload_trusted_effects_from_disk(&mut scanout, &mut server) {
+        match super::reload_initial_trusted_effects_from_disk(&mut scanout, &mut server) {
             Ok(Some(snapshot)) => println!(
                 "trusted effects: loaded {} generation={} effects={}",
                 snapshot.manifest_path, snapshot.generation, snapshot.effect_count
@@ -1307,7 +1312,9 @@ impl NativeRuntime {
                 NativeCursorOwnerPlan::LegacyHardware
             ) | (_, NativeCursorOwnerPlan::Software)
         ));
-        scanout.set_cursor_image(cursor_image.clone());
+        if !scanout.render_worker_active() {
+            scanout.set_cursor_image(cursor_image.clone());
+        }
         let cursor_render_mode =
             if pre_kms_atomic_cursor.is_some() || pre_kms_legacy_cursor.is_some() {
                 NativeCursorRenderMode::Hardware
@@ -1388,11 +1395,10 @@ impl NativeRuntime {
             {
                 server.note_client_cursor_surface_sample(software_cursor_commit.is_none());
             }
-            let mut initial_gpu_sampling_started = false;
             let initial_scene = initial_resolved_scene
                 .take()
                 .expect("initial resolved scene is transferred into the frozen frame");
-            let mut frozen_initial = FrozenNativeRenderFrame::freeze(
+            let frozen_initial = FrozenNativeRenderFrame::freeze(
                 target.width,
                 target.height,
                 initial_scene,
@@ -1402,13 +1408,9 @@ impl NativeRuntime {
                 Some(initial_damage.as_renderer_damage(target.width, target.height)),
             );
             let initial_render_target = explicit.render_target_request(slot)?;
-            let parts = match explicit.render_to_slot(
-                initial_render_target,
-                0,
-                &mut frozen_initial,
-                &mut initial_gpu_sampling_started,
-                None,
-            )? {
+            let (initial_outcome, frozen_initial) =
+                explicit.render_initial_frame(initial_render_target, 0, frozen_initial)?;
+            let parts = match initial_outcome {
                 AtomicSlotRenderOutcome::Rendered(parts) => *parts,
                 AtomicSlotRenderOutcome::Skipped { slot, reason, .. } => {
                     explicit.swapchain_mut()?.cancel_render_before_gpu(slot)?;

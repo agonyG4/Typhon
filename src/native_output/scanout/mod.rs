@@ -31,6 +31,7 @@ mod worker;
 pub(crate) use atomic_direct::*;
 #[allow(unused_imports)]
 pub(crate) use atomic_egl_gbm::*;
+pub(crate) use atomic_render_domain::AtomicRenderDomainInfo;
 pub(crate) use backend::*;
 pub(crate) use direct::*;
 pub(crate) use direct_lease::*;
@@ -49,8 +50,9 @@ pub(crate) use output_slot::*;
 #[allow(unused_imports)]
 pub(crate) use output_swapchain::*;
 pub(crate) use render_worker::{
-    AtomicRenderWorkerCompletion, AtomicRenderWorkerEvent, AtomicRenderWorkerIdentity,
-    PreparedWorkerEffectReload, RenderWorkerJobId, completion_matches_job,
+    AtomicRenderCandidateIdentity, AtomicRenderWorkerCompletion, AtomicRenderWorkerEvent,
+    AtomicRenderWorkerIdentity, PreparedWorkerEffectReload, RenderWorkerJobId,
+    completion_matches_job,
 };
 pub(crate) use scaled_probe::*;
 
@@ -295,6 +297,42 @@ impl NativeScanoutBackend {
         matches!(self, Self::AtomicEglGbm(scanout) if scanout.render_worker_active())
     }
 
+    pub(crate) fn try_promote_worker_output_candidate(
+        &mut self,
+        identity: AtomicRenderCandidateIdentity,
+    ) -> io::Result<bool> {
+        match self {
+            Self::AtomicEglGbm(scanout) => scanout.try_promote_worker_output_candidate(identity),
+            Self::NativeEglGbm(_) | Self::Gbm(_) | Self::Dumb(_) => Err(io::Error::other(
+                "worker output candidate promotion requires explicit Atomic scanout",
+            )),
+        }
+    }
+
+    pub(crate) fn try_discard_worker_output_candidate(
+        &mut self,
+        identity: AtomicRenderCandidateIdentity,
+    ) -> io::Result<bool> {
+        match self {
+            Self::AtomicEglGbm(scanout) => scanout.try_discard_worker_output_candidate(identity),
+            Self::NativeEglGbm(_) | Self::Gbm(_) | Self::Dumb(_) => Err(io::Error::other(
+                "worker output candidate discard requires explicit Atomic scanout",
+            )),
+        }
+    }
+
+    pub(crate) fn dispatch_deferred_release_fence(
+        &mut self,
+        job_id: RenderWorkerJobId,
+    ) -> io::Result<Option<u64>> {
+        match self {
+            Self::AtomicEglGbm(scanout) => scanout.dispatch_deferred_release_fence(job_id),
+            Self::NativeEglGbm(_) | Self::Gbm(_) | Self::Dumb(_) => Err(io::Error::other(
+                "deferred GPU release proof requires explicit Atomic scanout",
+            )),
+        }
+    }
+
     pub(crate) fn dispatch_render_worker_capture(
         &mut self,
         job_id: RenderWorkerJobId,
@@ -438,6 +476,12 @@ impl NativeScanoutBackend {
             Self::AtomicEglGbm(scanout) => scanout.squash_animation_available(),
             Self::NativeEglGbm(scanout) => scanout.squash_animation_available(),
             Self::Gbm(_) | Self::Dumb(_) => false,
+        }
+    }
+
+    pub(crate) fn finish_render_work(&self) {
+        if let Self::NativeEglGbm(scanout) = self {
+            scanout.finish_render_work();
         }
     }
 

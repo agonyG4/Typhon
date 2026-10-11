@@ -10,6 +10,7 @@ use oblivion_one::native::{
     sync_file::query_sync_file_info,
 };
 
+use crate::egl_renderer::native_fence::NativeRenderFence;
 use crate::native_output::NativePerfField;
 use crate::native_output::kms_worker::KmsCommitWorkerHandle;
 use crate::native_output::pacing::BoundedSamples;
@@ -431,6 +432,54 @@ fn reconcile_retry_state(
     );
 }
 
+fn register_deferred_release_fence(
+    registry: &mut DmabufGpuReleaseRegistry,
+    server: &mut OwnCompositorServer,
+    event_loop: &mut NativeEventLoop,
+    release_fence: NativeRenderFence,
+    now_ns: u64,
+) -> Option<DmabufReleaseRetryReason> {
+    let lease_id = match registry.allocate_lease_id() {
+        Ok(lease_id) => lease_id,
+        Err(_) => return Some(DmabufReleaseRetryReason::NoGpuProofAvailable),
+    };
+    let completion_fd = match release_fence.duplicate_completion_fd() {
+        Ok(completion_fd) => completion_fd,
+        Err(_) => {
+            registry.note_completion_fd_failure();
+            return Some(DmabufReleaseRetryReason::CompletionFdDuplicationFailed);
+        }
+    };
+    let transferred = server.transfer_deferred_dmabuf_releases_to_gpu_lease(lease_id);
+    if transferred == 0 {
+        return None;
+    }
+    registry.note_obligations_armed(transferred);
+    match registry.register_with_origin(
+        lease_id,
+        completion_fd,
+        event_loop,
+        DmabufGpuReleaseOrigin::DeferredRetry,
+        transferred,
+        now_ns,
+    ) {
+        Ok(_) => None,
+        Err(_) => {
+            registry.note_registration_failure();
+            server.requeue_dmabuf_gpu_release_lease(lease_id);
+            Some(DmabufReleaseRetryReason::ReactorRegistrationFailed)
+        }
+    }
+}
+
+fn release_fence_completion_matches(
+    expected: Option<(crate::native_output::scanout::RenderWorkerJobId, u64)>,
+    job_id: crate::native_output::scanout::RenderWorkerJobId,
+    control_epoch: u64,
+) -> bool {
+    expected == Some((job_id, control_epoch))
+}
+
 impl DmabufGpuReleaseRegistry {
     pub(crate) fn allocate_lease_id(&mut self) -> io::Result<DmabufGpuReleaseLeaseId> {
         let id = std::num::NonZeroU64::new(self.next_lease_id.max(1))
@@ -850,6 +899,54 @@ impl super::NativeRuntime {
         );
     }
 
+    pub(super) fn render_worker_release_fence_ready(
+        &mut self,
+        job_id: crate::native_output::scanout::RenderWorkerJobId,
+        control_epoch: u64,
+        result: io::Result<NativeRenderFence>,
+    ) -> super::NativeResult<()> {
+        if !release_fence_completion_matches(
+            self.pending_dmabuf_release_fence,
+            job_id,
+            control_epoch,
+        ) {
+            return Err(io::Error::other(
+                "render-worker release-fence completion does not match its pending request",
+            )
+            .into());
+        }
+        self.pending_dmabuf_release_fence = None;
+        let now_ns = oblivion_one::native::event_loop::monotonic_now_ns()?;
+        let proof_retry_failure = match result {
+            Ok(fence) => register_deferred_release_fence(
+                &mut self.dmabuf_gpu_release_registry,
+                &mut self.server,
+                &mut self.event_loop,
+                fence,
+                now_ns,
+            ),
+            Err(_) => {
+                self.dmabuf_gpu_release_registry
+                    .note_fence_creation_failure();
+                Some(DmabufReleaseRetryReason::NoGpuProofAvailable)
+            }
+        };
+        reconcile_retry_state(
+            &mut self.dmabuf_gpu_release_registry,
+            self.server.deferred_dmabuf_release_count(),
+            self.server.retryable_deferred_dmabuf_release_count(),
+            self.server.explicit_release_signal_retry_count(),
+            self.server.explicit_release_signal_retry_count() > 0,
+            false,
+            proof_retry_failure,
+            now_ns,
+        );
+        self.event_loop.request_continuation(
+            oblivion_one::native::event_loop::NativeContinuationReason::FrameScheduler,
+        )?;
+        Ok(())
+    }
+
     pub(super) fn service_due_dmabuf_release_retry(
         &mut self,
         now_ns: u64,
@@ -871,72 +968,78 @@ impl super::NativeRuntime {
             retry_service_decision(deferred_count, retryable_count),
             DmabufReleaseRetryServiceDecision::ServiceProofRequired
         ) {
-            match &*self.scanout {
+            let atomic_release_state = match &*self.scanout {
                 crate::native_output::scanout::NativeScanoutBackend::AtomicEglGbm(explicit) => {
-                    let safety =
-                        dmabuf_gpu_release_safety(explicit, self.kms_commit_worker.as_ref());
+                    Some((
+                        dmabuf_gpu_release_safety(explicit, self.kms_commit_worker.as_ref()),
+                        explicit.render_worker_active(),
+                        explicit.render_worker_busy(),
+                    ))
+                }
+                _ => None,
+            };
+            match atomic_release_state {
+                Some((safety, true, _)) if !safety.permits_compositor_gpu_release() => {
+                    proof_retry_failure = Some(DmabufReleaseRetryReason::DirectKmsOwnershipBlocked);
+                }
+                Some((_, true, _)) if self.pending_dmabuf_release_fence.is_some() => {
+                    proof_service_suppressed = true;
+                }
+                Some((_, true, _))
+                    if self.pending_render_worker_identity.is_some()
+                        || self.pending_render_worker_context.is_some()
+                        || self.pending_render_worker_outer.is_some()
+                        || self.pending_render_worker_completion.is_some()
+                        || self.pending_render_worker_capture.is_some()
+                        || self.pending_worker_effect_reload.is_some() =>
+                {
+                    proof_retry_failure = Some(DmabufReleaseRetryReason::NoGpuProofAvailable);
+                }
+                Some((_, true, true)) => {
+                    proof_retry_failure = Some(DmabufReleaseRetryReason::NoGpuProofAvailable);
+                }
+                Some((_, true, false)) => {
+                    let job_id = super::render_worker::next_render_worker_job_id()?;
+                    match self.scanout.dispatch_deferred_release_fence(job_id)? {
+                        Some(control_epoch) => {
+                            self.pending_dmabuf_release_fence = Some((job_id, control_epoch));
+                            proof_service_suppressed = true;
+                        }
+                        None => {
+                            proof_retry_failure =
+                                Some(DmabufReleaseRetryReason::NoGpuProofAvailable);
+                        }
+                    }
+                }
+                Some((safety, false, _)) => {
                     if !safety.permits_compositor_gpu_release() {
                         proof_retry_failure =
                             Some(DmabufReleaseRetryReason::DirectKmsOwnershipBlocked);
                     } else {
-                        proof_retry_failure = 'proof: {
-                            let lease_id =
-                                match self.dmabuf_gpu_release_registry.allocate_lease_id() {
-                                    Ok(lease_id) => lease_id,
-                                    Err(_) => {
-                                        break 'proof Some(
-                                            DmabufReleaseRetryReason::NoGpuProofAvailable,
-                                        );
-                                    }
-                                };
-                            let release_fence = match explicit.create_render_fence() {
-                                Ok(fence) => fence,
-                                Err(_) => {
-                                    self.dmabuf_gpu_release_registry
-                                        .note_fence_creation_failure();
-                                    break 'proof Some(
-                                        DmabufReleaseRetryReason::NoGpuProofAvailable,
-                                    );
-                                }
-                            };
-                            let completion_fd = match release_fence.duplicate_completion_fd() {
-                                Ok(fd) => fd,
-                                Err(_) => {
-                                    self.dmabuf_gpu_release_registry
-                                        .note_completion_fd_failure();
-                                    break 'proof Some(
-                                        DmabufReleaseRetryReason::CompletionFdDuplicationFailed,
-                                    );
-                                }
-                            };
-                            let transferred = self
-                                .server
-                                .transfer_deferred_dmabuf_releases_to_gpu_lease(lease_id);
-                            if transferred == 0 {
-                                break 'proof None;
-                            }
-                            self.dmabuf_gpu_release_registry
-                                .note_obligations_armed(transferred);
-                            match self.dmabuf_gpu_release_registry.register_with_origin(
-                                lease_id,
-                                completion_fd,
+                        let release_fence = match &*self.scanout {
+                            crate::native_output::scanout::NativeScanoutBackend::AtomicEglGbm(
+                                explicit,
+                            ) => explicit.create_render_fence(),
+                            _ => unreachable!("Atomic release state was just checked"),
+                        };
+                        proof_retry_failure = match release_fence {
+                            Ok(fence) => register_deferred_release_fence(
+                                &mut self.dmabuf_gpu_release_registry,
+                                &mut self.server,
                                 &mut self.event_loop,
-                                DmabufGpuReleaseOrigin::DeferredRetry,
-                                transferred,
+                                fence,
                                 oblivion_one::native::event_loop::monotonic_now_ns()
                                     .unwrap_or(now_ns),
-                            ) {
-                                Ok(_) => None,
-                                Err(_) => {
-                                    self.dmabuf_gpu_release_registry.note_registration_failure();
-                                    self.server.requeue_dmabuf_gpu_release_lease(lease_id);
-                                    Some(DmabufReleaseRetryReason::ReactorRegistrationFailed)
-                                }
+                            ),
+                            Err(_) => {
+                                self.dmabuf_gpu_release_registry
+                                    .note_fence_creation_failure();
+                                Some(DmabufReleaseRetryReason::NoGpuProofAvailable)
                             }
                         };
                     }
                 }
-                _ => {
+                None => {
                     // Compatibility backends retain their existing conservative
                     // presentation-bound authority; they do not provide a retry
                     // proof for this scheduler.
@@ -987,6 +1090,23 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    #[test]
+    fn deferred_release_fence_completion_rejects_stale_job_or_control_epoch() {
+        let job = crate::native_output::scanout::RenderWorkerJobId::new(17)
+            .expect("nonzero render job ID");
+        let other_job = crate::native_output::scanout::RenderWorkerJobId::new(18)
+            .expect("nonzero render job ID");
+
+        assert!(release_fence_completion_matches(Some((job, 4)), job, 4));
+        assert!(!release_fence_completion_matches(
+            Some((job, 4)),
+            other_job,
+            4
+        ));
+        assert!(!release_fence_completion_matches(Some((job, 4)), job, 5));
+        assert!(!release_fence_completion_matches(None, job, 4));
+    }
 
     fn pipe() -> (OwnedFd, OwnedFd) {
         let mut fds = [-1; 2];

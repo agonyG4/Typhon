@@ -183,17 +183,51 @@ suspend stops new admission, drains the executing render continuation after
 reactor demotion, and acknowledges render-pool generation rebind before the
 reactor is rearmed.
 
-The worker is still not an effective runtime transport. `auto` reports an
-automatic startup degradation and uses the synchronous transport; `force`
-fails startup. The remaining gating path is output-configuration candidate
-preparation, promotion, and retirement: it still creates and renders the
-candidate synchronously. Worker-mode output configuration must prepare the
-candidate on the existing `typhon-render` thread, retain the old render domain
-until KMS commits, then acknowledge old-domain destruction before releasing the
-old physical pool. Failure paths also need candidate-destruction acknowledgments
-before dropping candidate GBM BOs. Until this path is asynchronous and the
-same-checkout binary build is qualified, do not use `auto` as a hardware A/B
-setting.
+`OBLIVION_ONE_RENDER_WORKER=off|auto|force` selects the explicit Atomic
+transport and defaults to `off`. `auto` may fall back to synchronous setup only
+before the worker has taken active renderer ownership; `force` reports startup
+failure instead. Once worker ownership is active, renderer failures enter
+controlled failure handling and never move EGL/GL state back to the reactor.
+The synchronous path remains available for clean hardware A/B comparison.
+
+Bootstrap uses two stages. Before the reactor enters its event loop or is
+promoted to realtime, `typhon-render` discovers EGL/DMA-BUF capabilities and
+returns a `Send` capability snapshot. The reactor combines that data with KMS
+capabilities, allocates physical BOs, then sends the owned descriptors and
+selected format/modifier plus the current material/effect generation and
+cursor image back to the same worker for renderer initialization. The worker
+installs those renderer revisions before acknowledging initialization. If a
+trusted effect manifest is present, shader publication is completed on the
+worker with a bounded pre-event-loop reply; only after success does the reactor
+publish the prepared trusted registry generation. The initial Atomic modeset
+frame is also drawn by that worker through one bounded startup reply before
+the realtime loop begins. Normal reactor-to-worker admission remains
+nonblocking.
+
+Output configuration uses one asynchronous candidate on the existing worker.
+The reactor allocates candidate physical resources and retains them while the
+worker imports descriptors, builds a candidate render domain, and renders the
+initial full-damage frame. KMS modesets only after its fence is ready. After a
+successful modeset, the worker destroys the old render domain and acknowledges
+before the reactor releases the old physical pool. Failure and suspend paths
+likewise wait for candidate destruction acknowledgement before releasing its
+BOs. There is no second candidate or prepared frame job.
+When startup selected the synchronous transport, later output replacement
+keeps that transport and does not create a render thread from the event loop.
+
+The worker eventfd carries frame, capture, effect-reload, output-candidate, and
+deferred DMA-BUF release-fence completions through fixed-capacity command and
+completion slots. No-visual release fences and deferred retry fences are
+created on the worker; an export failure leaves release obligations pending
+for retry. Skipped and failed renders finish any started GPU sampling before
+their completion allows reactor-side slot or protocol settlement. Session
+quiescence drains worker ownership after reactor demotion, and teardown retains
+physical storage if worker destruction cannot be acknowledged within its
+bounded shutdown interval.
+
+`cargo check --bin oblivion-one` qualifies the binary source when it is clean,
+but does not qualify hardware timing or performance. Worker mode stays off by
+default until the documented `off` versus `auto` hardware A/B has been run.
 
 The three-slot bound covers output-frame terminal tokens. Other worker work
 uses separate fixed admission limits, not entries in an unbounded common queue:

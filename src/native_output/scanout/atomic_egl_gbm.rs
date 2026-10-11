@@ -1,7 +1,7 @@
 use std::{
     collections::HashSet,
     fs, io, iter,
-    os::fd::{AsFd, AsRawFd, BorrowedFd},
+    os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd},
     os::unix::fs::MetadataExt,
     time::Instant,
 };
@@ -36,13 +36,17 @@ use crate::native_output::runtime::{
 use oblivion_one::window_lifecycle_animation::LifecycleRenderFallbacks;
 
 use super::atomic_direct::{direct_candidate_key, direct_scanout_debug};
-use super::atomic_render_domain::{AtomicRenderDomain, AtomicRenderDomainBootstrap};
+use super::atomic_render_domain::{
+    AtomicRenderDomain, AtomicRenderDomainBootstrap, AtomicRenderDomainInfo,
+};
 pub(crate) use super::atomic_render_domain::{AtomicRenderedFrameParts, AtomicSlotRenderOutcome};
 use super::render_worker::{
-    AtomicRenderControl, AtomicRenderTransportKind, AtomicRenderWorkerCapture,
-    AtomicRenderWorkerEffectReload, AtomicRenderWorkerEvent, AtomicRenderWorkerHandle,
-    AtomicRenderWorkerIdentity, AtomicRenderWorkerJob, AtomicRenderWorkerPolicy,
-    AtomicRenderWorkerStartup, RenderWorkerJobId, SequencedRenderControl, apply_render_control,
+    AtomicRenderCandidateIdentity, AtomicRenderCandidateJob, AtomicRenderControl,
+    AtomicRenderTransportKind, AtomicRenderWorkerCapture, AtomicRenderWorkerEffectReload,
+    AtomicRenderWorkerEvent, AtomicRenderWorkerHandle, AtomicRenderWorkerIdentity,
+    AtomicRenderWorkerInitialFrame, AtomicRenderWorkerJob, AtomicRenderWorkerPolicy,
+    AtomicRenderWorkerReleaseFence, AtomicRenderWorkerStartup, RenderWorkerJobId,
+    SequencedRenderControl, apply_render_control,
 };
 use super::*;
 use crate::native_output::presentation::async_validation::CompositedPresentationValidationKey;
@@ -98,6 +102,7 @@ pub(crate) struct AtomicEglGbmScanout {
     direct: DirectScanoutControl,
     width: u32,
     height: u32,
+    renderable_dmabuf_formats: Vec<EglGlesDmabufFormat>,
     dmabuf_feedback: EglGlesDmabufFeedback,
     dmabuf_main_device: Option<u64>,
     dmabuf_main_device_path: Option<String>,
@@ -460,6 +465,98 @@ enum AtomicRenderTransport {
     Worker(AtomicRenderWorkerHandle),
 }
 
+/// Reactor-owned physical half of an output-configuration candidate. Its BOs
+/// remain alive until the render worker acknowledges candidate destruction or
+/// promotion of the matching render domain.
+pub(crate) struct AtomicOutputConfigurationCandidate {
+    identity: AtomicRenderCandidateIdentity,
+    physical_device: Option<gbm::Device<OwnedFd>>,
+    physical_pool: Option<AtomicPhysicalOutputPool>,
+    discovery: Option<AtomicDiscovery>,
+    render_domain_may_own: bool,
+    drm_rdev: u64,
+    format_modifier: DrmFormatModifierPair,
+    width: u32,
+    height: u32,
+}
+
+impl AtomicOutputConfigurationCandidate {
+    pub(crate) const fn identity(&self) -> AtomicRenderCandidateIdentity {
+        self.identity
+    }
+
+    pub(crate) const fn pool_generation(&self) -> u64 {
+        self.identity.pool_generation
+    }
+
+    pub(crate) fn worker_domain_destroyed(&mut self) {
+        self.render_domain_may_own = false;
+    }
+
+    pub(crate) fn framebuffer(&self, slot: OutputSlotId) -> io::Result<FramebufferId> {
+        self.physical_pool
+            .as_ref()
+            .ok_or_else(|| io::Error::other("candidate physical pool is unavailable"))?
+            .physical_slot(slot)
+            .map(|slot| slot.framebuffer)
+    }
+
+    fn take_parts(
+        &mut self,
+    ) -> io::Result<(
+        gbm::Device<OwnedFd>,
+        AtomicPhysicalOutputPool,
+        AtomicDiscovery,
+        u64,
+        DrmFormatModifierPair,
+        u32,
+        u32,
+    )> {
+        if self.physical_device.is_none()
+            || self.physical_pool.is_none()
+            || self.discovery.is_none()
+        {
+            return Err(io::Error::other(
+                "candidate physical ownership was already transferred",
+            ));
+        }
+        Ok((
+            self.physical_device
+                .take()
+                .expect("candidate device checked"),
+            self.physical_pool.take().expect("candidate pool checked"),
+            self.discovery.take().expect("candidate discovery checked"),
+            self.drm_rdev,
+            self.format_modifier,
+            self.width,
+            self.height,
+        ))
+    }
+}
+
+impl Drop for AtomicOutputConfigurationCandidate {
+    fn drop(&mut self) {
+        if self.render_domain_may_own {
+            // The worker may still have an EGLImage referencing this BO. A
+            // fatal path retains it until process exit rather than risking GPU
+            // use-after-free.
+            if let Some(pool) = self.physical_pool.take() {
+                std::mem::forget(pool);
+            }
+            if let Some(device) = self.physical_device.take() {
+                std::mem::forget(device);
+            }
+        } else {
+            if let (Some(pool), Some(device)) =
+                (self.physical_pool.take(), self.physical_device.as_ref())
+            {
+                pool.teardown(device.as_fd(), true);
+            }
+            self.physical_device.take();
+        }
+    }
+}
+
 const MAX_PENDING_RENDER_CONTROLS: usize = 16;
 
 fn create_synchronous_render_setup(
@@ -515,6 +612,8 @@ fn create_worker_render_setup(
     width: u32,
     height: u32,
     pool_generation: u64,
+    initial_generation: std::sync::Arc<oblivion_one::effects::EffectRegistryGeneration>,
+    cursor_image: std::sync::Arc<oblivion_one::cursor_theme::CompositorCursorImage>,
 ) -> io::Result<(
     AtomicRenderTransport,
     DrmFormatModifierPair,
@@ -552,6 +651,9 @@ fn create_worker_render_setup(
                 format_modifier,
                 descriptors,
                 identities.to_vec(),
+                std::sync::Arc::clone(&initial_generation),
+                std::sync::Arc::clone(&initial_generation),
+                std::sync::Arc::clone(&cursor_image),
             )?);
             Ok(())
         },
@@ -1184,6 +1286,305 @@ impl AtomicEglGbmScanout {
         self.direct.invalidate_direct_validation_cache();
     }
 
+    pub(crate) fn start_worker_output_configuration_candidate(
+        &mut self,
+        kms: &fs::File,
+        discovery: AtomicDiscovery,
+        width: u32,
+        height: u32,
+        output_generation: u64,
+        pool_generation: u64,
+        job_id: RenderWorkerJobId,
+        frame_id: u64,
+        frozen_frame: FrozenNativeRenderFrame,
+        material_generation: oblivion_one::effects::EffectRegistryGeneration,
+        effect_generation: oblivion_one::effects::EffectRegistryGeneration,
+        cursor_image: std::sync::Arc<oblivion_one::cursor_theme::CompositorCursorImage>,
+    ) -> io::Result<AtomicOutputConfigurationCandidate> {
+        if !matches!(&self.render_transport, AtomicRenderTransport::Worker(_)) {
+            return Err(io::Error::other(
+                "asynchronous output candidate requires the active Atomic render worker",
+            ));
+        }
+        if self.render_worker_busy() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "render worker is busy before output candidate preparation",
+            ));
+        }
+
+        let physical_fd =
+            duplicate_fd_cloexec(kms.as_raw_fd()).map_err(io::Error::from_raw_os_error)?;
+        let drm_rdev = kms.metadata()?.rdev();
+        let physical_device = gbm::Device::new(physical_fd)?;
+        let mut probe = DeviceAllocationProbe {
+            device: &physical_device,
+            width,
+            height,
+        };
+        let format_modifier = select_output_format_modifier_for_presentation(
+            oblivion_one::compositor::OutputPresentationMode::Vsync,
+            &discovery.plane_scanout_formats,
+            Some(&discovery.plane_async_scanout_formats),
+            &self.renderable_dmabuf_formats,
+            &mut probe,
+        )?;
+        let mut physical_pool = create_physical_output_pool(
+            &physical_device,
+            kms.as_fd(),
+            width,
+            height,
+            format_modifier,
+            pool_generation,
+        )?;
+        let slot = OutputSlotId::new(0).expect("slot zero is valid");
+        let descriptors = match physical_pool.export_render_slot_descriptors() {
+            Ok(descriptors) => descriptors,
+            Err(error) => {
+                physical_pool.teardown(physical_device.as_fd(), true);
+                return Err(error);
+            }
+        };
+        let render_device_fd = match duplicate_fd_cloexec(kms.as_raw_fd()) {
+            Ok(fd) => fd,
+            Err(error) => {
+                physical_pool.teardown(physical_device.as_fd(), true);
+                return Err(io::Error::from_raw_os_error(error));
+            }
+        };
+        let target = match physical_pool.render_target_request(slot, 0) {
+            Ok(target) => target,
+            Err(error) => {
+                physical_pool.teardown(physical_device.as_fd(), true);
+                return Err(error);
+            }
+        };
+        let identity =
+            AtomicRenderCandidateIdentity::new(job_id, output_generation, pool_generation, slot);
+        let (controls_before, required_control_epoch) = match self.take_render_controls_for_job() {
+            Ok(controls) => controls,
+            Err(error) => {
+                physical_pool.teardown(physical_device.as_fd(), true);
+                return Err(error);
+            }
+        };
+        let job = AtomicRenderCandidateJob {
+            identity,
+            render_device_fd,
+            width,
+            height,
+            format_modifier,
+            physical_slot_identities: physical_pool.identities(),
+            descriptors,
+            target,
+            frame_id,
+            frozen_frame,
+            material_generation,
+            effect_generation,
+            cursor_image,
+            required_control_epoch,
+            controls_before,
+        };
+        let Some(worker) = self.render_worker_mut() else {
+            physical_pool.teardown(physical_device.as_fd(), true);
+            return Err(io::Error::other(
+                "render worker disappeared during candidate setup",
+            ));
+        };
+        if let Err(job) = worker.try_prepare_candidate(job) {
+            self.pending_render_controls = job.controls_before;
+            physical_pool.teardown(physical_device.as_fd(), true);
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "render worker rejected output candidate preparation",
+            ));
+        }
+
+        Ok(AtomicOutputConfigurationCandidate {
+            identity,
+            physical_device: Some(physical_device),
+            physical_pool: Some(physical_pool),
+            discovery: Some(discovery),
+            render_domain_may_own: true,
+            drm_rdev,
+            format_modifier,
+            width,
+            height,
+        })
+    }
+
+    pub(crate) fn try_promote_worker_output_candidate(
+        &mut self,
+        identity: AtomicRenderCandidateIdentity,
+    ) -> io::Result<bool> {
+        if self.render_worker_busy() {
+            return Ok(false);
+        }
+        let (controls_before, required_control_epoch) = self.take_render_controls_for_job()?;
+        let Some(worker) = self.render_worker_mut() else {
+            self.pending_render_controls = controls_before;
+            return Err(io::Error::other(
+                "render worker disappeared before candidate promotion",
+            ));
+        };
+        match worker.try_promote_candidate(identity, controls_before, required_control_epoch) {
+            Ok(()) => Ok(true),
+            Err((error, controls_before)) => {
+                self.pending_render_controls = controls_before;
+                if error.kind() == io::ErrorKind::WouldBlock {
+                    Ok(false)
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    pub(crate) fn try_discard_worker_output_candidate(
+        &mut self,
+        identity: AtomicRenderCandidateIdentity,
+    ) -> io::Result<bool> {
+        if self.render_worker_busy() {
+            return Ok(false);
+        }
+        let Some(worker) = self.render_worker_mut() else {
+            return Err(io::Error::other(
+                "render worker disappeared before candidate discard",
+            ));
+        };
+        match worker.try_discard_candidate(identity) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(crate) fn adopt_worker_output_candidate(
+        &mut self,
+        mut candidate: AtomicOutputConfigurationCandidate,
+        frame: Box<AtomicRenderedFrameParts>,
+        render_info: AtomicRenderDomainInfo,
+    ) -> io::Result<()> {
+        if !matches!(&self.render_transport, AtomicRenderTransport::Worker(_)) {
+            return Err(io::Error::other(
+                "cannot adopt a worker output candidate without worker ownership",
+            ));
+        }
+        if candidate.identity.pool_generation != candidate.pool_generation() {
+            return Err(io::Error::other(
+                "candidate physical pool generation mismatch",
+            ));
+        }
+        let (physical_device, physical_pool, discovery, drm_rdev, format_modifier, width, height) =
+            candidate.take_parts()?;
+        let physical_identities = physical_pool.identities();
+        if physical_pool.pool_generation() != candidate.identity.pool_generation
+            || !physical_identities
+                .contains(&(candidate.identity.slot, candidate.identity.pool_generation))
+            || physical_identities
+                .iter()
+                .any(|(_, generation)| *generation != candidate.identity.pool_generation)
+        {
+            std::mem::forget(physical_pool);
+            std::mem::forget(physical_device);
+            return Err(io::Error::other(
+                "candidate physical pool does not match its render identity",
+            ));
+        }
+        let scanout_capabilities = discover_direct_scanout_capabilities(
+            &discovery.plane_scanout_formats,
+            &render_info.dmabuf_feedback,
+        );
+        let scanout_capabilities = DirectScanoutFeedbackCapabilities::new(
+            drm_rdev,
+            candidate.identity.pool_generation,
+            discovery.pipeline.plane.get(),
+            scanout_capabilities,
+        );
+        let kms_presentable_client_formats = discover_kms_presentable_client_formats(
+            &discovery.plane_scanout_formats,
+            render_info.dmabuf_feedback.formats(),
+        );
+        let kms_preferred_selection = resolve_kms_preferred_dmabuf_policy(
+            KmsPreferredDmabufPolicy::from_env(),
+            &render_info.egl_vendor,
+            render_info.dmabuf_feedback.formats(),
+            &kms_presentable_client_formats,
+        );
+        self.dmabuf_kms_preferred_state = kms_preferred_selection.summary();
+        self.dmabuf_feedback = EglGlesDmabufFeedback::with_scanout_tranche(
+            scanout_capabilities.formats.iter().map(|format| {
+                EglGlesDmabufFormat::new(
+                    DrmFormat::from_fourcc(format.format),
+                    DrmModifier(format.modifier),
+                )
+            }),
+            kms_preferred_selection.advertised_renderer_formats,
+        );
+        self.dmabuf_scanout_capabilities = scanout_capabilities;
+        self.dmabuf_main_device = render_info.dmabuf_main_device;
+        self.dmabuf_main_device_path = render_info.dmabuf_main_device_path;
+        self.dmabuf_egl_vendor = render_info.egl_vendor;
+        self.lifecycle_animation_available = render_info.lifecycle_animation_available;
+        self.squash_animation_available = render_info.squash_animation_available;
+        self.renderable_dmabuf_formats = render_info.dmabuf_feedback.formats().to_vec();
+        self.async_page_flip_capable = discovery.optional.async_page_flip;
+        self.async_format_capable = discovery
+            .plane_async_scanout_formats
+            .contains(&format_modifier);
+        self.vrr_connector_capable = discovery.pipeline.connector_props.vrr_capable.is_some()
+            && discovery
+                .pipeline
+                .connector_props
+                .vrr_capable_value
+                .is_some_and(|value| value != 0);
+        self.vrr_crtc_property_available = discovery.pipeline.crtc_props.vrr_enabled.is_some();
+        self.connector_content_types = [
+            DrmContentType::Graphics,
+            DrmContentType::Photo,
+            DrmContentType::Cinema,
+            DrmContentType::Game,
+        ]
+        .into_iter()
+        .filter(|content_type| {
+            discovery
+                .pipeline
+                .connector_props
+                .content_type_value(content_type.as_str())
+                .is_some()
+        })
+        .collect();
+        self.async_crtc_id = discovery.pipeline.crtc.get();
+        self.async_primary_plane_id = discovery.pipeline.plane.get();
+        self.async_output_generation = candidate.identity.pool_generation;
+
+        let output_id = self.direct.output_id;
+        let old_pool = self.physical_pool.replace(physical_pool);
+        let old_device = self._physical_device.replace(physical_device);
+        self.direct = DirectScanoutControl::new(
+            self._physical_device
+                .as_ref()
+                .expect("candidate physical device installed")
+                .as_fd(),
+            candidate.identity.pool_generation,
+            output_id,
+        );
+        self.width = width;
+        self.height = height;
+        self.format_modifier = format_modifier;
+        self.render_slot_identities = self
+            .physical_pool
+            .as_ref()
+            .expect("candidate physical pool installed")
+            .identities();
+        self.swapchain = None;
+        if let (Some(pool), Some(device)) = (old_pool, old_device.as_ref()) {
+            pool.teardown(device.as_fd(), self.drm_cleanup_armed);
+        }
+        drop(old_device);
+        self.promote_initial_presented(frame.slot, frame.scene_commit)
+    }
+
     pub(crate) fn create_unattached_pool(
         kms: &fs::File,
         discovery: &AtomicDiscovery,
@@ -1191,14 +1592,65 @@ impl AtomicEglGbmScanout {
         height: u32,
         pool_generation: u64,
         output_id: OutputId,
+        initial_generation: std::sync::Arc<oblivion_one::effects::EffectRegistryGeneration>,
+        cursor_image: std::sync::Arc<oblivion_one::cursor_theme::CompositorCursorImage>,
     ) -> io::Result<Self> {
-        let physical_fd =
-            duplicate_fd_cloexec(kms.as_raw_fd()).map_err(io::Error::from_raw_os_error)?;
-        let physical_device = gbm::Device::new(physical_fd)?;
         let worker_policy = AtomicRenderWorkerPolicy::parse(
             std::env::var("OBLIVION_ONE_RENDER_WORKER").ok().as_deref(),
         )
         .map_err(io::Error::other)?;
+        Self::create_unattached_pool_with_policy(
+            kms,
+            discovery,
+            width,
+            height,
+            pool_generation,
+            output_id,
+            worker_policy,
+            initial_generation,
+            cursor_image,
+        )
+    }
+
+    /// Output reconfiguration on an already synchronous transport must stay
+    /// synchronous; it must not create a render worker from the event loop.
+    pub(crate) fn create_synchronous_unattached_pool(
+        kms: &fs::File,
+        discovery: &AtomicDiscovery,
+        width: u32,
+        height: u32,
+        pool_generation: u64,
+        output_id: OutputId,
+        initial_generation: std::sync::Arc<oblivion_one::effects::EffectRegistryGeneration>,
+        cursor_image: std::sync::Arc<oblivion_one::cursor_theme::CompositorCursorImage>,
+    ) -> io::Result<Self> {
+        Self::create_unattached_pool_with_policy(
+            kms,
+            discovery,
+            width,
+            height,
+            pool_generation,
+            output_id,
+            AtomicRenderWorkerPolicy::Off,
+            initial_generation,
+            cursor_image,
+        )
+    }
+
+    fn create_unattached_pool_with_policy(
+        kms: &fs::File,
+        discovery: &AtomicDiscovery,
+        width: u32,
+        height: u32,
+        pool_generation: u64,
+        output_id: OutputId,
+        worker_policy: AtomicRenderWorkerPolicy,
+        initial_generation: std::sync::Arc<oblivion_one::effects::EffectRegistryGeneration>,
+        cursor_image: std::sync::Arc<oblivion_one::cursor_theme::CompositorCursorImage>,
+    ) -> io::Result<Self> {
+        let physical_fd =
+            duplicate_fd_cloexec(kms.as_raw_fd()).map_err(io::Error::from_raw_os_error)?;
+        let physical_device = gbm::Device::new(physical_fd)?;
         let (render_transport, format_modifier, render_info, physical_pool, worker_startup) =
             match worker_policy {
                 AtomicRenderWorkerPolicy::Off => create_synchronous_render_setup(
@@ -1219,31 +1671,65 @@ impl AtomicEglGbmScanout {
                     )
                 })?,
                 AtomicRenderWorkerPolicy::Auto => {
-                    eprintln!(
-                        "native render worker: requested=auto effective=synchronous startup=automatic_startup_degraded reason=worker_capture_effect_reload_output_configuration_and_session_continuations_not_fully_migrated"
-                    );
-                    create_synchronous_render_setup(
+                    match create_worker_render_setup(
                         kms,
                         discovery,
                         &physical_device,
                         width,
                         height,
                         pool_generation,
-                    )
-                    .map(|setup| {
-                        (
+                        std::sync::Arc::clone(&initial_generation),
+                        std::sync::Arc::clone(&cursor_image),
+                    ) {
+                        Ok(setup) => (
                             setup.0,
                             setup.1,
                             setup.2,
                             setup.3,
-                            AtomicRenderWorkerStartup::AutomaticStartupDegraded,
-                        )
-                    })?
+                            AtomicRenderWorkerStartup::WorkerStarted,
+                        ),
+                        Err(worker_error) => {
+                            eprintln!(
+                                "native render worker: requested=auto effective=synchronous startup=automatic_startup_degraded reason=worker_bootstrap_failed error={worker_error}"
+                            );
+                            create_synchronous_render_setup(
+                                kms,
+                                discovery,
+                                &physical_device,
+                                width,
+                                height,
+                                pool_generation,
+                            )
+                            .map(|setup| {
+                                (
+                                    setup.0,
+                                    setup.1,
+                                    setup.2,
+                                    setup.3,
+                                    AtomicRenderWorkerStartup::AutomaticStartupDegraded,
+                                )
+                            })?
+                        }
+                    }
                 }
                 AtomicRenderWorkerPolicy::Force => {
-                    return Err(io::Error::other(
-                        "native render worker force mode is unavailable until capture, effect reload, output configuration, session recovery, and common renderer settlement are fully asynchronous",
-                    ));
+                    let setup = create_worker_render_setup(
+                        kms,
+                        discovery,
+                        &physical_device,
+                        width,
+                        height,
+                        pool_generation,
+                        std::sync::Arc::clone(&initial_generation),
+                        std::sync::Arc::clone(&cursor_image),
+                    )?;
+                    (
+                        setup.0,
+                        setup.1,
+                        setup.2,
+                        setup.3,
+                        AtomicRenderWorkerStartup::WorkerStarted,
+                    )
                 }
             };
         let transport_kind = match &render_transport {
@@ -1259,6 +1745,7 @@ impl AtomicEglGbmScanout {
             matches!(transport_kind, AtomicRenderTransportKind::Worker),
         );
 
+        let renderable_dmabuf_formats = render_info.dmabuf_feedback.formats().to_vec();
         let scanout_capabilities = discover_direct_scanout_capabilities(
             &discovery.plane_scanout_formats,
             &render_info.dmabuf_feedback,
@@ -1311,6 +1798,7 @@ impl AtomicEglGbmScanout {
             dmabuf_kms_preferred_state,
             format_modifier,
             drm_cleanup_armed: true,
+            renderable_dmabuf_formats,
             deadline_hints_enabled: true,
             counters: ExplicitOutputCounters::default(),
             async_page_flip_capable: discovery.optional.async_page_flip,
@@ -1416,6 +1904,47 @@ impl AtomicEglGbmScanout {
         }
     }
 
+    pub(crate) fn render_initial_frame(
+        &mut self,
+        target: RenderTargetRequest,
+        frame_id: u64,
+        frozen_frame: FrozenNativeRenderFrame,
+    ) -> io::Result<(AtomicSlotRenderOutcome, FrozenNativeRenderFrame)> {
+        if matches!(&self.render_transport, AtomicRenderTransport::Worker(_)) {
+            let (controls_before, required_control_epoch) = self.take_render_controls_for_job()?;
+            return self
+                .render_worker_mut()
+                .ok_or_else(|| io::Error::other("render worker disappeared during bootstrap"))?
+                .render_initial_frame(AtomicRenderWorkerInitialFrame {
+                    target,
+                    frame_id,
+                    frozen_frame,
+                    required_control_epoch,
+                    controls_before,
+                });
+        }
+        match &mut self.render_transport {
+            AtomicRenderTransport::Synchronous(domain) => {
+                let mut frozen_frame = frozen_frame;
+                let mut gpu_sampling_started = false;
+                let result = domain.render_to_slot(
+                    target,
+                    frame_id,
+                    &mut frozen_frame,
+                    &mut gpu_sampling_started,
+                    None,
+                );
+                if !matches!(&result, Ok(AtomicSlotRenderOutcome::Rendered(_)))
+                    && gpu_sampling_started
+                {
+                    domain.finish_render_work();
+                }
+                result.map(|outcome| (outcome, frozen_frame))
+            }
+            AtomicRenderTransport::Worker(_) => unreachable!("worker handled before sync borrow"),
+        }
+    }
+
     /// Capture the published scene without acquiring a physical output slot.
     /// The normal Atomic context is made current, but no KMS or swapchain
     /// state participates in this operation.
@@ -1500,6 +2029,7 @@ impl AtomicEglGbmScanout {
         let reload = AtomicRenderWorkerEffectReload {
             job_id,
             previous_generation,
+            manifest: None,
             required_control_epoch,
             controls_before,
         };
@@ -1511,6 +2041,63 @@ impl AtomicEglGbmScanout {
             Ok(()) => Ok(Some(required_control_epoch)),
             Err(reload) => {
                 self.pending_render_controls = reload.controls_before;
+                Ok(None)
+            }
+        }
+    }
+
+    pub(crate) fn reload_effect_registry_before_event_loop(
+        &mut self,
+        job_id: RenderWorkerJobId,
+        previous_generation: std::sync::Arc<oblivion_one::effects::EffectRegistryGeneration>,
+        manifest_path: String,
+        manifest: oblivion_one::effects::EffectManifest,
+    ) -> Result<Option<super::render_worker::PreparedWorkerEffectReload>, String> {
+        if !self.render_worker().is_some_and(|worker| !worker.busy()) {
+            return Err(String::from(
+                "startup effect reload requires an idle Atomic render worker",
+            ));
+        }
+        let (controls_before, required_control_epoch) = self
+            .take_render_controls_for_job()
+            .map_err(|error| error.to_string())?;
+        let reload = AtomicRenderWorkerEffectReload {
+            job_id,
+            previous_generation,
+            manifest: Some((manifest_path, manifest)),
+            required_control_epoch,
+            controls_before,
+        };
+        let Some(worker) = self.render_worker_mut() else {
+            self.pending_render_controls = reload.controls_before;
+            return Err(String::from(
+                "startup effect reload requires the Atomic render worker",
+            ));
+        };
+        worker.reload_effects_before_event_loop(reload)
+    }
+
+    pub(crate) fn dispatch_deferred_release_fence(
+        &mut self,
+        job_id: RenderWorkerJobId,
+    ) -> io::Result<Option<u64>> {
+        if !self.render_worker().is_some_and(|worker| !worker.busy()) {
+            return Ok(None);
+        }
+        let (controls_before, required_control_epoch) = self.take_render_controls_for_job()?;
+        let request = AtomicRenderWorkerReleaseFence {
+            job_id,
+            required_control_epoch,
+            controls_before,
+        };
+        match self
+            .render_worker_mut()
+            .ok_or_else(|| io::Error::other("release fence requires render-worker mode"))?
+            .try_dispatch_release_fence(request)
+        {
+            Ok(()) => Ok(Some(required_control_epoch)),
+            Err(request) => {
+                self.pending_render_controls = request.controls_before;
                 Ok(None)
             }
         }

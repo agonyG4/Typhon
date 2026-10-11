@@ -231,6 +231,12 @@ pub(crate) fn teardown_without_drm_io(io: &mut impl NativeSessionIo) {
     io.disarm_drm_destructors();
 }
 
+impl NativeRuntime {
+    pub(super) fn quiesce_render_worker_for_teardown(&mut self) -> NativeResult<()> {
+        <Self as NativeSessionIo>::quiesce_render_worker(self)
+    }
+}
+
 impl NativeSessionIo for NativeRuntime {
     #[cfg(test)]
     fn observe(&mut self, operation: NativeIoOperation) {
@@ -262,54 +268,60 @@ impl NativeSessionIo for NativeRuntime {
         }
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        while self.scanout.render_worker_busy() {
-            let now = std::time::Instant::now();
-            if now >= deadline {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "render worker did not quiesce within the session suspend bound",
-                )
-                .into());
-            }
-            let Some(fd) = self.scanout.render_worker_event_fd() else {
-                return Err(io::Error::other(
-                    "active render worker has no registered completion eventfd",
-                )
-                .into());
-            };
-            let timeout_ms = deadline
-                .saturating_duration_since(now)
-                .as_millis()
-                .clamp(1, 100) as i32;
-            let mut descriptor = libc::pollfd {
-                fd,
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            // The reactor was demoted before session quiescence. This bounded
-            // wait returns only worker events so their ordinary settlement can
-            // return slot and protocol ownership before output quarantine.
-            let ready = unsafe { libc::poll(&mut descriptor, 1, timeout_ms) };
-            if ready < 0 {
-                let error = io::Error::last_os_error();
-                if error.kind() == io::ErrorKind::Interrupted {
+        loop {
+            while self.scanout.render_worker_busy() {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "render worker did not quiesce within the session suspend bound",
+                    )
+                    .into());
+                }
+                let Some(fd) = self.scanout.render_worker_event_fd() else {
+                    return Err(io::Error::other(
+                        "active render worker has no registered completion eventfd",
+                    )
+                    .into());
+                };
+                let timeout_ms = deadline
+                    .saturating_duration_since(now)
+                    .as_millis()
+                    .clamp(1, 100) as i32;
+                let mut descriptor = libc::pollfd {
+                    fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                // The reactor was demoted before session quiescence. This
+                // bounded wait returns only worker events so their ordinary
+                // settlement can return slot and protocol ownership before
+                // output quarantine.
+                let ready = unsafe { libc::poll(&mut descriptor, 1, timeout_ms) };
+                if ready < 0 {
+                    let error = io::Error::last_os_error();
+                    if error.kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return Err(error.into());
+                }
+                if ready == 0 {
                     continue;
                 }
-                return Err(error.into());
+                self.process_render_worker_events()?;
+                let mut cycle =
+                    NativeCycleState::for_worker_quiescence(self.scanout.page_flip_pending());
+                self.settle_pending_render_worker_completion(&mut cycle)?;
             }
-            if ready == 0 {
-                continue;
-            }
-            self.process_render_worker_events()?;
-            let mut cycle =
-                NativeCycleState::for_worker_quiescence(self.scanout.page_flip_pending());
-            self.settle_pending_render_worker_completion(&mut cycle)?;
-        }
 
-        if self.pending_render_worker_completion.is_some() {
-            let mut cycle =
-                NativeCycleState::for_worker_quiescence(self.scanout.page_flip_pending());
-            self.settle_pending_render_worker_completion(&mut cycle)?;
+            if self.pending_render_worker_completion.is_some() {
+                let mut cycle =
+                    NativeCycleState::for_worker_quiescence(self.scanout.page_flip_pending());
+                self.settle_pending_render_worker_completion(&mut cycle)?;
+            }
+            if !self.quiesce_worker_output_candidate_step()? {
+                break;
+            }
         }
         if self.pending_render_worker_identity.is_some()
             || self.pending_render_worker_context.is_some()
@@ -317,6 +329,7 @@ impl NativeSessionIo for NativeRuntime {
             || self.pending_render_worker_completion.is_some()
             || self.pending_render_worker_capture.is_some()
             || self.pending_worker_effect_reload.is_some()
+            || self.pending_dmabuf_release_fence.is_some()
         {
             return Err(io::Error::other(
                 "render worker quiesced with reactor continuation ownership still pending",

@@ -29,7 +29,7 @@ pub(crate) enum OutputConfigurationOperation {
     },
 }
 
-enum CandidateScanoutState {
+pub(super) enum CandidateScanoutState {
     RenderingFence {
         scanout: NativeScanoutBackend,
         frame: AtomicRenderedFrameParts,
@@ -39,14 +39,65 @@ enum CandidateScanoutState {
         modeset: PreparedAtomicRuntimeModeset<DrmModeBlobIo>,
         cursor: Option<AtomicCursorVisualState>,
     },
+    WorkerPreparing {
+        candidate: AtomicOutputConfigurationCandidate,
+        cursor: Option<AtomicCursorVisualState>,
+    },
+    WorkerCancelAfterPrepare {
+        candidate: AtomicOutputConfigurationCandidate,
+        detail: String,
+    },
+    WorkerRenderingFence {
+        candidate: AtomicOutputConfigurationCandidate,
+        frame: Box<AtomicRenderedFrameParts>,
+        render_info: AtomicRenderDomainInfo,
+        cursor: Option<AtomicCursorVisualState>,
+    },
+    WorkerReady {
+        candidate: AtomicOutputConfigurationCandidate,
+        frame: Box<AtomicRenderedFrameParts>,
+        render_info: AtomicRenderDomainInfo,
+        modeset: PreparedAtomicRuntimeModeset<DrmModeBlobIo>,
+        cursor: Option<AtomicCursorVisualState>,
+    },
+    WorkerPromoting {
+        candidate: AtomicOutputConfigurationCandidate,
+        frame: Box<AtomicRenderedFrameParts>,
+        render_info: AtomicRenderDomainInfo,
+        cursor: Option<AtomicCursorVisualState>,
+        committed_at_ns: u64,
+    },
+    WorkerPromotionQueued {
+        candidate: AtomicOutputConfigurationCandidate,
+        frame: Box<AtomicRenderedFrameParts>,
+        render_info: AtomicRenderDomainInfo,
+        cursor: Option<AtomicCursorVisualState>,
+        committed_at_ns: u64,
+    },
+    WorkerPromoted {
+        candidate: AtomicOutputConfigurationCandidate,
+        frame: Box<AtomicRenderedFrameParts>,
+        render_info: AtomicRenderDomainInfo,
+        cursor: Option<AtomicCursorVisualState>,
+        committed_at_ns: u64,
+    },
+    WorkerDiscardQueued {
+        candidate: AtomicOutputConfigurationCandidate,
+        detail: String,
+    },
+    WorkerDiscarding {
+        candidate: AtomicOutputConfigurationCandidate,
+        detail: String,
+    },
 }
 
 pub(crate) struct PendingOutputConfigurationRequest {
     pub(crate) response: Option<(ReactorToken, u64)>,
     pub(crate) operation: OutputConfigurationOperation,
     pub(crate) target: NativeAppliedOutputConfiguration,
-    candidate: Option<CandidateScanoutState>,
+    pub(super) candidate: Option<CandidateScanoutState>,
     failure_code: Option<oblivion_one::control::ControlErrorCode>,
+    prepared_transaction: Option<PreparedOutputConfigurationTransaction>,
 }
 
 impl PendingOutputConfigurationRequest {
@@ -61,14 +112,213 @@ impl PendingOutputConfigurationRequest {
             target,
             candidate: None,
             failure_code: None,
+            prepared_transaction: None,
         }
     }
 
     pub(crate) fn waiting_on_render_fence(&self) -> bool {
         matches!(
             self.candidate,
-            Some(CandidateScanoutState::RenderingFence { .. })
+            Some(
+                CandidateScanoutState::RenderingFence { .. }
+                    | CandidateScanoutState::WorkerRenderingFence { .. }
+            )
         )
+    }
+}
+
+impl NativeRuntime {
+    pub(super) fn render_worker_candidate_prepared(
+        &mut self,
+        identity: AtomicRenderCandidateIdentity,
+        result: io::Result<(Box<AtomicRenderedFrameParts>, AtomicRenderDomainInfo)>,
+    ) -> NativeResult<()> {
+        let Some(mut pending) = self.pending_output_configuration.take() else {
+            return Err(io::Error::other(
+                "render candidate completion arrived without output-configuration ownership",
+            )
+            .into());
+        };
+        let Some(candidate_state) = pending.candidate.take() else {
+            self.pending_output_configuration = Some(pending);
+            return Err(io::Error::other(
+                "render candidate completion arrived outside candidate preparation",
+            )
+            .into());
+        };
+        let (mut candidate, cursor, cancel_after_prepare) = match candidate_state {
+            CandidateScanoutState::WorkerPreparing { candidate, cursor } => {
+                (candidate, cursor, None)
+            }
+            CandidateScanoutState::WorkerCancelAfterPrepare { candidate, detail } => {
+                (candidate, None, Some(detail))
+            }
+            other => {
+                pending.candidate = Some(other);
+                self.pending_output_configuration = Some(pending);
+                return Err(io::Error::other(
+                    "render candidate completion arrived outside candidate preparation",
+                )
+                .into());
+            }
+        };
+        if !candidate.identity().matches(identity) {
+            pending.candidate = Some(CandidateScanoutState::WorkerPreparing { candidate, cursor });
+            self.pending_output_configuration = Some(pending);
+            return Err(io::Error::other(
+                "render candidate completion identity does not match output configuration",
+            )
+            .into());
+        }
+        if let Some(detail) = cancel_after_prepare {
+            match result {
+                Ok((_frame, _render_info)) => {
+                    pending.candidate =
+                        Some(CandidateScanoutState::WorkerDiscardQueued { candidate, detail });
+                    self.pending_output_configuration = Some(pending);
+                }
+                Err(error) => {
+                    candidate.worker_domain_destroyed();
+                    drop(candidate);
+                    self.fail_pending_output_configuration(
+                        pending,
+                        format!("{detail}; candidate preparation failed: {error}"),
+                    )?;
+                }
+            }
+            self.event_loop.request_continuation(
+                oblivion_one::native::event_loop::NativeContinuationReason::FrameScheduler,
+            )?;
+            return Ok(());
+        }
+        match result {
+            Ok((frame, render_info)) => {
+                if frame.slot != identity.slot {
+                    pending.candidate =
+                        Some(CandidateScanoutState::WorkerPreparing { candidate, cursor });
+                    self.pending_output_configuration = Some(pending);
+                    return Err(io::Error::other(
+                        "render candidate completed for the wrong physical slot",
+                    )
+                    .into());
+                }
+                let fd = frame
+                    .render_fence
+                    .readiness_fd()
+                    .ok_or_else(|| io::Error::other("candidate render fence has no readiness fd"))?
+                    .as_raw_fd();
+                self.output_render_fence_token = Some(
+                    self.event_loop
+                        .register(fd, NativeEventSource::OutputRenderFence)?,
+                );
+                pending.candidate = Some(CandidateScanoutState::WorkerRenderingFence {
+                    candidate,
+                    frame,
+                    render_info,
+                    cursor,
+                });
+                self.pending_output_configuration = Some(pending);
+            }
+            Err(error) => {
+                candidate.worker_domain_destroyed();
+                pending.candidate = None;
+                self.fail_pending_output_configuration(pending, error.to_string())?;
+            }
+        }
+        self.event_loop.request_continuation(
+            oblivion_one::native::event_loop::NativeContinuationReason::FrameScheduler,
+        )?;
+        Ok(())
+    }
+
+    pub(super) fn render_worker_candidate_promoted(
+        &mut self,
+        identity: AtomicRenderCandidateIdentity,
+    ) -> NativeResult<()> {
+        let Some(mut pending) = self.pending_output_configuration.take() else {
+            return Err(io::Error::other(
+                "render candidate promotion acknowledgement has no output request",
+            )
+            .into());
+        };
+        let Some(CandidateScanoutState::WorkerPromoting {
+            candidate,
+            frame,
+            render_info,
+            cursor,
+            committed_at_ns,
+        }) = pending.candidate.take()
+        else {
+            self.pending_output_configuration = Some(pending);
+            return Err(io::Error::other(
+                "render candidate promotion acknowledgement arrived in the wrong state",
+            )
+            .into());
+        };
+        if !candidate.identity().matches(identity) {
+            pending.candidate = Some(CandidateScanoutState::WorkerPromoting {
+                candidate,
+                frame,
+                render_info,
+                cursor,
+                committed_at_ns,
+            });
+            self.pending_output_configuration = Some(pending);
+            return Err(io::Error::other(
+                "render candidate promotion identity does not match output request",
+            )
+            .into());
+        }
+        pending.candidate = Some(CandidateScanoutState::WorkerPromoted {
+            candidate,
+            frame,
+            render_info,
+            cursor,
+            committed_at_ns,
+        });
+        self.pending_output_configuration = Some(pending);
+        self.event_loop.request_continuation(
+            oblivion_one::native::event_loop::NativeContinuationReason::FrameScheduler,
+        )?;
+        Ok(())
+    }
+
+    pub(super) fn render_worker_candidate_discarded(
+        &mut self,
+        identity: AtomicRenderCandidateIdentity,
+    ) -> NativeResult<()> {
+        let Some(mut pending) = self.pending_output_configuration.take() else {
+            return Err(io::Error::other(
+                "render candidate discard acknowledgement has no output request",
+            )
+            .into());
+        };
+        let Some(CandidateScanoutState::WorkerDiscarding {
+            mut candidate,
+            detail,
+        }) = pending.candidate.take()
+        else {
+            self.pending_output_configuration = Some(pending);
+            return Err(io::Error::other(
+                "render candidate discard acknowledgement arrived in the wrong state",
+            )
+            .into());
+        };
+        if !candidate.identity().matches(identity) {
+            pending.candidate = Some(CandidateScanoutState::WorkerDiscarding { candidate, detail });
+            self.pending_output_configuration = Some(pending);
+            return Err(io::Error::other(
+                "render candidate discard identity does not match output request",
+            )
+            .into());
+        }
+        candidate.worker_domain_destroyed();
+        drop(candidate);
+        self.fail_pending_output_configuration(pending, detail)?;
+        self.event_loop.request_continuation(
+            oblivion_one::native::event_loop::NativeContinuationReason::FrameScheduler,
+        )?;
+        Ok(())
     }
 }
 
@@ -683,13 +933,141 @@ impl NativeRuntime {
         }
 
         if pending.candidate.is_none() {
+            if self.scanout.render_worker_active() && self.scanout.render_worker_busy() {
+                self.pending_output_configuration = Some(pending);
+                return Ok(OutputConfigurationAdvance::Waiting);
+            }
             match self.prepare_output_configuration_candidate(&pending.target) {
                 Ok(candidate) => pending.candidate = Some(candidate),
                 Err(error) => {
+                    if error.kind() == io::ErrorKind::WouldBlock {
+                        self.pending_output_configuration = Some(pending);
+                        return Ok(OutputConfigurationAdvance::Waiting);
+                    }
                     self.fail_pending_output_configuration(pending, error.to_string())?;
                     return Ok(OutputConfigurationAdvance::Completed);
                 }
             }
+        }
+
+        if matches!(
+            pending.candidate.as_ref(),
+            Some(CandidateScanoutState::WorkerDiscardQueued { .. })
+        ) {
+            let Some(CandidateScanoutState::WorkerDiscardQueued { candidate, detail }) =
+                pending.candidate.take()
+            else {
+                unreachable!()
+            };
+            let identity = candidate.identity();
+            match self.scanout.try_discard_worker_output_candidate(identity) {
+                Ok(true) => {
+                    pending.candidate =
+                        Some(CandidateScanoutState::WorkerDiscarding { candidate, detail });
+                }
+                Ok(false) => {
+                    pending.candidate =
+                        Some(CandidateScanoutState::WorkerDiscardQueued { candidate, detail });
+                }
+                Err(error) => {
+                    pending.candidate =
+                        Some(CandidateScanoutState::WorkerDiscardQueued { candidate, detail });
+                    self.pending_output_configuration = Some(pending);
+                    return Err(error.into());
+                }
+            }
+            self.pending_output_configuration = Some(pending);
+            return Ok(OutputConfigurationAdvance::Waiting);
+        }
+
+        if matches!(
+            pending.candidate.as_ref(),
+            Some(CandidateScanoutState::WorkerPromotionQueued { .. })
+        ) {
+            let Some(CandidateScanoutState::WorkerPromotionQueued {
+                candidate,
+                frame,
+                render_info,
+                cursor,
+                committed_at_ns,
+            }) = pending.candidate.take()
+            else {
+                unreachable!()
+            };
+            let identity = candidate.identity();
+            match self.scanout.try_promote_worker_output_candidate(identity) {
+                Ok(true) => {
+                    pending.candidate = Some(CandidateScanoutState::WorkerPromoting {
+                        candidate,
+                        frame,
+                        render_info,
+                        cursor,
+                        committed_at_ns,
+                    });
+                }
+                Ok(false) => {
+                    pending.candidate = Some(CandidateScanoutState::WorkerPromotionQueued {
+                        candidate,
+                        frame,
+                        render_info,
+                        cursor,
+                        committed_at_ns,
+                    });
+                }
+                Err(error) => {
+                    pending.candidate = Some(CandidateScanoutState::WorkerPromotionQueued {
+                        candidate,
+                        frame,
+                        render_info,
+                        cursor,
+                        committed_at_ns,
+                    });
+                    self.pending_output_configuration = Some(pending);
+                    return Err(error.into());
+                }
+            }
+            self.pending_output_configuration = Some(pending);
+            return Ok(OutputConfigurationAdvance::Waiting);
+        }
+
+        if matches!(
+            pending.candidate.as_ref(),
+            Some(CandidateScanoutState::WorkerPromoted { .. })
+        ) {
+            let Some(CandidateScanoutState::WorkerPromoted {
+                candidate,
+                frame,
+                render_info,
+                cursor,
+                committed_at_ns,
+            }) = pending.candidate.take()
+            else {
+                unreachable!()
+            };
+            self.complete_worker_output_configuration(
+                pending,
+                candidate,
+                frame,
+                render_info,
+                cursor,
+                committed_at_ns,
+            )?;
+            return Ok(OutputConfigurationAdvance::Completed);
+        }
+
+        if matches!(
+            pending.candidate.as_ref(),
+            Some(
+                CandidateScanoutState::WorkerPreparing { .. }
+                    | CandidateScanoutState::WorkerCancelAfterPrepare { .. }
+                    | CandidateScanoutState::WorkerDiscarding { .. }
+                    | CandidateScanoutState::WorkerPromoting { .. }
+                    | CandidateScanoutState::WorkerPromotionQueued { .. }
+                    | CandidateScanoutState::WorkerPromoted { .. }
+            )
+        ) {
+            self.pending_output_configuration = Some(pending);
+            return Ok(OutputConfigurationAdvance::Waiting);
         }
 
         if matches!(
@@ -745,6 +1123,87 @@ impl NativeRuntime {
                 modeset,
                 cursor,
             });
+        }
+
+        if matches!(
+            pending.candidate.as_ref(),
+            Some(CandidateScanoutState::WorkerRenderingFence { .. })
+        ) {
+            let ready = match pending.candidate.as_ref() {
+                Some(CandidateScanoutState::WorkerRenderingFence { frame, .. }) => {
+                    frame.render_fence.is_signaled_nonblocking()?
+                }
+                _ => false,
+            };
+            if !ready {
+                self.pending_output_configuration = Some(pending);
+                return Ok(OutputConfigurationAdvance::Waiting);
+            }
+            if let Some(token) = self.output_render_fence_token.take() {
+                self.event_loop.unregister(token)?;
+            }
+            let Some(CandidateScanoutState::WorkerRenderingFence {
+                candidate,
+                frame,
+                render_info,
+                cursor,
+            }) = pending.candidate.take()
+            else {
+                unreachable!()
+            };
+            let framebuffer = candidate.framebuffer(frame.slot)?;
+            let modeset = match self.kms_backend.prepare_runtime_modeset_candidate(
+                pending.target.mode,
+                pending.target.width,
+                pending.target.height,
+                framebuffer,
+                cursor,
+            ) {
+                Ok(modeset) => modeset,
+                Err(error) => {
+                    pending.candidate = Some(CandidateScanoutState::WorkerRenderingFence {
+                        candidate,
+                        frame,
+                        render_info,
+                        cursor,
+                    });
+                    self.fail_pending_output_configuration(pending, error.to_string())?;
+                    return Ok(OutputConfigurationAdvance::Waiting);
+                }
+            };
+            pending.candidate = Some(CandidateScanoutState::WorkerReady {
+                candidate,
+                frame,
+                render_info,
+                modeset,
+                cursor,
+            });
+        }
+
+        if matches!(
+            pending.candidate.as_ref(),
+            Some(CandidateScanoutState::WorkerReady { .. })
+        ) {
+            let Some(CandidateScanoutState::WorkerReady {
+                candidate,
+                frame,
+                render_info,
+                modeset,
+                cursor,
+            }) = pending.candidate.take()
+            else {
+                unreachable!()
+            };
+            return self.advance_worker_candidate_ready(
+                pending,
+                candidate,
+                frame,
+                render_info,
+                modeset,
+                cursor,
+                now_ns,
+                advance_started,
+            );
         }
 
         let CandidateScanoutState::Ready {
@@ -900,6 +1359,278 @@ impl NativeRuntime {
         Ok(OutputConfigurationAdvance::Completed)
     }
 
+    pub(super) fn quiesce_worker_output_candidate_step(&mut self) -> NativeResult<bool> {
+        let Some(candidate) = self
+            .pending_output_configuration
+            .as_ref()
+            .and_then(|pending| pending.candidate.as_ref())
+        else {
+            return Ok(false);
+        };
+        match candidate {
+            CandidateScanoutState::WorkerPreparing { .. }
+            | CandidateScanoutState::WorkerCancelAfterPrepare { .. }
+            | CandidateScanoutState::WorkerDiscarding { .. }
+            | CandidateScanoutState::WorkerPromoting { .. } => {
+                self.process_render_worker_events()?;
+                Ok(true)
+            }
+            CandidateScanoutState::WorkerRenderingFence { .. }
+            | CandidateScanoutState::WorkerReady { .. } => {
+                let pending = self
+                    .pending_output_configuration
+                    .take()
+                    .expect("candidate state came from a pending output request");
+                self.fail_pending_output_configuration(
+                    pending,
+                    "output configuration cancelled for session suspend".to_string(),
+                )?;
+                Ok(true)
+            }
+            CandidateScanoutState::WorkerDiscardQueued { .. }
+            | CandidateScanoutState::WorkerPromotionQueued { .. }
+            | CandidateScanoutState::WorkerPromoted { .. } => {
+                let now_ns = monotonic_now_ns()?;
+                let _ = self.advance_output_configuration(now_ns)?;
+                Ok(true)
+            }
+            CandidateScanoutState::RenderingFence { .. } | CandidateScanoutState::Ready { .. } => {
+                Ok(false)
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn advance_worker_candidate_ready(
+        &mut self,
+        mut pending: PendingOutputConfigurationRequest,
+        candidate: AtomicOutputConfigurationCandidate,
+        frame: Box<AtomicRenderedFrameParts>,
+        render_info: AtomicRenderDomainInfo,
+        modeset: PreparedAtomicRuntimeModeset<DrmModeBlobIo>,
+        cursor: Option<AtomicCursorVisualState>,
+        now_ns: u64,
+        advance_started: Instant,
+    ) -> NativeResult<OutputConfigurationAdvance> {
+        pending.candidate = Some(CandidateScanoutState::WorkerReady {
+            candidate,
+            frame,
+            render_info,
+            modeset,
+            cursor,
+        });
+        if self.scanout.render_worker_busy() {
+            self.pending_output_configuration = Some(pending);
+            return Ok(OutputConfigurationAdvance::Waiting);
+        }
+        let Some(CandidateScanoutState::WorkerReady {
+            candidate,
+            frame,
+            render_info,
+            mut modeset,
+            cursor,
+        }) = pending.candidate.take()
+        else {
+            unreachable!("worker candidate ready state was just installed")
+        };
+
+        if let Err(error) = self
+            .kms_backend
+            .test_runtime_modeset_candidate(&mut modeset)
+        {
+            pending.candidate = Some(CandidateScanoutState::WorkerReady {
+                candidate,
+                frame,
+                render_info,
+                modeset,
+                cursor,
+            });
+            self.fail_pending_output_configuration(pending, format!("TEST_ONLY: {error}"))?;
+            return Ok(OutputConfigurationAdvance::Waiting);
+        }
+        if !self.scanout.can_retire_direct_after_synchronous_modeset() {
+            pending.candidate = Some(CandidateScanoutState::WorkerReady {
+                candidate,
+                frame,
+                render_info,
+                modeset,
+                cursor,
+            });
+            self.fail_pending_output_configuration(
+                pending,
+                "direct scanout ownership did not drain before synchronous modeset".to_string(),
+            )?;
+            return Ok(OutputConfigurationAdvance::Waiting);
+        }
+
+        let prepared_transaction = match pending.operation {
+            OutputConfigurationOperation::TemporaryApply { previous } => {
+                let next_generation = self
+                    .output_configuration_generation
+                    .get()
+                    .wrapping_add(1)
+                    .max(1);
+                match self
+                    .output_configuration_transactions
+                    .prepare_temporary_apply(
+                        format!("output-{}", self.output_id.get()),
+                        previous,
+                        pending.target,
+                        next_generation,
+                    ) {
+                    Ok(prepared) => Some(prepared),
+                    Err(error) => {
+                        pending.candidate = Some(CandidateScanoutState::WorkerReady {
+                            candidate,
+                            frame,
+                            render_info,
+                            modeset,
+                            cursor,
+                        });
+                        self.fail_pending_output_configuration(
+                            pending,
+                            format!("confirmation transaction reservation failed: {error:?}"),
+                        )?;
+                        return Ok(OutputConfigurationAdvance::Waiting);
+                    }
+                }
+            }
+            OutputConfigurationOperation::Rollback { .. } => None,
+        };
+
+        match self
+            .acquire_watches
+            .park_for_session_suspend(&mut self.event_loop)
+        {
+            Ok(parked) => self.parked_acquire_watches.extend(parked),
+            Err(error) => {
+                if let Some(prepared) = prepared_transaction {
+                    self.output_configuration_transactions
+                        .cancel_prepared_temporary_apply(prepared);
+                }
+                self.rearm_output_acquire_watches(now_ns);
+                pending.candidate = Some(CandidateScanoutState::WorkerReady {
+                    candidate,
+                    frame,
+                    render_info,
+                    modeset,
+                    cursor,
+                });
+                self.fail_pending_output_configuration(pending, error.to_string())?;
+                return Ok(OutputConfigurationAdvance::Waiting);
+            }
+        }
+
+        let commit_started_at_ns = now_ns.saturating_add(
+            u64::try_from(advance_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        );
+        let commit_started = Instant::now();
+        if let Err(error) = self
+            .kms_backend
+            .commit_runtime_modeset_candidate(&mut modeset)
+        {
+            if let Some(prepared) = prepared_transaction {
+                self.output_configuration_transactions
+                    .cancel_prepared_temporary_apply(prepared);
+            }
+            self.rearm_output_acquire_watches(commit_started_at_ns);
+            pending.candidate = Some(CandidateScanoutState::WorkerReady {
+                candidate,
+                frame,
+                render_info,
+                modeset,
+                cursor,
+            });
+            self.fail_pending_output_configuration(pending, format!("real commit: {error}"))?;
+            return Ok(OutputConfigurationAdvance::Waiting);
+        }
+        self.kms_backend
+            .adopt_committed_runtime_modeset_candidate(modeset);
+        let committed_at_ns = commit_started_at_ns
+            .saturating_add(u64::try_from(commit_started.elapsed().as_nanos()).unwrap_or(u64::MAX));
+        pending.prepared_transaction = prepared_transaction;
+        pending.candidate = Some(CandidateScanoutState::WorkerPromotionQueued {
+            candidate,
+            frame,
+            render_info,
+            cursor,
+            committed_at_ns,
+        });
+        self.pending_output_configuration = Some(pending);
+        self.event_loop.request_continuation(
+            oblivion_one::native::event_loop::NativeContinuationReason::FrameScheduler,
+        )?;
+        Ok(OutputConfigurationAdvance::Waiting)
+    }
+
+    fn complete_worker_output_configuration(
+        &mut self,
+        mut pending: PendingOutputConfigurationRequest,
+        candidate: AtomicOutputConfigurationCandidate,
+        frame: Box<AtomicRenderedFrameParts>,
+        render_info: AtomicRenderDomainInfo,
+        cursor: Option<AtomicCursorVisualState>,
+        committed_at_ns: u64,
+    ) -> NativeResult<()> {
+        self.publish_worker_output_configuration(
+            pending.target,
+            candidate,
+            frame,
+            render_info,
+            cursor,
+            committed_at_ns,
+        )?;
+        if let Some(prepared) = pending.prepared_transaction.take() {
+            let transaction_id = self
+                .output_configuration_transactions
+                .finalize_temporary_apply(prepared, committed_at_ns);
+            self.perf.log("native.output_configuration_applied", || {
+                vec![
+                    NativePerfField::u64("transaction_id", transaction_id.get()),
+                    NativePerfField::u64(
+                        "configuration_generation",
+                        self.output_configuration_generation.get(),
+                    ),
+                    NativePerfField::u64("width", u64::from(self.target.width)),
+                    NativePerfField::u64("height", u64::from(self.target.height)),
+                ]
+            });
+            self.queue_output_snapshot_response_after_commit(pending.response);
+        } else {
+            match pending.operation {
+                OutputConfigurationOperation::TemporaryApply { .. } => {
+                    return Err(io::Error::other(
+                        "committed worker output apply lost its reserved transaction",
+                    )
+                    .into());
+                }
+                OutputConfigurationOperation::Rollback { transaction_id } => {
+                    self.output_configuration_transactions
+                        .finalize_committed_rollback(transaction_id);
+                    if self.pending_output_persistence.as_ref().is_some_and(|job| {
+                        matches!(job.purpose, OutputPersistencePurpose::Confirm { .. })
+                    }) {
+                        self.output_persistence_compensation_required = true;
+                    }
+                    self.perf
+                        .log("native.output_configuration_rolled_back", || {
+                            vec![
+                                NativePerfField::u64(
+                                    "configuration_generation",
+                                    self.output_configuration_generation.get(),
+                                ),
+                                NativePerfField::u64("width", u64::from(self.target.width)),
+                                NativePerfField::u64("height", u64::from(self.target.height)),
+                            ]
+                        });
+                    self.queue_output_snapshot_response_after_commit(pending.response);
+                }
+            }
+        }
+        self.rearm_output_acquire_watches(committed_at_ns);
+        Ok(())
+    }
+
     fn rearm_output_acquire_watches(&mut self, now_ns: u64) {
         if self.parked_acquire_watches.is_empty() {
             self.output_reconfiguration_rearm_retry_deadline_ns = None;
@@ -1031,6 +1762,68 @@ impl NativeRuntime {
     ) -> io::Result<CandidateScanoutState> {
         let generation = self.drm_file_generation.wrapping_add(1).max(1);
         let output_id = self.output_id;
+        let current_format = self.scanout.scanout_format();
+        let cursor = self.candidate_cursor_state(target);
+        if let NativeScanoutBackend::AtomicEglGbm(explicit) = &mut *self.scanout
+            && explicit.render_worker_active()
+        {
+            if explicit.render_worker_busy() {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "render worker is busy before output candidate preparation",
+                ));
+            }
+            let connector = ConnectorId::new(target.connector_id)
+                .ok_or_else(|| io::Error::other("connector ID is zero"))?;
+            let crtc =
+                CrtcId::new(target.crtc_id).ok_or_else(|| io::Error::other("CRTC ID is zero"))?;
+            let discovery = KmsBackendSelection::discover_atomic_pipeline(
+                self.kms.file().as_fd(),
+                connector,
+                crtc,
+                current_format,
+            )
+            .map_err(io::Error::other)?;
+            let scene =
+                ResolvedNativeFrameScene::for_synchronous_output_reconfiguration(&self.server)
+                    .into_owned();
+            let mut candidate_input_state = self.input_state.clone();
+            candidate_input_state.reconfigure_output_bounds(target.width, target.height);
+            let candidate_cursor_mode = match self.cursor_render_mode {
+                NativeCursorRenderMode::SoftwareClient => NativeCursorRenderMode::Software,
+                mode => mode,
+            };
+            let frozen_frame = FrozenNativeRenderFrame::freeze(
+                target.width,
+                target.height,
+                scene,
+                &self.server,
+                &candidate_input_state,
+                candidate_cursor_mode,
+                Some(
+                    NativeOutputDamage::full_output(target.width, target.height)
+                        .as_renderer_damage(target.width, target.height),
+                ),
+            );
+            let job_id = super::render_worker::next_render_worker_job_id()?;
+            let material_generation = self.server.trusted_effect_registry().current();
+            let effect_generation = self.server.trusted_effect_registry().current();
+            let candidate = explicit.start_worker_output_configuration_candidate(
+                self.kms.file(),
+                discovery,
+                target.width,
+                target.height,
+                generation,
+                generation,
+                job_id,
+                self.frame_index.wrapping_add(1).max(1),
+                frozen_frame,
+                (*material_generation).clone(),
+                (*effect_generation).clone(),
+                self.cursor_image.clone(),
+            )?;
+            return Ok(CandidateScanoutState::WorkerPreparing { candidate, cursor });
+        }
         let mut scanout = match self.scanout.kind() {
             NativeScanoutKind::AtomicEglGbmExplicit => {
                 let connector = ConnectorId::new(target.connector_id)
@@ -1045,13 +1838,16 @@ impl NativeRuntime {
                     format,
                 )
                 .map_err(io::Error::other)?;
-                let explicit = AtomicEglGbmScanout::create_unattached_pool(
+                let initial_generation = self.server.trusted_effect_registry().current();
+                let explicit = AtomicEglGbmScanout::create_synchronous_unattached_pool(
                     self.kms.file(),
                     &discovery,
                     target.width,
                     target.height,
                     generation,
                     output_id,
+                    initial_generation,
+                    self.cursor_image.clone(),
                 )?;
                 NativeScanoutBackend::from_atomic_explicit(explicit)
             }
@@ -1182,6 +1978,36 @@ impl NativeRuntime {
         self.scanout.retire_direct_after_synchronous_modeset();
         std::mem::swap(&mut *self.scanout, candidate_scanout);
 
+        self.publish_output_configuration_state(target, cursor, now_ns);
+    }
+
+    fn publish_worker_output_configuration(
+        &mut self,
+        target: NativeAppliedOutputConfiguration,
+        candidate: AtomicOutputConfigurationCandidate,
+        frame: Box<AtomicRenderedFrameParts>,
+        render_info: AtomicRenderDomainInfo,
+        cursor: Option<AtomicCursorVisualState>,
+        now_ns: u64,
+    ) -> NativeResult<()> {
+        self.scanout.retire_direct_after_synchronous_modeset();
+        let NativeScanoutBackend::AtomicEglGbm(explicit) = &mut *self.scanout else {
+            return Err(io::Error::other(
+                "worker output candidate lost its explicit Atomic scanout owner",
+            )
+            .into());
+        };
+        explicit.adopt_worker_output_candidate(candidate, frame, render_info)?;
+        self.publish_output_configuration_state(target, cursor, now_ns);
+        Ok(())
+    }
+
+    fn publish_output_configuration_state(
+        &mut self,
+        target: NativeAppliedOutputConfiguration,
+        cursor: Option<AtomicCursorVisualState>,
+        now_ns: u64,
+    ) {
         self.target = target;
         self.drm_file_generation = self.drm_file_generation.wrapping_add(1).max(1);
         self.acquire_watches
@@ -1270,9 +2096,76 @@ impl NativeRuntime {
 
     fn fail_pending_output_configuration(
         &mut self,
-        pending: PendingOutputConfigurationRequest,
+        mut pending: PendingOutputConfigurationRequest,
         detail: String,
     ) -> NativeResult<()> {
+        if let Some(candidate_state) = pending.candidate.take() {
+            match candidate_state {
+                CandidateScanoutState::WorkerPreparing { candidate, .. }
+                | CandidateScanoutState::WorkerCancelAfterPrepare { candidate, .. } => {
+                    pending.candidate =
+                        Some(CandidateScanoutState::WorkerCancelAfterPrepare { candidate, detail });
+                    self.pending_output_configuration = Some(pending);
+                    return Ok(());
+                }
+                CandidateScanoutState::WorkerRenderingFence {
+                    candidate,
+                    frame,
+                    render_info,
+                    cursor,
+                } => {
+                    if let Some(token) = self.output_render_fence_token.take()
+                        && let Err(error) = self.event_loop.unregister(token)
+                    {
+                        self.output_render_fence_token = Some(token);
+                        pending.candidate = Some(CandidateScanoutState::WorkerRenderingFence {
+                            candidate,
+                            frame,
+                            render_info,
+                            cursor,
+                        });
+                        self.pending_output_configuration = Some(pending);
+                        return Err(error.into());
+                    }
+                    drop(frame);
+                    self.queue_worker_candidate_discard(pending, candidate, detail)?;
+                    return Ok(());
+                }
+                CandidateScanoutState::WorkerReady {
+                    candidate,
+                    frame,
+                    render_info: _,
+                    modeset: _,
+                    cursor: _,
+                } => {
+                    drop(frame);
+                    self.queue_worker_candidate_discard(pending, candidate, detail)?;
+                    return Ok(());
+                }
+                queued @ CandidateScanoutState::WorkerDiscardQueued { .. }
+                | queued @ CandidateScanoutState::WorkerDiscarding { .. } => {
+                    pending.candidate = Some(queued);
+                    self.pending_output_configuration = Some(pending);
+                    return Ok(());
+                }
+                promoted @ CandidateScanoutState::WorkerPromotionQueued { .. }
+                | promoted @ CandidateScanoutState::WorkerPromoting { .. }
+                | promoted @ CandidateScanoutState::WorkerPromoted { .. } => {
+                    pending.candidate = Some(promoted);
+                    self.pending_output_configuration = Some(pending);
+                    return Err(io::Error::other(
+                        "output configuration cannot be failed after KMS committed a worker candidate",
+                    )
+                    .into());
+                }
+                other => {
+                    pending.candidate = Some(other);
+                    // Synchronous candidate ownership is destroyed by dropping
+                    // its own render domain before its physical pool.
+                    let _ = pending.candidate.take();
+                }
+            }
+        }
         match pending.operation {
             OutputConfigurationOperation::TemporaryApply { .. } => {
                 let code = pending
@@ -1309,6 +2202,28 @@ impl NativeRuntime {
                 )?;
             }
         }
+        Ok(())
+    }
+
+    fn queue_worker_candidate_discard(
+        &mut self,
+        mut pending: PendingOutputConfigurationRequest,
+        candidate: AtomicOutputConfigurationCandidate,
+        detail: String,
+    ) -> NativeResult<()> {
+        let identity = candidate.identity();
+        let state = match self.scanout.try_discard_worker_output_candidate(identity) {
+            Ok(true) => CandidateScanoutState::WorkerDiscarding { candidate, detail },
+            Ok(false) => CandidateScanoutState::WorkerDiscardQueued { candidate, detail },
+            Err(error) => {
+                pending.candidate =
+                    Some(CandidateScanoutState::WorkerDiscardQueued { candidate, detail });
+                self.pending_output_configuration = Some(pending);
+                return Err(error.into());
+            }
+        };
+        pending.candidate = Some(state);
+        self.pending_output_configuration = Some(pending);
         Ok(())
     }
 }
