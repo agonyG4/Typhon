@@ -740,6 +740,7 @@ pub(crate) struct NativeRuntime {
     pending_render_worker_outer: Option<presentation_cycle::AtomicRenderOuterContinuation>,
     pending_render_worker_completion: Option<super::scanout::AtomicRenderWorkerCompletion>,
     pending_render_worker_capture: Option<render_worker::PendingWorkerCapture>,
+    pending_worker_effect_reload: Option<render_worker::PendingWorkerEffectReload>,
     cursor_io_worker: Option<oblivion_one::cursor_manager::CursorIoWorker>,
     cursor_io_worker_reactor_token: Option<ReactorToken>,
     pending_cursor_job: Option<PendingCursorJob>,

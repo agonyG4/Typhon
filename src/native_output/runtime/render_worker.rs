@@ -7,7 +7,7 @@
 use super::*;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-static NEXT_RENDER_WORKER_CAPTURE_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_RENDER_WORKER_JOB_ID: AtomicU64 = AtomicU64::new(1);
 
 pub(super) struct PendingWorkerCapture {
     pub(super) job_id: crate::native_output::scanout::RenderWorkerJobId,
@@ -17,9 +17,16 @@ pub(super) struct PendingWorkerCapture {
     pub(super) cancelled: bool,
 }
 
-pub(super) fn next_render_worker_capture_id()
+pub(super) struct PendingWorkerEffectReload {
+    pub(super) job_id: crate::native_output::scanout::RenderWorkerJobId,
+    pub(super) control_epoch: u64,
+    pub(super) token: oblivion_one::native::event_loop::ReactorToken,
+    pub(super) request_id: u64,
+}
+
+pub(super) fn next_render_worker_job_id()
 -> io::Result<crate::native_output::scanout::RenderWorkerJobId> {
-    let value = NEXT_RENDER_WORKER_CAPTURE_ID
+    let value = NEXT_RENDER_WORKER_JOB_ID
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             current.checked_add(1)
         })
@@ -28,7 +35,110 @@ pub(super) fn next_render_worker_capture_id()
         .ok_or_else(|| io::Error::other("render-worker capture ID is zero"))
 }
 
+pub(super) const fn effect_reload_admission_available(
+    worker_active: bool,
+    worker_busy: bool,
+    reload_pending: bool,
+) -> bool {
+    worker_active && !worker_busy && !reload_pending
+}
+
 impl NativeRuntime {
+    fn complete_worker_effect_reload(
+        &mut self,
+        job_id: crate::native_output::scanout::RenderWorkerJobId,
+        control_epoch: u64,
+        result: Result<Option<crate::native_output::scanout::PreparedWorkerEffectReload>, String>,
+    ) -> NativeResult<()> {
+        if self.pending_render_worker_identity.is_some()
+            || self.pending_render_worker_context.is_some()
+            || self.pending_render_worker_outer.is_some()
+            || self.pending_render_worker_completion.is_some()
+            || self.pending_render_worker_capture.is_some()
+        {
+            return Err(io::Error::other(
+                "effect reload completion arrived while another render continuation owns the worker",
+            )
+            .into());
+        }
+        let Some(pending) = self.pending_worker_effect_reload.take() else {
+            return Err(io::Error::other(
+                "effect reload completion arrived without reactor request ownership",
+            )
+            .into());
+        };
+        if pending.job_id != job_id || pending.control_epoch != control_epoch {
+            return Err(io::Error::other(
+                "effect reload completion job identity or renderer control epoch mismatch",
+            )
+            .into());
+        }
+
+        let mut request_redraw = false;
+        let response = match result {
+            Ok(Some(reload)) => {
+                let generation = self
+                    .server
+                    .trusted_effect_registry()
+                    .publish_prepared_reload(reload.prepared)
+                    .map_err(|error| {
+                        io::Error::other(format!(
+                            "render worker installed an effect generation that could not become authoritative: {error}"
+                        ))
+                    })?;
+                let scene_generation = self.server.scene_render_generation();
+                self.server.reconcile_trusted_effect_bindings();
+                if self.server.scene_render_generation() == scene_generation {
+                    self.server.note_trusted_effect_registry_reload();
+                }
+                request_redraw = true;
+                let snapshot = oblivion_one::control_snapshots::TrustedEffectsReloadSnapshot {
+                    manifest_path: reload.manifest_path,
+                    generation: generation.generation,
+                    effect_count: generation.effects.len(),
+                };
+                match serde_json::to_value(snapshot) {
+                    Ok(snapshot) => oblivion_one::control::ControlResponse::success(
+                        pending.request_id,
+                        snapshot,
+                    ),
+                    Err(_) => oblivion_one::control::ControlResponse::failure(
+                        pending.request_id,
+                        oblivion_one::control::ControlError::new(
+                            oblivion_one::control::ControlErrorCode::Internal,
+                            "effect reload snapshot failed",
+                        ),
+                    ),
+                }
+            }
+            Ok(None) => oblivion_one::control::ControlResponse::failure(
+                pending.request_id,
+                oblivion_one::control::ControlError::new(
+                    oblivion_one::control::ControlErrorCode::Internal,
+                    "trusted effects manifest is not present",
+                ),
+            ),
+            Err(error) => oblivion_one::control::ControlResponse::failure(
+                pending.request_id,
+                oblivion_one::control::ControlError::new(
+                    oblivion_one::control::ControlErrorCode::Internal,
+                    format!("trusted effect reload failed: {error}"),
+                ),
+            ),
+        };
+        if self.control_server.has_client(pending.token) {
+            self.control_server
+                .queue_response(&mut self.event_loop, pending.token, response)?;
+        }
+        if request_redraw {
+            self.queued_redraw_requested = true;
+            self.event_loop.request_continuation(
+                oblivion_one::native::event_loop::NativeContinuationReason::FrameScheduler,
+            )?;
+        }
+        Ok(())
+    }
+
     fn complete_worker_capture(
         &mut self,
         job_id: crate::native_output::scanout::RenderWorkerJobId,
@@ -619,6 +729,13 @@ impl NativeRuntime {
                         oblivion_one::native::event_loop::NativeContinuationReason::ScreenCaptureBacklog,
                     )?;
                 }
+                crate::native_output::scanout::AtomicRenderWorkerEvent::EffectsReloaded {
+                    job_id,
+                    control_epoch,
+                    result,
+                } => {
+                    self.complete_worker_effect_reload(job_id, control_epoch, result)?;
+                }
                 crate::native_output::scanout::AtomicRenderWorkerEvent::Fatal {
                     job_id,
                     gpu_execution_uncertain,
@@ -632,5 +749,18 @@ impl NativeRuntime {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::effect_reload_admission_available;
+
+    #[test]
+    fn effect_reload_admission_is_single_flight_and_requires_idle_worker() {
+        assert!(effect_reload_admission_available(true, false, false));
+        assert!(!effect_reload_admission_available(true, true, false));
+        assert!(!effect_reload_admission_available(true, false, true));
+        assert!(!effect_reload_admission_available(false, false, false));
     }
 }

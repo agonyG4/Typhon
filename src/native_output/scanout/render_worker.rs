@@ -25,7 +25,7 @@ use crate::egl_renderer::native_fence::NativeRenderFence;
 use crate::egl_renderer::{EglSceneFrameCommit, OutputDamage};
 use crate::native_output::presentation::transaction::OutputTransactionId;
 use oblivion_one::cursor_theme::CompositorCursorImage;
-use oblivion_one::effects::EffectRegistryGeneration;
+use oblivion_one::effects::{EffectRegistryGeneration, PreparedEffectRegistryReload};
 use oblivion_one::native::kms::DrmFormatModifierPair;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -168,6 +168,18 @@ pub(crate) struct AtomicRenderWorkerCapture {
     pub(crate) controls_before: Vec<SequencedRenderControl>,
 }
 
+pub(crate) struct AtomicRenderWorkerEffectReload {
+    pub(crate) job_id: RenderWorkerJobId,
+    pub(crate) previous_generation: Arc<EffectRegistryGeneration>,
+    pub(crate) required_control_epoch: u64,
+    pub(crate) controls_before: Vec<SequencedRenderControl>,
+}
+
+pub(crate) struct PreparedWorkerEffectReload {
+    pub(crate) manifest_path: String,
+    pub(crate) prepared: PreparedEffectRegistryReload,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct AtomicRenderWorkerIdentity {
     pub(crate) job_id: RenderWorkerJobId,
@@ -215,6 +227,11 @@ pub(crate) enum AtomicRenderWorkerEvent {
         control_epoch: u64,
         result: io::Result<Vec<u8>>,
     },
+    EffectsReloaded {
+        job_id: RenderWorkerJobId,
+        control_epoch: u64,
+        result: Result<Option<PreparedWorkerEffectReload>, String>,
+    },
     Fatal {
         job_id: Option<RenderWorkerJobId>,
         gpu_execution_uncertain: bool,
@@ -238,6 +255,7 @@ enum RenderWorkerCommand {
     },
     Render(AtomicRenderWorkerJob),
     Capture(AtomicRenderWorkerCapture),
+    ReloadEffects(AtomicRenderWorkerEffectReload),
     Shutdown,
 }
 
@@ -421,6 +439,31 @@ impl AtomicRenderWorkerHandle {
             }
             Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
                 unreachable!("only a capture command is offered through try_dispatch_capture")
+            }
+        }
+    }
+
+    pub(crate) fn try_dispatch_effect_reload(
+        &mut self,
+        reload: AtomicRenderWorkerEffectReload,
+    ) -> Result<(), AtomicRenderWorkerEffectReload> {
+        if !self.initialized || self.busy || self.fatal.load(Ordering::Acquire) {
+            return Err(reload);
+        }
+        match self
+            .commands
+            .try_send(RenderWorkerCommand::ReloadEffects(reload))
+        {
+            Ok(()) => {
+                self.busy = true;
+                Ok(())
+            }
+            Err(TrySendError::Full(RenderWorkerCommand::ReloadEffects(reload)))
+            | Err(TrySendError::Disconnected(RenderWorkerCommand::ReloadEffects(reload))) => {
+                Err(reload)
+            }
+            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
+                unreachable!("only a reload command is offered through try_dispatch_effect_reload")
             }
         }
     }
@@ -671,6 +714,78 @@ fn render_worker_loop(
                     return;
                 }
             }
+            RenderWorkerCommand::ReloadEffects(reload) => {
+                let AtomicRenderWorkerEffectReload {
+                    job_id,
+                    previous_generation,
+                    required_control_epoch,
+                    controls_before,
+                } = reload;
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                    || -> io::Result<Result<Option<PreparedWorkerEffectReload>, String>> {
+                        let domain = domain.as_mut().ok_or_else(|| {
+                            io::Error::other(
+                                "render worker received effect reload before initialization",
+                            )
+                        })?;
+                        validate_render_control_batch(
+                            applied_control_epoch,
+                            &controls_before,
+                            required_control_epoch,
+                        )?;
+                        for control in controls_before {
+                            apply_render_control(domain, control.control)?;
+                            applied_control_epoch = control.epoch;
+                        }
+                        let reload_result = (|| {
+                            let Some((path, manifest)) =
+                                oblivion_one::effects::load_default_trusted_effect_manifest()
+                                    .map_err(|error| error.to_string())?
+                            else {
+                                return Ok(None);
+                            };
+                            let prepared = PreparedEffectRegistryReload::from_previous(
+                                &previous_generation,
+                                manifest,
+                            )
+                            .map_err(|error| error.to_string())?;
+                            domain
+                                .publish_effect_registry_generation(prepared.generation().clone())
+                                .map_err(|error| error.to_string())?;
+                            Ok(Some(PreparedWorkerEffectReload {
+                                manifest_path: path.display().to_string(),
+                                prepared,
+                            }))
+                        })();
+                        Ok(reload_result)
+                    },
+                ));
+                let event = match result {
+                    Ok(Ok(result)) => AtomicRenderWorkerEvent::EffectsReloaded {
+                        job_id,
+                        control_epoch: applied_control_epoch,
+                        result,
+                    },
+                    Ok(Err(_)) => AtomicRenderWorkerEvent::Fatal {
+                        job_id: Some(job_id),
+                        gpu_execution_uncertain: true,
+                        reason: "effect_reload_control_application_failed",
+                    },
+                    Err(_) => AtomicRenderWorkerEvent::Fatal {
+                        job_id: Some(job_id),
+                        gpu_execution_uncertain: true,
+                        reason: "panic_during_effect_reload",
+                    },
+                };
+                fatal.store(
+                    matches!(&event, AtomicRenderWorkerEvent::Fatal { .. }),
+                    Ordering::Release,
+                );
+                if publish_event(&events, &event_fd, event).is_err() {
+                    fatal.store(true, Ordering::Release);
+                    return;
+                }
+            }
             RenderWorkerCommand::Shutdown => {
                 if let Some(mut domain) = domain.take() {
                     domain.teardown();
@@ -853,6 +968,8 @@ fn assert_atomic_render_worker_transport_is_send() {
     fn assert_send<T: Send>() {}
     assert_send::<AtomicRenderWorkerJob>();
     assert_send::<AtomicRenderWorkerCapture>();
+    assert_send::<AtomicRenderWorkerEffectReload>();
+    assert_send::<PreparedWorkerEffectReload>();
     assert_send::<AtomicRenderWorkerCompletion>();
     assert_send::<AtomicRenderWorkerEvent>();
 }
@@ -1003,6 +1120,34 @@ mod tests {
                 reason: "control_lane_overflow",
             })
         ));
+    }
+
+    #[test]
+    fn effect_reload_admission_is_nonblocking_while_another_command_is_active() {
+        let (commands, _command_rx) = mpsc::sync_channel(1);
+        let (_events_tx, events) = mpsc::sync_channel(1);
+        let event_fd = Arc::new(create_eventfd().expect("eventfd"));
+        let fatal = Arc::new(AtomicBool::new(false));
+        let mut worker = AtomicRenderWorkerHandle {
+            commands,
+            events,
+            event_fd,
+            join: None,
+            busy: true,
+            initialized: true,
+            fatal,
+            control_lane_overflowed: false,
+        };
+
+        let rejected = worker.try_dispatch_effect_reload(AtomicRenderWorkerEffectReload {
+            job_id: RenderWorkerJobId::new(1).expect("nonzero job id"),
+            previous_generation: Arc::new(EffectRegistryGeneration::empty()),
+            controls_before: Vec::new(),
+            required_control_epoch: 0,
+        });
+
+        assert!(rejected.is_err());
+        assert!(worker.busy());
     }
 
     #[test]

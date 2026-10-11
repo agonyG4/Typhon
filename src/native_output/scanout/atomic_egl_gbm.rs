@@ -39,9 +39,9 @@ use super::atomic_render_domain::{AtomicRenderDomain, AtomicRenderDomainBootstra
 pub(crate) use super::atomic_render_domain::{AtomicRenderedFrameParts, AtomicSlotRenderOutcome};
 use super::render_worker::{
     AtomicRenderControl, AtomicRenderTransportKind, AtomicRenderWorkerCapture,
-    AtomicRenderWorkerEvent, AtomicRenderWorkerHandle, AtomicRenderWorkerIdentity,
-    AtomicRenderWorkerJob, AtomicRenderWorkerPolicy, AtomicRenderWorkerStartup, RenderWorkerJobId,
-    SequencedRenderControl, apply_render_control,
+    AtomicRenderWorkerEffectReload, AtomicRenderWorkerEvent, AtomicRenderWorkerHandle,
+    AtomicRenderWorkerIdentity, AtomicRenderWorkerJob, AtomicRenderWorkerPolicy,
+    AtomicRenderWorkerStartup, RenderWorkerJobId, SequencedRenderControl, apply_render_control,
 };
 use super::*;
 use crate::native_output::presentation::async_validation::CompositedPresentationValidationKey;
@@ -1241,6 +1241,34 @@ impl AtomicEglGbmScanout {
                 Err(io::Error::other(
                     "render worker rejected a serialized capture command",
                 ))
+            }
+        }
+    }
+
+    pub(crate) fn dispatch_effect_reload(
+        &mut self,
+        job_id: RenderWorkerJobId,
+        previous_generation: std::sync::Arc<oblivion_one::effects::EffectRegistryGeneration>,
+    ) -> io::Result<Option<u64>> {
+        if !self.render_worker().is_some_and(|worker| !worker.busy()) {
+            return Ok(None);
+        }
+        let (controls_before, required_control_epoch) = self.take_render_controls_for_job()?;
+        let reload = AtomicRenderWorkerEffectReload {
+            job_id,
+            previous_generation,
+            required_control_epoch,
+            controls_before,
+        };
+        match self
+            .render_worker_mut()
+            .ok_or_else(|| io::Error::other("effect reload requires render-worker mode"))?
+            .try_dispatch_effect_reload(reload)
+        {
+            Ok(()) => Ok(Some(required_control_epoch)),
+            Err(reload) => {
+                self.pending_render_controls = reload.controls_before;
+                Ok(None)
             }
         }
     }

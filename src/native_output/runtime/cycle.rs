@@ -1568,7 +1568,7 @@ impl NativeRuntime {
         };
         let resolved_scene = ResolvedNativeFrameScene::from_server(&self.server).into_owned();
         if self.scanout.render_worker_active() {
-            let job_id = super::render_worker::next_render_worker_capture_id()?;
+            let job_id = super::render_worker::next_render_worker_job_id()?;
             let frozen_frame = match &*self.scanout {
                 crate::native_output::scanout::NativeScanoutBackend::AtomicEglGbm(scanout) => {
                     scanout.freeze_capture_frame(

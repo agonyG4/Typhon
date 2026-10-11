@@ -1048,6 +1048,16 @@ impl NativeRuntime {
                     ));
                 }
             };
+            if self.pending_worker_effect_reload.is_some() {
+                return Some(ControlResponse::failure(
+                    request.id,
+                    ControlError::new(
+                        ControlErrorCode::Internal,
+                        "trusted effect registry reload is in flight",
+                    )
+                    .with_detail("effect_reload_busy"),
+                ));
+            }
             match self.server.set_material_configuration(configuration) {
                 Ok(snapshot) => {
                     let generation = self.server.trusted_effect_registry().current();
@@ -1229,6 +1239,63 @@ impl NativeRuntime {
                         "effects reload takes no arguments",
                     ),
                 ));
+            }
+            if self.scanout.render_worker_active() {
+                if !super::render_worker::effect_reload_admission_available(
+                    true,
+                    self.scanout.render_worker_busy(),
+                    self.pending_worker_effect_reload.is_some(),
+                ) {
+                    return Some(ControlResponse::failure(
+                        request.id,
+                        ControlError::new(
+                            ControlErrorCode::Internal,
+                            "render worker is busy; effect reload was not admitted",
+                        )
+                        .with_detail("effect_reload_busy"),
+                    ));
+                }
+                let job_id = match super::render_worker::next_render_worker_job_id() {
+                    Ok(job_id) => job_id,
+                    Err(error) => {
+                        return Some(ControlResponse::failure(
+                            request.id,
+                            ControlError::new(ControlErrorCode::Internal, error.to_string()),
+                        ));
+                    }
+                };
+                let previous_generation = self.server.trusted_effect_registry().current();
+                match self
+                    .scanout
+                    .dispatch_render_worker_effect_reload(job_id, previous_generation)
+                {
+                    Ok(Some(control_epoch)) => {
+                        self.pending_worker_effect_reload =
+                            Some(super::render_worker::PendingWorkerEffectReload {
+                                job_id,
+                                control_epoch,
+                                token,
+                                request_id: request.id,
+                            });
+                        return None;
+                    }
+                    Ok(None) => {
+                        return Some(ControlResponse::failure(
+                            request.id,
+                            ControlError::new(
+                                ControlErrorCode::Internal,
+                                "render worker rejected effect reload admission",
+                            )
+                            .with_detail("effect_reload_busy"),
+                        ));
+                    }
+                    Err(error) => {
+                        return Some(ControlResponse::failure(
+                            request.id,
+                            ControlError::new(ControlErrorCode::Internal, error.to_string()),
+                        ));
+                    }
+                }
             }
             let snapshot = match super::reload_trusted_effects_from_disk(
                 &mut self.scanout,

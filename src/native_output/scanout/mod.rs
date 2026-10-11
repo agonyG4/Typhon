@@ -50,7 +50,7 @@ pub(crate) use output_slot::*;
 pub(crate) use output_swapchain::*;
 pub(crate) use render_worker::{
     AtomicRenderWorkerCompletion, AtomicRenderWorkerEvent, AtomicRenderWorkerIdentity,
-    RenderWorkerJobId, completion_matches_job,
+    PreparedWorkerEffectReload, RenderWorkerJobId, completion_matches_job,
 };
 pub(crate) use scaled_probe::*;
 
@@ -304,6 +304,21 @@ impl NativeScanoutBackend {
             Self::AtomicEglGbm(scanout) => scanout.dispatch_capture(job_id, frozen_frame),
             Self::NativeEglGbm(_) | Self::Gbm(_) | Self::Dumb(_) => Err(std::io::Error::other(
                 "render-worker capture requires explicit Atomic scanout",
+            )),
+        }
+    }
+
+    pub(crate) fn dispatch_render_worker_effect_reload(
+        &mut self,
+        job_id: RenderWorkerJobId,
+        previous_generation: std::sync::Arc<oblivion_one::effects::EffectRegistryGeneration>,
+    ) -> std::io::Result<Option<u64>> {
+        match self {
+            Self::AtomicEglGbm(scanout) => {
+                scanout.dispatch_effect_reload(job_id, previous_generation)
+            }
+            Self::NativeEglGbm(_) | Self::Gbm(_) | Self::Dumb(_) => Err(std::io::Error::other(
+                "render-worker effect reload requires explicit Atomic scanout",
             )),
         }
     }

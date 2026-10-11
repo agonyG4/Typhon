@@ -293,6 +293,22 @@ pub struct PreparedEffectRegistryReload {
 }
 
 impl PreparedEffectRegistryReload {
+    pub fn from_previous(
+        previous: &EffectRegistryGeneration,
+        manifest: EffectManifest,
+    ) -> Result<Self, RegistryReloadError> {
+        let mut generation = build_generation(manifest, previous.generation.saturating_add(1))?;
+        inherit_builtin_material(&mut generation, previous)?;
+        Ok(Self {
+            previous_generation: previous.generation,
+            generation,
+        })
+    }
+
+    pub fn previous_generation(&self) -> u64 {
+        self.previous_generation
+    }
+
     pub fn generation(&self) -> &EffectRegistryGeneration {
         &self.generation
     }
@@ -411,12 +427,7 @@ impl TrustedEffectRegistry {
         manifest: EffectManifest,
     ) -> Result<PreparedEffectRegistryReload, RegistryReloadError> {
         let previous = self.current();
-        let mut generation = build_generation(manifest, previous.generation.saturating_add(1))?;
-        inherit_builtin_material(&mut generation, &previous)?;
-        Ok(PreparedEffectRegistryReload {
-            previous_generation: previous.generation,
-            generation,
-        })
+        PreparedEffectRegistryReload::from_previous(&previous, manifest)
     }
 
     /// Publish a prepared candidate only if the authoritative generation has
@@ -1120,6 +1131,18 @@ mod tests {
 
         assert_eq!(published.generation, candidate_generation);
         assert_eq!(registry.current().generation, candidate_generation);
+    }
+
+    #[test]
+    fn prepared_reload_can_be_built_from_an_owned_previous_generation_snapshot() {
+        let registry = TrustedEffectRegistry::new();
+        let previous = registry.current();
+
+        let prepared = PreparedEffectRegistryReload::from_previous(&previous, manifest()).unwrap();
+
+        assert_eq!(prepared.previous_generation(), previous.generation);
+        assert_eq!(prepared.generation().generation, previous.generation + 1);
+        assert_eq!(registry.current().generation, previous.generation);
     }
 
     #[test]

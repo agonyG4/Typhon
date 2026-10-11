@@ -742,6 +742,7 @@ impl NativeRuntime {
             pending_render_worker_outer: None,
             pending_render_worker_completion: None,
             pending_render_worker_capture: None,
+            pending_worker_effect_reload: None,
             cursor_io_worker: Some(cursor_io_worker),
             cursor_io_worker_reactor_token,
             pending_cursor_job: None,
