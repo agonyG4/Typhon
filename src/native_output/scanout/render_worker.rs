@@ -428,7 +428,7 @@ impl AtomicRenderWorkerHandle {
                 }
                 let panic_events = event_tx.clone();
                 let panic_fd = Arc::clone(&worker_event_fd);
-                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let loop_result = super::render_worker_panic::catch_render_worker_loop(|| {
                     render_worker_loop(
                         bootstrap,
                         command_rx,
@@ -436,9 +436,8 @@ impl AtomicRenderWorkerHandle {
                         worker_event_fd,
                         worker_fatal.clone(),
                     );
-                }))
-                .is_err()
-                {
+                });
+                if let Err(panic) = loop_result {
                     worker_fatal.store(true, Ordering::Release);
                     let _ = publish_event(
                         &panic_events,
@@ -446,7 +445,7 @@ impl AtomicRenderWorkerHandle {
                         AtomicRenderWorkerEvent::Fatal {
                             job_id: None,
                             gpu_execution_uncertain: true,
-                            reason: "worker_loop_panic",
+                            reason: panic.reason(),
                         },
                     );
                 }
