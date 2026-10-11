@@ -5,6 +5,14 @@ use crate::xwayland::xwm::{
     X11MoveResizeDirection as Direction, X11MoveResizeRequest, XwmCommand,
 };
 
+pub(super) struct X11ConfigureRequestGeometry {
+    pub icccm_geometry: X11Geometry,
+    pub accepted_geometry: X11Geometry,
+    pub constraint_reason: String,
+    pub usable_area: crate::compositor::OutputRect,
+    pub frame_extents: [u32; 4],
+}
+
 fn trace_x11_resize_backend_command(
     window: X11WindowHandle,
     command_kind: &'static str,
@@ -35,13 +43,11 @@ impl OwnCompositorServer {
         window: X11WindowHandle,
         request: X11ConfigureRequest,
         current_authoritative: Option<X11Geometry>,
-        desired: X11Geometry,
+        normalization: &X11ConfigureRequestGeometry,
     ) {
-        let root_surface_id = self
-            .state
-            .window_id_for_x11_handle(window)
-            .and_then(|id| self.state.window(id))
-            .map(|window| window.root_surface_id);
+        let window_id = self.state.window_id_for_x11_handle(window);
+        let managed = window_id.and_then(|id| self.state.window(id));
+        let root_surface_id = managed.map(|window| window.root_surface_id);
         let visual_geometry = root_surface_id
             .and_then(|surface_id| self.state.current_visual_root_window_geometry(surface_id))
             .map(|value| format!("{value:?}"));
@@ -52,9 +58,12 @@ impl OwnCompositorServer {
                 .map(|surface| format!("{}x{}", surface.width, surface.height))
         });
         let interaction = self.state.window_interaction_debug_snapshot();
+        let usable = normalization.usable_area;
+        let [frame_left, frame_right, frame_top, frame_bottom] = normalization.frame_extents;
         trace::emit("x11_configure_request_normalized", || {
             TraceFields::new()
                 .field("source", "compositor")
+                .optional("window_id", window_id.map(|id| id.get()))
                 .field("xid", window.xid())
                 .field("requested", format!("{:?}", request.requested))
                 .field("fields", format!("{:?}", request.fields))
@@ -63,8 +72,49 @@ impl OwnCompositorServer {
                     "current_authoritative_geometry",
                     current_authoritative.map(|value| format!("{value:?}")),
                 )
-                .field("desired_geometry", format!("{desired:?}"))
-                .field("active_resize", self.state.x11_resize_active(window))
+                .field(
+                    "icccm_geometry",
+                    format!("{:?}", normalization.icccm_geometry),
+                )
+                .field(
+                    "wm_accepted_geometry",
+                    format!("{:?}", normalization.accepted_geometry),
+                )
+                .field(
+                    "constraint_reason",
+                    normalization.constraint_reason.as_str(),
+                )
+                .field(
+                    "constrained",
+                    normalization.icccm_geometry != normalization.accepted_geometry,
+                )
+                .field("usable_x", usable.x)
+                .field("usable_y", usable.y)
+                .field("usable_width", usable.width)
+                .field("usable_height", usable.height)
+                .field("frame_extents_left", frame_left)
+                .field("frame_extents_right", frame_right)
+                .field("frame_extents_top", frame_top)
+                .field("frame_extents_bottom", frame_bottom)
+                .optional(
+                    "window_minimized",
+                    managed.map(|window| window.state.is_minimized()),
+                )
+                .optional(
+                    "pending_restore",
+                    window_id.map(|id| self.state.pending_xwayland_restores.contains_key(&id)),
+                )
+                .optional("active_resize", Some(self.state.x11_resize_active(window)))
+                .optional(
+                    "layout_membership",
+                    managed
+                        .and_then(|window| window.management)
+                        .map(|value| format!("{:?}", value.layout())),
+                )
+                .optional(
+                    "mode",
+                    managed.map(|window| format!("{:?}", window.state.mode())),
+                )
                 .optional(
                     "active_interaction_id",
                     interaction.map(|value| value.interaction_id),
@@ -83,17 +133,174 @@ impl OwnCompositorServer {
         window: X11WindowHandle,
         request: X11ConfigureRequest,
         constraints: WindowConstraints,
-    ) -> X11Geometry {
+    ) -> X11ConfigureRequestGeometry {
         let current = self
             .state
             .x11_authoritative_geometry(window)
             .unwrap_or(request.requested);
-        crate::xwayland::xwm::icccm::apply_configure_request(
+        let icccm_geometry = crate::xwayland::xwm::icccm::apply_configure_request(
             current,
             request.requested,
             request.fields,
             constraints,
-        )
+        );
+        let usable_area = self.state.usable_output_geometry();
+        let frame_extents = self.state.x11_decoration_frame_extents(window);
+        let managed_policy = self
+            .state
+            .window_id_for_x11_handle(window)
+            .and_then(|window_id| self.state.window(window_id))
+            .filter(|managed| {
+                managed.kind == crate::compositor::DesktopWindowKind::Managed
+                    && managed.is_normal_x11_role()
+                    && managed.x11_placement_policy
+                        == Some(crate::compositor::X11PlacementPolicy::CompositorManaged)
+            })
+            .map(|managed| {
+                (
+                    managed.id,
+                    managed.state.mode(),
+                    managed.management.is_some_and(|management| {
+                        management.layout() == crate::wm::LayoutMembership::Tiled
+                    }),
+                )
+            });
+
+        let mut reasons = Vec::new();
+        if (request.fields.x && icccm_geometry.x != request.requested.x)
+            || (request.fields.y && icccm_geometry.y != request.requested.y)
+            || (request.fields.width && icccm_geometry.width != request.requested.width)
+            || (request.fields.height && icccm_geometry.height != request.requested.height)
+        {
+            reasons.push("icccm");
+        }
+
+        let accepted_geometry = match managed_policy {
+            Some((_, mode, _)) if mode != crate::compositor::ToplevelMode::Normal => {
+                reasons.push("mode_authority");
+                current
+            }
+            Some((_, _, true)) => {
+                reasons.push("layout_authority");
+                current
+            }
+            Some((_, _, false)) => {
+                let (geometry, work_area_reasons) = constrain_managed_x11_request(
+                    icccm_geometry,
+                    request.fields,
+                    usable_area,
+                    frame_extents,
+                );
+                reasons.extend(work_area_reasons);
+                geometry
+            }
+            None => icccm_geometry,
+        };
+
+        X11ConfigureRequestGeometry {
+            icccm_geometry,
+            accepted_geometry,
+            constraint_reason: if reasons.is_empty() {
+                "none".to_string()
+            } else {
+                reasons.join("+")
+            },
+            usable_area,
+            frame_extents,
+        }
+    }
+
+    pub(super) fn trace_x11_client_configure_authority_change(
+        &self,
+        handle: X11WindowHandle,
+        request: X11ConfigureRequest,
+        normalization: &X11ConfigureRequestGeometry,
+        old_client: Option<X11Geometry>,
+        old_frame: Option<crate::compositor::WindowGeometry>,
+        old_materialized: Option<crate::compositor::PresentationRect>,
+    ) {
+        if !matches!(
+            std::env::var("ASTREA_LIFECYCLE_DIAGNOSTICS").as_deref(),
+            Ok("1" | "true" | "on")
+        ) {
+            return;
+        }
+        let Some(window_id) = self.state.window_id_for_x11_handle(handle) else {
+            return;
+        };
+        let Some(window) = self.state.window(window_id) else {
+            return;
+        };
+        let new_client = window.x11_geometry.map(|geometry| geometry.client);
+        let new_materialized = window.x11_materialized_client_rect;
+        let client_fields = |prefix: &str, value: Option<X11Geometry>| match value {
+            Some(value) => format!(
+                "{prefix}_x={} {prefix}_y={} {prefix}_width={} {prefix}_height={}",
+                value.x, value.y, value.width, value.height,
+            ),
+            None => {
+                format!("{prefix}_x=none {prefix}_y=none {prefix}_width=none {prefix}_height=none")
+            }
+        };
+        let rect_fields =
+            |prefix: &str, rect: Option<crate::compositor::PresentationRect>| match rect {
+                Some(rect) => format!(
+                    "{prefix}_x={:.1} {prefix}_y={:.1} {prefix}_width={:.1} {prefix}_height={:.1}",
+                    rect.x(),
+                    rect.y(),
+                    rect.width(),
+                    rect.height(),
+                ),
+                None => format!(
+                    "{prefix}_x=none {prefix}_y=none {prefix}_width=none {prefix}_height=none"
+                ),
+            };
+        let usable = normalization.usable_area;
+        let [left, right, top, bottom] = normalization.frame_extents;
+        let layout = window
+            .management
+            .map(|management| format!("{:?}", management.layout()))
+            .unwrap_or_else(|| "none".to_string());
+        eprintln!(
+            "typhon.x11_geometry event=authority_change window_id={} xid={} source=client_configure_request window_minimized={} pending_restore={} active_resize={} layout_membership={} mode={:?} {} {} old_frame={:?} new_frame={:?} {} {} requested_x={} requested_y={} requested_width={} requested_height={} request_fields={:?} icccm_x={} icccm_y={} icccm_width={} icccm_height={} wm_accepted_x={} wm_accepted_y={} wm_accepted_width={} wm_accepted_height={} constraint_reason={} usable_x={:.1} usable_y={:.1} usable_width={:.1} usable_height={:.1} frame_extents_left={} frame_extents_right={} frame_extents_top={} frame_extents_bottom={}",
+            window_id.get(),
+            handle.xid(),
+            window.state.is_minimized(),
+            self.state
+                .pending_xwayland_restores
+                .contains_key(&window_id),
+            self.state.x11_resize_active(handle),
+            layout,
+            window.state.mode(),
+            client_fields("old_client", old_client),
+            client_fields("new_client", new_client),
+            old_frame,
+            window.x11_geometry.map(|geometry| geometry.frame),
+            rect_fields("old_materialized", old_materialized),
+            rect_fields("new_materialized", new_materialized),
+            request.requested.x,
+            request.requested.y,
+            request.requested.width,
+            request.requested.height,
+            request.fields,
+            normalization.icccm_geometry.x,
+            normalization.icccm_geometry.y,
+            normalization.icccm_geometry.width,
+            normalization.icccm_geometry.height,
+            normalization.accepted_geometry.x,
+            normalization.accepted_geometry.y,
+            normalization.accepted_geometry.width,
+            normalization.accepted_geometry.height,
+            normalization.constraint_reason,
+            usable.x,
+            usable.y,
+            usable.width,
+            usable.height,
+            left,
+            right,
+            top,
+            bottom,
+        );
     }
 
     pub(super) fn handle_x11_move_resize_request(
@@ -436,4 +643,105 @@ impl OwnCompositorServer {
             })
             .collect()
     }
+}
+
+fn constrain_managed_x11_request(
+    mut geometry: X11Geometry,
+    fields: crate::xwayland::xwm::X11ConfigureFlags,
+    usable_area: crate::compositor::OutputRect,
+    extents: [u32; 4],
+) -> (X11Geometry, Vec<&'static str>) {
+    let usable_left = usable_area.x.ceil() as i64;
+    let usable_top = usable_area.y.ceil() as i64;
+    let usable_right = (usable_area.x + usable_area.width).floor() as i64;
+    let usable_bottom = (usable_area.y + usable_area.height).floor() as i64;
+    let [left, right, top, bottom] = extents.map(i64::from);
+    let maximum_width = usable_right
+        .saturating_sub(usable_left)
+        .saturating_sub(left)
+        .saturating_sub(right)
+        .max(1);
+    let maximum_height = usable_bottom
+        .saturating_sub(usable_top)
+        .saturating_sub(top)
+        .saturating_sub(bottom)
+        .max(1);
+    let mut reasons = Vec::new();
+
+    let original_width = geometry.width;
+    geometry.width =
+        u32::try_from(i64::from(geometry.width).min(maximum_width)).unwrap_or(u32::MAX);
+    if geometry.width != original_width {
+        reasons.push("usable_width");
+    }
+    let original_height = geometry.height;
+    geometry.height =
+        u32::try_from(i64::from(geometry.height).min(maximum_height)).unwrap_or(u32::MAX);
+    if geometry.height != original_height {
+        reasons.push("usable_height");
+    }
+
+    let original_x = geometry.x;
+    if fields.x {
+        let minimum_x = usable_left.saturating_add(left);
+        let maximum_x = usable_right
+            .saturating_sub(right)
+            .saturating_sub(i64::from(geometry.width))
+            .max(minimum_x);
+        geometry.x = clamp_i64_to_i32(i64::from(geometry.x).clamp(minimum_x, maximum_x));
+    } else {
+        let available_width = usable_right
+            .saturating_sub(right)
+            .saturating_sub(i64::from(geometry.x))
+            .max(1);
+        let accepted_width =
+            u32::try_from(i64::from(geometry.width).min(available_width)).unwrap_or(u32::MAX);
+        if accepted_width != geometry.width {
+            geometry.width = accepted_width;
+            if !reasons.contains(&"usable_width") {
+                reasons.push("usable_width");
+            }
+        }
+    }
+    if geometry.x != original_x {
+        reasons.push("usable_position");
+    }
+
+    let original_y = geometry.y;
+    if fields.y {
+        let minimum_y = usable_top.saturating_add(top);
+        let maximum_y = usable_bottom
+            .saturating_sub(bottom)
+            .saturating_sub(i64::from(geometry.height))
+            .max(minimum_y);
+        geometry.y = clamp_i64_to_i32(i64::from(geometry.y).clamp(minimum_y, maximum_y));
+    } else {
+        let available_height = usable_bottom
+            .saturating_sub(bottom)
+            .saturating_sub(i64::from(geometry.y))
+            .max(1);
+        let accepted_height =
+            u32::try_from(i64::from(geometry.height).min(available_height)).unwrap_or(u32::MAX);
+        if accepted_height != geometry.height {
+            geometry.height = accepted_height;
+            if !reasons.contains(&"usable_height") {
+                reasons.push("usable_height");
+            }
+        }
+    }
+    if geometry.y != original_y {
+        reasons.push("usable_position");
+    }
+
+    (geometry, reasons)
+}
+
+fn clamp_i64_to_i32(value: i64) -> i32 {
+    i32::try_from(value).unwrap_or_else(|_| {
+        if value.is_negative() {
+            i32::MIN
+        } else {
+            i32::MAX
+        }
+    })
 }

@@ -1795,13 +1795,14 @@ impl CompositorState {
                         .window(interaction.window_id)
                         .is_some_and(|window| matches!(window.backend, WindowBackend::X11(_)))
                 {
-                    self.set_x11_frame_geometry(
+                    self.set_x11_frame_geometry_from_source(
                         interaction.window_id,
                         WindowGeometry::new(
                             placement,
                             interaction.start_width,
                             interaction.start_height,
                         ),
+                        X11GeometryAuthoritySource::InteractiveMove,
                     );
                     self.queue_backend_configure(
                         interaction.window_id,

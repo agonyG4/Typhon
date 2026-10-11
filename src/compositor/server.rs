@@ -860,16 +860,18 @@ impl OwnCompositorServer {
                                 management.layout() == crate::wm::LayoutMembership::Tiled
                             })
                     });
+                let normalization =
+                    self.x11_configure_request_geometry(window, request, constraints);
                 let geometry = if tiled_authority {
                     current_authoritative.unwrap_or(request.requested)
                 } else {
-                    self.x11_configure_request_geometry(window, request, constraints)
+                    normalization.accepted_geometry
                 };
                 self.trace_x11_configure_request_normalized(
                     window,
                     request,
                     current_authoritative,
-                    geometry,
+                    &normalization,
                 );
                 let border_width = self
                     .state
@@ -880,7 +882,34 @@ impl OwnCompositorServer {
                         || request.fields.width
                         || request.fields.height)
                 {
-                    let _ = self.state.set_x11_geometry(window, geometry);
+                    let window_id = self.state.window_id_for_x11_handle(window);
+                    let old_frame = window_id
+                        .and_then(|id| self.state.window(id))
+                        .and_then(|window| window.x11_geometry.map(|geometry| geometry.frame));
+                    let old_materialized = window_id
+                        .and_then(|id| self.state.window(id))
+                        .and_then(|window| window.x11_materialized_client_rect);
+                    let changed = self.state.set_x11_geometry_from_source(
+                        window,
+                        geometry,
+                        crate::compositor::X11GeometryAuthoritySource::ClientConfigureRequest,
+                    );
+                    if changed
+                        && (current_authoritative != Some(geometry)
+                            || window_id
+                                .and_then(|id| self.state.window(id))
+                                .and_then(|window| window.x11_materialized_client_rect)
+                                != old_materialized)
+                    {
+                        self.trace_x11_client_configure_authority_change(
+                            window,
+                            request,
+                            &normalization,
+                            current_authoritative,
+                            old_frame,
+                            old_materialized,
+                        );
+                    }
                 }
                 let mut commands = vec![XwmCommand::Configure {
                     window,

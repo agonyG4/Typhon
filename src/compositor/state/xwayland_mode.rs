@@ -134,7 +134,11 @@ impl CompositorState {
             )
         };
         if geometry_changed || mode_changed || minimized_changed {
-            let _ = self.set_x11_frame_geometry(window_id, target_geometry);
+            let _ = self.set_x11_frame_geometry_from_source(
+                window_id,
+                target_geometry,
+                X11GeometryAuthoritySource::WindowMode,
+            );
             self.set_surface_placement_with_cause(
                 root_surface_id,
                 target_geometry.placement,
@@ -183,16 +187,36 @@ impl CompositorState {
         true
     }
 
+    #[cfg(test)]
     pub(in crate::compositor) fn set_x11_frame_geometry(
         &mut self,
         window_id: WindowId,
         geometry: WindowGeometry,
+    ) -> bool {
+        self.set_x11_frame_geometry_from_source(
+            window_id,
+            geometry,
+            X11GeometryAuthoritySource::CompositorPolicy,
+        )
+    }
+
+    pub(in crate::compositor) fn set_x11_frame_geometry_from_source(
+        &mut self,
+        window_id: WindowId,
+        geometry: WindowGeometry,
+        source: X11GeometryAuthoritySource,
     ) -> bool {
         let Some(materialized_client_rect) =
             self.materialized_x11_client_rect_for_frame(window_id, geometry)
         else {
             return false;
         };
+        let old_geometry = self
+            .window(window_id)
+            .and_then(|window| window.x11_geometry);
+        let old_materialized = self
+            .window(window_id)
+            .and_then(|window| window.x11_materialized_client_rect);
         let Some(window) = self.window_mut(window_id) else {
             return false;
         };
@@ -207,6 +231,13 @@ impl CompositorState {
         };
         x11_geometry.frame = geometry;
         window.x11_materialized_client_rect = Some(materialized_client_rect);
+        self.trace_x11_geometry_authority_change(
+            window_id,
+            source,
+            old_geometry.map(|geometry| geometry.client),
+            old_geometry.map(|geometry| geometry.frame),
+            old_materialized,
+        );
         true
     }
 
@@ -245,6 +276,12 @@ impl CompositorState {
         else {
             return false;
         };
+        let old_geometry = self
+            .window(window_id)
+            .and_then(|window| window.x11_geometry);
+        let old_materialized = self
+            .window(window_id)
+            .and_then(|window| window.x11_materialized_client_rect);
         let Some(window) = self.window_mut(window_id) else {
             return false;
         };
@@ -268,6 +305,13 @@ impl CompositorState {
         };
         x11_geometry.frame = frame;
         window.x11_materialized_client_rect = Some(materialized_client_rect);
+        self.trace_x11_geometry_authority_change(
+            window_id,
+            X11GeometryAuthoritySource::InteractiveResize,
+            old_geometry.map(|geometry| geometry.client),
+            old_geometry.map(|geometry| geometry.frame),
+            old_materialized,
+        );
         resize_debug_log(|| {
             format!(
                 "event=xwayland_resize_geometry_promoted xid={} resize_epoch={} geometry={:?} visual_preserved=true",

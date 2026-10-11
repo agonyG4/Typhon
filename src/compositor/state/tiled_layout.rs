@@ -1000,7 +1000,11 @@ impl CompositorState {
                 );
             }
             WindowBackend::X11(_) => {
-                let _ = self.set_x11_frame_geometry(window_id, geometry);
+                let _ = self.set_x11_frame_geometry_from_source(
+                    window_id,
+                    geometry,
+                    X11GeometryAuthoritySource::TiledLayout,
+                );
                 self.set_surface_placement_with_cause(
                     root_surface_id,
                     geometry.placement,

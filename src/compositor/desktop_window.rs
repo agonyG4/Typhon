@@ -100,6 +100,35 @@ pub(super) struct X11GeometryState {
     pub(super) frame: WindowGeometry,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::compositor) enum X11GeometryAuthoritySource {
+    InitialManage,
+    ClientConfigureRequest,
+    ConfigureNotify,
+    WindowMode,
+    InteractiveMove,
+    InteractiveResize,
+    TiledLayout,
+    PlacementMigration,
+    CompositorPolicy,
+}
+
+impl X11GeometryAuthoritySource {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::InitialManage => "initial_manage",
+            Self::ClientConfigureRequest => "client_configure_request",
+            Self::ConfigureNotify => "configure_notify",
+            Self::WindowMode => "window_mode",
+            Self::InteractiveMove => "interactive_move",
+            Self::InteractiveResize => "interactive_resize",
+            Self::TiledLayout => "tiled_layout",
+            Self::PlacementMigration => "placement_migration",
+            Self::CompositorPolicy => "compositor_policy",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DesktopWindow {
     pub id: WindowId,

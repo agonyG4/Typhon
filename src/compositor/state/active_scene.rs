@@ -789,13 +789,14 @@ impl CompositorState {
                 .window(window_id)
                 .is_some_and(|window| matches!(window.backend, WindowBackend::X11(_)))
         {
-            self.set_x11_frame_geometry(
+            self.set_x11_frame_geometry_from_source(
                 window_id,
                 WindowGeometry::new(
                     presented_origin,
                     canonical_geometry.width,
                     canonical_geometry.height,
                 ),
+                X11GeometryAuthoritySource::CompositorPolicy,
             );
         }
         let visual_changed =

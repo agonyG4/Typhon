@@ -133,6 +133,8 @@ impl CompositorState {
         {
             return Err(DesktopWindowError::DuplicateRootSurface);
         }
+        let previous_x11_geometry = window.x11_geometry;
+        let previous_materialized_client_rect = window.x11_materialized_client_rect;
         let initial_placement = match window.backend {
             WindowBackend::Xdg(_) => Some(self.allocate_initial_frame(None, (800, 600))),
             WindowBackend::X11(_) => match window.x11_placement_policy {
@@ -170,16 +172,24 @@ impl CompositorState {
                 window.x11_materialized_client_rect = Some(rect);
             }
         }
+        let window_id = window.id;
         let root_surface_id = window.root_surface_id;
-        self.ensure_window_scene_nodes(window.id, root_surface_id);
+        self.ensure_window_scene_nodes(window_id, root_surface_id);
         self.window_by_root_surface
-            .insert(root_surface_id, window.id);
+            .insert(root_surface_id, window_id);
         if let WindowBackend::X11(handle) = window.backend {
-            self.window_by_x11_handle.insert(handle, window.id);
+            self.window_by_x11_handle.insert(handle, window_id);
         }
         window.refresh_workspace_membership(self.workspace_manager.active_workspace());
-        self.window_stacking.push(window.id);
-        self.desktop_windows.insert(window.id, window);
+        self.window_stacking.push(window_id);
+        self.desktop_windows.insert(window_id, window);
+        self.trace_x11_geometry_authority_change(
+            window_id,
+            X11GeometryAuthoritySource::InitialManage,
+            previous_x11_geometry.map(|geometry| geometry.client),
+            previous_x11_geometry.map(|geometry| geometry.frame),
+            previous_materialized_client_rect,
+        );
         self.mark_astrea_toplevel_structure_dirty();
         if let Some(placement) = initial_placement {
             self.set_surface_placement_with_cause(
@@ -522,7 +532,11 @@ impl CompositorState {
                 ..geometry
             })
             .unwrap_or(geometry);
-        let _ = self.set_x11_geometry(handle, initial_geometry);
+        let _ = self.set_x11_geometry_from_source(
+            handle,
+            initial_geometry,
+            X11GeometryAuthoritySource::InitialManage,
+        );
         self.rebuild_x11_transient_relationships();
         self.apply_initial_x11_state(handle, requested_state, geometry);
         Ok(window_id)
@@ -570,7 +584,11 @@ impl CompositorState {
             if let Some(window) = self.window_mut(window_id) {
                 window.state.set_mode(mode);
             }
-            let _ = self.set_x11_frame_geometry(window_id, restore_geometry);
+            let _ = self.set_x11_frame_geometry_from_source(
+                window_id,
+                restore_geometry,
+                X11GeometryAuthoritySource::InitialManage,
+            );
             self.set_surface_placement_with_cause(
                 root_surface_id,
                 floating_placement,
@@ -748,15 +766,21 @@ impl CompositorState {
         old_policy: Option<X11PlacementPolicy>,
         new_policy: Option<X11PlacementPolicy>,
     ) {
-        let Some((surface_id, client, current_frame)) = self.window(window_id).map(|window| {
-            (
-                window.root_surface_id,
-                window.x11_geometry.map(|geometry| geometry.client),
-                window.x11_geometry.map(|geometry| geometry.frame),
-            )
-        }) else {
+        let Some((surface_id, client, current_frame, old_materialized)) =
+            self.window(window_id).map(|window| {
+                (
+                    window.root_surface_id,
+                    window.x11_geometry.map(|geometry| geometry.client),
+                    window.x11_geometry.map(|geometry| geometry.frame),
+                    window.x11_materialized_client_rect,
+                )
+            })
+        else {
             return;
         };
+        let old_geometry = self
+            .window(window_id)
+            .and_then(|window| window.x11_geometry);
         let Some(client) = client else {
             return;
         };
@@ -802,6 +826,13 @@ impl CompositorState {
         if let Some(rect) = materialized_client_rect {
             self.set_x11_materialized_client_rect(window_id, rect);
         }
+        self.trace_x11_geometry_authority_change(
+            window_id,
+            X11GeometryAuthoritySource::PlacementMigration,
+            old_geometry.map(|geometry| geometry.client),
+            old_geometry.map(|geometry| geometry.frame),
+            old_materialized,
+        );
         self.set_surface_placement_with_cause(
             surface_id,
             placement,
@@ -975,10 +1006,24 @@ impl CompositorState {
         (target_size != committed_size).then_some(target_size)
     }
 
+    #[cfg(test)]
     pub(in crate::compositor) fn set_x11_geometry(
         &mut self,
         handle: X11WindowHandle,
         geometry: crate::xwayland::xwm::X11Geometry,
+    ) -> bool {
+        self.set_x11_geometry_from_source(
+            handle,
+            geometry,
+            X11GeometryAuthoritySource::CompositorPolicy,
+        )
+    }
+
+    pub(in crate::compositor) fn set_x11_geometry_from_source(
+        &mut self,
+        handle: X11WindowHandle,
+        geometry: crate::xwayland::xwm::X11Geometry,
+        source: X11GeometryAuthoritySource,
     ) -> bool {
         let Some(window_id) = self.window_id_for_x11_handle(handle) else {
             return false;
@@ -1002,6 +1047,12 @@ impl CompositorState {
         else {
             return false;
         };
+        let old_geometry = self
+            .window(window_id)
+            .and_then(|window| window.x11_geometry);
+        let old_materialized = self
+            .window(window_id)
+            .and_then(|window| window.x11_materialized_client_rect);
         let placement = match placement_policy {
             Some(X11PlacementPolicy::CompositorManaged) => {
                 SurfacePlacement::absolute_root_at(filtered.x, filtered.y)
@@ -1040,6 +1091,15 @@ impl CompositorState {
         if let Some(rect) = materialized_client_rect {
             self.set_x11_materialized_client_rect(window_id, rect);
         }
+        if source != X11GeometryAuthoritySource::ClientConfigureRequest {
+            self.trace_x11_geometry_authority_change(
+                window_id,
+                source,
+                old_geometry.map(|geometry| geometry.client),
+                old_geometry.map(|geometry| geometry.frame),
+                old_materialized,
+            );
+        }
         let visual_changed = normal_managed && !resize_active && previous_visual != Some(frame);
         let animation_kind = if visual_changed {
             previous_visual.map(|previous| {
@@ -1076,6 +1136,92 @@ impl CompositorState {
         true
     }
 
+    pub(in crate::compositor) fn trace_x11_geometry_authority_change(
+        &self,
+        window_id: WindowId,
+        source: X11GeometryAuthoritySource,
+        old_client: Option<crate::xwayland::xwm::X11Geometry>,
+        old_frame: Option<WindowGeometry>,
+        old_materialized: Option<PresentationRect>,
+    ) {
+        if !matches!(
+            std::env::var("ASTREA_LIFECYCLE_DIAGNOSTICS").as_deref(),
+            Ok("1" | "true" | "on")
+        ) {
+            return;
+        }
+        let Some(window) = self.window(window_id) else {
+            return;
+        };
+        let WindowBackend::X11(handle) = window.backend else {
+            return;
+        };
+        let Some(geometry) = window.x11_geometry else {
+            return;
+        };
+        let new_materialized = window.x11_materialized_client_rect;
+        if old_client == Some(geometry.client)
+            && old_frame == Some(geometry.frame)
+            && old_materialized == new_materialized
+        {
+            return;
+        }
+        let rect_fields = |prefix: &str, rect: Option<PresentationRect>| match rect {
+            Some(rect) => format!(
+                "{prefix}_x={:.1} {prefix}_y={:.1} {prefix}_width={:.1} {prefix}_height={:.1}",
+                rect.x(),
+                rect.y(),
+                rect.width(),
+                rect.height(),
+            ),
+            None => {
+                format!("{prefix}_x=none {prefix}_y=none {prefix}_width=none {prefix}_height=none")
+            }
+        };
+        let client_fields =
+            |prefix: &str, value: Option<crate::xwayland::xwm::X11Geometry>| match value {
+                Some(value) => format!(
+                    "{prefix}_x={} {prefix}_y={} {prefix}_width={} {prefix}_height={}",
+                    value.x, value.y, value.width, value.height,
+                ),
+                None => format!(
+                    "{prefix}_x=none {prefix}_y=none {prefix}_width=none {prefix}_height=none"
+                ),
+            };
+        let usable = self.usable_output_geometry();
+        let [left, right, top, bottom] = self.x11_decoration_frame_extents(handle);
+        let layout = window
+            .management
+            .map(|management| format!("{:?}", management.layout()))
+            .unwrap_or_else(|| "none".to_string());
+        eprintln!(
+            "typhon.x11_geometry event=authority_change window_id={} xid={} source={} window_minimized={} pending_restore={} active_resize={} layout_membership={} mode={:?} {} {} old_frame={:?} new_frame={:?} {} {} usable_x={:.1} usable_y={:.1} usable_width={:.1} usable_height={:.1} frame_extents_left={} frame_extents_right={} frame_extents_top={} frame_extents_bottom={} requested_x=none requested_y=none requested_width=none requested_height=none request_fields=none",
+            window_id.get(),
+            handle.xid(),
+            source.as_str(),
+            window.state.is_minimized(),
+            self.pending_xwayland_restores.contains_key(&window_id),
+            self.active_toplevel_resizes
+                .contains_key(&window.root_surface_id),
+            layout,
+            format_args!("{:?}", window.state.mode()),
+            client_fields("old_client", old_client),
+            client_fields("new_client", Some(geometry.client)),
+            old_frame,
+            geometry.frame,
+            rect_fields("old_materialized", old_materialized),
+            rect_fields("new_materialized", new_materialized),
+            usable.x,
+            usable.y,
+            usable.width,
+            usable.height,
+            left,
+            right,
+            top,
+            bottom,
+        );
+    }
+
     pub(in crate::compositor) fn reconcile_x11_configure_notify(
         &mut self,
         handle: X11WindowHandle,
@@ -1084,6 +1230,12 @@ impl CompositorState {
         let Some(window_id) = self.window_id_for_x11_handle(handle) else {
             return false;
         };
+        let old_geometry = self
+            .window(window_id)
+            .and_then(|window| window.x11_geometry);
+        let old_materialized = self
+            .window(window_id)
+            .and_then(|window| window.x11_materialized_client_rect);
         let Some((root_surface_id, placement_policy, persisted_placement)) =
             self.window(window_id).map(|window| {
                 (
@@ -1134,6 +1286,13 @@ impl CompositorState {
         if let Some(rect) = materialized_client_rect {
             self.set_x11_materialized_client_rect(window_id, rect);
         }
+        self.trace_x11_geometry_authority_change(
+            window_id,
+            X11GeometryAuthoritySource::ConfigureNotify,
+            old_geometry.map(|geometry| geometry.client),
+            old_geometry.map(|geometry| geometry.frame),
+            old_materialized,
+        );
         if self.active_toplevel_resizes.contains_key(&root_surface_id) {
             return false;
         }

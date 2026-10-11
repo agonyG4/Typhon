@@ -241,6 +241,10 @@ struct FirstBufferFixture {
 }
 
 fn first_buffer_fixture() -> FirstBufferFixture {
+    first_buffer_fixture_with_buffer_size(2, 2)
+}
+
+fn first_buffer_fixture_with_buffer_size(width: u32, height: u32) -> FirstBufferFixture {
     let socket_name = super::unique_socket_name();
     let mut server = super::OwnCompositorServer::bind_cpu_composition(&socket_name)
         .expect("bind compositor server");
@@ -269,21 +273,43 @@ fn first_buffer_fixture() -> FirstBufferFixture {
         .roundtrip(&mut super::RegistryTestState::default())
         .expect("complete association");
 
-    let file = super::create_test_shm_file(&[
-        0xffff_0000,
-        0xff00_ff00,
-        0xff00_00ff,
-        0xffff_ffff,
-        0xff10_1010,
-        0xff20_2020,
-        0xff30_3030,
-        0xff40_4040,
-    ])
-    .expect("create shm buffer");
-    let pool = shm.create_pool(file.as_fd(), 32, &qh, ());
-    let buffer = pool.create_buffer(0, 2, 2, 8, client_wl_shm::Format::Argb8888, &qh, ());
+    let pixel_count = usize::try_from(width)
+        .expect("test buffer width fits usize")
+        .checked_mul(usize::try_from(height).expect("test buffer height fits usize"))
+        .expect("test buffer pixel count fits usize");
+    let pixels = if (width, height) == (2, 2) {
+        vec![
+            0xffff_0000,
+            0xff00_ff00,
+            0xff00_00ff,
+            0xffff_ffff,
+            0xff10_1010,
+            0xff20_2020,
+            0xff30_3030,
+            0xff40_4040,
+        ]
+    } else {
+        vec![0xffff_ffff; pixel_count]
+    };
+    let file = super::create_test_shm_file(&pixels).expect("create shm buffer");
+    let pool_size = i32::try_from(pixels.len() * 4).expect("test shm pool size fits i32");
+    let pool = shm.create_pool(file.as_fd(), pool_size, &qh, ());
+    let buffer = pool.create_buffer(
+        0,
+        i32::try_from(width).expect("test buffer width fits i32"),
+        i32::try_from(height).expect("test buffer height fits i32"),
+        i32::try_from(width * 4).expect("test buffer stride fits i32"),
+        client_wl_shm::Format::Argb8888,
+        &qh,
+        (),
+    );
     surface.attach(Some(&buffer), 0, 0);
-    surface.damage_buffer(0, 0, 2, 2);
+    surface.damage_buffer(
+        0,
+        0,
+        i32::try_from(width).expect("test buffer width fits i32"),
+        i32::try_from(height).expect("test buffer height fits i32"),
+    );
     surface.commit();
     connection.flush().expect("flush first buffer");
     queue
@@ -3090,6 +3116,359 @@ fn x11_partial_moveresize_preserves_unrequested_geometry() {
             } && fields.x
     ));
 }
+
+#[test]
+fn floating_x11_resize_request_stays_inside_the_usable_work_area() {
+    let mut fixture = first_buffer_fixture();
+    let mut snapshot = fake_snapshot();
+    snapshot.surface_id = fixture.surface_id;
+    snapshot.geometry = X11Geometry {
+        x: 136,
+        y: 136,
+        width: 800,
+        height: 600,
+    };
+    let handle = snapshot.handle;
+    fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::WindowReady(snapshot));
+    let current = handle_geometry(&fixture.server, handle);
+    let usable = fixture.server.state.usable_output_geometry();
+    let extents = fixture.server.state.x11_decoration_frame_extents(handle);
+
+    let commands = fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::ConfigureRequested {
+            window: handle,
+            request: X11ConfigureRequest {
+                requested: X11Geometry {
+                    x: 0,
+                    y: 0,
+                    width: 1_920,
+                    height: 1_080,
+                },
+                fields: X11ConfigureFlags {
+                    width: true,
+                    height: true,
+                    ..X11ConfigureFlags::default()
+                },
+                client_event_sequence: None,
+                border_width: 0,
+                sibling: None,
+                stack_mode: None,
+            },
+        });
+    let accepted = match commands.as_slice() {
+        [XwmCommand::Configure { geometry, .. }] => *geometry,
+        other => panic!("expected one normalized Configure command, got {other:?}"),
+    };
+
+    assert_eq!(accepted.x, current.x, "width-only resize must preserve x");
+    assert_eq!(accepted.y, current.y, "height-only resize must preserve y");
+    assert!(accepted.width < 1_920 || accepted.height < 1_080);
+    let frame_left = f64::from(accepted.x) - f64::from(extents[0]);
+    let frame_top = f64::from(accepted.y) - f64::from(extents[2]);
+    let frame_right = f64::from(accepted.x) + f64::from(accepted.width) + f64::from(extents[1]);
+    let frame_bottom = f64::from(accepted.y) + f64::from(accepted.height) + f64::from(extents[3]);
+    assert!(frame_left >= usable.x);
+    assert!(frame_top >= usable.y);
+    assert!(frame_right <= usable.x + usable.width);
+    assert!(frame_bottom <= usable.y + usable.height);
+    assert_eq!(
+        fixture.server.state.x11_authoritative_geometry(handle),
+        Some(accepted),
+        "only the accepted geometry becomes managed authority"
+    );
+}
+
+#[test]
+fn floating_x11_explicit_position_is_clamped_with_its_server_frame() {
+    let mut fixture = first_buffer_fixture();
+    let mut snapshot = fake_snapshot();
+    snapshot.surface_id = fixture.surface_id;
+    snapshot.geometry = X11Geometry {
+        x: 136,
+        y: 136,
+        width: 800,
+        height: 600,
+    };
+    let handle = snapshot.handle;
+    fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::WindowReady(snapshot));
+    let usable = fixture.server.state.usable_output_geometry();
+    let extents = fixture.server.state.x11_decoration_frame_extents(handle);
+
+    let commands = fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::ConfigureRequested {
+            window: handle,
+            request: X11ConfigureRequest {
+                requested: X11Geometry {
+                    x: -400,
+                    y: -200,
+                    width: 0,
+                    height: 0,
+                },
+                fields: X11ConfigureFlags {
+                    x: true,
+                    y: true,
+                    ..X11ConfigureFlags::default()
+                },
+                client_event_sequence: None,
+                border_width: 0,
+                sibling: None,
+                stack_mode: None,
+            },
+        });
+    let accepted = match commands.as_slice() {
+        [XwmCommand::Configure { geometry, .. }] => *geometry,
+        other => panic!("expected one normalized Configure command, got {other:?}"),
+    };
+
+    assert!(f64::from(accepted.x) - f64::from(extents[0]) >= usable.x);
+    assert!(f64::from(accepted.y) - f64::from(extents[2]) >= usable.y);
+    assert!(
+        f64::from(accepted.x) + f64::from(accepted.width) + f64::from(extents[1])
+            <= usable.x + usable.width
+    );
+    assert!(
+        f64::from(accepted.y) + f64::from(accepted.height) + f64::from(extents[3])
+            <= usable.y + usable.height
+    );
+}
+
+#[test]
+fn pending_xwayland_restore_tracks_work_area_accepted_configure_geometry() {
+    let mut fixture = stationary_pointer_xwayland_fixture();
+    let managed = X11Geometry {
+        x: 37,
+        y: 42,
+        width: 800,
+        height: 600,
+    };
+    let (window_id, handle, source_content) =
+        prepare_pending_xwayland_restore(&mut fixture, managed);
+    let usable = fixture.server.state.usable_output_geometry();
+    let extents = fixture.server.state.x11_decoration_frame_extents(handle);
+
+    let commands = fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::ConfigureRequested {
+            window: handle,
+            request: X11ConfigureRequest {
+                requested: X11Geometry {
+                    x: -1,
+                    y: -1,
+                    width: 1_920,
+                    height: 1_080,
+                },
+                fields: X11ConfigureFlags {
+                    width: true,
+                    height: true,
+                    ..X11ConfigureFlags::default()
+                },
+                client_event_sequence: None,
+                border_width: 0,
+                sibling: None,
+                stack_mode: None,
+            },
+        });
+    let accepted = match commands.as_slice() {
+        [XwmCommand::Configure { geometry, .. }] => *geometry,
+        other => panic!("expected one normalized Configure command, got {other:?}"),
+    };
+    assert_eq!((accepted.x, accepted.y), (managed.x, managed.y));
+    assert!(accepted.width < 1_920 || accepted.height < 1_080);
+    assert!(f64::from(accepted.x) - f64::from(extents[0]) >= usable.x);
+    assert!(f64::from(accepted.y) - f64::from(extents[2]) >= usable.y);
+    assert!(
+        f64::from(accepted.x) + f64::from(accepted.width) + f64::from(extents[1])
+            <= usable.x + usable.width
+    );
+    assert!(
+        f64::from(accepted.y) + f64::from(accepted.height) + f64::from(extents[3])
+            <= usable.y + usable.height
+    );
+    assert_eq!(
+        fixture.server.state.x11_authoritative_geometry(handle),
+        Some(accepted)
+    );
+    assert!(
+        fixture
+            .server
+            .state
+            .pending_xwayland_restores
+            .contains_key(&window_id)
+    );
+
+    commit_replacement_xwayland_content(&mut fixture, &source_content, 1_920, 1_080, 0, 0);
+    assert!(
+        fixture
+            .server
+            .state
+            .pending_xwayland_restores
+            .contains_key(&window_id)
+    );
+    assert_eq!(
+        fixture.server.state.x11_authoritative_geometry(handle),
+        Some(accepted),
+        "a stale backing commit cannot change accepted managed geometry"
+    );
+    commit_replacement_xwayland_content(
+        &mut fixture,
+        &source_content,
+        accepted.width,
+        accepted.height,
+        0,
+        0,
+    );
+    assert!(
+        !fixture
+            .server
+            .state
+            .pending_xwayland_restores
+            .contains_key(&window_id)
+    );
+    let rect = fixture
+        .server
+        .state
+        .window(window_id)
+        .and_then(|window| window.x11_materialized_client_rect)
+        .expect("accepted X11 geometry remains materialized after restore");
+    assert_eq!(
+        (rect.width(), rect.height()),
+        (f64::from(accepted.width), f64::from(accepted.height))
+    );
+}
+
+#[test]
+fn xwayland_stale_content_publication_keeps_managed_aperture_for_render_and_input() {
+    let mut fixture = first_buffer_fixture_with_buffer_size(1_920, 1_080);
+    let mut snapshot = fake_snapshot();
+    snapshot.surface_id = fixture.surface_id;
+    snapshot.geometry = X11Geometry {
+        x: 136,
+        y: 136,
+        width: 800,
+        height: 600,
+    };
+    let handle = snapshot.handle;
+    fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::WindowReady(snapshot));
+    let window_id = fixture
+        .server
+        .state
+        .window_id_for_x11_handle(handle)
+        .expect("managed X11 window");
+    let accepted_geometry = fixture
+        .server
+        .state
+        .x11_authoritative_geometry(handle)
+        .expect("accepted X11 geometry");
+    let accepted_rect = fixture
+        .server
+        .state
+        .window(window_id)
+        .and_then(|window| window.x11_materialized_client_rect)
+        .expect("materialized X11 client rectangle");
+    assert_eq!(
+        (accepted_geometry.width, accepted_geometry.height),
+        (800, 600)
+    );
+
+    let stale_content = fixture
+        .server
+        .state
+        .current_surface_buffers
+        .get(&fixture.surface_id)
+        .cloned()
+        .expect("committed XWayland content");
+    assert!(fixture.server.state.commit_xwayland_surface_buffer(
+        fixture.surface_id,
+        stale_content,
+        Vec::new(),
+        SurfacePublicationSource::Immediate,
+    ));
+
+    assert_eq!(
+        fixture.server.state.x11_authoritative_geometry(handle),
+        Some(accepted_geometry),
+        "wl_surface publication updates content, never managed geometry"
+    );
+    assert_eq!(
+        fixture
+            .server
+            .state
+            .window(window_id)
+            .and_then(|window| { window.x11_materialized_client_rect }),
+        Some(accepted_rect)
+    );
+    let root = fixture
+        .server
+        .state
+        .renderable_surface(fixture.surface_id)
+        .expect("published stale XWayland surface");
+    assert_eq!(
+        root.render_target_size, None,
+        "stale content is never stretched"
+    );
+    assert_eq!((root.width, root.height), (1_920, 1_080));
+    let scene_surfaces = fixture.server.state.active_scene_surfaces();
+    let scene_assignments = fixture
+        .server
+        .state
+        .active_scene_surface_render_assignments();
+    let root_index = scene_surfaces
+        .iter()
+        .position(|surface| surface.surface_id == fixture.surface_id)
+        .unwrap_or_else(|| {
+            panic!(
+                "XWayland root missing from production scene: root={root:?}, scene_surfaces={scene_surfaces:?}"
+            )
+        });
+    let assignment = scene_assignments
+        .get(root_index)
+        .expect("production scene assignment matches its surface order");
+    let expected_visible_target = SurfaceTargetRect::new(
+        accepted_rect.x().round() as i32,
+        accepted_rect.y().round() as i32,
+        accepted_rect.width().round() as u32,
+        accepted_rect.height().round() as u32,
+    );
+    let element = crate::compositor::RenderSceneElement::from_surface_with_aperture(
+        root,
+        assignment.target,
+        assignment.visual_clip.clone(),
+    );
+    assert_eq!(
+        element.visible_target(),
+        expected_visible_target,
+        "stale backing pixels remain bounded by the accepted managed rectangle"
+    );
+    assert_eq!(
+        crate::compositor::render::surface_local_point_for_assignment(
+            root,
+            assignment,
+            accepted_rect.x() + accepted_rect.width() / 2.0,
+            accepted_rect.y() + accepted_rect.height() / 2.0,
+        ),
+        Some((400.0, 300.0)),
+        "input uses the same production assignment and logical surface mapping"
+    );
+    assert_eq!(
+        crate::compositor::render::surface_local_point_for_assignment(
+            root,
+            assignment,
+            accepted_rect.x() + accepted_rect.width() + 1.0,
+            accepted_rect.y() + accepted_rect.height() / 2.0,
+        ),
+        None,
+        "input outside the visible managed aperture cannot hit stale content"
+    );
+}
+
 #[test]
 fn x11_client_configure_left_resize_preserves_right_edge() {
     let mut fixture = first_buffer_fixture();

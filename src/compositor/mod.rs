@@ -135,6 +135,7 @@ mod workspace_protocol;
 pub(crate) use crate::core::{OutputId, OutputIdAllocator};
 pub use crate::core::{SceneNodeId, WindowId};
 use commit_debug::*;
+pub(in crate::compositor) use desktop_window::X11GeometryAuthoritySource;
 pub use desktop_window::{
     DesktopStackLayer, DesktopWindowKind, WindowConstraints, WindowMetadata, X11DesktopRole,
     X11PlacementPolicy,
