@@ -48,6 +48,7 @@ bounded by discovered capabilities and transaction validation.
 | Policy | Accepted values | Default | Effective fallback and status |
 | --- | --- | --- | --- |
 | `OBLIVION_ONE_KMS_MODE` | `auto`, `atomic`, `legacy` | `auto` | `auto` selects Atomic first and falls back to Legacy only for Atomic capability, discovery, or initial `TEST_ONLY` failures. Later Atomic failures remain fatal. Explicit `atomic` failures are fatal. |
+| `OBLIVION_ONE_OUTPUT_MODE_MUTATION` | `auto`, `off`, `qualification` | `auto` | Auto follows project-level output-mode production qualification; off always disables mode mutation; qualification explicitly crosses only that static gate and still requires every dynamic runtime safety check. |
 | `OBLIVION_ONE_SCANOUT_BACKEND` | `auto`; Atomic aliases `gpu`, `native`, `native-gpu`, `native-egl-gbm`, `egl-gbm`, `gles-gbm`, `egl-gles-gbm`; rollback `native-egl-gbm-opaque`; CPU GBM aliases `gbm-cpu-write`, `gbm-cpu-write-pageflip`, `cpu-gbm-write`, `cpu-gbm-pageflip`, `cpu`, `cpu-gbm`, `gbm`, `egl`, `pageflip`, `gbm-egl`, `gbm-egl-pageflip`; dumb aliases `dumb`, `framebuffer`, `legacy` | `auto` | Auto chooses explicit Atomic EGL/GBM, then CPU GBM, then dumb when those capabilities are available. Explicit backend choices do not walk that fallback list. Unknown values warn and use `auto`. The opaque path is rollback-only and is never selected automatically. |
 | `OBLIVION_ONE_KMS_COMMIT_WORKER` | `off`, `auto`, `force` | `auto` | Auto uses the worker on Atomic KMS; worker startup failure warns and continues synchronously. Legacy KMS remains synchronous. `force` fails on Legacy KMS or Atomic worker startup failure; `off` is intentionally synchronous. Invalid explicit values are configuration errors. |
 | `OBLIVION_ONE_TRIPLE_BUFFERING` | `auto`, `off`, `force` | `auto` | Auto selects triple buffering only with proven capabilities and useful overlap; otherwise it stays double-buffered. `force` does not bypass capability blockers and falls back to double buffering with a doctor warning. Invalid values are configuration errors. |
@@ -59,6 +60,20 @@ bounded by discovered capabilities and transaction validation.
 | `OBLIVION_ONE_DMABUF_KMS_PREFERRED` | `auto`, `off`, `force` | `auto` | Auto prefers exact same-FOURCC renderer/KMS modifier intersections only on NVIDIA EGL. Force removes incompatible advertised choices only when a safe replacement exists; it cannot create a missing intersection. Unknown values warn and use `off`. |
 | `TYPHON_EGL_CONTEXT_PRIORITY` | `auto`, `high`, `medium` | `auto` | Auto requests HIGH when `EGL_IMG_context_priority` is advertised. High explicitly requests HIGH but falls back to default context creation if the request is rejected or the extension is unavailable. Medium preserves the previous default-priority behavior and is the rollback/A-B control. Unknown values warn and use `auto`. |
 | `OBLIVION_ONE_SCHEDULING_QOS` | `off`, `auto`, `require` | `off` | Off makes no scheduler changes. Auto tries verified `SCHED_RR` priority 1 with `SCHED_RESET_ON_FORK` and a finite soft RT-time guard, then RTKit/direct high-priority FAIR, then normal scheduling. Require fails startup unless the reactor's RR state verifies. RTKit realtime is excluded while child resource-limit isolation remains unresolved. |
+
+`OBLIVION_ONE_OUTPUT_MODE_MUTATION` is read once from the compositor launch
+environment during native bootstrap and is not persisted or changeable through
+Settings or a control command. Its default is `auto`; the current
+`OUTPUT_MODE_SELECTION_RUNTIME_QUALIFIED` project constant remains `false`, so
+normal sessions keep advertising `modeSelectionSupported=false`.
+`qualification` is reserved for explicit target-hardware qualification and is
+not an end-user feature. It does
+not bypass Atomic KMS, exact mode inventory, supported live scanout,
+generation/transaction validation, persistence, compensation, or rollback
+checks. `off` is the emergency disable even after future project-level
+qualification. Only the literal values `auto`,
+`off`, and `qualification` are accepted; invalid explicit values are
+configuration errors.
 
 EGL context priority is a scheduling hint; a successful HIGH request may still be
 assigned MEDIUM or another priority by the driver. Native renderer startup emits
