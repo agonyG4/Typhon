@@ -5,6 +5,10 @@ use crate::compositor::{
 };
 
 use super::registry::EffectRegistry;
+use super::render_graph_demand::{
+    EffectDemandPlannerPolicy, EffectDemandRegionalFallbackReason,
+    configured_effect_demand_planner_policy, plan_regional_effect_demand,
+};
 use super::{
     BUILTIN_EFFECT_PROGRAM_ID, ColorMatrixSpec, DualKawaseBlurSpec, EffectAlphaMode,
     EffectCoverage, EffectFailurePolicy, EffectFrameDemand, EffectInstanceId, EffectNode,
@@ -523,8 +527,16 @@ pub struct CompiledEffectInstance {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct EffectDemandPlanStats {
     pub repair_rect_count: usize,
+    /// Conservative instance-level edges recorded at graph compilation.
     pub dependency_edge_count: usize,
+    /// Legacy instance-edge propagations; regional mode mirrors its causal propagation count.
     pub dependency_propagations: usize,
+    /// SceneCapture checkpoint edges visited by the regional planner.
+    pub causal_dependency_edges_considered: usize,
+    /// Checkpoint edges that propagated a non-empty SceneCapture region.
+    pub causal_dependency_propagations: usize,
+    /// Checkpoint edges whose influence region missed the demanded capture.
+    pub causal_dependency_pruned_empty: usize,
     pub max_instance_region_rect_count: usize,
     pub region_representation_overflows: usize,
     pub visible_clip_fallbacks: usize,
@@ -533,9 +545,16 @@ pub struct EffectDemandPlanStats {
     pub pass_count_selected: usize,
     pub partial_pass_count: usize,
     pub full_domain_pass_count: usize,
+    /// Ordinary texture producer edges that propagated non-empty regions.
     pub pass_dependency_propagations: usize,
     pub max_pass_region_rect_count: usize,
     pub pass_conservative_fallbacks: usize,
+    /// Planner selected for this frame, including a regional request that fell back.
+    pub planner_policy: EffectDemandPlannerPolicy,
+    /// True when regional planning failed and this frame ran through legacy planning.
+    pub regional_fallback: bool,
+    /// Stable token for the first reason regional planning fell back.
+    pub regional_fallback_reason: EffectDemandRegionalFallbackReason,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -695,7 +714,10 @@ fn all_visible_instances_with_output_regions(
     demand
 }
 
-fn unique_instance_index(graph: &CompiledFrameGraph, id: EffectInstanceId) -> Option<usize> {
+pub(crate) fn unique_instance_index(
+    graph: &CompiledFrameGraph,
+    id: EffectInstanceId,
+) -> Option<usize> {
     let mut found = None;
     for (index, instance) in graph.instances.iter().enumerate() {
         if instance.id != id {
@@ -776,6 +798,9 @@ pub struct EffectExecutionDemandDiagnostics {
     pub cause: EffectDemandConservativeCause,
     /// The first graph metadata issue when the graph failed preflight.
     pub metadata_issue: Option<GraphExecutionMetadataIssue>,
+    pub planner_policy: EffectDemandPlannerPolicy,
+    pub regional_fallback: bool,
+    pub regional_fallback_reason: EffectDemandRegionalFallbackReason,
 }
 
 fn dependency_edge_count(graph: &CompiledFrameGraph) -> usize {
@@ -807,7 +832,7 @@ pub fn plan_effect_execution_demand_with_kawase_mode(
     )
 }
 
-/// Plans demand and returns the conservative cause without changing selection behavior.
+/// Plans demand using the configured policy and returns fallback diagnostics.
 pub fn plan_effect_execution_demand_with_diagnostics(
     graph: &CompiledFrameGraph,
     repair_region: &EffectRegion,
@@ -826,6 +851,171 @@ pub fn plan_effect_execution_demand_with_diagnostics(
 }
 
 fn plan_effect_execution_demand_with_kawase_mode_observing(
+    graph: &CompiledFrameGraph,
+    repair_region: &EffectRegion,
+    conservative_full: bool,
+    full_kawase: bool,
+    diagnostics: Option<&mut EffectExecutionDemandDiagnostics>,
+) -> EffectExecutionDemand {
+    plan_effect_execution_demand_with_policy_observing(
+        graph,
+        repair_region,
+        conservative_full,
+        full_kawase,
+        configured_effect_demand_planner_policy(),
+        diagnostics,
+    )
+}
+
+/// Plans effect demand using an explicit policy, allowing deterministic A/B
+/// comparisons without mutating the process environment.
+pub fn plan_effect_execution_demand_with_policy(
+    graph: &CompiledFrameGraph,
+    repair_region: &EffectRegion,
+    conservative_full: bool,
+    full_kawase: bool,
+    policy: EffectDemandPlannerPolicy,
+) -> EffectExecutionDemand {
+    plan_effect_execution_demand_with_policy_observing(
+        graph,
+        repair_region,
+        conservative_full,
+        full_kawase,
+        policy,
+        None,
+    )
+}
+
+/// Explicit-policy planner with stable fallback diagnostics.
+pub fn plan_effect_execution_demand_with_policy_and_diagnostics(
+    graph: &CompiledFrameGraph,
+    repair_region: &EffectRegion,
+    conservative_full: bool,
+    full_kawase: bool,
+    policy: EffectDemandPlannerPolicy,
+) -> (EffectExecutionDemand, EffectExecutionDemandDiagnostics) {
+    let mut diagnostics = EffectExecutionDemandDiagnostics::default();
+    let demand = plan_effect_execution_demand_with_policy_observing(
+        graph,
+        repair_region,
+        conservative_full,
+        full_kawase,
+        policy,
+        Some(&mut diagnostics),
+    );
+    (demand, diagnostics)
+}
+
+fn plan_effect_execution_demand_with_policy_observing(
+    graph: &CompiledFrameGraph,
+    repair_region: &EffectRegion,
+    conservative_full: bool,
+    full_kawase: bool,
+    policy: EffectDemandPlannerPolicy,
+    mut diagnostics: Option<&mut EffectExecutionDemandDiagnostics>,
+) -> EffectExecutionDemand {
+    if let Some(diagnostics) = diagnostics.as_deref_mut() {
+        diagnostics.planner_policy = policy;
+    }
+
+    if policy == EffectDemandPlannerPolicy::Legacy {
+        let mut demand = plan_effect_execution_demand_legacy(
+            graph,
+            repair_region,
+            conservative_full,
+            full_kawase,
+            diagnostics.as_deref_mut(),
+        );
+        demand.plan_stats.planner_policy = policy;
+        return demand;
+    }
+
+    match plan_regional_effect_demand(graph, repair_region, conservative_full, full_kawase) {
+        Ok(regional) => {
+            let instances = graph
+                .instances
+                .iter()
+                .enumerate()
+                .filter_map(|(index, instance)| {
+                    let output_region =
+                        regional.pass_regions[regional.final_pass_indices[index]].clone();
+                    (!output_region.is_empty()).then(|| EffectInstanceExecutionDemand {
+                        id: instance.id,
+                        presentation_output_region: regional.presentation_output_regions[index]
+                            .clone(),
+                        output_region,
+                    })
+                })
+                .collect();
+            let mut demand = EffectExecutionDemand::new(instances, regional.execution_region);
+            demand.passes = regional.passes;
+            demand.visible_clip_fallbacks = regional.visible_clip_fallbacks;
+            demand.plan_stats = regional.plan_stats;
+            demand.plan_stats.planner_policy = policy;
+            update_pass_plan_stats(
+                graph,
+                &demand.passes,
+                &demand.conservative_instances,
+                &mut demand.plan_stats,
+            );
+            if let Some(diagnostics) = diagnostics.as_deref_mut() {
+                diagnostics.planner_policy = policy;
+            }
+            demand
+        }
+        Err(reason) => {
+            let metadata_issue = graph_execution_metadata_issue(graph);
+            let mut demand = plan_effect_execution_demand_legacy(
+                graph,
+                repair_region,
+                conservative_full,
+                full_kawase,
+                diagnostics.as_deref_mut(),
+            );
+            demand.plan_stats.planner_policy = policy;
+            demand.plan_stats.regional_fallback = true;
+            demand.plan_stats.regional_fallback_reason = reason;
+            if let Some(diagnostics) = diagnostics.as_deref_mut() {
+                diagnostics.planner_policy = policy;
+                diagnostics.regional_fallback = true;
+                diagnostics.regional_fallback_reason = reason;
+                diagnostics.metadata_issue = diagnostics.metadata_issue.or(metadata_issue);
+                if diagnostics.cause == EffectDemandConservativeCause::None {
+                    diagnostics.cause = regional_fallback_cause(reason);
+                }
+            }
+            demand
+        }
+    }
+}
+
+fn regional_fallback_cause(
+    reason: EffectDemandRegionalFallbackReason,
+) -> EffectDemandConservativeCause {
+    match reason {
+        EffectDemandRegionalFallbackReason::CallerConservativeFull => {
+            EffectDemandConservativeCause::CallerConservativeFull
+        }
+        EffectDemandRegionalFallbackReason::RepairRegionUnrepresentable => {
+            EffectDemandConservativeCause::RepairRegionUnrepresentable
+        }
+        EffectDemandRegionalFallbackReason::PassLookupFailed
+        | EffectDemandRegionalFallbackReason::DependencyOrderingInvalid => {
+            EffectDemandConservativeCause::DependencyLookupFailed
+        }
+        EffectDemandRegionalFallbackReason::None
+        | EffectDemandRegionalFallbackReason::GraphMetadataIncomplete
+        | EffectDemandRegionalFallbackReason::FinalPassMissing
+        | EffectDemandRegionalFallbackReason::TextureLookupFailed
+        | EffectDemandRegionalFallbackReason::TextureProducerAmbiguous
+        | EffectDemandRegionalFallbackReason::RequiredInputRegionUnavailable
+        | EffectDemandRegionalFallbackReason::RegionOutsideDomain => {
+            EffectDemandConservativeCause::GraphMetadataIncomplete
+        }
+    }
+}
+
+fn plan_effect_execution_demand_legacy(
     graph: &CompiledFrameGraph,
     repair_region: &EffectRegion,
     conservative_full: bool,
@@ -992,12 +1182,15 @@ fn plan_effect_execution_demand_with_kawase_mode_observing(
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct TextureProducer {
-    pass_index: Option<usize>,
-    valid: bool,
+pub(crate) struct TextureProducer {
+    pub(crate) pass_index: Option<usize>,
+    pub(crate) valid: bool,
 }
 
-fn full_pass_region(graph: &CompiledFrameGraph, pass: &CompiledRenderPass) -> EffectRegion {
+pub(crate) fn full_pass_region(
+    graph: &CompiledFrameGraph,
+    pass: &CompiledRenderPass,
+) -> EffectRegion {
     pass.output
         .and_then(|output| graph.textures.iter().find(|texture| texture.id == output))
         .map_or_else(EffectRegion::empty, |texture| {
@@ -1059,7 +1252,7 @@ fn conservative_pass_demands(
         .collect()
 }
 
-fn graph_texture_index(graph: &CompiledFrameGraph, id: GraphTextureId) -> Option<usize> {
+pub(crate) fn graph_texture_index(graph: &CompiledFrameGraph, id: GraphTextureId) -> Option<usize> {
     let mut found = None;
     for (index, texture) in graph.textures.iter().enumerate() {
         if texture.id != id {
@@ -1073,7 +1266,7 @@ fn graph_texture_index(graph: &CompiledFrameGraph, id: GraphTextureId) -> Option
     found
 }
 
-fn texture_producers(graph: &CompiledFrameGraph) -> Vec<TextureProducer> {
+pub(crate) fn texture_producers(graph: &CompiledFrameGraph) -> Vec<TextureProducer> {
     graph
         .textures
         .iter()
@@ -1717,7 +1910,7 @@ fn plan_effect_pass_execution_demand(
     );
 }
 
-fn graph_execution_metadata_issue(
+pub(crate) fn graph_execution_metadata_issue(
     graph: &CompiledFrameGraph,
 ) -> Option<GraphExecutionMetadataIssue> {
     // The compiler records dependencies from checkpoints that precede the
@@ -7486,6 +7679,522 @@ mod tests {
             false,
         );
         assert_eq!(demand.instances.len(), 3);
+    }
+
+    #[test]
+    fn regional_solver_prunes_compiled_but_runtime_empty_backdrop_dependencies() {
+        let (_, registry) = blur_scene();
+        let make_instance = |id, surface, rect| {
+            let region = EffectRegion::from_rect(rect);
+            ResolvedEffectInstance {
+                id: EffectInstanceId::new(id).unwrap(),
+                program: EffectProgramId::new(1).unwrap(),
+                anchor: EffectAnchor::BeforeSurface(surface),
+                target_bounds: rect,
+                region,
+                parameter_block: EffectParameterBlock::default(),
+                coverage: None,
+                signature: id,
+                frame_demand: EffectFrameDemand::OnDamage,
+                visual_group: None,
+                anchor_scope: EffectAnchorScope::VisualGroup,
+                backdrop_reuse: crate::compositor::EffectBackdropReuse::Exact,
+                scene_order: EffectSceneOrder {
+                    group_order: 0,
+                    surface_order: surface,
+                    phase: 0,
+                },
+            }
+        };
+        let first = make_instance(1, 1, EffectRect::new(500, 300, 20, 20).unwrap());
+        let second = make_instance(2, 2, EffectRect::new(780, 300, 20, 20).unwrap());
+        let consumer = make_instance(3, 3, EffectRect::new(500, 300, 320, 180).unwrap());
+        let scene = ResolvedEffectScene::new(1, vec![first, second, consumer]);
+        let output_bounds = EffectRect::new(0, 0, 1920, 1080).unwrap();
+        let FrameExecutionPlan::EffectGraph(graph) =
+            compile_frame_execution_plan(&scene, &EffectRegion::empty(), output_bounds, &registry)
+                .unwrap()
+        else {
+            panic!("overlapping backdrop effects must compile to an effect graph");
+        };
+        let first_id = EffectInstanceId::new(1).unwrap();
+        let second_id = EffectInstanceId::new(2).unwrap();
+        let consumer_id = EffectInstanceId::new(3).unwrap();
+        assert!(graph.instances[2].dependencies.contains(&first_id));
+        assert!(graph.instances[2].dependencies.contains(&second_id));
+        assert!(graph.instances[2].capture_region.contains_point(785, 305));
+        assert!(graph.instances[2].capture_region.contains_point(505, 305));
+
+        let repair = EffectRegion::from_rect(EffectRect::new(502, 302, 2, 2).unwrap());
+        let (legacy, _) = plan_effect_execution_demand_with_policy_and_diagnostics(
+            &graph,
+            &repair,
+            false,
+            false,
+            EffectDemandPlannerPolicy::Legacy,
+        );
+        let (regional, diagnostics) = plan_effect_execution_demand_with_policy_and_diagnostics(
+            &graph,
+            &repair,
+            false,
+            false,
+            EffectDemandPlannerPolicy::Regional,
+        );
+
+        assert_eq!(
+            legacy
+                .instances
+                .iter()
+                .map(|item| item.id)
+                .collect::<Vec<_>>(),
+            vec![first_id, second_id, consumer_id]
+        );
+        assert_eq!(
+            legacy.passes.iter().map(|pass| pass.id).collect::<Vec<_>>(),
+            graph.passes.iter().map(|pass| pass.id).collect::<Vec<_>>()
+        );
+        let expected_first_output = graph.instances[0].output_influence_region.union(&repair);
+        assert!(semantically_equal_regions(
+            legacy.output_region(first_id).unwrap(),
+            &expected_first_output
+        ));
+        assert_eq!(
+            legacy.output_region(second_id),
+            Some(&graph.instances[1].output_influence_region)
+        );
+        assert!(semantically_equal_regions(
+            legacy.output_region(consumer_id).unwrap(),
+            &repair.intersect(&graph.instances[2].output_influence_region)
+        ));
+        assert!(!legacy.instance_is_conservative_full(first_id));
+        assert!(!legacy.instance_is_conservative_full(second_id));
+        assert!(!legacy.instance_is_conservative_full(consumer_id));
+        assert!(regional.contains(first_id));
+        assert!(!regional.contains(second_id));
+        assert!(regional.contains(consumer_id));
+        let consumer_capture = graph
+            .passes
+            .iter()
+            .find(|pass| pass.instance == consumer_id && pass.kind == RenderPassKind::SceneCapture)
+            .unwrap();
+        let capture_demand = regional.pass_output_region(consumer_capture.id).unwrap();
+        assert!(!capture_demand.contains_point(785, 305));
+        assert!(capture_demand.contains_point(505, 305));
+        let propagated_first =
+            capture_demand.intersect(&graph.instances[0].output_influence_region);
+        let direct_first = repair.intersect(&graph.instances[0].output_influence_region);
+        let expected_first = propagated_first.union(&direct_first);
+        assert!(semantically_equal_regions(
+            regional.output_region(first_id).unwrap(),
+            &expected_first
+        ));
+        assert!(
+            capture_demand.bounding_rect().unwrap().width
+                < graph.instances[2]
+                    .capture_region
+                    .bounding_rect()
+                    .unwrap()
+                    .width
+        );
+        assert!(!regional.is_conservative_full());
+        assert!(!diagnostics.regional_fallback);
+        assert!(
+            regional
+                .passes
+                .iter()
+                .all(|pass| !pass.output_region.is_empty())
+        );
+    }
+
+    fn causal_blur_graph(regions: &[EffectRect]) -> CompiledFrameGraph {
+        let (_, registry) = blur_scene();
+        let instances = regions
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, rect)| {
+                let id = u64::try_from(index + 1).unwrap();
+                let surface = u32::try_from(index + 1).unwrap();
+                ResolvedEffectInstance {
+                    id: EffectInstanceId::new(id).unwrap(),
+                    program: EffectProgramId::new(1).unwrap(),
+                    anchor: EffectAnchor::BeforeSurface(surface),
+                    target_bounds: rect,
+                    region: EffectRegion::from_rect(rect),
+                    parameter_block: EffectParameterBlock::default(),
+                    coverage: None,
+                    signature: id,
+                    frame_demand: EffectFrameDemand::OnDamage,
+                    visual_group: None,
+                    anchor_scope: EffectAnchorScope::VisualGroup,
+                    backdrop_reuse: crate::compositor::EffectBackdropReuse::Exact,
+                    scene_order: EffectSceneOrder {
+                        group_order: 0,
+                        surface_order: surface,
+                        phase: 0,
+                    },
+                }
+            })
+            .collect();
+        let scene = ResolvedEffectScene::new(1, instances);
+        let FrameExecutionPlan::EffectGraph(graph) = compile_frame_execution_plan(
+            &scene,
+            &EffectRegion::empty(),
+            EffectRect::new(0, 0, 1920, 1080).unwrap(),
+            &registry,
+        )
+        .unwrap() else {
+            panic!("visible blur effects must compile to an effect graph");
+        };
+        graph
+    }
+
+    #[test]
+    fn regional_full_output_repair_selects_the_same_graph_work_as_legacy() {
+        let graph = causal_blur_graph(&[
+            EffectRect::new(500, 300, 20, 20).unwrap(),
+            EffectRect::new(780, 300, 20, 20).unwrap(),
+            EffectRect::new(500, 300, 320, 180).unwrap(),
+        ]);
+        let full_repair = EffectRegion::from_rect(EffectRect::new(0, 0, 1920, 1080).unwrap());
+        let legacy = plan_effect_execution_demand_with_policy(
+            &graph,
+            &full_repair,
+            false,
+            false,
+            EffectDemandPlannerPolicy::Legacy,
+        );
+        let (regional, diagnostics) = plan_effect_execution_demand_with_policy_and_diagnostics(
+            &graph,
+            &full_repair,
+            false,
+            false,
+            EffectDemandPlannerPolicy::Regional,
+        );
+
+        assert!(!diagnostics.regional_fallback);
+        assert_eq!(
+            regional
+                .instances
+                .iter()
+                .map(|item| item.id)
+                .collect::<Vec<_>>(),
+            legacy
+                .instances
+                .iter()
+                .map(|item| item.id)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            regional
+                .passes
+                .iter()
+                .map(|pass| pass.id)
+                .collect::<Vec<_>>(),
+            legacy.passes.iter().map(|pass| pass.id).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            regional.plan_stats().pass_count_selected,
+            legacy.plan_stats().pass_count_selected
+        );
+    }
+
+    #[test]
+    fn regional_transitive_checkpoint_demand_flows_in_reverse_pass_order() {
+        let graph = causal_blur_graph(&[
+            EffectRect::new(450, 300, 8, 30).unwrap(),
+            EffectRect::new(480, 300, 20, 40).unwrap(),
+            EffectRect::new(500, 300, 20, 60).unwrap(),
+        ]);
+        let first = EffectInstanceId::new(1).unwrap();
+        let second = EffectInstanceId::new(2).unwrap();
+        let third = EffectInstanceId::new(3).unwrap();
+        assert!(graph.instances[1].dependencies.contains(&first));
+        assert!(graph.instances[2].dependencies.contains(&second));
+        assert!(!graph.instances[2].dependencies.contains(&first));
+
+        let mut repair = EffectRegion::empty();
+        for (x, y) in [(502, 310), (506, 330), (510, 350)] {
+            repair.push(EffectRect::new(x, y, 2, 2).unwrap());
+        }
+        let (regional, diagnostics) = plan_effect_execution_demand_with_policy_and_diagnostics(
+            &graph,
+            &repair,
+            false,
+            false,
+            EffectDemandPlannerPolicy::Regional,
+        );
+        assert!(!diagnostics.regional_fallback);
+        assert!(regional.contains(first));
+        assert!(regional.contains(second));
+        assert!(regional.contains(third));
+        assert_eq!(regional.plan_stats().causal_dependency_edges_considered, 2);
+        assert_eq!(regional.plan_stats().causal_dependency_propagations, 2);
+        let second_capture = graph
+            .passes
+            .iter()
+            .find(|pass| pass.instance == second && pass.kind == RenderPassKind::SceneCapture)
+            .unwrap();
+        assert!(
+            regional
+                .pass_output_region(second_capture.id)
+                .is_some_and(|region| !region.is_empty())
+        );
+    }
+
+    #[test]
+    fn regional_fragmented_repairs_stay_bounded_and_prune_unrelated_effects() {
+        let graph = causal_blur_graph(&[EffectRect::new(100, 80, 320, 180).unwrap()]);
+        let mut fragmented_repair = EffectRegion::empty();
+        for index in 0..MAX_EFFECT_REGION_RECTS {
+            fragmented_repair.push(
+                EffectRect::new(
+                    110 + (index as i32 % 16) * 12,
+                    90 + (index as i32 / 16) * 12,
+                    4,
+                    4,
+                )
+                .unwrap(),
+            );
+        }
+        let fragmented = plan_effect_execution_demand_with_policy(
+            &graph,
+            &fragmented_repair,
+            false,
+            false,
+            EffectDemandPlannerPolicy::Regional,
+        );
+        assert!(!fragmented.plan_stats().regional_fallback);
+        assert!(
+            fragmented
+                .passes
+                .iter()
+                .all(|pass| pass.output_region.rects().len() <= MAX_EFFECT_REGION_RECTS)
+        );
+        assert!(fragmented.plan_stats().max_pass_region_rect_count <= MAX_EFFECT_REGION_RECTS);
+
+        let separated = causal_blur_graph(&[
+            EffectRect::new(100, 80, 320, 180).unwrap(),
+            EffectRect::new(1400, 500, 320, 180).unwrap(),
+        ]);
+        let first_id = EffectInstanceId::new(1).unwrap();
+        let second_id = EffectInstanceId::new(2).unwrap();
+        let local = plan_effect_execution_demand_with_policy(
+            &separated,
+            &EffectRegion::from_rect(EffectRect::new(110, 90, 8, 8).unwrap()),
+            false,
+            false,
+            EffectDemandPlannerPolicy::Regional,
+        );
+        assert!(!local.plan_stats().regional_fallback);
+        assert!(local.contains(first_id));
+        assert!(!local.contains(second_id));
+    }
+
+    #[test]
+    fn regional_full_kawase_expands_before_propagating_capture_input() {
+        let graph = causal_blur_graph(&[EffectRect::new(100, 80, 320, 180).unwrap()]);
+        let repair = EffectRegion::from_rect(EffectRect::new(120, 100, 7, 9).unwrap());
+        let (demand, diagnostics) = plan_effect_execution_demand_with_policy_and_diagnostics(
+            &graph,
+            &repair,
+            false,
+            true,
+            EffectDemandPlannerPolicy::Regional,
+        );
+        assert!(!diagnostics.regional_fallback);
+        for pass in graph.passes.iter().filter(|pass| {
+            matches!(
+                pass.kind,
+                RenderPassKind::DualKawaseDownsample | RenderPassKind::DualKawaseUpsample
+            )
+        }) {
+            assert_eq!(
+                demand.pass_output_region(pass.id),
+                Some(&full_pass_region(&graph, pass))
+            );
+        }
+        let capture = graph
+            .passes
+            .iter()
+            .find(|pass| pass.kind == RenderPassKind::SceneCapture)
+            .unwrap();
+        let capture_output = graph
+            .textures
+            .iter()
+            .find(|texture| Some(texture.id) == capture.output)
+            .unwrap();
+        assert_eq!(
+            demand.pass_output_region(capture.id),
+            Some(&EffectRegion::from_rect(capture_output.domain))
+        );
+    }
+
+    #[test]
+    fn regional_planner_falls_back_to_legacy_for_malformed_checkpoint_edges() {
+        let mut graph = causal_blur_graph(&[
+            EffectRect::new(500, 300, 20, 20).unwrap(),
+            EffectRect::new(780, 300, 20, 20).unwrap(),
+            EffectRect::new(500, 300, 320, 180).unwrap(),
+        ]);
+        let consumer_capture = graph
+            .passes
+            .iter_mut()
+            .find(|pass| {
+                pass.instance == EffectInstanceId::new(3).unwrap()
+                    && pass.kind == RenderPassKind::SceneCapture
+            })
+            .unwrap();
+        consumer_capture
+            .checkpoint_dependencies
+            .push(GraphPassId::new(65_000).unwrap());
+        let repair = EffectRegion::from_rect(EffectRect::new(502, 302, 2, 2).unwrap());
+        let legacy = plan_effect_execution_demand_with_policy(
+            &graph,
+            &repair,
+            false,
+            false,
+            EffectDemandPlannerPolicy::Legacy,
+        );
+        let (regional, diagnostics) = plan_effect_execution_demand_with_policy_and_diagnostics(
+            &graph,
+            &repair,
+            false,
+            false,
+            EffectDemandPlannerPolicy::Regional,
+        );
+
+        assert!(diagnostics.regional_fallback);
+        assert_eq!(
+            diagnostics.regional_fallback_reason.as_str(),
+            "pass_lookup_failed"
+        );
+        assert!(regional.plan_stats().regional_fallback);
+        assert_eq!(regional.instances, legacy.instances);
+        assert_eq!(regional.passes, legacy.passes);
+        assert_eq!(regional.execution_region, legacy.execution_region);
+    }
+
+    #[test]
+    fn regional_solver_keeps_external_texture_sources_out_of_producer_lookup() {
+        for external_source in [
+            GraphTextureSource::PrecomputedBackdrop,
+            GraphTextureSource::Static(crate::effects::StaticTextureId::new(9).unwrap()),
+        ] {
+            let mut graph = causal_blur_graph(&[EffectRect::new(100, 80, 320, 180).unwrap()]);
+            let final_pass = graph
+                .passes
+                .iter()
+                .find(|pass| {
+                    matches!(
+                        pass.kind,
+                        RenderPassKind::Composite | RenderPassKind::OutputPostProcess
+                    )
+                })
+                .unwrap();
+            let final_pass_id = final_pass.id;
+            let external_texture_id = final_pass.inputs[0];
+            let producer_pass_id = graph
+                .passes
+                .iter()
+                .find(|pass| pass.output == Some(external_texture_id))
+                .unwrap()
+                .id;
+            graph
+                .textures
+                .iter_mut()
+                .find(|texture| texture.id == external_texture_id)
+                .unwrap()
+                .source = external_source;
+            let (demand, diagnostics) = plan_effect_execution_demand_with_policy_and_diagnostics(
+                &graph,
+                &EffectRegion::from_rect(EffectRect::new(120, 100, 5, 5).unwrap()),
+                false,
+                false,
+                EffectDemandPlannerPolicy::Regional,
+            );
+
+            assert!(!diagnostics.regional_fallback);
+            assert!(!demand.pass_output_region(final_pass_id).unwrap().is_empty());
+            assert!(demand.pass_output_region(producer_pass_id).is_none());
+        }
+    }
+
+    #[test]
+    fn fifteen_window_stress_fixture_reduces_localized_regional_work() {
+        let (mut scene, registry) = synthesized_builtin_blur_scene(15);
+        for (index, instance) in scene.instances.iter_mut().take(14).enumerate() {
+            let rect =
+                EffectRect::new(100 + i32::try_from(index).unwrap() * 70, 50, 90, 60).unwrap();
+            instance.region = EffectRegion::from_rect(rect);
+            instance.target_bounds = rect;
+        }
+        let last = scene.instances.last_mut().unwrap();
+        let last_region = EffectRect::new(80, 40, 1300, 160).unwrap();
+        last.region = EffectRegion::from_rect(last_region);
+        last.target_bounds = last_region;
+        let output_bounds = EffectRect::new(0, 0, 1500, 240).unwrap();
+        let FrameExecutionPlan::EffectGraph(graph) =
+            compile_frame_execution_plan(&scene, &EffectRegion::empty(), output_bounds, &registry)
+                .unwrap()
+        else {
+            panic!("15 synthesized blur instances must compile to an effect graph");
+        };
+        let repair = EffectRegion::from_rect(EffectRect::new(1320, 70, 4, 4).unwrap());
+        let legacy = plan_effect_execution_demand_with_policy(
+            &graph,
+            &repair,
+            false,
+            false,
+            EffectDemandPlannerPolicy::Legacy,
+        );
+        let (regional, diagnostics) = plan_effect_execution_demand_with_policy_and_diagnostics(
+            &graph,
+            &repair,
+            false,
+            false,
+            EffectDemandPlannerPolicy::Regional,
+        );
+
+        assert!(!diagnostics.regional_fallback);
+        assert!(regional.instances.len() <= legacy.instances.len());
+        assert!(
+            regional.plan_stats().pass_count_selected <= legacy.plan_stats().pass_count_selected
+        );
+        assert!(regional.instances.len() < legacy.instances.len());
+        assert!(
+            regional.plan_stats().pass_count_selected < legacy.plan_stats().pass_count_selected
+        );
+        println!(
+            "planner_stress legacy_instances={} regional_instances={} legacy_passes={} regional_passes={}",
+            legacy.instances.len(),
+            regional.instances.len(),
+            legacy.plan_stats().pass_count_selected,
+            regional.plan_stats().pass_count_selected,
+        );
+
+        let full_repair = EffectRegion::from_rect(output_bounds);
+        let legacy_full = plan_effect_execution_demand_with_policy(
+            &graph,
+            &full_repair,
+            false,
+            false,
+            EffectDemandPlannerPolicy::Legacy,
+        );
+        let (regional_full, full_diagnostics) =
+            plan_effect_execution_demand_with_policy_and_diagnostics(
+                &graph,
+                &full_repair,
+                false,
+                false,
+                EffectDemandPlannerPolicy::Regional,
+            );
+        assert!(!full_diagnostics.regional_fallback);
+        assert_eq!(regional_full.instances.len(), legacy_full.instances.len());
+        assert_eq!(
+            regional_full.plan_stats().pass_count_selected,
+            legacy_full.plan_stats().pass_count_selected
+        );
     }
 
     #[test]

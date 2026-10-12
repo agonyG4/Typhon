@@ -9,6 +9,40 @@ This document records the reproducible procedure for the Typhon effects engine.
 It does not convert unit tests, shader-source inspection, or the dry-run matrix
 into hardware qualification.
 
+## Regional causal demand planner
+
+The experimental runtime demand planner is selected with
+`TYPHON_EFFECT_DEMAND_PLANNER=legacy|regional`. Unset and unknown values select
+`legacy`; values are trimmed and matched without regard to case. Unknown values
+emit one warning per process. The default remains `legacy` during
+qualification.
+
+`regional` preserves the current causal backdrop semantics. It does not share
+or precompute backdrop pixels. The compiled graph and its checkpoint
+dependencies remain a conservative topology: a dependency means an earlier
+effect may influence some pixels in the consumer's full capture domain. At
+runtime, demand starts at final presentation passes and flows backward through
+the existing texture sampling-region mapping. A demanded `SceneCapture` then
+intersects its actual demanded output region with each earlier effect's output
+influence. Empty intersections prune that compiled dependency; non-empty
+intersections demand only those pixels from the earlier effect's final pass.
+Reverse graph order carries those regions through transitive causal edges.
+
+If regional planning encounters incomplete or unsupported metadata, an unsafe
+region mapping, or invalid edge ordering, the entire frame falls back to the
+legacy planner. Demand trace records include
+`effect_demand_planner=legacy|regional`,
+`effect_demand_regional_fallback=true|false`, a stable fallback reason, and
+causal edge considered/propagated/pruned counters. These diagnostics establish
+which planner ran; they do not establish a performance result.
+
+This planner is separate from the rejected global precomputed-window-blur
+architecture described below. That experiment can omit intervening windows
+from a later window's backdrop and is not exact for overlapping causal effects.
+Keep `TYPHON_EFFECT_PRECOMPUTED_WINDOW_BLUR=off` for qualification. No
+performance claim is valid until deterministic correctness is followed by a
+comparable native A/B workload.
+
 ## Precomputed synthesized-window blur experiment
 
 The diagnostic environment variable is

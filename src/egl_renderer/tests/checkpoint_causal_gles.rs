@@ -209,6 +209,45 @@ fn render_checkpoint_test_frame_with_stats(
     .expect("diagnostic frame renders")
 }
 
+#[allow(clippy::too_many_arguments)]
+fn render_checkpoint_test_frame_with_planner(
+    harness: &mut GlesEffectTestHarness,
+    graph: &oblivion_one::effects::CompiledFrameGraph,
+    surface_signatures: &[EglSceneSurfaceSignature],
+    repair: OutputRect,
+    output_size: (u32, u32),
+    region: EffectRegion,
+    full: bool,
+    config: effects::EffectDebugConfig,
+    policy: oblivion_one::effects::EffectDemandPlannerPolicy,
+) -> oblivion_one::effects::EffectExecutionDemand {
+    set_current_snapshot(&mut harness.renderer, surface_signatures);
+    harness
+        .renderer
+        .effect_runtime
+        .effect_resources
+        .begin_checkpoint_frame();
+    let demand = oblivion_one::effects::plan_effect_execution_demand_with_policy(
+        graph,
+        &region,
+        false,
+        config.kawase_mode() == effects::EffectDebugKawaseMode::Full,
+        policy,
+    );
+    let selection = effects::select_effect_execution(graph, &demand);
+    effects::execute_effect_graph_with_debug_config(
+        &mut harness.renderer,
+        graph,
+        OutputFramebufferOrigin::TopLeftScanout,
+        &diagnostic_repaint_plan_for_repairs_in_size(&[repair], full, output_size),
+        &demand,
+        &selection,
+        config,
+    )
+    .expect("planner-specific diagnostic frame renders");
+    demand
+}
+
 fn full_current_checkpoint_reference(
     fixture: NativeThreeCheckpointFixture,
     signatures: &[EglSceneSurfaceSignature],
@@ -241,6 +280,164 @@ fn full_current_checkpoint_reference(
     let checkpoint_c = cached_checkpoint_pixels(&mut reference, &graph, 32);
     let checkpoint_b = cached_checkpoint_pixels(&mut reference, &graph, 33);
     (output, checkpoint_c, checkpoint_b)
+}
+
+fn pixel_difference_summary(left: &[u8], right: &[u8]) -> String {
+    if left.len() != right.len() {
+        return format!("lengths differ: left={} right={}", left.len(), right.len());
+    }
+    let differing_pixels = left
+        .chunks_exact(4)
+        .zip(right.chunks_exact(4))
+        .filter(|(left, right)| left != right)
+        .count();
+    let first_differences = left
+        .chunks_exact(4)
+        .zip(right.chunks_exact(4))
+        .enumerate()
+        .filter_map(|(index, (left, right))| {
+            (left != right).then_some((index, left.to_vec(), right.to_vec()))
+        })
+        .take(4)
+        .collect::<Vec<_>>();
+    format!("differing_pixels={differing_pixels}, first={first_differences:?}")
+}
+
+#[test]
+fn legacy_and_regional_planners_match_partial_overlapping_checkpoint_pixels() {
+    let fixture = native_three_checkpoint_fixture();
+    let config = effects::EffectDebugConfig::new(
+        effects::EffectDebugCaptureMode::Replay,
+        effects::EffectDebugKawaseMode::Partial,
+    );
+    let full_region = EffectRegion::from_rect(fixture.output_bounds);
+    let repairs = [
+        OutputRect::new(0, 0, 2, 2),
+        OutputRect::new(158, 0, 2, 2),
+        OutputRect::new(0, 118, 2, 2),
+        OutputRect::new(158, 118, 2, 2),
+        OutputRect::new(20, 16, 4, 4),
+        OutputRect::new(76, 56, 4, 4),
+        OutputRect::new(44, 32, 4, 4),
+        OutputRect::new(132, 96, 4, 4),
+    ];
+    #[derive(Debug)]
+    struct SequenceResult {
+        output_frames: Vec<Vec<u8>>,
+        overlap_causal_edges: usize,
+        overlap_checkpoint_passes: usize,
+    }
+
+    fn run_sequence(
+        fixture: NativeThreeCheckpointFixture,
+        repairs: &[OutputRect],
+        full_region: &EffectRegion,
+        config: effects::EffectDebugConfig,
+        policy: oblivion_one::effects::EffectDemandPlannerPolicy,
+    ) -> SequenceResult {
+        let mut harness = GlesEffectTestHarness::new(fixture.output_size.0, fixture.output_size.1);
+        harness.install_texture_backed_output();
+        install_native_three_checkpoint_diagnostic_scene(&mut harness, fixture.scene);
+
+        let seed_graph = compile_native_three_checkpoint_graph(fixture, &EffectRegion::empty());
+        let initial_signatures = signatures(fixture.scene, None);
+        let seed_demand = render_checkpoint_test_frame_with_planner(
+            &mut harness,
+            &seed_graph,
+            &initial_signatures,
+            fixture.repair,
+            fixture.output_size,
+            full_region.clone(),
+            true,
+            config,
+            policy,
+        );
+        if policy == oblivion_one::effects::EffectDemandPlannerPolicy::Regional {
+            assert!(!seed_demand.plan_stats().regional_fallback);
+        }
+
+        let mut output_frames = vec![read_diagnostic_pixels(&harness)];
+        let mut overlap_causal_edges = 0;
+        let mut overlap_checkpoint_passes = 0;
+        for repair in repairs.iter().copied() {
+            update_diagnostic_background_for_surface(
+                &mut harness,
+                fixture.scene.background_surface,
+                repair,
+                [236, 28, 42, 255],
+            );
+            let current_damage = diagnostic_region(repair);
+            let current_graph = compile_native_three_checkpoint_graph(fixture, &current_damage);
+            let current_signatures =
+                signatures(fixture.scene, Some(fixture.scene.background_surface));
+            let demand = render_checkpoint_test_frame_with_planner(
+                &mut harness,
+                &current_graph,
+                &current_signatures,
+                repair,
+                fixture.output_size,
+                current_damage,
+                false,
+                config,
+                policy,
+            );
+            if policy == oblivion_one::effects::EffectDemandPlannerPolicy::Regional {
+                assert!(!demand.plan_stats().regional_fallback);
+            }
+            if repair == OutputRect::new(76, 56, 4, 4) {
+                overlap_causal_edges = demand.plan_stats().causal_dependency_propagations;
+                overlap_checkpoint_passes = current_graph
+                    .passes
+                    .iter()
+                    .filter(|pass| {
+                        pass.kind == RenderPassKind::SceneCapture
+                            && !pass.checkpoint_dependencies.is_empty()
+                            && demand
+                                .pass_output_region(pass.id)
+                                .is_some_and(|region| !region.is_empty())
+                    })
+                    .count();
+            }
+            output_frames.push(read_diagnostic_pixels(&harness));
+        }
+
+        SequenceResult {
+            output_frames,
+            overlap_causal_edges,
+            overlap_checkpoint_passes,
+        }
+    }
+
+    let legacy = run_sequence(
+        fixture,
+        &repairs,
+        &full_region,
+        config,
+        oblivion_one::effects::EffectDemandPlannerPolicy::Legacy,
+    );
+    let regional = run_sequence(
+        fixture,
+        &repairs,
+        &full_region,
+        config,
+        oblivion_one::effects::EffectDemandPlannerPolicy::Regional,
+    );
+
+    assert_eq!(legacy.output_frames.len(), repairs.len() + 1);
+    assert_eq!(regional.output_frames.len(), repairs.len() + 1);
+    assert_eq!(legacy.output_frames[0], regional.output_frames[0]);
+    for (index, repair) in repairs.iter().enumerate() {
+        assert_eq!(
+            pixel_difference_summary(
+                &legacy.output_frames[index + 1],
+                &regional.output_frames[index + 1],
+            ),
+            "differing_pixels=0, first=[]",
+            "legacy and regional pixels differ for repair {repair:?}"
+        );
+    }
+    assert!(regional.overlap_causal_edges > 0);
+    assert!(regional.overlap_checkpoint_passes >= 2);
 }
 
 #[test]

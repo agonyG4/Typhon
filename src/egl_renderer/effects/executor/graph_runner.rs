@@ -401,7 +401,21 @@ pub(super) fn execute_graph_passes_inner(
                 scene_cursor = next_cursor.max(scene_cursor);
             }
             if is_direct_framebuffer_capture(pass, scene_baseline_authority, debug_config) {
-                let required = pass_output_texture_domain(graph, pass);
+                let regional_pass_demand = demand.has_pass_plan()
+                    && demand.plan_stats().planner_policy
+                        == oblivion_one::effects::EffectDemandPlannerPolicy::Regional
+                    && !demand.plan_stats().regional_fallback;
+                // The regional solver validates only the capture pixels this
+                // frame requested. Legacy and fallback plans keep their
+                // existing full-texture validity check.
+                let required = if regional_pass_demand {
+                    demand
+                        .pass_output_region(pass.id)
+                        .cloned()
+                        .unwrap_or_else(|| pass_output_texture_domain(graph, pass))
+                } else {
+                    pass_output_texture_domain(graph, pass)
+                };
                 let required_effect_region =
                     checkpoint_dependency_influence_region(graph, pass, &required);
                 let mut dependency_validity = Vec::new();

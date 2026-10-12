@@ -6,7 +6,7 @@ use oblivion_one::{
     compositor::{self, RenderableSurface},
     effects::{
         CompiledPrecomputedBackdropPlan, EffectExecutionDemand, FrameExecutionPlan,
-        compile_frame_execution_variants,
+        compile_frame_execution_variants, configured_effect_demand_planner_policy,
     },
 };
 
@@ -584,6 +584,7 @@ impl FramePipeline<'_> {
                         count.saturating_add(instance.dependencies.len())
                     }),
                     dependency_propagations: 0,
+                    planner_policy: configured_effect_demand_planner_policy(),
                     max_instance_region_rect_count: 0,
                     conservative_full: planned.plan.mode == RepaintMode::Full,
                     ..oblivion_one::effects::EffectDemandPlanStats::default()

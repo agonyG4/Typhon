@@ -5,6 +5,7 @@ pub mod model;
 pub mod parameters;
 pub mod registry;
 pub mod render_graph;
+pub mod render_graph_demand;
 pub mod validation;
 
 pub use config::*;
@@ -14,4 +15,5 @@ pub use model::*;
 pub use parameters::*;
 pub use registry::*;
 pub use render_graph::*;
+pub use render_graph_demand::*;
 pub use validation::*;

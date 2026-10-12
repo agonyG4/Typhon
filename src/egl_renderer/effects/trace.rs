@@ -852,7 +852,7 @@ impl EffectExecutionTrace {
     ) {
         self.event(|| {
             format!(
-                "event={phase}_{boundary} frame_id={} render_generation={} scene_generation={} scene_signature={} repaint_mode={} render_damage={} repair_damage={} visible_effects={} selected_effects={} graph_passes={} graph_textures={} peak_live_intermediates={} repair_rect_count={} dependency_edge_count={} dependency_propagations={} max_instance_region_rect_count={} region_representation_overflows={} visible_clip_fallbacks={} work_region_bbox_coalesces={} conservative_full={} pass_count_selected={} partial_pass_count={} full_domain_pass_count={} pass_dependency_propagations={} max_pass_region_rect_count={} pass_conservative_fallbacks={}",
+                "event={phase}_{boundary} frame_id={} render_generation={} scene_generation={} scene_signature={} repaint_mode={} render_damage={} repair_damage={} visible_effects={} selected_effects={} graph_passes={} graph_textures={} peak_live_intermediates={} effect_demand_planner={} effect_demand_regional_fallback={} effect_demand_regional_fallback_reason={} repair_rect_count={} dependency_edge_count={} dependency_propagations={} causal_dependency_edges_considered={} causal_dependency_propagations={} causal_dependency_pruned_empty={} max_instance_region_rect_count={} region_representation_overflows={} visible_clip_fallbacks={} work_region_bbox_coalesces={} conservative_full={} pass_count_selected={} partial_pass_count={} full_domain_pass_count={} pass_dependency_propagations={} max_pass_region_rect_count={} pass_conservative_fallbacks={}",
                 optional_u64(self.frame_id),
                 optional_u64(summary.render_generation.or(self.render_generation)),
                 optional_u64(summary.scene_generation.or(self.scene_generation)),
@@ -867,6 +867,18 @@ impl EffectExecutionTrace {
                 optional_usize(summary.peak_live_intermediate_count),
                 summary
                     .demand_plan
+                    .map(|stats| stats.planner_policy.as_str())
+                    .unwrap_or("unknown"),
+                summary.demand_plan.map_or_else(
+                    || "unknown".to_owned(),
+                    |stats| stats.regional_fallback.to_string(),
+                ),
+                summary
+                    .demand_plan
+                    .map(|stats| stats.regional_fallback_reason.as_str())
+                    .unwrap_or("unknown"),
+                summary
+                    .demand_plan
                     .map(|stats| stats.repair_rect_count)
                     .map_or_else(|| "unknown".to_owned(), |count| count.to_string()),
                 summary
@@ -876,6 +888,18 @@ impl EffectExecutionTrace {
                 summary
                     .demand_plan
                     .map(|stats| stats.dependency_propagations)
+                    .map_or_else(|| "unknown".to_owned(), |count| count.to_string()),
+                summary
+                    .demand_plan
+                    .map(|stats| stats.causal_dependency_edges_considered)
+                    .map_or_else(|| "unknown".to_owned(), |count| count.to_string()),
+                summary
+                    .demand_plan
+                    .map(|stats| stats.causal_dependency_propagations)
+                    .map_or_else(|| "unknown".to_owned(), |count| count.to_string()),
+                summary
+                    .demand_plan
+                    .map(|stats| stats.causal_dependency_pruned_empty)
                     .map_or_else(|| "unknown".to_owned(), |count| count.to_string()),
                 summary
                     .demand_plan
@@ -1467,11 +1491,15 @@ mod tests {
                 repair_rect_count: 71,
                 dependency_edge_count: 6,
                 dependency_propagations: 6,
+                causal_dependency_edges_considered: 9,
+                causal_dependency_propagations: 5,
+                causal_dependency_pruned_empty: 4,
                 max_instance_region_rect_count: 72,
                 region_representation_overflows: 3,
                 visible_clip_fallbacks: 2,
                 work_region_bbox_coalesces: 1,
                 conservative_full: false,
+                planner_policy: oblivion_one::effects::EffectDemandPlannerPolicy::Regional,
                 ..Default::default()
             }),
             ..FrameTraceSummary::default()
@@ -1482,8 +1510,14 @@ mod tests {
         let line = take_test_events().pop().expect("demand trace event");
 
         assert!(line.contains("repair_rect_count=71"));
+        assert!(line.contains("effect_demand_planner=regional"));
+        assert!(line.contains("effect_demand_regional_fallback=false"));
+        assert!(line.contains("effect_demand_regional_fallback_reason=none"));
         assert!(line.contains("dependency_edge_count=6"));
         assert!(line.contains("dependency_propagations=6"));
+        assert!(line.contains("causal_dependency_edges_considered=9"));
+        assert!(line.contains("causal_dependency_propagations=5"));
+        assert!(line.contains("causal_dependency_pruned_empty=4"));
         assert!(line.contains("max_instance_region_rect_count=72"));
         assert!(line.contains("region_representation_overflows=3"));
         assert!(line.contains("visible_clip_fallbacks=2"));

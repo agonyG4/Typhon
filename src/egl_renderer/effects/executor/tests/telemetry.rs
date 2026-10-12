@@ -935,6 +935,52 @@ fn effect_selection_follows_direct_presentation_and_graph_dependencies() {
 }
 
 #[test]
+fn executor_selection_skips_empty_regional_passes_before_texture_acquisition() {
+    let visible = oblivion_one::effects::EffectRegion::from_rect(
+        oblivion_one::effects::EffectRect::new(300, 160, 120, 80).unwrap(),
+    );
+    let graph = compile_builtin_background_blur(
+        visible.clone(),
+        &EffectRegion::empty(),
+        oblivion_one::effects::EffectRect::new(0, 0, 1920, 1080).unwrap(),
+    );
+    let instance = oblivion_one::effects::EffectInstanceId::new(1).unwrap();
+    let empty_capture = graph
+        .passes
+        .iter()
+        .find(|pass| pass.kind == RenderPassKind::SceneCapture)
+        .unwrap();
+    let demanded_final = graph
+        .passes
+        .iter()
+        .rev()
+        .find(|pass| {
+            matches!(
+                pass.kind,
+                RenderPassKind::Composite | RenderPassKind::OutputPostProcess
+            )
+        })
+        .unwrap();
+    let demand = planned_demand(
+        instance,
+        visible.clone(),
+        vec![
+            (empty_capture.id, EffectRegion::empty()),
+            (demanded_final.id, visible),
+        ],
+    );
+
+    let selection = select_effect_execution(&graph, &demand);
+
+    assert_eq!(selection.executed_passes, vec![demanded_final.id]);
+    assert!(
+        !selection
+            .acquired_texture_ids
+            .contains(&empty_capture.output.unwrap())
+    );
+}
+
+#[test]
 fn structured_repaint_36_and_60_rects_reach_scene_replay_state() {
     use crate::egl_renderer::damage::{
         BufferAge, EglPartialRepaintCapabilities, OutputDamage, PartialRepaintComplexityPolicy,
