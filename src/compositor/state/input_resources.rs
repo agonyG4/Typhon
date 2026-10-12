@@ -476,6 +476,7 @@ impl CompositorState {
             return;
         };
         let surface_id = compositor_surface_id(&surface);
+        let role_before_assignment = self.surface_role(surface_id);
         if let Err(error) = self.assign_surface_role(surface_id, SurfaceRole::Cursor) {
             pointer_debug_log_lazy(|| {
                 format!(
@@ -487,8 +488,11 @@ impl CompositorState {
             });
             return;
         }
+        debug_assert!(matches!(
+            role_before_assignment,
+            SurfaceRole::Unassigned | SurfaceRole::Cursor
+        ));
         self.cursor_surface_ids.insert(surface_id);
-        self.unmap_surface_content(surface_id);
         let choice = ClientCursorChoice::Surface(ActiveClientCursor {
             pointer: pointer.clone(),
             surface_id,
@@ -502,6 +506,7 @@ impl CompositorState {
         self.focused_client_cursor = Some(choice);
         self.cursor_visibility.client_hidden_pointer = None;
         self.cursor_visibility.client_cursor_pointer = Some(pointer.clone());
+        let adopted_current_content = self.adopt_current_cursor_surface_content(surface_id);
         pointer_debug_log_lazy(|| {
             format!(
                 "cursor request client_surface pointer={} surface={} hotspot=({}, {})",
@@ -511,7 +516,7 @@ impl CompositorState {
                 hotspot_y
             )
         });
-        if changed {
+        if changed && !adopted_current_content {
             self.advance_render_generation(RenderGenerationCause::CursorState);
         }
         self.sync_cursor_visibility_request();

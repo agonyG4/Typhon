@@ -1341,6 +1341,16 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                                 .state
                                 .current_surface_buffers
                                 .contains_key(&internal_surface_id),
+                            current_buffer_id: server
+                                .state
+                                .current_surface_buffers
+                                .get(&internal_surface_id)
+                                .map(|buffer| buffer.buffer_id().get()),
+                            current_commit_sequence: server
+                                .state
+                                .current_surface_buffers
+                                .get(&internal_surface_id)
+                                .map(|buffer| buffer.commit_sequence().get()),
                             active_dmabuf: server
                                 .state
                                 .active_dmabuf_buffers

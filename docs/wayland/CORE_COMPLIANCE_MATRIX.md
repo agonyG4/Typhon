@@ -227,6 +227,12 @@ contract until the bound is upgraded, which this milestone forbids.
 | `wl_subsurface` | n/a | request `set_sync` | 1 | `protocols/core.rs` | Implemented | Partial |
 | `wl_subsurface` | n/a | request `set_desync` | 1 | `protocols/core.rs` | Implemented | Partial |
 
+Selecting a cursor surface preserves any buffer already committed to it.
+Cursor-role assignment adopts that current content for cursor presentation
+without requiring a second `wl_surface.commit`. The `wl_pointer.set_cursor`
+classification remains `Partial` because this lifecycle fix does not resolve
+the other gaps represented by that row.
+
 ## Stable xdg-shell request/event inventory
 
 | interface | advertised | request/event | XML since | dispatch owner | classification | status |

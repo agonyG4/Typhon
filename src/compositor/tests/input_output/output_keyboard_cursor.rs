@@ -1053,13 +1053,138 @@ fn valid_cursor_surface_commit_exposes_hotspot_adjusted_overlay_snapshot() {
     );
     let _server = stop_controllable_test_server(commands, server_thread);
 
+    let result = result.unwrap();
+    assert_eq!(result.cursor_before_commit, None);
     let cursor = result
-        .unwrap()
         .cursor
         .expect("valid committed cursor should have an overlay snapshot");
     assert_eq!(cursor.logical_x, render::FIRST_SURFACE_OFFSET.0 + 19);
     assert_eq!(cursor.logical_y, render::FIRST_SURFACE_OFFSET.1 + 13);
     assert_eq!((cursor.width, cursor.height), (24, 24));
+}
+
+#[test]
+fn precommitted_cursor_surface_is_adopted_on_set_cursor_without_recommit() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let result = create_precommitted_cursor_surface_without_recommit(&socket_path, &commands);
+    let _server = stop_controllable_test_server(commands, server_thread);
+    let result = result.unwrap();
+
+    let before = result
+        .pre_role_current_buffer
+        .expect("roleless commit should retain its current buffer");
+    let after = result
+        .current_buffer_after_set_cursor
+        .expect("cursor role should retain the current buffer");
+    let cursor = result
+        .cursor
+        .expect("precommitted cursor content should be visible without another commit");
+
+    assert!(before.current_surface_buffer);
+    assert_eq!(before.current_buffer_id, Some(cursor.buffer_id));
+    assert_eq!(before.current_commit_sequence, Some(cursor.commit_sequence));
+    assert!(after.current_surface_buffer);
+    assert_eq!(after.current_buffer_id, before.current_buffer_id);
+    assert_eq!(
+        after.current_commit_sequence,
+        before.current_commit_sequence
+    );
+    assert_eq!(after.active_dmabuf, before.active_dmabuf);
+    assert_eq!(
+        after.pending_dmabuf_releases,
+        before.pending_dmabuf_releases
+    );
+    assert_eq!(result.cause, RenderGenerationCause::CursorState);
+    assert_eq!(
+        result.generation_after_set_cursor,
+        result
+            .generation_before_set_cursor
+            .map(|generation| generation + 1)
+    );
+    assert_eq!(cursor.first_pixel, Some(0xff20_3040));
+    assert_eq!(cursor.logical_x, render::FIRST_SURFACE_OFFSET.0 + 19);
+    assert_eq!(cursor.logical_y, render::FIRST_SURFACE_OFFSET.1 + 13);
+    assert_eq!((cursor.width, cursor.height), (12, 12));
+    assert_eq!(cursor.buffer_scale, 2);
+    assert_eq!(
+        cursor.buffer_transform,
+        wayland_server::protocol::wl_output::Transform::Normal
+    );
+    assert!(cursor.journal_contains_commit_sequence);
+    assert_eq!(result.renderable_count, 1);
+}
+
+#[test]
+fn null_buffer_commit_after_precommitted_cursor_adoption_removes_cursor_content() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let result = create_precommitted_cursor_surface_then_null_commit(&socket_path, &commands);
+    let _server = stop_controllable_test_server(commands, server_thread);
+    let result = result.unwrap();
+    let adopted = result
+        .cursor
+        .expect("precommitted content should be visible before the null commit");
+    assert_eq!(
+        result.cursor_after_null_buffer_cleared,
+        Some(true),
+        "an explicit null-buffer cursor commit should clear adopted content"
+    );
+    assert_eq!(
+        result
+            .pre_role_current_buffer
+            .expect("roleless cursor commit should retain its attachment")
+            .current_buffer_id,
+        Some(adopted.buffer_id)
+    );
+}
+
+#[test]
+fn precommitted_dmabuf_cursor_keeps_one_release_obligation_on_set_cursor() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let result =
+        create_precommitted_dmabuf_cursor_surface_without_recommit(&socket_path, &commands);
+    let _server = stop_controllable_test_server(commands, server_thread);
+    let result = result.unwrap();
+    let before = result
+        .pre_role_current_buffer
+        .expect("roleless DMA-BUF commit should retain its current buffer");
+    let after = result
+        .current_buffer_after_set_cursor
+        .expect("cursor-role adoption should retain its current buffer");
+    let cursor = result
+        .cursor
+        .expect("precommitted DMA-BUF cursor should be renderable without recommit");
+
+    assert!(before.current_surface_buffer);
+    assert!(before.active_dmabuf);
+    assert_eq!(before.pending_dmabuf_releases, 0);
+    assert_eq!(before.current_buffer_id, Some(cursor.buffer_id));
+    assert_eq!(before.current_commit_sequence, Some(cursor.commit_sequence));
+    assert!(after.current_surface_buffer);
+    assert!(after.active_dmabuf);
+    assert_eq!(
+        after.pending_dmabuf_releases,
+        before.pending_dmabuf_releases
+    );
+    assert_eq!(after.current_buffer_id, before.current_buffer_id);
+    assert_eq!(
+        after.current_commit_sequence,
+        before.current_commit_sequence
+    );
+    assert!(cursor.journal_contains_commit_sequence);
+    assert_eq!((cursor.width, cursor.height), (2, 2));
+    assert_eq!(result.renderable_count, 1);
 }
 
 #[test]
@@ -1460,10 +1585,24 @@ fn client_cursor_hotspot_hide_reselect_and_destroy_transitions_are_isolated() {
     let initial = snapshots.initial.unwrap();
     let hotspot_changed = snapshots.hotspot_changed.unwrap();
     assert_eq!(hotspot_changed.surface_id, initial.surface_id);
+    assert_eq!(hotspot_changed.buffer_id, initial.buffer_id);
+    assert_eq!(hotspot_changed.commit_sequence, initial.commit_sequence);
+    assert_eq!(hotspot_changed.first_pixel, initial.first_pixel);
     assert_eq!(hotspot_changed.logical_x, initial.logical_x - 4);
     assert_eq!(hotspot_changed.logical_y, initial.logical_y - 6);
+    assert_eq!(initial.first_pixel, Some(0xff20_3040));
+    assert!(initial.journal_contains_commit_sequence);
     assert_eq!(snapshots.hidden, None);
-    assert_eq!(snapshots.reselected.unwrap().surface_id, initial.surface_id);
+    let reselected = snapshots.reselected.unwrap();
+    assert_eq!(reselected.surface_id, initial.surface_id);
+    assert_eq!(reselected.buffer_id, initial.buffer_id);
+    let replaced = snapshots.replaced.unwrap();
+    assert_eq!(replaced.surface_id, initial.surface_id);
+    assert_ne!(replaced.buffer_id, initial.buffer_id);
+    assert_ne!(replaced.commit_sequence, initial.commit_sequence);
+    assert!(replaced.commit_sequence > initial.commit_sequence);
+    assert_eq!(replaced.first_pixel, Some(0xffab_cdef));
+    assert!(replaced.journal_contains_commit_sequence);
     assert_eq!(snapshots.destroyed, None);
 }
 

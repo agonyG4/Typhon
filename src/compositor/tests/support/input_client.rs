@@ -871,6 +871,10 @@ pub(in crate::compositor::tests) fn create_toplevel_then_set_and_commit_cursor_s
     };
     let cursor_surface = compositor.create_surface(&qh, ());
     pointer.set_cursor(serial, Some(&cursor_surface), 1, 1);
+    connection.flush()?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    let cursor_before_commit = capture_client_cursor_snapshot(commands);
     if request_frame_callback {
         cursor_surface.frame(&qh, ());
     }
@@ -905,9 +909,139 @@ pub(in crate::compositor::tests) fn create_toplevel_then_set_and_commit_cursor_s
 
     Ok(CursorSurfaceCommitSnapshot {
         renderable_count: capture_renderable_surface_count(commands),
+        cursor_before_commit,
         cursor: capture_client_cursor_snapshot(commands),
+        pre_role_current_buffer: None,
+        current_buffer_after_set_cursor: None,
+        generation_before_set_cursor: None,
+        generation_after_set_cursor: None,
+        cursor_after_null_buffer_cleared: None,
         callback_state,
         cause: capture_render_generation_cause(commands),
+    })
+}
+
+pub(in crate::compositor::tests) fn create_precommitted_cursor_surface_without_recommit(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+) -> Result<CursorSurfaceCommitSnapshot, Box<dyn std::error::Error>> {
+    create_precommitted_cursor_surface_without_recommit_inner(socket_path, commands, false, false)
+}
+
+pub(in crate::compositor::tests) fn create_precommitted_cursor_surface_then_null_commit(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+) -> Result<CursorSurfaceCommitSnapshot, Box<dyn std::error::Error>> {
+    create_precommitted_cursor_surface_without_recommit_inner(socket_path, commands, false, true)
+}
+
+pub(in crate::compositor::tests) fn create_precommitted_dmabuf_cursor_surface_without_recommit(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+) -> Result<CursorSurfaceCommitSnapshot, Box<dyn std::error::Error>> {
+    create_precommitted_cursor_surface_without_recommit_inner(socket_path, commands, true, false)
+}
+
+fn create_precommitted_cursor_surface_without_recommit_inner(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+    use_dmabuf: bool,
+    null_commit_after_adoption: bool,
+) -> Result<CursorSurfaceCommitSnapshot, Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+    let dmabuf: Option<client_zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1> = if use_dmabuf {
+        Some(globals.bind(&qh, 3..=3, ())?)
+    } else {
+        None
+    };
+    let pointer = seat.get_pointer(&qh, ());
+    let (surface, _xdg_surface, _toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 160, 120)?;
+    surface.commit();
+    connection.flush()?;
+
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state)?;
+    commands.send(ServerCommand::PointerMotion {
+        x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 20.0,
+        y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 14.0,
+    })?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    let serial = state
+        .pointer_enter_serial
+        .ok_or("missing pointer enter serial")?;
+
+    let cursor_surface = compositor.create_surface(&qh, ());
+    let (shm_buffer, dmabuf_buffer) = if use_dmabuf {
+        let buffer = create_test_dmabuf_buffer(
+            dmabuf.as_ref().expect("DMA-BUF global was bound"),
+            &qh,
+            0xff20_3040,
+        )?;
+        cursor_surface.attach(Some(&buffer), 0, 0);
+        cursor_surface.damage_buffer(0, 0, 2, 2);
+        (None, Some(buffer))
+    } else {
+        cursor_surface.set_buffer_scale(2);
+        let buffer = attach_test_buffered_surface(&cursor_surface, &shm, &qh, 24, 24)?;
+        (Some(buffer), None)
+    };
+    cursor_surface.commit();
+    connection.flush()?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+
+    let pre_role_current_buffer = Some(capture_surface_buffer_ownership_for_protocol_surface(
+        commands,
+        cursor_surface.id().protocol_id(),
+    ));
+    let generation_before_set_cursor = capture_render_generation(commands);
+    pointer.set_cursor(serial, Some(&cursor_surface), 1, 1);
+    connection.flush()?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    let current_buffer_after_set_cursor =
+        Some(capture_surface_buffer_ownership_for_protocol_surface(
+            commands,
+            cursor_surface.id().protocol_id(),
+        ));
+    let generation_after_set_cursor = capture_render_generation(commands);
+    let cursor = capture_client_cursor_snapshot(commands);
+    let renderable_count = capture_renderable_surface_count(commands);
+    let cause = capture_render_generation_cause(commands);
+    let cursor_after_null_buffer_cleared = if null_commit_after_adoption {
+        cursor_surface.attach(None, 0, 0);
+        cursor_surface.commit();
+        connection.flush()?;
+        wait_for_server_commands(commands);
+        queue.roundtrip(&mut state)?;
+        Some(capture_client_cursor_snapshot(commands).is_none())
+    } else {
+        None
+    };
+    drop(shm_buffer);
+    drop(dmabuf_buffer);
+
+    Ok(CursorSurfaceCommitSnapshot {
+        renderable_count,
+        cursor_before_commit: None,
+        cursor,
+        pre_role_current_buffer,
+        current_buffer_after_set_cursor,
+        generation_before_set_cursor: Some(generation_before_set_cursor),
+        generation_after_set_cursor: Some(generation_after_set_cursor),
+        cursor_after_null_buffer_cleared,
+        callback_state: None,
+        cause,
     })
 }
 
@@ -1041,8 +1175,12 @@ pub(in crate::compositor::tests) fn exercise_client_cursor_state_transitions(
         .ok_or("missing pointer enter serial")?;
 
     let cursor_surface = compositor.create_surface(&qh, ());
-    pointer.set_cursor(serial, Some(&cursor_surface), 1, 1);
     commit_test_buffered_surface(&cursor_surface, &shm, &qh, 24, 24)?;
+    connection.flush()?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+
+    pointer.set_cursor(serial, Some(&cursor_surface), 1, 1);
     connection.flush()?;
     wait_for_server_commands(commands);
     queue.roundtrip(&mut state)?;
@@ -1063,6 +1201,15 @@ pub(in crate::compositor::tests) fn exercise_client_cursor_state_transitions(
     wait_for_server_commands(commands);
     let reselected = capture_client_cursor_snapshot(commands);
 
+    let mut replacement_buffer = TestShmBuffer::new(&shm, &qh, 24, 24)?;
+    replacement_buffer.write_pixels(&vec![0xffab_cdef; 24 * 24])?;
+    replacement_buffer.attach(&cursor_surface, 24, 24);
+    cursor_surface.commit();
+    connection.flush()?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    let replaced = capture_client_cursor_snapshot(commands);
+
     cursor_surface.destroy();
     connection.flush()?;
     wait_for_server_commands(commands);
@@ -1073,6 +1220,7 @@ pub(in crate::compositor::tests) fn exercise_client_cursor_state_transitions(
         hotspot_changed,
         hidden,
         reselected,
+        replaced,
         destroyed,
     })
 }

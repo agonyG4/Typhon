@@ -1122,6 +1122,12 @@ This is not equivalent to general desktop capture. The local portal backend adve
 
 The native input profile advertises relative pointer, pointer constraints, pointer warp, cursor shape, keyboard-shortcuts inhibit and idle inhibit. `wl_touch` is explicitly not advertised; `get_touch` is a required `missing_capability` protocol error. Cursor-shape supports pointer devices; tablet-tool creation is not advertised as capability.
 
+Cursor-role assignment changes presentation ownership without destroying
+current `wl_surface` content. A buffer committed before
+`wl_pointer.set_cursor` is adopted as the cursor's current content, so the
+client does not need to commit the surface again. Empty cursor surfaces remain
+empty until a later cursor-role commit supplies content.
+
 ### Source anchors
 
 - `src/compositor/server_globals.rs` — global registration/auth-capability boundary.

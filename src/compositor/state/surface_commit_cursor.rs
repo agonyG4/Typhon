@@ -2,6 +2,70 @@ use super::*;
 use crate::compositor::state_data::SurfaceContentMapping;
 
 impl CompositorState {
+    pub(in crate::compositor) fn adopt_current_cursor_surface_content(
+        &mut self,
+        surface_id: u32,
+    ) -> bool {
+        let has_cursor_role = matches!(self.surface_role(surface_id), SurfaceRole::Cursor);
+        debug_assert!(has_cursor_role);
+        if !has_cursor_role || self.client_cursor_surfaces.contains_key(&surface_id) {
+            return false;
+        }
+
+        let Some(current) = self.current_surface_buffers.get(&surface_id).cloned() else {
+            return false;
+        };
+        let (materialized, shm_release, copy_to_release_us) = match current {
+            CurrentSurfaceBuffer::Materialized(materialized) => (materialized, None, 0),
+            CurrentSurfaceBuffer::Unmaterialized(pending) => {
+                let copy_started = std::time::Instant::now();
+                let (materialized, shm_release) = match pending
+                    .materialize_for_publication(None, &RenderableSurfaceDamage::Full)
+                {
+                    Ok(materialized) => materialized,
+                    Err(_) => {
+                        self.note_shm_materialization_failure(&pending);
+                        return false;
+                    }
+                };
+                (
+                    materialized,
+                    shm_release,
+                    copy_started.elapsed().as_micros() as u64,
+                )
+            }
+        };
+
+        let generation = self.next_render_generation_value();
+        let commit_sequence = materialized.commit_sequence;
+        let surface = materialized.to_renderable_surface(
+            surface_id,
+            SurfacePlacement::root(),
+            generation,
+            RenderableSurfaceDamage::Full,
+        );
+        let buffer_size = surface.buffer_size();
+
+        // The original commit already established this attachment's lifetime.
+        // Replacing only the representation here preserves DMA-BUF release ownership.
+        self.current_surface_buffers
+            .insert(surface_id, CurrentSurfaceBuffer::Materialized(materialized));
+        self.client_cursor_surfaces.insert(surface_id, surface);
+        if let Some(release) = shm_release {
+            self.release_materialized_shm(release, copy_to_release_us);
+        }
+        self.record_surface_damage_commit_at(
+            surface_id,
+            Some(commit_sequence),
+            RenderableSurfaceDamage::Full,
+            buffer_size.width,
+            buffer_size.height,
+        );
+        self.set_render_generation(generation, RenderGenerationCause::CursorState);
+        self.refresh_presentation_feedback_eligibility();
+        true
+    }
+
     pub(in crate::compositor) fn commit_cursor_surface_buffer(
         &mut self,
         surface_id: u32,

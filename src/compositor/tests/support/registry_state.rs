@@ -376,6 +376,8 @@ pub(in crate::compositor::tests) struct InactiveDescendantSnapshots {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::compositor::tests) struct SurfaceBufferOwnershipSnapshot {
     pub(in crate::compositor::tests) current_surface_buffer: bool,
+    pub(in crate::compositor::tests) current_buffer_id: Option<u64>,
+    pub(in crate::compositor::tests) current_commit_sequence: Option<u64>,
     pub(in crate::compositor::tests) active_dmabuf: bool,
     pub(in crate::compositor::tests) pending_dmabuf_releases: usize,
 }
@@ -630,7 +632,15 @@ pub(in crate::compositor::tests) struct WindowInteractionCursorSnapshots {
 #[derive(Debug)]
 pub(in crate::compositor::tests) struct CursorSurfaceCommitSnapshot {
     pub(in crate::compositor::tests) renderable_count: usize,
+    pub(in crate::compositor::tests) cursor_before_commit: Option<ClientCursorSnapshot>,
     pub(in crate::compositor::tests) cursor: Option<ClientCursorSnapshot>,
+    pub(in crate::compositor::tests) pre_role_current_buffer:
+        Option<SurfaceBufferOwnershipSnapshot>,
+    pub(in crate::compositor::tests) current_buffer_after_set_cursor:
+        Option<SurfaceBufferOwnershipSnapshot>,
+    pub(in crate::compositor::tests) generation_before_set_cursor: Option<u64>,
+    pub(in crate::compositor::tests) generation_after_set_cursor: Option<u64>,
+    pub(in crate::compositor::tests) cursor_after_null_buffer_cleared: Option<bool>,
     pub(in crate::compositor::tests) callback_state: Option<(bool, bool)>,
     pub(in crate::compositor::tests) cause: RenderGenerationCause,
 }
@@ -641,6 +651,7 @@ pub(in crate::compositor::tests) struct CursorTransitionSnapshots {
     pub(in crate::compositor::tests) hotspot_changed: Option<ClientCursorSnapshot>,
     pub(in crate::compositor::tests) hidden: Option<ClientCursorSnapshot>,
     pub(in crate::compositor::tests) reselected: Option<ClientCursorSnapshot>,
+    pub(in crate::compositor::tests) replaced: Option<ClientCursorSnapshot>,
     pub(in crate::compositor::tests) destroyed: Option<ClientCursorSnapshot>,
 }
 

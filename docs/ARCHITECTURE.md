@@ -99,6 +99,12 @@ policy. A locked pointer suppresses absolute pointer motion while relative
 motion continues, but the selected client cursor surface or shape remains
 visible unless an independent cursor request or override changes it.
 
+Assigning `SurfaceRole::Cursor` changes how a `wl_surface`'s current content is
+presented; it does not discard that content. If the client commits a buffer
+before `wl_pointer.set_cursor`, Typhon adopts the current committed content
+into cursor presentation without requiring another client commit. The cursor
+keeps its ordinary cursor-content ownership outside the desktop scene.
+
 ## Effective XDG window geometry
 
 The compositor has one logical authority for native XDG window geometry.
