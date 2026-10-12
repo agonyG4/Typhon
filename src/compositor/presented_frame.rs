@@ -225,7 +225,7 @@ mod tests {
         PresentationGeometryMutation, PresentationOpacity, PresentationOpacityMutation,
         PresentationRetainedVisualIdentity, PresentationRetainedVisualKind, PresentationRevisionId,
         PresentationSampleTimeSource, PresentationTransactionId, PresentationTransactionRequest,
-        PresentationWindowTarget,
+        PresentationWindowTarget, PresentedWindowGeometry,
     };
     use crate::window_lifecycle_animation::{
         LifecycleDirection, LifecycleFrameSample, LifecycleFrameSnapshot, LifecycleMotionRequest,
@@ -445,6 +445,135 @@ mod tests {
     }
 
     #[test]
+    fn repeated_identical_physical_presentation_keeps_pointer_hit_generation() {
+        let mut state = CompositorState::new(None);
+        let output_id = state.native_output_id().expect("test output id");
+        let root_surface_id = 71;
+        let pointer_generation_before_authority = state.pointer_hit_generation;
+        let scene_node_id = SceneNodeId::from_raw(PRESENTATION_NODE).expect("scene node");
+        let presented_rect = rect(20.0, 30.0, 180.0, 120.0);
+        let mut presentation = PresentationFrameSnapshot::empty_for_output(output_id);
+        presentation.presented_windows = vec![
+            PresentedWindowGeometry::with_scene_node(
+                scene_node_id,
+                root_surface_id,
+                presented_rect,
+            ),
+            PresentedWindowGeometry::with_scene_node(
+                SceneNodeId::from_raw(PRESENTATION_NODE + 1).expect("second scene node"),
+                root_surface_id + 1,
+                rect(230.0, 30.0, 100.0, 80.0),
+            ),
+        ];
+        presentation.signature = 1;
+
+        state.publish_presented_presentation(1, &presentation);
+        let after_authority = state.pointer_hit_generation;
+        assert_eq!(
+            after_authority,
+            pointer_generation_before_authority + 1,
+            "the first authoritative publication changes input eligibility"
+        );
+        let _ = state.pointer_scene_hit_at(0.0, 0.0);
+        let topology_after_authority = state.interaction_topology_generation;
+        let metrics_before_repeats = state.pointer_input_metrics_snapshot();
+
+        for frame_id in 2..=4 {
+            let mut repeated = presentation.clone();
+            repeated.sampled_at = AnimationTime::from_nanos(frame_id * 1_000_000);
+            repeated.signature = frame_id;
+            if frame_id == 3 {
+                repeated.presented_windows[0] = PresentedWindowGeometry::with_scene_node(
+                    SceneNodeId::from_raw(PRESENTATION_NODE + 3).expect("replacement node"),
+                    root_surface_id,
+                    presented_rect,
+                );
+            } else if frame_id == 4 {
+                repeated.presented_windows.reverse();
+            }
+            state.publish_presented_frame(PresentedFramePublication {
+                frame_id,
+                presentation: &repeated,
+                lifecycle: &LifecycleFrameSnapshot::default(),
+                lifecycle_scene: PresentedLifecycleScene::Initial,
+                canonical_scene: None,
+                window_exits: &[],
+            });
+        }
+
+        assert_eq!(
+            state.pointer_hit_generation, after_authority,
+            "frame IDs, sample timestamps, signatures, and scene-node IDs do not change pointer mapping"
+        );
+        assert_eq!(
+            state.interaction_topology_generation,
+            topology_after_authority
+        );
+        let metrics_after_repeats = state.pointer_input_metrics_snapshot();
+        assert_eq!(
+            metrics_after_repeats.pointer_hit_generation_invalidations,
+            metrics_before_repeats.pointer_hit_generation_invalidations
+        );
+        assert_eq!(
+            metrics_after_repeats.interaction_topology_invalidations,
+            metrics_before_repeats.interaction_topology_invalidations
+        );
+        assert_eq!(
+            metrics_after_repeats.visual_stack_groups_cache_rebuilds,
+            metrics_before_repeats.visual_stack_groups_cache_rebuilds
+        );
+    }
+
+    #[test]
+    fn opacity_and_presentation_clip_only_do_not_invalidate_pointer_hits() {
+        let mut state = CompositorState::new(None);
+        let output_id = state.native_output_id().expect("test output id");
+        let scene_node_id = SceneNodeId::from_raw(PRESENTATION_NODE).expect("scene node");
+        let canonical_rect = rect(20.0, 30.0, 180.0, 120.0);
+        let start_clip = PresentationClip::Rect(clip_rect(0.0, 0.0, 180.0, 120.0));
+        let target_clip = PresentationClip::Rect(clip_rect(10.0, 10.0, 120.0, 90.0));
+        state
+            .presentation_animator
+            .commit(presentation_request(
+                scene_node_id,
+                AnimationTime::from_nanos(0),
+                (canonical_rect, canonical_rect),
+                (1.0, 0.4),
+                (start_clip, target_clip),
+            ))
+            .expect("opacity and clip animation");
+        let physical_geometry = vec![PresentedWindowGeometry::with_scene_node(
+            scene_node_id,
+            PRESENTATION_ROOT,
+            canonical_rect,
+        )];
+        let mut first = sample_presentation(
+            &state,
+            output_id,
+            AnimationTime::from_nanos(2_000_000),
+            canonical_rect,
+        );
+        first.presented_windows.clone_from(&physical_geometry);
+        let mut second = sample_presentation(
+            &state,
+            output_id,
+            AnimationTime::from_nanos(6_000_000),
+            canonical_rect,
+        );
+        second.presented_windows.clone_from(&physical_geometry);
+        assert_ne!(first.opacities, second.opacities);
+        assert_ne!(first.clips, second.clips);
+
+        state.publish_presented_presentation(1, &first);
+        let pointer_generation = state.pointer_hit_generation;
+        let topology_generation = state.interaction_topology_generation;
+        state.publish_presented_presentation(2, &second);
+
+        assert_eq!(state.pointer_hit_generation, pointer_generation);
+        assert_eq!(state.interaction_topology_generation, topology_generation);
+    }
+
+    #[test]
     fn canonical_capture_rejects_misaligned_surface_identity_projections() {
         let output_id = OutputId::from_raw(1).expect("test output id");
         let scene_node_ids = [SceneNodeId::from_raw(1).expect("test scene node")];
@@ -633,8 +762,8 @@ mod tests {
         );
         assert_eq!(
             state.pointer_hit_generation,
-            previous_pointer_hit_generation + 2,
-            "Presentation and Lifecycle each keep their pointer-hit invalidation"
+            previous_pointer_hit_generation + 1,
+            "only the first authoritative physical presentation changes input mapping"
         );
     }
 
@@ -707,6 +836,47 @@ mod tests {
                 .transaction_record(identity.transaction_id())
                 .is_some()
         );
+    }
+
+    #[test]
+    fn empty_and_minimize_lifecycle_publications_do_not_invalidate_pointer_hits() {
+        let mut state = CompositorState::new(None);
+        let output_id = state.native_output_id().expect("test output id");
+        let presentation = PresentationFrameSnapshot::empty_for_output(output_id);
+        state.publish_presented_presentation(1, &presentation);
+        let pointer_generation = state.pointer_hit_generation;
+        let topology_generation = state.interaction_topology_generation;
+
+        state.publish_presented_lifecycle(2, &LifecycleFrameSnapshot::default());
+        assert_eq!(state.pointer_hit_generation, pointer_generation);
+
+        let window_id = WindowId::from_raw(903).expect("lifecycle window id");
+        let root_surface_id = 903;
+        let identity = state
+            .window_lifecycle_animator
+            .start_or_reverse(
+                lifecycle_request(
+                    &mut state.presentation_animator,
+                    &mut state.retained_lifecycle_payloads,
+                    window_id,
+                    root_surface_id,
+                    LifecycleDirection::Minimize,
+                ),
+                None,
+                AnimationTime::from_nanos(0),
+                1.0,
+            )
+            .expect("minimize transition starts");
+        let minimize = lifecycle_snapshot(
+            window_id,
+            root_surface_id,
+            identity,
+            LifecycleDirection::Minimize,
+        );
+        state.publish_presented_lifecycle(3, &minimize);
+
+        assert_eq!(state.pointer_hit_generation, pointer_generation);
+        assert_eq!(state.interaction_topology_generation, topology_generation);
     }
 
     #[test]
@@ -828,6 +998,10 @@ mod tests {
         let lifecycle = LifecycleFrameSnapshot::from_sample(&lifecycle_sample);
         assert!(lifecycle.samples[0].mathematically_settled);
         let presentation = PresentationFrameSnapshot::empty_for_output(output_id);
+        state.publish_presented_presentation(11, &presentation);
+        let pointer_generation_before_ack = state.pointer_hit_generation;
+        let topology_generation_before_ack = state.interaction_topology_generation;
+        let metrics_before_ack = state.pointer_input_metrics_snapshot();
         state.publish_presented_frame(PresentedFramePublication {
             frame_id: 12,
             presentation: &presentation,
@@ -848,6 +1022,20 @@ mod tests {
         assert!(!state.lifecycle_root_restore_suppressed(root_surface_id));
         assert_eq!(state.presented_presentation_frame_id(), 12);
         assert_eq!(state.presented_lifecycle_frame_id(), 12);
+        assert_eq!(
+            state.pointer_hit_generation,
+            pointer_generation_before_ack + 1
+        );
+        assert_eq!(
+            state.interaction_topology_generation,
+            topology_generation_before_ack
+        );
+        assert_eq!(
+            state
+                .pointer_input_metrics_snapshot()
+                .pointer_hit_generation_invalidations,
+            metrics_before_ack.pointer_hit_generation_invalidations + 1
+        );
         assert_eq!(
             state
                 .presented_lifecycle_physical

@@ -1902,6 +1902,86 @@ fn wayland_buffer_window_geometry_refreshes_pointer_hit_cache_after_derived_orig
 }
 
 #[test]
+fn wayland_buffer_pixels_preserve_hit_generation_and_offset_commit_invalidates() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let stream = UnixStream::connect(&socket_path).unwrap();
+    let connection = Connection::from_socket(stream).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ()).unwrap();
+    let _pointer = seat.get_pointer(&qh, ());
+    let surface = compositor.create_surface(&qh, ());
+    let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
+    let _toplevel = xdg_surface.get_toplevel(&qh, ());
+    let initial_buffer = TestShmBuffer::new(&shm, &qh, 100, 80).unwrap();
+
+    let mut state = RegistryTestState::default();
+    surface.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+
+    xdg_surface.set_window_geometry(0, 0, 100, 80);
+    initial_buffer.attach(&surface, 100, 80);
+    surface.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    commands
+        .send(ServerCommand::CancelRootPresentationProperties {
+            root_surface_id: surface.id().protocol_id(),
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+
+    let initial = capture_renderable_surface_snapshot(&commands);
+    let surface_id = initial[0].surface_id;
+    let point_x = f64::from(initial[0].origin_x) + 40.0;
+    let point_y = f64::from(initial[0].origin_y) + 30.0;
+    commands
+        .send(ServerCommand::PointerMotion {
+            x: point_x,
+            y: point_y,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    let initial_hit = capture_pointer_scene_hit(&commands, point_x, point_y);
+    let generation_before_pixels = capture_pointer_hit_generation(&commands);
+
+    let pixel_buffer = TestShmBuffer::new(&shm, &qh, 100, 80).unwrap();
+    pixel_buffer.attach(&surface, 100, 80);
+    surface.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    let generation_after_pixels = capture_pointer_hit_generation(&commands);
+    let hit_after_pixels = capture_pointer_scene_hit(&commands, point_x, point_y);
+
+    let offset_buffer = TestShmBuffer::new(&shm, &qh, 100, 80).unwrap();
+    surface.offset(10, 0);
+    offset_buffer.attach(&surface, 100, 80);
+    surface.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    let generation_after_offset = capture_pointer_hit_generation(&commands);
+    let hit_after_offset = capture_pointer_scene_hit(&commands, point_x, point_y);
+
+    commands.send(ServerCommand::Stop).unwrap();
+    let _server = server_thread.join().unwrap();
+
+    assert_eq!(initial_hit, (Some(surface_id), Some((40.0, 30.0))));
+    assert_eq!(hit_after_pixels, initial_hit);
+    assert_eq!(generation_after_pixels, generation_before_pixels);
+    assert_eq!(hit_after_offset, (Some(surface_id), Some((30.0, 30.0))));
+    assert_ne!(generation_after_offset, generation_after_pixels);
+}
+
+#[test]
 fn wayland_retained_mapping_resize_preview_converges_after_final_commit() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();

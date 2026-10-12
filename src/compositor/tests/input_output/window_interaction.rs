@@ -139,6 +139,7 @@ fn overlapping_server_decoration_does_not_focus_window_underneath() {
     queue_b.roundtrip(&mut state_b).unwrap();
     assert_eq!(capture_focused_window_id(&commands), Some(a_window_id));
     let scene_generation_before_input_region = capture_scene_render_generation(&commands);
+    let pointer_metrics_before_input_region = capture_pointer_input_metrics(&commands);
     let titlebar_x = f64::from(surface_a_snapshot.origin_x + 20);
     let titlebar_y = f64::from(surface_a_snapshot.origin_y - 13);
 
@@ -153,6 +154,22 @@ fn overlapping_server_decoration_does_not_focus_window_underneath() {
         capture_scene_render_generation(&commands),
         scene_generation_before_input_region,
         "input-region-only commit must not be mistaken for a render generation change"
+    );
+    let pointer_metrics_after_input_region = capture_pointer_input_metrics(&commands);
+    assert!(
+        pointer_metrics_after_input_region.pointer_hit_generation_invalidations
+            > pointer_metrics_before_input_region.pointer_hit_generation_invalidations,
+        "input-region changes remain pointer-hit invalidations"
+    );
+    assert_eq!(
+        pointer_metrics_after_input_region.interaction_topology_invalidations,
+        pointer_metrics_before_input_region.interaction_topology_invalidations,
+        "input-region changes do not alter visual-stack topology"
+    );
+    assert_eq!(
+        pointer_metrics_after_input_region.visual_stack_groups_cache_rebuilds,
+        pointer_metrics_before_input_region.visual_stack_groups_cache_rebuilds,
+        "input-region changes reuse the visual-stack group cache"
     );
     assert_eq!(
         capture_pointer_focus_surface_id(&commands),

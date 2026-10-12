@@ -124,6 +124,13 @@ impl CompositorState {
         let existing_surface =
             renderable_index.and_then(|index| self.renderable_surfaces.get(index));
         let surface_was_renderable = existing_surface.is_some();
+        let pointer_mapping_changed = existing_surface.is_none_or(|surface| {
+            surface.x != pending.x
+                || surface.y != pending.y
+                || surface.width != width
+                || surface.height != height
+                || surface.placement != placement
+        });
         let buffer_identity_changed =
             existing_surface.is_some_and(|surface| surface.buffer_id() != pending.data.buffer_id());
         let visual_mapping_changed = existing_surface.is_none_or(|surface| {
@@ -440,7 +447,7 @@ impl CompositorState {
             self.complete_applied_resize_transaction(surface_id, resize_commit);
         }
         let pointer_focus_refreshed = self.refresh_pointer_focus_after_geometry_change(
-            window_geometry_changed,
+            pointer_mapping_changed || window_geometry_changed,
             pointer_hit_generation_before_publication,
         );
         if committed_popup && (popup_mapping_changed || placement_changed || visual_state_changed) {

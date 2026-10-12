@@ -1051,8 +1051,8 @@ impl CompositorState {
 
     pub(in crate::compositor) fn invalidate_surface_origin_cache(&mut self) {
         self.surface_origin_cache_generation = None;
-        self.visual_stack_groups_cache_generation = None;
-        self.advance_pointer_hit_generation();
+        self.visual_stack_groups_cache_topology_generation = None;
+        self.advance_interaction_topology_generation();
     }
 
     pub(in crate::compositor) fn raise_renderable_surface_tree(&mut self, surface_id: u32) -> bool {

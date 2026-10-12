@@ -908,6 +908,7 @@ impl CompositorState {
             trusted_effect_registry,
             pointer_hit_instrumentation_enabled:
                 super::support_types::pointer_hit_instrumentation_enabled(),
+            interaction_topology_generation: 1,
             ..Self::default()
         };
         state.native_output_id = state.output_id_allocator.allocate().ok();
@@ -955,6 +956,16 @@ impl CompositorState {
             .pointer_hit_generation_invalidations
             .saturating_add(1);
         self.pointer_hit_generation
+    }
+
+    pub(in crate::compositor) fn advance_interaction_topology_generation(&mut self) {
+        self.interaction_topology_generation =
+            advance_nonzero_serial(self.interaction_topology_generation);
+        self.pointer_hit_metrics.interaction_topology_invalidations = self
+            .pointer_hit_metrics
+            .interaction_topology_invalidations
+            .saturating_add(1);
+        self.advance_pointer_hit_generation();
     }
 
     pub(in crate::compositor) fn begin_surface_tree_publication(&mut self) {

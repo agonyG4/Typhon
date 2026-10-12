@@ -455,6 +455,8 @@ fn restore_suppression_tracks_both_reversal_directions() {
     state.lifecycle_animation_renderer_available = Some(true);
     let root_surface_id = 391;
     let group = visual_group(rect(384.0, 60.0, 832.0, 640.0));
+    let topology_generation = state.interaction_topology_generation;
+    let pointer_generation_before_restore = state.pointer_hit_generation;
 
     state.begin_lifecycle_restore(
         window_id,
@@ -463,9 +465,15 @@ fn restore_suppression_tracks_both_reversal_directions() {
         ResolvedEffectScene::default(),
         Vec::new(),
     );
+    assert_eq!(
+        state.pointer_hit_generation,
+        pointer_generation_before_restore + 1
+    );
+    assert_eq!(state.interaction_topology_generation, topology_generation);
     let restore_to_minimize =
         state.lifecycle_scene_sample_at(AnimationTime::monotonic_now().expect("sample time"));
     assert!(restore_to_minimize.restore_suppresses_root(root_surface_id));
+    let pointer_generation_before_minimize = state.pointer_hit_generation;
     state.begin_lifecycle_minimize(
         window_id,
         root_surface_id,
@@ -475,10 +483,41 @@ fn restore_suppression_tracks_both_reversal_directions() {
         ResolvedEffectScene::default(),
         Vec::new(),
     );
+    assert_eq!(
+        state.pointer_hit_generation,
+        pointer_generation_before_minimize + 1
+    );
+    assert_eq!(state.interaction_topology_generation, topology_generation);
     let minimize = state
         .lifecycle_scene_sample_at(AnimationTime::monotonic_now().expect("reversed sample time"));
     assert!(!minimize.restore_suppresses_root(root_surface_id));
     assert_eq!(minimize.samples[0].direction, LifecycleDirection::Minimize);
+
+    let pointer_generation_before_second_restore = state.pointer_hit_generation;
+    state.begin_lifecycle_restore(
+        window_id,
+        root_surface_id,
+        Some(group),
+        ResolvedEffectScene::default(),
+        Vec::new(),
+    );
+    assert_eq!(
+        state.pointer_hit_generation,
+        pointer_generation_before_second_restore + 1
+    );
+    assert_eq!(state.interaction_topology_generation, topology_generation);
+    let restore =
+        state.lifecycle_scene_sample_at(AnimationTime::monotonic_now().expect("restored sample"));
+    assert!(restore.restore_suppresses_root(root_surface_id));
+    assert_eq!(restore.samples[0].direction, LifecycleDirection::Restore);
+}
+
+#[test]
+fn cancelling_restore_after_renderer_loss_invalidates_pointer_hits_only() {
+    let (mut state, window_id) = ssd_test_state(3_920);
+    state.lifecycle_animation_renderer_available = Some(true);
+    let root_surface_id = 3_920;
+    let group = visual_group(rect(384.0, 60.0, 832.0, 640.0));
 
     state.begin_lifecycle_restore(
         window_id,
@@ -487,10 +526,15 @@ fn restore_suppression_tracks_both_reversal_directions() {
         ResolvedEffectScene::default(),
         Vec::new(),
     );
-    let restore =
-        state.lifecycle_scene_sample_at(AnimationTime::monotonic_now().expect("restored sample"));
-    assert!(restore.restore_suppresses_root(root_surface_id));
-    assert_eq!(restore.samples[0].direction, LifecycleDirection::Restore);
+    assert!(state.lifecycle_root_restore_suppressed(root_surface_id));
+    let pointer_generation = state.pointer_hit_generation;
+    let topology_generation = state.interaction_topology_generation;
+
+    state.set_lifecycle_animation_renderer_available(false);
+
+    assert!(!state.lifecycle_root_restore_suppressed(root_surface_id));
+    assert_eq!(state.pointer_hit_generation, pointer_generation + 1);
+    assert_eq!(state.interaction_topology_generation, topology_generation);
 }
 
 #[test]
@@ -1139,7 +1183,17 @@ fn off_output_transition_settles_without_pageflip_and_does_not_block_scheduler()
             .lifecycle_scene_sample_at(AnimationTime::from_nanos(0))
             .restore_suppresses_root(302)
     );
+    let pointer_generation_before_settlement = state.pointer_hit_generation;
+    let topology_generation_before_settlement = state.interaction_topology_generation;
     assert!(state.settle_lifecycle_no_visual_change());
+    assert_eq!(
+        state.pointer_hit_generation,
+        pointer_generation_before_settlement + 1
+    );
+    assert_eq!(
+        state.interaction_topology_generation,
+        topology_generation_before_settlement
+    );
     assert_eq!(state.window_lifecycle_animator.active_count(), 0);
     assert_eq!(state.presentation_animator.transaction_count(), 0);
     assert_eq!(
@@ -1157,6 +1211,44 @@ fn off_output_transition_settles_without_pageflip_and_does_not_block_scheduler()
             .window_lifecycle_animator
             .acknowledge(transition_id, true)
             .is_none()
+    );
+}
+
+#[test]
+fn restore_render_fallback_invalidates_hit_suppression_without_topology_change() {
+    let (mut state, window_id) = ssd_test_state(412);
+    state.lifecycle_animation_renderer_available = Some(true);
+    let root_surface_id = 412;
+    state.begin_lifecycle_restore(
+        window_id,
+        root_surface_id,
+        Some(visual_group(rect(384.0, 60.0, 832.0, 640.0))),
+        ResolvedEffectScene::default(),
+        Vec::new(),
+    );
+    let scene_node_id = state
+        .scene_node_id_for_window_group(window_id)
+        .expect("window group SceneNode");
+    let identity = active_lifecycle_identity(&state, scene_node_id);
+    let pointer_generation_before = state.pointer_hit_generation;
+    let topology_generation_before = state.interaction_topology_generation;
+
+    assert!(
+        state.apply_lifecycle_render_fallback(LifecycleRenderFallbackEntry {
+            window_id,
+            root_surface_id,
+            presentation_identity: identity,
+            payload_id: PresentationRetainedVisualPayloadId::from_origin_identity(identity),
+            effect: LifecycleEffectKind::Lamp,
+            reason: LifecycleRenderFallbackReason::LampProgramUnavailable,
+        })
+    );
+
+    assert!(!state.lifecycle_root_restore_suppressed(root_surface_id));
+    assert_eq!(state.pointer_hit_generation, pointer_generation_before + 1);
+    assert_eq!(
+        state.interaction_topology_generation,
+        topology_generation_before
     );
 }
 

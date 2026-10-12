@@ -33,6 +33,8 @@ pub(in crate::compositor) struct PointerInputMetrics {
     pub(in crate::compositor) full_scene_hit_scans: u64,
     pub(in crate::compositor) owner_locality_fast_hits: u64,
     pub(in crate::compositor) pointer_hit_generation_invalidations: u64,
+    pub(in crate::compositor) interaction_topology_invalidations: u64,
+    pub(in crate::compositor) visual_stack_groups_cache_rebuilds: u64,
     pub(in crate::compositor) pointer_scene_hit_groups_inspected: u64,
     pub(in crate::compositor) pointer_scene_hit_surfaces_inspected: u64,
     pub(in crate::compositor) pointer_scene_hit_origin_cache_clones: u64,
@@ -733,14 +735,21 @@ impl CompositorState {
     }
 
     fn refresh_visual_stack_groups_cache(&mut self) {
-        if self.visual_stack_groups_cache_generation == Some(self.pointer_hit_generation) {
+        if self.visual_stack_groups_cache_topology_generation
+            == Some(self.interaction_topology_generation)
+        {
             return;
         }
         self.visual_stack_groups_cache = render::visual_stack_groups(
             self.active_scene_surfaces(),
             self.active_scene_popup_surface_ids(),
         );
-        self.visual_stack_groups_cache_generation = Some(self.pointer_hit_generation);
+        self.visual_stack_groups_cache_topology_generation =
+            Some(self.interaction_topology_generation);
+        self.pointer_hit_metrics.visual_stack_groups_cache_rebuilds = self
+            .pointer_hit_metrics
+            .visual_stack_groups_cache_rebuilds
+            .saturating_add(1);
     }
 
     fn pointer_target_at_visual_root_window(

@@ -624,6 +624,8 @@ impl CompositorState {
         resolved_effect_scene: ResolvedEffectScene,
         lifecycle_decorations: Vec<DecorationRenderInstance>,
     ) {
+        let restore_was_suppressed = self.lifecycle_root_restore_suppressed(root_surface_id);
+        let pointer_generation_before = self.pointer_hit_generation;
         self.begin_lifecycle_minimize_with_preparation(
             window_id,
             root_surface_id,
@@ -634,6 +636,11 @@ impl CompositorState {
             lifecycle_decorations,
             None,
         );
+        if restore_was_suppressed != self.lifecycle_root_restore_suppressed(root_surface_id)
+            && self.pointer_hit_generation == pointer_generation_before
+        {
+            self.advance_pointer_hit_generation();
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1166,6 +1173,8 @@ impl CompositorState {
         resolved_effect_scene: ResolvedEffectScene,
         lifecycle_decorations: Vec<DecorationRenderInstance>,
     ) {
+        let restore_was_suppressed = self.lifecycle_root_restore_suppressed(root_surface_id);
+        let pointer_generation_before = self.pointer_hit_generation;
         self.begin_lifecycle_restore_with_source(
             window_id,
             root_surface_id,
@@ -1174,6 +1183,12 @@ impl CompositorState {
             lifecycle_decorations,
             None,
         );
+        if !restore_was_suppressed
+            && self.lifecycle_root_restore_suppressed(root_surface_id)
+            && self.pointer_hit_generation == pointer_generation_before
+        {
+            self.advance_pointer_hit_generation();
+        }
     }
 
     pub(in crate::compositor) fn begin_lifecycle_restore_with_source(
@@ -1450,10 +1465,17 @@ impl CompositorState {
                         self.output_size.height,
                     )
             })
-            .map(|sample| (sample.presentation_identity, sample.payload_id))
+            .map(|sample| {
+                (
+                    sample.presentation_identity,
+                    sample.payload_id,
+                    sample.root_surface_id,
+                )
+            })
             .collect::<Vec<_>>();
         let mut settled = false;
-        for (identity, payload_id) in candidates {
+        let mut restore_interactability_changed = false;
+        for (identity, payload_id, root_surface_id) in candidates {
             if self
                 .presentation_animator
                 .active_retained_visual(identity.scene_node_id(), identity.kind())
@@ -1467,10 +1489,13 @@ impl CompositorState {
             if payload.payload_id != payload_id {
                 continue;
             }
+            let restore_was_suppressed = self.lifecycle_root_restore_suppressed(root_surface_id);
             if let Some(retired_identity) = self
                 .window_lifecycle_animator
                 .settle_no_visual_change(identity)
             {
+                restore_interactability_changed |= restore_was_suppressed
+                    && !self.lifecycle_root_restore_suppressed(root_surface_id);
                 if !self
                     .presentation_animator
                     .retire_active_retained_visual_exact(retired_identity)
@@ -1480,6 +1505,9 @@ impl CompositorState {
                 let _ = self.retire_lifecycle_payload_exact(identity, "no_visual_change");
                 settled = true;
             }
+        }
+        if restore_interactability_changed {
+            self.advance_pointer_hit_generation();
         }
         settled
     }
@@ -1535,6 +1563,7 @@ impl CompositorState {
         snapshot: &LifecycleFrameSnapshot,
         scene: crate::compositor::PresentedLifecycleScene<'_>,
     ) {
+        let mut restore_interactability_changed = false;
         self.presented_lifecycle_physical.publish(
             frame_id,
             snapshot,
@@ -1574,6 +1603,11 @@ impl CompositorState {
                 lifecycle_sample.presentation_identity,
                 lifecycle_sample.mathematically_settled,
             );
+            if acknowledged.as_ref().is_some()
+                && lifecycle_sample.direction == LifecycleDirection::Restore
+            {
+                restore_interactability_changed = true;
+            }
             let retired = acknowledged.is_some_and(|identity| {
                 self.presentation_animator
                     .retire_active_retained_visual_exact(identity)
@@ -1619,7 +1653,9 @@ impl CompositorState {
                 );
             }
         }
-        self.advance_pointer_hit_generation();
+        if restore_interactability_changed {
+            self.advance_pointer_hit_generation();
+        }
     }
 
     pub(in crate::compositor) fn set_lifecycle_animation_enabled(&mut self, enabled: bool) {
@@ -1674,12 +1710,19 @@ impl CompositorState {
         {
             return false;
         }
+        let restore_was_suppressed =
+            self.lifecycle_root_restore_suppressed(fallback.root_surface_id);
         let Some(identity) = self
             .window_lifecycle_animator
             .retire_render_fallback(fallback.presentation_identity)
         else {
             return false;
         };
+        let restore_interactability_changed = restore_was_suppressed
+            && !self.lifecycle_root_restore_suppressed(fallback.root_surface_id);
+        if restore_interactability_changed {
+            self.advance_pointer_hit_generation();
+        }
         if !self
             .presentation_animator
             .retire_active_retained_visual_exact(identity)
@@ -1721,24 +1764,34 @@ impl CompositorState {
             .presentation_animator
             .active_retained_visuals(PresentationRetainedVisualKind::WindowLifecycle)
             .into_iter()
-            .filter(|identity| {
-                self.window_lifecycle_animator
-                    .sample(*identity, AnimationTime::from_nanos(0))
-                    .is_some_and(|sample| match sample.effect {
-                        LifecycleEffectKind::Lamp => !lamp_available,
-                        LifecycleEffectKind::Squash => !squash_available,
-                    })
+            .filter_map(|identity| {
+                let sample = self
+                    .window_lifecycle_animator
+                    .sample(identity, AnimationTime::from_nanos(0))?;
+                let unavailable = match sample.effect {
+                    LifecycleEffectKind::Lamp => !lamp_available,
+                    LifecycleEffectKind::Squash => !squash_available,
+                };
+                unavailable.then_some((identity, sample.direction == LifecycleDirection::Restore))
             })
             .collect::<Vec<_>>();
-        for identity in unavailable {
+        let mut restore_interactability_changed = false;
+        for (identity, was_restore) in unavailable {
+            restore_interactability_changed |= was_restore;
             self.window_lifecycle_animator.cancel(identity);
             self.presentation_animator
                 .retire_active_retained_visual_exact(identity);
             let _ = self.retire_lifecycle_payload_exact(identity, "renderer_unavailable");
         }
+        if restore_interactability_changed {
+            self.advance_pointer_hit_generation();
+        }
     }
 
-    pub(in crate::compositor) fn lifecycle_cancel_window(&mut self, window_id: WindowId) {
+    pub(in crate::compositor) fn lifecycle_cancel_window(&mut self, window_id: WindowId) -> bool {
+        let root_surface_id = self.window(window_id).map(|window| window.root_surface_id);
+        let restore_was_suppressed = root_surface_id
+            .is_some_and(|root_surface_id| self.lifecycle_root_restore_suppressed(root_surface_id));
         let scene_node_id = self.scene_node_id_for_window_group(window_id);
         let active_identity = scene_node_id.and_then(|scene_node_id| {
             self.presentation_animator.active_retained_visual(
@@ -1775,6 +1828,10 @@ impl CompositorState {
                 .retire_retained_visual_exact(identity);
             self.window_lifecycle_animator.cancel(identity);
         }
+        restore_was_suppressed
+            && root_surface_id.is_some_and(|root_surface_id| {
+                !self.lifecycle_root_restore_suppressed(root_surface_id)
+            })
     }
 
     pub(in crate::compositor) fn lifecycle_teardown_window(&mut self, window_id: WindowId) {

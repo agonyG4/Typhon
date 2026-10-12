@@ -1949,6 +1949,103 @@ fn xdg_maximize_exit_first_frame_maps_the_committed_root_to_the_physical_source(
 }
 
 #[test]
+fn unchanged_presented_geometry_keeps_hit_validity_and_changed_geometry_remaps_input() {
+    let surface_id = 3_911;
+    let mut state = xdg_state(
+        test_surface(surface_id),
+        DecorationPreference::ClientSide,
+        ToplevelMode::Normal,
+    );
+    let canonical = state
+        .current_presentation_rect_for_root(surface_id)
+        .expect("canonical presentation rectangle");
+    let first_physical = PresentedWindowGeometry::new(surface_id, canonical);
+    state.publish_presented_window_geometry(1, first_physical);
+    let stable_generation = state.pointer_hit_generation;
+    let topology_generation = state.interaction_topology_generation;
+    let screen_point = (canonical.x() + 130.0, canonical.y() + 80.0);
+    let first_mapping = state
+        .presentation_input_point_for_root(surface_id, screen_point.0, screen_point.1)
+        .expect("initial physical mapping");
+
+    state.publish_presented_window_geometry(2, first_physical);
+    assert_eq!(state.pointer_hit_generation, stable_generation);
+    assert_eq!(state.interaction_topology_generation, topology_generation);
+
+    let moved_physical_rect = crate::presentation_animation::PresentationRect::new(
+        canonical.x() + 100.0,
+        canonical.y() + 40.0,
+        canonical.width(),
+        canonical.height(),
+    )
+    .expect("moved physical rectangle");
+    state.publish_presented_window_geometry(
+        3,
+        PresentedWindowGeometry::new(surface_id, moved_physical_rect),
+    );
+    let moved_mapping = state
+        .presentation_input_point_for_root(surface_id, screen_point.0, screen_point.1)
+        .expect("updated physical mapping");
+
+    assert_ne!(state.pointer_hit_generation, stable_generation);
+    assert_eq!(state.interaction_topology_generation, topology_generation);
+    assert_eq!(first_mapping.0 - moved_mapping.0, 100.0);
+    assert_eq!(first_mapping.1 - moved_mapping.1, 40.0);
+}
+
+#[test]
+fn stacking_change_advances_topology_and_rebuilds_visual_stack_groups() {
+    let first_surface_id = 3_912;
+    let second_surface_id = 3_913;
+    let mut state = xdg_state(
+        test_surface(first_surface_id),
+        DecorationPreference::ClientSide,
+        ToplevelMode::Normal,
+    );
+    let second_window_id = state.allocate_window_id().expect("second window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_xdg(second_window_id, second_surface_id))
+        .expect("insert second XDG window");
+    state.append_renderable_surface(test_surface(second_surface_id));
+    state.rebuild_active_scene_view();
+    assert_eq!(state.active_scene_surfaces().len(), 2);
+
+    let _ = state.pointer_scene_hit_at(10.0, 10.0);
+    let surfaces_before = state
+        .active_scene_surfaces()
+        .iter()
+        .map(|surface| surface.surface_id)
+        .collect::<Vec<_>>();
+    let pointer_generation_before = state.pointer_hit_generation;
+    let topology_generation_before = state.interaction_topology_generation;
+    let metrics_before = state.pointer_input_metrics_snapshot();
+
+    assert!(state.raise_root_window(first_surface_id));
+    let surfaces_after = state
+        .active_scene_surfaces()
+        .iter()
+        .map(|surface| surface.surface_id)
+        .collect::<Vec<_>>();
+    assert_ne!(surfaces_before, surfaces_after);
+    assert_ne!(state.pointer_hit_generation, pointer_generation_before);
+    assert_ne!(
+        state.interaction_topology_generation,
+        topology_generation_before
+    );
+
+    let _ = state.pointer_scene_hit_at(10.0, 10.0);
+    let metrics_after = state.pointer_input_metrics_snapshot();
+    assert_eq!(
+        metrics_after.visual_stack_groups_cache_rebuilds,
+        metrics_before.visual_stack_groups_cache_rebuilds + 1
+    );
+    assert!(
+        metrics_after.interaction_topology_invalidations
+            > metrics_before.interaction_topology_invalidations
+    );
+}
+
+#[test]
 fn x11_maximize_exit_first_frame_maps_the_committed_root_to_the_physical_source() {
     let surface_id = 98;
     let mut state = CompositorState::new(None);

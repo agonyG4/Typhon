@@ -23,12 +23,15 @@ The retained records distinguish these clock domains and stages:
 - Libinput's source-clock oldest/newest event timestamps in microseconds. They are not subtracted from monotonic timestamps.
 - Monotonic input-batch materialization, dispatch start/completion, and cursor-arbitration times.
 - Hit-test counter and CPU-time deltas for the sampled dispatch.
+- Bounded pointer-hit invalidation, interaction-topology invalidation, and visual-stack cache-rebuild deltas. The JSONL fields are `hit_test_generation_invalidations`, `hit_test_topology_invalidations`, and `hit_test_visual_stack_groups_cache_rebuilds`; these distinguish invalidated hit knowledge from topology changes and actual group reconstruction without per-motion logging.
 - Effect-scene resolution duration where resolution is associated with that cycle. A missing value is unknown, not zero.
 - Cursor epoch, policy (`auto`, `piggyback`, or `software`), arbitration reason, pending-since age, freshness deadline, overdue age, retry-not-before, and supersession.
 - Primary carrier/ownership state, physical cursor target sequence and presentation time, worker wake time, and commit-complete deadline.
 - A transaction joined by output and epoch, subject to matching arbitration and build-time constraints; worker queue, KMS submit start/return, and pageflip observation values appear only when present.
 
 Each sampled input record is followed by an `arbitration_evidence` JSONL record. Cursor age at arbitration is recorded directly; age at transaction build, worker queue, KMS submit, and pageflip is derived from the preserved pending-since timestamp and the exact same output/epoch transaction join. These ages retain the original pending-since timestamp across coalesced epochs and retries. A missing join is reported as missing data, not zero latency. Pageflip-derived cursor age is still an observed presentation interval, not optical visibility.
+
+Pointer-hit validity follows interaction state rather than render churn. Repeated physical presentation at unchanged authority and root rectangles, including changed frame IDs and sample timestamps, should report zero pointer-hit invalidations, topology invalidations, and group-cache rebuilds. Opacity- or clip-only presentation changes also leave hit validity unchanged. A changed physical rectangle invalidates pointer mapping while preserving topology. Empty or Minimize-only lifecycle publications do not invalidate pointer hits; a successful settled Restore acknowledgement does when it removes logical suppression. These counters are bounded aggregates and do not establish hardware latency improvement.
 
 Percentile records include their valid sample count. Do not interpret a percentile from fewer than 1,000 observations as a stable tail estimate. KMS queue wait uses only worker transactions with both queue and submit-start timestamps. Submission-to-pageflip is an observed transaction interval, not optical latency.
 

@@ -29,6 +29,9 @@ pub(crate) struct CursorHitTestCounters {
     pub(crate) groups_inspected: u64,
     pub(crate) surfaces_inspected: u64,
     pub(crate) cpu_ns: u64,
+    pub(crate) pointer_hit_generation_invalidations: u64,
+    pub(crate) interaction_topology_invalidations: u64,
+    pub(crate) visual_stack_groups_cache_rebuilds: u64,
 }
 
 impl CursorHitTestCounters {
@@ -50,6 +53,15 @@ impl CursorHitTestCounters {
                 .surfaces_inspected
                 .saturating_sub(before.surfaces_inspected),
             cpu_ns: self.cpu_ns.saturating_sub(before.cpu_ns),
+            pointer_hit_generation_invalidations: self
+                .pointer_hit_generation_invalidations
+                .saturating_sub(before.pointer_hit_generation_invalidations),
+            interaction_topology_invalidations: self
+                .interaction_topology_invalidations
+                .saturating_sub(before.interaction_topology_invalidations),
+            visual_stack_groups_cache_rebuilds: self
+                .visual_stack_groups_cache_rebuilds
+                .saturating_sub(before.visual_stack_groups_cache_rebuilds),
         }
     }
 }
@@ -65,6 +77,9 @@ impl From<PointerInputMetricsSnapshot> for CursorHitTestCounters {
             groups_inspected: snapshot.groups_inspected,
             surfaces_inspected: snapshot.surfaces_inspected,
             cpu_ns: snapshot.cpu_ns,
+            pointer_hit_generation_invalidations: snapshot.pointer_hit_generation_invalidations,
+            interaction_topology_invalidations: snapshot.interaction_topology_invalidations,
+            visual_stack_groups_cache_rebuilds: snapshot.visual_stack_groups_cache_rebuilds,
         }
     }
 }
@@ -729,7 +744,7 @@ impl NativeCursorResponsivenessTrace {
         );
         let _ = writeln!(
             output,
-            "{{\"type\":\"cumulative_counter_deltas\",\"hit_test_calls\":{},\"hit_test_cache_hits\":{},\"hit_test_cache_misses\":{},\"hit_test_full_scene_scans\":{},\"hit_test_owner_locality_fast_hits\":{},\"hit_test_groups_inspected\":{},\"hit_test_surfaces_inspected\":{},\"hit_test_cpu_ns\":{},\"arbitration_response_windows_opened\":{},\"arbitration_changes_coalesced\":{},\"arbitration_plane_delta_plans\":{},\"arbitration_plane_delta_submissions\":{},\"arbitration_deferred_for_primary\":{},\"arbitration_piggybacked\":{},\"arbitration_idle_hardware_updates\":{},\"arbitration_idle_software_updates\":{},\"ready_primary_piggybacks\":{},\"unready_primary_bypass_decisions\":{},\"kms_busy_retries\":{},\"cursor_service_target_misses\":{}}}",
+            "{{\"type\":\"cumulative_counter_deltas\",\"hit_test_calls\":{},\"hit_test_cache_hits\":{},\"hit_test_cache_misses\":{},\"hit_test_full_scene_scans\":{},\"hit_test_owner_locality_fast_hits\":{},\"hit_test_groups_inspected\":{},\"hit_test_surfaces_inspected\":{},\"hit_test_cpu_ns\":{},\"hit_test_generation_invalidations\":{},\"hit_test_topology_invalidations\":{},\"hit_test_visual_stack_groups_cache_rebuilds\":{},\"arbitration_response_windows_opened\":{},\"arbitration_changes_coalesced\":{},\"arbitration_plane_delta_plans\":{},\"arbitration_plane_delta_submissions\":{},\"arbitration_deferred_for_primary\":{},\"arbitration_piggybacked\":{},\"arbitration_idle_hardware_updates\":{},\"arbitration_idle_software_updates\":{},\"ready_primary_piggybacks\":{},\"unready_primary_bypass_decisions\":{},\"kms_busy_retries\":{},\"cursor_service_target_misses\":{}}}",
             hit_test_delta.calls,
             hit_test_delta.cache_hits,
             hit_test_delta.cache_misses,
@@ -738,6 +753,9 @@ impl NativeCursorResponsivenessTrace {
             hit_test_delta.groups_inspected,
             hit_test_delta.surfaces_inspected,
             hit_test_delta.cpu_ns,
+            hit_test_delta.pointer_hit_generation_invalidations,
+            hit_test_delta.interaction_topology_invalidations,
+            hit_test_delta.visual_stack_groups_cache_rebuilds,
             arbitration_delta.response_windows_opened,
             arbitration_delta.changes_coalesced,
             arbitration_delta.plane_delta_plans,
@@ -1047,7 +1065,7 @@ fn append_sample_jsonl(
     });
     let _ = writeln!(
         output,
-        "{{\"type\":\"sample\",\"sample_id\":{},\"raw_motion_events\":{},\"coalesced_motion_events\":{},\"source_oldest_timestamp_usec\":{},\"source_newest_timestamp_usec\":{},\"input_batch_materialized_at_ns\":{},\"dispatch_started_at_ns\":{},\"dispatch_completed_at_ns\":{},\"dispatch_duration_ns\":{},\"input_batch_to_dispatch_complete_ns\":{},\"dispatch_to_arbitration_ns\":{},\"dispatch_complete_to_arbitration_ns\":{},\"hit_test_calls\":{},\"hit_test_cache_hits\":{},\"hit_test_cache_misses\":{},\"hit_test_full_scene_scans\":{},\"hit_test_owner_locality_fast_hits\":{},\"hit_test_groups_inspected\":{},\"hit_test_surfaces_inspected\":{},\"hit_test_cpu_ns\":{},\"effect_scene_resolution_ns\":{},\"effect_scene_visible_instances\":{},\"output_id\":{},\"cursor_epoch\":{},\"arbitration_cursor_epoch\":{},\"arbitration_at_ns\":{},\"disposition\":\"{}\",\"superseded_by_epoch\":{},\"trace_write_cpu_ns\":{},\"cursor_transaction_id\":{},\"cursor_transaction_built_at_ns\":{},\"worker_queued_at_ns\":{},\"kms_submit_started_at_ns\":{},\"kms_submit_returned_at_ns\":{},\"pageflip_observed_at_ns\":{},\"actual_pageflip_sequence\":{},\"kms_queue_wait_ns\":{},\"kms_submit_duration_ns\":{},\"submit_return_to_pageflip_observation_ns\":{},\"pageflip_timestamp_kind\":\"compositor_observed_not_optical\"}}",
+        "{{\"type\":\"sample\",\"sample_id\":{},\"raw_motion_events\":{},\"coalesced_motion_events\":{},\"source_oldest_timestamp_usec\":{},\"source_newest_timestamp_usec\":{},\"input_batch_materialized_at_ns\":{},\"dispatch_started_at_ns\":{},\"dispatch_completed_at_ns\":{},\"dispatch_duration_ns\":{},\"input_batch_to_dispatch_complete_ns\":{},\"dispatch_to_arbitration_ns\":{},\"dispatch_complete_to_arbitration_ns\":{},\"hit_test_calls\":{},\"hit_test_cache_hits\":{},\"hit_test_cache_misses\":{},\"hit_test_full_scene_scans\":{},\"hit_test_owner_locality_fast_hits\":{},\"hit_test_groups_inspected\":{},\"hit_test_surfaces_inspected\":{},\"hit_test_cpu_ns\":{},\"hit_test_generation_invalidations\":{},\"hit_test_topology_invalidations\":{},\"hit_test_visual_stack_groups_cache_rebuilds\":{},\"effect_scene_resolution_ns\":{},\"effect_scene_visible_instances\":{},\"output_id\":{},\"cursor_epoch\":{},\"arbitration_cursor_epoch\":{},\"arbitration_at_ns\":{},\"disposition\":\"{}\",\"superseded_by_epoch\":{},\"trace_write_cpu_ns\":{},\"cursor_transaction_id\":{},\"cursor_transaction_built_at_ns\":{},\"worker_queued_at_ns\":{},\"kms_submit_started_at_ns\":{},\"kms_submit_returned_at_ns\":{},\"pageflip_observed_at_ns\":{},\"actual_pageflip_sequence\":{},\"kms_queue_wait_ns\":{},\"kms_submit_duration_ns\":{},\"submit_return_to_pageflip_observation_ns\":{},\"pageflip_timestamp_kind\":\"compositor_observed_not_optical\"}}",
         sample.sample_id,
         sample.raw_motion_events,
         sample.coalesced_motion_events,
@@ -1086,6 +1104,18 @@ fn append_sample_jsonl(
             |value| value.surfaces_inspected.to_string()
         ),
         json_number(hit_test_cpu_ns),
+        sample.hit_test_delta.map_or_else(
+            || "null".to_owned(),
+            |value| value.pointer_hit_generation_invalidations.to_string()
+        ),
+        sample.hit_test_delta.map_or_else(
+            || "null".to_owned(),
+            |value| value.interaction_topology_invalidations.to_string()
+        ),
+        sample.hit_test_delta.map_or_else(
+            || "null".to_owned(),
+            |value| value.visual_stack_groups_cache_rebuilds.to_string()
+        ),
         json_number(sample.effect_scene_resolution_ns),
         json_number(
             sample
@@ -1209,6 +1239,7 @@ mod tests {
         NativeCursorOutputArbitration, NativeCursorOutputDisposition, NativeCursorSchedulingPolicy,
         cursor_output_disposition_at_deadline,
     };
+    use oblivion_one::compositor::PointerInputMetricsSnapshot;
     use oblivion_one::core::OutputId;
     use std::num::NonZeroU64;
 
@@ -1293,6 +1324,41 @@ mod tests {
         assert_eq!(id, None);
         assert_eq!(trace.motion_batches, 0);
         assert!(trace.records.is_empty());
+    }
+
+    #[test]
+    fn hit_invalidation_deltas_are_present_in_cursor_responsiveness_jsonl() {
+        let mut trace = NativeCursorResponsivenessTrace::new(true, 4, 1);
+        let sample_id = trace
+            .record_motion_batch(1, 1, || Some(timing()))
+            .expect("sample retained");
+        trace.complete_motion_batch(
+            sample_id,
+            output_id(),
+            Some(1),
+            200,
+            CursorHitTestCounters {
+                pointer_hit_generation_invalidations: 2,
+                interaction_topology_invalidations: 3,
+                visual_stack_groups_cache_rebuilds: 4,
+                ..CursorHitTestCounters::default()
+            },
+        );
+        let hit_test_after = PointerInputMetricsSnapshot {
+            pointer_hit_generation_invalidations: 2,
+            interaction_topology_invalidations: 3,
+            visual_stack_groups_cache_rebuilds: 4,
+            ..PointerInputMetricsSnapshot::default()
+        };
+        let output = trace.format_dump(
+            &PresentationTransactionTraceRing::new(4),
+            hit_test_after,
+            &NativeCursorOutputArbitration::default(),
+        );
+
+        assert!(output.contains("\"hit_test_generation_invalidations\":2"));
+        assert!(output.contains("\"hit_test_topology_invalidations\":3"));
+        assert!(output.contains("\"hit_test_visual_stack_groups_cache_rebuilds\":4"));
     }
 
     #[test]

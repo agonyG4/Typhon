@@ -22,8 +22,12 @@ pub(super) struct LifecyclePreCapturePreparation {
 impl CompositorState {
     pub(in crate::compositor) fn cancel_lifecycle_precapture_after_render_failure(&mut self) {
         let windows = self.retained_lifecycle_payloads.windows_with_precapture();
+        let mut restore_interactability_changed = false;
         for window_id in windows {
-            self.lifecycle_cancel_window(window_id);
+            restore_interactability_changed |= self.lifecycle_cancel_window(window_id);
+        }
+        if restore_interactability_changed {
+            self.advance_pointer_hit_generation();
         }
     }
 

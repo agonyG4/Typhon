@@ -46,6 +46,18 @@ The actual code dispatches bounded input work; it does not equate each physical 
 | Presentation decision | `NativeCursorOutputArbitration` tracks cursor age, a KMS service opportunity, retry timing, and primary/KMS ownership. Auto distinguishes an attachable ready carrier from dirty scene work and an owned KMS lane. |
 | KMS submission and completion | One `AtomicCommitArbiter` and the existing worker/output transaction path own Atomic admission, submission, and completion identity. Cursor scheduling is a class within that authority, not a second submitter. |
 
+## Pointer hit validity boundary
+
+Render, pixel, and presentation activity does not invalidate pointer hit state by default. Only changes that can alter the hit target, input acceptance, or local-coordinate mapping advance `pointer_hit_generation`. Buffer contents, damage, opacity, effects, frame IDs, and repeated presentation samples at the same physical geometry do not serve as input-validity signals.
+
+Visual-stack grouping has a separate `interaction_topology_generation`. It tracks the active surface order and IDs, canonical and effective render parent relationships, and popup membership used to build `visual_stack_groups`. A topology change advances both topology and pointer-hit generations. Geometry or input-region changes can advance pointer-hit generation without rebuilding visual-stack topology. The cache is keyed only by topology generation.
+
+Physical presentation advances pointer-hit validity only when its input projection changes: authority becomes active/inactive, a root enters/leaves the presented-window set, or a root's physical rectangle changes. Pointer mapping uses those rectangles to reject roots without presented geometry and to inverse-map coordinates. Presentation node IDs, opacity, clip, sample timestamps, frame IDs, and pixel contents are not part of that projection. Lifecycle physical publication advances pointer-hit validity only when a successful exact Restore acknowledgement removes logical suppression and makes the root interactable; empty and Minimize-only publications do not.
+
+The legacy surface-origin invalidation path conservatively advances topology as well as pointer-hit validity because its callers include both topology and geometry mutations. That leaves occasional safe false-positive topology invalidations until those callers can be classified individually.
+
+This phase does not claim O(1) steady-state pointer motion. Owner-locality reuse still walks cached visual groups and surface indices to prove the prior owner remains frontmost. Removing that proof traversal belongs to the later PointerHitCertificate phase. The generation and bounded-counter changes establish source-level invalidation semantics; no hardware performance improvement is claimed without measurement.
+
 The input batch budget bounds dispatch. The cursor checkpoint runs after pageflip drain, bounded input, session/shutdown checks, and output-transition checks, immediately before acquire/prepare. It calls the same cursor presentation helper, `AtomicCommitArbiter`, output transaction ledger, and KMS worker as the later presentation path. It does not resolve effects or render scene work. It is enabled only for a matured Auto hardware cursor without an attachable primary carrier; it skips independent admission when a ready frame, worker/KMS ownership, or unavailable worker lane blocks it. Primary acquire/prepare continues after cursor admission or deferral. Kernel scheduling, GPU/EGL waits, Atomic backpressure, and driver behavior still limit any real-world bound.
 
 ## Scene-on-change implementation

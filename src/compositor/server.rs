@@ -128,6 +128,9 @@ pub struct PointerInputMetricsSnapshot {
     pub groups_inspected: u64,
     pub surfaces_inspected: u64,
     pub cpu_ns: u64,
+    pub pointer_hit_generation_invalidations: u64,
+    pub interaction_topology_invalidations: u64,
+    pub visual_stack_groups_cache_rebuilds: u64,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct XwaylandClientIdentity {
@@ -182,6 +185,9 @@ impl OwnCompositorServer {
             groups_inspected: metrics.pointer_scene_hit_groups_inspected,
             surfaces_inspected: metrics.pointer_scene_hit_surfaces_inspected,
             cpu_ns: metrics.pointer_scene_hit_cpu_nanos,
+            pointer_hit_generation_invalidations: metrics.pointer_hit_generation_invalidations,
+            interaction_topology_invalidations: metrics.interaction_topology_invalidations,
+            visual_stack_groups_cache_rebuilds: metrics.visual_stack_groups_cache_rebuilds,
         }
     }
 

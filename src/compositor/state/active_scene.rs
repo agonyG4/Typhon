@@ -122,6 +122,73 @@ impl ActiveSceneView {
     }
 }
 
+fn visual_stack_topology_changed(
+    previous_surfaces: &[RenderableSurface],
+    previous_popup_surface_ids: &[u32],
+    next_surfaces: &[RenderableSurface],
+    next_popup_surface_ids: &[u32],
+) -> bool {
+    previous_popup_surface_ids != next_popup_surface_ids
+        || previous_surfaces.len() != next_surfaces.len()
+        || previous_surfaces
+            .iter()
+            .zip(next_surfaces)
+            .any(|(previous, next)| {
+                previous.surface_id != next.surface_id
+                    || previous.placement.parent_surface_id != next.placement.parent_surface_id
+                    || previous
+                        .render_placement
+                        .unwrap_or(previous.placement)
+                        .parent_surface_id
+                        != next
+                            .render_placement
+                            .unwrap_or(next.placement)
+                            .parent_surface_id
+            })
+}
+
+fn interaction_surface_mapping_changed(
+    previous_surfaces: &[RenderableSurface],
+    previous_assignments: &[render::SurfaceRenderSpaceAssignment],
+    next_surfaces: &[RenderableSurface],
+    next_assignments: &[render::SurfaceRenderSpaceAssignment],
+) -> bool {
+    previous_assignments != next_assignments
+        || previous_surfaces.len() != next_surfaces.len()
+        || previous_surfaces
+            .iter()
+            .zip(next_surfaces)
+            .any(|(previous, next)| {
+                render::surface_logical_extent(previous) != render::surface_logical_extent(next)
+            })
+}
+
+fn presented_window_input_projection_changed(
+    previous: &[PresentedWindowGeometry],
+    next: &[PresentedWindowGeometry],
+) -> bool {
+    previous.len() != next.len()
+        || previous.iter().any(|window| {
+            let same_projection_count = |windows: &[PresentedWindowGeometry]| {
+                windows
+                    .iter()
+                    .filter(|candidate| {
+                        candidate.root_surface_id() == window.root_surface_id()
+                            && candidate.presented_rect() == window.presented_rect()
+                    })
+                    .count()
+            };
+            let first_rect_for_root = |windows: &[PresentedWindowGeometry]| {
+                windows
+                    .iter()
+                    .find(|candidate| candidate.root_surface_id() == window.root_surface_id())
+                    .map(|candidate| candidate.presented_rect())
+            };
+            same_projection_count(previous) != same_projection_count(next)
+                || first_rect_for_root(previous) != first_rect_for_root(next)
+        })
+}
+
 fn materialize_presented_window_geometry(
     canonical_geometry: WindowGeometry,
     canonical_rect: PresentationRect,
@@ -668,6 +735,20 @@ impl CompositorState {
             .map(|index| self.presented_window_geometries[index])
     }
 
+    fn presented_input_projection_changed(
+        &self,
+        next_authoritative: bool,
+        next_geometries: &[PresentedWindowGeometry],
+    ) -> bool {
+        let previous_authoritative = self.presented_presentation_frame_id != 0;
+        previous_authoritative != next_authoritative
+            || (next_authoritative
+                && presented_window_input_projection_changed(
+                    &self.presented_window_geometries,
+                    next_geometries,
+                ))
+    }
+
     pub(in crate::compositor) fn current_presentation_rect_for_root(
         &self,
         root_surface_id: u32,
@@ -907,6 +988,8 @@ impl CompositorState {
         if presentation.output_id != expected_output_id {
             return;
         }
+        let input_projection_changed =
+            self.presented_input_projection_changed(frame_id != 0, &presentation.presented_windows);
         self.presented_presentation_frame_id = frame_id;
         self.presented_presentation = Some(presentation.clone());
         self.presented_window_geometries = presentation.presented_windows.clone();
@@ -948,7 +1031,9 @@ impl CompositorState {
                     .acknowledge_presented_clip(expected_output_id, ack);
             }
         }
-        self.advance_pointer_hit_generation();
+        if input_projection_changed {
+            self.advance_pointer_hit_generation();
+        }
     }
 
     pub(in crate::compositor) fn presented_presentation_frame_id(&self) -> u64 {
@@ -994,9 +1079,13 @@ impl CompositorState {
         frame_id: u64,
         geometry: PresentedWindowGeometry,
     ) {
+        let input_projection_changed =
+            self.presented_input_projection_changed(frame_id != 0, std::slice::from_ref(&geometry));
         self.presented_presentation_frame_id = frame_id;
         self.presented_window_geometries = vec![geometry];
-        self.advance_pointer_hit_generation();
+        if input_projection_changed {
+            self.advance_pointer_hit_generation();
+        }
     }
 
     pub(in crate::compositor) fn animate_toplevel_visual_geometry(
@@ -1129,11 +1218,28 @@ impl CompositorState {
             .iter()
             .map(|surface| surface.surface_id)
             .collect::<Vec<_>>();
+        let selection_changed = previous_selection != Some(selection);
+        let topology_changed = visual_stack_topology_changed(
+            &self.active_scene_view.surfaces,
+            &self.active_scene_view.popup_surface_ids,
+            &surfaces,
+            &popup_surface_ids,
+        );
+        let surface_origins_changed = self.active_scene_view.surface_origins != surface_origins;
+        let surface_mapping_changed = interaction_surface_mapping_changed(
+            &self.active_scene_view.surfaces,
+            &self.active_scene_view.surface_render_assignments,
+            &surfaces,
+            &surface_render_assignments,
+        );
+        let presentation_owner_mapping_changed =
+            self.active_scene_view.presentation_owner_roots_in_order
+                != presentation_owner_roots_in_order;
         let update = ActiveSceneUpdate {
-            selection_changed: previous_selection != Some(selection),
+            selection_changed,
             visual_scene_changed: previous_surface_ids != surface_ids
                 || self.active_scene_view.popup_surface_ids != popup_surface_ids
-                || self.active_scene_view.surface_origins != surface_origins,
+                || surface_origins_changed,
         };
         self.active_scene_view.surfaces = surfaces;
         self.active_scene_view.surface_indices = surface_indices;
@@ -1148,7 +1254,15 @@ impl CompositorState {
         self.active_scene_view.selection = Some(selection);
         self.active_scene_view.rebuild_count =
             self.active_scene_view.rebuild_count.saturating_add(1);
-        self.advance_pointer_hit_generation();
+        if topology_changed {
+            self.advance_interaction_topology_generation();
+        } else if selection_changed
+            || surface_origins_changed
+            || surface_mapping_changed
+            || presentation_owner_mapping_changed
+        {
+            self.advance_pointer_hit_generation();
+        }
         self.refresh_frame_work_visibility();
         self.rebuild_scene_work_index();
         if self.surface_tree_generation.is_none() {
@@ -1178,7 +1292,7 @@ impl CompositorState {
         let popup_surface_ids = self.active_popup_surface_ids_from_state();
         if popup_surface_ids != self.active_scene_view.popup_surface_ids {
             self.active_scene_view.popup_surface_ids = popup_surface_ids;
-            self.advance_pointer_hit_generation();
+            self.advance_interaction_topology_generation();
             if self.surface_tree_generation.is_none() {
                 self.refresh_effect_scene_summary();
             }
@@ -1442,6 +1556,19 @@ fn effect_scene_surface_geometry_changed(
 #[cfg(test)]
 mod presentation_owner_tests {
     use super::*;
+
+    #[test]
+    fn equivalent_active_scene_rebuild_does_not_invalidate_pointer_hits() {
+        let mut state = CompositorState::new(None);
+        state.rebuild_active_scene_view();
+        let pointer_hit_generation = state.pointer_hit_generation;
+        let topology_generation = state.interaction_topology_generation;
+
+        state.rebuild_active_scene_view();
+
+        assert_eq!(state.pointer_hit_generation, pointer_hit_generation);
+        assert_eq!(state.interaction_topology_generation, topology_generation);
+    }
 
     #[test]
     fn root_without_window_group_has_no_presentation_owner() {
