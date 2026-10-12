@@ -721,6 +721,7 @@ pub(crate) struct NativeRuntime {
     perf: NativePerfLogger,
     target: NativeAppliedOutputConfiguration,
     output_capabilities: NativeOutputCapabilities,
+    output_mode_mutation_policy: output_configuration::OutputModeMutationPolicy,
     output_configuration_generation: OutputConfigurationGeneration,
     output_configuration_transactions: OutputConfigurationTransactions,
     pending_output_configuration: Option<PendingOutputConfigurationRequest>,
@@ -798,6 +799,7 @@ pub(crate) struct NativeRuntime {
     output_configuration_persistence_worker_reactor_token: Option<ReactorToken>,
     pending_output_persistence: Option<PendingOutputPersistence>,
     next_output_persistence_job_id: u64,
+    output_persistence_unavailable_logged: bool,
     output_reconfiguration_rearm_retry_deadline_ns: Option<u64>,
     output_persistence_compensation_required: bool,
     output_persistence_compensation_failed: bool,
@@ -987,6 +989,8 @@ impl NativeRuntime {
             .expect("bootstrap termination journal")
             .persist_run_started();
         let result = (|| {
+            let output_mode_mutation_policy =
+                output_configuration::OutputModeMutationPolicy::from_environment()?;
             // Block process-directed child and termination signals before any
             // native driver, graphics library, or compositor initialization
             // can create a thread. The child supervisor's signalfd remains the
@@ -995,7 +999,7 @@ impl NativeRuntime {
             oblivion_one::native::scheduling_qos::initialize_from_environment()
                 .map_err(io::Error::other)?;
             frame::initialize_effect_owner_diagnostics();
-            Self::bootstrap_native(config, &mut termination)
+            Self::bootstrap_native(config, output_mode_mutation_policy, &mut termination)
         })();
         if let Err(error) = &result
             && let Some(mut termination) = termination.take()

@@ -194,6 +194,7 @@ struct NativeRuntimeBootstrapTail {
 impl NativeRuntime {
     fn finish_bootstrap(
         parts: NativeRuntimeBootstrapTail,
+        output_mode_mutation_policy: super::output_configuration::OutputModeMutationPolicy,
         termination: &mut Option<NativeTerminationJournal>,
     ) -> NativeResult<Self> {
         let NativeRuntimeBootstrapTail {
@@ -688,6 +689,7 @@ impl NativeRuntime {
             kms_backend,
             target,
             output_capabilities,
+            output_mode_mutation_policy,
             output_configuration_generation: OutputConfigurationGeneration::initial(),
             output_configuration_transactions: OutputConfigurationTransactions::new(),
             pending_output_configuration: None,
@@ -761,6 +763,7 @@ impl NativeRuntime {
             output_configuration_persistence_worker_reactor_token,
             pending_output_persistence: None,
             next_output_persistence_job_id: 1,
+            output_persistence_unavailable_logged: false,
             output_reconfiguration_rearm_retry_deadline_ns: None,
             output_persistence_compensation_required: false,
             output_persistence_compensation_failed: false,
@@ -852,10 +855,12 @@ impl NativeRuntime {
             runtime.termination.persist_fatal_checkpoint();
             return Err(error);
         }
+        runtime.log_output_mode_mutation_exposure();
         Ok(runtime)
     }
     pub(super) fn bootstrap_native(
         config: NativeRuntimeConfig,
+        output_mode_mutation_policy: super::output_configuration::OutputModeMutationPolicy,
         termination: &mut Option<NativeTerminationJournal>,
     ) -> NativeResult<Self> {
         let controller_policy = ControllerPolicy::from_env()?;
@@ -1792,6 +1797,7 @@ impl NativeRuntime {
                 vrr_policy,
                 initial_presented_scene,
             },
+            output_mode_mutation_policy,
             termination,
         )
     }

@@ -15,9 +15,156 @@ use oblivion_one::native::scheduler::NativeFrameScheduler;
 use oblivion_one::private_config::{PrivateConfigError, PrivateConfigFile};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
-// Keep native mode mutation unavailable until the coordinated NativeRuntime
-// transition tests qualify publication, rollback, and persistence together.
+// Production mode mutation stays disabled until the target-hardware matrix is
+// qualified. The explicit boot policy is the only development qualification
+// override and still passes through every runtime capability check.
 const OUTPUT_MODE_SELECTION_RUNTIME_QUALIFIED: bool = false;
+const OUTPUT_MODE_MUTATION_POLICY_ENV: &str = "OBLIVION_ONE_OUTPUT_MODE_MUTATION";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OutputModeMutationPolicy {
+    Auto,
+    Off,
+    Qualification,
+}
+
+impl OutputModeMutationPolicy {
+    pub(crate) fn parse(value: Option<&str>) -> Result<Self, String> {
+        match value {
+            None | Some("auto") => Ok(Self::Auto),
+            Some("off") => Ok(Self::Off),
+            Some("qualification") => Ok(Self::Qualification),
+            Some(value) => Err(value.to_string()),
+        }
+    }
+
+    pub(crate) fn from_environment() -> io::Result<Self> {
+        match std::env::var(OUTPUT_MODE_MUTATION_POLICY_ENV) {
+            Ok(value) => Self::parse(Some(&value)).map_err(|value| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "invalid {OUTPUT_MODE_MUTATION_POLICY_ENV} value {value:?}; expected auto, off, or qualification"
+                    ),
+                )
+            }),
+            Err(std::env::VarError::NotPresent) => Ok(Self::Auto),
+            Err(std::env::VarError::NotUnicode(_)) => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{OUTPUT_MODE_MUTATION_POLICY_ENV} must be valid UTF-8"),
+            )),
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Off => "off",
+            Self::Qualification => "qualification",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputModeMutationBlocker {
+    ProjectUnqualified,
+    PolicyDisabled,
+    LegacyKms,
+    MissingExactModeInventory,
+    UnsupportedScanout,
+    ScanoutUnavailable,
+    PersistenceUnavailable,
+    PersistenceCompensationPending,
+    PersistenceCompensationFailed,
+    RollbackFailed,
+}
+
+impl OutputModeMutationBlocker {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::ProjectUnqualified => "project_unqualified",
+            Self::PolicyDisabled => "policy_disabled",
+            Self::LegacyKms => "legacy_kms",
+            Self::MissingExactModeInventory => "missing_exact_mode_inventory",
+            Self::UnsupportedScanout => "unsupported_scanout",
+            Self::ScanoutUnavailable => "scanout_unavailable",
+            Self::PersistenceUnavailable => "persistence_unavailable",
+            Self::PersistenceCompensationPending => "persistence_compensation_pending",
+            Self::PersistenceCompensationFailed => "persistence_compensation_failed",
+            Self::RollbackFailed => "rollback_failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OutputModeMutationRuntimeEvidence {
+    atomic_kms: bool,
+    exact_mode_count: usize,
+    scanout_kind: NativeScanoutKind,
+    scanout_available: bool,
+    persistence_available: bool,
+    persistence_compensation_pending: bool,
+    persistence_compensation_failed: bool,
+    rollback_failed: bool,
+}
+
+fn output_mode_mutation_exposure_allowed(
+    production_qualified: bool,
+    policy: OutputModeMutationPolicy,
+) -> Result<(), OutputModeMutationBlocker> {
+    match policy {
+        OutputModeMutationPolicy::Off => Err(OutputModeMutationBlocker::PolicyDisabled),
+        OutputModeMutationPolicy::Auto if !production_qualified => {
+            Err(OutputModeMutationBlocker::ProjectUnqualified)
+        }
+        OutputModeMutationPolicy::Auto | OutputModeMutationPolicy::Qualification => Ok(()),
+    }
+}
+
+fn output_mode_mutation_runtime_support(
+    evidence: OutputModeMutationRuntimeEvidence,
+) -> Result<(), OutputModeMutationBlocker> {
+    if !evidence.atomic_kms {
+        return Err(OutputModeMutationBlocker::LegacyKms);
+    }
+    if evidence.exact_mode_count == 0 {
+        return Err(OutputModeMutationBlocker::MissingExactModeInventory);
+    }
+    if !matches!(
+        evidence.scanout_kind,
+        NativeScanoutKind::AtomicEglGbmExplicit
+            | NativeScanoutKind::NativeEglGbmOpaqueCompatibility
+            | NativeScanoutKind::GbmCpuWritePageFlip
+            | NativeScanoutKind::DumbFramebuffer
+    ) {
+        return Err(OutputModeMutationBlocker::UnsupportedScanout);
+    }
+    if !evidence.scanout_available {
+        return Err(OutputModeMutationBlocker::ScanoutUnavailable);
+    }
+    if !evidence.persistence_available {
+        return Err(OutputModeMutationBlocker::PersistenceUnavailable);
+    }
+    if evidence.persistence_compensation_pending {
+        return Err(OutputModeMutationBlocker::PersistenceCompensationPending);
+    }
+    if evidence.persistence_compensation_failed {
+        return Err(OutputModeMutationBlocker::PersistenceCompensationFailed);
+    }
+    if evidence.rollback_failed {
+        return Err(OutputModeMutationBlocker::RollbackFailed);
+    }
+    Ok(())
+}
+
+fn output_mode_mutation_support(
+    production_qualified: bool,
+    policy: OutputModeMutationPolicy,
+    evidence: OutputModeMutationRuntimeEvidence,
+) -> Result<(), OutputModeMutationBlocker> {
+    output_mode_mutation_exposure_allowed(production_qualified, policy)?;
+    output_mode_mutation_runtime_support(evidence)
+}
 
 #[derive(Clone, Copy)]
 pub(crate) enum OutputConfigurationOperation {
@@ -677,9 +824,10 @@ pub(crate) struct PendingOutputPersistence {
 
 impl NativeRuntime {
     pub(crate) fn mode_selection_supported(&self) -> bool {
-        if !OUTPUT_MODE_SELECTION_RUNTIME_QUALIFIED {
-            return false;
-        }
+        self.output_mode_mutation_support().is_ok()
+    }
+
+    fn output_mode_mutation_support(&self) -> Result<(), OutputModeMutationBlocker> {
         let rollback_failed =
             self.output_configuration_transactions
                 .active()
@@ -689,18 +837,41 @@ impl NativeRuntime {
                         OutputConfigurationTransactionPhase::RollbackFailed { .. }
                     )
                 });
-        output_mode_mutation_is_supported(
-            self.kms_backend.effective_kind() == oblivion_one::native::kms::KmsBackendKind::Atomic,
-            !self.output_capabilities.mode_inventory.entries().is_empty(),
-            self.scanout.kind(),
-            !self.scanout_destroyed,
-            self.output_configuration_persistence_worker
-                .as_ref()
-                .is_some_and(OutputConfigurationPersistenceWorker::is_available),
-            self.output_persistence_compensation_required,
-            self.output_persistence_compensation_failed,
-            rollback_failed,
+        output_mode_mutation_support(
+            OUTPUT_MODE_SELECTION_RUNTIME_QUALIFIED,
+            self.output_mode_mutation_policy,
+            OutputModeMutationRuntimeEvidence {
+                atomic_kms: self.kms_backend.effective_kind()
+                    == oblivion_one::native::kms::KmsBackendKind::Atomic,
+                exact_mode_count: self.output_capabilities.mode_inventory.entries().len(),
+                scanout_kind: self.scanout.kind(),
+                scanout_available: !self.scanout_destroyed,
+                persistence_available: self
+                    .output_configuration_persistence_worker
+                    .as_ref()
+                    .is_some_and(OutputConfigurationPersistenceWorker::is_available),
+                persistence_compensation_pending: self.output_persistence_compensation_required,
+                persistence_compensation_failed: self.output_persistence_compensation_failed,
+                rollback_failed,
+            },
         )
+    }
+
+    pub(crate) fn log_output_mode_mutation_exposure(&self) {
+        let support = self.output_mode_mutation_support();
+        let blocker = support
+            .err()
+            .map_or("none", OutputModeMutationBlocker::as_str);
+        eprintln!(
+            "native display mutation: policy={} production_qualified={} effective={} blocker={} kms={} scanout={} exact_modes={}",
+            self.output_mode_mutation_policy.as_str(),
+            OUTPUT_MODE_SELECTION_RUNTIME_QUALIFIED,
+            blocker == "none",
+            blocker,
+            self.kms_backend.effective_kind().as_str(),
+            self.scanout.kind().as_str(),
+            self.output_capabilities.mode_inventory.entries().len(),
+        );
     }
 
     pub(crate) fn enqueue_temporary_output_configuration(
@@ -904,6 +1075,13 @@ impl NativeRuntime {
             .output_configuration_persistence_worker
             .as_ref()
             .is_some_and(|worker| !worker.is_available());
+        if unavailable && !self.output_persistence_unavailable_logged {
+            self.output_persistence_unavailable_logged = true;
+            eprintln!(
+                "native display mutation became unavailable: blocker={}",
+                OutputModeMutationBlocker::PersistenceUnavailable.as_str()
+            );
+        }
         if wakeup.reasons.output_configuration_persistence_worker() || unavailable {
             let completion = self
                 .output_configuration_persistence_worker
@@ -2466,31 +2644,6 @@ impl OutputConfigurationRuntime for NativeRuntime {
     }
 }
 
-fn output_mode_mutation_is_supported(
-    atomic_kms: bool,
-    has_exact_mode_inventory: bool,
-    scanout_kind: NativeScanoutKind,
-    scanout_available: bool,
-    persistence_available: bool,
-    persistence_compensation_pending: bool,
-    persistence_compensation_failed: bool,
-    rollback_failed: bool,
-) -> bool {
-    atomic_kms
-        && has_exact_mode_inventory
-        && scanout_available
-        && persistence_available
-        && !persistence_compensation_pending
-        && !persistence_compensation_failed
-        && !rollback_failed
-        && matches!(
-            scanout_kind,
-            NativeScanoutKind::AtomicEglGbmExplicit
-                | NativeScanoutKind::NativeEglGbmOpaqueCompatibility
-                | NativeScanoutKind::GbmCpuWritePageFlip
-                | NativeScanoutKind::DumbFramebuffer
-        )
-}
 pub(crate) const fn output_configuration_cycle_is_due(
     pending_request: bool,
     rollback_deadline_expired: bool,
@@ -2514,59 +2667,194 @@ struct OutputTransactionArgs {
 mod tests {
     use super::*;
 
+    fn fully_qualified_evidence() -> OutputModeMutationRuntimeEvidence {
+        OutputModeMutationRuntimeEvidence {
+            atomic_kms: true,
+            exact_mode_count: 7,
+            scanout_kind: NativeScanoutKind::AtomicEglGbmExplicit,
+            scanout_available: true,
+            persistence_available: true,
+            persistence_compensation_pending: false,
+            persistence_compensation_failed: false,
+            rollback_failed: false,
+        }
+    }
+
+    #[test]
+    fn output_mode_policy_parser_accepts_only_documented_values() {
+        assert_eq!(
+            OutputModeMutationPolicy::parse(None),
+            Ok(OutputModeMutationPolicy::Auto)
+        );
+        assert_eq!(
+            OutputModeMutationPolicy::parse(Some("auto")),
+            Ok(OutputModeMutationPolicy::Auto)
+        );
+        assert_eq!(
+            OutputModeMutationPolicy::parse(Some("off")),
+            Ok(OutputModeMutationPolicy::Off)
+        );
+        assert_eq!(
+            OutputModeMutationPolicy::parse(Some("qualification")),
+            Ok(OutputModeMutationPolicy::Qualification)
+        );
+        for value in ["1", "true", "yes", "on", "", "AUTO"] {
+            assert!(
+                OutputModeMutationPolicy::parse(Some(value)).is_err(),
+                "{value:?} is not an accepted policy"
+            );
+        }
+    }
+
+    #[test]
+    fn output_mode_exposure_policy_follows_production_qualification() {
+        let cases = [
+            (false, OutputModeMutationPolicy::Auto, false),
+            (false, OutputModeMutationPolicy::Off, false),
+            (false, OutputModeMutationPolicy::Qualification, true),
+            (true, OutputModeMutationPolicy::Auto, true),
+            (true, OutputModeMutationPolicy::Off, false),
+            (true, OutputModeMutationPolicy::Qualification, true),
+        ];
+        for (production_qualified, policy, expected) in cases {
+            assert_eq!(
+                output_mode_mutation_support(
+                    production_qualified,
+                    policy,
+                    fully_qualified_evidence(),
+                )
+                .is_ok(),
+                expected,
+                "production_qualified={production_qualified}, policy={policy:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn qualification_policy_does_not_bypass_runtime_capability_blockers() {
+        assert_eq!(
+            output_mode_mutation_support(
+                false,
+                OutputModeMutationPolicy::Qualification,
+                fully_qualified_evidence(),
+            ),
+            Ok(())
+        );
+
+        let mut evidence = fully_qualified_evidence();
+        evidence.atomic_kms = false;
+        assert_eq!(
+            output_mode_mutation_support(false, OutputModeMutationPolicy::Qualification, evidence,),
+            Err(OutputModeMutationBlocker::LegacyKms)
+        );
+
+        let mut evidence = fully_qualified_evidence();
+        evidence.exact_mode_count = 0;
+        assert_eq!(
+            output_mode_mutation_support(false, OutputModeMutationPolicy::Qualification, evidence,),
+            Err(OutputModeMutationBlocker::MissingExactModeInventory)
+        );
+
+        let mut evidence = fully_qualified_evidence();
+        evidence.scanout_kind = NativeScanoutKind::Unavailable;
+        assert_eq!(
+            output_mode_mutation_support(false, OutputModeMutationPolicy::Qualification, evidence,),
+            Err(OutputModeMutationBlocker::UnsupportedScanout)
+        );
+
+        let mut evidence = fully_qualified_evidence();
+        evidence.scanout_available = false;
+        assert_eq!(
+            output_mode_mutation_support(false, OutputModeMutationPolicy::Qualification, evidence,),
+            Err(OutputModeMutationBlocker::ScanoutUnavailable)
+        );
+
+        let mut evidence = fully_qualified_evidence();
+        evidence.persistence_available = false;
+        assert_eq!(
+            output_mode_mutation_support(false, OutputModeMutationPolicy::Qualification, evidence,),
+            Err(OutputModeMutationBlocker::PersistenceUnavailable)
+        );
+
+        let mut evidence = fully_qualified_evidence();
+        evidence.persistence_compensation_pending = true;
+        assert_eq!(
+            output_mode_mutation_support(false, OutputModeMutationPolicy::Qualification, evidence,),
+            Err(OutputModeMutationBlocker::PersistenceCompensationPending)
+        );
+
+        let mut evidence = fully_qualified_evidence();
+        evidence.persistence_compensation_failed = true;
+        assert_eq!(
+            output_mode_mutation_support(false, OutputModeMutationPolicy::Qualification, evidence,),
+            Err(OutputModeMutationBlocker::PersistenceCompensationFailed)
+        );
+
+        let mut evidence = fully_qualified_evidence();
+        evidence.rollback_failed = true;
+        assert_eq!(
+            output_mode_mutation_support(false, OutputModeMutationPolicy::Qualification, evidence,),
+            Err(OutputModeMutationBlocker::RollbackFailed)
+        );
+    }
+
+    #[test]
+    fn output_mode_blocker_priority_is_stable() {
+        let mut evidence = fully_qualified_evidence();
+        evidence.atomic_kms = false;
+        evidence.exact_mode_count = 0;
+        evidence.scanout_kind = NativeScanoutKind::Unavailable;
+        evidence.scanout_available = false;
+        evidence.persistence_available = false;
+        evidence.persistence_compensation_pending = true;
+        evidence.persistence_compensation_failed = true;
+        evidence.rollback_failed = true;
+        assert_eq!(
+            output_mode_mutation_support(false, OutputModeMutationPolicy::Qualification, evidence,),
+            Err(OutputModeMutationBlocker::LegacyKms)
+        );
+
+        evidence.atomic_kms = true;
+        assert_eq!(
+            output_mode_mutation_support(false, OutputModeMutationPolicy::Qualification, evidence,),
+            Err(OutputModeMutationBlocker::MissingExactModeInventory)
+        );
+
+        assert_eq!(
+            output_mode_mutation_support(
+                false,
+                OutputModeMutationPolicy::Auto,
+                fully_qualified_evidence(),
+            ),
+            Err(OutputModeMutationBlocker::ProjectUnqualified)
+        );
+        assert_eq!(
+            output_mode_mutation_support(
+                true,
+                OutputModeMutationPolicy::Off,
+                fully_qualified_evidence(),
+            ),
+            Err(OutputModeMutationBlocker::PolicyDisabled)
+        );
+    }
+
     #[test]
     fn mode_selection_stays_unavailable_until_runtime_integration_is_qualified() {
         assert!(!OUTPUT_MODE_SELECTION_RUNTIME_QUALIFIED);
     }
 
     #[test]
-    fn capability_requires_atomic_exact_inventory_replacement_and_persistence() {
-        let supported = |atomic_kms, scanout_kind| {
-            output_mode_mutation_is_supported(
-                atomic_kms,
-                true,
-                scanout_kind,
-                true,
-                true,
-                false,
-                false,
-                false,
-            )
-        };
-        assert!(!supported(false, NativeScanoutKind::AtomicEglGbmExplicit));
-        assert!(!output_mode_mutation_is_supported(
-            true,
-            false,
+    fn runtime_support_accepts_only_qualified_scanout_kinds() {
+        for scanout_kind in [
             NativeScanoutKind::AtomicEglGbmExplicit,
-            true,
-            true,
-            false,
-            false,
-            false,
-        ));
-        assert!(!supported(true, NativeScanoutKind::Unavailable));
-        assert!(supported(true, NativeScanoutKind::AtomicEglGbmExplicit));
-        assert!(supported(true, NativeScanoutKind::GbmCpuWritePageFlip));
-        assert!(!output_mode_mutation_is_supported(
-            true,
-            true,
-            NativeScanoutKind::AtomicEglGbmExplicit,
-            true,
-            false,
-            false,
-            false,
-            false,
-        ));
-        assert!(!output_mode_mutation_is_supported(
-            true,
-            true,
-            NativeScanoutKind::AtomicEglGbmExplicit,
-            true,
-            true,
-            false,
-            false,
-            true,
-        ));
+            NativeScanoutKind::NativeEglGbmOpaqueCompatibility,
+            NativeScanoutKind::GbmCpuWritePageFlip,
+            NativeScanoutKind::DumbFramebuffer,
+        ] {
+            let mut evidence = fully_qualified_evidence();
+            evidence.scanout_kind = scanout_kind;
+            assert_eq!(output_mode_mutation_runtime_support(evidence), Ok(()));
+        }
     }
 
     #[test]
