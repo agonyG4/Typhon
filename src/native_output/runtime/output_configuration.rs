@@ -505,6 +505,162 @@ pub(crate) enum OutputConfigurationAdvance {
     Completed,
 }
 
+/// A ready synchronous candidate crossing the single irreversible KMS commit
+/// boundary. Candidate construction and all KMS behavior stay in their owners.
+enum OutputConfigurationTransitionCandidate {
+    Ready {
+        scanout: NativeScanoutBackend,
+        modeset: PreparedAtomicRuntimeModeset<DrmModeBlobIo>,
+        cursor: Option<AtomicCursorVisualState>,
+    },
+    Adopted {
+        scanout: NativeScanoutBackend,
+        cursor: Option<AtomicCursorVisualState>,
+    },
+}
+
+/// Statically dispatched coordination port for the synchronous output
+/// transition. NativeRuntime supplies the production owners; qualification
+/// tests substitute only these narrow owner calls.
+trait OutputConfigurationRuntime {
+    type Candidate;
+    type ConfirmationReservation;
+    type Response;
+
+    fn test_candidate(&mut self, candidate: &mut Self::Candidate) -> Result<(), String>;
+    fn direct_scanout_retirement_safe(&mut self) -> bool;
+    fn reserve_confirmation_transaction(
+        &mut self,
+        operation: OutputConfigurationOperation,
+        target: NativeAppliedOutputConfiguration,
+    ) -> Result<Option<Self::ConfirmationReservation>, String>;
+    fn cancel_confirmation_reservation(&mut self, reservation: Self::ConfirmationReservation);
+    fn park_acquire_watches(&mut self) -> Result<(), String>;
+    fn commit_started_at_ns(&mut self, cycle_started_at: Instant, now_ns: u64) -> u64;
+    fn commit_candidate(
+        &mut self,
+        candidate: &mut Self::Candidate,
+        commit_started_at_ns: u64,
+    ) -> Result<u64, String>;
+    fn adopt_committed_candidate(&mut self, candidate: Self::Candidate) -> Self::Candidate;
+    fn finalize_committed_transaction(
+        &mut self,
+        operation: OutputConfigurationOperation,
+        reservation: Option<Self::ConfirmationReservation>,
+        committed_at_ns: u64,
+    );
+    fn publish_committed_output_configuration(
+        &mut self,
+        operation: OutputConfigurationOperation,
+        target: NativeAppliedOutputConfiguration,
+        candidate: Self::Candidate,
+        committed_at_ns: u64,
+    );
+    fn rearm_acquire_watches(&mut self, now_ns: u64);
+    fn queue_success_response(
+        &mut self,
+        operation: OutputConfigurationOperation,
+        response: Self::Response,
+    );
+    fn queue_failure_response(
+        &mut self,
+        operation: OutputConfigurationOperation,
+        target: NativeAppliedOutputConfiguration,
+        response: Self::Response,
+        failure_code: Option<oblivion_one::control::ControlErrorCode>,
+        detail: String,
+    ) -> NativeResult<()>;
+    fn begin_persistence(
+        &mut self,
+        purpose: OutputPersistencePurpose,
+        response: Self::Response,
+        bytes: Vec<u8>,
+    ) -> Result<(), OutputPersistenceSubmitError>;
+}
+
+fn advance_output_configuration_transition<R: OutputConfigurationRuntime>(
+    runtime: &mut R,
+    operation: OutputConfigurationOperation,
+    target: NativeAppliedOutputConfiguration,
+    response: R::Response,
+    failure_code: Option<oblivion_one::control::ControlErrorCode>,
+    mut candidate: R::Candidate,
+    now_ns: u64,
+    cycle_started_at: Instant,
+) -> NativeResult<OutputConfigurationAdvance> {
+    if let Err(detail) = runtime.test_candidate(&mut candidate) {
+        runtime.queue_failure_response(operation, target, response, failure_code, detail)?;
+        return Ok(OutputConfigurationAdvance::Completed);
+    }
+    if !runtime.direct_scanout_retirement_safe() {
+        runtime.queue_failure_response(
+            operation,
+            target,
+            response,
+            failure_code,
+            "direct scanout ownership did not drain before synchronous modeset".to_string(),
+        )?;
+        return Ok(OutputConfigurationAdvance::Completed);
+    }
+
+    let reservation = match runtime.reserve_confirmation_transaction(operation, target) {
+        Ok(reservation) => reservation,
+        Err(detail) => {
+            runtime.queue_failure_response(operation, target, response, failure_code, detail)?;
+            return Ok(OutputConfigurationAdvance::Completed);
+        }
+    };
+    if matches!(
+        operation,
+        OutputConfigurationOperation::TemporaryApply { .. }
+    ) && reservation.is_none()
+    {
+        runtime.queue_failure_response(
+            operation,
+            target,
+            response,
+            failure_code,
+            "confirmation transaction reservation was not created".to_string(),
+        )?;
+        return Ok(OutputConfigurationAdvance::Completed);
+    }
+
+    if let Err(detail) = runtime.park_acquire_watches() {
+        if let Some(reservation) = reservation {
+            runtime.cancel_confirmation_reservation(reservation);
+        }
+        runtime.rearm_acquire_watches(now_ns);
+        runtime.queue_failure_response(operation, target, response, failure_code, detail)?;
+        return Ok(OutputConfigurationAdvance::Completed);
+    }
+
+    let commit_started_at_ns = runtime.commit_started_at_ns(cycle_started_at, now_ns);
+    let committed_at_ns = match runtime.commit_candidate(&mut candidate, commit_started_at_ns) {
+        Ok(committed_at_ns) => committed_at_ns,
+        Err(detail) => {
+            if let Some(reservation) = reservation {
+                runtime.cancel_confirmation_reservation(reservation);
+            }
+            runtime.rearm_acquire_watches(commit_started_at_ns);
+            runtime.queue_failure_response(
+                operation,
+                target,
+                response,
+                failure_code,
+                format!("real commit: {detail}"),
+            )?;
+            return Ok(OutputConfigurationAdvance::Completed);
+        }
+    };
+
+    let candidate = runtime.adopt_committed_candidate(candidate);
+    runtime.finalize_committed_transaction(operation, reservation, committed_at_ns);
+    runtime.publish_committed_output_configuration(operation, target, candidate, committed_at_ns);
+    runtime.rearm_acquire_watches(committed_at_ns);
+    runtime.queue_success_response(operation, response);
+    Ok(OutputConfigurationAdvance::Completed)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OutputPersistencePurpose {
     Confirm {
@@ -638,7 +794,8 @@ impl NativeRuntime {
                         return Some(response);
                     }
                 };
-                match self.submit_output_persistence(
+                match OutputConfigurationRuntime::begin_persistence(
+                    self,
                     OutputPersistencePurpose::Confirm { transaction_id },
                     Some((token, request_id)),
                     bytes,
@@ -900,7 +1057,8 @@ impl NativeRuntime {
         {
             let current = self.persisted_output_configuration(self.target)?;
             if let Ok(bytes) = current.encode() {
-                if let Err(error) = self.submit_output_persistence(
+                if let Err(error) = OutputConfigurationRuntime::begin_persistence(
+                    self,
                     OutputPersistencePurpose::Compensate,
                     None,
                     bytes,
@@ -1207,156 +1365,29 @@ impl NativeRuntime {
         }
 
         let CandidateScanoutState::Ready {
-            mut scanout,
-            mut modeset,
+            scanout,
+            modeset,
             cursor,
         } = pending.candidate.take().expect("candidate prepared")
         else {
             self.pending_output_configuration = Some(pending);
             return Ok(OutputConfigurationAdvance::Waiting);
         };
-        if let Err(error) = self
-            .kms_backend
-            .test_runtime_modeset_candidate(&mut modeset)
-        {
-            self.fail_pending_output_configuration(pending, format!("TEST_ONLY: {error}"))?;
-            return Ok(OutputConfigurationAdvance::Completed);
-        }
-
-        if !self.scanout.can_retire_direct_after_synchronous_modeset() {
-            self.fail_pending_output_configuration(
-                pending,
-                "direct scanout ownership did not drain before synchronous modeset".to_string(),
-            )?;
-            return Ok(OutputConfigurationAdvance::Completed);
-        }
-
-        let prepared_transaction = match pending.operation {
-            OutputConfigurationOperation::TemporaryApply { previous } => {
-                let next_generation = self
-                    .output_configuration_generation
-                    .get()
-                    .wrapping_add(1)
-                    .max(1);
-                match self
-                    .output_configuration_transactions
-                    .prepare_temporary_apply(
-                        format!("output-{}", self.output_id.get()),
-                        previous,
-                        pending.target,
-                        next_generation,
-                    ) {
-                    Ok(prepared) => Some(prepared),
-                    Err(error) => {
-                        self.fail_pending_output_configuration(
-                            pending,
-                            format!("confirmation transaction reservation failed: {error:?}"),
-                        )?;
-                        return Ok(OutputConfigurationAdvance::Completed);
-                    }
-                }
-            }
-            OutputConfigurationOperation::Rollback { .. } => None,
-        };
-
-        // Pause watch admission by not servicing explicit-sync changes while
-        // this pending request owns the cycle. Drain actual KMS ownership above,
-        // then park every remaining acquire obligation before the real commit.
-        match self
-            .acquire_watches
-            .park_for_session_suspend(&mut self.event_loop)
-        {
-            Ok(parked) => self.parked_acquire_watches.extend(parked),
-            Err(error) => {
-                if let Some(prepared) = prepared_transaction {
-                    self.output_configuration_transactions
-                        .cancel_prepared_temporary_apply(prepared);
-                }
-                self.rearm_output_acquire_watches(now_ns);
-                self.fail_pending_output_configuration(pending, error.to_string())?;
-                return Ok(OutputConfigurationAdvance::Completed);
-            }
-        }
-
-        let commit_started_at_ns = now_ns.saturating_add(
-            u64::try_from(advance_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
-        );
-        let commit_started = Instant::now();
-        if let Err(error) = self
-            .kms_backend
-            .commit_runtime_modeset_candidate(&mut modeset)
-        {
-            if let Some(prepared) = prepared_transaction {
-                self.output_configuration_transactions
-                    .cancel_prepared_temporary_apply(prepared);
-            }
-            self.rearm_output_acquire_watches(commit_started_at_ns);
-            self.fail_pending_output_configuration(pending, format!("real commit: {error}"))?;
-            return Ok(OutputConfigurationAdvance::Completed);
-        }
-        self.kms_backend
-            .adopt_committed_runtime_modeset_candidate(modeset);
-        let committed_at_ns = commit_started_at_ns
-            .saturating_add(u64::try_from(commit_started.elapsed().as_nanos()).unwrap_or(u64::MAX));
-
-        if let Some(prepared) = prepared_transaction {
-            let transaction_id = self
-                .output_configuration_transactions
-                .finalize_temporary_apply(prepared, committed_at_ns);
-            self.publish_output_configuration(
-                pending.target,
-                &mut scanout,
+        debug_assert!(pending.prepared_transaction.is_none());
+        advance_output_configuration_transition(
+            self,
+            pending.operation,
+            pending.target,
+            pending.response,
+            pending.failure_code,
+            OutputConfigurationTransitionCandidate::Ready {
+                scanout,
+                modeset,
                 cursor,
-                committed_at_ns,
-            );
-            self.perf.log("native.output_configuration_applied", || {
-                vec![
-                    NativePerfField::u64("transaction_id", transaction_id.get()),
-                    NativePerfField::u64(
-                        "configuration_generation",
-                        self.output_configuration_generation.get(),
-                    ),
-                    NativePerfField::u64("width", u64::from(self.target.width)),
-                    NativePerfField::u64("height", u64::from(self.target.height)),
-                ]
-            });
-            self.queue_output_snapshot_response_after_commit(pending.response);
-        } else {
-            self.publish_output_configuration(
-                pending.target,
-                &mut scanout,
-                cursor,
-                committed_at_ns,
-            );
-        }
-
-        match pending.operation {
-            OutputConfigurationOperation::TemporaryApply { .. } => {}
-            OutputConfigurationOperation::Rollback { transaction_id } => {
-                self.output_configuration_transactions
-                    .finalize_committed_rollback(transaction_id);
-                if self.pending_output_persistence.as_ref().is_some_and(|job| {
-                    matches!(job.purpose, OutputPersistencePurpose::Confirm { .. })
-                }) {
-                    // A late successful write must be repaired after the rollback owns the mode.
-                    self.output_persistence_compensation_required = true;
-                }
-                self.perf
-                    .log("native.output_configuration_rolled_back", || {
-                        vec![
-                            NativePerfField::u64(
-                                "configuration_generation",
-                                self.output_configuration_generation.get(),
-                            ),
-                            NativePerfField::u64("width", u64::from(self.target.width)),
-                            NativePerfField::u64("height", u64::from(self.target.height)),
-                        ]
-                    });
-                self.queue_output_snapshot_response_after_commit(pending.response);
-            }
-        }
-        self.rearm_output_acquire_watches(committed_at_ns);
-        Ok(OutputConfigurationAdvance::Completed)
+            },
+            now_ns,
+            advance_started,
+        )
     }
 
     pub(super) fn quiesce_worker_output_candidate_step(&mut self) -> NativeResult<bool> {
@@ -2232,6 +2263,209 @@ impl NativeRuntime {
     }
 }
 
+impl OutputConfigurationRuntime for NativeRuntime {
+    type Candidate = OutputConfigurationTransitionCandidate;
+    type ConfirmationReservation = PreparedOutputConfigurationTransaction;
+    type Response = Option<(ReactorToken, u64)>;
+
+    fn test_candidate(&mut self, candidate: &mut Self::Candidate) -> Result<(), String> {
+        let OutputConfigurationTransitionCandidate::Ready { modeset, .. } = candidate else {
+            return Err("output candidate is not ready for TEST_ONLY".to_string());
+        };
+        self.kms_backend
+            .test_runtime_modeset_candidate(modeset)
+            .map_err(|error| format!("TEST_ONLY: {error}"))
+    }
+
+    fn direct_scanout_retirement_safe(&mut self) -> bool {
+        self.scanout.can_retire_direct_after_synchronous_modeset()
+    }
+
+    fn reserve_confirmation_transaction(
+        &mut self,
+        operation: OutputConfigurationOperation,
+        target: NativeAppliedOutputConfiguration,
+    ) -> Result<Option<Self::ConfirmationReservation>, String> {
+        let OutputConfigurationOperation::TemporaryApply { previous } = operation else {
+            return Ok(None);
+        };
+        let next_generation = self
+            .output_configuration_generation
+            .get()
+            .wrapping_add(1)
+            .max(1);
+        self.output_configuration_transactions
+            .prepare_temporary_apply(
+                format!("output-{}", self.output_id.get()),
+                previous,
+                target,
+                next_generation,
+            )
+            .map(Some)
+            .map_err(|error| format!("confirmation transaction reservation failed: {error:?}"))
+    }
+
+    fn cancel_confirmation_reservation(&mut self, reservation: Self::ConfirmationReservation) {
+        self.output_configuration_transactions
+            .cancel_prepared_temporary_apply(reservation);
+    }
+
+    fn park_acquire_watches(&mut self) -> Result<(), String> {
+        let parked = self
+            .acquire_watches
+            .park_for_session_suspend(&mut self.event_loop)
+            .map_err(|error| error.to_string())?;
+        self.parked_acquire_watches.extend(parked);
+        Ok(())
+    }
+
+    fn commit_started_at_ns(&mut self, cycle_started_at: Instant, now_ns: u64) -> u64 {
+        now_ns.saturating_add(
+            u64::try_from(cycle_started_at.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        )
+    }
+
+    fn commit_candidate(
+        &mut self,
+        candidate: &mut Self::Candidate,
+        commit_started_at_ns: u64,
+    ) -> Result<u64, String> {
+        let OutputConfigurationTransitionCandidate::Ready { modeset, .. } = candidate else {
+            return Err("output candidate is not ready for real commit".to_string());
+        };
+        let commit_started = Instant::now();
+        self.kms_backend
+            .commit_runtime_modeset_candidate(modeset)
+            .map_err(|error| error.to_string())?;
+        Ok(commit_started_at_ns
+            .saturating_add(u64::try_from(commit_started.elapsed().as_nanos()).unwrap_or(u64::MAX)))
+    }
+
+    fn adopt_committed_candidate(&mut self, candidate: Self::Candidate) -> Self::Candidate {
+        let OutputConfigurationTransitionCandidate::Ready {
+            scanout,
+            modeset,
+            cursor,
+        } = candidate
+        else {
+            unreachable!("only a tested synchronous candidate can be committed")
+        };
+        self.kms_backend
+            .adopt_committed_runtime_modeset_candidate(modeset);
+        OutputConfigurationTransitionCandidate::Adopted { scanout, cursor }
+    }
+
+    fn finalize_committed_transaction(
+        &mut self,
+        operation: OutputConfigurationOperation,
+        reservation: Option<Self::ConfirmationReservation>,
+        committed_at_ns: u64,
+    ) {
+        match operation {
+            OutputConfigurationOperation::TemporaryApply { .. } => {
+                let reservation =
+                    reservation.expect("temporary apply reservation is held through real commit");
+                self.output_configuration_transactions
+                    .finalize_temporary_apply(reservation, committed_at_ns);
+            }
+            OutputConfigurationOperation::Rollback { transaction_id } => {
+                self.output_configuration_transactions
+                    .finalize_committed_rollback(transaction_id);
+                if self.pending_output_persistence.as_ref().is_some_and(|job| {
+                    matches!(job.purpose, OutputPersistencePurpose::Confirm { .. })
+                }) {
+                    // A late successful write must be repaired after rollback owns the mode.
+                    self.output_persistence_compensation_required = true;
+                }
+            }
+        }
+    }
+
+    fn publish_committed_output_configuration(
+        &mut self,
+        operation: OutputConfigurationOperation,
+        target: NativeAppliedOutputConfiguration,
+        candidate: Self::Candidate,
+        committed_at_ns: u64,
+    ) {
+        let OutputConfigurationTransitionCandidate::Adopted {
+            mut scanout,
+            cursor,
+        } = candidate
+        else {
+            unreachable!("KMS adoption precedes authoritative output publication")
+        };
+        self.publish_output_configuration(target, &mut scanout, cursor, committed_at_ns);
+        match operation {
+            OutputConfigurationOperation::TemporaryApply { .. } => {
+                let transaction_id = self
+                    .output_configuration_transactions
+                    .active()
+                    .expect("temporary apply transaction was finalized before publication")
+                    .id;
+                self.perf.log("native.output_configuration_applied", || {
+                    vec![
+                        NativePerfField::u64("transaction_id", transaction_id.get()),
+                        NativePerfField::u64(
+                            "configuration_generation",
+                            self.output_configuration_generation.get(),
+                        ),
+                        NativePerfField::u64("width", u64::from(self.target.width)),
+                        NativePerfField::u64("height", u64::from(self.target.height)),
+                    ]
+                });
+            }
+            OutputConfigurationOperation::Rollback { .. } => {
+                self.perf
+                    .log("native.output_configuration_rolled_back", || {
+                        vec![
+                            NativePerfField::u64(
+                                "configuration_generation",
+                                self.output_configuration_generation.get(),
+                            ),
+                            NativePerfField::u64("width", u64::from(self.target.width)),
+                            NativePerfField::u64("height", u64::from(self.target.height)),
+                        ]
+                    });
+            }
+        }
+    }
+
+    fn rearm_acquire_watches(&mut self, now_ns: u64) {
+        self.rearm_output_acquire_watches(now_ns);
+    }
+
+    fn queue_success_response(
+        &mut self,
+        _operation: OutputConfigurationOperation,
+        response: Self::Response,
+    ) {
+        self.queue_output_snapshot_response_after_commit(response);
+    }
+
+    fn queue_failure_response(
+        &mut self,
+        operation: OutputConfigurationOperation,
+        target: NativeAppliedOutputConfiguration,
+        response: Self::Response,
+        failure_code: Option<oblivion_one::control::ControlErrorCode>,
+        detail: String,
+    ) -> NativeResult<()> {
+        let mut pending = PendingOutputConfigurationRequest::new(response, operation, target);
+        pending.failure_code = failure_code;
+        self.fail_pending_output_configuration(pending, detail)
+    }
+
+    fn begin_persistence(
+        &mut self,
+        purpose: OutputPersistencePurpose,
+        response: Self::Response,
+        bytes: Vec<u8>,
+    ) -> Result<(), OutputPersistenceSubmitError> {
+        self.submit_output_persistence(purpose, response, bytes)
+    }
+}
+
 fn output_mode_mutation_is_supported(
     atomic_kms: bool,
     has_exact_mode_inventory: bool,
@@ -2257,7 +2491,6 @@ fn output_mode_mutation_is_supported(
                 | NativeScanoutKind::DumbFramebuffer
         )
 }
-
 pub(crate) const fn output_configuration_cycle_is_due(
     pending_request: bool,
     rollback_deadline_expired: bool,
@@ -2407,3 +2640,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "output_configuration_qualification_tests.rs"]
+mod qualification_tests;
