@@ -686,7 +686,7 @@ fn portal_rect_is_aspect_fit_centered_and_direction_aligned() {
 }
 
 #[test]
-fn sink_terminal_depth_is_source_aspect_independent() {
+fn sink_terminal_thickness_is_source_aspect_independent() {
     let anchor = rect(900.0, 900.0, 64.0, 64.0);
     let sources = [
         rect(100.0, 100.0, 1600.0, 900.0), // wide
@@ -717,37 +717,7 @@ fn sink_terminal_depth_is_source_aspect_independent() {
 }
 
 #[test]
-fn sink_rect_is_aspect_independent_and_directionally_symmetric() {
-    let anchor = rect(-32.0, 900.0, 64.0, 64.0);
-    let sources = [
-        rect(-960.0, 120.0, 1600.0, 900.0),
-        rect(80.0, -400.0, 400.0, 900.0),
-        rect(120.0, 120.0, 600.0, 600.0),
-    ];
-    let mut bottom_depths = Vec::new();
-    for source in sources {
-        let portal = lamp_portal_rect(source, anchor, LampDirection::Bottom)
-            .expect("valid aspect-fit portal");
-        let sink = lamp_sink_rect(
-            anchor,
-            portal,
-            LampDirection::Bottom,
-            ASTREA_LAMP_ABSORB_DEPTH,
-            ASTREA_LAMP_SINK_THICKNESS,
-        )
-        .expect("valid sink");
-        assert!(rect_contains_rect(anchor, sink));
-        assert!(sink.x().is_finite() && sink.y().is_finite());
-        assert!(
-            (sink.y() + sink.height() * 0.5 - (anchor.y() + 0.6 * anchor.height())).abs() < 1.0e-12
-        );
-        assert_eq!(sink.x(), portal.x());
-        assert_eq!(sink.width(), portal.width());
-        assert_eq!(sink.height(), ASTREA_LAMP_SINK_THICKNESS);
-        bottom_depths.push(sink.height());
-    }
-    assert!(bottom_depths.windows(2).all(|pair| pair[0] == pair[1]));
-
+fn lamp_sink_terminates_at_target_ingress_edge_for_all_directions() {
     let cases = [
         (LampDirection::Bottom, rect(900.0, 900.0, 64.0, 64.0)),
         (LampDirection::Top, rect(900.0, 12.0, 64.0, 64.0)),
@@ -755,6 +725,7 @@ fn sink_rect_is_aspect_independent_and_directionally_symmetric() {
         (LampDirection::Left, rect(12.0, 500.0, 64.0, 64.0)),
     ];
     let source = rect(400.0, 300.0, 800.0, 600.0);
+    let epsilon = 1.0e-9;
     for (direction, directional_anchor) in cases {
         let portal = lamp_portal_rect(source, directional_anchor, direction)
             .expect("valid directional portal");
@@ -762,11 +733,17 @@ fn sink_rect_is_aspect_independent_and_directionally_symmetric() {
             directional_anchor,
             portal,
             direction,
-            ASTREA_LAMP_ABSORB_DEPTH,
             ASTREA_LAMP_SINK_THICKNESS,
         )
         .expect("valid directional sink");
         assert!(rect_contains_rect(directional_anchor, sink));
+        assert!(rect_contains_rect(portal, sink));
+        assert!(
+            [sink.x(), sink.y(), sink.width(), sink.height()]
+                .into_iter()
+                .all(f64::is_finite)
+        );
+        assert!(sink.width() > 0.0 && sink.height() > 0.0);
         assert_eq!(
             match direction {
                 LampDirection::Top | LampDirection::Bottom => sink.width(),
@@ -777,22 +754,62 @@ fn sink_rect_is_aspect_independent_and_directionally_symmetric() {
                 LampDirection::Left | LampDirection::Right => portal.height(),
             }
         );
-        let (anchor_start, anchor_end) = axis_bounds(directional_anchor, direction);
-        let center = match direction {
-            LampDirection::Top | LampDirection::Bottom => sink.y() + sink.height() * 0.5,
-            LampDirection::Left | LampDirection::Right => sink.x() + sink.width() * 0.5,
-        };
-        let expected_depth = match direction {
-            LampDirection::Bottom | LampDirection::Right => {
-                (center - anchor_start) / (anchor_end - anchor_start)
+        match direction {
+            LampDirection::Bottom => {
+                assert!((sink.y() - portal.y()).abs() <= epsilon);
+                assert!((sink.y() - directional_anchor.y()).abs() <= epsilon);
+                assert_eq!(sink.x(), portal.x());
+                assert_eq!(sink.width(), portal.width());
             }
-            LampDirection::Top | LampDirection::Left => {
-                (anchor_end - center) / (anchor_end - anchor_start)
+            LampDirection::Top => {
+                let sink_bottom = sink.y() + sink.height();
+                let portal_bottom = portal.y() + portal.height();
+                let anchor_bottom = directional_anchor.y() + directional_anchor.height();
+                assert!((sink_bottom - portal_bottom).abs() <= epsilon);
+                assert!((sink_bottom - anchor_bottom).abs() <= epsilon);
+                assert_eq!(sink.x(), portal.x());
+                assert_eq!(sink.width(), portal.width());
             }
-        };
-        assert!((expected_depth - ASTREA_LAMP_ABSORB_DEPTH).abs() < 1.0e-12);
+            LampDirection::Right => {
+                assert!((sink.x() - portal.x()).abs() <= epsilon);
+                assert!((sink.x() - directional_anchor.x()).abs() <= epsilon);
+                assert_eq!(sink.y(), portal.y());
+                assert_eq!(sink.height(), portal.height());
+            }
+            LampDirection::Left => {
+                let sink_right = sink.x() + sink.width();
+                let portal_right = portal.x() + portal.width();
+                let anchor_right = directional_anchor.x() + directional_anchor.width();
+                assert!((sink_right - portal_right).abs() <= epsilon);
+                assert!((sink_right - anchor_right).abs() <= epsilon);
+                assert_eq!(sink.y(), portal.y());
+                assert_eq!(sink.height(), portal.height());
+            }
+        }
     }
+}
 
+#[test]
+fn steam_dock_anchor_does_not_use_deep_absorb_terminal() {
+    let source = rect(-72.0, 101.0, 1566.0, 848.0);
+    let anchor = rect(1134.0, 1010.0, 48.0, 48.0);
+    let group = LifecycleVisualGroup::from_bounds(source, source, source, anchor, 1920, 1080)
+        .expect("Steam reproduction visual group");
+    assert_eq!(group.lamp_direction, LampDirection::Bottom);
+    assert!((group.sink_rect.y() - anchor.y()).abs() <= 1.0e-9);
+    assert_eq!(group.sink_rect.height(), ASTREA_LAMP_SINK_THICKNESS);
+    assert!(
+        (group.sink_rect.y() + group.sink_rect.height() * 0.5
+            - (anchor.y() + anchor.height() * 0.60))
+            .abs()
+            > 1.0,
+        "Steam terminal must remain at the Dock ingress edge"
+    );
+}
+
+#[test]
+fn lamp_ingress_terminal_is_finite_for_tiny_targets() {
+    let source = rect(400.0, 300.0, 800.0, 600.0);
     let tiny_anchor = rect(-0.003, -0.004, 0.003, 0.004);
     let tiny_portal =
         lamp_portal_rect(source, tiny_anchor, LampDirection::Bottom).expect("valid tiny portal");
@@ -800,12 +817,150 @@ fn sink_rect_is_aspect_independent_and_directionally_symmetric() {
         tiny_anchor,
         tiny_portal,
         LampDirection::Bottom,
-        ASTREA_LAMP_ABSORB_DEPTH,
         ASTREA_LAMP_SINK_THICKNESS,
     )
     .expect("valid tiny sink");
     assert!(rect_contains_rect(tiny_anchor, tiny_sink));
+    assert!(rect_contains_rect(tiny_portal, tiny_sink));
     assert!(tiny_sink.width() > 0.0 && tiny_sink.height() > 0.0);
+    assert!(
+        [
+            tiny_sink.x(),
+            tiny_sink.y(),
+            tiny_sink.width(),
+            tiny_sink.height()
+        ]
+        .into_iter()
+        .all(f64::is_finite)
+    );
+    assert!(tiny_sink.height() <= tiny_portal.height());
+    assert!((tiny_sink.y() - tiny_anchor.y()).abs() <= 1.0e-9);
+}
+
+#[test]
+fn lamp_warp_never_crosses_target_ingress_edge() {
+    let source = rect(400.0, 300.0, 800.0, 600.0);
+    let separated_cases = [
+        (LampDirection::Bottom, rect(900.0, 900.0, 64.0, 64.0)),
+        (LampDirection::Top, rect(900.0, 12.0, 64.0, 64.0)),
+        (LampDirection::Right, rect(1240.0, 500.0, 64.0, 64.0)),
+        (LampDirection::Left, rect(12.0, 500.0, 64.0, 64.0)),
+    ];
+    let normalized_samples = [0.0, 0.5, 1.0];
+    let progress_samples = [0.0, 0.1, 0.25, 0.5, 0.75, 0.9, 0.98, 1.0];
+    let epsilon = 1.0e-9;
+
+    for (direction, anchor) in separated_cases {
+        let portal = lamp_portal_rect(source, anchor, direction).expect("valid portal");
+        let movement_extent = match direction {
+            LampDirection::Top | LampDirection::Bottom => portal.height(),
+            LampDirection::Left | LampDirection::Right => portal.width(),
+        };
+        let thickness = ASTREA_LAMP_SINK_THICKNESS.min(movement_extent);
+        let ingress_limit = match direction {
+            LampDirection::Bottom => anchor.y() + thickness,
+            LampDirection::Top => anchor.y() + anchor.height() - thickness,
+            LampDirection::Right => anchor.x() + thickness,
+            LampDirection::Left => anchor.x() + anchor.width() - thickness,
+        };
+        let bump_distance = lamp_bump_distance(source, anchor, direction);
+        assert_eq!(bump_distance, 0.0);
+
+        for progress in progress_samples {
+            let channels = lamp_motion_channels(progress, bump_distance);
+            for u in normalized_samples {
+                for v in normalized_samples {
+                    let point = [
+                        source.x() + source.width() * u,
+                        source.y() + source.height() * v,
+                    ];
+                    let warped = lamp_warp_point_directional(
+                        source,
+                        anchor,
+                        direction,
+                        ASTREA_LAMP_MAX_SHAPE_FACTOR,
+                        bump_distance,
+                        channels,
+                        point,
+                    );
+                    assert!(warped.into_iter().all(f64::is_finite));
+                    let primary = match direction {
+                        LampDirection::Top | LampDirection::Bottom => warped[1],
+                        LampDirection::Left | LampDirection::Right => warped[0],
+                    };
+                    match direction {
+                        LampDirection::Bottom | LampDirection::Right => assert!(
+                            primary <= ingress_limit + epsilon,
+                            "{direction:?} warp crossed ingress at progress {progress}: {primary} > {ingress_limit}"
+                        ),
+                        LampDirection::Top | LampDirection::Left => assert!(
+                            primary >= ingress_limit - epsilon,
+                            "{direction:?} warp crossed ingress at progress {progress}: {primary} < {ingress_limit}"
+                        ),
+                    }
+                }
+            }
+        }
+    }
+
+    let overlapping_source = rect(100.0, 100.0, 200.0, 200.0);
+    let overlapping_anchor = rect(100.0, 250.0, 64.0, 64.0);
+    let bump_distance = lamp_bump_distance(
+        overlapping_source,
+        overlapping_anchor,
+        LampDirection::Bottom,
+    );
+    assert_eq!(bump_distance, 50.0);
+    let ingress_limit = overlapping_anchor.y() + ASTREA_LAMP_SINK_THICKNESS;
+    for progress in progress_samples {
+        let channels = lamp_motion_channels(progress, bump_distance);
+        for x_fraction in normalized_samples {
+            for y in [
+                overlapping_source.y(),
+                overlapping_source.y() + overlapping_source.height() * 0.5,
+                overlapping_anchor.y(),
+            ] {
+                let point = [
+                    overlapping_source.x() + overlapping_source.width() * x_fraction,
+                    y,
+                ];
+                let warped = lamp_warp_point_directional(
+                    overlapping_source,
+                    overlapping_anchor,
+                    LampDirection::Bottom,
+                    ASTREA_LAMP_MAX_SHAPE_FACTOR,
+                    bump_distance,
+                    channels,
+                    point,
+                );
+                assert!(warped.into_iter().all(f64::is_finite));
+                assert!(
+                    warped[1] <= ingress_limit + epsilon,
+                    "overlap retreat crossed ingress at progress {progress}: {} > {ingress_limit}",
+                    warped[1]
+                );
+            }
+
+            let already_overlapping_point = [
+                overlapping_source.x() + overlapping_source.width() * x_fraction,
+                overlapping_source.y() + overlapping_source.height(),
+            ];
+            let warped = lamp_warp_point_directional(
+                overlapping_source,
+                overlapping_anchor,
+                LampDirection::Bottom,
+                ASTREA_LAMP_MAX_SHAPE_FACTOR,
+                bump_distance,
+                channels,
+                already_overlapping_point,
+            );
+            assert!(warped.into_iter().all(f64::is_finite));
+            assert!(
+                warped[1] <= already_overlapping_point[1] + epsilon,
+                "overlap retreat deepened target penetration at progress {progress}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -1475,7 +1630,6 @@ fn directional_warp_has_exact_endpoints_and_finite_intermediates() {
         anchor,
         portal,
         LampDirection::Bottom,
-        ASTREA_LAMP_ABSORB_DEPTH,
         ASTREA_LAMP_SINK_THICKNESS,
     )
     .expect("sink");
@@ -1555,7 +1709,6 @@ fn lamp_is_identity_at_zero_and_reaches_sink_at_one() {
         anchor,
         portal,
         LampDirection::Bottom,
-        ASTREA_LAMP_ABSORB_DEPTH,
         ASTREA_LAMP_SINK_THICKNESS,
     )
     .expect("sink");
@@ -1580,7 +1733,7 @@ fn full_window_reference_freezes_the_presented_affine_basis() {
     );
     assert_eq!(
         lamp_warp_window_point(full, source, anchor, point, 1.0),
-        [1232.0, 938.4]
+        [1232.0, 900.5]
     );
 }
 

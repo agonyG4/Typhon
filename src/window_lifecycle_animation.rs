@@ -24,9 +24,6 @@ pub const ASTREA_LAMP_TRANSLATION_BLEND: f64 = 0.25;
 pub const ASTREA_LAMP_RETREAT_END: f64 = 0.30;
 /// Spatial delay power applied to rows away from the destination edge.
 pub const ASTREA_LAMP_STRETCH_POWER: f64 = 2.0;
-/// Absorption depth measured from the Dock-facing anchor edge toward its far
-/// edge. This is a spatial starting point, not an Apple implementation value.
-pub const ASTREA_LAMP_ABSORB_DEPTH: f64 = 0.60;
 /// Keep the sink non-degenerate while the terminal opacity interval hides it.
 pub const ASTREA_LAMP_SINK_THICKNESS: f64 = 1.0;
 /// Cubic rail control ordinates for the least pronounced frozen shape.
@@ -308,7 +305,6 @@ impl LifecycleVisualGroup {
                 target.rect,
                 group.portal_rect,
                 group.lamp_direction,
-                ASTREA_LAMP_ABSORB_DEPTH,
                 ASTREA_LAMP_SINK_THICKNESS,
             )?;
             group.shape_factor = lamp_shape_factor(
@@ -422,7 +418,6 @@ impl LifecycleVisualGroup {
             target.rect,
             portal_rect,
             lamp_direction,
-            ASTREA_LAMP_ABSORB_DEPTH,
             ASTREA_LAMP_SINK_THICKNESS,
         )?;
         let shape_factor =
@@ -1372,30 +1367,25 @@ pub fn lamp_sink_rect(
     anchor_rect: PresentationRect,
     portal_rect: PresentationRect,
     direction: LampDirection,
-    absorb_depth: f64,
     sink_thickness: f64,
 ) -> Option<PresentationRect> {
     if !valid_rect(anchor_rect)
         || !valid_rect(portal_rect)
         || !rect_contains_rect(anchor_rect, portal_rect)
-        || !absorb_depth.is_finite()
         || !sink_thickness.is_finite()
     {
         return None;
     }
-    let absorb_depth = absorb_depth.clamp(0.0, 1.0);
-    let (anchor_start, anchor_end) = axis_bounds(anchor_rect, direction);
-    let axis_extent = anchor_end - anchor_start;
+    let (portal_start, portal_end) = axis_bounds(portal_rect, direction);
+    let axis_extent = portal_end - portal_start;
+    if !portal_start.is_finite() || !portal_end.is_finite() || !axis_extent.is_finite() {
+        return None;
+    }
     let thickness = sink_thickness.max(f64::MIN_POSITIVE).min(axis_extent);
-    let mut axis_start = match direction {
-        LampDirection::Bottom | LampDirection::Right => {
-            anchor_start + axis_extent * absorb_depth - thickness * 0.5
-        }
-        LampDirection::Top | LampDirection::Left => {
-            anchor_end - axis_extent * absorb_depth - thickness * 0.5
-        }
+    let axis_start = match direction {
+        LampDirection::Bottom | LampDirection::Right => portal_start,
+        LampDirection::Top | LampDirection::Left => portal_end - thickness,
     };
-    axis_start = axis_start.clamp(anchor_start, anchor_end - thickness);
     let sink = match direction {
         LampDirection::Top | LampDirection::Bottom => {
             PresentationRect::new(portal_rect.x(), axis_start, portal_rect.width(), thickness)?
@@ -1404,7 +1394,10 @@ pub fn lamp_sink_rect(
             PresentationRect::new(axis_start, portal_rect.y(), thickness, portal_rect.height())?
         }
     };
-    (valid_rect(sink) && rect_contains_rect(anchor_rect, sink)).then_some(sink)
+    (valid_rect(sink)
+        && rect_contains_rect(anchor_rect, sink)
+        && rect_contains_rect(portal_rect, sink))
+    .then_some(sink)
 }
 
 fn rect_contains_rect(outer: PresentationRect, inner: PresentationRect) -> bool {
@@ -1720,13 +1713,7 @@ pub fn lamp_warp_point_directional(
     let Some(portal) = lamp_portal_rect(source, anchor, direction) else {
         return [0.0, 0.0];
     };
-    let Some(sink) = lamp_sink_rect(
-        anchor,
-        portal,
-        direction,
-        ASTREA_LAMP_ABSORB_DEPTH,
-        ASTREA_LAMP_SINK_THICKNESS,
-    ) else {
+    let Some(sink) = lamp_sink_rect(anchor, portal, direction, ASTREA_LAMP_SINK_THICKNESS) else {
         return [0.0, 0.0];
     };
     lamp_warp_point_directional_to_target(
@@ -1814,13 +1801,7 @@ pub fn lamp_warp_point(
     let Some(portal) = lamp_portal_rect(source, anchor, direction) else {
         return [0.0, 0.0];
     };
-    let Some(sink) = lamp_sink_rect(
-        anchor,
-        portal,
-        direction,
-        ASTREA_LAMP_ABSORB_DEPTH,
-        ASTREA_LAMP_SINK_THICKNESS,
-    ) else {
+    let Some(sink) = lamp_sink_rect(anchor, portal, direction, ASTREA_LAMP_SINK_THICKNESS) else {
         return [0.0, 0.0];
     };
     if progress >= 1.0 {
