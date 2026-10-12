@@ -396,24 +396,6 @@ impl GlesSceneRenderer {
     }
 
     #[cfg(test)]
-    pub(crate) fn draw_squash_overlay(
-        &mut self,
-        scissor: Option<OutputRect>,
-    ) -> RendererResult<()> {
-        let Self {
-            gl,
-            scene_state,
-            effect_runtime,
-            lifecycle,
-            resources,
-            ..
-        } = self;
-        let mut context =
-            LifecycleRenderContext::new(gl, scene_state, effect_runtime, resources.texture_view());
-        lifecycle.draw_squash_overlay(&mut context, scissor)
-    }
-
-    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(in crate::egl_renderer) fn execute_effect_graph_with_overlays_config(
         &mut self,

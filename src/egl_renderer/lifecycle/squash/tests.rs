@@ -1,6 +1,7 @@
 use super::*;
 use crate::egl_renderer::tests::{
-    GlesEffectTestHarness, lifecycle_test_lamp_sample as lamp_test_sample,
+    GlesEffectTestHarness, draw_lifecycle_markers_for_test,
+    lifecycle_test_lamp_sample as lamp_test_sample,
     lifecycle_test_surface_fixture as lifecycle_test_surface,
     lifecycle_transfer_texture_key as lifecycle_transfer_test_texture_key,
     test_lifecycle_identities_for_windows,
@@ -38,6 +39,7 @@ fn prepare_two_window_sampling_draw(harness: &mut GlesEffectTestHarness) -> [glo
     assert_ne!(second_sample.payload_id, lifecycle.samples[0].payload_id);
     second_sample.visual_source.presentation_identity = second_identity;
     second_sample.visual_source.payload_id = second_sample.payload_id;
+    second_sample.visual_source.resource_payload_id = second_sample.payload_id;
     second_sample.visual_source.root_surface_id = second_sample.root_surface_id;
     lifecycle.samples.push(second_sample);
     harness.renderer.lifecycle.begin_frame(&lifecycle);
@@ -136,17 +138,14 @@ fn prepare_two_window_sampling_draw(harness: &mut GlesEffectTestHarness) -> [glo
 }
 
 fn draw_squash_sampling_pass(harness: &mut GlesEffectTestHarness) {
-    let renderer = &mut harness.renderer;
-    let mut context = LifecycleRenderContext::new(
-        &harness.gl,
-        &mut renderer.scene_state,
-        &mut renderer.effect_runtime,
-        renderer.resources.texture_view(),
-    );
-    renderer
+    let identities = harness
+        .renderer
         .lifecycle
-        .draw_squash_overlay(&mut context, None)
-        .expect("Squash sampling draw succeeds");
+        .samples()
+        .iter()
+        .map(|sample| sample.presentation_identity)
+        .collect::<Vec<_>>();
+    draw_lifecycle_markers_for_test(harness, &identities).expect("Squash sampling draw succeeds");
 }
 
 fn assert_squash_textures_have_filter(
@@ -402,6 +401,7 @@ fn squash_missing_retained_texture_falls_back_without_render_evidence() {
         200,
     )
     .expect("valid Squash visual group");
+    let identity = sample.presentation_identity;
     let retained_surface = lifecycle_test_surface(
         1,
         100,
@@ -421,9 +421,7 @@ fn squash_missing_retained_texture_falls_back_without_render_evidence() {
         OutputFramebufferOrigin::BottomLeft,
     );
 
-    harness
-        .renderer
-        .draw_squash_overlay(None)
+    draw_lifecycle_markers_for_test(&mut harness, &[identity])
         .expect("missing retained texture is a recoverable lifecycle fallback");
     let fallbacks = harness.renderer.lifecycle.fallbacks();
     assert_eq!(fallbacks.failed.len(), 1);

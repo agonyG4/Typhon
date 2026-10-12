@@ -1,6 +1,7 @@
 use super::*;
 use crate::egl_renderer::tests::{
-    GlesEffectTestHarness, lifecycle_test_lamp_sample as lamp_test_sample,
+    GlesEffectTestHarness, draw_lifecycle_markers_for_test,
+    lifecycle_test_lamp_sample as lamp_test_sample,
     lifecycle_transfer_texture_key as lifecycle_transfer_test_texture_key,
     test_lifecycle_identities_for_windows, test_lifecycle_identity,
     test_lifecycle_identity_sequence,
@@ -58,6 +59,7 @@ fn prepare_two_window_lamp_draw(
     second_sample.visual_source.presentation_identity = second_identity;
     second_sample.visual_source.root_surface_id = second_sample.root_surface_id;
     second_sample.visual_source.payload_id = second_sample.payload_id;
+    second_sample.visual_source.resource_payload_id = second_sample.payload_id;
     lifecycle.samples.push(second_sample);
     harness.renderer.lifecycle.begin_frame(&lifecycle);
 
@@ -131,24 +133,14 @@ fn prepare_two_window_lamp_draw(
 }
 
 fn draw_lamp_sampling_pass(harness: &mut GlesEffectTestHarness) {
-    let renderer = &mut harness.renderer;
-    let mut context = LifecycleRenderContext::new(
-        &harness.gl,
-        &mut renderer.scene_state,
-        &mut renderer.effect_runtime,
-        renderer.resources.texture_view(),
-    );
-    renderer
+    let identities = harness
+        .renderer
         .lifecycle
-        .draw_lamp_overlay(&mut context, None)
-        .expect("Lamp sampling draw succeeds");
-}
-
-fn render_lifecycle_overlap_pixel(
-    lower_effect: LifecycleEffectKind,
-    upper_effect: LifecycleEffectKind,
-) -> [u8; 4] {
-    render_lifecycle_overlap(lower_effect, upper_effect, false, false).0
+        .samples()
+        .iter()
+        .map(|sample| sample.presentation_identity)
+        .collect::<Vec<_>>();
+    draw_lifecycle_markers_for_test(harness, &identities).expect("Lamp sampling draw succeeds");
 }
 
 fn render_lifecycle_overlap(
@@ -200,6 +192,7 @@ fn render_lifecycle_overlap(
         sample.visual_source.root_surface_id = sample.root_surface_id;
         sample.visual_source.presentation_identity = identity;
         sample.visual_source.payload_id = payload_id;
+        sample.visual_source.resource_payload_id = payload_id;
         samples.push(sample);
     }
     samples.sort_by_key(|sample| sample.presentation_identity);
@@ -283,47 +276,8 @@ fn render_lifecycle_overlap(
         OutputFramebufferOrigin::BottomLeft,
     );
 
-    let plan = RepaintPlan {
-        render_damage: OutputDamage::Full,
-        repair_damage: OutputDamage::Full,
-        buffer_age: None,
-        mode: RepaintMode::Full,
-        fallback_reason: Some(FullRepaintReason::CurrentDamageFull),
-        complexity_policy: PartialRepaintComplexityPolicy::Legacy,
-        complexity_action: PartialRepaintComplexityAction::NotApplicable,
-    };
-    let repairs = [
-        OutputRect {
-            x: 0,
-            y: 0,
-            width: 200,
-            height: 200,
-        },
-        OutputRect {
-            x: 120,
-            y: 0,
-            width: 200,
-            height: 200,
-        },
-    ];
-    {
-        let renderer = &mut harness.renderer;
-        let mut context = LifecycleRenderContext::new(
-            &harness.gl,
-            &mut renderer.scene_state,
-            &mut renderer.effect_runtime,
-            renderer.resources.texture_view(),
-        );
-        renderer
-            .lifecycle
-            .draw_overlays(
-                &mut context,
-                &repairs,
-                OutputFramebufferOrigin::BottomLeft,
-                &plan,
-            )
-            .expect("ordered lifecycle overlap draws");
-    }
+    draw_lifecycle_markers_for_test(&mut harness, &identities)
+        .expect("lifecycle markers dispatch in painter order");
 
     let mut pixel = [0_u8; 4];
     unsafe {
@@ -671,63 +625,24 @@ fn lamp_grid_admission_is_atomic_when_the_minimum_grid_does_not_fit() {
 }
 
 #[test]
-fn legacy_scissored_lifecycle_phases_prepare_once_after_all_repairs() {
+fn legacy_scissored_phase_plan_replays_lifecycle_markers_during_base_repairs() {
     let phases = legacy_scene_scissored_phase_plan(2).collect::<Vec<_>>();
     assert_eq!(
         phases,
         vec![
             LegacySceneScissoredPhase::BaseRepair(0),
             LegacySceneScissoredPhase::BaseRepair(1),
-            LegacySceneScissoredPhase::PrepareLifecycleSources,
             LegacySceneScissoredPhase::RestoreRepairScissor(0),
-            LegacySceneScissoredPhase::LifecycleOverlay(0),
             LegacySceneScissoredPhase::ExternalOverlays(0),
             LegacySceneScissoredPhase::RestoreRepairScissor(1),
-            LegacySceneScissoredPhase::LifecycleOverlay(1),
             LegacySceneScissoredPhase::ExternalOverlays(1),
         ],
-        "legacy scissored execution prepares once and draws ordered lifecycle windows once per repair"
+        "canonical replay draws lifecycle markers during base repairs before external overlays"
     );
 }
 
 #[test]
-fn gles_lifecycle_lamp_below_squash_draws_squash_on_top() {
-    assert_eq!(
-        render_lifecycle_overlap_pixel(LifecycleEffectKind::Lamp, LifecycleEffectKind::Squash),
-        [0, 0, 255, 255],
-        "the upper Squash lifecycle window owns the overlapping pixel"
-    );
-}
-
-#[test]
-fn gles_lifecycle_squash_below_lamp_draws_lamp_on_top() {
-    assert_eq!(
-        render_lifecycle_overlap_pixel(LifecycleEffectKind::Squash, LifecycleEffectKind::Lamp),
-        [0, 0, 255, 255],
-        "the upper Lamp lifecycle window owns the overlapping pixel"
-    );
-}
-
-#[test]
-fn gles_lifecycle_lamp_windows_follow_compositor_order() {
-    assert_eq!(
-        render_lifecycle_overlap_pixel(LifecycleEffectKind::Lamp, LifecycleEffectKind::Lamp),
-        [0, 0, 255, 255],
-        "Lamp draws the upper compositor window last even when retained identities conflict"
-    );
-}
-
-#[test]
-fn gles_lifecycle_squash_windows_follow_compositor_order() {
-    assert_eq!(
-        render_lifecycle_overlap_pixel(LifecycleEffectKind::Squash, LifecycleEffectKind::Squash,),
-        [0, 0, 255, 255],
-        "Squash draws the upper compositor window last even when retained identities conflict"
-    );
-}
-
-#[test]
-fn gles_lifecycle_multiple_repairs_keep_order_and_isolate_fallbacks() {
+fn failed_lower_squash_does_not_suppress_higher_lamp_or_evidence() {
     let (pixel, evidence, fallbacks) = render_lifecycle_overlap(
         LifecycleEffectKind::Squash,
         LifecycleEffectKind::Lamp,

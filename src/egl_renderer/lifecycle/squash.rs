@@ -261,17 +261,6 @@ impl SquashRenderState {
             }));
     }
 
-    #[cfg(test)]
-    pub(super) fn draw_overlay(
-        &mut self,
-        frame: &mut LifecycleFrameState,
-        visual_store: &LifecycleVisualStore,
-        context: &mut LifecycleRenderContext<'_>,
-        scissor: Option<OutputRect>,
-    ) -> RendererResult<()> {
-        self.draw_overlay_matching(frame, visual_store, context, scissor, None)
-    }
-
     pub(super) fn draw_overlay_for_sample(
         &mut self,
         frame: &mut LifecycleFrameState,

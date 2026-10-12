@@ -88,6 +88,24 @@ pub(super) struct GlesEffectTestHarness {
     _egl_test_lock: std::sync::MutexGuard<'static, ()>,
 }
 
+pub(super) fn draw_lifecycle_markers_for_test(
+    harness: &mut GlesEffectTestHarness,
+    identities: &[PresentationRetainedVisualIdentity],
+) -> RendererResult<()> {
+    let renderer = &mut harness.renderer;
+    let (_, mut dispatcher) = renderer.lifecycle.replay_dispatch_parts();
+    let mut context = LifecycleRenderContext::new(
+        &harness.gl,
+        &mut renderer.scene_state,
+        &mut renderer.effect_runtime,
+        renderer.resources.texture_view(),
+    );
+    for identity in identities {
+        dispatcher.draw_marker(&mut context, *identity, None)?;
+    }
+    Ok(())
+}
+
 impl GlesEffectTestHarness {
     pub(super) fn new(width: u32, height: u32) -> Self {
         Self::new_with_capabilities(

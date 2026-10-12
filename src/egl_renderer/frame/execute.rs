@@ -865,7 +865,6 @@ impl FramePipeline<'_> {
                                 draw_result =
                                     self.draw_command_batch(true, output_rect, replay_lifecycle);
                             }
-                            LegacySceneScissoredPhase::PrepareLifecycleSources => {}
                             LegacySceneScissoredPhase::RestoreRepairScissor(index) => {
                                 let [x, y, width, height] = scissors[index];
                                 unsafe {
@@ -873,7 +872,6 @@ impl FramePipeline<'_> {
                                     self.gl.scissor(x, y, width, height);
                                 }
                             }
-                            LegacySceneScissoredPhase::LifecycleOverlay(_) => {}
                             LegacySceneScissoredPhase::ExternalOverlays(index) => {
                                 if draw_external_overlays {
                                     let [x, y, width, height] = scissors[index];
@@ -1159,9 +1157,7 @@ fn build_checkpoint_causal_state(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::egl_renderer) enum LegacySceneScissoredPhase {
     BaseRepair(usize),
-    PrepareLifecycleSources,
     RestoreRepairScissor(usize),
-    LifecycleOverlay(usize),
     ExternalOverlays(usize),
 }
 
@@ -1177,17 +1173,14 @@ impl Iterator for LegacySceneScissoredPhasePlan {
     fn next(&mut self) -> Option<Self::Item> {
         let phase = if self.index < self.repair_count {
             LegacySceneScissoredPhase::BaseRepair(self.index)
-        } else if self.index == self.repair_count {
-            LegacySceneScissoredPhase::PrepareLifecycleSources
         } else {
-            let offset = self.index - self.repair_count - 1;
-            let repair = offset / 3;
+            let offset = self.index - self.repair_count;
+            let repair = offset / 2;
             if repair >= self.repair_count {
                 return None;
             }
-            match offset % 3 {
+            match offset % 2 {
                 0 => LegacySceneScissoredPhase::RestoreRepairScissor(repair),
-                1 => LegacySceneScissoredPhase::LifecycleOverlay(repair),
                 _ => LegacySceneScissoredPhase::ExternalOverlays(repair),
             }
         };

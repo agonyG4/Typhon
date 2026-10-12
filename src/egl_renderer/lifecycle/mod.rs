@@ -176,16 +176,6 @@ impl LifecycleRenderState {
         );
     }
 
-    #[cfg(test)]
-    pub(super) fn draw_lamp_overlay(
-        &mut self,
-        context: &mut LifecycleRenderContext<'_>,
-        scissor: Option<OutputRect>,
-    ) -> RendererResult<()> {
-        self.lamp
-            .draw_overlay(&mut self.frame, &self.visual_store, context, scissor)
-    }
-
     pub(super) fn rebuild_squash_commands(
         &mut self,
         snapshot: &LifecycleSceneSample,
@@ -204,46 +194,6 @@ impl LifecycleRenderState {
             framebuffer_origin,
             &mut self.frame,
         );
-    }
-
-    #[cfg(test)]
-    pub(super) fn draw_squash_overlay(
-        &mut self,
-        context: &mut LifecycleRenderContext<'_>,
-        scissor: Option<OutputRect>,
-    ) -> RendererResult<()> {
-        self.squash
-            .draw_overlay(&mut self.frame, &self.visual_store, context, scissor)
-    }
-
-    /// Dispatches one repair through the ordered lifecycle coordinator.
-    /// Each retained window stays paired with its own effect renderer and
-    /// render evidence; only window groups are sorted by live painter metadata.
-    pub(super) fn draw_ordered_overlay(
-        &mut self,
-        context: &mut LifecycleRenderContext<'_>,
-        scissor: Option<OutputRect>,
-    ) -> RendererResult<()> {
-        let ordered_samples = self.frame.ordered_samples.clone();
-        for ordered in ordered_samples {
-            match ordered.sample.effect {
-                LifecycleEffectKind::Lamp => self.lamp.draw_overlay_for_sample(
-                    &mut self.frame,
-                    &self.visual_store,
-                    context,
-                    scissor,
-                    ordered.sample,
-                )?,
-                LifecycleEffectKind::Squash => self.squash.draw_overlay_for_sample(
-                    &mut self.frame,
-                    &self.visual_store,
-                    context,
-                    scissor,
-                    ordered.sample,
-                )?,
-            }
-        }
-        Ok(())
     }
 
     pub(super) fn extend_surface_consumers(
@@ -392,38 +342,6 @@ impl LifecycleRenderState {
         self.visual_store
             .capture_visual_source(context, source, sample, target, framebuffer_origin)
             .map_err(|error| io::Error::other(format!("{error:?}")).into())
-    }
-
-    pub(super) fn draw_overlays(
-        &mut self,
-        context: &mut LifecycleRenderContext<'_>,
-        rects: &[OutputRect],
-        framebuffer_origin: OutputFramebufferOrigin,
-        plan: &RepaintPlan,
-    ) -> RendererResult<()> {
-        self.prepare_visual_sources(context, plan, framebuffer_origin)?;
-        for rect in rects {
-            let y = match framebuffer_origin {
-                OutputFramebufferOrigin::BottomLeft => context
-                    .scene_state
-                    .current_size
-                    .1
-                    .saturating_sub(rect.y.max(0) as u32 + rect.height)
-                    as i32,
-                OutputFramebufferOrigin::TopLeftScanout => rect.y,
-            };
-            unsafe {
-                context.gl.enable(glow::SCISSOR_TEST);
-                context
-                    .gl
-                    .scissor(rect.x, y, rect.width as i32, rect.height as i32);
-            }
-            self.draw_ordered_overlay(context, Some(*rect))?;
-        }
-        unsafe {
-            context.gl.disable(glow::SCISSOR_TEST);
-        }
-        Ok(())
     }
 
     pub(super) fn destroy_gl_resources(&mut self, gl: &glow::Context) {

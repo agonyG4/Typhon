@@ -1053,8 +1053,10 @@ fn moving_blur_domain_reuses_real_gles_resources() {
         ..RepaintPlan::default()
     };
     let mut first_dimensions = None;
-    let mut first_cache_bytes = None;
     let mut first_allocation_count = None;
+    let mut warm_checkpoint_entries = None;
+    let mut warm_checkpoint_bytes_max = 0;
+    let mut warm_pool_bytes_max = 0;
     let mut capture_radii = None;
     let mut positions = Vec::with_capacity(512);
     for step in 0..512 {
@@ -1093,6 +1095,15 @@ fn moving_blur_domain_reuses_real_gles_resources() {
         let oblivion_one::effects::FrameExecutionPlan::EffectGraph(graph) = plan else {
             panic!("moving blur must compile to an effect graph");
         };
+        assert_eq!(
+            graph
+                .textures
+                .iter()
+                .filter(|texture| texture.source == GraphTextureSource::CapturedScene)
+                .count(),
+            1,
+            "moving blur uses one persistent scene capture"
+        );
         let demand = plan_effect_execution_demand(&graph, &full_damage, true);
         let selection = effects::select_effect_execution(&graph, &demand);
 
@@ -1160,17 +1171,49 @@ fn moving_blur_domain_reuses_real_gles_resources() {
             }
         }
 
-        let metrics = harness.renderer.effect_runtime.effect_resources.metrics();
-        assert_eq!(metrics.checked_out_texture_count, 0, "step {step}");
+        let effect_resources = &harness.renderer.effect_runtime.effect_resources;
+        let metrics = effect_resources.metrics();
+        let (checkpoint_entries, checkpoint_bytes) = effect_resources.checkpoint_cache_stats();
+        assert_eq!(
+            checkpoint_entries, 1,
+            "step {step}: one capture stays cached"
+        );
+        assert_eq!(
+            metrics.checked_out_texture_count, checkpoint_entries,
+            "step {step}: only persistent checkpoint owners remain checked out"
+        );
+        assert!(metrics.current_bytes <= metrics.budget_bytes, "step {step}");
+        if step < 16 {
+            warm_checkpoint_bytes_max = warm_checkpoint_bytes_max.max(checkpoint_bytes);
+            warm_pool_bytes_max = warm_pool_bytes_max.max(metrics.current_bytes);
+        }
+        if step == 0 || step == 15 {
+            eprintln!(
+                "moving blur resources step {step}: checked_out={} checkpoint_entries={} checkpoint_bytes={} allocation_count={} current_bytes={}",
+                metrics.checked_out_texture_count,
+                checkpoint_entries,
+                checkpoint_bytes,
+                metrics.allocation_count,
+                metrics.current_bytes,
+            );
+        }
         if step == 15 {
-            first_cache_bytes = Some(metrics.current_bytes);
             first_allocation_count = Some(metrics.allocation_count);
+            warm_checkpoint_entries = Some(checkpoint_entries);
         }
         if step >= 16 {
             assert_eq!(
-                metrics.current_bytes,
-                first_cache_bytes.expect("warm cache bytes"),
-                "step {step} changed cache size"
+                checkpoint_entries,
+                warm_checkpoint_entries.expect("warm checkpoint entry count"),
+                "step {step} grew the checkpoint cache"
+            );
+            assert!(
+                checkpoint_bytes <= warm_checkpoint_bytes_max,
+                "step {step} grew beyond the warm checkpoint-cache size bound"
+            );
+            assert!(
+                metrics.current_bytes <= warm_pool_bytes_max,
+                "step {step} grew beyond the warm resource-pool byte bound"
             );
             assert_eq!(
                 metrics.allocation_count,
@@ -1182,12 +1225,32 @@ fn moving_blur_domain_reuses_real_gles_resources() {
         assert!(metrics.cached_texture_count <= 16);
     }
 
-    let metrics = harness.renderer.effect_runtime.effect_resources.metrics();
+    let effect_resources = &mut harness.renderer.effect_runtime.effect_resources;
+    let metrics = effect_resources.metrics();
+    let (checkpoint_entries, checkpoint_bytes) = effect_resources.checkpoint_cache_stats();
+    assert_eq!(checkpoint_entries, 1);
+    assert_eq!(metrics.checked_out_texture_count, checkpoint_entries);
     assert!(
         metrics.reuse_count > 0,
         "moving blur did not reuse pooled textures"
     );
+    eprintln!(
+        "moving blur resources before retirement: checked_out={} checkpoint_entries={} checkpoint_bytes={} allocation_count={} current_bytes={}",
+        metrics.checked_out_texture_count,
+        checkpoint_entries,
+        checkpoint_bytes,
+        metrics.allocation_count,
+        metrics.current_bytes,
+    );
+
+    effect_resources.clear_checkpoint_capture_cache();
+    let metrics = effect_resources.metrics();
+    assert_eq!(effect_resources.checkpoint_cache_stats(), (0, 0));
     assert_eq!(metrics.checked_out_texture_count, 0);
+    eprintln!(
+        "moving blur resources after retirement: checked_out={} checkpoint_entries=0 checkpoint_bytes=0 allocation_count={} current_bytes={}",
+        metrics.checked_out_texture_count, metrics.allocation_count, metrics.current_bytes,
+    );
 }
 
 #[test]
@@ -1242,8 +1305,10 @@ fn moving_visual_group_blur_replays_only_background_below_target() {
         (184, 144),
     ];
     let mut first_dimensions = None;
-    let mut warm_cache_bytes = None;
     let mut warm_allocation_count = None;
+    let mut warm_checkpoint_entries = None;
+    let mut warm_checkpoint_bytes_max = 0;
+    let mut warm_pool_bytes_max = 0;
     let mut capture_radii = None;
 
     for (step, (x, y)) in positions.iter().copied().cycle().take(512).enumerate() {
@@ -1260,6 +1325,15 @@ fn moving_visual_group_blur_replays_only_background_below_target() {
         let oblivion_one::effects::FrameExecutionPlan::EffectGraph(graph) = plan else {
             panic!("visual-group blur must compile to an effect graph");
         };
+        assert_eq!(
+            graph
+                .textures
+                .iter()
+                .filter(|texture| texture.source == GraphTextureSource::CapturedScene)
+                .count(),
+            1,
+            "visual-group blur uses one persistent scene capture"
+        );
         let capture_pass = graph
             .passes
             .iter()
@@ -1350,17 +1424,49 @@ fn moving_visual_group_blur_replays_only_background_below_target() {
             }
         }
 
-        let metrics = harness.renderer.effect_runtime.effect_resources.metrics();
-        assert_eq!(metrics.checked_out_texture_count, 0, "step {step}");
+        let effect_resources = &harness.renderer.effect_runtime.effect_resources;
+        let metrics = effect_resources.metrics();
+        let (checkpoint_entries, checkpoint_bytes) = effect_resources.checkpoint_cache_stats();
+        assert_eq!(
+            checkpoint_entries, 1,
+            "step {step}: one capture stays cached"
+        );
+        assert_eq!(
+            metrics.checked_out_texture_count, checkpoint_entries,
+            "step {step}: only persistent checkpoint owners remain checked out"
+        );
+        assert!(metrics.current_bytes <= metrics.budget_bytes, "step {step}");
+        if step < positions.len() {
+            warm_checkpoint_bytes_max = warm_checkpoint_bytes_max.max(checkpoint_bytes);
+            warm_pool_bytes_max = warm_pool_bytes_max.max(metrics.current_bytes);
+        }
+        if step == 0 || step == positions.len() - 1 {
+            eprintln!(
+                "visual-group blur resources step {step}: checked_out={} checkpoint_entries={} checkpoint_bytes={} allocation_count={} current_bytes={}",
+                metrics.checked_out_texture_count,
+                checkpoint_entries,
+                checkpoint_bytes,
+                metrics.allocation_count,
+                metrics.current_bytes,
+            );
+        }
         if step == positions.len() - 1 {
-            warm_cache_bytes = Some(metrics.current_bytes);
             warm_allocation_count = Some(metrics.allocation_count);
+            warm_checkpoint_entries = Some(checkpoint_entries);
         }
         if step >= positions.len() {
             assert_eq!(
-                metrics.current_bytes,
-                warm_cache_bytes.expect("warm cache bytes"),
-                "step {step} changed cache size"
+                checkpoint_entries,
+                warm_checkpoint_entries.expect("warm checkpoint entry count"),
+                "step {step} grew the checkpoint cache"
+            );
+            assert!(
+                checkpoint_bytes <= warm_checkpoint_bytes_max,
+                "step {step} grew beyond the warm checkpoint-cache size bound"
+            );
+            assert!(
+                metrics.current_bytes <= warm_pool_bytes_max,
+                "step {step} grew beyond the warm resource-pool byte bound"
             );
             assert_eq!(
                 metrics.allocation_count,
@@ -1372,12 +1478,32 @@ fn moving_visual_group_blur_replays_only_background_below_target() {
         assert!(metrics.cached_texture_count <= 32);
     }
 
-    let metrics = harness.renderer.effect_runtime.effect_resources.metrics();
+    let effect_resources = &mut harness.renderer.effect_runtime.effect_resources;
+    let metrics = effect_resources.metrics();
+    let (checkpoint_entries, checkpoint_bytes) = effect_resources.checkpoint_cache_stats();
+    assert_eq!(checkpoint_entries, 1);
+    assert_eq!(metrics.checked_out_texture_count, checkpoint_entries);
     assert!(
         metrics.reuse_count > 0,
         "visual-group blur did not reuse pooled textures"
     );
+    eprintln!(
+        "visual-group blur resources before retirement: checked_out={} checkpoint_entries={} checkpoint_bytes={} allocation_count={} current_bytes={}",
+        metrics.checked_out_texture_count,
+        checkpoint_entries,
+        checkpoint_bytes,
+        metrics.allocation_count,
+        metrics.current_bytes,
+    );
+
+    effect_resources.clear_checkpoint_capture_cache();
+    let metrics = effect_resources.metrics();
+    assert_eq!(effect_resources.checkpoint_cache_stats(), (0, 0));
     assert_eq!(metrics.checked_out_texture_count, 0);
+    eprintln!(
+        "visual-group blur resources after retirement: checked_out={} checkpoint_entries=0 checkpoint_bytes=0 allocation_count={} current_bytes={}",
+        metrics.checked_out_texture_count, metrics.allocation_count, metrics.current_bytes,
+    );
 }
 
 #[test]
