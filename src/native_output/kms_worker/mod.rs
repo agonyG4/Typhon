@@ -37,8 +37,11 @@ pub(crate) use thread::{KmsCommitExecutor, KmsWorkerSubmission, KmsWorkerSubmitF
 pub(crate) use thread::{
     KmsCommitWorkerHandle, KmsWorkerEvent, KmsWorkerQuiesceHandle, ValidationBaseInvalidationReason,
 };
+#[cfg(test)]
+pub(crate) use timing::KmsWorkerDispatchModel;
 pub(crate) use timing::{
-    KmsWorkerDispatchBudget, KmsWorkerDispatchModel, KmsWorkerDispatchTailObservation,
+    DISPATCH_GUARD_NS, KmsDispatchModels, KmsServiceClass, KmsWorkerDispatchBudget,
+    KmsWorkerDispatchTailObservation,
 };
 
 #[cfg(test)]

@@ -3,6 +3,7 @@ use super::kms_worker::{
     handle_fatal_worker_jobs, prepare_frozen_cursor_presentation_for_submission,
     retain_complete_submitted_ownership, retain_uncertain_job_with_suspension,
 };
+use super::kms_worker::{WorkerTimingJournalSample, record_primary_worker_timing};
 use super::kms_worker_teardown::SubmittedWorkerPacingState;
 use super::plane_cycle::plane_delta_reservation_outcome;
 use crate::native_output::kms_worker::{
@@ -23,6 +24,7 @@ use oblivion_one::compositor::{
     CompositorFrameBatchId, PresentationFeedbackBatchId, SurfaceCommitSequence,
     SurfacePresentationCommitKey,
 };
+use oblivion_one::native::adaptive_buffering::AdaptiveRenderJournal;
 use oblivion_one::native::kms::{FramebufferId, PageFlipToken};
 use oblivion_one::native::presentation_deadline::{
     MonotonicTimestampNs, PresentationTarget, PresentationTargetReason,
@@ -31,6 +33,55 @@ use oblivion_one::native::scheduler::NativeOutputPacingMode;
 use std::num::NonZeroU64;
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::time::Duration;
+
+#[test]
+fn cursor_plane_delta_timing_does_not_enter_primary_render_prediction() {
+    let transaction_id = OutputTransactionId::new(NonZeroU64::new(1).expect("transaction ID"));
+    let mut journal = AdaptiveRenderJournal::default();
+    let sample = WorkerTimingJournalSample {
+        queue_residency_ns: 40_000_000,
+        ioctl_duration_ns: 30_000_000,
+        pre_submit_duration_ns: 20_000_000,
+        dispatch_duration_ns: 50_000_000,
+        submit_wake_lateness_ns: Some(10_000_000),
+        submission_budget_ns: Some(80_000_000),
+    };
+
+    record_primary_worker_timing(
+        &mut journal,
+        AtomicCommitKind::PlaneDelta {
+            transaction_id,
+            cursor_epoch: 1,
+            framebuffer_id: Some(1),
+        },
+        sample,
+    );
+
+    let prediction = journal.prediction(Duration::from_millis(16));
+    assert_eq!(prediction.p95_atomic_submit_ns, 0);
+    assert_eq!(prediction.p95_worker_queue_residency_ns, 0);
+    assert_eq!(prediction.p95_worker_pre_submit_ns, 0);
+    assert_eq!(prediction.p95_worker_dispatch_ns, 0);
+    assert_eq!(prediction.p95_wake_lateness_ns, 0);
+    assert_eq!(prediction.kms_dispatch_budget_ns, 250_000);
+
+    record_primary_worker_timing(
+        &mut journal,
+        AtomicCommitKind::CompositedPrimary {
+            transaction_id,
+            frame_id: 1,
+            framebuffer_id: 1,
+        },
+        sample,
+    );
+    let primary_prediction = journal.prediction(Duration::from_millis(16));
+    assert_eq!(primary_prediction.p95_atomic_submit_ns, 30_000_000);
+    assert_eq!(primary_prediction.p95_worker_queue_residency_ns, 40_000_000);
+    assert_eq!(primary_prediction.p95_worker_pre_submit_ns, 20_000_000);
+    assert_eq!(primary_prediction.p95_worker_dispatch_ns, 50_000_000);
+    assert_eq!(primary_prediction.p95_wake_lateness_ns, 0);
+    assert_eq!(primary_prediction.kms_dispatch_budget_ns, 80_000_000);
+}
 
 struct RecordingFatalJobHandler {
     retained: Vec<KmsCommitJob>,

@@ -146,6 +146,7 @@ pub(crate) struct CursorEpochPresentationTrace {
     pub(crate) kms_submit_started_at_ns: Option<u64>,
     pub(crate) kms_submit_returned_at_ns: Option<u64>,
     pub(crate) pageflip_observed_at_ns: Option<u64>,
+    pub(crate) pageflip_sequence: Option<u64>,
 }
 
 impl PresentationTransactionEvent {
@@ -397,6 +398,18 @@ impl PresentationTransactionTraceRing {
             })
     }
 
+    pub(crate) fn record_cursor_pageflip_sequence(
+        &mut self,
+        transaction_id: OutputTransactionId,
+        pageflip_sequence: u64,
+    ) {
+        if let Some(transaction) = self.cursor_epoch_transactions.get_mut(&transaction_id) {
+            transaction
+                .pageflip_sequence
+                .get_or_insert(pageflip_sequence);
+        }
+    }
+
     pub(crate) const fn cursor_epoch_transactions_dropped(&self) -> u64 {
         self.cursor_epoch_transactions_dropped
     }
@@ -431,6 +444,7 @@ impl PresentationTransactionTraceRing {
                         kms_submit_started_at_ns: None,
                         kms_submit_returned_at_ns: None,
                         pageflip_observed_at_ns: None,
+                        pageflip_sequence: None,
                     },
                 );
             }

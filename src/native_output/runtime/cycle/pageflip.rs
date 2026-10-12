@@ -1048,6 +1048,7 @@ impl NativeRuntime {
             confirmed_kms_presentation,
             presentation_deadline,
             presentation_timing,
+            cursor_timing,
             scheduled_presentation_target,
             render_journal,
             adaptive_buffering,
@@ -1381,6 +1382,95 @@ impl NativeRuntime {
                 _ => None,
             };
             if cursor_commit {
+                let monotonic_before_sample_ns = monotonic_now_ns()?;
+                let compositor_receive_us = sample_clock_microseconds(*drm_timestamp_clock)?;
+                let monotonic_after_sample_ns = monotonic_now_ns()?;
+                let cursor_presented_at = estimate_pageflip_timestamp(
+                    *drm_timestamp_clock,
+                    pageflip.timestamp.seconds,
+                    pageflip.timestamp.microseconds,
+                    compositor_receive_us,
+                    monotonic_before_sample_ns,
+                    monotonic_after_sample_ns,
+                    compositor_receive_ns,
+                )
+                .presented_at;
+                let prepared_cursor_presentation =
+                    presentation_deadline.prepare_presented(cursor_presented_at);
+                let actual_logical_sequence = prepared_cursor_presentation.logical_sequence();
+                let cursor_kms_evidence = if *kms_commit_worker_transport
+                    == crate::native_output::kms_worker::KmsCommitWorkerTransport::Worker
+                {
+                    PageFlipToken::new(pageflip.user_data)
+                        .and_then(|token| {
+                            submitted_worker_ownership
+                                .iter()
+                                .find(|ownership| ownership.job.token == token)
+                        })
+                        .and_then(|ownership| {
+                            let (
+                                crate::native_output::presentation::transaction::FramePresentationReservation::Fixed(target),
+                                crate::native_output::presentation::kms_timing::KmsPresentationTiming::Fixed(window),
+                            ) = (ownership.job.reservation, ownership.job.presentation_timing)
+                            else {
+                                return None;
+                            };
+                            (ownership.job.output_generation == *drm_file_generation).then(|| {
+                                crate::native_output::presentation::cursor_timing::CursorKmsSubmissionEvidence::new(
+                                    ownership.job.token,
+                                    ownership.job.output_generation,
+                                    target,
+                                    window,
+                                    ownership.job.queued_at.get(),
+                                    ownership.actual_worker_wait_returned_at.get(),
+                                    ownership.submit_returned_at.get(),
+                                )
+                            })
+                        })
+                } else {
+                    PageFlipToken::new(pageflip.user_data).and_then(|token| {
+                        cursor_timing.take_synchronous_submission(token, *drm_file_generation)
+                    })
+                };
+                if let Some(evidence) = cursor_kms_evidence
+                    && evidence.output_generation == *drm_file_generation
+                    && cursor_timing.output_generation() == *drm_file_generation
+                    && evidence.window.mode_key() == Some(cursor_timing.mode_key())
+                {
+                    let outcome = evidence.classify(actual_logical_sequence);
+                    cursor_timing.observe_kms(outcome, cursor_presented_at.get());
+                    perf.log("native.cursor_kms_timing", || {
+                        vec![
+                            NativePerfField::u64("target_sequence", evidence.target_sequence),
+                            NativePerfField::u64(
+                                "actual_logical_sequence",
+                                actual_logical_sequence,
+                            ),
+                            NativePerfField::u64(
+                                "actual_pageflip_sequence",
+                                u64::from(pageflip.sequence),
+                            ),
+                            NativePerfField::u64(
+                                "target_presentation_ns",
+                                evidence.target_presentation_ns,
+                            ),
+                            NativePerfField::u64(
+                                "submit_window_deadline_ns",
+                                evidence.window.commit_complete_deadline_ns(),
+                            ),
+                            NativePerfField::u64("queued_at_ns", evidence.queued_at_ns),
+                            NativePerfField::u64(
+                                "submit_returned_at_ns",
+                                evidence.submit_returned_at_ns,
+                            ),
+                            NativePerfField::str("outcome", format!("{outcome:?}")),
+                            NativePerfField::u64(
+                                "cursor_apply_guard_us",
+                                cursor_timing.apply_guard_ns(cursor_presented_at.get()) / 1_000,
+                            ),
+                        ]
+                    });
+                }
                 // Cursor-only completion is not a complete compositor cycle.
                 // Continue through protocol and input dispatch so a primary
                 // producer can be observed and scheduled immediately.
@@ -1440,6 +1530,10 @@ impl NativeRuntime {
                             Ok(())
                         },
                     )?;
+                    self.presentation_trace.record_cursor_pageflip_sequence(
+                        transaction_id,
+                        u64::from(pageflip.sequence),
+                    );
                 } else {
                     let _ = complete_plane_delta_pageflip(
                         atomic_cursor,
@@ -1481,6 +1575,7 @@ impl NativeRuntime {
                         presented_cursor,
                     );
                 }
+                presentation_deadline.commit_presented(prepared_cursor_presentation);
             }
             let direct_pending = matches!(
                 atomic_completion,

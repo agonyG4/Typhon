@@ -506,7 +506,6 @@ impl NativeRuntime {
             event_loop.register(fd, NativeEventSource::ChildSignal)?;
         }
         let scheduler_anchor_ns = monotonic_now_ns()?;
-        let refresh_hz = output_refresh_rate.rounded_hz();
         let mut frame_scheduler = NativeFrameScheduler::new_with_refresh_interval_ns(
             refresh_interval_ns,
             scheduler_anchor_ns,
@@ -523,6 +522,11 @@ impl NativeRuntime {
             KmsModeTiming::from_mode(&target.mode, refresh_interval_ns),
             drm_file_generation,
         );
+        let cursor_timing =
+            crate::native_output::presentation::cursor_timing::CursorTimingDomain::new(
+                KmsModeTiming::from_mode(&target.mode, refresh_interval_ns),
+                drm_file_generation,
+            );
         let scheduled_presentation_target = None;
         let render_journal = AdaptiveRenderJournal::default();
         let adaptive_buffering = AdaptiveBufferingController::new(triple_buffer_policy);
@@ -780,6 +784,7 @@ impl NativeRuntime {
             output_transactions: OutputTransactionLedger::new_for_output(output_id),
             confirmed_kms_presentation: ConfirmedKmsPresentationState::default(),
             presentation_timing,
+            cursor_timing,
             presentation_deadline,
             scheduled_presentation_target,
             render_journal,

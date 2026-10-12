@@ -22,6 +22,35 @@ use super::presentation_transactions::{
     settle_forced_shutdown_transaction_if_safe, settle_returned_cursor_sidecar,
 };
 use super::*;
+
+#[derive(Clone, Copy)]
+pub(super) struct WorkerTimingJournalSample {
+    pub(super) queue_residency_ns: u64,
+    pub(super) ioctl_duration_ns: u64,
+    pub(super) pre_submit_duration_ns: u64,
+    pub(super) dispatch_duration_ns: u64,
+    pub(super) submit_wake_lateness_ns: Option<u64>,
+    pub(super) submission_budget_ns: Option<u64>,
+}
+
+pub(super) fn record_primary_worker_timing(
+    journal: &mut AdaptiveRenderJournal,
+    kind: AtomicCommitKind,
+    sample: WorkerTimingJournalSample,
+) {
+    if matches!(kind, AtomicCommitKind::PlaneDelta { .. }) {
+        return;
+    }
+    journal.record_worker_queue_residency(sample.queue_residency_ns);
+    journal.record_atomic_submit(sample.ioctl_duration_ns);
+    journal.record_worker_service(sample.pre_submit_duration_ns, sample.dispatch_duration_ns);
+    if let Some(lateness_ns) = sample.submit_wake_lateness_ns {
+        journal.record_fixed_timed_wake(lateness_ns);
+    }
+    if let Some(budget_ns) = sample.submission_budget_ns {
+        journal.record_fixed_submission_budget(budget_ns);
+    }
+}
 use crate::native_output::presentation::kms_timing::KmsPresentationTiming;
 use crate::native_output::presentation::plane::CursorRevision;
 use crate::native_output::presentation::transaction::FramePresentationReservation;
@@ -1119,21 +1148,18 @@ impl NativeRuntime {
                 let queued_at = ownership.job.queued_at.get();
                 let submit_started_at = ownership.submit_started_at.get();
                 let submit_returned_at = ownership.submit_returned_at.get();
-                self.render_journal
-                    .record_worker_queue_residency(ownership.queue_residency_ns);
-                self.render_journal
-                    .record_atomic_submit(ownership.ioctl_duration_ns);
-                self.render_journal.record_worker_service(
-                    ownership.pre_submit_duration_ns,
-                    ownership.dispatch_duration_ns,
+                record_primary_worker_timing(
+                    &mut self.render_journal,
+                    kind,
+                    WorkerTimingJournalSample {
+                        queue_residency_ns: ownership.queue_residency_ns,
+                        ioctl_duration_ns: ownership.ioctl_duration_ns,
+                        pre_submit_duration_ns: ownership.pre_submit_duration_ns,
+                        dispatch_duration_ns: ownership.dispatch_duration_ns,
+                        submit_wake_lateness_ns: ownership.submit_wake_lateness_ns,
+                        submission_budget_ns: ownership.submission_budget_ns,
+                    },
                 );
-                if let Some(lateness_ns) = ownership.submit_wake_lateness_ns {
-                    self.render_journal.record_fixed_timed_wake(lateness_ns);
-                }
-                if let Some(budget_ns) = ownership.submission_budget_ns {
-                    self.render_journal
-                        .record_fixed_submission_budget(budget_ns);
-                }
                 let _output_generation = ownership.job.output_generation;
                 let cursor = ownership.job.cursor.clone();
                 let sidecar_owner = ownership

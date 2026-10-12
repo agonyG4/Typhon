@@ -81,23 +81,22 @@ impl NativeRuntime {
 
         let now_ns = monotonic_now_ns()?;
         let now = MonotonicTimestampNs::new(now_ns);
-        let refresh_interval = Duration::from_nanos(self.output_refresh_rate.interval_ns());
-        let prediction = self.render_journal.prediction_at_with_kms_guard(
-            now,
-            refresh_interval,
-            self.presentation_timing.apply_guard_ns(),
-        );
         let pending_target = super::planner::pending_fixed_target_for_scanout(&self.scanout)?;
-        let candidate = super::planner::plan_cursor_service_opportunity_with_scene_prediction(
+        let cursor_dispatch_budget_ns = worker.dispatch_budget_ns(
+            crate::native_output::kms_worker::KmsServiceClass::CursorPlaneDelta,
+            self.drm_file_generation,
+        );
+        let candidate = super::planner::plan_cursor_service_opportunity_with_current(
             &self.presentation_deadline,
-            &self.presentation_timing,
+            &self.cursor_timing,
             now,
             super::planner::cursor_primary_ordering_target(
                 self.scheduled_presentation_target,
                 pending_target,
             ),
-            prediction.total_cost_ns,
-            prediction.kms_dispatch_budget_ns,
+            cursor_dispatch_budget_ns,
+            self.cursor_output_arbitration.service_opportunity(),
+            crate::native_output::kms_worker::KmsCommitWorkerTransport::Worker,
         );
         if let Some(candidate) = candidate {
             if self.cursor_output_arbitration.pending()
@@ -203,6 +202,7 @@ impl NativeRuntime {
             Some(worker),
             &self.kms_backend,
             cursor,
+            &mut self.cursor_timing,
             Some(desired),
             &mut self.atomic_commit_arbiter,
             &mut self.output_transactions,

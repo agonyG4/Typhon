@@ -1,7 +1,7 @@
 use super::cursor_cycle::{apply_cursor_position, resolve_native_cursor_for_server};
 use super::planner::{
     cursor_primary_ordering_target, pending_fixed_target_for_scanout,
-    plan_cursor_service_opportunity,
+    plan_cursor_service_opportunity_with_current,
 };
 use super::*;
 
@@ -2085,10 +2085,12 @@ impl NativeRuntime {
             event_loop,
             system_action_transport,
             drm_reactor_token: _,
+            kms_commit_worker,
             cursor_output_arbitration,
             frame_scheduler,
             output_refresh_rate,
             presentation_timing,
+            cursor_timing,
             presentation_deadline,
             scheduled_presentation_target,
             render_journal,
@@ -2675,19 +2677,24 @@ impl NativeRuntime {
                 == NativeCursorSchedulingPolicy::Auto
             {
                 let now = MonotonicTimestampNs::new(now_ns);
-                let refresh_interval = Duration::from_nanos(output_refresh_rate.interval_ns());
-                let prediction = render_journal.prediction_at_with_kms_guard(
-                    now,
-                    refresh_interval,
-                    presentation_timing.apply_guard_ns(),
+                let cursor_dispatch_budget_ns = kms_commit_worker.as_ref().map_or(
+                    crate::native_output::kms_worker::DISPATCH_GUARD_NS,
+                    |worker| {
+                        worker.dispatch_budget_ns(
+                            crate::native_output::kms_worker::KmsServiceClass::CursorPlaneDelta,
+                            *drm_file_generation,
+                        )
+                    },
                 );
                 let pending_target = pending_fixed_target_for_scanout(scanout)?;
-                plan_cursor_service_opportunity(
+                plan_cursor_service_opportunity_with_current(
                     presentation_deadline,
-                    presentation_timing,
+                    cursor_timing,
                     now,
                     cursor_primary_ordering_target(*scheduled_presentation_target, pending_target),
-                    prediction.kms_dispatch_budget_ns,
+                    cursor_dispatch_budget_ns,
+                    cursor_output_arbitration.service_opportunity(),
+                    self.kms_commit_worker_transport,
                 )
             } else {
                 None

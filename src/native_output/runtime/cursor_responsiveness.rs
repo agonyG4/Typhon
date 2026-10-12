@@ -201,6 +201,7 @@ pub(crate) struct CursorKmsAttribution {
     pub(crate) kms_submit_returned_at_ns: Option<u64>,
     /// This is a compositor/kernel pageflip observation, not optical visibility.
     pub(crate) pageflip_observed_at_ns: Option<u64>,
+    pub(crate) pageflip_sequence: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -228,6 +229,10 @@ pub(crate) struct CursorResponsivenessSample {
     pub(crate) cursor_overdue_age_ns: Option<u64>,
     pub(crate) cursor_service_deadline_ns: Option<u64>,
     pub(crate) cursor_target_service_deadline_ns: Option<u64>,
+    pub(crate) cursor_prepare_budget_ns: Option<u64>,
+    pub(crate) cursor_dispatch_budget_ns: Option<u64>,
+    pub(crate) cursor_apply_guard_ns: Option<u64>,
+    pub(crate) cursor_total_lead_ns: Option<u64>,
     pub(crate) cursor_retry_not_before_ns: Option<u64>,
     pub(crate) primary_ready_carrier: Option<bool>,
     pub(crate) primary_target_owned: Option<bool>,
@@ -399,6 +404,10 @@ impl NativeCursorResponsivenessTrace {
             cursor_overdue_age_ns: None,
             cursor_service_deadline_ns: None,
             cursor_target_service_deadline_ns: None,
+            cursor_prepare_budget_ns: None,
+            cursor_dispatch_budget_ns: None,
+            cursor_apply_guard_ns: None,
+            cursor_total_lead_ns: None,
             cursor_retry_not_before_ns: None,
             primary_ready_carrier: None,
             primary_target_owned: None,
@@ -577,6 +586,10 @@ impl NativeCursorResponsivenessTrace {
             sample.cursor_commit_complete_deadline_ns =
                 Some(opportunity.submit_window.commit_complete_deadline_ns());
             sample.cursor_target_service_deadline_ns = Some(opportunity.service_deadline_ns);
+            sample.cursor_prepare_budget_ns = Some(opportunity.prepare_budget_ns);
+            sample.cursor_dispatch_budget_ns = Some(opportunity.dispatch_budget_ns);
+            sample.cursor_apply_guard_ns = Some(opportunity.apply_guard_ns);
+            sample.cursor_total_lead_ns = Some(opportunity.total_lead_ns);
         }
     }
 
@@ -971,6 +984,7 @@ impl From<CursorEpochPresentationTrace> for CursorKmsAttribution {
             kms_submit_started_at_ns: transaction.kms_submit_started_at_ns,
             kms_submit_returned_at_ns: transaction.kms_submit_returned_at_ns,
             pageflip_observed_at_ns: transaction.pageflip_observed_at_ns,
+            pageflip_sequence: transaction.pageflip_sequence,
         }
     }
 }
@@ -1033,7 +1047,7 @@ fn append_sample_jsonl(
     });
     let _ = writeln!(
         output,
-        "{{\"type\":\"sample\",\"sample_id\":{},\"raw_motion_events\":{},\"coalesced_motion_events\":{},\"source_oldest_timestamp_usec\":{},\"source_newest_timestamp_usec\":{},\"input_batch_materialized_at_ns\":{},\"dispatch_started_at_ns\":{},\"dispatch_completed_at_ns\":{},\"dispatch_duration_ns\":{},\"input_batch_to_dispatch_complete_ns\":{},\"dispatch_to_arbitration_ns\":{},\"dispatch_complete_to_arbitration_ns\":{},\"hit_test_calls\":{},\"hit_test_cache_hits\":{},\"hit_test_cache_misses\":{},\"hit_test_full_scene_scans\":{},\"hit_test_owner_locality_fast_hits\":{},\"hit_test_groups_inspected\":{},\"hit_test_surfaces_inspected\":{},\"hit_test_cpu_ns\":{},\"effect_scene_resolution_ns\":{},\"effect_scene_visible_instances\":{},\"output_id\":{},\"cursor_epoch\":{},\"arbitration_cursor_epoch\":{},\"arbitration_at_ns\":{},\"disposition\":\"{}\",\"superseded_by_epoch\":{},\"trace_write_cpu_ns\":{},\"cursor_transaction_id\":{},\"cursor_transaction_built_at_ns\":{},\"worker_queued_at_ns\":{},\"kms_submit_started_at_ns\":{},\"kms_submit_returned_at_ns\":{},\"pageflip_observed_at_ns\":{},\"kms_queue_wait_ns\":{},\"kms_submit_duration_ns\":{},\"submit_return_to_pageflip_observation_ns\":{},\"pageflip_timestamp_kind\":\"compositor_observed_not_optical\"}}",
+        "{{\"type\":\"sample\",\"sample_id\":{},\"raw_motion_events\":{},\"coalesced_motion_events\":{},\"source_oldest_timestamp_usec\":{},\"source_newest_timestamp_usec\":{},\"input_batch_materialized_at_ns\":{},\"dispatch_started_at_ns\":{},\"dispatch_completed_at_ns\":{},\"dispatch_duration_ns\":{},\"input_batch_to_dispatch_complete_ns\":{},\"dispatch_to_arbitration_ns\":{},\"dispatch_complete_to_arbitration_ns\":{},\"hit_test_calls\":{},\"hit_test_cache_hits\":{},\"hit_test_cache_misses\":{},\"hit_test_full_scene_scans\":{},\"hit_test_owner_locality_fast_hits\":{},\"hit_test_groups_inspected\":{},\"hit_test_surfaces_inspected\":{},\"hit_test_cpu_ns\":{},\"effect_scene_resolution_ns\":{},\"effect_scene_visible_instances\":{},\"output_id\":{},\"cursor_epoch\":{},\"arbitration_cursor_epoch\":{},\"arbitration_at_ns\":{},\"disposition\":\"{}\",\"superseded_by_epoch\":{},\"trace_write_cpu_ns\":{},\"cursor_transaction_id\":{},\"cursor_transaction_built_at_ns\":{},\"worker_queued_at_ns\":{},\"kms_submit_started_at_ns\":{},\"kms_submit_returned_at_ns\":{},\"pageflip_observed_at_ns\":{},\"actual_pageflip_sequence\":{},\"kms_queue_wait_ns\":{},\"kms_submit_duration_ns\":{},\"submit_return_to_pageflip_observation_ns\":{},\"pageflip_timestamp_kind\":\"compositor_observed_not_optical\"}}",
         sample.sample_id,
         sample.raw_motion_events,
         sample.coalesced_motion_events,
@@ -1091,13 +1105,14 @@ fn append_sample_jsonl(
         json_number(attribution.and_then(|value| value.kms_submit_started_at_ns)),
         json_number(attribution.and_then(|value| value.kms_submit_returned_at_ns)),
         json_number(attribution.and_then(|value| value.pageflip_observed_at_ns)),
+        json_number(attribution.and_then(|value| value.pageflip_sequence)),
         json_number(kms_queue_wait_ns),
         json_number(kms_submit_duration_ns),
         json_number(submit_return_to_pageflip_ns),
     );
     let _ = writeln!(
         output,
-        "{{\"type\":\"arbitration_evidence\",\"sample_id\":{},\"policy\":{},\"reason\":{},\"pending_since_ns\":{},\"cursor_age_at_arbitration_ns\":{},\"service_deadline_ns\":{},\"overdue_age_ns\":{},\"target_service_deadline_ns\":{},\"retry_not_before_ns\":{},\"primary_ready_carrier\":{},\"primary_target_owned\":{},\"primary_worker_queued\":{},\"primary_kernel_submitted\":{},\"independent_kms_admission\":{},\"cursor_target_sequence\":{},\"cursor_target_presentation_ns\":{},\"worker_wake_ns\":{},\"commit_complete_deadline_ns\":{},\"cursor_age_at_transaction_build_ns\":{},\"cursor_age_at_worker_queue_ns\":{},\"cursor_age_at_kms_submit_ns\":{},\"cursor_age_at_pageflip_observation_ns\":{}}}",
+        "{{\"type\":\"arbitration_evidence\",\"sample_id\":{},\"policy\":{},\"reason\":{},\"pending_since_ns\":{},\"cursor_age_at_arbitration_ns\":{},\"service_deadline_ns\":{},\"overdue_age_ns\":{},\"target_service_deadline_ns\":{},\"retry_not_before_ns\":{},\"primary_ready_carrier\":{},\"primary_target_owned\":{},\"primary_worker_queued\":{},\"primary_kernel_submitted\":{},\"independent_kms_admission\":{},\"cursor_target_sequence\":{},\"cursor_target_presentation_ns\":{},\"worker_wake_ns\":{},\"commit_complete_deadline_ns\":{},\"cursor_prepare_budget_ns\":{},\"cursor_dispatch_budget_ns\":{},\"cursor_apply_guard_ns\":{},\"cursor_total_lead_ns\":{},\"cursor_age_at_transaction_build_ns\":{},\"cursor_age_at_worker_queue_ns\":{},\"cursor_age_at_kms_submit_ns\":{},\"cursor_age_at_pageflip_observation_ns\":{}}}",
         sample.sample_id,
         json_string(sample.policy),
         json_string(sample.arbitration_reason),
@@ -1116,6 +1131,10 @@ fn append_sample_jsonl(
         json_number(sample.cursor_target_presentation_ns),
         json_number(sample.cursor_worker_wake_ns),
         json_number(sample.cursor_commit_complete_deadline_ns),
+        json_number(sample.cursor_prepare_budget_ns),
+        json_number(sample.cursor_dispatch_budget_ns),
+        json_number(sample.cursor_apply_guard_ns),
+        json_number(sample.cursor_total_lead_ns),
         json_number(pending_age_at_transaction_built_ns),
         json_number(pending_age_at_worker_queue_ns),
         json_number(pending_age_at_kms_submit_ns),
@@ -1421,6 +1440,77 @@ mod tests {
         let mut jsonl = String::new();
         super::append_sample_jsonl(&mut jsonl, *sample, None);
         assert!(jsonl.contains("\"overdue_age_ns\":50"));
+
+        let sample = trace.sample_mut(sample_id).unwrap();
+        sample.cursor_prepare_budget_ns = Some(400_000);
+        sample.cursor_dispatch_budget_ns = Some(250_000);
+        sample.cursor_apply_guard_ns = Some(1_100_000);
+        sample.cursor_total_lead_ns = Some(1_750_000);
+        let mut jsonl = String::new();
+        super::append_sample_jsonl(&mut jsonl, *sample, None);
+        assert!(jsonl.contains("\"cursor_prepare_budget_ns\":400000"));
+        assert!(jsonl.contains("\"cursor_dispatch_budget_ns\":250000"));
+        assert!(jsonl.contains("\"cursor_apply_guard_ns\":1100000"));
+        assert!(jsonl.contains("\"cursor_total_lead_ns\":1750000"));
+    }
+
+    #[test]
+    fn cursor_opportunity_trace_records_the_selected_timing_budgets() {
+        use crate::native_output::presentation::cursor_timing::CursorTimingDomain;
+        use crate::native_output::presentation::kms_timing::KmsModeTiming;
+        use crate::native_output::runtime::planner::plan_cursor_service_opportunity;
+        use oblivion_one::native::presentation_deadline::{
+            MonotonicTimestampNs, PresentationDeadlinePlanner,
+        };
+        use std::time::Duration;
+
+        const REFRESH_NS: u64 = 10_000_000;
+        let now = MonotonicTimestampNs::new(1_000_000_000);
+        let mut planner = PresentationDeadlinePlanner::new(Duration::from_nanos(REFRESH_NS));
+        planner.note_presented(now);
+        let timing = CursorTimingDomain::new(
+            KmsModeTiming::from_mode(&drm_sys::drm_mode_modeinfo::default(), REFRESH_NS),
+            2,
+        );
+        let opportunity = plan_cursor_service_opportunity(&planner, &timing, now, None, 250_000)
+            .expect("cursor opportunity");
+        let mut trace = NativeCursorResponsivenessTrace::new(true, 4, 1);
+        let sample_id = sample(&mut trace, 1);
+        let mut arbitration = NativeCursorOutputArbitration::default();
+        arbitration.request_hardware_for_opportunity(1, now.get(), opportunity);
+
+        trace.record_arbitration_evidence(
+            Some(sample_id),
+            output_id(),
+            Some(1),
+            now.get(),
+            NativeCursorSchedulingPolicy::Auto,
+            &arbitration,
+            super::super::frame::NativeCursorPrimaryState::default(),
+            Some(opportunity),
+            NativeCursorOutputDisposition::SubmitPlaneDelta,
+        );
+
+        let sample = trace.sample(sample_id).unwrap();
+        assert_eq!(
+            sample.cursor_prepare_budget_ns,
+            Some(opportunity.prepare_budget_ns)
+        );
+        assert_eq!(
+            sample.cursor_dispatch_budget_ns,
+            Some(opportunity.dispatch_budget_ns)
+        );
+        assert_eq!(
+            sample.cursor_apply_guard_ns,
+            Some(opportunity.apply_guard_ns)
+        );
+        assert_eq!(sample.cursor_total_lead_ns, Some(opportunity.total_lead_ns));
+        let mut jsonl = String::new();
+        super::append_sample_jsonl(&mut jsonl, *sample, None);
+        assert!(jsonl.contains(&format!(
+            "\"cursor_total_lead_ns\":{}",
+            opportunity.total_lead_ns
+        )));
     }
 
     #[test]
@@ -1561,6 +1651,7 @@ mod tests {
             transaction_id,
             timestamp_ns: 240,
         });
+        presentation.record_cursor_pageflip_sequence(transaction_id, 241);
 
         let attribution = trace
             .cursor_transaction_attribution(sample_id, &presentation)
@@ -1569,6 +1660,14 @@ mod tests {
         assert_eq!(attribution.kms_submit_started_at_ns, Some(220));
         assert_eq!(attribution.kms_submit_returned_at_ns, Some(230));
         assert_eq!(attribution.pageflip_observed_at_ns, Some(240));
+        assert_eq!(attribution.pageflip_sequence, Some(241));
+        let mut jsonl = String::new();
+        super::append_sample_jsonl(
+            &mut jsonl,
+            *trace.sample(sample_id).unwrap(),
+            Some(attribution),
+        );
+        assert!(jsonl.contains("\"actual_pageflip_sequence\":241"));
     }
 
     #[test]

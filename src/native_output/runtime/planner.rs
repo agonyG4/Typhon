@@ -8,12 +8,10 @@ use oblivion_one::{compositor::OwnCompositorServer, native::scheduler::NativeFra
 use std::io;
 use std::time::Duration;
 
-use crate::native_output::presentation::kms_timing::{KmsPresentationTimingModel, KmsSubmitWindow};
-
-/// Bounded time for the reactor to build and enqueue a cursor-only Atomic
-/// transaction before the KMS worker's timed wake. This is intentionally
-/// independent of primary scene render prediction.
-pub(crate) const CURSOR_PREPARATION_GUARD_NS: u64 = 2_000_000;
+use crate::native_output::kms_worker::KmsCommitWorkerTransport;
+use crate::native_output::presentation::{
+    cursor_timing::CursorTimingDomain, kms_timing::KmsSubmitWindow,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CursorServiceOpportunity {
@@ -21,45 +19,120 @@ pub(crate) struct CursorServiceOpportunity {
     pub(crate) submit_window: KmsSubmitWindow,
     pub(crate) service_deadline_ns: u64,
     pub(crate) ordering_after_primary: Option<PresentationTarget>,
+    pub(crate) prepare_budget_ns: u64,
+    pub(crate) dispatch_budget_ns: u64,
+    pub(crate) apply_guard_ns: u64,
+    pub(crate) total_lead_ns: u64,
 }
 
-/// Plan the next legal physical cursor service opportunity using only the
-/// cursor preparation guard and KMS dispatch/apply costs. A reserved primary
-/// target remains an ordering lower bound; an advisory visual target is not
-/// cursor ownership and is ignored.
+/// Plan the earliest legal physical cursor opportunity. Timing budgets define
+/// the service deadline and worker wake, while exact physical ownership alone
+/// can move the target to a later refresh. This is the late-latch policy.
 pub(crate) fn plan_cursor_service_opportunity(
     planner: &PresentationDeadlinePlanner,
-    timing: &KmsPresentationTimingModel,
+    timing: &CursorTimingDomain,
     now: MonotonicTimestampNs,
     primary_target: Option<PresentationTarget>,
     kms_dispatch_budget_ns: u64,
 ) -> Option<CursorServiceOpportunity> {
-    let ready_cost_ns = CURSOR_PREPARATION_GUARD_NS
-        .saturating_add(timing.apply_guard_ns())
-        .saturating_add(kms_dispatch_budget_ns);
-    let ready_cost = Duration::from_nanos(ready_cost_ns);
+    plan_cursor_service_opportunity_with_current(
+        planner,
+        timing,
+        now,
+        primary_target,
+        kms_dispatch_budget_ns,
+        None,
+        KmsCommitWorkerTransport::Worker,
+    )
+}
+
+/// Replan a pending cursor epoch using its prior physical target as an
+/// ordering bound only after that target's KMS completion window has closed.
+/// A due preparation/dispatch service deadline alone keeps the same target
+/// eligible for late-latched service.
+pub(crate) fn plan_cursor_service_opportunity_with_current(
+    planner: &PresentationDeadlinePlanner,
+    timing: &CursorTimingDomain,
+    now: MonotonicTimestampNs,
+    primary_target: Option<PresentationTarget>,
+    kms_dispatch_budget_ns: u64,
+    current_opportunity: Option<CursorServiceOpportunity>,
+    transport: KmsCommitWorkerTransport,
+) -> Option<CursorServiceOpportunity> {
+    let prepare_budget_ns = timing.preparation_budget_ns();
+    let apply_guard_ns = timing.apply_guard_ns(now.get());
+    let total_lead_ns = prepare_budget_ns
+        .saturating_add(kms_dispatch_budget_ns)
+        .saturating_add(apply_guard_ns);
     let binding_primary_target =
         primary_target.filter(|target| target.authority() == PresentationTargetAuthority::Reserved);
-    let target = match binding_primary_target {
-        Some(primary_target) => planner.reactive_target_after(now, ready_cost, primary_target),
-        None => planner.reactive_target(now, ready_cost),
+    let expired_cursor_target = current_opportunity
+        .filter(|opportunity| {
+            opportunity.submit_window.mode_key() == Some(timing.mode_key())
+                && (opportunity.target.presentation_time.get() <= now.get()
+                    || (transport == KmsCommitWorkerTransport::Synchronous
+                        && opportunity.submit_window.commit_complete_deadline_ns() <= now.get()))
+        })
+        .map(|opportunity| PresentationTarget {
+            reason: PresentationTargetReason::Normal,
+            selection_evidence:
+                oblivion_one::native::presentation_deadline::TargetSelectionEvidence {
+                    earliest_feasible_sequence: opportunity.target.sequence,
+                    binding: true,
+                },
+            ..opportunity.target
+        });
+    let ordering_target = match (binding_primary_target, expired_cursor_target) {
+        (Some(primary), Some(cursor)) => Some(
+            if primary.physical_claim().sequence > cursor.physical_claim().sequence {
+                primary
+            } else {
+                cursor
+            },
+        ),
+        (Some(primary), None) => Some(primary),
+        (None, Some(cursor)) => Some(cursor),
+        (None, None) => None,
+    };
+    // Preparation and dispatch budgets affect only the service deadline and
+    // never make worker transport skip a refresh. Synchronous transport keeps
+    // its physical-admission gate and selects only a target with apply lead.
+    let target_selection_lead = match transport {
+        KmsCommitWorkerTransport::Worker => Duration::from_nanos(1),
+        KmsCommitWorkerTransport::Synchronous => Duration::from_nanos(apply_guard_ns),
+    };
+    let target = match ordering_target {
+        Some(lower_bound) => planner.reactive_target_after(now, target_selection_lead, lower_bound),
+        None => planner.reactive_target(now, target_selection_lead),
     }?;
-    let submit_window = timing
-        .submit_window(
-            target.presentation_time.get(),
-            target.submit_not_before().get(),
-            kms_dispatch_budget_ns,
-        )
-        .ok()?;
-    let service_deadline_ns = submit_window
-        .worker_wake_at_ns()
-        .saturating_sub(CURSOR_PREPARATION_GUARD_NS);
-    (service_deadline_ns >= now.get()).then_some(CursorServiceOpportunity {
+    let submit_window =
+        cursor_submit_window(target, timing, kms_dispatch_budget_ns, apply_guard_ns);
+    let service_deadline_ns = target.presentation_time.get().saturating_sub(total_lead_ns);
+    Some(CursorServiceOpportunity {
         target,
         submit_window,
         service_deadline_ns,
         ordering_after_primary: binding_primary_target,
+        prepare_budget_ns,
+        dispatch_budget_ns: kms_dispatch_budget_ns,
+        apply_guard_ns,
+        total_lead_ns,
     })
+}
+
+fn cursor_submit_window(
+    target: PresentationTarget,
+    timing: &CursorTimingDomain,
+    dispatch_budget_ns: u64,
+    apply_guard_ns: u64,
+) -> KmsSubmitWindow {
+    KmsSubmitWindow::late_latch(
+        target.presentation_time.get(),
+        target.submit_not_before().get(),
+        dispatch_budget_ns,
+        apply_guard_ns,
+    )
+    .with_mode_key(timing.mode_key())
 }
 
 /// Plan the cursor opportunity from a scene prediction without borrowing the
@@ -67,7 +140,7 @@ pub(crate) fn plan_cursor_service_opportunity(
 /// is relevant to an independent cursor plane commit.
 pub(crate) fn plan_cursor_service_opportunity_with_scene_prediction(
     planner: &PresentationDeadlinePlanner,
-    timing: &KmsPresentationTimingModel,
+    timing: &CursorTimingDomain,
     now: MonotonicTimestampNs,
     primary_target: Option<PresentationTarget>,
     _scene_total_cost_ns: u64,
@@ -475,6 +548,7 @@ mod tests {
         NativeCursorOutputArbitration, NativeCursorOutputDisposition, NativeCursorPrimaryState,
         NativeCursorSchedulingPolicy,
     };
+    use crate::native_output::presentation::cursor_timing::CursorTimingDomain;
     use crate::native_output::presentation::kms_timing::{
         KmsModeTiming, KmsPresentationTimingModel,
     };
@@ -833,7 +907,7 @@ mod tests {
         let now = MonotonicTimestampNs::new(1_000_000_000);
         let mut planner = PresentationDeadlinePlanner::new(Duration::from_nanos(REFRESH_NS));
         planner.note_presented(now);
-        let timing = KmsPresentationTimingModel::new(
+        let timing = CursorTimingDomain::new(
             KmsModeTiming::from_mode(&drm_mode_modeinfo::default(), REFRESH_NS),
             7,
         );
@@ -886,7 +960,7 @@ mod tests {
         let now = MonotonicTimestampNs::new(1_000_000_000);
         let mut planner = PresentationDeadlinePlanner::new(Duration::from_nanos(REFRESH_NS));
         planner.note_presented(now);
-        let timing = KmsPresentationTimingModel::new(
+        let timing = CursorTimingDomain::new(
             KmsModeTiming::from_mode(&drm_mode_modeinfo::default(), REFRESH_NS),
             7,
         );
@@ -917,7 +991,7 @@ mod tests {
         let now = MonotonicTimestampNs::new(now_ns);
         let mut planner = PresentationDeadlinePlanner::new(Duration::from_nanos(REFRESH_NS));
         planner.note_presented(now);
-        let timing = KmsPresentationTimingModel::new(
+        let timing = CursorTimingDomain::new(
             KmsModeTiming::from_mode(&drm_mode_modeinfo::default(), REFRESH_NS),
             7,
         );
@@ -992,7 +1066,7 @@ mod tests {
         let input_time = MonotonicTimestampNs::new(input_ns);
         let mut planner = PresentationDeadlinePlanner::new(Duration::from_nanos(REFRESH_NS));
         planner.note_presented(input_time);
-        let timing = KmsPresentationTimingModel::new(
+        let timing = CursorTimingDomain::new(
             KmsModeTiming::from_mode(&drm_mode_modeinfo::default(), REFRESH_NS),
             7,
         );
@@ -1037,20 +1111,21 @@ mod tests {
 
         // Model the actual presentation-cycle order: the CursorResponse
         // timer wakes, then the planner runs again before disposition. A
-        // one-nanosecond late wake selects a later target while O1 is still
-        // physically reachable.
+        // one-nanosecond late wake keeps O1 while its KMS window is open.
         let replan_ns = first.service_deadline_ns.saturating_add(1);
         assert!(replan_ns < first.submit_window.commit_complete_deadline_ns());
-        let replanned = plan_cursor_service_opportunity(
+        let replanned = plan_cursor_service_opportunity_with_current(
             &planner,
             &timing,
             MonotonicTimestampNs::new(replan_ns),
             None,
             500_000,
+            Some(first),
+            KmsCommitWorkerTransport::Worker,
         )
-        .expect("planner returns a fresh future opportunity before disposition");
-        assert_ne!(replanned.target.identity(), first.target.identity());
-        assert!(replanned.service_deadline_ns > replan_ns);
+        .expect("late-latch preserves the current physical opportunity");
+        assert_eq!(replanned.target.identity(), first.target.identity());
+        assert!(replanned.service_deadline_ns <= replan_ns);
 
         let (cursor_work, deadline_due, cursor_plane_delta_due) = update_cursor_output_arbitration(
             &mut arbitration,
@@ -1139,7 +1214,7 @@ mod tests {
         let input_time = MonotonicTimestampNs::new(input_ns);
         let mut planner = PresentationDeadlinePlanner::new(Duration::from_nanos(REFRESH_NS));
         planner.note_presented(input_time);
-        let timing = KmsPresentationTimingModel::new(
+        let timing = CursorTimingDomain::new(
             KmsModeTiming::from_mode(&drm_mode_modeinfo::default(), REFRESH_NS),
             7,
         );
@@ -1168,16 +1243,15 @@ mod tests {
         // occurs during these replans.
         let mut now_ns = input_ns;
         for _ in 0..4 {
-            now_ns = current
-                .submit_window
-                .commit_complete_deadline_ns()
-                .saturating_add(1);
-            let next = plan_cursor_service_opportunity(
+            now_ns = current.target.presentation_time.get().saturating_add(1);
+            let next = plan_cursor_service_opportunity_with_current(
                 &planner,
                 &timing,
                 MonotonicTimestampNs::new(now_ns),
                 None,
                 500_000,
+                Some(current),
+                KmsCommitWorkerTransport::Worker,
             )
             .expect("a later legal physical target can be planned");
             assert_ne!(next.target.identity(), current.target.identity());
@@ -1233,7 +1307,7 @@ mod tests {
         let input_time = MonotonicTimestampNs::new(input_ns);
         let mut planner = PresentationDeadlinePlanner::new(Duration::from_nanos(REFRESH_NS));
         planner.note_presented(input_time);
-        let timing = KmsPresentationTimingModel::new(
+        let timing = CursorTimingDomain::new(
             KmsModeTiming::from_mode(&drm_mode_modeinfo::default(), REFRESH_NS),
             7,
         );
@@ -1258,12 +1332,14 @@ mod tests {
             .submit_window
             .commit_complete_deadline_ns()
             .saturating_add(1);
-        let replacement = plan_cursor_service_opportunity(
+        let replacement = plan_cursor_service_opportunity_with_current(
             &planner,
             &timing,
             MonotonicTimestampNs::new(replan_ns),
             None,
             500_000,
+            Some(first),
+            KmsCommitWorkerTransport::Synchronous,
         )
         .expect("replacement physical target after O1 expires");
         update_cursor_output_arbitration(
@@ -1434,7 +1510,7 @@ mod tests {
         let input_time = MonotonicTimestampNs::new(input_ns);
         let mut planner = PresentationDeadlinePlanner::new(Duration::from_nanos(REFRESH_NS));
         planner.note_presented(input_time);
-        let timing = KmsPresentationTimingModel::new(
+        let timing = CursorTimingDomain::new(
             KmsModeTiming::from_mode(&drm_mode_modeinfo::default(), REFRESH_NS),
             7,
         );
@@ -1449,12 +1525,14 @@ mod tests {
             .submit_window
             .commit_complete_deadline_ns()
             .saturating_add(1);
-        let second = plan_cursor_service_opportunity(
+        let second = plan_cursor_service_opportunity_with_current(
             &planner,
             &timing,
             MonotonicTimestampNs::new(o2_replan_ns),
             None,
             500_000,
+            Some(first),
+            KmsCommitWorkerTransport::Synchronous,
         )
         .expect("O2 after O1 physically expires");
         arbitration.reconcile_pending_service_opportunity(second, o2_replan_ns);
@@ -1467,12 +1545,14 @@ mod tests {
             .submit_window
             .commit_complete_deadline_ns()
             .saturating_add(1);
-        let third = plan_cursor_service_opportunity(
+        let third = plan_cursor_service_opportunity_with_current(
             &planner,
             &timing,
             MonotonicTimestampNs::new(o3_replan_ns),
             None,
             500_000,
+            Some(second),
+            KmsCommitWorkerTransport::Synchronous,
         )
         .expect("O3 after O2 physically expires");
         arbitration.reconcile_pending_service_opportunity(third, o3_replan_ns);
@@ -1520,7 +1600,7 @@ mod tests {
         let event_time = MonotonicTimestampNs::new(event_ns);
         let mut planner = PresentationDeadlinePlanner::new(Duration::from_nanos(REFRESH_NS));
         planner.note_presented(event_time);
-        let timing = KmsPresentationTimingModel::new(
+        let timing = CursorTimingDomain::new(
             KmsModeTiming::from_mode(&drm_mode_modeinfo::default(), REFRESH_NS),
             7,
         );
@@ -1602,18 +1682,16 @@ mod tests {
                 .planning_retry_wake_deadline_ns(planning_wake_ns),
             ..NativeWakePlanInputs::default()
         });
+        assert!(opportunity.service_deadline_ns <= planning_wake_ns);
         assert_eq!(
-            response_plan.deadline,
-            Some(NativeDeadline {
-                owner: NativeDeadlineOwner::CursorResponse,
-                at_ns: opportunity.service_deadline_ns,
-            })
+            response_plan.deadline, None,
+            "the planning timer already woke after the soft cursor deadline"
         );
 
         let disposition = cursor_output_disposition_for_primary_state(
             &mut arbitration,
             NativeCursorSchedulingPolicy::Auto,
-            opportunity.service_deadline_ns,
+            planning_wake_ns,
             NativeCursorPrimaryState {
                 independent_kms_admission: true,
                 ..NativeCursorPrimaryState::default()
@@ -1624,8 +1702,8 @@ mod tests {
         arbitration.note_plane_delta_submission();
         arbitration.consume_submitted_epoch(
             8,
-            opportunity.service_deadline_ns,
-            scheduler.next_refresh_deadline_ns(opportunity.service_deadline_ns),
+            planning_wake_ns,
+            scheduler.next_refresh_deadline_ns(planning_wake_ns),
         );
         assert!(!arbitration.pending());
     }
@@ -1639,7 +1717,7 @@ mod tests {
         let mut presentation_planner =
             PresentationDeadlinePlanner::new(Duration::from_nanos(REFRESH_NS));
         presentation_planner.note_presented(MonotonicTimestampNs::new(burst_start_ns));
-        let timing = KmsPresentationTimingModel::new(
+        let timing = CursorTimingDomain::new(
             KmsModeTiming::from_mode(&drm_mode_modeinfo::default(), REFRESH_NS),
             7,
         );
@@ -1729,7 +1807,7 @@ mod tests {
         let now = MonotonicTimestampNs::new(1_000_000_000);
         let mut planner = PresentationDeadlinePlanner::new(Duration::from_nanos(REFRESH_NS));
         planner.note_presented(now);
-        let timing = KmsPresentationTimingModel::new(
+        let timing = CursorTimingDomain::new(
             KmsModeTiming::from_mode(&drm_mode_modeinfo::default(), REFRESH_NS),
             7,
         );
@@ -1779,7 +1857,7 @@ mod tests {
         let now = MonotonicTimestampNs::new(1_000_000_000);
         let mut planner = PresentationDeadlinePlanner::new(Duration::from_nanos(REFRESH_NS));
         planner.note_presented(now);
-        let timing = KmsPresentationTimingModel::new(
+        let timing = CursorTimingDomain::new(
             KmsModeTiming::from_mode(&drm_mode_modeinfo::default(), REFRESH_NS),
             7,
         );
@@ -1816,7 +1894,7 @@ mod tests {
             let refresh_ns = 1_000_000_000 / hz;
             let mut planner = PresentationDeadlinePlanner::new(Duration::from_nanos(refresh_ns));
             planner.note_presented(now);
-            let timing = KmsPresentationTimingModel::new(
+            let timing = CursorTimingDomain::new(
                 KmsModeTiming::from_mode(&drm_mode_modeinfo::default(), refresh_ns),
                 9,
             );
@@ -1824,11 +1902,146 @@ mod tests {
                 plan_cursor_service_opportunity(&planner, &timing, now, None, 500_000).unwrap();
 
             assert!(opportunity.target.presentation_time.get() > now.get());
-            assert!(opportunity.service_deadline_ns >= now.get());
             assert_eq!(
-                opportunity.submit_window.worker_wake_at_ns(),
-                opportunity.service_deadline_ns + CURSOR_PREPARATION_GUARD_NS
+                opportunity.service_deadline_ns,
+                opportunity.target.presentation_time.get() - opportunity.total_lead_ns
             );
+        }
+    }
+
+    #[test]
+    fn primary_kms_stress_does_not_change_cursor_target_or_service_deadline() {
+        const REFRESH_NS: u64 = 1_000_000_000 / 165;
+        let now = MonotonicTimestampNs::new(2_000_000_000);
+        let mut planner = PresentationDeadlinePlanner::new(Duration::from_nanos(REFRESH_NS));
+        planner.note_presented(now);
+        let mode = KmsModeTiming::from_mode(&drm_mode_modeinfo::default(), REFRESH_NS);
+        let healthy_primary = KmsPresentationTimingModel::new(mode, 9);
+        let mut stressed_primary = healthy_primary;
+        for _ in 0..128 {
+            stressed_primary.observe_pageflip(
+                9,
+                mode.key(),
+                crate::native_output::presentation::kms_timing::KmsPresentationOutcome::KmsApplyGuardMiss,
+            );
+        }
+
+        assert!(
+            stressed_primary.adaptive_apply_guard_ns() > healthy_primary.adaptive_apply_guard_ns()
+        );
+        let cursor_timing = CursorTimingDomain::new(mode, 9);
+        let healthy = plan_cursor_service_opportunity(&planner, &cursor_timing, now, None, 500_000)
+            .expect("healthy cursor opportunity");
+        let after_primary_stress =
+            plan_cursor_service_opportunity(&planner, &cursor_timing, now, None, 500_000)
+                .expect("cursor opportunity remains available");
+
+        assert_eq!(
+            after_primary_stress.target.identity(),
+            healthy.target.identity()
+        );
+        assert_eq!(
+            after_primary_stress.service_deadline_ns,
+            healthy.service_deadline_ns
+        );
+    }
+
+    #[test]
+    fn cursor_soft_budget_crossing_a_refresh_does_not_create_a_refresh_divider() {
+        for hz in [60u64, 120, 144, 165, 240, 360] {
+            let refresh_ns = 1_000_000_000 / hz;
+            let now = MonotonicTimestampNs::new(3_000_000_000);
+            let mut planner = PresentationDeadlinePlanner::new(Duration::from_nanos(refresh_ns));
+            planner.note_presented(now);
+            let timing = CursorTimingDomain::new(
+                KmsModeTiming::from_mode(&drm_mode_modeinfo::default(), refresh_ns),
+                11,
+            );
+            let fixed_lead_ns = timing
+                .preparation_budget_ns()
+                .saturating_add(timing.apply_guard_ns(now.get()));
+            let below = refresh_ns.saturating_sub(fixed_lead_ns).saturating_sub(1);
+            let above = refresh_ns.saturating_sub(fixed_lead_ns).saturating_add(1);
+            let before = plan_cursor_service_opportunity(&planner, &timing, now, None, below)
+                .expect("cursor opportunity below refresh budget");
+            let after = plan_cursor_service_opportunity(&planner, &timing, now, None, above)
+                .expect("late-latched cursor opportunity above refresh budget");
+
+            assert_eq!(
+                after.target.sequence, before.target.sequence,
+                "crossing the soft lead budget at {hz} Hz must not skip one refresh"
+            );
+        }
+    }
+
+    #[test]
+    fn cursor_motion_1000hz_coalesces_to_one_target_per_refresh_at_supported_rates() {
+        use std::collections::BTreeSet;
+
+        const SIMULATION_NS: u64 = 1_000_000_000;
+        const INPUT_INTERVAL_NS: u64 = 1_000_000;
+
+        for hz in [60u64, 120, 144, 165, 240, 360] {
+            let refresh_ns = SIMULATION_NS / hz;
+            let mut planner = PresentationDeadlinePlanner::new(Duration::from_nanos(refresh_ns));
+            let mut now = MonotonicTimestampNs::new(0);
+            planner.note_presented(now);
+            let timing = CursorTimingDomain::new(
+                KmsModeTiming::from_mode(&drm_mode_modeinfo::default(), refresh_ns),
+                17,
+            );
+            let mut arbitration = NativeCursorOutputArbitration::default();
+            let mut next_input_ns = INPUT_INTERVAL_NS;
+            let mut input_epoch = 0_u64;
+            let mut raw_updates = 0_u64;
+            let mut opportunities = 0_u64;
+            let mut independent_target_sequences = BTreeSet::new();
+
+            while now.get() < SIMULATION_NS {
+                let opportunity =
+                    plan_cursor_service_opportunity(&planner, &timing, now, None, 50_000)
+                        .expect("fixed-refresh cursor opportunity");
+                opportunities = opportunities.saturating_add(1);
+                let mut oldest_motion_ns = None;
+
+                while next_input_ns < opportunity.target.presentation_time.get()
+                    && next_input_ns < SIMULATION_NS
+                {
+                    input_epoch = input_epoch.saturating_add(1);
+                    raw_updates = raw_updates.saturating_add(1);
+                    oldest_motion_ns.get_or_insert(next_input_ns);
+                    arbitration.request_hardware_for_opportunity(
+                        input_epoch,
+                        next_input_ns,
+                        opportunity,
+                    );
+                    assert_eq!(arbitration.pending_since_ns(), oldest_motion_ns);
+                    assert_eq!(
+                        arbitration.deadline_ns(),
+                        Some(opportunity.service_deadline_ns)
+                    );
+                    assert_eq!(
+                        arbitration
+                            .service_opportunity()
+                            .map(|current| current.target.sequence),
+                        Some(opportunity.target.sequence),
+                        "raw motion may refresh state but cannot create a second target"
+                    );
+                    next_input_ns = next_input_ns.saturating_add(INPUT_INTERVAL_NS);
+                }
+
+                if arbitration.pending() {
+                    assert_eq!(arbitration.desired_epoch(), input_epoch);
+                    assert!(independent_target_sequences.insert(opportunity.target.sequence));
+                    arbitration.consume(input_epoch);
+                }
+
+                now = opportunity.target.presentation_time;
+                planner.note_presented(now);
+            }
+
+            assert!(raw_updates > independent_target_sequences.len() as u64);
+            assert!(independent_target_sequences.len() as u64 <= opportunities);
         }
     }
 
@@ -1838,7 +2051,7 @@ mod tests {
         let now = MonotonicTimestampNs::new(1_000_000_000);
         let mut planner = PresentationDeadlinePlanner::new(Duration::from_nanos(REFRESH_NS));
         planner.note_presented(now);
-        let timing = KmsPresentationTimingModel::new(
+        let timing = CursorTimingDomain::new(
             KmsModeTiming::from_mode(&drm_mode_modeinfo::default(), REFRESH_NS),
             7,
         );
@@ -1861,27 +2074,44 @@ mod tests {
         assert_eq!(arbitration.pending_since_ns(), Some(now.get()));
         assert_eq!(arbitration.service_opportunity(), Some(first));
 
-        let missed_at = first
+        let late_service_at = first
             .submit_window
             .commit_complete_deadline_ns()
             .saturating_add(1);
-        assert!(arbitration.due(missed_at));
+        assert!(arbitration.due(late_service_at));
         assert_eq!(
-            arbitration
-                .physical_admission_for_transport(KmsCommitWorkerTransport::Worker, missed_at),
-            NativeCursorPhysicalAdmission::NoValidOpportunity,
-            "freshness debt does not make the expired physical target valid"
+            arbitration.physical_admission_for_transport(
+                KmsCommitWorkerTransport::Worker,
+                late_service_at
+            ),
+            NativeCursorPhysicalAdmission::WorkerQueueNow,
+            "worker transport can still late-latch while the physical refresh is current"
         );
-        let next = plan_cursor_service_opportunity(
+        let late_latched = plan_cursor_service_opportunity_with_current(
             &planner,
             &timing,
-            MonotonicTimestampNs::new(missed_at),
+            MonotonicTimestampNs::new(late_service_at),
             None,
             500_000,
+            Some(first),
+            KmsCommitWorkerTransport::Worker,
         )
-        .expect("later physical cursor target");
+        .expect("late-latched physical cursor target");
+        assert_eq!(late_latched.target.identity(), first.target.identity());
+
+        let target_missed_at = first.target.presentation_time.get().saturating_add(1);
+        let next = plan_cursor_service_opportunity_with_current(
+            &planner,
+            &timing,
+            MonotonicTimestampNs::new(target_missed_at),
+            None,
+            500_000,
+            Some(first),
+            KmsCommitWorkerTransport::Worker,
+        )
+        .expect("next physical cursor target after a real target miss");
         assert!(next.target.sequence > first.target.sequence);
-        arbitration.request_hardware_for_opportunity(3, missed_at, next);
+        arbitration.request_hardware_for_opportunity(3, target_missed_at, next);
         assert_eq!(arbitration.deadline_ns(), Some(original_deadline));
         assert_eq!(arbitration.pending_since_ns(), Some(now.get()));
         assert_eq!(
@@ -1890,13 +2120,13 @@ mod tests {
                 .map(|opportunity| opportunity.target.sequence),
             Some(next.target.sequence)
         );
-        assert!(arbitration.due(missed_at));
+        assert!(arbitration.due(target_missed_at));
         assert_eq!(
-            arbitration.wake_deadline_ns(missed_at),
+            arbitration.wake_deadline_ns(target_missed_at),
             None,
             "matured freshness must not be postponed to a replacement target's service point"
         );
-        assert!(next.submit_window.worker_wake_at_ns() > missed_at);
+        assert!(next.submit_window.worker_wake_at_ns() > target_missed_at);
     }
 
     #[test]
@@ -2019,7 +2249,7 @@ mod tests {
                 let mut target_planner =
                     PresentationDeadlinePlanner::new(Duration::from_nanos(REFRESH_NS));
                 target_planner.note_presented(model_now);
-                let timing = KmsPresentationTimingModel::new(
+                let timing = CursorTimingDomain::new(
                     KmsModeTiming::from_mode(&drm_mode_modeinfo::default(), REFRESH_NS),
                     7,
                 );

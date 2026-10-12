@@ -270,6 +270,26 @@ impl NativeRuntime {
             });
         let presentation_timing = self.presentation_timing;
         let presentation_timing_snapshot = presentation_timing.snapshot();
+        let diagnostic_now_ns = monotonic_now_ns().unwrap_or(0);
+        let cursor_timing_snapshot = self.cursor_timing.snapshot(diagnostic_now_ns);
+        let cursor_prepare_budget_ns = self.cursor_timing.preparation_budget_ns();
+        let primary_dispatch_budget_ns = worker
+            .timing
+            .primary_dispatch_budget_ns
+            .max(crate::native_output::kms_worker::DISPATCH_GUARD_NS);
+        let cursor_dispatch_generation_matches =
+            worker.timing.cursor_dispatch_generation == self.drm_file_generation;
+        let cursor_dispatch_budget_ns = if cursor_dispatch_generation_matches {
+            worker.timing.cursor_dispatch_budget_ns
+        } else {
+            0
+        }
+        .max(crate::native_output::kms_worker::DISPATCH_GUARD_NS);
+        let cursor_dispatch_tail_guard_ns = if cursor_dispatch_generation_matches {
+            worker.timing.cursor_dispatch_tail_guard_ns
+        } else {
+            0
+        };
         let service_prediction = self.render_journal.prediction_with_kms_guard(
             Duration::from_nanos(presentation_timing.mode().refresh_interval_ns()),
             presentation_timing.apply_guard_ns(),
@@ -295,6 +315,26 @@ impl NativeRuntime {
                 base_apply_guard_ns: presentation_timing.base_mode_guard_ns(),
                 adaptive_apply_guard_ns: presentation_timing.adaptive_apply_guard_ns(),
                 total_apply_guard_ns: presentation_timing.apply_guard_ns(),
+                primary_dispatch_budget_us: primary_dispatch_budget_ns / 1_000,
+                primary_dispatch_tail_guard_us: worker.timing.primary_dispatch_tail_guard_ns
+                    / 1_000,
+                primary_apply_guard_us: presentation_timing.apply_guard_ns() / 1_000,
+                cursor_prepare_budget_us: cursor_prepare_budget_ns / 1_000,
+                cursor_dispatch_budget_us: cursor_dispatch_budget_ns / 1_000,
+                cursor_dispatch_tail_guard_us: cursor_dispatch_tail_guard_ns / 1_000,
+                cursor_apply_guard_us: cursor_timing_snapshot.apply_guard_ns / 1_000,
+                cursor_total_lead_us: cursor_prepare_budget_ns
+                    .saturating_add(cursor_dispatch_budget_ns)
+                    .saturating_add(cursor_timing_snapshot.apply_guard_ns)
+                    / 1_000,
+                cursor_target_hits: cursor_timing_snapshot.target_hits,
+                cursor_dispatch_misses: cursor_timing_snapshot.dispatch_misses,
+                cursor_apply_misses: cursor_timing_snapshot.apply_misses,
+                cursor_unreachable_targets: cursor_timing_snapshot.unreachable_targets,
+                cursor_recovery_clean_hits: cursor_timing_snapshot.recovery_clean_hits,
+                cursor_guard_increases: cursor_timing_snapshot.guard_increases,
+                cursor_guard_decays: cursor_timing_snapshot.guard_decays,
+                cursor_guard_age_ms: cursor_timing_snapshot.guard_age_ms,
                 target_hits: presentation_timing_snapshot.target_hits,
                 pre_render_unreachable: presentation_timing_snapshot.unreachable_targets,
                 render_readiness_misses: presentation_timing_snapshot.render_readiness_misses,

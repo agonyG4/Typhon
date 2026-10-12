@@ -11,7 +11,7 @@ use super::frame::{
 use super::planner::{
     NativePresentationPath, NativePresentationPlanInput, cursor_primary_ordering_target,
     pacing_mode_for_target, pending_fixed_target_for_scanout,
-    plan_cursor_service_opportunity_with_scene_prediction, plan_native_presentation_path,
+    plan_cursor_service_opportunity_with_current, plan_native_presentation_path,
     plan_visual_target_for_budget, prepare_presentation_target, reactive_or_commit_timing_target,
 };
 use super::presentation_cursor::*;
@@ -327,6 +327,7 @@ impl NativeRuntime {
             presented_planes,
             confirmed_kms_presentation,
             presentation_timing,
+            cursor_timing,
             presentation_deadline,
             scheduled_presentation_target,
             render_journal,
@@ -511,13 +512,23 @@ impl NativeRuntime {
         };
         let primary_ordering_target =
             cursor_primary_ordering_target(*scheduled_presentation_target, pending_target);
-        let cursor_target_opportunity = plan_cursor_service_opportunity_with_scene_prediction(
+        let cursor_dispatch_budget_ns = kms_commit_worker.as_ref().map_or(
+            crate::native_output::kms_worker::DISPATCH_GUARD_NS,
+            |worker| {
+                worker.dispatch_budget_ns(
+                    crate::native_output::kms_worker::KmsServiceClass::CursorPlaneDelta,
+                    *drm_file_generation,
+                )
+            },
+        );
+        let cursor_target_opportunity = plan_cursor_service_opportunity_with_current(
             presentation_deadline,
-            presentation_timing,
+            cursor_timing,
             scheduler_now,
             primary_ordering_target,
-            prediction.total_cost_ns,
-            prediction.kms_dispatch_budget_ns,
+            cursor_dispatch_budget_ns,
+            cursor_output_arbitration.service_opportunity(),
+            *kms_commit_worker_transport,
         );
         let cursor_service_opportunity = (*cursor_scheduling_policy
             == super::frame::NativeCursorSchedulingPolicy::Auto)
@@ -1023,6 +1034,7 @@ impl NativeRuntime {
                 kms_commit_worker.as_ref(),
                 kms_backend,
                 cursor,
+                cursor_timing,
                 desired,
                 atomic_commit_arbiter,
                 output_transactions,

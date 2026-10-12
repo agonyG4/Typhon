@@ -1079,6 +1079,8 @@ pub(super) fn queue_plane_delta_for_presentation(
     worker: &KmsCommitWorkerHandle,
     server: &mut OwnCompositorServer,
     cursor: &mut NativeAtomicCursor,
+    cursor_timing: &mut crate::native_output::presentation::cursor_timing::CursorTimingDomain,
+    admitted_at_ns: u64,
     desired: Option<AtomicCursorVisualState>,
     atomic_commit_arbiter: &mut AtomicCommitArbiter,
     output_transactions: &mut OutputTransactionLedger,
@@ -1124,9 +1126,11 @@ pub(super) fn queue_plane_delta_for_presentation(
         cursor_reveal,
         cursor_reveal_trace,
     )? {
-        WorkerQueueOutcome::CursorQueued { .. } | WorkerQueueOutcome::SidecarQueued { .. } => {
+        WorkerQueueOutcome::CursorQueued { .. } => {
+            cursor_timing.observe_preparation(admitted_at_ns, monotonic_now_ns()?);
             Ok(SchedulerDecision::WaitForPageFlip)
         }
+        WorkerQueueOutcome::SidecarQueued { .. } => Ok(SchedulerDecision::WaitForPageFlip),
         WorkerQueueOutcome::Unavailable(_) => Ok(SchedulerDecision::Idle),
         WorkerQueueOutcome::Queued { .. } => {
             Err(io::Error::other("cursor worker admission returned a primary queue result").into())
@@ -1140,6 +1144,7 @@ pub(super) fn present_cursor_for_presentation(
     worker: Option<&KmsCommitWorkerHandle>,
     kms_backend: &KmsBackendSelection,
     cursor: &mut NativeAtomicCursor,
+    cursor_timing: &mut crate::native_output::presentation::cursor_timing::CursorTimingDomain,
     desired: Option<AtomicCursorVisualState>,
     atomic_commit_arbiter: &mut AtomicCommitArbiter,
     output_transactions: &mut OutputTransactionLedger,
@@ -1169,6 +1174,7 @@ pub(super) fn present_cursor_for_presentation(
     cursor_reveal_trace: &mut Option<CursorRevealTraceLedger>,
     vrr_policy: VrrPolicy,
 ) -> NativeResult<Option<SchedulerDecision>> {
+    let admitted_at_ns = monotonic_now_ns()?;
     let cursor_surface_damage = desired
         .as_ref()
         .filter(|state| state.visible)
@@ -1218,6 +1224,8 @@ pub(super) fn present_cursor_for_presentation(
             worker,
             server,
             cursor,
+            cursor_timing,
+            admitted_at_ns,
             desired,
             atomic_commit_arbiter,
             output_transactions,
@@ -1251,11 +1259,14 @@ pub(super) fn present_cursor_for_presentation(
     let decision = submit_plane_delta(
         kms_backend,
         cursor,
+        cursor_timing,
+        admitted_at_ns,
         desired,
         atomic_commit_arbiter,
         output_transactions,
         presentation_trace,
         cursor_target,
+        submit_window,
         crtc_id,
         output_generation,
         pacing_mode,

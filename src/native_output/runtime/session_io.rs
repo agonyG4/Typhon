@@ -646,6 +646,10 @@ impl NativeSessionIo for NativeRuntime {
             KmsModeTiming::from_mode(&self.target.mode, self.output_refresh_rate.interval_ns()),
             generation,
         );
+        self.cursor_timing.reconfigure(
+            KmsModeTiming::from_mode(&self.target.mode, self.output_refresh_rate.interval_ns()),
+            generation,
+        );
         self.abandon_direct_fallback();
         self.scanout.rebind_session_generation(
             generation,

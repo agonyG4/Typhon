@@ -2,7 +2,7 @@
 
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
-use super::timing::KmsWorkerDispatchTailObservation;
+use super::timing::{KmsServiceClass, KmsWorkerDispatchTailObservation};
 
 const UNSIGNED_BUCKET_LIMITS_NS: [u64; 14] = [
     50_000,
@@ -263,6 +263,13 @@ pub(crate) struct WorkerTimingMetrics {
     dispatch_tail_guard_increases: AtomicU64,
     dispatch_tail_guard_decays: AtomicU64,
     dispatch_tail_guard_cap_hits: AtomicU64,
+    primary_dispatch_budget_ns: AtomicU64,
+    primary_dispatch_tail_guard_ns: AtomicU64,
+    cursor_dispatch_budget_ns: AtomicU64,
+    cursor_dispatch_tail_guard_ns: AtomicU64,
+    cursor_dispatch_generation: AtomicU64,
+    direct_dispatch_budget_ns: AtomicU64,
+    direct_dispatch_tail_guard_ns: AtomicU64,
     late_before_ioctl: AtomicU64,
     late_after_ioctl: AtomicU64,
     test_only_count: AtomicU64,
@@ -286,6 +293,13 @@ pub(crate) struct WorkerTimingSnapshot {
     pub(crate) dispatch_tail_guard_increases: u64,
     pub(crate) dispatch_tail_guard_decays: u64,
     pub(crate) dispatch_tail_guard_cap_hits: u64,
+    pub(crate) primary_dispatch_budget_ns: u64,
+    pub(crate) primary_dispatch_tail_guard_ns: u64,
+    pub(crate) cursor_dispatch_budget_ns: u64,
+    pub(crate) cursor_dispatch_tail_guard_ns: u64,
+    pub(crate) cursor_dispatch_generation: u64,
+    pub(crate) direct_dispatch_budget_ns: u64,
+    pub(crate) direct_dispatch_tail_guard_ns: u64,
     pub(crate) late_before_ioctl: u64,
     pub(crate) late_after_ioctl: u64,
     pub(crate) test_only_count: u64,
@@ -350,6 +364,35 @@ impl WorkerTimingMetrics {
         }
     }
 
+    pub(crate) fn record_service_class_dispatch(
+        &self,
+        class: KmsServiceClass,
+        generation: u64,
+        budget_ns: u64,
+        tail_guard_ns: u64,
+    ) {
+        let (budget, tail) = match class {
+            KmsServiceClass::Primary => (
+                &self.primary_dispatch_budget_ns,
+                &self.primary_dispatch_tail_guard_ns,
+            ),
+            KmsServiceClass::CursorPlaneDelta => (
+                &self.cursor_dispatch_budget_ns,
+                &self.cursor_dispatch_tail_guard_ns,
+            ),
+            KmsServiceClass::DirectScanout => (
+                &self.direct_dispatch_budget_ns,
+                &self.direct_dispatch_tail_guard_ns,
+            ),
+        };
+        budget.store(budget_ns, Ordering::Relaxed);
+        tail.store(tail_guard_ns, Ordering::Relaxed);
+        if class == KmsServiceClass::CursorPlaneDelta {
+            self.cursor_dispatch_generation
+                .store(generation, Ordering::Relaxed);
+        }
+    }
+
     pub(crate) fn record_pageflip_ack_delay(&self, delay_ns: u64) {
         self.pageflip_ack_delay.record(delay_ns);
     }
@@ -383,6 +426,19 @@ impl WorkerTimingMetrics {
                 .load(Ordering::Relaxed),
             dispatch_tail_guard_decays: self.dispatch_tail_guard_decays.load(Ordering::Relaxed),
             dispatch_tail_guard_cap_hits: self.dispatch_tail_guard_cap_hits.load(Ordering::Relaxed),
+            primary_dispatch_budget_ns: self.primary_dispatch_budget_ns.load(Ordering::Relaxed),
+            primary_dispatch_tail_guard_ns: self
+                .primary_dispatch_tail_guard_ns
+                .load(Ordering::Relaxed),
+            cursor_dispatch_budget_ns: self.cursor_dispatch_budget_ns.load(Ordering::Relaxed),
+            cursor_dispatch_tail_guard_ns: self
+                .cursor_dispatch_tail_guard_ns
+                .load(Ordering::Relaxed),
+            cursor_dispatch_generation: self.cursor_dispatch_generation.load(Ordering::Relaxed),
+            direct_dispatch_budget_ns: self.direct_dispatch_budget_ns.load(Ordering::Relaxed),
+            direct_dispatch_tail_guard_ns: self
+                .direct_dispatch_tail_guard_ns
+                .load(Ordering::Relaxed),
             late_before_ioctl: self.late_before_ioctl.load(Ordering::Relaxed),
             late_after_ioctl: self.late_after_ioctl.load(Ordering::Relaxed),
             test_only_count: self.test_only_count.load(Ordering::Relaxed),

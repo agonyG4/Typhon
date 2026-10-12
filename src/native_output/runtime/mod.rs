@@ -825,6 +825,7 @@ pub(crate) struct NativeRuntime {
     presented_planes: crate::native_output::presentation::plane::PresentedPlaneSnapshot,
     confirmed_kms_presentation: ConfirmedKmsPresentationState,
     presentation_timing: KmsPresentationTimingModel,
+    cursor_timing: crate::native_output::presentation::cursor_timing::CursorTimingDomain,
     presentation_deadline: PresentationDeadlinePlanner,
     scheduled_presentation_target: Option<PresentationTarget>,
     render_journal: AdaptiveRenderJournal,

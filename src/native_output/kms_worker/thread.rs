@@ -15,7 +15,7 @@ use super::queue::{
 use super::{
     CursorSidecar, CursorSidecarOfferError, CursorSidecarReturnReason, EstablishedKmsBase,
     KmsCommitAdmissionPermit, KmsCommitBundleIdentity, KmsCommitJob, KmsCursorOwner,
-    KmsWorkerAdmissionError, KmsWorkerDispatchModel,
+    KmsDispatchModels, KmsServiceClass, KmsWorkerAdmissionError,
 };
 use crate::native_output::{
     OutputTransactionId,
@@ -474,6 +474,22 @@ impl KmsCommitWorkerHandle {
         self.shared.metrics.snapshot()
     }
 
+    pub(crate) fn dispatch_budget_ns(&self, class: KmsServiceClass, generation: u64) -> u64 {
+        let timing = self.shared.metrics.timing.snapshot();
+        let observed = match class {
+            KmsServiceClass::Primary => timing.primary_dispatch_budget_ns,
+            KmsServiceClass::CursorPlaneDelta => {
+                if timing.cursor_dispatch_generation != generation {
+                    0
+                } else {
+                    timing.cursor_dispatch_budget_ns
+                }
+            }
+            KmsServiceClass::DirectScanout => timing.direct_dispatch_budget_ns,
+        };
+        observed.max(super::timing::DISPATCH_GUARD_NS)
+    }
+
     pub(crate) fn record_submit_ack_delay(&self, delay_ns: u64) {
         self.shared.metrics.timing.record_submit_ack_delay(delay_ns);
     }
@@ -924,7 +940,7 @@ fn publish_terminal_sidecar_return(
 }
 
 fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
-    let mut dispatch_model = KmsWorkerDispatchModel::default();
+    let mut dispatch_models = KmsDispatchModels::default();
     loop {
         let Some(work) = take_next_work(&shared) else {
             return;
@@ -940,12 +956,29 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
                 continue;
             }
         };
+        let service_class = KmsServiceClass::from_kind(job.kind);
+        if service_class == KmsServiceClass::CursorPlaneDelta {
+            let mode_key = job
+                .fixed_submit_window()
+                .and_then(|window| window.mode_key());
+            dispatch_models.rebind_cursor_timing_domain(job.output_generation, mode_key);
+            if let FramePresentationReservation::Fixed(target) = job.reservation {
+                dispatch_models
+                    .model_mut(service_class)
+                    .set_cursor_recovery_window(
+                        target.refresh_interval.as_nanos().min(u128::from(u64::MAX)) as u64,
+                    );
+            }
+        }
         #[cfg(test)]
         if let Some(pause) = shared.take_dequeue_pause_for_test() {
             pause.pause();
         }
         let mut executing = ExecutingDirectCandidateGuard::from_dequeued(&shared, direct_candidate);
         let now_ns = monotonic_now_ns();
+        dispatch_models
+            .model_mut(service_class)
+            .age_tail_guard(now_ns);
         let planned_worker_wake_at = job.presentation_timing.worker_wake_at_ns();
         let wait_armed = match job.presentation_timing {
             KmsPresentationTiming::Fixed(_) => job
@@ -1130,12 +1163,19 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
                     // that acquired executable worker ownership by its planned wake gives
                     // the worker a fair chance to meet the dispatch deadline and may train
                     // the adaptive tail guard.
-                    let binding_target = match job.reservation {
-                        FramePresentationReservation::Fixed(target) => target.is_binding(),
-                        FramePresentationReservation::Variable(_)
-                        | FramePresentationReservation::DeferredO1(_) => false,
+                    let binding_target = match (service_class, job.reservation) {
+                        (
+                            KmsServiceClass::CursorPlaneDelta,
+                            FramePresentationReservation::Fixed(_),
+                        ) => job.fixed_submit_window().is_some_and(|window| {
+                            job.queued_at.get() <= window.commit_complete_deadline_ns()
+                        }),
+                        (_, FramePresentationReservation::Fixed(target)) => target.is_binding(),
+                        (_, FramePresentationReservation::Variable(_))
+                        | (_, FramePresentationReservation::DeferredO1(_)) => false,
                     };
                     let dequeued_before_planned_wake = dequeued_at.get() <= planned_worker_wake_at;
+                    let dispatch_model = dispatch_models.model_mut(service_class);
                     if let Some(lateness_ns) = fixed_timed_wake_lateness_ns {
                         dispatch_model.record_fixed_timed_wake(lateness_ns);
                     }
@@ -1161,6 +1201,12 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
                     });
                     let dispatch_budget: super::KmsWorkerDispatchBudget = dispatch_model.budget();
                     let dispatch_budget_ns = dispatch_budget.dispatch_budget_ns;
+                    shared.metrics.timing.record_service_class_dispatch(
+                        service_class,
+                        job.output_generation,
+                        dispatch_budget_ns,
+                        dispatch_model.adaptive_tail_guard_ns(),
+                    );
                     let fixed_submission_budget_ns =
                         matches!(job.presentation_timing, KmsPresentationTiming::Fixed(_))
                             .then_some(dispatch_budget_ns);

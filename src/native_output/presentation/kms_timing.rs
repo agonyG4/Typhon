@@ -229,6 +229,29 @@ impl KmsSubmitWindow {
         })
     }
 
+    /// Build a vblank-locked best-effort cursor window. A cursor payload whose
+    /// soft deadline is already due is still eligible for immediate service;
+    /// the pageflip sequence will record whether that late latch hit.
+    pub(crate) fn late_latch(
+        target_presentation_ns: u64,
+        earliest_submit_ns: u64,
+        dispatch_budget_ns: u64,
+        apply_guard_ns: u64,
+    ) -> Self {
+        let commit_complete_deadline_ns = target_presentation_ns.saturating_sub(apply_guard_ns);
+        let worker_wake_at_ns =
+            earliest_submit_ns.max(commit_complete_deadline_ns.saturating_sub(dispatch_budget_ns));
+        Self {
+            mode_key: None,
+            target_presentation_ns,
+            earliest_submit_ns,
+            worker_wake_at_ns,
+            commit_complete_deadline_ns,
+            dispatch_budget_ns,
+            apply_guard_ns,
+        }
+    }
+
     pub(crate) const fn with_mode_key(mut self, mode_key: KmsModeTimingKey) -> Self {
         self.mode_key = Some(mode_key);
         self

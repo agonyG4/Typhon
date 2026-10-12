@@ -1171,7 +1171,8 @@ impl NativeCursorOutputArbitration {
             return NativeCursorPhysicalAdmission::NoValidOpportunity;
         };
         let target_expired = opportunity.target.presentation_time.get() <= now_ns
-            || opportunity.submit_window.commit_complete_deadline_ns() <= now_ns;
+            || (transport == KmsCommitWorkerTransport::Synchronous
+                && opportunity.submit_window.commit_complete_deadline_ns() <= now_ns);
         if target_expired {
             return NativeCursorPhysicalAdmission::NoValidOpportunity;
         }

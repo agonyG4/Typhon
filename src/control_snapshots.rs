@@ -852,6 +852,38 @@ pub struct KmsPerformanceSnapshot {
     pub base_apply_guard_ns: u64,
     pub adaptive_apply_guard_ns: u64,
     pub total_apply_guard_ns: u64,
+    #[serde(default)]
+    pub primary_dispatch_budget_us: u64,
+    #[serde(default)]
+    pub primary_dispatch_tail_guard_us: u64,
+    #[serde(default)]
+    pub primary_apply_guard_us: u64,
+    #[serde(default)]
+    pub cursor_prepare_budget_us: u64,
+    #[serde(default)]
+    pub cursor_dispatch_budget_us: u64,
+    #[serde(default)]
+    pub cursor_dispatch_tail_guard_us: u64,
+    #[serde(default)]
+    pub cursor_apply_guard_us: u64,
+    #[serde(default)]
+    pub cursor_total_lead_us: u64,
+    #[serde(default)]
+    pub cursor_target_hits: u64,
+    #[serde(default)]
+    pub cursor_dispatch_misses: u64,
+    #[serde(default)]
+    pub cursor_apply_misses: u64,
+    #[serde(default)]
+    pub cursor_unreachable_targets: u64,
+    #[serde(default)]
+    pub cursor_recovery_clean_hits: u64,
+    #[serde(default)]
+    pub cursor_guard_increases: u64,
+    #[serde(default)]
+    pub cursor_guard_decays: u64,
+    #[serde(default)]
+    pub cursor_guard_age_ms: u64,
     pub target_hits: u64,
     pub pre_render_unreachable: u64,
     pub render_readiness_misses: u64,

@@ -2072,6 +2072,10 @@ impl NativeRuntime {
             KmsModeTiming::from_mode(&target.mode, self.output_refresh_rate.interval_ns()),
             self.drm_file_generation,
         );
+        self.cursor_timing.reconfigure(
+            KmsModeTiming::from_mode(&target.mode, self.output_refresh_rate.interval_ns()),
+            self.drm_file_generation,
+        );
         let interval = Duration::from_nanos(self.output_refresh_rate.interval_ns());
         self.presentation_deadline.invalidate(interval);
         self.scheduled_presentation_target = None;

@@ -1187,11 +1187,14 @@ pub(super) fn trace_cursor_epoch_transaction(
 pub(super) fn submit_plane_delta(
     kms_backend: &KmsBackendSelection,
     cursor: &mut NativeAtomicCursor,
+    cursor_timing: &mut crate::native_output::presentation::cursor_timing::CursorTimingDomain,
+    admitted_at_ns: u64,
     desired: Option<AtomicCursorVisualState>,
     atomic_commit_arbiter: &mut AtomicCommitArbiter,
     output_transactions: &mut OutputTransactionLedger,
     presentation_trace: &mut PresentationTransactionTraceRing,
     target: PresentationTarget,
+    submit_window: Option<crate::native_output::presentation::kms_timing::KmsSubmitWindow>,
     crtc_id: u32,
     output_generation: u64,
     pacing_mode: NativeOutputPacingMode,
@@ -1317,16 +1320,15 @@ pub(super) fn submit_plane_delta(
                 submitted_delivery,
                 Some(cursor_source_for_trace(cursor)),
             );
+            let kms_submit_started_at_ns = monotonic_now_ns().unwrap_or(submission_at_ns);
             let trace_kms_submit = presentation_trace.enabled();
-            let kms_submit_started_at_ns =
-                trace_kms_submit.then(monotonic_now_ns).and_then(Result::ok);
-            if let Some(timestamp_ns) = kms_submit_started_at_ns {
+            if trace_kms_submit {
                 presentation_trace.push(PresentationTransactionEvent::KmsSubmitStarted {
                     transaction_id,
-                    timestamp_ns,
+                    timestamp_ns: kms_submit_started_at_ns,
                 });
             }
-            let kms_submit_started = trace_kms_submit.then(std::time::Instant::now);
+            let kms_submit_started = std::time::Instant::now();
             match kms_backend.submit_cursor_flip_with_presentation(
                 desired.as_ref(),
                 token,
@@ -1334,15 +1336,13 @@ pub(super) fn submit_plane_delta(
                 content_type,
             ) {
                 Ok(()) => {
-                    let kms_submit_returned_at_ns = kms_submit_started_at_ns.map(|started_at_ns| {
-                        monotonic_now_ns().unwrap_or_else(|_| {
-                            let elapsed_ns = kms_submit_started
-                                .map(|started| started.elapsed().as_nanos())
-                                .unwrap_or_default()
-                                .min(u128::from(u64::MAX))
-                                as u64;
-                            started_at_ns.saturating_add(elapsed_ns)
-                        })
+                    let kms_submit_returned_at_ns = monotonic_now_ns().unwrap_or_else(|_| {
+                        let elapsed_ns = kms_submit_started
+                            .elapsed()
+                            .as_nanos()
+                            .min(u128::from(u64::MAX))
+                            as u64;
+                        kms_submit_started_at_ns.saturating_add(elapsed_ns)
                     });
                     if let Some(submitter) = kms_backend.atomic_commit_submitter() {
                         trace_cursor_kms_submit(
@@ -1386,11 +1386,24 @@ pub(super) fn submit_plane_delta(
                             MonotonicTimestampNs::new(submission_at_ns),
                         )
                         .map_err(io::Error::other)?;
-                    if let Some(timestamp_ns) = kms_submit_returned_at_ns {
+                    if trace_kms_submit {
                         presentation_trace.push(PresentationTransactionEvent::KmsSubmitReturned {
                             transaction_id,
-                            timestamp_ns,
+                            timestamp_ns: kms_submit_returned_at_ns,
                         });
+                    }
+                    if let Some(window) = submit_window {
+                        cursor_timing.note_synchronous_submission(
+                            crate::native_output::presentation::cursor_timing::CursorKmsSubmissionEvidence::new(
+                                token,
+                                output_generation,
+                                target,
+                                window,
+                                admitted_at_ns,
+                                kms_submit_started_at_ns,
+                                kms_submit_returned_at_ns,
+                            ),
+                        );
                     }
                     let submitted_state = cursor.begin_submission_at_revision_with_capability_key(
                         token,
