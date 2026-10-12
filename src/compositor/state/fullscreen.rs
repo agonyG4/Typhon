@@ -107,6 +107,8 @@ impl CompositorState {
         Some(metadata)
     }
 
+    /// Returns generic geometry for a toplevel mode. Normal maps to output size here; managed
+    /// X11 transitions must resolve Normal from the window's current or saved geometry.
     pub(in crate::compositor) fn window_geometry_for_mode(
         &self,
         mode: ToplevelMode,

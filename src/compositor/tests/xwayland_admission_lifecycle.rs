@@ -207,8 +207,15 @@ fn client_positioned_initial_x11_geometry_skips_managed_work_area_clamping() {
 #[test]
 fn compositor_minimize_unmaps_once_and_restore_maps_with_live_association() {
     let mut fixture = first_buffer_fixture();
+    assert!(fixture.server.state.set_output_size(1_920, 1_080));
     let mut snapshot = fake_snapshot();
     snapshot.surface_id = fixture.surface_id;
+    snapshot.geometry = X11Geometry {
+        x: 136,
+        y: 100,
+        width: 800,
+        height: 600,
+    };
     let handle = snapshot.handle;
     fixture
         .server
@@ -218,6 +225,27 @@ fn compositor_minimize_unmaps_once_and_restore_maps_with_live_association() {
         .state
         .window_id_for_x11_handle(handle)
         .expect("normal X11 window admitted");
+    let original_geometry = fixture
+        .server
+        .state
+        .window(window_id)
+        .expect("admitted window")
+        .x11_geometry
+        .expect("managed X11 geometry");
+    let original_materialized = fixture
+        .server
+        .state
+        .window(window_id)
+        .expect("admitted window")
+        .x11_materialized_client_rect;
+    let original_placement = fixture.server.state.surface_placement(fixture.surface_id);
+    assert_eq!(
+        (
+            original_geometry.client.width,
+            original_geometry.client.height
+        ),
+        (800, 600)
+    );
     assert!(
         !fixture
             .server
@@ -251,6 +279,24 @@ fn compositor_minimize_unmaps_once_and_restore_maps_with_live_association() {
         XwmCommand::SetState { window, state, .. }
             if *window == handle && state.hidden
     )));
+    assert!(minimized.iter().all(|command| !matches!(
+        command,
+        XwmCommand::ConfigureFrame { window, .. } if *window == handle
+    )));
+    let minimized_window = fixture
+        .server
+        .state
+        .window(window_id)
+        .expect("minimized X11 window");
+    assert_eq!(minimized_window.x11_geometry, Some(original_geometry));
+    assert_eq!(
+        minimized_window.x11_materialized_client_rect,
+        original_materialized
+    );
+    assert_eq!(
+        fixture.server.state.surface_placement(fixture.surface_id),
+        original_placement
+    );
     assert!(!fixture.server.state.minimize_desktop_window(window_id));
     assert_eq!(
         fixture.server.state.window_id_for_x11_handle(handle),
@@ -280,6 +326,24 @@ fn compositor_minimize_unmaps_once_and_restore_maps_with_live_association() {
             .count(),
         1,
         "restore must map even while the old Wayland association still exists"
+    );
+    assert!(restored.iter().all(|command| !matches!(
+        command,
+        XwmCommand::ConfigureFrame { window, .. } if *window == handle
+    )));
+    let restored_window = fixture
+        .server
+        .state
+        .window(window_id)
+        .expect("restoring X11 window");
+    assert_eq!(restored_window.x11_geometry, Some(original_geometry));
+    assert_eq!(
+        restored_window.x11_materialized_client_rect,
+        original_materialized
+    );
+    assert_eq!(
+        fixture.server.state.surface_placement(fixture.surface_id),
+        original_placement
     );
     assert_eq!(
         fixture.server.state.window_id_for_x11_handle(handle),
@@ -515,10 +579,17 @@ fn managed_configure_after_remap_uses_preserved_frame_extents_and_geometry_polic
 }
 
 #[test]
-fn client_hidden_request_uses_the_compositor_mapping_transition_once() {
+fn client_hidden_minimize_preserves_normal_managed_geometry() {
     let mut fixture = first_buffer_fixture();
+    assert!(fixture.server.state.set_output_size(1_920, 1_080));
     let mut snapshot = fake_snapshot();
     snapshot.surface_id = fixture.surface_id;
+    snapshot.geometry = X11Geometry {
+        x: 136,
+        y: 100,
+        width: 800,
+        height: 600,
+    };
     let handle = snapshot.handle;
     fixture
         .server
@@ -528,6 +599,28 @@ fn client_hidden_request_uses_the_compositor_mapping_transition_once() {
         .state
         .window_id_for_x11_handle(handle)
         .expect("normal X11 window admitted");
+    let original_geometry = fixture
+        .server
+        .state
+        .window(window_id)
+        .expect("admitted window")
+        .x11_geometry
+        .expect("managed X11 geometry");
+    let original_materialized = fixture
+        .server
+        .state
+        .window(window_id)
+        .expect("admitted window")
+        .x11_materialized_client_rect;
+    let original_placement = fixture.server.state.surface_placement(fixture.surface_id);
+    assert_eq!(
+        (
+            original_geometry.client.width,
+            original_geometry.client.height
+        ),
+        (800, 600)
+    );
+    let _ = fixture.server.take_xwayland_backend_commands(0);
 
     let immediate = fixture
         .server
@@ -559,6 +652,24 @@ fn client_hidden_request_uses_the_compositor_mapping_transition_once() {
         XwmCommand::SetState { window, state, .. }
             if *window == handle && state.hidden
     )));
+    assert!(backend.iter().all(|command| !matches!(
+        command,
+        XwmCommand::ConfigureFrame { window, .. } if *window == handle
+    )));
+    let minimized_window = fixture
+        .server
+        .state
+        .window(window_id)
+        .expect("minimized X11 window");
+    assert_eq!(minimized_window.x11_geometry, Some(original_geometry));
+    assert_eq!(
+        minimized_window.x11_materialized_client_rect,
+        original_materialized
+    );
+    assert_eq!(
+        fixture.server.state.surface_placement(fixture.surface_id),
+        original_placement
+    );
     assert!(
         fixture
             .server
@@ -569,5 +680,365 @@ fn client_hidden_request_uses_the_compositor_mapping_transition_once() {
     assert_eq!(
         fixture.server.state.window_id_for_x11_handle(handle),
         Some(window_id)
+    );
+}
+
+#[test]
+fn client_hidden_restore_preserves_normal_managed_geometry() {
+    let mut fixture = first_buffer_fixture();
+    assert!(fixture.server.state.set_output_size(1_920, 1_080));
+    let mut snapshot = fake_snapshot();
+    snapshot.surface_id = fixture.surface_id;
+    snapshot.geometry = X11Geometry {
+        x: 136,
+        y: 100,
+        width: 800,
+        height: 600,
+    };
+    let handle = snapshot.handle;
+    fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::WindowReady(snapshot));
+    let window_id = fixture
+        .server
+        .state
+        .window_id_for_x11_handle(handle)
+        .expect("normal X11 window admitted");
+    let _ = fixture.server.take_xwayland_backend_commands(0);
+
+    assert!(fixture.server.state.minimize_desktop_window(window_id));
+    let minimized_commands = fixture.server.take_xwayland_backend_commands(0);
+    assert_eq!(
+        minimized_commands
+            .iter()
+            .filter(|command| matches!(command, XwmCommand::Unmap(window) if *window == handle))
+            .count(),
+        1
+    );
+    let original_geometry = fixture
+        .server
+        .state
+        .window(window_id)
+        .expect("minimized X11 window")
+        .x11_geometry
+        .expect("managed geometry");
+    let original_materialized = fixture
+        .server
+        .state
+        .window(window_id)
+        .expect("minimized X11 window")
+        .x11_materialized_client_rect;
+    let original_placement = fixture.server.state.surface_placement(fixture.surface_id);
+    let original_visual_geometry = fixture
+        .server
+        .state
+        .toplevel_visual_geometries
+        .get(&fixture.surface_id)
+        .cloned();
+    assert_eq!(
+        (
+            original_geometry.client.width,
+            original_geometry.client.height
+        ),
+        (800, 600)
+    );
+    assert!(fixture.server.state.pending_xwayland_restores.is_empty());
+    fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::StateRequested {
+            window: handle,
+            request: crate::xwayland::xwm::X11StateRequest {
+                action: crate::xwayland::xwm::X11StateAction::Remove,
+                first: Some(crate::xwayland::xwm::X11StateAtom::Hidden),
+                second: None,
+            },
+        });
+    let restored = fixture.server.take_xwayland_backend_commands(0);
+    assert_eq!(
+        restored
+            .iter()
+            .filter(|command| matches!(command, XwmCommand::Map(window) if *window == handle))
+            .count(),
+        1,
+        "restoring a hidden client must queue one Map"
+    );
+    assert!(restored.iter().all(|command| !matches!(
+        command,
+        XwmCommand::ConfigureFrame { window, .. } if *window == handle
+    )));
+    assert!(
+        fixture
+            .server
+            .state
+            .pending_xwayland_restores
+            .contains_key(&window_id)
+    );
+    let restored_window = fixture
+        .server
+        .state
+        .window(window_id)
+        .expect("restoring X11 window");
+    assert_eq!(restored_window.x11_geometry, Some(original_geometry));
+    assert_eq!(
+        restored_window.x11_materialized_client_rect,
+        original_materialized
+    );
+    assert_eq!(
+        fixture.server.state.surface_placement(fixture.surface_id),
+        original_placement
+    );
+    assert_eq!(
+        fixture
+            .server
+            .state
+            .toplevel_visual_geometries
+            .get(&fixture.surface_id)
+            .cloned(),
+        original_visual_geometry
+    );
+}
+
+#[test]
+fn minimized_normal_to_maximized_visible_applies_only_final_mode_geometry() {
+    let mut fixture = first_buffer_fixture();
+    assert!(fixture.server.state.set_output_size(1_920, 1_080));
+    let mut snapshot = fake_snapshot();
+    snapshot.surface_id = fixture.surface_id;
+    snapshot.geometry = X11Geometry {
+        x: 136,
+        y: 100,
+        width: 800,
+        height: 600,
+    };
+    let handle = snapshot.handle;
+    fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::WindowReady(snapshot));
+    let window_id = fixture
+        .server
+        .state
+        .window_id_for_x11_handle(handle)
+        .expect("normal X11 window admitted");
+    let _ = fixture.server.take_xwayland_backend_commands(0);
+    assert!(fixture.server.state.minimize_desktop_window(window_id));
+    let minimized_commands = fixture.server.take_xwayland_backend_commands(0);
+    assert_eq!(
+        minimized_commands
+            .iter()
+            .filter(|command| matches!(command, XwmCommand::Unmap(window) if *window == handle))
+            .count(),
+        1
+    );
+
+    assert!(fixture.server.state.apply_x11_published_state(
+        handle,
+        crate::xwayland::xwm::X11PublishedState {
+            fullscreen: false,
+            maximized: true,
+            hidden: false,
+            activated: false,
+        },
+    ));
+    let transition_commands = fixture.server.take_xwayland_backend_commands(0);
+    let maximized = fixture.server.state.window_geometry_for_surface_mode(
+        fixture.surface_id,
+        crate::compositor::ToplevelMode::Maximized,
+    );
+    let expected = maximized;
+    let expected_x11 = X11Geometry {
+        x: maximized.placement.local_x,
+        y: maximized.placement.local_y,
+        width: maximized.width,
+        height: maximized.height,
+    };
+    assert_eq!(
+        transition_commands
+            .iter()
+            .filter(|command| matches!(
+                command,
+                XwmCommand::ConfigureFrame { window, .. } if *window == handle
+            ))
+            .count(),
+        1,
+        "the combined restore and maximize transaction must configure once"
+    );
+    assert!(transition_commands.iter().any(|command| matches!(
+        command,
+        XwmCommand::ConfigureFrame { window, geometry, .. }
+            if *window == handle && *geometry == expected_x11
+    )));
+    assert!(
+        transition_commands
+            .iter()
+            .any(|command| matches!(command, XwmCommand::Map(window) if *window == handle))
+    );
+    assert_eq!(
+        fixture
+            .server
+            .state
+            .window(window_id)
+            .expect("maximized X11 window")
+            .state
+            .mode(),
+        crate::compositor::ToplevelMode::Maximized
+    );
+    assert_eq!(
+        fixture
+            .server
+            .state
+            .window(window_id)
+            .expect("maximized X11 window")
+            .x11_geometry
+            .expect("maximized geometry")
+            .frame,
+        expected
+    );
+}
+
+#[test]
+fn minimized_maximized_to_normal_visible_uses_saved_restore_geometry() {
+    let mut fixture = first_buffer_fixture();
+    assert!(fixture.server.state.set_output_size(1_920, 1_080));
+    let mut snapshot = fake_snapshot();
+    snapshot.surface_id = fixture.surface_id;
+    snapshot.geometry = X11Geometry {
+        x: 136,
+        y: 100,
+        width: 800,
+        height: 600,
+    };
+    let handle = snapshot.handle;
+    fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::WindowReady(snapshot));
+    let window_id = fixture
+        .server
+        .state
+        .window_id_for_x11_handle(handle)
+        .expect("normal X11 window admitted");
+    let original_geometry = fixture
+        .server
+        .state
+        .window(window_id)
+        .expect("admitted window")
+        .x11_geometry
+        .expect("normal geometry");
+    let original_materialized = fixture
+        .server
+        .state
+        .window(window_id)
+        .expect("admitted window")
+        .x11_materialized_client_rect;
+    let original_placement = fixture.server.state.surface_placement(fixture.surface_id);
+    let original_visual_geometry = fixture
+        .server
+        .state
+        .toplevel_visual_geometries
+        .get(&fixture.surface_id)
+        .cloned();
+    assert_eq!(
+        (
+            original_geometry.client.width,
+            original_geometry.client.height
+        ),
+        (800, 600)
+    );
+    let _ = fixture.server.take_xwayland_backend_commands(0);
+
+    assert!(fixture.server.state.apply_x11_published_state(
+        handle,
+        crate::xwayland::xwm::X11PublishedState {
+            fullscreen: false,
+            maximized: true,
+            hidden: false,
+            activated: false,
+        },
+    ));
+    let maximize_commands = fixture.server.take_xwayland_backend_commands(0);
+    assert_eq!(
+        maximize_commands
+            .iter()
+            .filter(|command| matches!(
+                command,
+                XwmCommand::ConfigureFrame { window, .. } if *window == handle
+            ))
+            .count(),
+        1
+    );
+    assert!(fixture.server.state.minimize_desktop_window(window_id));
+    let minimize_commands = fixture.server.take_xwayland_backend_commands(0);
+    assert_eq!(
+        minimize_commands
+            .iter()
+            .filter(|command| matches!(command, XwmCommand::Unmap(window) if *window == handle))
+            .count(),
+        1
+    );
+    assert!(fixture.server.state.apply_x11_published_state(
+        handle,
+        crate::xwayland::xwm::X11PublishedState {
+            fullscreen: false,
+            maximized: false,
+            hidden: false,
+            activated: false,
+        },
+    ));
+    let restore_commands = fixture.server.take_xwayland_backend_commands(0);
+    assert_eq!(
+        restore_commands
+            .iter()
+            .filter(|command| matches!(command, XwmCommand::Map(window) if *window == handle))
+            .count(),
+        1
+    );
+    assert_eq!(
+        restore_commands
+            .iter()
+            .filter(|command| matches!(
+                command,
+                XwmCommand::ConfigureFrame { window, .. } if *window == handle
+            ))
+            .count(),
+        1,
+        "the combined unmaximize and restore transaction must configure once"
+    );
+    let original_frame = original_geometry.frame;
+    let original_frame_x11 = X11Geometry {
+        x: original_frame.placement.local_x,
+        y: original_frame.placement.local_y,
+        width: original_frame.width,
+        height: original_frame.height,
+    };
+    assert!(restore_commands.iter().any(|command| matches!(
+        command,
+        XwmCommand::ConfigureFrame { window, geometry, .. }
+            if *window == handle && *geometry == original_frame_x11
+    )));
+    let restored_window = fixture
+        .server
+        .state
+        .window(window_id)
+        .expect("restored normal X11 window");
+    assert_eq!(
+        restored_window.state.mode(),
+        crate::compositor::ToplevelMode::Normal
+    );
+    assert_eq!(restored_window.x11_geometry, Some(original_geometry));
+    assert_eq!(
+        restored_window.x11_materialized_client_rect,
+        original_materialized
+    );
+    assert_eq!(
+        fixture.server.state.surface_placement(fixture.surface_id),
+        original_placement
+    );
+    assert_eq!(
+        fixture
+            .server
+            .state
+            .toplevel_visual_geometries
+            .get(&fixture.surface_id)
+            .cloned(),
+        original_visual_geometry
     );
 }

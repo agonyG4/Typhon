@@ -54,7 +54,21 @@ impl CompositorState {
         if !mode_changed && !minimized_changed {
             return false;
         }
-
+        if !mode_changed && minimized_changed && interaction_target.is_none() {
+            if minimized {
+                if !self.minimize_desktop_window(window_id) {
+                    if let Some(window) = self.window_mut(window_id) {
+                        window.state.mark_minimized_without_surfaces();
+                    }
+                    self.queue_backend_state(window_id);
+                    self.mark_astrea_toplevel_dirty(window_id);
+                }
+            } else if !self.restore_minimized_desktop_window(window_id) {
+                self.queue_backend_state(window_id);
+                self.mark_astrea_toplevel_dirty(window_id);
+            }
+            return true;
+        }
         let source_geometry = self
             .toplevel_visual_geometries
             .contains_key(&root_surface_id)
@@ -115,6 +129,11 @@ impl CompositorState {
                     WindowGeometry::new(self.surface_placement(root_surface_id), 1, 1)
                 })
         } else {
+            debug_assert_ne!(
+                mode,
+                ToplevelMode::Normal,
+                "Normal X11 geometry must come from window-owned state"
+            );
             self.window_geometry_for_surface_mode(root_surface_id, mode)
         };
         if mode_changed {
