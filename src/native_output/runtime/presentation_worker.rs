@@ -682,6 +682,9 @@ pub(super) fn native_scene_damage_for_resolved_scene(
     resolved_scene: &ResolvedNativeFrameScene<'_>,
     cursor_damage: NativeCursorDamageBounds,
 ) -> NativeOutputDamage {
+    if resolved_scene.workspace_presentation_sample.is_some() {
+        return NativeOutputDamage::full_output(width, height);
+    }
     native_output_damage_for_scene_snapshots(
         width,
         height,

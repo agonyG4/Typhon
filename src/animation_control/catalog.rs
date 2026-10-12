@@ -124,6 +124,7 @@ impl AnimationEffect {
                 | Self::WindowGlide
                 | Self::MinimizeLamp
                 | Self::MinimizeSquash
+                | Self::WorkspaceSlide
         )
     }
 
@@ -134,6 +135,7 @@ impl AnimationEffect {
     /// still planned.
     pub const fn is_available_for_slot(self, slot: AnimationSlot) -> bool {
         match self {
+            Self::WorkspaceSlide => matches!(slot, AnimationSlot::WorkspaceSwitch),
             Self::WindowScale | Self::WindowGlide => {
                 matches!(slot, AnimationSlot::WindowOpen | AnimationSlot::WindowClose)
             }
@@ -212,10 +214,7 @@ impl AnimationEffect {
                     AnimationSlot::WindowMinimize | AnimationSlot::WindowRestore
                 )
             }
-            Self::WorkspaceSlide => matches!(
-                slot,
-                AnimationSlot::WorkspaceSwitch | AnimationSlot::WorkspaceWindowMove
-            ),
+            Self::WorkspaceSlide => matches!(slot, AnimationSlot::WorkspaceSwitch),
         }
     }
 }
@@ -250,6 +249,7 @@ impl AnimationPreset {
             (Self::Macos, AnimationSlot::WindowOpen | AnimationSlot::WindowClose) => {
                 AnimationEffect::WindowGlide
             }
+            (_, AnimationSlot::WorkspaceSwitch) => AnimationEffect::WorkspaceSlide,
             (
                 Self::Astrea | Self::Kde,
                 AnimationSlot::WindowMove
@@ -306,6 +306,34 @@ mod tests {
             AnimationPreset::ALL.map(AnimationPreset::id),
             ["astrea", "kde", "macos"]
         );
+    }
+
+    #[test]
+    fn workspace_slide_is_executable_only_for_workspace_switch() {
+        let capabilities = super::super::AnimationRuntimeCapabilities::default();
+        let effect = AnimationEffect::WorkspaceSlide;
+
+        assert!(effect.is_available());
+        assert!(effect.compatible_with(AnimationSlot::WorkspaceSwitch));
+        assert!(effect.is_available_for_slot(AnimationSlot::WorkspaceSwitch));
+        assert!(effect.is_executable_for(AnimationSlot::WorkspaceSwitch, capabilities));
+        assert!(!effect.compatible_with(AnimationSlot::WorkspaceWindowMove));
+        assert!(!effect.is_available_for_slot(AnimationSlot::WorkspaceWindowMove));
+        assert!(!effect.is_executable_for(AnimationSlot::WorkspaceWindowMove, capabilities));
+    }
+
+    #[test]
+    fn all_presets_request_slide_only_for_workspace_switch() {
+        for preset in AnimationPreset::ALL {
+            assert_eq!(
+                preset.requested_effect(AnimationSlot::WorkspaceSwitch),
+                AnimationEffect::WorkspaceSlide
+            );
+            assert_eq!(
+                preset.requested_effect(AnimationSlot::WorkspaceWindowMove),
+                AnimationEffect::None
+            );
+        }
     }
 
     #[test]

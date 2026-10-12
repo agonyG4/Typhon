@@ -252,6 +252,9 @@ impl CompositorState {
         );
 
         let mut blockers = DirectScanoutSceneBlockers::default();
+        if self.workspace_presentation.transition().is_some() {
+            blockers.push(DirectScanoutSceneRejection::WorkspacePresentationTransition);
+        }
         if !fullscreen_plan.composition_underlay_roots.is_empty() {
             blockers.push(DirectScanoutSceneRejection::FullscreenUnderlayVisible);
         }

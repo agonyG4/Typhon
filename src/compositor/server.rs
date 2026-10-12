@@ -1758,6 +1758,40 @@ impl OwnCompositorServer {
         self.state.active_workspace()
     }
 
+    pub fn workspace_presentation_active(&self) -> bool {
+        self.state.workspace_presentation.transition().is_some()
+    }
+
+    pub fn retire_workspace_presentation_if_rendered(
+        &mut self,
+        sample: &crate::compositor::WorkspacePresentationSample,
+    ) -> bool {
+        let retired = self.state.retire_workspace_presentation_if_rendered(sample);
+        if retired && crate::pointer_debug::cursor_responsiveness_trace_enabled() {
+            let participants = sample
+                .participants
+                .iter()
+                .map(|participant| participant.workspace)
+                .collect::<Vec<_>>();
+            eprintln!(
+                "workspace_slide_retired transition_id={} position={:.6} velocity={:.6} target_position={:.6} target_workspace={:?} participants={participants:?}",
+                sample.transition_id.get(),
+                sample.position,
+                sample.velocity,
+                sample.target_position,
+                sample.target_workspace,
+            );
+        }
+        retired
+    }
+
+    pub fn workspace_frame_presentation_scene_at(
+        &self,
+        sampled_at: AnimationTime,
+    ) -> Option<crate::compositor::WorkspaceFramePresentationScene> {
+        self.state.workspace_frame_presentation_scene_at(sampled_at)
+    }
+
     pub fn activate_workspace(&mut self, workspace: WorkspaceId) -> WorkspaceSwitchOutcome {
         self.state.activate_workspace(workspace)
     }
@@ -2018,6 +2052,22 @@ impl OwnCompositorServer {
                 fullscreen_plan,
                 lifecycle,
             )
+    }
+
+    #[doc(hidden)]
+    pub fn resolved_effect_scene_for_workspace_frame_with_lifecycle(
+        &self,
+        frame_source: &crate::compositor::FrameEffectSceneInput<'_>,
+        presentation: &PresentationSceneSample,
+        fullscreen_plan: &FullscreenCompositionPlan,
+        lifecycle: &crate::window_lifecycle_animation::LifecycleSceneSample,
+    ) -> ResolvedEffectScene {
+        self.state.resolved_effect_scene_with_frame_presentation(
+            frame_source,
+            presentation,
+            fullscreen_plan,
+            lifecycle,
+        )
     }
 
     pub fn effect_frame_demand_snapshot(&self) -> EffectFrameDemandSnapshot {

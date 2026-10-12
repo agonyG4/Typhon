@@ -91,6 +91,7 @@ mod window_interaction;
 mod window_open_animation;
 mod window_resize;
 mod windows;
+pub(in crate::compositor) mod workspace_presentation;
 mod workspaces;
 mod xdg_geometry;
 mod xdg_lifecycle;

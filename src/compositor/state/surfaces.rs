@@ -1167,6 +1167,17 @@ impl CompositorState {
         }
 
         self.output_size = output_size;
+        if let Some(transition) = self.workspace_presentation.transition() {
+            if crate::pointer_debug::cursor_responsiveness_trace_enabled() {
+                eprintln!(
+                    "workspace_slide_fallback transition_id={} reason=output_reconfiguration target_workspace={:?}",
+                    transition.id.get(),
+                    transition.target_workspace,
+                );
+            }
+            self.workspace_presentation.clear();
+            self.refresh_frame_work_visibility();
+        }
         for window in self.desktop_windows.values_mut() {
             window.state.clear_minimized_lifecycle_target();
         }

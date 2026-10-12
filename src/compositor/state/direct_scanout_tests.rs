@@ -323,6 +323,37 @@ fn same_size_scene_stays_on_the_accepted_direct_candidate_path() {
 }
 
 #[test]
+fn active_workspace_presentation_transition_explicitly_blocks_direct_scanout() {
+    let mut state = CompositorState::new(None);
+    let target = crate::wm::WorkspaceId::new(2).expect("workspace id");
+    let outcome = state.workspace_manager.activate(target);
+    let output_size = BufferSize::new(state.output_size.width, state.output_size.height)
+        .expect("configured output size");
+    install_probe_scanout_surface(&mut state, 303, output_size);
+
+    assert!(
+        state.direct_scanout_scene_candidate().is_ok(),
+        "the fullscreen-sized surface is scanout-compatible before the transition"
+    );
+
+    state.workspace_presentation.activate_for_switch(
+        outcome,
+        &state.workspace_manager,
+        AnimationTime::from_nanos(0),
+        AnimationCurve::easing(Duration::from_secs(1), EasingCurve::Linear),
+    );
+
+    let analysis = state.direct_scanout_scene_analysis();
+    assert!(analysis.candidate.is_none());
+    assert!(
+        analysis
+            .blockers
+            .reasons()
+            .contains(&DirectScanoutSceneRejection::WorkspacePresentationTransition)
+    );
+}
+
+#[test]
 fn simple_size_mismatch_is_a_probe_candidate_with_distinct_source_and_output_sizes() {
     let mut state = CompositorState::new(None);
     let output_size = BufferSize::new(state.output_size.width, state.output_size.height)

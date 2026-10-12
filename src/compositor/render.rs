@@ -174,6 +174,16 @@ impl DecorationRenderInstance {
         (self.origin_x, self.origin_y)
     }
 
+    /// Return a frame-local decoration shifted in logical output coordinates.
+    /// This preserves any ordinary window presentation already applied to the
+    /// decoration and leaves its canonical render plan untouched.
+    pub fn translated_by_logical_offset(&self, x: f64, y: f64) -> Self {
+        let mut translated = self.clone();
+        translated.origin_x = translated.origin_x.saturating_add(x.round() as i32);
+        translated.origin_y = translated.origin_y.saturating_add(y.round() as i32);
+        translated
+    }
+
     pub const fn root_surface_id(&self) -> u32 {
         self.root_surface_id
     }
@@ -3619,7 +3629,8 @@ mod tests {
     use super::*;
     use crate::compositor::{SurfaceCommitSequence, SurfacePlacement, ViewportSourceRect};
     use crate::presentation_animation::{
-        PresentationGeometryTransform, PresentationOpacity, PresentationRect,
+        PresentationGeometryTransform, PresentationGroupTransform, PresentationOpacity,
+        PresentationRect,
     };
     use crate::render_backend::buffer::{
         BufferIdAllocator, BufferIdentity, BufferSize, CommittedSurfaceBuffer,
@@ -5566,6 +5577,37 @@ mod tests {
             root_surface_id: 1,
             scene_node_id: SceneNodeId::from_raw(1).expect("test decoration scene node"),
         }
+    }
+
+    #[test]
+    fn workspace_translation_composes_after_decoration_presentation_geometry() {
+        let decoration = test_decoration_instance(100, 100);
+        let ordinary_transform = PresentationGroupTransform::new(
+            1,
+            crate::presentation_animation::TransitionId::new(
+                std::num::NonZeroU64::new(3).expect("non-zero transition id"),
+            ),
+            PresentationRect::new(100.0, 100.0, 20.0, 20.0).expect("canonical group"),
+            PresentationRect::new(200.0, 200.0, 40.0, 40.0).expect("presented group"),
+            false,
+        );
+        let ordinarily_presented = decoration
+            .with_presentation_transform(ordinary_transform)
+            .expect("ordinary decoration presentation");
+        let before_bounds = ordinarily_presented.scene_snapshot().bounds();
+
+        let translated = ordinarily_presented.translated_by_logical_offset(-480.0, 0.0);
+
+        assert_eq!(translated.origin().0, ordinarily_presented.origin().0 - 480);
+        assert_eq!(
+            translated.scene_snapshot().bounds(),
+            (
+                before_bounds.0 - 480,
+                before_bounds.1,
+                before_bounds.2,
+                before_bounds.3,
+            )
+        );
     }
 
     #[test]

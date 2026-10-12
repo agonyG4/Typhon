@@ -138,6 +138,12 @@ impl WorkspaceManager {
         self.workspaces.iter().copied()
     }
 
+    pub fn workspace_axis_position(&self, workspace: WorkspaceId) -> Option<f64> {
+        self.workspaces()
+            .position(|candidate| candidate == workspace)
+            .map(|index| index as f64)
+    }
+
     pub const fn workspace_count(&self) -> u32 {
         self.workspaces.len() as u32
     }
@@ -150,5 +156,24 @@ impl WorkspaceManager {
 impl Default for WorkspaceManager {
     fn default() -> Self {
         Self::new(DEFAULT_WORKSPACE_COUNT).expect("default workspace count is non-zero")
+    }
+}
+
+#[cfg(test)]
+mod workspace_axis_tests {
+    use super::*;
+
+    #[test]
+    fn workspace_axis_position_uses_regular_workspace_order() {
+        let manager = WorkspaceManager::new(4).unwrap();
+        let workspaces = manager.workspaces().collect::<Vec<_>>();
+
+        assert_eq!(manager.workspace_axis_position(workspaces[0]), Some(0.0));
+        assert_eq!(manager.workspace_axis_position(workspaces[1]), Some(1.0));
+        assert_eq!(manager.workspace_axis_position(workspaces[3]), Some(3.0));
+        assert_eq!(
+            manager.workspace_axis_position(WorkspaceId::new(99).unwrap()),
+            None
+        );
     }
 }

@@ -121,3 +121,26 @@ The required application matrix for a real TTY/DRM qualification is Palworld,
 Steam UI/popups/fullscreen launch, Firefox, Kitty move/resize, and one
 additional Vulkan game. Unit tests and `--dry-run` output are not real hardware
 qualification.
+
+## Workspace Slide Phase 1
+
+`workspace.slide` is executable for `workspace.switch`. The Astrea, KDE, and
+macOS presets request it for workspace switching; `workspace.window-move`
+remains unimplemented. The semantic active workspace changes immediately, and
+the frame renderer samples live surfaces from the visible cells along the
+continuous workspace path. Workspace motion uses the global animation speed
+setting. It does not retain a workspace framebuffer.
+
+Regular workspace content moves by the full logical output width. Layer-shell,
+wallpaper, the visible special workspace, and global overlays stay stationary.
+Input continues to target the semantic active workspace throughout the
+non-interactive transition. Phase 1 declines the slide and performs the
+immediate switch when the traversed path contains a true fullscreen owner, a
+visible retained lifecycle or WindowExit visual, or a held/DND interaction.
+Active slides use conservative full-output damage and block Direct Scanout.
+
+This implementation is not hardware-qualified until the real TTY compositor
+has been visually exercised for basic and reverse switches, non-adjacent
+traversal, rapid retargeting, blur in both participating workspaces, stationary
+shell content, ordinary window motion, special workspaces, fullscreen fallback,
+and both Wayland and XWayland clients. Unit tests do not replace that run.

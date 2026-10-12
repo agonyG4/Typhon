@@ -142,6 +142,7 @@ pub enum DirectScanoutSceneRejection {
     PresentationOpacity,
     LifecycleAnimation,
     WindowExitAnimation,
+    WorkspacePresentationTransition,
     PendingOrUnpublishedWork,
 }
 
@@ -176,6 +177,7 @@ impl DirectScanoutSceneRejection {
             Self::PresentationOpacity => "presentation_opacity",
             Self::LifecycleAnimation => "lifecycle_animation",
             Self::WindowExitAnimation => "window_exit_animation",
+            Self::WorkspacePresentationTransition => "workspace_presentation_transition",
             Self::PendingOrUnpublishedWork => "pending_or_unpublished_work",
         }
     }

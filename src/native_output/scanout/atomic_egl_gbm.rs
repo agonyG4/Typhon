@@ -2940,6 +2940,11 @@ impl AtomicEglGbmScanout {
                     } else {
                         (None, None)
                     };
+                if let Some(sample) = resolved_scene.workspace_presentation_sample.as_ref()
+                    && sample.mathematically_settled
+                {
+                    server.retire_workspace_presentation_if_rendered(sample);
+                }
                 server.mark_frame_callbacks_rendered(protocol_batch_id);
                 Ok(AtomicFrameRenderOutcome::Rendered {
                     frame_id,

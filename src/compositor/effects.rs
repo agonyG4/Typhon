@@ -173,6 +173,15 @@ pub struct ResolvedEffectScene {
     pub signature: u64,
 }
 
+#[derive(Clone, Copy)]
+pub struct FrameEffectSceneInput<'a> {
+    pub surfaces: &'a [super::RenderableSurface],
+    pub popup_surface_ids: &'a [u32],
+    pub presentation_owner_roots: &'a [u32],
+    pub workspace_by_owner_root: &'a HashMap<u32, crate::wm::WorkspaceId>,
+    pub workspace_sample: &'a super::WorkspacePresentationSample,
+}
+
 impl Default for ResolvedEffectScene {
     fn default() -> Self {
         Self::new(0, Vec::new())
@@ -441,6 +450,180 @@ impl super::CompositorState {
         }
         instances.sort_by_key(effect_semantic_sort_key);
         ResolvedEffectScene::new(self.scene_render_generation, instances)
+    }
+
+    pub(in crate::compositor) fn resolved_effect_scene_for_frame_surfaces(
+        &self,
+        surfaces: &[super::RenderableSurface],
+        popup_surface_ids: &[u32],
+    ) -> ResolvedEffectScene {
+        let groups = visual_stack_groups(surfaces, popup_surface_ids);
+        let visible_surface_ids = surfaces
+            .iter()
+            .map(|surface| surface.surface_id)
+            .collect::<std::collections::HashSet<_>>();
+        let mut instances = self
+            .internal_surface_effects
+            .values()
+            .chain(
+                self.protocol_surface_effects
+                    .values()
+                    .filter_map(|binding| binding.instance.as_ref()),
+            )
+            .filter(|instance| {
+                effect_anchor_surface_id(instance.anchor)
+                    .is_none_or(|surface_id| visible_surface_ids.contains(&surface_id))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let selected_background_effect = self.background_effect_enabled.then(|| {
+            let registry_generation = self.trusted_effect_registry.current();
+            let material_selection = self.material_program_control.snapshot(
+                &registry_generation,
+                self.material_program_rendering_available,
+            );
+            registry_generation
+                .effects
+                .get(&material_selection.effective_program)
+                .and_then(|effect| {
+                    self.material_program_parameter_control
+                        .parameter_block_for_effect(effect)
+                        .ok()
+                        .map(|parameters| (effect, parameters))
+                })
+                .map_or_else(
+                    || {
+                        (
+                            crate::effects::builtin_background_blur_program_id(),
+                            EffectParameterBlock::default(),
+                            EffectFrameDemand::OnDamage,
+                        )
+                    },
+                    |(effect, parameters)| {
+                        (
+                            effect.program.program.id,
+                            parameters,
+                            effect.program.program.frame_demand,
+                        )
+                    },
+                )
+        });
+        if let Some((selected_program, selected_parameter_block, selected_frame_demand)) =
+            selected_background_effect
+        {
+            let origins = super::surface_origins(surfaces);
+            for (surface, origin) in surfaces.iter().zip(origins.iter()) {
+                let Some(surface_resource) = self.surface_resource_by_id(surface.surface_id) else {
+                    continue;
+                };
+                let Some(surface_data) = surface_resource.data::<SurfaceData>() else {
+                    continue;
+                };
+                let client_request_committed =
+                    !surface_data.committed_background_effect().ops().is_empty();
+                let root_surface_id = self.root_surface_id_for_surface(surface.surface_id);
+                if root_surface_id != surface.surface_id && !client_request_committed {
+                    continue;
+                }
+                let Some(assignment) =
+                    self.blur_assignment_for_surface(surface, surface_data, *origin)
+                else {
+                    continue;
+                };
+                if !self.is_effective_blur_assignment(&assignment) {
+                    continue;
+                }
+                let Some(target_bounds) = assignment.region.bounding_rect() else {
+                    continue;
+                };
+                let coverage = if assignment.source
+                    == crate::compositor::blur_assignment::BlurAssignmentSource::Client
+                {
+                    surface_data
+                        .committed_background_effect_coverage()
+                        .and_then(|coverage| {
+                            coverage.translated(f64::from(origin.0), f64::from(origin.1))
+                        })
+                        .filter(EffectCoverage::is_enabled)
+                } else {
+                    None
+                };
+                instances.push(ResolvedEffectInstance {
+                    id: background_effect_instance_id(surface.surface_id),
+                    program: selected_program,
+                    anchor: EffectAnchor::BeforeSurface(surface.surface_id),
+                    signature: internal_effect_signature(
+                        surface.surface_id,
+                        EffectAnchor::BeforeSurface(surface.surface_id),
+                        selected_program,
+                        &assignment.region,
+                        &selected_parameter_block,
+                        coverage.as_ref(),
+                    ),
+                    frame_demand: selected_frame_demand,
+                    visual_group: Self::visual_group_for_surface_in_groups(
+                        surfaces,
+                        &groups,
+                        surface.surface_id,
+                    ),
+                    region: assignment.region,
+                    target_bounds,
+                    parameter_block: selected_parameter_block.clone(),
+                    coverage,
+                    anchor_scope: assignment.anchor_scope,
+                    backdrop_reuse: assignment.source.into(),
+                    scene_order: EffectSceneOrder::for_anchor(EffectAnchor::BeforeSurface(
+                        surface.surface_id,
+                    )),
+                });
+            }
+        }
+
+        for instance in &mut instances {
+            let surface_id = effect_anchor_surface_id(instance.anchor);
+            instance.visual_group = surface_id.and_then(|surface_id| {
+                Self::visual_group_for_surface_in_groups(surfaces, &groups, surface_id)
+            });
+            instance.scene_order = Self::scene_order_for_frame_instance(instance, surfaces);
+        }
+        instances.sort_by_key(effect_semantic_sort_key);
+        ResolvedEffectScene::new(self.scene_render_generation, instances)
+    }
+
+    fn scene_order_for_frame_instance(
+        instance: &ResolvedEffectInstance,
+        surfaces: &[super::RenderableSurface],
+    ) -> EffectSceneOrder {
+        let phase = match instance.anchor {
+            EffectAnchor::BeforeSurface(_) => 0,
+            EffectAnchor::ReplaceSurface(_) => 1,
+            EffectAnchor::AfterSurface(_) => 2,
+            EffectAnchor::OutputPostProcess => 3,
+        };
+        let Some(surface_id) = effect_anchor_surface_id(instance.anchor) else {
+            return EffectSceneOrder {
+                group_order: u32::MAX,
+                surface_order: u32::MAX,
+                phase,
+            };
+        };
+        let group_order = instance
+            .visual_group
+            .map_or(u32::MAX.saturating_sub(1), VisualGroupId::get);
+        let surface_order = match instance.anchor_scope {
+            EffectAnchorScope::Surface => surfaces
+                .iter()
+                .position(|surface| surface.surface_id == surface_id)
+                .and_then(|index| u32::try_from(index).ok())
+                .unwrap_or(u32::MAX.saturating_sub(1)),
+            EffectAnchorScope::VisualGroup => 0,
+        };
+        EffectSceneOrder {
+            group_order,
+            surface_order,
+            phase,
+        }
     }
 
     pub(in crate::compositor) fn direct_scanout_effect_doctor_details(
@@ -927,6 +1110,15 @@ fn effect_semantic_sort_key(instance: &ResolvedEffectInstance) -> (EffectSceneOr
     (instance.scene_order, instance.id.get())
 }
 
+fn effect_anchor_surface_id(anchor: EffectAnchor) -> Option<u32> {
+    match anchor {
+        EffectAnchor::BeforeSurface(surface_id)
+        | EffectAnchor::ReplaceSurface(surface_id)
+        | EffectAnchor::AfterSurface(surface_id) => Some(surface_id),
+        EffectAnchor::OutputPostProcess => None,
+    }
+}
+
 pub(in crate::compositor) fn map_effect_rect(
     transform: crate::presentation_animation::PresentationGroupTransform,
     rect: EffectRect,
@@ -1299,6 +1491,205 @@ mod tests {
         source_state[0].signature = 99;
         assert_eq!(scene.instances[0].signature, 1);
         assert_eq!(scene.generation, 7);
+    }
+
+    #[test]
+    fn frame_effect_scene_filters_bindings_to_the_frame_surface_stream() {
+        let mut state = crate::compositor::CompositorState::new(None);
+        let mut visible = test_effect_instance(
+            EffectInstanceId::new(11).unwrap(),
+            crate::effects::EffectFrameDemand::OnDamage,
+            EffectRegion::from_rect(EffectRect::new(10, 20, 80, 40).unwrap()),
+        );
+        visible.anchor = EffectAnchor::BeforeSurface(11);
+        visible.anchor_scope = EffectAnchorScope::Surface;
+        let mut off_path = visible.clone();
+        off_path.id = EffectInstanceId::new(22).unwrap();
+        off_path.anchor = EffectAnchor::BeforeSurface(22);
+        state.internal_surface_effects.insert(11, visible);
+        state.internal_surface_effects.insert(22, off_path);
+
+        let selected_surfaces = [test_effect_surface(11)];
+        let scene = state.resolved_effect_scene_for_frame_surfaces(&selected_surfaces, &[]);
+
+        assert_eq!(
+            scene
+                .instances
+                .iter()
+                .map(|instance| instance.anchor)
+                .collect::<Vec<_>>(),
+            [EffectAnchor::BeforeSurface(11)],
+            "effect bindings execute only when their anchors belong to this frame scene"
+        );
+        assert_eq!(scene.instances[0].scene_order.surface_order, 0);
+    }
+
+    #[test]
+    fn workspace_frame_effects_follow_window_presentation_then_translate_and_clip() {
+        use crate::compositor::{
+            WorkspaceLogicalClip, WorkspacePresentationParticipant, WorkspacePresentationSample,
+            WorkspacePresentationTransitionId,
+        };
+        use crate::presentation_animation::{
+            AnimationTime, PresentationGroupTransform, PresentationRect,
+            PresentationSampleTimeSource,
+        };
+
+        let mut state = crate::compositor::CompositorState::new(None);
+        let region = EffectRegion::from_rect(EffectRect::new(150, 20, 100, 40).unwrap());
+        let mut effect = test_effect_instance(
+            EffectInstanceId::new(31).unwrap(),
+            crate::effects::EffectFrameDemand::OnDamage,
+            region,
+        );
+        effect.anchor = EffectAnchor::BeforeSurface(11);
+        effect.anchor_scope = EffectAnchorScope::Surface;
+        state.internal_surface_effects.insert(11, effect);
+
+        let sampled_at = AnimationTime::from_nanos(15);
+        let output_id = crate::core::OutputId::from_raw(1).unwrap();
+        let mut ordinary_presentation =
+            crate::presentation_animation::PresentationSceneSample::empty_for_output(
+                output_id,
+                sampled_at,
+                PresentationSampleTimeSource::ZeroFallback,
+            );
+        ordinary_presentation
+            .transforms
+            .push(PresentationGroupTransform::new(
+                11,
+                crate::presentation_animation::TransitionId::new(
+                    std::num::NonZeroU64::new(2).unwrap(),
+                ),
+                PresentationRect::new(100.0, 20.0, 100.0, 40.0).unwrap(),
+                PresentationRect::new(200.0, 40.0, 200.0, 80.0).unwrap(),
+                false,
+            ));
+        let target_workspace = crate::wm::WorkspaceId::new(2).unwrap();
+        let workspace_sample = WorkspacePresentationSample {
+            transition_id: WorkspacePresentationTransitionId::new(9),
+            sampled_at,
+            position: 0.25,
+            velocity: 0.0,
+            target_position: 1.0,
+            target_workspace,
+            mathematically_settled: false,
+            participants: vec![WorkspacePresentationParticipant {
+                workspace: target_workspace,
+                workspace_index: 1,
+                offset_units: 0.75,
+                translation_x: 1440.0,
+                translation_y: 0.0,
+                logical_cell_clip: WorkspaceLogicalClip {
+                    x: 1440.0,
+                    y: 0.0,
+                    width: 480.0,
+                    height: 1080.0,
+                },
+            }],
+            signature: 42,
+        };
+        let selected_surfaces = [test_effect_surface(11)];
+        assert!(
+            state
+                .active_scene_surfaces()
+                .iter()
+                .all(|surface| surface.surface_id != 11),
+            "the workspace effect anchor is absent from the semantic active scene"
+        );
+        let selected_owner_roots = [11];
+        let workspace_by_owner_root = std::collections::HashMap::from([(11, target_workspace)]);
+        let fullscreen_plan = state.fullscreen_composition_plan();
+        let lifecycle = state.lifecycle_scene_sample_at(sampled_at);
+
+        let frame_source = FrameEffectSceneInput {
+            surfaces: &selected_surfaces,
+            popup_surface_ids: &[],
+            presentation_owner_roots: &selected_owner_roots,
+            workspace_by_owner_root: &workspace_by_owner_root,
+            workspace_sample: &workspace_sample,
+        };
+        let scene = state.resolved_effect_scene_with_frame_presentation(
+            &frame_source,
+            &ordinary_presentation,
+            &fullscreen_plan,
+            &lifecycle,
+        );
+
+        assert_eq!(scene.instances.len(), 1);
+        assert_eq!(
+            scene.instances[0].region.rects(),
+            &[EffectRect::new(1740, 40, 180, 80).unwrap()],
+            "ordinary presentation is applied before workspace translation and cell clipping"
+        );
+        assert_eq!(
+            scene.instances[0].target_bounds,
+            EffectRect::new(1740, 40, 180, 80).unwrap()
+        );
+        assert_ne!(scene.instances[0].signature, 1);
+
+        let mut next_workspace_sample = workspace_sample.clone();
+        next_workspace_sample.position = 0.30;
+        next_workspace_sample.signature = 43;
+        next_workspace_sample.participants[0].offset_units = 0.70;
+        next_workspace_sample.participants[0].translation_x = 1344.0;
+        next_workspace_sample.participants[0].logical_cell_clip.x = 1344.0;
+        next_workspace_sample.participants[0]
+            .logical_cell_clip
+            .width = 576.0;
+        let next_frame_source = FrameEffectSceneInput {
+            workspace_sample: &next_workspace_sample,
+            ..frame_source
+        };
+        let next_scene = state.resolved_effect_scene_with_frame_presentation(
+            &next_frame_source,
+            &ordinary_presentation,
+            &fullscreen_plan,
+            &lifecycle,
+        );
+
+        assert_ne!(scene.signature, next_scene.signature);
+        assert_ne!(
+            scene.instances[0].signature,
+            next_scene.instances[0].signature
+        );
+    }
+
+    fn test_effect_surface(surface_id: u32) -> crate::compositor::RenderableSurface {
+        use crate::compositor::{
+            RenderableSurface, RenderableSurfaceDamage, SurfaceCommitSequence, SurfacePlacement,
+            SurfaceRenderBackend,
+        };
+        use crate::render_backend::buffer::{
+            BufferIdAllocator, BufferSize, CommittedSurfaceBuffer,
+        };
+        use wayland_server::protocol::wl_output;
+
+        let size = BufferSize::new(80, 40).unwrap();
+        RenderableSurface {
+            surface_id,
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 40,
+            placement: SurfacePlacement::absolute_root_at(10, 20),
+            render_backend: SurfaceRenderBackend::NativeWayland,
+            render_placement: None,
+            visual_clip: None,
+            render_target_size: None,
+            generation: 1,
+            commit_sequence: SurfaceCommitSequence::initial(),
+            buffer: CommittedSurfaceBuffer::shm_snapshot(
+                BufferIdAllocator::default().allocate().unwrap(),
+                size,
+                vec![0; 80 * 40],
+            ),
+            viewport_source: None,
+            viewport_destination: None,
+            buffer_scale: 1,
+            buffer_transform: wl_output::Transform::Normal,
+            damage: RenderableSurfaceDamage::Full,
+        }
     }
 
     #[test]

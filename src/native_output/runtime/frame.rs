@@ -5,7 +5,7 @@ use oblivion_one::effects::{
 };
 use std::{
     borrow::Cow,
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     sync::{
         OnceLock,
         atomic::{AtomicU64, Ordering},
@@ -14,9 +14,13 @@ use std::{
 
 use oblivion_one::compositor::{
     AnimationTime, ClientCursorRenderState, DecorationRenderInstance, DecorationSceneSnapshot,
-    DesktopVisualState, FullscreenRenderPlanMetrics, PointerWarpOrigin, PresentationFrameSnapshot,
-    PresentationSceneSample, PresentedCanonicalSceneSnapshot, ResolvedEffectScene, SceneNodeId,
-    SurfaceResourceSyncState, WindowExitFrameEvidence,
+    DesktopVisualState, FrameEffectSceneInput, FullscreenRenderPlanMetrics, PointerWarpOrigin,
+    PresentationFrameSnapshot, PresentationSceneSample, PresentedCanonicalSceneSnapshot,
+    ResolvedEffectScene, SceneNodeId, SurfacePlacement, SurfaceResourceSyncState,
+    WindowExitFrameEvidence, WorkspacePresentationSample,
+};
+use oblivion_one::presentation_animation::{
+    PresentationClip, PresentationClipRect, PresentationGroupClip,
 };
 use oblivion_one::window_lifecycle_animation::{LifecycleFrameSnapshot, LifecycleSceneSample};
 
@@ -90,6 +94,7 @@ pub(crate) struct ResolvedNativeFrameScene<'a> {
     pub(crate) snapshot: NativeSceneSnapshot,
     pub(crate) canonical_scene_evidence: Option<PresentedCanonicalSceneSnapshot>,
     pub(crate) scene_identity_signature: u64,
+    pub(crate) workspace_presentation_sample: Option<WorkspacePresentationSample>,
     pub(crate) effects: ResolvedEffectScene,
     pub(crate) effect_scene_resolution_ns: Option<u64>,
     pub(crate) effect_scene_visible_instances: usize,
@@ -104,6 +109,146 @@ pub(crate) struct ResolvedNativeFrameScene<'a> {
     pub(crate) lifecycle_decorations: Vec<DecorationRenderInstance>,
     pub(crate) lifecycle_snapshot: LifecycleFrameSnapshot,
     pub(crate) window_exit_evidence: Vec<WindowExitFrameEvidence>,
+}
+
+fn translate_workspace_frame_surfaces<'a>(
+    surfaces: Cow<'a, [RenderableSurface]>,
+    presentation_owner_roots: &[u32],
+    translations_by_owner_root: &HashMap<u32, (f64, f64)>,
+) -> Cow<'a, [RenderableSurface]> {
+    assert_eq!(
+        surfaces.len(),
+        presentation_owner_roots.len(),
+        "workspace presentation owner roots must remain aligned with frame surfaces"
+    );
+    if translations_by_owner_root.is_empty() {
+        return surfaces;
+    }
+
+    let origins = oblivion_one::compositor::surface_origins(surfaces.as_ref());
+    let mut translated_origins = HashMap::with_capacity(surfaces.len());
+    for (index, (surface, owner_root)) in surfaces
+        .iter()
+        .zip(presentation_owner_roots.iter().copied())
+        .enumerate()
+    {
+        let Some((translation_x, translation_y)) = translations_by_owner_root.get(&owner_root)
+        else {
+            continue;
+        };
+        let Some((origin_x, origin_y)) = origins.get(index).copied() else {
+            continue;
+        };
+        translated_origins.insert(
+            surface.surface_id,
+            (
+                origin_x.saturating_add(translation_x.round() as i32),
+                origin_y.saturating_add(translation_y.round() as i32),
+            ),
+        );
+    }
+    if translated_origins.is_empty() {
+        return surfaces;
+    }
+
+    let mut translated = surfaces.to_vec();
+    for (surface, owner_root) in translated
+        .iter_mut()
+        .zip(presentation_owner_roots.iter().copied())
+    {
+        if !translations_by_owner_root.contains_key(&owner_root) {
+            continue;
+        }
+        let Some((origin_x, origin_y)) = translated_origins.get(&surface.surface_id).copied()
+        else {
+            continue;
+        };
+        let parent_surface_id = surface.placement.parent_surface_id.or_else(|| {
+            surface
+                .render_placement
+                .and_then(|placement| placement.parent_surface_id)
+        });
+        surface.render_placement = Some(match parent_surface_id {
+            Some(parent_surface_id) => {
+                let parent_origin =
+                    translated_origins
+                        .get(&parent_surface_id)
+                        .copied()
+                        .or_else(|| {
+                            surfaces
+                                .iter()
+                                .position(|candidate| candidate.surface_id == parent_surface_id)
+                                .and_then(|index| origins.get(index).copied())
+                        });
+                if let Some((parent_x, parent_y)) = parent_origin {
+                    SurfacePlacement::subsurface(
+                        parent_surface_id,
+                        origin_x.saturating_sub(parent_x).saturating_sub(surface.x),
+                        origin_y.saturating_sub(parent_y).saturating_sub(surface.y),
+                    )
+                } else {
+                    SurfacePlacement::absolute_root_at(
+                        origin_x.saturating_sub(surface.x),
+                        origin_y.saturating_sub(surface.y),
+                    )
+                }
+            }
+            None => SurfacePlacement::absolute_root_at(
+                origin_x.saturating_sub(surface.x),
+                origin_y.saturating_sub(surface.y),
+            ),
+        });
+    }
+    Cow::Owned(translated)
+}
+
+fn intersect_presentation_clip_rects(
+    left: PresentationClipRect,
+    right: PresentationClipRect,
+) -> PresentationClipRect {
+    let x = left.x().max(right.x());
+    let y = left.y().max(right.y());
+    let right_edge = (left.x() + left.width()).min(right.x() + right.width());
+    let bottom_edge = (left.y() + left.height()).min(right.y() + right.height());
+    PresentationClipRect::new(x, y, (right_edge - x).max(0.0), (bottom_edge - y).max(0.0))
+        .expect("intersecting finite presentation clips remains finite")
+}
+
+fn merge_workspace_presentation_clips(
+    presentation: &mut PresentationSceneSample,
+    workspace_clips_by_owner_root: &HashMap<u32, (SceneNodeId, PresentationClipRect)>,
+) {
+    for (&root_surface_id, &(scene_node_id, workspace_clip)) in workspace_clips_by_owner_root {
+        if let Some(existing) = presentation
+            .clips
+            .iter_mut()
+            .find(|clip| clip.root_surface_id == root_surface_id)
+        {
+            let presented_clip = existing
+                .presented_clip
+                .map(|clip| intersect_presentation_clip_rects(clip, workspace_clip))
+                .unwrap_or(workspace_clip);
+            let clip = match existing.clip {
+                PresentationClip::Rect(clip) => {
+                    intersect_presentation_clip_rects(clip, workspace_clip)
+                }
+                PresentationClip::Unbounded => workspace_clip,
+            };
+            existing.clip = PresentationClip::Rect(clip);
+            existing.presented_clip = Some(presented_clip);
+        } else {
+            presentation.clips.push(PresentationGroupClip {
+                scene_node_id,
+                root_surface_id,
+                clip: PresentationClip::Rect(workspace_clip),
+                presented_clip: Some(workspace_clip),
+                transition: None,
+            });
+        }
+    }
+    presentation
+        .clips
+        .sort_unstable_by_key(|clip| clip.root_surface_id);
 }
 
 fn freeze_presentation_effect_influences(
@@ -409,6 +554,7 @@ impl<'a> ResolvedNativeFrameScene<'a> {
         scene.snapshot = NativeSceneSnapshot::default();
         scene.canonical_scene_evidence = None;
         scene.scene_identity_signature = 0;
+        scene.workspace_presentation_sample = None;
         scene.effects = ResolvedEffectScene::default();
         scene.presentation = presentation;
         scene.presentation_snapshot = PresentationFrameSnapshot::from_sample(&scene.presentation);
@@ -463,6 +609,57 @@ impl<'a> ResolvedNativeFrameScene<'a> {
     ) -> Self {
         let (canonical_surfaces, canonical_scene_nodes, fullscreen_plan, visibility) =
             server.native_frame_renderable_surfaces_with_scene_nodes_and_composition_plan();
+        let workspace_frame_scene = server.workspace_frame_presentation_scene_at(at);
+        let workspace_presentation_sample = workspace_frame_scene
+            .as_ref()
+            .map(|scene| scene.workspace_sample.clone());
+        let workspace_by_owner_root = workspace_frame_scene
+            .as_ref()
+            .map(|scene| scene.workspace_by_owner_root.clone())
+            .unwrap_or_default();
+        let workspace_translations_by_owner_root = workspace_presentation_sample
+            .as_ref()
+            .map(|sample| {
+                workspace_by_owner_root
+                    .iter()
+                    .filter_map(|(&owner_root, workspace)| {
+                        sample
+                            .participants
+                            .iter()
+                            .find(|participant| participant.workspace == *workspace)
+                            .map(|participant| {
+                                (
+                                    owner_root,
+                                    (participant.translation_x, participant.translation_y),
+                                )
+                            })
+                    })
+                    .collect::<HashMap<_, _>>()
+            })
+            .unwrap_or_default();
+        let workspace_clips_by_owner_root = workspace_presentation_sample
+            .as_ref()
+            .map(|sample| {
+                workspace_by_owner_root
+                    .iter()
+                    .filter_map(|(&owner_root, workspace)| {
+                        let participant = sample
+                            .participants
+                            .iter()
+                            .find(|participant| participant.workspace == *workspace)?;
+                        let clip = PresentationClipRect::new(
+                            participant.logical_cell_clip.x,
+                            participant.logical_cell_clip.y,
+                            participant.logical_cell_clip.width,
+                            participant.logical_cell_clip.height,
+                        )?;
+                        let scene_node_id =
+                            server.presentation_scene_node_id_for_root(owner_root)?;
+                        Some((owner_root, (scene_node_id, clip)))
+                    })
+                    .collect::<HashMap<_, _>>()
+            })
+            .unwrap_or_default();
         let canonical_owner_roots = Cow::Owned(
             canonical_surfaces
                 .iter()
@@ -505,11 +702,52 @@ impl<'a> ResolvedNativeFrameScene<'a> {
             canonical_scene_nodes.as_ref(),
         );
         assert_surface_owner_alignment(canonical_surfaces.as_ref(), canonical_owner_roots.as_ref());
+        let semantic_owner_roots = canonical_owner_roots.clone();
+        let semantic_canonical_surface_ids = canonical_surfaces
+            .iter()
+            .map(|surface| surface.surface_id)
+            .collect::<HashSet<_>>();
+        let (frame_surfaces, frame_scene_nodes, frame_owner_roots, frame_popup_surface_ids) =
+            if let Some(frame_scene) = workspace_frame_scene {
+                let (surfaces, scene_nodes, owner_roots) = filter_surface_scene_nodes_with_owners(
+                    Cow::Owned(frame_scene.surfaces),
+                    Cow::Owned(frame_scene.scene_node_ids),
+                    Cow::Owned(frame_scene.presentation_owner_root_surface_ids),
+                    |surface| {
+                        !restore_suppressed_roots.contains(
+                            &server.lifecycle_root_surface_for_surface(surface.surface_id),
+                        ) && fullscreen_plan.allows_composition_root(
+                            server.presentation_owner_root_for_surface(surface.surface_id),
+                        )
+                    },
+                );
+                let popup_ids = frame_scene
+                    .popup_surface_ids
+                    .into_iter()
+                    .filter(|surface_id| {
+                        !restore_suppressed_roots
+                            .contains(&server.lifecycle_root_surface_for_surface(*surface_id))
+                            && fullscreen_plan.allows_composition_root(
+                                server.presentation_owner_root_for_surface(*surface_id),
+                            )
+                    })
+                    .collect::<Vec<_>>();
+                (surfaces, scene_nodes, owner_roots, Cow::Owned(popup_ids))
+            } else {
+                (
+                    canonical_surfaces,
+                    canonical_scene_nodes,
+                    canonical_owner_roots,
+                    Cow::Borrowed(server.popup_surface_ids()),
+                )
+            };
+        assert_surface_scene_node_alignment(frame_surfaces.as_ref(), frame_scene_nodes.as_ref());
+        assert_surface_owner_alignment(frame_surfaces.as_ref(), frame_owner_roots.as_ref());
         let exit_parts = resolve_window_exit_frame_parts(
             server,
-            &canonical_surfaces,
-            &canonical_scene_nodes,
-            &canonical_owner_roots,
+            &frame_surfaces,
+            &frame_scene_nodes,
+            &frame_owner_roots,
             at,
             sample_time_source,
         );
@@ -517,18 +755,36 @@ impl<'a> ResolvedNativeFrameScene<'a> {
         let all_canonical_ordered_surfaces = exit_parts.surfaces;
         let all_canonical_ordered_nodes = exit_parts.scene_nodes;
         let all_canonical_ordered_owners = exit_parts.owner_roots;
-        let surfaces = exit_parts.presented_surfaces;
-        let decorations = exit_parts.decorations;
+        let canonical_frame_surfaces = exit_parts.presented_surfaces.clone();
+        let surfaces = translate_workspace_frame_surfaces(
+            exit_parts.presented_surfaces,
+            all_canonical_ordered_owners.as_ref(),
+            &workspace_translations_by_owner_root,
+        );
+        let mut decorations = exit_parts.decorations;
+        for decoration in &mut decorations {
+            if let Some((translation_x, translation_y)) =
+                workspace_translations_by_owner_root.get(&decoration.root_surface_id())
+            {
+                *decoration =
+                    decoration.translated_by_logical_offset(*translation_x, *translation_y);
+            }
+        }
         let targets = exit_parts.targets;
-        let presentation = exit_parts.presentation;
-        let canonical_surface_ids = exit_parts.canonical_surface_ids;
+        let mut presentation = exit_parts.presentation;
+        merge_workspace_presentation_clips(&mut presentation, &workspace_clips_by_owner_root);
+        let canonical_surface_ids = exit_parts
+            .canonical_surface_ids
+            .into_iter()
+            .filter(|surface_id| semantic_canonical_surface_ids.contains(surface_id))
+            .collect::<HashSet<_>>();
         let canonical_key_by_surface = exit_parts.canonical_key_by_surface;
         let presentation_snapshot = PresentationFrameSnapshot::from_sample_with_presented_windows(
             &presentation,
             server.presented_window_geometries_for_targets(&presentation, &targets),
         );
         let lifecycle_snapshot = LifecycleFrameSnapshot::from_sample(&lifecycle);
-        let popup_surface_ids = Cow::Borrowed(server.popup_surface_ids());
+        let popup_surface_ids = frame_popup_surface_ids;
         let external_overlay_surface_ids = server.external_overlay_surface_ids(&lifecycle);
         let lifecycle_marker_insertions = lifecycle_marker_insertions(
             server,
@@ -538,18 +794,35 @@ impl<'a> ResolvedNativeFrameScene<'a> {
             popup_surface_ids.as_ref(),
             &external_overlay_surface_ids,
             &lifecycle,
-            canonical_owner_roots.as_ref(),
+            semantic_owner_roots.as_ref(),
             &exits,
         );
         let render_generation = server.scene_render_generation();
         let effect_registry_generation = server.trusted_effect_registry().current();
         let effect_scene_started = crate::pointer_debug::cursor_responsiveness_trace_enabled()
             .then(std::time::Instant::now);
-        let canonical_effects = server.resolved_effect_scene_for_presentation_with_lifecycle(
-            &presentation,
-            &fullscreen_plan,
-            &lifecycle,
-        );
+        let canonical_effects =
+            if let Some(workspace_sample) = workspace_presentation_sample.as_ref() {
+                let frame_effect_source = FrameEffectSceneInput {
+                    surfaces: frame_surfaces.as_ref(),
+                    popup_surface_ids: popup_surface_ids.as_ref(),
+                    presentation_owner_roots: frame_owner_roots.as_ref(),
+                    workspace_by_owner_root: &workspace_by_owner_root,
+                    workspace_sample,
+                };
+                server.resolved_effect_scene_for_workspace_frame_with_lifecycle(
+                    &frame_effect_source,
+                    &presentation,
+                    &fullscreen_plan,
+                    &lifecycle,
+                )
+            } else {
+                server.resolved_effect_scene_for_presentation_with_lifecycle(
+                    &presentation,
+                    &fullscreen_plan,
+                    &lifecycle,
+                )
+            };
         let effect_scene_resolution_ns = effect_scene_started
             .map(|started| started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64);
         let effect_scene_visible_instances = canonical_effects.instances.len();
@@ -620,18 +893,22 @@ impl<'a> ResolvedNativeFrameScene<'a> {
                 },
             );
         }
-        let (snapshot, scene_identity_signature) = finalize_snapshot(
+        let (snapshot, mut scene_identity_signature) = finalize_snapshot(
             snapshot,
             &external_overlay_surface_ids,
             visibility,
             &effects,
         );
+        if let Some(workspace_sample) = &workspace_presentation_sample {
+            scene_identity_signature = scene_identity_signature.wrapping_mul(0x0000_0100_0000_01b3)
+                ^ workspace_sample.signature;
+        }
         #[cfg(test)]
         {
             note_snapshot_finalization();
             note_identity_computation();
         }
-        let canonical_presented_surfaces = surfaces
+        let canonical_presented_surfaces = canonical_frame_surfaces
             .iter()
             .filter(|surface| canonical_surface_ids.contains(&surface.surface_id))
             .cloned()
@@ -705,6 +982,7 @@ impl<'a> ResolvedNativeFrameScene<'a> {
             snapshot,
             canonical_scene_evidence,
             scene_identity_signature,
+            workspace_presentation_sample,
             effects,
             effect_scene_resolution_ns,
             effect_scene_visible_instances,
@@ -733,6 +1011,7 @@ impl<'a> ResolvedNativeFrameScene<'a> {
             snapshot: self.snapshot,
             canonical_scene_evidence: self.canonical_scene_evidence,
             scene_identity_signature: self.scene_identity_signature,
+            workspace_presentation_sample: self.workspace_presentation_sample,
             effects: self.effects,
             effect_scene_resolution_ns: self.effect_scene_resolution_ns,
             effect_scene_visible_instances: self.effect_scene_visible_instances,
@@ -818,6 +1097,7 @@ pub(crate) struct NativeRepaintInputs {
     pub(crate) effect_work_pending: bool,
     pub(crate) effect_dirty_region: EffectRegion,
     pub(crate) page_flip_pending: bool,
+    pub(crate) workspace_animation_work: bool,
 }
 
 #[cfg(test)]
@@ -848,6 +1128,7 @@ pub(crate) fn native_repaint_decision(inputs: NativeRepaintInputs) -> NativeRepa
         && inputs.only_pending_surface_frame_callbacks
         && !inputs.render_generation_changed
         && !inputs.redraw_requested
+        && !inputs.workspace_animation_work
         && !effect_work_pending;
     NativeRepaintDecision {
         // Accepting a socket is protocol progress, not visual work.  The
@@ -858,6 +1139,7 @@ pub(crate) fn native_repaint_decision(inputs: NativeRepaintInputs) -> NativeRepa
             || inputs.redraw_requested
             || inputs.cursor_work_pending
             || effect_work_pending
+            || inputs.workspace_animation_work
             || (inputs.pending_frame_work && !protocol_only_present),
         protocol_only_present,
     }

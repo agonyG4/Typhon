@@ -8,8 +8,9 @@ use crate::native_output::output::{
     NativeSurfaceDamageEvidence, clip_damage_for_frame_snapshots,
 };
 use oblivion_one::compositor::{
-    PresentationFrameSnapshot, PresentationRect, PresentationSampleTimeSource,
-    PresentationSceneSample, PresentedWindowGeometry,
+    FullscreenRenderPlanMetrics, PresentationFrameSnapshot, PresentationRect,
+    PresentationSampleTimeSource, PresentationSceneSample, PresentedWindowGeometry,
+    ResolvedEffectScene,
 };
 use oblivion_one::core::SceneNodeId;
 use oblivion_one::effects::{
@@ -18,7 +19,7 @@ use oblivion_one::effects::{
 use oblivion_one::presentation_animation::{
     PresentationClip, PresentationClipRect, PresentationGroupClip,
 };
-use oblivion_one::window_lifecycle_animation::LifecycleFrameSnapshot;
+use oblivion_one::window_lifecycle_animation::{LifecycleFrameSnapshot, LifecycleSceneSample};
 
 fn native_damage_covers(damage: &NativeOutputDamage, expected: NativeDamageRect) -> bool {
     damage.kind == NativeDamageKind::FullOutput
@@ -165,6 +166,80 @@ fn snapshot_with_effect_recipe_at_generation(
         conservative_full: false,
     };
     snapshot
+}
+
+fn empty_resolved_scene_with_workspace_slide() -> ResolvedNativeFrameScene<'static> {
+    let output_id = OutputId::from_raw(1).expect("test output id");
+    let sampled_at = oblivion_one::compositor::AnimationTime::from_nanos(1);
+    ResolvedNativeFrameScene {
+        surfaces: std::borrow::Cow::Borrowed(&[]),
+        surface_scene_node_ids: std::borrow::Cow::Borrowed(&[]),
+        presentation_owner_root_surface_ids: std::borrow::Cow::Borrowed(&[]),
+        decorations: Vec::new(),
+        popup_surface_ids: std::borrow::Cow::Borrowed(&[]),
+        external_overlay_surface_ids: Vec::new(),
+        render_generation: 1,
+        visibility: FullscreenRenderPlanMetrics::default(),
+        snapshot: NativeSceneSnapshot::default(),
+        canonical_scene_evidence: None,
+        scene_identity_signature: 0,
+        workspace_presentation_sample: Some(
+            oblivion_one::compositor::WorkspacePresentationSample {
+                transition_id: oblivion_one::compositor::WorkspacePresentationTransitionId::new(1),
+                sampled_at,
+                position: 0.5,
+                velocity: 0.0,
+                target_position: 1.0,
+                target_workspace: oblivion_one::wm::WorkspaceId::new(2).expect("target workspace"),
+                mathematically_settled: false,
+                participants: Vec::new(),
+                signature: 9,
+            },
+        ),
+        effects: ResolvedEffectScene::default(),
+        effect_scene_resolution_ns: None,
+        effect_scene_visible_instances: 0,
+        presentation: PresentationSceneSample::empty_for_output(
+            output_id,
+            sampled_at,
+            PresentationSampleTimeSource::ZeroFallback,
+        ),
+        presentation_snapshot: PresentationFrameSnapshot::empty_for_output(output_id),
+        lifecycle: LifecycleSceneSample {
+            sampled_at,
+            samples: Vec::new(),
+            minimized_visual_resource_payload_ids: Vec::new(),
+        },
+        lifecycle_marker_insertions: Vec::new(),
+        lifecycle_surfaces: Vec::new(),
+        lifecycle_decorations: Vec::new(),
+        lifecycle_snapshot: LifecycleFrameSnapshot::default(),
+        window_exit_evidence: Vec::new(),
+    }
+}
+
+#[test]
+fn workspace_slide_damage_covers_the_full_output_even_without_surface_damage() {
+    let resolved = empty_resolved_scene_with_workspace_slide();
+    let damage = super::presentation_worker::native_scene_damage_for_resolved_scene(
+        1920,
+        1080,
+        &NativeSceneSnapshot::default(),
+        &resolved,
+        NativeCursorDamageBounds::default(),
+    );
+
+    assert_eq!(damage.kind, NativeDamageKind::FullOutput);
+    assert_eq!(damage.pixels, 1920 * 1080);
+    assert_eq!(
+        damage.rects,
+        [NativeDamageRect {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        }]
+    );
 }
 
 #[test]

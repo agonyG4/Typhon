@@ -846,6 +846,7 @@ fn native_repaint_decision_skips_visible_frame_callback_without_damage() {
             effect_work_pending: false,
             effect_dirty_region: oblivion_one::effects::EffectRegion::empty(),
             page_flip_pending: false,
+            workspace_animation_work: false,
         }),
         NativeRepaintDecision {
             repaint: false,
@@ -867,6 +868,7 @@ fn accepting_client_without_visual_work_does_not_request_repaint() {
             effect_work_pending: false,
             effect_dirty_region: oblivion_one::effects::EffectRegion::empty(),
             page_flip_pending: false,
+            workspace_animation_work: false,
         }),
         NativeRepaintDecision {
             repaint: false,
@@ -888,6 +890,7 @@ fn native_repaint_decision_paints_non_callback_pending_frame_work() {
             effect_work_pending: false,
             effect_dirty_region: oblivion_one::effects::EffectRegion::empty(),
             page_flip_pending: false,
+            workspace_animation_work: false,
         }),
         NativeRepaintDecision {
             repaint: true,
@@ -909,7 +912,32 @@ fn native_repaint_decision_paints_visual_changes_even_with_frame_callback() {
             effect_work_pending: false,
             effect_dirty_region: oblivion_one::effects::EffectRegion::empty(),
             page_flip_pending: false,
+            workspace_animation_work: false,
         }),
+        NativeRepaintDecision {
+            repaint: true,
+            protocol_only_present: false,
+        }
+    );
+}
+
+#[test]
+fn native_repaint_decision_continues_workspace_animation_without_other_work() {
+    let decision = native_repaint_decision(NativeRepaintInputs {
+        accepted_clients: false,
+        render_generation_changed: false,
+        pending_frame_work: false,
+        only_pending_surface_frame_callbacks: false,
+        redraw_requested: false,
+        cursor_work_pending: false,
+        effect_work_pending: false,
+        effect_dirty_region: oblivion_one::effects::EffectRegion::empty(),
+        page_flip_pending: false,
+        workspace_animation_work: true,
+    });
+
+    assert_eq!(
+        decision,
         NativeRepaintDecision {
             repaint: true,
             protocol_only_present: false,
@@ -930,6 +958,7 @@ fn native_repaint_decision_paints_cursor_work_without_primary_work() {
             effect_work_pending: false,
             effect_dirty_region: oblivion_one::effects::EffectRegion::empty(),
             page_flip_pending: false,
+            workspace_animation_work: false,
         }),
         NativeRepaintDecision {
             repaint: true,
@@ -951,6 +980,7 @@ fn native_repaint_decision_waits_for_pending_pageflip_before_repaint() {
             effect_work_pending: false,
             effect_dirty_region: oblivion_one::effects::EffectRegion::empty(),
             page_flip_pending: true,
+            workspace_animation_work: false,
         }),
         NativeRepaintDecision {
             repaint: false,
@@ -983,6 +1013,7 @@ fn predictive_o1_retry_never_renders_without_active_frame() {
         effect_work_pending: false,
         effect_dirty_region: oblivion_one::effects::EffectRegion::empty(),
         page_flip_pending: false,
+        workspace_animation_work: false,
     });
     assert!(
         queued_redraw_requested && repaint.repaint,
@@ -1225,6 +1256,7 @@ fn continuous_effect_work_requests_a_compositor_owned_frame() {
                 oblivion_one::effects::EffectRect::new(10, 10, 20, 20).unwrap(),
             ),
             page_flip_pending: false,
+            workspace_animation_work: false,
         }),
         NativeRepaintDecision {
             repaint: true,

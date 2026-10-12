@@ -579,6 +579,7 @@ impl NativeRuntime {
             effect_work_pending: effect_demand.continuous_visible,
             effect_dirty_region: effect_demand.dirty_region.clone(),
             page_flip_pending: false,
+            workspace_animation_work: server.workspace_presentation_active(),
         });
         if let Some(start_ns) = cursor_planning_started_at_ns {
             slow_cycle_trace.record_phase(

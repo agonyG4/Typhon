@@ -206,6 +206,12 @@ impl crate::compositor::CompositorState {
         self.presentation_animator.set_enabled(enabled);
         self.set_lifecycle_animation_enabled(enabled);
         self.reconcile_lifecycle_animation_policy();
+        if !enabled && self.workspace_presentation.clear() {
+            self.refresh_frame_work_visibility();
+            self.advance_render_generation(
+                crate::compositor::RenderGenerationCause::WorkspaceSwitch,
+            );
+        }
         Ok(self.animation_control_snapshot())
     }
 }

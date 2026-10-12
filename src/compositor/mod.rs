@@ -242,7 +242,7 @@ pub use direct_scanout::{
 pub(crate) use effects::ProtocolSurfaceEffectBinding;
 pub use effects::{
     EffectAnchor, EffectAnchorScope, EffectFrameDemandSnapshot, EffectSceneOrder,
-    EffectSceneSummary, ResolvedEffectInstance, ResolvedEffectScene,
+    EffectSceneSummary, FrameEffectSceneInput, ResolvedEffectInstance, ResolvedEffectScene,
 };
 pub(crate) use effects::{SurfaceEffectBindingKey, SurfaceEffectBindingOwners, SurfaceEffectSlot};
 pub use fullscreen::{
@@ -821,6 +821,8 @@ pub struct CompositorState {
     pub(in crate::compositor) pending_x11_activation: Option<PendingX11Activation>,
     pub(in crate::compositor) pending_xwayland_restores: HashMap<WindowId, PendingXwaylandRestore>,
     pub(in crate::compositor) workspace_manager: WorkspaceManager,
+    pub(in crate::compositor) workspace_presentation:
+        state::workspace_presentation::WorkspacePresentationState,
     pub(in crate::compositor) window_stacking: Vec<WindowId>,
     pub(in crate::compositor) applied_override_redirect_stack: Option<(XwaylandGeneration, u64)>,
     xwayland_scene_batch: XwaylandSceneBatchState,
@@ -1245,6 +1247,10 @@ pub use presented_frame::{PresentedFramePublication, PresentedLifecycleScene};
 pub use state::window_exit_retained::{
     WindowExitFrozenContent, WindowExitPainterOrder, WindowExitRenderGroup, WindowExitSurfaceMerge,
     window_exit_stack_order_key,
+};
+pub use state::workspace_presentation::{
+    WorkspaceFramePresentationScene, WorkspaceLogicalClip, WorkspacePresentationParticipant,
+    WorkspacePresentationSample, WorkspacePresentationTransitionId,
 };
 use state::*;
 #[cfg(test)]

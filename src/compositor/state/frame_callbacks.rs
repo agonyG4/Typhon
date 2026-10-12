@@ -27,6 +27,29 @@ impl SurfaceFrameClockState {
 }
 
 impl CompositorState {
+    fn surface_is_visible_for_frame_work(&self, surface_id: u32) -> bool {
+        if self.surface_is_visible_in_active_scene(surface_id) {
+            return true;
+        }
+        let owner_root = self.presentation_owner_root_for_surface(surface_id);
+        let Some(window_id) = self.window_id_for_surface(owner_root) else {
+            return false;
+        };
+        let Some(owner_id) = self.workspace_owner_window_id(window_id) else {
+            return false;
+        };
+        self.window(owner_id).is_some_and(|window| {
+            !window.state.is_minimized()
+                && window.management.is_some_and(|management| {
+                    matches!(
+                        management.location(),
+                        WorkspaceLocation::Regular(workspace)
+                            if self.regular_workspace_is_visible_for_frame_work(workspace)
+                    )
+                })
+        })
+    }
+
     pub(in crate::compositor) fn queue_frame_callbacks_for_surface(
         &mut self,
         surface_id: u32,
@@ -35,7 +58,7 @@ impl CompositorState {
         for callback in callbacks {
             self.pending_frame_callback_surfaces
                 .insert(callback.id(), surface_id);
-            if self.surface_is_visible_in_active_scene(surface_id) {
+            if self.surface_is_visible_for_frame_work(surface_id) {
                 self.visible_pending_frame_callbacks.push(callback);
                 self.visible_pending_frame_callback_count =
                     self.visible_pending_frame_callback_count.saturating_add(1);
@@ -139,7 +162,7 @@ impl CompositorState {
                 .get(&callback.id())
                 .copied();
             if surface_id
-                .is_some_and(|surface_id| self.surface_is_visible_in_active_scene(surface_id))
+                .is_some_and(|surface_id| self.surface_is_visible_for_frame_work(surface_id))
             {
                 self.visible_pending_frame_callbacks.push(callback);
             } else {
@@ -363,7 +386,7 @@ impl CompositorState {
                 .client_cursor_render_state()
                 .is_some_and(|cursor| cursor.surface.surface_id == feedback.surface_id);
         }
-        let visible = self.surface_is_visible_in_active_scene(feedback.surface_id);
+        let visible = self.surface_is_visible_for_frame_work(feedback.surface_id);
         let root = self.presentation_owner_root_for_surface(feedback.surface_id);
         let allowed = fullscreen_plan.allows_composition_root(root);
         visible && allowed
@@ -426,7 +449,7 @@ impl CompositorState {
                 .pending_frame_callback_surfaces
                 .get(&callback.id())
                 .copied()
-                .is_some_and(|surface_id| self.surface_is_visible_in_active_scene(surface_id));
+                .is_some_and(|surface_id| self.surface_is_visible_for_frame_work(surface_id));
             if visible {
                 self.visible_pending_frame_callbacks.push(callback);
                 self.visible_pending_frame_callback_count =

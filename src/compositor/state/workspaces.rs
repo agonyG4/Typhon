@@ -2,6 +2,10 @@ use crate::wm::{
     LayoutMembership, SpecialWorkspaceId, SpecialWorkspaceToggleOutcome, WorkspaceId,
     WorkspaceLocation, WorkspaceSwitchOutcome,
 };
+use crate::{
+    animation_control::{AnimationEffect, AnimationRuntimeCapabilities, AnimationSlot},
+    presentation_animation::{AnimationCurve, AnimationTime, SpringSpec},
+};
 
 use super::pointer_constraints::PointerConstraintDeactivationReason;
 use super::*;
@@ -22,6 +26,131 @@ struct WorkspaceMembershipTransition {
 impl CompositorState {
     pub(in crate::compositor) fn active_workspace(&self) -> WorkspaceId {
         self.workspace_manager.active_workspace()
+    }
+
+    fn workspace_slide_admission_fallback(
+        &self,
+        previous: WorkspaceId,
+        target: WorkspaceId,
+        sampled_at: AnimationTime,
+    ) -> Option<&'static str> {
+        if !self.animation_control.enabled()
+            || self.animation_control.effective_effect(
+                AnimationSlot::WorkspaceSwitch,
+                AnimationRuntimeCapabilities::default(),
+            ) != AnimationEffect::WorkspaceSlide
+        {
+            return Some("effect_disabled");
+        }
+
+        let Some(previous_position) = self.workspace_manager.workspace_axis_position(previous)
+        else {
+            return Some("invalid_workspace_axis");
+        };
+        let Some(target_position) = self.workspace_manager.workspace_axis_position(target) else {
+            return Some("invalid_workspace_axis");
+        };
+        let start_position = self
+            .workspace_presentation
+            .transition()
+            .and_then(|_| {
+                self.workspace_presentation
+                    .sample_at(&self.workspace_manager, sampled_at, 1.0, 1.0)
+            })
+            .map_or(previous_position, |sample| sample.position);
+        let path_start = start_position.min(target_position);
+        let path_end = start_position.max(target_position);
+        let traverses_fullscreen = self.desktop_windows.keys().copied().any(|window_id| {
+            let Some(owner_id) = self.workspace_owner_window_id(window_id) else {
+                return false;
+            };
+            let Some(window) = self.window(owner_id) else {
+                return false;
+            };
+            if window.state.is_minimized() || window.state.mode() != ToplevelMode::Fullscreen {
+                return false;
+            }
+            let Some(WorkspaceLocation::Regular(workspace)) =
+                window.management.map(|management| management.location())
+            else {
+                return false;
+            };
+            self.workspace_manager
+                .workspace_axis_position(workspace)
+                .is_some_and(|position| position >= path_start && position <= path_end)
+        });
+        if traverses_fullscreen {
+            return Some("fullscreen_path");
+        }
+        if self.lifecycle_animation_has_pending_visible() {
+            return Some("retained_lifecycle_active");
+        }
+        if self.window_exit_payloads.active_payloads().next().is_some() {
+            return Some("window_exit_active");
+        }
+        if self.active_drag.is_some()
+            || self.implicit_pointer_grab.is_some()
+            || !self.held_pointer_buttons.is_empty()
+            || self.window_interaction.is_some()
+        {
+            return Some("dnd_or_interaction");
+        }
+        None
+    }
+
+    fn begin_workspace_slide(
+        &mut self,
+        outcome: WorkspaceSwitchOutcome,
+        sampled_at: AnimationTime,
+    ) {
+        let WorkspaceSwitchOutcome::Changed { previous, current } = outcome else {
+            return;
+        };
+        if let Some(reason) = self.workspace_slide_admission_fallback(previous, current, sampled_at)
+        {
+            let transition_id = self
+                .workspace_presentation
+                .transition()
+                .map_or(0, |transition| transition.id.get());
+            self.workspace_presentation.clear();
+            if crate::pointer_debug::cursor_responsiveness_trace_enabled() {
+                eprintln!(
+                    "workspace_slide_fallback transition_id={transition_id} reason={reason} previous_workspace={} target_workspace={}",
+                    previous.get(),
+                    current.get(),
+                );
+            }
+            return;
+        }
+
+        let curve = crate::animation_control::scale_curve(
+            AnimationCurve::spring(SpringSpec::new(300.0, 38.1051).with_settlement(0.0001, 0.002)),
+            self.animation_control.configuration().speed,
+        );
+        let retarget = self.workspace_presentation.transition().is_some();
+        if let Some(transition_id) = self.workspace_presentation.activate_for_switch(
+            outcome,
+            &self.workspace_manager,
+            sampled_at,
+            curve,
+        ) && crate::pointer_debug::cursor_responsiveness_trace_enabled()
+            && let Some(transition) = self.workspace_presentation.transition()
+        {
+            let event = if retarget {
+                "workspace_slide_retarget"
+            } else {
+                "workspace_slide_start"
+            };
+            eprintln!(
+                "{event} transition_id={} previous_workspace={} target_workspace={} start_position={:.6} start_velocity={:.6} target_position={:.6}",
+                transition_id.get(),
+                previous.get(),
+                current.get(),
+                transition.start_position,
+                transition.start_velocity,
+                transition.target_position,
+            );
+        }
     }
 
     pub(in crate::compositor) fn toggle_default_special_workspace(
@@ -207,6 +336,16 @@ impl CompositorState {
             .is_none_or(|window_id| self.window_is_visible_in_active_scene(window_id))
     }
 
+    pub(in crate::compositor) fn regular_workspace_is_visible_for_frame_work(
+        &self,
+        workspace: WorkspaceId,
+    ) -> bool {
+        workspace == self.active_workspace()
+            || self
+                .workspace_presentation
+                .path_contains_workspace(&self.workspace_manager, workspace)
+    }
+
     pub(in crate::compositor) fn workspace_owner_window_id(
         &self,
         window_id: WindowId,
@@ -248,6 +387,9 @@ impl CompositorState {
         let WorkspaceSwitchOutcome::Changed { .. } = outcome else {
             return outcome;
         };
+        let sampled_at = AnimationTime::monotonic_now().unwrap_or(AnimationTime::from_nanos(0));
+        self.begin_workspace_slide(outcome, sampled_at);
+        self.refresh_frame_work_visibility();
         self.workspace_scene_transition_active = true;
         let location = WorkspaceLocation::Regular(workspace);
         let layout_batch = (self.tiled_layout.tree(location).is_some()

@@ -635,6 +635,113 @@ fn resolved_native_frame_scene_excludes_culled_transition_owner() {
 }
 
 #[test]
+fn resolved_native_frame_scene_carries_workspace_presentation_sample() {
+    let socket_name = format!("typhon-workspace-frame-sample-{}", process::id());
+    let mut server = OwnCompositorServer::bind_cpu_composition(&socket_name)
+        .expect("bind compositor for workspace-frame sample regression");
+    server
+        .set_animation_configuration(oblivion_one::animation_control::AnimationConfiguration {
+            enabled: true,
+            overrides: std::collections::BTreeMap::from([(
+                oblivion_one::animation_control::AnimationSlot::WorkspaceSwitch,
+                oblivion_one::animation_control::AnimationEffect::WorkspaceSlide,
+            )]),
+            ..oblivion_one::animation_control::AnimationConfiguration::default()
+        })
+        .expect("enable workspace slide for frame-scene regression");
+    server.install_native_frame_test_scene(
+        vec![test_surface(
+            691,
+            320,
+            200,
+            SurfacePlacement::absolute_root_at(20, 30),
+        )],
+        &[],
+        None,
+    );
+    let target = oblivion_one::wm::WorkspaceId::new(2).expect("workspace id");
+    assert!(matches!(
+        server.activate_workspace(target),
+        oblivion_one::wm::WorkspaceSwitchOutcome::Changed { current, .. }
+            if current == target
+    ));
+
+    let resolved = ResolvedNativeFrameScene::from_server(&server);
+    let workspace_sample = resolved
+        .workspace_presentation_sample
+        .as_ref()
+        .expect("active workspace transition is sampled in the frame scene");
+
+    assert_eq!(workspace_sample.target_workspace, target);
+    assert_eq!(resolved.surface_ids().collect::<Vec<_>>(), [691]);
+}
+
+#[test]
+fn workspace_translation_moves_frame_geometry_without_changing_client_extent() {
+    let mut surfaces = vec![
+        test_surface(901, 320, 200, SurfacePlacement::absolute_root_at(20, 30)),
+        test_surface(902, 640, 360, SurfacePlacement::absolute_root_at(40, 50)),
+    ];
+    let presented_size = BufferSize::new(720, 405).expect("presented render target size");
+    surfaces[1].render_target_size = Some(presented_size);
+    let offsets = std::collections::HashMap::from([(901, (-480.0, 0.0)), (902, (1440.0, 0.0))]);
+
+    let translated =
+        super::translate_workspace_frame_surfaces(Cow::Owned(surfaces), &[901, 902], &offsets);
+
+    assert_eq!(
+        oblivion_one::compositor::surface_origins(translated.as_ref()),
+        [(-460, 30), (1480, 50)]
+    );
+    assert_eq!((translated[0].width, translated[0].height), (320, 200));
+    assert_eq!((translated[1].width, translated[1].height), (640, 360));
+    assert_eq!(translated[1].render_target_size, Some(presented_size));
+}
+
+#[test]
+fn workspace_cell_clip_intersects_an_existing_presentation_clip() {
+    let output_id = oblivion_one::core::OutputId::from_raw(1).expect("test output id");
+    let root_surface_id = 912;
+    let scene_node_id = oblivion_one::core::SceneNodeId::from_raw(912).expect("scene node id");
+    let existing_clip =
+        oblivion_one::presentation_animation::PresentationClipRect::new(10.0, 10.0, 50.0, 50.0)
+            .expect("existing clip");
+    let workspace_clip =
+        oblivion_one::presentation_animation::PresentationClipRect::new(40.0, 0.0, 50.0, 80.0)
+            .expect("workspace cell clip");
+    let mut presentation = PresentationSceneSample::empty_for_output(
+        output_id,
+        AnimationTime::from_nanos(1),
+        oblivion_one::compositor::PresentationSampleTimeSource::ZeroFallback,
+    );
+    presentation.clips.push(
+        oblivion_one::presentation_animation::PresentationGroupClip {
+            scene_node_id,
+            root_surface_id,
+            clip: oblivion_one::presentation_animation::PresentationClip::Rect(existing_clip),
+            presented_clip: Some(existing_clip),
+            transition: None,
+        },
+    );
+
+    super::merge_workspace_presentation_clips(
+        &mut presentation,
+        &std::collections::HashMap::from([(root_surface_id, (scene_node_id, workspace_clip))]),
+    );
+
+    assert_eq!(presentation.clips.len(), 1);
+    assert_eq!(
+        presentation.clips[0].presented_clip,
+        Some(
+            oblivion_one::presentation_animation::PresentationClipRect::new(
+                40.0, 10.0, 20.0, 50.0,
+            )
+            .expect("intersection clip")
+        )
+    );
+}
+
+#[test]
 fn synchronous_modeset_candidate_is_a_client_free_transition_projection() {
     let socket_name = format!("typhon-frame-modeset-candidate-{}", process::id());
     let mut server = OwnCompositorServer::bind_cpu_composition(&socket_name)
@@ -906,6 +1013,7 @@ fn snapshot_ref_preserves_constructor_popup_ids_and_order() {
             ),
             canonical_scene_evidence: None,
             scene_identity_signature: 0,
+            workspace_presentation_sample: None,
             effects: ResolvedEffectScene::default(),
             effect_scene_resolution_ns: None,
             effect_scene_visible_instances: 0,

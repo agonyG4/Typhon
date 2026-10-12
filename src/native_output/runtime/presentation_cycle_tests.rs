@@ -58,6 +58,7 @@ fn auto_hardware_cursor_deadline_does_not_queue_primary_render_work() {
         effect_work_pending: false,
         effect_dirty_region: oblivion_one::effects::EffectRegion::empty(),
         page_flip_pending: false,
+        workspace_animation_work: false,
     });
     assert!(!repaint.repaint);
 
