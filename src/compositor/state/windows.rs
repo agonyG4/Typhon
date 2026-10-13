@@ -2732,7 +2732,11 @@ impl CompositorState {
         }
 
         if current_mode == mode {
-            self.restore_normal_root_window_from(surface_id, source)
+            if mode == ToplevelMode::Fullscreen {
+                self.restore_after_fullscreen_root_window_from(surface_id, source)
+            } else {
+                self.restore_normal_root_window_from(surface_id, source)
+            }
         } else {
             self.set_root_window_mode_from(surface_id, mode, source)
         }
@@ -2892,6 +2896,64 @@ impl CompositorState {
     #[cfg(test)]
     pub(in crate::compositor) fn restore_normal_root_window(&mut self, surface_id: u32) -> bool {
         self.restore_normal_root_window_from(surface_id, WindowModeRequestSource::OtherInternal)
+    }
+
+    /// Updates a pending maximization request while the client remains fullscreen.
+    /// None means the normal (non-fullscreen) transition path should handle it.
+    pub(in crate::compositor) fn update_fullscreen_return_mode_from_xdg(
+        &mut self,
+        surface_id: u32,
+        return_mode: ToplevelMode,
+    ) -> Option<bool> {
+        if self.toplevel_window_state(surface_id)?.mode() != ToplevelMode::Fullscreen {
+            return None;
+        }
+        self.toplevel_window_state_mut(surface_id)?
+            .set_fullscreen_restore_mode(return_mode);
+        let geometry = self.window_geometry_for_surface_mode(surface_id, ToplevelMode::Fullscreen);
+        Some(
+            self.send_configure_root_window_to(
+                surface_id,
+                ToplevelConfigureSize::Suggested {
+                    width: geometry.width,
+                    height: geometry.height,
+                },
+                ToplevelMode::Fullscreen.xdg_states(),
+            )
+            .is_some(),
+        )
+    }
+
+    pub(in crate::compositor) fn restore_after_fullscreen_root_window_from(
+        &mut self,
+        surface_id: u32,
+        source: WindowModeRequestSource,
+    ) -> bool {
+        let Some(window) = self.toplevel_window_state(surface_id) else {
+            return false;
+        };
+        if window.mode() != ToplevelMode::Fullscreen {
+            let mode = window.mode();
+            let geometry = self.window_geometry_for_surface_mode(surface_id, mode);
+            return self
+                .send_configure_root_window_to(
+                    surface_id,
+                    ToplevelConfigureSize::Suggested {
+                        width: geometry.width,
+                        height: geometry.height,
+                    },
+                    mode.xdg_states(),
+                )
+                .is_some();
+        }
+        match window.fullscreen_restore_mode() {
+            ToplevelMode::Maximized => {
+                self.set_root_window_mode_from(surface_id, ToplevelMode::Maximized, source)
+            }
+            ToplevelMode::Normal | ToplevelMode::Fullscreen => {
+                self.restore_normal_root_window_from(surface_id, source)
+            }
+        }
     }
 
     pub(in crate::compositor) fn restore_normal_root_window_from(

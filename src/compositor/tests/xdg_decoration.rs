@@ -1300,7 +1300,6 @@ fn delayed_surface_commit_uses_captured_decoration_state_without_syncobj() {
     client.pump(&commands).unwrap();
 
     let blocked = capture_xdg_role_snapshot(&commands, client.surface.id().protocol_id());
-    assert_eq!(blocked.pending_explicit_sync_commits, 0);
     assert_eq!(blocked.pending_surface_tree_transactions, 1);
     assert_eq!(capture_native_decoration_count(&commands), 0);
 
@@ -1505,8 +1504,7 @@ fn delayed_surface_commit_uses_decoration_state_captured_at_commit() {
     wait_for_server_commands(&commands);
     let blocked = capture_xdg_role_snapshot(&commands, client.surface.id().protocol_id());
     assert_eq!(
-        blocked.pending_explicit_sync_commits + blocked.pending_surface_tree_transactions,
-        1,
+        blocked.pending_surface_tree_transactions, 1,
         "C1 must remain unpublished while its acquire point is unsignaled: {blocked:?}"
     );
     assert_eq!(capture_native_decoration_count(&commands), 0);
@@ -1554,9 +1552,7 @@ fn delayed_surface_commit_uses_decoration_state_captured_at_commit() {
     wait_for_server_commands(&commands);
     let blocked_destroy = capture_xdg_role_snapshot(&commands, client.surface.id().protocol_id());
     assert_eq!(
-        blocked_destroy.pending_explicit_sync_commits
-            + blocked_destroy.pending_surface_tree_transactions,
-        1,
+        blocked_destroy.pending_surface_tree_transactions, 1,
         "C4 must remain unpublished while its acquire point is unsignaled: {blocked_destroy:?}"
     );
     assert_eq!(capture_native_decoration_count(&commands), 1);

@@ -51,6 +51,71 @@ fn wayland_client_can_create_subsurface_on_oblivion_server() {
 }
 
 #[test]
+fn destroying_parent_then_subsurface_allows_role_recreation() {
+    // The parent wl_surface can be destroyed before its child's
+    // wl_subsurface object. The child may be reused after the latter dies.
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind_cpu_composition(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    let stream = UnixStream::connect(&socket_path).unwrap();
+    let connection = Connection::from_socket(stream).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let subcompositor: client_wl_subcompositor::WlSubcompositor =
+        globals.bind(&qh, 1..=1, ()).unwrap();
+    let original_parent = compositor.create_surface(&qh, ());
+    let new_parent = compositor.create_surface(&qh, ());
+    let child = compositor.create_surface(&qh, ());
+    let child_protocol_id = child.id().protocol_id();
+    let new_parent_protocol_id = new_parent.id().protocol_id();
+
+    let old_role = subcompositor.get_subsurface(&child, &original_parent, &qh, ());
+    connection.flush().unwrap();
+    queue.roundtrip(&mut RegistryTestState::default()).unwrap();
+    let child_id = resolve_internal_surface_id(&commands, child_protocol_id);
+    let new_parent_id = resolve_internal_surface_id(&commands, new_parent_protocol_id);
+    assert_eq!(
+        capture_surface_role_state(&commands, child_id),
+        ("subsurface".into(), true)
+    );
+
+    original_parent.destroy();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut RegistryTestState::default()).unwrap();
+    assert_eq!(
+        capture_surface_role_state(&commands, child_id),
+        ("subsurface".into(), true)
+    );
+
+    old_role.destroy();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut RegistryTestState::default()).unwrap();
+    assert_eq!(
+        capture_surface_role_state(&commands, child_id),
+        ("unassigned".into(), false)
+    );
+
+    let _new_role = subcompositor.get_subsurface(&child, &new_parent, &qh, ());
+    connection.flush().unwrap();
+    queue.roundtrip(&mut RegistryTestState::default()).unwrap();
+    assert_eq!(
+        capture_surface_role_state(&commands, child_id),
+        ("subsurface".into(), true)
+    );
+
+    let server = stop_controllable_test_server(commands, server_thread);
+    assert_eq!(server.state.compliance_metrics.protocol_errors_total, 0);
+    assert_eq!(
+        server.state.surface_role(child_id),
+        SurfaceRole::Subsurface {
+            parent_id: new_parent_id
+        }
+    );
+}
+
+#[test]
 fn wayland_client_subsurface_commit_tracks_parent_relative_position() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();

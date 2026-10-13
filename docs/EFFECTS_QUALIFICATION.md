@@ -43,6 +43,42 @@ Keep `TYPHON_EFFECT_PRECOMPUTED_WINDOW_BLUR=off` for qualification. No
 performance claim is valid until deterministic correctness is followed by a
 comparable native A/B workload.
 
+## Terminal Kawase Composite Fusion (Milestone 2A)
+
+The same-binary control is
+`TYPHON_EFFECT_TERMINAL_BLUR_FUSION=off|on`. Unset, `off`, and unknown values
+select `off`; values are trimmed and case-insensitive. Unknown values warn
+once per process. The default remains `off` during qualification.
+
+This is an exact causal physical-rendering optimization. It keeps each
+window's existing scene capture and checkpoint dependencies, and does not
+precompute or share backdrop state. For an eligible canonical blur it removes
+the final full-resolution Kawase materialization and the local material
+texture, then runs that final upsample and the existing ColorMatrix/Tint/Noise
+chain inside the final Composite. The Composite remains authoritative for
+output encoding, alpha mode, presentation opacity, analytic coverage,
+visual-group clipping, blending, framebuffer orientation, and damage scissors.
+
+`EffectDebugKawaseMode::Full` disables terminal fusion for that frame so the
+existing full-Kawase diagnostic continues to show the unfused stages. The
+terminal shader is prewarmed as Composite variant 1. Its upsample work remains
+timed as `Composite`; compare total Effects GPU time and frame/fence tails,
+since Composite duration is expected to increase.
+
+Before a native comparison, require deterministic compiler, demand-footprint,
+shader-coordinate, and real GLES off/on equivalence checks. The synthesized
+15-window canonical fixture should report 105 passes and 0 fusions with policy
+off, then 75 passes, 15 fusions, and 30 elided passes with policy on. Captures
+must remain unchanged. Native qualification must use the same release binary,
+hold `TYPHON_EFFECT_PRECOMPUTED_WINDOW_BLUR=off` and
+`TYPHON_EFFECT_DEMAND_PLANNER=legacy` constant, and alternate the same
+overlapping 15-Kitty workload between fusion off and on. Verify
+`terminal_blur_fusion_policy`, `terminal_blur_fusion_candidates`,
+`terminal_blur_fusions`, and `terminal_blur_passes_elided` in the graph trace
+before interpreting pass or timing changes. A pass-count reduction alone is
+not a native performance result; no native-performance claim is valid without
+comparable A/B evidence.
+
 ## Precomputed synthesized-window blur experiment
 
 The diagnostic environment variable is

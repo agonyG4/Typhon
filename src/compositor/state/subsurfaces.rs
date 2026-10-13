@@ -887,6 +887,22 @@ impl CompositorState {
             })
             .collect::<HashMap<_, _>>();
         let Some(detached) = self.surface_transactions.detach_role(surface_id) else {
+            // Removing a parent wl_surface can discard cached transaction
+            // relationships while the child's wl_subsurface object is alive.
+            // Retire the live role if that object is later destroyed.
+            if let Some(LiveRoleInstance::Subsurface { parent_id }) =
+                self.surface_role_lifecycle(surface_id).live_instance
+            {
+                self.deactivate_role_instance(surface_id);
+                self.set_surface_placement(surface_id, SurfacePlacement::root());
+                self.detach_subsurface_from_parent_stack_lineage(parent_id, surface_id);
+                self.reorder_renderable_surfaces_by_committed_stack();
+                if crate::compositor::state::roles::surface_tree_debug_enabled() {
+                    eprintln!(
+                        "oblivion-one compositor: subsurface_role_retired_without_transaction surface={surface_id} parent={parent_id}"
+                    );
+                }
+            }
             return;
         };
         let parent_id = detached.relationship.parent_id;

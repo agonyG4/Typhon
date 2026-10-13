@@ -15,6 +15,7 @@ pub(crate) struct MinimizedVisualSnapshot {
 #[derive(Debug, Clone)]
 pub(crate) struct WindowState {
     mode: ToplevelMode,
+    fullscreen_restore_mode: Option<ToplevelMode>,
     normal_restore_target: Option<NormalRestoreTarget>,
     minimized_surfaces: Vec<RenderableSurface>,
     minimized: bool,
@@ -28,7 +29,24 @@ impl WindowState {
     }
 
     pub(super) fn set_mode(&mut self, mode: ToplevelMode) {
+        if self.mode != ToplevelMode::Fullscreen && mode == ToplevelMode::Fullscreen {
+            self.fullscreen_restore_mode = Some(self.mode);
+        } else if mode != ToplevelMode::Fullscreen {
+            self.fullscreen_restore_mode = None;
+        }
         self.mode = mode;
+    }
+
+    pub(super) fn fullscreen_restore_mode(&self) -> ToplevelMode {
+        self.fullscreen_restore_mode.unwrap_or(ToplevelMode::Normal)
+    }
+
+    /// XDG maximize requests during fullscreen update the return mode without
+    /// changing the currently fullscreen presentation.
+    pub(super) fn set_fullscreen_restore_mode(&mut self, mode: ToplevelMode) {
+        if self.mode == ToplevelMode::Fullscreen && mode != ToplevelMode::Fullscreen {
+            self.fullscreen_restore_mode = Some(mode);
+        }
     }
 
     pub(super) fn is_minimized(&self) -> bool {
@@ -163,6 +181,7 @@ impl Default for WindowState {
     fn default() -> Self {
         Self {
             mode: ToplevelMode::Normal,
+            fullscreen_restore_mode: None,
             normal_restore_target: None,
             minimized_surfaces: Vec::new(),
             minimized: false,
@@ -262,6 +281,31 @@ pub(super) fn xdg_toplevel_state_bytes(states: &[xdg_toplevel::State]) -> Vec<u8
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fullscreen_retains_previously_maximized_mode_until_exit() {
+        let mut window = WindowState::default();
+        window.set_mode(ToplevelMode::Maximized);
+        window.set_mode(ToplevelMode::Fullscreen);
+        window.set_mode(ToplevelMode::Fullscreen);
+        assert_eq!(window.fullscreen_restore_mode(), ToplevelMode::Maximized);
+        window.set_mode(ToplevelMode::Maximized);
+        assert_eq!(window.fullscreen_restore_mode, None);
+    }
+
+    #[test]
+    fn fullscreen_underlying_mode_tracks_maximize_requests() {
+        let mut window = WindowState::default();
+        window.set_mode(ToplevelMode::Fullscreen);
+        assert_eq!(window.fullscreen_restore_mode(), ToplevelMode::Normal);
+        window.set_fullscreen_restore_mode(ToplevelMode::Maximized);
+        assert_eq!(window.fullscreen_restore_mode(), ToplevelMode::Maximized);
+        assert_eq!(window.mode(), ToplevelMode::Fullscreen);
+        window.set_fullscreen_restore_mode(ToplevelMode::Normal);
+        assert_eq!(window.fullscreen_restore_mode(), ToplevelMode::Normal);
+        window.set_mode(ToplevelMode::Normal);
+        assert_eq!(window.fullscreen_restore_mode, None);
+    }
 
     #[test]
     fn minimized_destination_survives_until_restore_uses_it_then_can_be_cleared() {

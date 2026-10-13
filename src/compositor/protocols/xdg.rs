@@ -980,17 +980,28 @@ impl Dispatch<xdg_toplevel::XdgToplevel, XdgToplevelData> for CompositorState {
                         client.id(),
                     );
                 }
-                state.set_root_window_mode_from(
-                    surface_id,
-                    ToplevelMode::Maximized,
-                    super::super::state::WindowModeRequestSource::XdgClient,
-                );
+                if state
+                    .update_fullscreen_return_mode_from_xdg(surface_id, ToplevelMode::Maximized)
+                    .is_none()
+                {
+                    state.set_root_window_mode_from(
+                        surface_id,
+                        ToplevelMode::Maximized,
+                        super::super::state::WindowModeRequestSource::XdgClient,
+                    );
+                }
             }
             xdg_toplevel::Request::UnsetMaximized => {
-                state.restore_normal_root_window_from(
-                    compositor_surface_id(&data.surface),
-                    super::super::state::WindowModeRequestSource::XdgClient,
-                );
+                let surface_id = compositor_surface_id(&data.surface);
+                if state
+                    .update_fullscreen_return_mode_from_xdg(surface_id, ToplevelMode::Normal)
+                    .is_none()
+                {
+                    state.restore_normal_root_window_from(
+                        surface_id,
+                        super::super::state::WindowModeRequestSource::XdgClient,
+                    );
+                }
             }
             xdg_toplevel::Request::SetFullscreen { output } => {
                 let surface_id = compositor_surface_id(&data.surface);
@@ -1030,7 +1041,7 @@ impl Dispatch<xdg_toplevel::XdgToplevel, XdgToplevelData> for CompositorState {
                         client.id(),
                     );
                 }
-                state.restore_normal_root_window_from(
+                state.restore_after_fullscreen_root_window_from(
                     surface_id,
                     super::super::state::WindowModeRequestSource::XdgClient,
                 );

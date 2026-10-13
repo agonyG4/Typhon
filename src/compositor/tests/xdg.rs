@@ -2772,6 +2772,46 @@ fn rapid_xdg_popup_cycles_leave_no_stale_popup_state() {
 }
 
 #[test]
+fn xdg_maximized_fullscreen_exit_returns_to_maximized() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    let connection = Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let (surface, _xdg_surface, toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 380, 220).unwrap();
+    surface.commit();
+    connection.flush().unwrap();
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state).unwrap();
+
+    toplevel.set_maximized();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    assert!(state.toplevel_has_state(client_xdg_toplevel::State::Maximized));
+    assert!(!state.toplevel_has_state(client_xdg_toplevel::State::Fullscreen));
+
+    toplevel.set_fullscreen(None);
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    assert!(state.toplevel_has_state(client_xdg_toplevel::State::Fullscreen));
+
+    toplevel.unset_fullscreen();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    assert!(!state.toplevel_has_state(client_xdg_toplevel::State::Fullscreen));
+    assert!(state.toplevel_has_state(client_xdg_toplevel::State::Maximized));
+    assert_eq!((state.toplevel_width, state.toplevel_height), (1280, 800));
+
+    stop_controllable_test_server(commands, server_thread);
+}
+
+#[test]
 fn xdg_fullscreen_settles_active_workspace_slide_but_maximize_keeps_it_active() {
     let socket_name = unique_socket_name();
     let mut server = OwnCompositorServer::bind(&socket_name).unwrap();
@@ -2835,6 +2875,58 @@ fn xdg_fullscreen_settles_active_workspace_slide_but_maximize_keeps_it_active() 
     queue.roundtrip(&mut state).unwrap();
     assert!(state.toplevel_has_state(client_xdg_toplevel::State::Fullscreen));
     assert!(!capture_workspace_presentation_active(&commands));
+
+    stop_controllable_test_server(commands, server_thread);
+}
+
+#[test]
+fn xdg_fullscreen_return_mode_tracks_maximize_changes_without_exiting_fullscreen() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    let connection = Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let (surface, _xdg_surface, toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 380, 220).unwrap();
+    surface.commit();
+    connection.flush().unwrap();
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state).unwrap();
+
+    toplevel.set_fullscreen(None);
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    assert!(state.toplevel_has_state(client_xdg_toplevel::State::Fullscreen));
+
+    toplevel.set_maximized();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    assert!(state.toplevel_has_state(client_xdg_toplevel::State::Fullscreen));
+    assert!(!state.toplevel_has_state(client_xdg_toplevel::State::Maximized));
+
+    toplevel.unset_fullscreen();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    assert!(state.toplevel_has_state(client_xdg_toplevel::State::Maximized));
+    assert!(!state.toplevel_has_state(client_xdg_toplevel::State::Fullscreen));
+
+    toplevel.set_fullscreen(None);
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    toplevel.unset_maximized();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    assert!(state.toplevel_has_state(client_xdg_toplevel::State::Fullscreen));
+    toplevel.unset_fullscreen();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    assert!(!state.toplevel_has_state(client_xdg_toplevel::State::Maximized));
+    assert!(!state.toplevel_has_state(client_xdg_toplevel::State::Fullscreen));
 
     stop_controllable_test_server(commands, server_thread);
 }

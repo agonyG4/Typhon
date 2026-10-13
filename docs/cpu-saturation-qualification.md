@@ -20,16 +20,16 @@ Run [`scripts/typhon_cpu_saturation_probe.py`](../scripts/typhon_cpu_saturation_
 while the native Typhon process is alive:
 
 ```bash
-findmnt -T /mnt/Aether/Desktop/GitHub
-mkdir -p /mnt/Aether/Desktop/GitHub/Typhon-cpu-saturation/idle-1
+mkdir -p diagnostics/idle-1
 python3 scripts/typhon_cpu_saturation_probe.py \
   --pid "$TYPHON_PID" --duration 300 --interval 0.5 \
-  --output /mnt/Aether/Desktop/GitHub/Typhon-cpu-saturation/idle-1/os.jsonl
+  --output "$PWD/diagnostics/idle-1/os.jsonl"
 ```
 
-The probe refuses to write unless `/mnt/Aether` is mounted, the Aether GitHub
-directory exists on that same filesystem, and the new output file resolves
-beneath that directory. It does not overwrite an existing trial file. Set
+The probe accepts absolute output paths inside the repository's `diagnostics/`
+directory or the historical `/mnt/Aether/Desktop/GitHub` results root.
+For Aether output, the mount must still be available and on the correct
+filesystem. It does not overwrite an existing trial file. Set
 `TYPHON_PID` only after checking that `ps -p "$TYPHON_PID" -o pid,comm,args`
 names the native Typhon process.
 
@@ -57,7 +57,7 @@ The probe is separate from Typhon's frame path and samples at 0.5-second or
 slower intervals. Running it adds a small amount of procfs/sysfs and output I/O;
 use the same interval for every comparison. Do not run it for more than 30
 minutes per invocation. It aggregates only scheduler sample values in memory;
-the full samples are streamed to the Aether output file.
+the full samples are streamed to the selected output file.
 
 ## Typhon traces
 
@@ -65,7 +65,7 @@ Use a fresh output directory for every trial. `bin/start-oblivion-one-tty` selec
 1920x1080@165 Hz. Launch on the target TTY with:
 
 ```bash
-TRIAL_DIR=/mnt/Aether/Desktop/GitHub/Typhon-cpu-saturation/idle-1
+TRIAL_DIR="$PWD/diagnostics/idle-1"
 mkdir -p "$TRIAL_DIR"
 TYPHON_SLOW_CYCLE_TRACE=1 \
 TYPHON_POINTER_TIMING_TRACE=1 \

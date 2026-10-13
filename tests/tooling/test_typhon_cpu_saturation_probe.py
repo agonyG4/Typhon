@@ -269,6 +269,15 @@ class OutputPathTests(unittest.TestCase):
             with self.subTest(path=path), self.assertRaises(ValueError):
                 validate_output_path(path, root)
 
+    def test_accepts_local_diagnostics_and_legacy_aether_paths(self) -> None:
+        local = Path(__file__).resolve().parents[2] / "diagnostics" / "test" / "os.jsonl"
+        aether = Path("/mnt/Aether/Desktop/GitHub/Typhon-cpu-saturation/test/os.jsonl")
+        self.assertEqual(validate_output_path(local), local.resolve())
+        self.assertEqual(validate_output_path(aether), aether.resolve())
+        for path in (Path("/tmp/os.jsonl"), Path("diagnostics/os.jsonl")):
+            with self.subTest(path=path), self.assertRaises(ValueError):
+                validate_output_path(path)
+
 
 if __name__ == "__main__":
     unittest.main()

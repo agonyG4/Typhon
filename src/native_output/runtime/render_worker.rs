@@ -43,6 +43,23 @@ pub(super) const fn effect_reload_admission_available(
     worker_active && !worker_busy && !reload_pending
 }
 
+/// A completed render worker cannot submit KMS from its completion callback.
+/// Even without a target/lane wait, the physical frame must become scheduler
+/// READY before another render can reuse the active pacing owner.
+fn handoff_render_worker_ready(
+    frame_pacing: &mut NativeFramePacing,
+    frame_scheduler: &mut NativeFrameScheduler,
+    ready_at_ns: u64,
+    waits_for_target: bool,
+    render_ahead: bool,
+) {
+    frame_pacing.note_ready_frame(ready_at_ns, waits_for_target);
+    frame_scheduler.note_ready_frame(None);
+    if render_ahead {
+        frame_pacing.note_predictive_unbound_ready();
+    }
+}
+
 impl NativeRuntime {
     fn complete_worker_effect_reload(
         &mut self,
@@ -386,15 +403,20 @@ impl NativeRuntime {
                         }
                     }
                     self.queued_redraw_requested = true;
-                } else if waits_for_target {
+                } else {
+                    // Worker completion only produces a physical READY; KMS
+                    // submission belongs to the next reactor scheduling pass.
+                    // Without this handoff, reactive frames remain in ACTIVE
+                    // and the next render attempts to bind a second frame.
                     self.server
                         .note_frame_callbacks_deferred_ready(protocol_batch_id);
-                    self.frame_pacing
-                        .note_ready_frame(settled.ready_at_ns, waits_for_target);
-                    self.frame_scheduler.note_ready_frame(None);
-                    if outer.render_ahead {
-                        self.frame_pacing.note_predictive_unbound_ready();
-                    }
+                    handoff_render_worker_ready(
+                        &mut self.frame_pacing,
+                        &mut self.frame_scheduler,
+                        settled.ready_at_ns,
+                        waits_for_target,
+                        outer.render_ahead,
+                    );
                 }
                 self.frame_pacing.log(
                     "render_complete",
@@ -651,7 +673,63 @@ impl NativeRuntime {
 
 #[cfg(test)]
 mod tests {
-    use super::effect_reload_admission_available;
+    use super::{effect_reload_admission_available, handoff_render_worker_ready};
+    use crate::native_output::presentation::transaction::test_deferred_o1_reservation;
+    use crate::native_output::runtime::{NativeFramePacing, NativeFrameScheduler};
+    use crate::native_output::scanout::{OutputFrameIdentitySnapshot, OutputSlotId};
+    use oblivion_one::native::scheduler::NativeOutputPacingMode;
+    use std::num::NonZeroU64;
+
+    fn identity(frame_id: u64) -> OutputFrameIdentitySnapshot {
+        OutputFrameIdentitySnapshot {
+            output_id: oblivion_one::core::OutputId::from_raw(1).unwrap(),
+            frame_id,
+            protocol_batch_id: oblivion_one::compositor::CompositorFrameBatchId::new(
+                NonZeroU64::new(frame_id).unwrap(),
+            ),
+            transaction_id: crate::native_output::OutputTransactionId::new(
+                NonZeroU64::new(frame_id).unwrap(),
+            ),
+            slot: OutputSlotId::new(1).unwrap(),
+            framebuffer_id: oblivion_one::native::kms::FramebufferId::new(frame_id as u32).unwrap(),
+            render_generation: frame_id,
+            pool_generation: 1,
+            reservation: test_deferred_o1_reservation(),
+        }
+    }
+
+    #[test]
+    fn worker_completion_hands_off_reactive_ready_without_lane_wait() {
+        for waits_for_target in [false, true] {
+            let mut pacing = NativeFramePacing::from_env();
+            let mut scheduler = NativeFrameScheduler::new_with_refresh_interval_ns(16_666_667, 0);
+            pacing.queue_visual(1, 1);
+            scheduler.queue_visual_work();
+            pacing
+                .begin_render_attempt(NativeOutputPacingMode::ReactiveDouble, false)
+                .unwrap();
+            let first = identity(1);
+            pacing.bind_physical_output_frame(first).unwrap();
+            scheduler.consume_visual_work();
+
+            handoff_render_worker_ready(&mut pacing, &mut scheduler, 2, waits_for_target, false);
+            assert_eq!(pacing.active, None);
+            assert!(pacing.ready.is_some());
+            assert_eq!(pacing.unsubmitted_physical_identity(), Some(first));
+            assert_eq!(pacing.active_physical_identity(), None);
+            assert!(scheduler.ready_frame_queued());
+
+            // The next render must be able to bind a different physical frame
+            // without inheriting the completed worker's active identity.
+            pacing.queue_visual(3, 2);
+            pacing
+                .begin_render_attempt(NativeOutputPacingMode::ReactiveDouble, false)
+                .unwrap();
+            pacing.bind_physical_output_frame(identity(2)).unwrap();
+            assert_eq!(pacing.active_physical_identity(), Some(identity(2)));
+            assert_eq!(pacing.unsubmitted_physical_identity(), Some(first));
+        }
+    }
 
     #[test]
     fn effect_reload_admission_is_single_flight_and_requires_idle_worker() {

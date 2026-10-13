@@ -592,8 +592,7 @@ fn render_lifecycle_overlap_pixel(
             sample.visual_group = LifecycleVisualGroup::from_bounds(
                 PresentationRect::new(60.0, 40.0, 180.0, 110.0).expect("canonical client rect"),
                 PresentationRect::new(40.0, 20.0, 220.0, 160.0).expect("canonical visual rect"),
-                PresentationRect::new(60.0, 40.0, 180.0, 110.0)
-                    .expect("presented client rect"),
+                PresentationRect::new(60.0, 40.0, 180.0, 110.0).expect("presented client rect"),
                 PresentationRect::new(220.0, 130.0, 60.0, 40.0).expect("anchor rect"),
                 320,
                 200,
@@ -742,8 +741,16 @@ fn render_lifecycle_overlap_pixel(
         !retained_above,
         "lifecycle marker must occupy the selected compositor stack position"
     );
-    let overlap_left = marker_command.bounds.x().max(upper_command.bounds.x()).max(0.0);
-    let overlap_top = marker_command.bounds.y().max(upper_command.bounds.y()).max(0.0);
+    let overlap_left = marker_command
+        .bounds
+        .x()
+        .max(upper_command.bounds.x())
+        .max(0.0);
+    let overlap_top = marker_command
+        .bounds
+        .y()
+        .max(upper_command.bounds.y())
+        .max(0.0);
     let overlap_right = (marker_command.bounds.x() + marker_command.bounds.width())
         .min(upper_command.bounds.x() + upper_command.bounds.width())
         .min(320.0);
@@ -940,9 +947,14 @@ fn egl_lifecycle_marker_replays_without_canonical_vertices_in_full_repaint() {
         }
     };
     assert!(evidence.contains(identity, resolved.lifecycle.samples[0].payload_id, 633));
-    assert!(harness.renderer.scene_state.commands.iter().all(|command| {
-        !matches!(command.layer, EglDrawLayer::Surface(_))
-    }));
+    assert!(
+        harness
+            .renderer
+            .scene_state
+            .commands
+            .iter()
+            .all(|command| { !matches!(command.layer, EglDrawLayer::Surface(_)) })
+    );
     assert!(
         harness
             .renderer
@@ -2172,7 +2184,9 @@ fn egl_lifecycle_background_blur_renders_reverses_and_keeps_real_capture_failure
         .visual_source
         .presentation_identity = failed_identity;
     failed_lifecycle.samples[0].visual_source.payload_id = failed_payload;
-    failed_lifecycle.samples[0].visual_source.resource_payload_id = failed_payload;
+    failed_lifecycle.samples[0]
+        .visual_source
+        .resource_payload_id = failed_payload;
     resolved.lifecycle = failed_lifecycle;
     set_test_lifecycle_marker_insertions(&server, &mut resolved);
     resolved.lifecycle_snapshot =
@@ -3210,8 +3224,15 @@ fn egl_lifecycle_background_blur_renders_retained_content_on_top_left_scanout() 
         .filter(|(_, event)| event.starts_with("event=effect_graph_release_end "))
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
-    assert!(graph_begins.len() >= 2, "source and frame effect graphs: {trace:?}");
-    assert_eq!(graph_ends.len(), graph_begins.len(), "graph executions: {trace:?}");
+    assert!(
+        graph_begins.len() >= 2,
+        "source and frame effect graphs: {trace:?}"
+    );
+    assert_eq!(
+        graph_ends.len(),
+        graph_begins.len(),
+        "graph executions: {trace:?}"
+    );
     assert_eq!(
         graph_release_begins.len(),
         graph_begins.len(),

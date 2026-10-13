@@ -2137,10 +2137,10 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                         }
                     }
                     ServerCommand::CapturePendingLockedPointerReveal(reply) => {
-                        let _ = reply.send(server.state.pending_locked_pointer_reveal.is_some());
+                        let _ = reply.send(server.state.has_pending_locked_pointer_reveal());
                     }
                     ServerCommand::CapturePendingLockedPointerRevealAndBackendRequests(reply) => {
-                        let pending = server.state.pending_locked_pointer_reveal.is_some();
+                        let pending = server.state.has_pending_locked_pointer_reveal();
                         let requests = server.take_pointer_constraint_backend_requests();
                         let _ = reply.send((pending, requests));
                     }

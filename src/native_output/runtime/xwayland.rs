@@ -835,7 +835,6 @@ mod tests {
                 XwmCommand::SetState {
                     window: dead,
                     state: Default::default(),
-                    frame_extents: [0; 4],
                 },
                 XwmCommand::Stack {
                     window: live,
