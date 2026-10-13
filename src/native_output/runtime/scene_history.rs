@@ -50,6 +50,24 @@ pub(crate) struct NativeSceneHistory {
     latest_submitted_frame_id: Option<u64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SceneSubmissionRollbackError {
+    TokenMissing,
+    TokenNotUnique,
+    OutputMismatch,
+    FrameIdentityMismatch,
+    RenderGenerationMismatch,
+    ReadyOccupied,
+}
+
+impl std::fmt::Display for SceneSubmissionRollbackError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{self:?}")
+    }
+}
+
+impl std::error::Error for SceneSubmissionRollbackError {}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PreparedNativePresentationTransition {
     pub(crate) token: u64,
@@ -188,6 +206,50 @@ impl NativeSceneHistory {
             .map(|(_, snapshot)| snapshot.frame_id)
     }
 
+    pub(crate) fn submitted_identity(&self, token: u64) -> Option<(OutputId, u64, u64)> {
+        self.submitted
+            .iter()
+            .find(|(submitted_token, _)| *submitted_token == token)
+            .map(|(_, snapshot)| {
+                (
+                    snapshot.output_id,
+                    snapshot.frame_id,
+                    snapshot.render_generation,
+                )
+            })
+    }
+
+    pub(crate) fn discard_submission_exact(
+        &mut self,
+        token: u64,
+        expected_output_id: OutputId,
+        expected_frame_id: u64,
+        expected_render_generation: u64,
+    ) -> Result<(), SceneSubmissionRollbackError> {
+        let mut matching = self
+            .submitted
+            .iter()
+            .enumerate()
+            .filter(|(_, (submitted_token, _))| *submitted_token == token);
+        let Some((index, (_, snapshot))) = matching.next() else {
+            return Err(SceneSubmissionRollbackError::TokenMissing);
+        };
+        if matching.next().is_some() {
+            return Err(SceneSubmissionRollbackError::TokenNotUnique);
+        }
+        if self.output_id != expected_output_id || snapshot.output_id != expected_output_id {
+            return Err(SceneSubmissionRollbackError::OutputMismatch);
+        }
+        if snapshot.frame_id != expected_frame_id {
+            return Err(SceneSubmissionRollbackError::FrameIdentityMismatch);
+        }
+        if snapshot.render_generation != expected_render_generation {
+            return Err(SceneSubmissionRollbackError::RenderGenerationMismatch);
+        }
+        self.submitted.remove(index);
+        Ok(())
+    }
+
     pub(crate) fn presented_snapshot(&self) -> Option<&NativeFrameSceneSnapshot> {
         self.presented.as_ref()
     }
@@ -265,6 +327,65 @@ impl NativeSceneHistory {
         self.queue_submission(token).then_some(()).ok_or_else(|| {
             io::Error::other("native submission has no rendered scene snapshot").into()
         })
+    }
+
+    pub(crate) fn validate_submission_to_ready_rollback(
+        &self,
+        token: u64,
+        expected_output_id: OutputId,
+        expected_frame_id: u64,
+        expected_render_generation: u64,
+    ) -> Result<(), SceneSubmissionRollbackError> {
+        let mut matching = self
+            .submitted
+            .iter()
+            .enumerate()
+            .filter(|(_, (submitted_token, _))| *submitted_token == token);
+        let Some((_, (_, snapshot))) = matching.next() else {
+            return Err(SceneSubmissionRollbackError::TokenMissing);
+        };
+        if matching.next().is_some() {
+            return Err(SceneSubmissionRollbackError::TokenNotUnique);
+        }
+        if self.output_id != expected_output_id || snapshot.output_id != expected_output_id {
+            return Err(SceneSubmissionRollbackError::OutputMismatch);
+        }
+        if snapshot.frame_id != expected_frame_id {
+            return Err(SceneSubmissionRollbackError::FrameIdentityMismatch);
+        }
+        if snapshot.render_generation != expected_render_generation {
+            return Err(SceneSubmissionRollbackError::RenderGenerationMismatch);
+        }
+        if self.ready.is_some() {
+            return Err(SceneSubmissionRollbackError::ReadyOccupied);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn rollback_submission_to_ready(
+        &mut self,
+        token: u64,
+        expected_output_id: OutputId,
+        expected_frame_id: u64,
+        expected_render_generation: u64,
+    ) -> Result<(), SceneSubmissionRollbackError> {
+        self.validate_submission_to_ready_rollback(
+            token,
+            expected_output_id,
+            expected_frame_id,
+            expected_render_generation,
+        )?;
+        let index = self
+            .submitted
+            .iter()
+            .position(|(submitted_token, _)| *submitted_token == token)
+            .expect("validated submitted scene token remains present");
+        let (_, snapshot) = self
+            .submitted
+            .remove(index)
+            .expect("position was returned from submitted scene history");
+        self.ready = Some(snapshot);
+        Ok(())
     }
 
     pub(crate) fn prepare_pageflip_transition(
@@ -630,6 +751,205 @@ mod tests {
             }],
             minimized_visual_resource_payload_ids: Vec::new(),
         })
+    }
+
+    #[test]
+    fn submitted_scene_rollback_restores_the_exact_snapshot_and_keeps_latest_diagnostic() {
+        let output_id = OutputId::from_raw(1).expect("output");
+        let mut restored = snapshot_with_root(2, 240.0);
+        restored.cursor_damage.client = Some(NativeClientCursorDamageState {
+            surface_id: 8,
+            scene_node_id: SceneNodeId::from_raw(8).expect("cursor scene node"),
+            generation: 3,
+            hotspot_x: 2,
+            hotspot_y: 4,
+            rect: Some(NativeDamageRect {
+                x: 10,
+                y: 12,
+                width: 16,
+                height: 18,
+            }),
+        });
+        restored.lifecycle = lifecycle_snapshot(0.5);
+        restored.canonical_scene_evidence = Some(PresentedCanonicalSceneSnapshot {
+            output_id,
+            render_generation: 2,
+            effect_identity_signature: 99,
+            surfaces: Vec::new(),
+        });
+        let identity = retained_identity(
+            oblivion_one::compositor::WindowId::from_raw(8).expect("window"),
+            8,
+        );
+        restored.window_exit_evidence.push(WindowExitFrameEvidence {
+            identity,
+            payload_id: 31,
+            root_surface_id: 8,
+            scene_node_id: SceneNodeId::from_raw(8).expect("window scene node"),
+        });
+        let expected = restored.clone();
+        let window_exit_storage = restored.window_exit_evidence.as_ptr();
+
+        let mut history = NativeSceneHistory::new(snapshot(1));
+        assert!(history.replace_ready(restored));
+        assert!(history.queue_submission(20));
+        assert_eq!(history.latest_submitted_frame_id(), Some(2));
+
+        history
+            .rollback_submission_to_ready(20, output_id, 2, 2)
+            .expect("exact submitted snapshot returns to READY");
+
+        assert_eq!(history.ready.as_ref(), Some(&expected));
+        assert_eq!(
+            history
+                .ready
+                .as_ref()
+                .expect("restored READY scene")
+                .window_exit_evidence
+                .as_ptr(),
+            window_exit_storage,
+            "rollback moves the existing snapshot instead of cloning its evidence"
+        );
+        assert_eq!(history.latest_submitted_frame_id(), Some(2));
+        assert_eq!(history.submitted_identity(20), None);
+    }
+
+    #[test]
+    fn rolling_back_worker_scene_preserves_an_older_submitted_pageflip() {
+        let output_id = OutputId::from_raw(1).expect("output");
+        let mut history = NativeSceneHistory::new(snapshot(1));
+        assert!(history.replace_ready(snapshot(2)));
+        assert!(history.queue_submission(20));
+        assert!(history.replace_ready(snapshot(3)));
+        assert!(history.queue_submission(30));
+
+        history
+            .rollback_submission_to_ready(30, output_id, 3, 3)
+            .expect("only worker-owned scene returns to READY");
+
+        assert_eq!(history.submitted_frame_id(20), Some(2));
+        assert_eq!(history.submitted_identity(20), Some((output_id, 2, 2)));
+        assert_eq!(history.submitted_identity(30), None);
+        assert_eq!(history.ready_frame_identity(), Some((3, 3)));
+    }
+
+    #[test]
+    fn terminal_compatibility_replan_discards_only_its_exact_scene_token() {
+        let output_id = OutputId::from_raw(1).expect("output");
+        let mut history = NativeSceneHistory::new(snapshot(1));
+        assert!(history.replace_ready(snapshot(2)));
+        assert!(history.queue_submission(20));
+        assert!(history.replace_ready(snapshot(3)));
+
+        history
+            .discard_submission_exact(20, output_id, 2, 2)
+            .expect("compatibility replan discards its old scene for a fresh render");
+
+        assert_eq!(history.submitted_identity(20), None);
+        assert_eq!(history.ready_frame_identity(), Some((3, 3)));
+        assert_eq!(history.latest_submitted_frame_id(), Some(2));
+    }
+
+    #[test]
+    fn exact_scene_discard_rejects_mismatched_identity_without_mutation() {
+        let output_id = OutputId::from_raw(1).expect("output");
+        let foreign_output_id = OutputId::from_raw(2).expect("foreign output");
+        let mut history = NativeSceneHistory::new(snapshot(1));
+        assert!(history.replace_ready(snapshot(2)));
+        assert!(history.queue_submission(20));
+
+        assert_eq!(
+            history.discard_submission_exact(20, foreign_output_id, 2, 2),
+            Err(SceneSubmissionRollbackError::OutputMismatch)
+        );
+        assert_eq!(
+            history.discard_submission_exact(20, output_id, 3, 2),
+            Err(SceneSubmissionRollbackError::FrameIdentityMismatch)
+        );
+        assert_eq!(
+            history.discard_submission_exact(20, output_id, 2, 3),
+            Err(SceneSubmissionRollbackError::RenderGenerationMismatch)
+        );
+        assert_eq!(history.submitted_identity(20), Some((output_id, 2, 2)));
+    }
+
+    #[test]
+    fn submitted_scene_rollback_rejects_an_occupied_ready_slot() {
+        let output_id = OutputId::from_raw(1).expect("output");
+        let mut history = NativeSceneHistory::new(snapshot(1));
+        assert!(history.replace_ready(snapshot(2)));
+        assert!(history.queue_submission(20));
+        assert!(history.replace_ready(snapshot(3)));
+        let ready_before = history.ready.clone();
+
+        assert_eq!(
+            history.rollback_submission_to_ready(20, output_id, 2, 2),
+            Err(SceneSubmissionRollbackError::ReadyOccupied)
+        );
+        assert_eq!(history.ready, ready_before);
+        assert_eq!(history.submitted_identity(20), Some((output_id, 2, 2)));
+    }
+
+    #[test]
+    fn submitted_scene_rollback_rejects_wrong_token_output_frame_and_generation() {
+        let output_id = OutputId::from_raw(1).expect("output");
+        let foreign_output_id = OutputId::from_raw(2).expect("foreign output");
+        let mut history = NativeSceneHistory::new(snapshot(1));
+        assert!(history.replace_ready(snapshot(2)));
+        assert!(history.queue_submission(20));
+
+        assert_eq!(
+            history.rollback_submission_to_ready(21, output_id, 2, 2),
+            Err(SceneSubmissionRollbackError::TokenMissing)
+        );
+        assert_eq!(
+            history.rollback_submission_to_ready(20, foreign_output_id, 2, 2),
+            Err(SceneSubmissionRollbackError::OutputMismatch)
+        );
+        assert_eq!(
+            history.rollback_submission_to_ready(20, output_id, 3, 2),
+            Err(SceneSubmissionRollbackError::FrameIdentityMismatch)
+        );
+        assert_eq!(
+            history.rollback_submission_to_ready(20, output_id, 2, 3),
+            Err(SceneSubmissionRollbackError::RenderGenerationMismatch)
+        );
+        assert_eq!(history.ready_frame_identity(), None);
+        assert_eq!(history.submitted_identity(20), Some((output_id, 2, 2)));
+        assert_eq!(history.latest_submitted_frame_id(), Some(2));
+    }
+
+    #[test]
+    fn submitted_scene_rollback_rejects_a_foreign_output_snapshot() {
+        let output_id = OutputId::from_raw(1).expect("output");
+        let foreign_output_id = OutputId::from_raw(2).expect("foreign output");
+        let mut history = NativeSceneHistory::new(snapshot(1));
+        let mut foreign = snapshot(2);
+        foreign.output_id = foreign_output_id;
+        history.submitted.push_back((20, foreign));
+
+        assert_eq!(
+            history.rollback_submission_to_ready(20, output_id, 2, 2),
+            Err(SceneSubmissionRollbackError::OutputMismatch)
+        );
+        assert_eq!(history.ready_frame_identity(), None);
+        assert_eq!(history.submitted_frame_id(20), Some(2));
+    }
+
+    #[test]
+    fn submitted_scene_rollback_rejects_a_non_unique_worker_token() {
+        let output_id = OutputId::from_raw(1).expect("output");
+        let mut history = NativeSceneHistory::new(snapshot(1));
+        history.submitted.push_back((20, snapshot(2)));
+        history.submitted.push_back((20, snapshot(3)));
+
+        assert_eq!(
+            history.rollback_submission_to_ready(20, output_id, 2, 2),
+            Err(SceneSubmissionRollbackError::TokenNotUnique)
+        );
+        assert_eq!(history.ready_frame_identity(), None);
+        assert_eq!(history.submitted.len(), 2);
+        assert_eq!(history.latest_submitted_frame_id(), None);
     }
 
     #[test]
