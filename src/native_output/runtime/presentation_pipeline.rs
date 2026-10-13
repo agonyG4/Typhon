@@ -1190,6 +1190,7 @@ mod tests {
         let prior_token = token(2050);
         let mut scene_history =
             NativeSceneHistory::new(scene_snapshot_for_identity(prior_identity));
+        assert!(scene_history.replace_ready(scene_snapshot_for_identity(prior_identity)));
         assert!(scene_history.queue_submission(prior_token.get()));
         assert!(scene_history.replace_ready(scene_snapshot_for_identity(ready)));
         let mut frame_scheduler = NativeFrameScheduler::new(60, 0);
