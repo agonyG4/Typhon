@@ -26,6 +26,7 @@ use crate::egl_renderer::{EglSceneFrameCommit, OutputDamage};
 use crate::native_output::presentation::transaction::OutputTransactionId;
 use oblivion_one::cursor_theme::CompositorCursorImage;
 use oblivion_one::effects::{EffectRegistryGeneration, PreparedEffectRegistryReload};
+use oblivion_one::native::OutputEpochId;
 use oblivion_one::native::kms::DrmFormatModifierPair;
 
 pub(crate) type AtomicRenderWorkerDiscovery =
@@ -117,7 +118,7 @@ pub(crate) struct AtomicRenderWorkerJob {
     pub(crate) job_id: RenderWorkerJobId,
     pub(crate) frame_id: u64,
     pub(crate) transaction_id: OutputTransactionId,
-    pub(crate) output_generation: u64,
+    pub(crate) output_epoch: OutputEpochId,
     pub(crate) render_generation: u64,
     pub(crate) target: RenderTargetRequest,
     pub(crate) frozen_frame: FrozenNativeRenderFrame,
@@ -185,7 +186,7 @@ pub(crate) struct AtomicRenderWorkerCompletion {
     pub(crate) job_id: RenderWorkerJobId,
     pub(crate) frame_id: u64,
     pub(crate) transaction_id: OutputTransactionId,
-    pub(crate) output_generation: u64,
+    pub(crate) output_epoch: OutputEpochId,
     pub(crate) render_generation: u64,
     pub(crate) target: RenderTargetRequest,
     pub(crate) control_epoch: u64,
@@ -232,10 +233,16 @@ pub(crate) struct AtomicRenderWorkerIdentity {
     pub(crate) job_id: RenderWorkerJobId,
     pub(crate) frame_id: u64,
     pub(crate) transaction_id: OutputTransactionId,
-    pub(crate) output_generation: u64,
+    pub(crate) output_epoch: OutputEpochId,
     pub(crate) render_generation: u64,
     pub(crate) control_epoch: u64,
     pub(crate) target: RenderTargetRequest,
+}
+
+impl AtomicRenderWorkerIdentity {
+    pub(crate) fn belongs_to_output_epoch(self, output_epoch: OutputEpochId) -> bool {
+        self.output_epoch == output_epoch
+    }
 }
 
 /// Exact identity for a render-domain candidate which is being prepared for
@@ -245,7 +252,7 @@ pub(crate) struct AtomicRenderWorkerIdentity {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct AtomicRenderCandidateIdentity {
     pub(crate) job_id: RenderWorkerJobId,
-    pub(crate) output_generation: u64,
+    pub(crate) output_epoch: OutputEpochId,
     pub(crate) pool_generation: u64,
     pub(crate) slot: super::OutputSlotId,
 }
@@ -253,21 +260,21 @@ pub(crate) struct AtomicRenderCandidateIdentity {
 impl AtomicRenderCandidateIdentity {
     pub(crate) const fn new(
         job_id: RenderWorkerJobId,
-        output_generation: u64,
+        output_epoch: OutputEpochId,
         pool_generation: u64,
         slot: super::OutputSlotId,
     ) -> Self {
         Self {
             job_id,
-            output_generation,
+            output_epoch,
             pool_generation,
             slot,
         }
     }
 
-    pub(crate) const fn matches(self, actual: Self) -> bool {
+    pub(crate) fn matches(self, actual: Self) -> bool {
         self.job_id.get() == actual.job_id.get()
-            && self.output_generation == actual.output_generation
+            && self.output_epoch == actual.output_epoch
             && self.pool_generation == actual.pool_generation
             && self.slot.get() == actual.slot.get()
     }
@@ -279,7 +286,7 @@ impl AtomicRenderWorkerCompletion {
             job_id: self.job_id,
             frame_id: self.frame_id,
             transaction_id: self.transaction_id,
-            output_generation: self.output_generation,
+            output_epoch: self.output_epoch,
             render_generation: self.render_generation,
             control_epoch: self.control_epoch,
             target: self.target,
@@ -294,7 +301,7 @@ pub(crate) fn completion_matches_job(
     expected.job_id.get() == actual.job_id.get()
         && expected.frame_id == actual.frame_id
         && expected.transaction_id.get() == actual.transaction_id.get()
-        && expected.output_generation == actual.output_generation
+        && expected.output_epoch == actual.output_epoch
         && expected.render_generation == actual.render_generation
         && expected.control_epoch == actual.control_epoch
         && expected.target.slot.get() == actual.target.slot.get()
@@ -1015,7 +1022,7 @@ fn render_worker_loop(
                     job_id,
                     frame_id,
                     transaction_id,
-                    output_generation,
+                    output_epoch,
                     render_generation,
                     target,
                     frozen_frame: mut frozen_frame,
@@ -1079,7 +1086,7 @@ fn render_worker_loop(
                             job_id,
                             frame_id,
                             transaction_id,
-                            output_generation,
+                            output_epoch,
                             render_generation,
                             target,
                             control_epoch: applied_control_epoch,
@@ -2051,7 +2058,7 @@ mod tests {
     fn candidate_completion_requires_matching_job_output_and_pool_identity() {
         let expected = AtomicRenderCandidateIdentity::new(
             RenderWorkerJobId::new(7).expect("nonzero job ID"),
-            11,
+            OutputEpochId::new(11).expect("nonzero output epoch"),
             13,
             super::super::OutputSlotId::new(0).expect("slot zero"),
         );
@@ -2059,25 +2066,25 @@ mod tests {
         assert!(expected.matches(expected));
         assert!(!expected.matches(AtomicRenderCandidateIdentity::new(
             RenderWorkerJobId::new(8).expect("nonzero job ID"),
-            11,
+            OutputEpochId::new(11).expect("nonzero output epoch"),
             13,
             super::super::OutputSlotId::new(0).expect("slot zero"),
         )));
         assert!(!expected.matches(AtomicRenderCandidateIdentity::new(
             RenderWorkerJobId::new(7).expect("nonzero job ID"),
-            12,
+            OutputEpochId::new(12).expect("nonzero output epoch"),
             13,
             super::super::OutputSlotId::new(0).expect("slot zero"),
         )));
         assert!(!expected.matches(AtomicRenderCandidateIdentity::new(
             RenderWorkerJobId::new(7).expect("nonzero job ID"),
-            11,
+            OutputEpochId::new(11).expect("nonzero output epoch"),
             14,
             super::super::OutputSlotId::new(0).expect("slot zero"),
         )));
         assert!(!expected.matches(AtomicRenderCandidateIdentity::new(
             RenderWorkerJobId::new(7).expect("nonzero job ID"),
-            11,
+            OutputEpochId::new(11).expect("nonzero output epoch"),
             13,
             super::super::OutputSlotId::new(1).expect("slot one"),
         )));
@@ -2255,7 +2262,7 @@ mod tests {
             job_id: RenderWorkerJobId::new(10).unwrap(),
             frame_id: 12,
             transaction_id: OutputTransactionId::new(NonZeroU64::new(13).unwrap()),
-            output_generation: 14,
+            output_epoch: OutputEpochId::new(14).unwrap(),
             render_generation: 15,
             control_epoch: 17,
             target: RenderTargetRequest {
@@ -2266,6 +2273,13 @@ mod tests {
         };
 
         assert!(completion_matches_job(identity, identity));
+        assert!(
+            identity.belongs_to_output_epoch(oblivion_one::native::OutputEpochId::new(14).unwrap())
+        );
+        assert!(
+            !identity
+                .belongs_to_output_epoch(oblivion_one::native::OutputEpochId::new(15).unwrap())
+        );
         assert!(!completion_matches_job(
             identity,
             AtomicRenderWorkerIdentity {
@@ -2290,7 +2304,7 @@ mod tests {
         assert!(!completion_matches_job(
             identity,
             AtomicRenderWorkerIdentity {
-                output_generation: 17,
+                output_epoch: OutputEpochId::new(17).unwrap(),
                 ..identity
             }
         ));

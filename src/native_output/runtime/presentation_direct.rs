@@ -38,7 +38,7 @@ pub(super) struct DirectPresentationInputs<'a> {
     pub(super) legacy_cursor_available: bool,
     pub(super) page_flip_pending: bool,
     pub(super) atomic_commit_pending: bool,
-    pub(super) drm_file_generation: u64,
+    pub(super) output_epoch: crate::native_output::OutputEpochId,
     pub(super) effective_cursor: Option<&'a AtomicCursorVisualState>,
     pub(super) last_direct_candidate_key: &'a mut Option<DirectScanoutCandidateKey>,
     pub(super) scene_changed: bool,
@@ -166,7 +166,7 @@ pub(super) fn inspect_direct_presentation(
                 DirectScanoutCandidateKey::from_candidate(
                     candidate,
                     inputs.output_id,
-                    inputs.drm_file_generation,
+                    inputs.output_epoch.get(),
                     super::scanout::direct_cursor_content_key(
                         inputs.effective_cursor,
                         cursor_direct_compatible,

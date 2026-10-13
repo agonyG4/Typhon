@@ -348,6 +348,7 @@ impl NativeRuntime {
                         .note_frame_callbacks_deferred_ready(protocol_batch_id);
                     self.frame_pacing
                         .note_ready_frame(settled.ready_at_ns, waits_for_target);
+                    self.frame_scheduler.note_ready_frame(None);
                     let owner = self
                         .scanout
                         .explicit_output_swapchain()
@@ -369,6 +370,7 @@ impl NativeRuntime {
                         ) => super::cycle::abandon_overtaken_ready(
                             explicit,
                             owner,
+                            self.output_epoch,
                             &mut self.scene_history,
                             &mut self.frame_pacing,
                             &mut self.frame_scheduler,
@@ -389,6 +391,7 @@ impl NativeRuntime {
                         .note_frame_callbacks_deferred_ready(protocol_batch_id);
                     self.frame_pacing
                         .note_ready_frame(settled.ready_at_ns, waits_for_target);
+                    self.frame_scheduler.note_ready_frame(None);
                     if outer.render_ahead {
                         self.frame_pacing.note_predictive_unbound_ready();
                     }
@@ -413,7 +416,7 @@ impl NativeRuntime {
                 );
                 self.last_rendered_scene_generation = outer.scene_generation;
                 let _ = (
-                    outer.output_generation,
+                    outer.output_epoch.get(),
                     outer.cursor_epoch,
                     outer.pacing_mode,
                 );
@@ -426,6 +429,19 @@ impl NativeRuntime {
         Ok(())
     }
 
+    fn retire_stale_render_worker_continuation(
+        &mut self,
+        identity: crate::native_output::scanout::AtomicRenderWorkerIdentity,
+    ) {
+        if self.pending_render_worker_identity != Some(identity) {
+            return;
+        }
+        self.pending_render_worker_identity = None;
+        self.pending_render_worker_context.take();
+        self.pending_render_worker_outer.take();
+        self.pending_render_worker_completion.take();
+    }
+
     pub(super) fn process_render_worker_events(&mut self) -> NativeResult<()> {
         loop {
             let event = self.scanout.try_take_render_worker_event()?;
@@ -434,6 +450,29 @@ impl NativeRuntime {
             };
             match event {
                 crate::native_output::scanout::AtomicRenderWorkerEvent::Rendered(completion) => {
+                    let identity = completion.identity();
+                    if !identity.belongs_to_output_epoch(self.output_epoch) {
+                        self.perf.log("native.render_worker.stale_completion", || {
+                            vec![
+                                NativePerfField::u64(
+                                    "completion_output_epoch",
+                                    completion.output_epoch.get(),
+                                ),
+                                NativePerfField::u64(
+                                    "current_output_epoch",
+                                    self.output_epoch.get(),
+                                ),
+                                NativePerfField::u64("job_id", completion.job_id.get()),
+                                NativePerfField::u64("frame_id", completion.frame_id),
+                            ]
+                        });
+                        // The worker has completed its transport ownership. Drop
+                        // the stale result and its fence/resources without
+                        // publishing it into the current output epoch.
+                        self.retire_stale_render_worker_continuation(identity);
+                        drop(completion);
+                        continue;
+                    }
                     if self.pending_render_worker_capture.is_some() {
                         return Err(io::Error::other(
                             "render completion arrived while a capture continuation owns the worker",

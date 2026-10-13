@@ -1,5 +1,51 @@
+pub(crate) use oblivion_one::native::OutputEpochId;
 use serde::{Deserialize, Serialize};
 use std::num::NonZeroU64;
+
+/// Identity of one physical DRM/session-file lifetime.
+///
+/// This changes only when the underlying DRM session is replaced. Output
+/// modesets advance `OutputEpochId` instead.
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) struct DrmSessionGeneration(NonZeroU64);
+
+impl DrmSessionGeneration {
+    pub(crate) const fn new(value: u64) -> Option<Self> {
+        match NonZeroU64::new(value) {
+            Some(value) => Some(Self(value)),
+            None => None,
+        }
+    }
+
+    pub(crate) const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+/// Proof that every owner capable of publishing work for an output epoch has
+/// been drained or transferred to lifecycle-managed parked state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct QuiescedOutputEpoch {
+    output_epoch: OutputEpochId,
+}
+
+impl QuiescedOutputEpoch {
+    pub(in crate::native_output) const fn from_boundary(
+        output_epoch: OutputEpochId,
+        boundary: NativeOutputReconfigurationBoundary,
+    ) -> Option<Self> {
+        if boundary.is_quiesced() {
+            Some(Self { output_epoch })
+        } else {
+            None
+        }
+    }
+
+    pub(crate) const fn output_epoch(self) -> OutputEpochId {
+        self.output_epoch
+    }
+}
 
 /// Semantic identity for user-visible output configuration.
 ///
@@ -110,7 +156,7 @@ pub(crate) enum OutputConfigurationConfirmCompletion {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct OutputConfigurationSafeBoundary {
+pub(crate) struct NativeOutputReconfigurationBoundary {
     pub(crate) main_thread_pageflip_owned: bool,
     pub(crate) worker_in_flight_owned: bool,
     pub(crate) worker_queued_next_owned: bool,
@@ -121,10 +167,11 @@ pub(crate) struct OutputConfigurationSafeBoundary {
     pub(crate) pacing_worker_reservation_owned: bool,
     pub(crate) output_render_fence_owned: bool,
     pub(crate) deferred_worker_event_owned: bool,
-    pub(crate) explicit_sync_obligation_owned: bool,
+    pub(crate) explicit_sync_watch_owned: bool,
+    pub(crate) parked_explicit_sync_obligation_owned: bool,
 }
 
-impl OutputConfigurationSafeBoundary {
+impl NativeOutputReconfigurationBoundary {
     pub(crate) const fn is_safe(self) -> bool {
         self.is_safe_ignoring_output_render_fence() && !self.output_render_fence_owned
     }
@@ -163,7 +210,16 @@ impl OutputConfigurationSafeBoundary {
             || self.pacing_worker_reservation_owned
             || self.deferred_worker_event_owned)
     }
+
+    const fn is_quiesced(self) -> bool {
+        self.is_safe() && !self.explicit_sync_watch_owned
+    }
 }
+
+/// Compatibility name for the Display path while it adopts the shared
+/// native-output boundary.
+#[allow(dead_code)]
+pub(crate) type OutputConfigurationSafeBoundary = NativeOutputReconfigurationBoundary;
 
 /// Server-owned state for the single Display configuration confirmation.
 /// Time is supplied by the native monotonic clock so this model is deterministic.
@@ -649,6 +705,17 @@ mod tests {
     }
 
     #[test]
+    fn output_epoch_and_drm_session_generation_have_independent_types() {
+        let mut output_epoch = OutputEpochId::initial();
+        let drm_session_generation = DrmSessionGeneration::new(7).unwrap();
+
+        assert_eq!(output_epoch.get(), 1);
+        assert_eq!(output_epoch.advance().get(), 2);
+        assert_eq!(drm_session_generation.get(), 7);
+        assert!(DrmSessionGeneration::new(0).is_none());
+    }
+
+    #[test]
     fn semantic_generation_advances_only_when_the_authority_requests_it() {
         let mut generation = OutputConfigurationGeneration::initial();
         let render_ticks = 165_u32;
@@ -838,14 +905,21 @@ mod tests {
     }
 
     #[test]
-    fn outstanding_acquire_fences_do_not_block_output_reconfiguration() {
+    fn acquire_watches_are_parked_before_the_epoch_can_be_sealed() {
         let boundary = OutputConfigurationSafeBoundary {
-            explicit_sync_obligation_owned: true,
+            explicit_sync_watch_owned: true,
             ..Default::default()
         };
 
         assert!(boundary.is_safe());
         assert!(boundary.is_safe_to_retire_unsubmitted_ready_frame());
+        assert!(QuiescedOutputEpoch::from_boundary(OutputEpochId::initial(), boundary,).is_none());
+
+        let parked = OutputConfigurationSafeBoundary {
+            parked_explicit_sync_obligation_owned: true,
+            ..Default::default()
+        };
+        assert!(QuiescedOutputEpoch::from_boundary(OutputEpochId::initial(), parked).is_some());
     }
 
     #[test]

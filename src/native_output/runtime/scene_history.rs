@@ -89,6 +89,28 @@ impl NativeSceneHistory {
         self.presented.as_ref().map(|snapshot| &snapshot.scene)
     }
 
+    pub(crate) fn ready_frame_identity(&self) -> Option<(u64, u64)> {
+        self.ready
+            .as_ref()
+            .map(|snapshot| (snapshot.frame_id, snapshot.render_generation))
+    }
+
+    pub(crate) fn has_ready_frame(&self) -> bool {
+        self.ready.is_some()
+    }
+
+    pub(crate) fn discard_ready_if_identity(
+        &mut self,
+        frame_id: u64,
+        render_generation: u64,
+    ) -> bool {
+        if self.ready_frame_identity() != Some((frame_id, render_generation)) {
+            return false;
+        }
+        self.ready = None;
+        true
+    }
+
     pub(crate) fn presented_presentation_if_any(
         &self,
     ) -> Option<&oblivion_one::compositor::PresentationFrameSnapshot> {

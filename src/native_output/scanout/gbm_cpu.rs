@@ -479,7 +479,7 @@ impl NativeGbmScanout {
         .map(|()| NativeSessionRecoveryProgress::Complete)
     }
 
-    pub(crate) fn rebind_session_generation(&mut self, generation: u64) {
+    pub(crate) fn rebind_output_epoch(&mut self, generation: u64) {
         self.backend_generation = generation;
     }
 

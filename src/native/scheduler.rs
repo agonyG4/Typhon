@@ -522,6 +522,11 @@ impl NativeFrameScheduler {
         self.ready_target = target;
     }
 
+    pub fn consume_ready_frame(&mut self) {
+        self.ready_frame_queued = false;
+        self.ready_target = None;
+    }
+
     pub fn note_ready_submission(&mut self, token: u64, now_ns: u64) -> Result<(), &'static str> {
         self.note_async_submission(token, now_ns)?;
         self.ready_frame_queued = false;
@@ -619,8 +624,7 @@ impl NativeFrameScheduler {
     }
 
     pub fn discard_ready_frame(&mut self) {
-        self.ready_frame_queued = false;
-        self.ready_target = None;
+        self.consume_ready_frame();
     }
 
     pub fn note_page_flip_completion(
@@ -1122,6 +1126,18 @@ mod tests {
         scheduler.note_ready_submission(42, 20).unwrap();
         assert_eq!(scheduler.pending_page_flip_token(), Some(42));
         assert!(!scheduler.ready_frame_queued());
+    }
+
+    #[test]
+    fn consuming_external_ready_frame_clears_scheduler_ready_ownership() {
+        let mut scheduler = NativeFrameScheduler::new(165, 0);
+        scheduler.note_ready_frame(None);
+        assert!(scheduler.ready_frame_queued());
+
+        scheduler.consume_ready_frame();
+
+        assert!(!scheduler.ready_frame_queued());
+        assert_eq!(scheduler.ready_target(), None);
     }
 
     #[test]

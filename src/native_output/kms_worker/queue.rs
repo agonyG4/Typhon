@@ -456,7 +456,7 @@ impl WorkerShared {
             job.kind.is_primary()
                 && job.token == token
                 && job.transaction_id == transaction_id
-                && job.output_generation == output_generation
+                && job.output_epoch.get() == output_generation
                 && job.crtc_id == crtc_id
                 && job.reservation == reservation
                 && job.primary_frame_id() == Some(frame_id)
@@ -469,7 +469,7 @@ impl WorkerShared {
         if state.queued.iter().any(|job| {
             job.kind.is_primary()
                 && job.reservation == reservation
-                && job.output_generation == output_generation
+                && job.output_epoch.get() == output_generation
                 && job.crtc_id == crtc_id
         }) {
             return KmsWorkerQueuedCancellation::IdentityMismatch;
@@ -503,7 +503,7 @@ impl WorkerShared {
         let queued = state.queued.front().and_then(|job| {
             if job.kind.is_primary()
                 && matches!(job.primary, super::KmsPrimaryUpdate::Framebuffer { .. })
-                && job.output_generation == output_generation
+                && job.output_epoch.get() == output_generation
                 && job.crtc_id == crtc_id
                 && job.fixed_target() == Some(target)
             {
@@ -511,7 +511,7 @@ impl WorkerShared {
                     transaction_id: job.owners.primary_transaction_id()?,
                     bundle_identity: job.identity(),
                     validation_base: job.validation_base,
-                    output_generation: job.output_generation,
+                    output_generation: job.output_epoch.get(),
                     crtc_id: job.crtc_id,
                     target,
                     phase: AttachablePrimaryPhase::Queued,
@@ -558,7 +558,7 @@ impl WorkerShared {
             );
         }
         let job = state.queued.front()?;
-        if job.output_generation != output_generation || job.crtc_id != crtc_id {
+        if job.output_epoch.get() != output_generation || job.crtc_id != crtc_id {
             return None;
         }
         if job.kind.is_primary()

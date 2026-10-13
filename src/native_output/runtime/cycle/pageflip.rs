@@ -63,7 +63,7 @@ fn confirm_kms_presentation_state(
 fn pageflip_identity(
     output_id: OutputId,
     token: PageFlipToken,
-    output_generation: u64,
+    output_epoch: OutputEpochId,
     crtc_id: u32,
 ) -> crate::native_output::presentation::plane::PlanePageflipIdentity {
     crate::native_output::presentation::plane::PlanePageflipIdentity {
@@ -71,7 +71,7 @@ fn pageflip_identity(
         bundle_id:
             crate::native_output::presentation::plane::KmsCommitBundleId::from_pageflip_token(token),
         token,
-        output_generation,
+        output_epoch,
         crtc_id,
     }
 }
@@ -698,7 +698,8 @@ fn presented_primary_from_worker_job(
         output_id: bundle_identity.output_id,
         bundle_id: bundle_identity.id,
         token: bundle_identity.token,
-        output_generation: bundle_identity.output_generation,
+        output_epoch: OutputEpochId::new(bundle_identity.output_generation)
+            .expect("KMS pageflip output epoch is nonzero"),
         crtc_id: bundle_identity.crtc_id,
     };
     match job.kind {
@@ -806,10 +807,143 @@ fn select_cursor_promotion(
     }
 }
 
+#[derive(Debug)]
+enum OutputFrameRetirementInvariantError {
+    PhysicalReadyIdentityChanged,
+    PacingOwnerMissing,
+    SceneReadyIdentityMismatch,
+    SchedulerReadyOwnershipMismatch,
+    OutputTransactionMissing,
+    OutputTransactionIdentityMismatch,
+    OutputTransactionNotUnsubmitted,
+    ProtocolObligationMismatch,
+    PhysicalReadyCannotBeSuspended,
+}
+
+impl std::fmt::Display for OutputFrameRetirementInvariantError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PhysicalReadyIdentityChanged => {
+                formatter.write_str("unsubmitted READY identity changed before terminalization")
+            }
+            Self::PacingOwnerMissing => formatter.write_str("overtaken READY has no pacing owner"),
+            Self::SceneReadyIdentityMismatch => {
+                formatter.write_str("unsubmitted READY has no matching scene-history READY owner")
+            }
+            Self::SchedulerReadyOwnershipMismatch => {
+                formatter.write_str("unsubmitted READY disagrees with scheduler READY ownership")
+            }
+            Self::OutputTransactionMissing => {
+                formatter.write_str("unsubmitted READY has no active output transaction")
+            }
+            Self::OutputTransactionIdentityMismatch => {
+                formatter.write_str("unsubmitted READY disagrees with its output transaction")
+            }
+            Self::OutputTransactionNotUnsubmitted => {
+                formatter.write_str("unsubmitted READY transaction is already physically owned")
+            }
+            Self::ProtocolObligationMismatch => {
+                formatter.write_str("unsubmitted READY transaction owns a different frame batch")
+            }
+            Self::PhysicalReadyCannotBeSuspended => {
+                formatter.write_str("unsubmitted READY could not be moved to suspended ownership")
+            }
+        }
+    }
+}
+
+impl std::error::Error for OutputFrameRetirementInvariantError {}
+
+fn validate_unsubmitted_ready_owners(
+    swapchain: &crate::native_output::scanout::AtomicOutputSwapchain,
+    owner: OutputFrameIdentitySnapshot,
+    output_epoch: OutputEpochId,
+    scene_history: &NativeSceneHistory,
+    frame_pacing: &NativeFramePacing,
+    frame_scheduler: &NativeFrameScheduler,
+    output_transactions: &OutputTransactionLedger,
+) -> NativeResult<()> {
+    if swapchain.ready_identity() != Some(owner) {
+        return Err(OutputFrameRetirementInvariantError::PhysicalReadyIdentityChanged.into());
+    }
+    if !frame_pacing.validate_physical_ready_owner(owner) {
+        return Err(OutputFrameRetirementInvariantError::PacingOwnerMissing.into());
+    }
+    if scene_history.ready_frame_identity() != Some((owner.frame_id, owner.render_generation)) {
+        return Err(OutputFrameRetirementInvariantError::SceneReadyIdentityMismatch.into());
+    }
+    if !frame_scheduler.ready_frame_queued() {
+        return Err(OutputFrameRetirementInvariantError::SchedulerReadyOwnershipMismatch.into());
+    }
+    let transaction = output_transactions
+        .transaction(owner.transaction_id)
+        .ok_or(OutputFrameRetirementInvariantError::OutputTransactionMissing)?;
+    let descriptor = transaction.descriptor();
+    if descriptor.id() != owner.transaction_id
+        || descriptor.output_id() != owner.output_id
+        || descriptor.output_generation() != output_epoch.get()
+        || descriptor.composited_frame_identity()
+            != Some((
+                owner.frame_id,
+                owner.render_generation,
+                owner.pool_generation,
+            ))
+    {
+        return Err(OutputFrameRetirementInvariantError::OutputTransactionIdentityMismatch.into());
+    }
+    if !matches!(
+        transaction.state().kind(),
+        OutputTransactionStateKind::Built
+            | OutputTransactionStateKind::Ready
+            | OutputTransactionStateKind::ReadyUnbound
+    ) {
+        return Err(OutputFrameRetirementInvariantError::OutputTransactionNotUnsubmitted.into());
+    }
+    if descriptor.obligations().frame_batch_id() != Some(owner.protocol_batch_id) {
+        return Err(OutputFrameRetirementInvariantError::ProtocolObligationMismatch.into());
+    }
+    swapchain
+        .validate_suspend_abandon_ready()
+        .map_err(|_| OutputFrameRetirementInvariantError::PhysicalReadyCannotBeSuspended)?;
+    Ok(())
+}
+
+pub(crate) fn validate_reconfiguration_frame_ownership(
+    explicit: &AtomicEglGbmScanout,
+    output_epoch: OutputEpochId,
+    scene_history: &NativeSceneHistory,
+    frame_pacing: &NativeFramePacing,
+    frame_scheduler: &NativeFrameScheduler,
+    output_transactions: &OutputTransactionLedger,
+) -> NativeResult<()> {
+    let swapchain = explicit.swapchain()?;
+    let physical_ready = swapchain.ready_identity();
+    if let Some(owner) = physical_ready {
+        return validate_unsubmitted_ready_owners(
+            swapchain,
+            owner,
+            output_epoch,
+            scene_history,
+            frame_pacing,
+            frame_scheduler,
+            output_transactions,
+        );
+    }
+    if frame_pacing.ready.is_some()
+        || frame_pacing.has_unbound_ready_owner()
+        || scene_history.has_ready_frame()
+        || frame_scheduler.ready_frame_queued()
+    {
+        return Err(OutputFrameRetirementInvariantError::PhysicalReadyIdentityChanged.into());
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn abandon_overtaken_ready(
     explicit: &mut AtomicEglGbmScanout,
     owner: OutputFrameIdentitySnapshot,
+    output_epoch: OutputEpochId,
     scene_history: &mut NativeSceneHistory,
     frame_pacing: &mut NativeFramePacing,
     frame_scheduler: &mut NativeFrameScheduler,
@@ -817,30 +951,19 @@ pub(crate) fn abandon_overtaken_ready(
     output_transactions: &mut OutputTransactionLedger,
     presented_at: MonotonicTimestampNs,
 ) -> NativeResult<()> {
-    if explicit.swapchain()?.ready_identity() != Some(owner) {
-        return Err(io::Error::other("overtaken READY identity no longer matches").into());
-    }
-    if !frame_pacing.abandon_ready_frame() {
-        return Err(io::Error::other("overtaken READY has no pacing owner").into());
-    }
-    scene_history.discard_ready();
-    frame_scheduler.discard_ready_frame();
-    if !explicit.swapchain_mut()?.suspend_abandon_ready()? {
-        return Err(io::Error::other("overtaken READY disappeared before abandonment").into());
-    }
-    settle_dropped_output_transaction(
+    let swapchain = explicit.swapchain_mut()?;
+    terminalize_unsubmitted_ready_frame(
+        swapchain,
+        owner,
+        output_epoch,
+        scene_history,
+        frame_pacing,
+        frame_scheduler,
         output_transactions,
-        owner.transaction_id,
-        OutputTransactionDropReason::SafeAbandonment,
         presented_at,
         |obligations| {
             discard_presentation_feedback_obligation(server, obligations);
-            if obligations.frame_batch_id() != Some(owner.protocol_batch_id) {
-                return Err(io::Error::other(
-                    "overtaken READY transaction owns a different frame batch",
-                )
-                .into());
-            }
+            debug_assert_eq!(obligations.frame_batch_id(), Some(owner.protocol_batch_id));
             server.complete_frame_batch_after_safe_abandonment(
                 owner.protocol_batch_id,
                 FrameBatchDiscardReason::SuspendAbandonment,
@@ -848,6 +971,116 @@ pub(crate) fn abandon_overtaken_ready(
             Ok(())
         },
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn terminalize_unsubmitted_ready_frame<F>(
+    swapchain: &mut crate::native_output::scanout::AtomicOutputSwapchain,
+    owner: OutputFrameIdentitySnapshot,
+    output_epoch: OutputEpochId,
+    scene_history: &mut NativeSceneHistory,
+    frame_pacing: &mut NativeFramePacing,
+    frame_scheduler: &mut NativeFrameScheduler,
+    output_transactions: &mut OutputTransactionLedger,
+    retired_at: MonotonicTimestampNs,
+    settle_protocol_obligations: F,
+) -> NativeResult<()>
+where
+    F: FnOnce(
+        crate::native_output::presentation::transaction::OutputProtocolObligations,
+    ) -> NativeResult<()>,
+{
+    validate_unsubmitted_ready_owners(
+        swapchain,
+        owner,
+        output_epoch,
+        scene_history,
+        frame_pacing,
+        frame_scheduler,
+        output_transactions,
+    )?;
+    settle_dropped_output_transaction(
+        output_transactions,
+        owner.transaction_id,
+        OutputTransactionDropReason::SafeAbandonment,
+        retired_at,
+        settle_protocol_obligations,
+    )?;
+    if !scene_history.discard_ready_if_identity(owner.frame_id, owner.render_generation) {
+        return Err(OutputFrameRetirementInvariantError::SceneReadyIdentityMismatch.into());
+    }
+    frame_pacing
+        .terminalize_unsubmitted_physical_frame(owner)
+        .map_err(|_| OutputFrameRetirementInvariantError::PacingOwnerMissing)?;
+    frame_scheduler.discard_ready_frame();
+    if !swapchain.suspend_abandon_ready()? {
+        return Err(OutputFrameRetirementInvariantError::PhysicalReadyCannotBeSuspended.into());
+    }
+    Ok(())
+}
+
+pub(crate) fn terminalize_unsubmitted_frame_for_reconfiguration(
+    explicit: &mut AtomicEglGbmScanout,
+    output_epoch: OutputEpochId,
+    scene_history: &mut NativeSceneHistory,
+    frame_pacing: &mut NativeFramePacing,
+    frame_scheduler: &mut NativeFrameScheduler,
+    server: &mut OwnCompositorServer,
+    output_transactions: &mut OutputTransactionLedger,
+    retired_at: MonotonicTimestampNs,
+) -> NativeResult<()> {
+    let physical_ready = explicit.swapchain()?.ready_identity();
+    if let Some(owner) = physical_ready {
+        abandon_overtaken_ready(
+            explicit,
+            owner,
+            output_epoch,
+            scene_history,
+            frame_pacing,
+            frame_scheduler,
+            server,
+            output_transactions,
+            retired_at,
+        )?;
+    } else {
+        validate_reconfiguration_frame_ownership(
+            explicit,
+            output_epoch,
+            scene_history,
+            frame_pacing,
+            frame_scheduler,
+            output_transactions,
+        )?;
+        if output_transactions.active_count() > 0 {
+            // A built or submitted transaction without a physical READY owner
+            // is still governed by its current asynchronous owner. The shared
+            // boundary will wait for that owner to retire.
+            return Ok(());
+        }
+        if frame_pacing.active_physical_identity().is_some() {
+            return Err(OutputFrameRetirementInvariantError::PhysicalReadyIdentityChanged.into());
+        }
+        if frame_pacing.active.is_some() {
+            frame_pacing.complete_unsubmitted_render_without_visual_change();
+        }
+        frame_scheduler.consume_visual_work();
+        frame_scheduler.discard_ready_frame();
+    }
+    if frame_pacing.active.is_some()
+        && frame_pacing.active_physical_identity().is_none()
+        && output_transactions.active_count() == 0
+    {
+        frame_pacing.complete_unsubmitted_render_without_visual_change();
+    }
+    if frame_pacing.has_unsettled_output_frame_ownership() {
+        return Err(io::Error::other(
+            "old output epoch retained pacing ownership after frame terminalization",
+        )
+        .into());
+    }
+    frame_scheduler.consume_visual_work();
+    frame_scheduler.discard_ready_frame();
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -913,7 +1146,7 @@ fn abandon_overtaken_worker_queued(
     }
 }
 
-fn register_suspended_fence_if_needed(
+pub(crate) fn register_suspended_fence_if_needed(
     explicit: &AtomicEglGbmScanout,
     event_loop: &mut NativeEventLoop,
     output_render_fence_token: &mut Option<ReactorToken>,
@@ -1012,7 +1245,7 @@ impl NativeRuntime {
             target,
             mode_label: _,
             output_refresh_rate,
-            drm_file_generation,
+            output_epoch,
             drm_timestamp_clock,
             presentation_clock,
             scanout,
@@ -1275,7 +1508,7 @@ impl NativeRuntime {
                         pageflip_drain.last_stale_token.unwrap_or(0),
                     ),
                     NativePerfField::str("kms_backend", kms_backend.effective_kind().as_str()),
-                    NativePerfField::u64("backend_generation", *drm_file_generation),
+                    NativePerfField::u64("backend_generation", output_epoch.get()),
                 ]
             });
         }
@@ -1296,7 +1529,7 @@ impl NativeRuntime {
                     atomic_commit_arbiter,
                     kms_backend.effective_kind(),
                     pageflip_event,
-                    *drm_file_generation,
+                    output_epoch.get(),
                     monotonic_now_ns()?,
                     mismatched_pageflip_events,
                     stale_pageflip_events,
@@ -1315,7 +1548,7 @@ impl NativeRuntime {
                             .map_or(0, PageFlipToken::get),
                     ),
                     NativePerfField::u64("crtc", u64::from(target.crtc_id)),
-                    NativePerfField::u64("generation", *drm_file_generation),
+                    NativePerfField::u64("generation", output_epoch.get()),
                     NativePerfField::bool("final_drain_completed", false),
                 ]
             });
@@ -1415,10 +1648,10 @@ impl NativeRuntime {
                             else {
                                 return None;
                             };
-                            (ownership.job.output_generation == *drm_file_generation).then(|| {
+                            (ownership.job.output_epoch == *output_epoch).then(|| {
                                 crate::native_output::presentation::cursor_timing::CursorKmsSubmissionEvidence::new(
                                     ownership.job.token,
-                                    ownership.job.output_generation,
+                                    ownership.job.output_epoch.get(),
                                     target,
                                     window,
                                     ownership.job.queued_at.get(),
@@ -1429,12 +1662,12 @@ impl NativeRuntime {
                         })
                 } else {
                     PageFlipToken::new(pageflip.user_data).and_then(|token| {
-                        cursor_timing.take_synchronous_submission(token, *drm_file_generation)
+                        cursor_timing.take_synchronous_submission(token, output_epoch.get())
                     })
                 };
                 if let Some(evidence) = cursor_kms_evidence
-                    && evidence.output_generation == *drm_file_generation
-                    && cursor_timing.output_generation() == *drm_file_generation
+                    && evidence.output_generation == output_epoch.get()
+                    && cursor_timing.output_generation() == output_epoch.get()
                     && evidence.window.mode_key() == Some(cursor_timing.mode_key())
                 {
                     let outcome = evidence.classify(actual_logical_sequence);
@@ -1506,7 +1739,7 @@ impl NativeRuntime {
                         transaction_id,
                         PageFlipToken::new(pageflip.user_data)
                             .ok_or_else(|| io::Error::other("pageflip token is zero"))?,
-                        *drm_file_generation,
+                        output_epoch.get(),
                         MonotonicTimestampNs::new(compositor_receive_ns),
                         Some(u64::from(pageflip.sequence)),
                         |obligations| {
@@ -1524,7 +1757,7 @@ impl NativeRuntime {
                             let _ = complete_plane_delta_pageflip(
                                 atomic_cursor,
                                 pageflip.user_data,
-                                *drm_file_generation,
+                                output_epoch.get(),
                                 perf,
                             )?;
                             Ok(())
@@ -1538,7 +1771,7 @@ impl NativeRuntime {
                     let _ = complete_plane_delta_pageflip(
                         atomic_cursor,
                         pageflip.user_data,
-                        *drm_file_generation,
+                        output_epoch.get(),
                         perf,
                     )?;
                 }
@@ -1548,12 +1781,8 @@ impl NativeRuntime {
                 {
                     let token = PageFlipToken::new(pageflip.user_data)
                         .ok_or_else(|| io::Error::other("cursor pageflip token is zero"))?;
-                    let identity = pageflip_identity(
-                        self.output_id,
-                        token,
-                        *drm_file_generation,
-                        target.crtc_id,
-                    );
+                    let identity =
+                        pageflip_identity(self.output_id, token, *output_epoch, target.crtc_id);
                     let previous_cursor = presented_planes.cursor;
                     let presented_cursor = cursor.presented_plane_state();
                     if !presented_planes.promote_bundle(
@@ -1606,7 +1835,7 @@ impl NativeRuntime {
                 matches!(completion, PageFlipCompletionResult::Completed { .. })
                     .then(|| {
                         output_transactions
-                            .submitted_transaction(pageflip_token, *drm_file_generation)
+                            .submitted_transaction(pageflip_token, output_epoch.get())
                     })
                     .flatten();
             let presentation_transaction_id =
@@ -1619,7 +1848,7 @@ impl NativeRuntime {
                 if confirm_kms_presentation_state(
                     confirmed_kms_presentation,
                     descriptor,
-                    *drm_file_generation,
+                    output_epoch.get(),
                     true,
                 ) {
                     let presentation_mode = descriptor.presentation_mode();
@@ -1640,7 +1869,7 @@ impl NativeRuntime {
                                 "pageflip_confirmed_mode",
                                 presentation_mode.as_str(),
                             ),
-                            NativePerfField::u64("output_generation", *drm_file_generation),
+                            NativePerfField::u64("output_generation", output_epoch.get()),
                         ]
                     });
                 }
@@ -1757,7 +1986,7 @@ impl NativeRuntime {
                             );
                             if let Some(mode_key) = window.mode_key() {
                                 presentation_timing.observe_pageflip(
-                                    ownership.job.output_generation,
+                                    ownership.job.output_epoch.get(),
                                     mode_key,
                                     outcome,
                                 );
@@ -1767,7 +1996,7 @@ impl NativeRuntime {
                     let direct_pageflip_identity = pageflip_identity(
                         self.output_id,
                         pageflip_token,
-                        *drm_file_generation,
+                        *output_epoch,
                         target.crtc_id,
                     );
                     cycle_direct::settle_direct_pageflip(
@@ -1777,7 +2006,7 @@ impl NativeRuntime {
                         output_transactions,
                         &mut self.presentation_trace,
                         atomic_cursor,
-                        *drm_file_generation,
+                        output_epoch.get(),
                         direct_pageflip_identity,
                         transaction_id,
                         pageflip_token,
@@ -1799,7 +2028,7 @@ impl NativeRuntime {
                         let identity = pageflip_identity(
                             self.output_id,
                             pageflip_token,
-                            *drm_file_generation,
+                            *output_epoch,
                             target.crtc_id,
                         );
                         let previous_cursor = presented_planes.cursor;
@@ -1898,7 +2127,7 @@ impl NativeRuntime {
                             "vrr_physical_lower_bound_violation",
                             vec![
                                 PacingField::u64("transaction_id", transaction_id.get()),
-                                PacingField::u64("output_generation", *drm_file_generation),
+                                PacingField::u64("output_generation", output_epoch.get()),
                                 PacingField::u64("actual_pageflip_ns", presented_at_ns),
                                 PacingField::option_u64(
                                     "required_lower_bound_ns",
@@ -1914,7 +2143,7 @@ impl NativeRuntime {
                         perf.log("native.vrr_physical_lower_bound_violation", || {
                             vec![
                                 NativePerfField::u64("transaction_id", transaction_id.get()),
-                                NativePerfField::u64("output_generation", *drm_file_generation),
+                                NativePerfField::u64("output_generation", output_epoch.get()),
                                 NativePerfField::u64("actual_pageflip_ns", presented_at_ns),
                                 NativePerfField::str(
                                     "required_lower_bound_ns",
@@ -1933,7 +2162,7 @@ impl NativeRuntime {
                                 NativePerfField::str("reason", reason),
                             ]
                         });
-                        explicit.reject_variable_pageflip_for_generation(*drm_file_generation);
+                        explicit.reject_variable_pageflip_for_generation(output_epoch.get());
                         if let Some(key) = output_transactions
                             .transaction_including_terminal(transaction_id)
                             .and_then(|record| record.descriptor().presentation_validation_key())
@@ -1984,6 +2213,7 @@ impl NativeRuntime {
                                 let recovered = abandon_overtaken_ready(
                                     explicit,
                                     owner,
+                                    *output_epoch,
                                     scene_history,
                                     frame_pacing,
                                     frame_scheduler,
@@ -2078,7 +2308,7 @@ impl NativeRuntime {
                     explicit.note_physical_primary_presentation(physical_claim)?;
                     match explicit.bind_ready_deferred_o1(
                         output_transactions,
-                        *drm_file_generation,
+                        output_epoch.get(),
                         presented_at,
                     )? {
                         DeferredO1BindingResult::NotReady => {}
@@ -2112,6 +2342,7 @@ impl NativeRuntime {
                             abandon_overtaken_ready(
                                 explicit,
                                 owner,
+                                *output_epoch,
                                 scene_history,
                                 frame_pacing,
                                 frame_scheduler,
@@ -2159,7 +2390,7 @@ impl NativeRuntime {
                         output_transactions,
                         transaction_id,
                         pageflip_token,
-                        *drm_file_generation,
+                        output_epoch.get(),
                         presented_at,
                         Some(actual_logical_sequence),
                     )?;
@@ -2224,7 +2455,7 @@ impl NativeRuntime {
                             complete_primary_cursor_pageflip(
                                 atomic_cursor,
                                 pageflip.user_data,
-                                *drm_file_generation,
+                                output_epoch.get(),
                             )?;
                             Ok(())
                         },
@@ -2259,7 +2490,7 @@ impl NativeRuntime {
                     let pageflip = pageflip_identity(
                         self.output_id,
                         pageflip_token,
-                        *drm_file_generation,
+                        *output_epoch,
                         target.crtc_id,
                     );
                     let presented_primary = Some(PresentedPrimaryAssignment::Composed {
@@ -2277,7 +2508,7 @@ impl NativeRuntime {
                         let identity = pageflip_identity(
                             self.output_id,
                             pageflip_token,
-                            *drm_file_generation,
+                            *output_epoch,
                             target.crtc_id,
                         );
                         let previous_cursor = presented_planes.cursor;
@@ -2394,7 +2625,7 @@ impl NativeRuntime {
                         if let Some(mode_key) = submit_window.mode_key() {
                             apply_guard_observation =
                                 Some(presentation_timing.observe_pageflip_with_evidence(
-                                    *drm_file_generation,
+                                    output_epoch.get(),
                                     mode_key,
                                     outcome,
                                 ));
@@ -2680,7 +2911,7 @@ impl NativeRuntime {
                     complete_primary_cursor_pageflip(
                         atomic_cursor,
                         pageflip.user_data,
-                        *drm_file_generation,
+                        output_epoch.get(),
                     )?;
                     if let Some(transaction_id) = compatibility_transaction_id {
                         complete_presented_output_transaction(
@@ -2689,7 +2920,7 @@ impl NativeRuntime {
                             transaction_id,
                             PageFlipToken::new(pageflip.user_data)
                                 .ok_or_else(|| io::Error::other("pageflip token is zero"))?,
-                            *drm_file_generation,
+                            output_epoch.get(),
                             MonotonicTimestampNs::new(presented_at_ns),
                             None,
                             |obligations| {
@@ -2740,7 +2971,7 @@ impl NativeRuntime {
                         NativePerfField::u64("render_generation", server.render_generation()),
                         NativePerfField::u64("pageflip_token", pageflip.user_data),
                         NativePerfField::str("kms_backend", kms_backend.effective_kind().as_str()),
-                        NativePerfField::u64("backend_generation", *drm_file_generation),
+                        NativePerfField::u64("backend_generation", output_epoch.get()),
                         NativePerfField::u64("kernel_sequence", u64::from(pageflip.sequence)),
                         NativePerfField::u64("kernel_timestamp_us", kernel_timestamp_us),
                         NativePerfField::u64("presentations", cadence.presentations),
@@ -2865,7 +3096,7 @@ impl NativeRuntime {
                             &mut self.presentation_trace,
                             sidecar_transaction_id,
                             pageflip_token,
-                            *drm_file_generation,
+                            output_epoch.get(),
                             MonotonicTimestampNs::new(compositor_receive_ns),
                             None,
                             |obligations| {
@@ -2892,7 +3123,7 @@ impl NativeRuntime {
                     {
                         if bundle_identity.token != pageflip_token
                             || bundle_identity.output_id != self.output_id
-                            || bundle_identity.output_generation != *drm_file_generation
+                            || bundle_identity.output_generation != output_epoch.get()
                             || bundle_identity.crtc_id != target.crtc_id
                         {
                             return Err(io::Error::other(
@@ -2905,7 +3136,8 @@ impl NativeRuntime {
                                 output_id: self.output_id,
                                 bundle_id: bundle_identity.id,
                                 token: bundle_identity.token,
-                                output_generation: bundle_identity.output_generation,
+                                output_epoch: OutputEpochId::new(bundle_identity.output_generation)
+                                    .expect("KMS pageflip output epoch is nonzero"),
                                 crtc_id: bundle_identity.crtc_id,
                             };
                         let cursor_plane_promotion = cursor_owner
@@ -2961,7 +3193,7 @@ impl NativeRuntime {
                             worker.set_established_presented_base_for_output(
                                 self.output_id,
                                 presented_planes.revision,
-                                *drm_file_generation,
+                                output_epoch.get(),
                                 target.crtc_id,
                             );
                         }

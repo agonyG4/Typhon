@@ -19,6 +19,7 @@ use oblivion_one::{
 use oblivion_one::render_backend::buffer::DrmFormat;
 
 use super::{ExplicitFramebufferDescriptor, ExplicitFramebufferPlane, add_explicit_framebuffer};
+use crate::native_output::output::DrmSessionGeneration;
 
 pub(crate) trait DirectFramebufferIo: Send + Sync {
     fn prime_fd_to_handle(&self, dma_buf: BorrowedFd<'_>) -> io::Result<u32>;
@@ -355,27 +356,30 @@ struct DirectFramebufferCacheEntry {
 pub(crate) struct DirectFramebufferCache {
     entries: HashMap<DmabufImageKey, DirectFramebufferCacheEntry>,
     capacity: usize,
-    drm_generation: u64,
+    drm_session_generation: DrmSessionGeneration,
     io: Arc<dyn DirectFramebufferIo>,
     use_counter: u64,
     cleanup_failures: Arc<AtomicU64>,
 }
 
 impl DirectFramebufferCache {
-    pub(crate) fn new(drm: BorrowedFd<'_>, drm_generation: u64) -> Self {
+    pub(crate) fn new(drm: BorrowedFd<'_>, drm_session_generation: DrmSessionGeneration) -> Self {
         Self::with_io(
             Arc::new(RealDirectFramebufferIo {
                 drm_fd: drm.as_raw_fd(),
             }),
-            drm_generation,
+            drm_session_generation,
         )
     }
 
-    pub(crate) fn with_io(io: Arc<dyn DirectFramebufferIo>, drm_generation: u64) -> Self {
+    pub(crate) fn with_io(
+        io: Arc<dyn DirectFramebufferIo>,
+        drm_session_generation: DrmSessionGeneration,
+    ) -> Self {
         Self {
             entries: HashMap::new(),
             capacity: 64,
-            drm_generation,
+            drm_session_generation,
             io,
             use_counter: 0,
             cleanup_failures: Arc::new(AtomicU64::new(0)),
@@ -450,8 +454,11 @@ impl DirectFramebufferCache {
         true
     }
 
-    pub(crate) fn clear_for_generation(&mut self, drm_generation: u64) {
-        if self.drm_generation == drm_generation {
+    pub(crate) fn rebind_session_generation(
+        &mut self,
+        drm_session_generation: DrmSessionGeneration,
+    ) {
+        if self.drm_session_generation == drm_session_generation {
             return;
         }
         let mut entries = self
@@ -463,7 +470,7 @@ impl DirectFramebufferCache {
         for entry in entries {
             drop(entry);
         }
-        self.drm_generation = drm_generation;
+        self.drm_session_generation = drm_session_generation;
     }
 
     pub(crate) fn disarm_drm_cleanup(&mut self) {
@@ -673,12 +680,13 @@ mod tests {
         let mut ids = oblivion_one::render_backend::buffer::BufferIdAllocator::default();
         let identity = ids.allocate().unwrap();
         let io = Arc::new(FakeIo::default());
-        let mut cache = DirectFramebufferCache::with_io(io.clone(), 1);
+        let mut cache =
+            DirectFramebufferCache::with_io(io.clone(), DrmSessionGeneration::new(1).unwrap());
         let buffer = test_buffer(&identity);
         assert!(!cache.get_or_import(&identity, &buffer).unwrap().1);
         assert!(cache.get_or_import(&identity, &buffer).unwrap().1);
         assert_eq!(cache.len(), 1);
-        cache.clear_for_generation(2);
+        cache.rebind_session_generation(DrmSessionGeneration::new(2).unwrap());
         assert_eq!(cache.len(), 0);
         assert_eq!(*io.events.lock().unwrap(), ["add_fb", "rm_fb", "gem_close"]);
     }
@@ -688,7 +696,8 @@ mod tests {
         let mut ids = oblivion_one::render_backend::buffer::BufferIdAllocator::default();
         let identity = ids.allocate().unwrap();
         let io = Arc::new(FakeIo::default());
-        let cache = DirectFramebufferCache::with_io(io.clone(), 1);
+        let cache =
+            DirectFramebufferCache::with_io(io.clone(), DrmSessionGeneration::new(1).unwrap());
         let buffer = test_buffer(&identity);
 
         let imported = cache.import_for_probe(&identity, &buffer).unwrap();
@@ -763,7 +772,7 @@ mod tests {
     fn dead_identity_is_evicted_before_a_new_cache_entry() {
         let mut ids = oblivion_one::render_backend::buffer::BufferIdAllocator::default();
         let io = Arc::new(FakeIo::default());
-        let mut cache = DirectFramebufferCache::with_io(io, 1);
+        let mut cache = DirectFramebufferCache::with_io(io, DrmSessionGeneration::new(1).unwrap());
         {
             let identity = ids.allocate().unwrap();
             let buffer = test_buffer(&identity);
@@ -779,7 +788,7 @@ mod tests {
     fn current_or_pending_arc_pins_cache_entry_from_eviction() {
         let mut ids = oblivion_one::render_backend::buffer::BufferIdAllocator::default();
         let io = Arc::new(FakeIo::default());
-        let mut cache = DirectFramebufferCache::with_io(io, 1);
+        let mut cache = DirectFramebufferCache::with_io(io, DrmSessionGeneration::new(1).unwrap());
         cache.capacity = 1;
         let first_identity = ids.allocate().unwrap();
         let first_buffer = test_buffer(&first_identity);

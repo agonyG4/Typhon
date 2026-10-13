@@ -621,7 +621,7 @@ fn triple_capability_reports_one_exact_blocker_in_safety_order() {
         render_fence_export: true,
         submission_transport_healthy: true,
         session_active: true,
-        output_generation_stable: true,
+        pool_generation_stable: true,
         ordinary_vsync: true,
         swapchain_poisoned: false,
         software_cursor_visible: false,

@@ -2,6 +2,7 @@ use super::kms_worker::{
     FatalWorkerJobDisposition, FatalWorkerJobHandler, UncertainJobRetention,
     handle_fatal_worker_jobs, prepare_frozen_cursor_presentation_for_submission,
     retain_complete_submitted_ownership, retain_uncertain_job_with_suspension,
+    retire_stale_submitted_completion,
 };
 use super::kms_worker::{WorkerTimingJournalSample, record_primary_worker_timing};
 use super::kms_worker_teardown::SubmittedWorkerPacingState;
@@ -166,7 +167,7 @@ fn test_uncertain_direct_job(lease: DirectPrimaryLease) -> KmsCommitJob {
         output_id: oblivion_one::core::OutputId::from_raw(1).expect("nonzero output id"),
         transaction_id,
         token,
-        output_generation: 1,
+        output_epoch: crate::native_output::OutputEpochId::initial(),
         crtc_id: 7,
         kind: AtomicCommitKind::DirectPrimary {
             transaction_id,
@@ -733,6 +734,35 @@ fn promotion_failure_quarantine_retains_complete_submitted_ownership() {
     assert_eq!(cleanup_count.load(std::sync::atomic::Ordering::Acquire), 0);
     emergency.clear();
     assert_eq!(cleanup_count.load(std::sync::atomic::Ordering::Acquire), 1);
+}
+
+#[test]
+fn old_epoch_kms_completion_releases_its_own_resources_without_current_mutation() {
+    let key = test_direct_key();
+    let (lease, cleanup_count) = DirectPrimaryLease::test_fixture_with_probe(key, 42);
+    let ownership = KmsSubmittedOwnership {
+        job: test_uncertain_direct_job(lease),
+        out_fence: Some(test_eventfd()),
+        planned_worker_wake_at: MonotonicTimestampNs::new(0),
+        actual_worker_wait_returned_at: MonotonicTimestampNs::new(0),
+        submit_started_at: MonotonicTimestampNs::new(1),
+        submit_returned_at: MonotonicTimestampNs::new(2),
+        queue_residency_ns: 0,
+        submit_wake_lateness_ns: Some(0),
+        pre_submit_duration_ns: 0,
+        ioctl_duration_ns: 1,
+        dispatch_duration_ns: 1,
+        submission_budget_ns: Some(1_000_000),
+        dispatch_tail_observation: None,
+    };
+    use std::os::fd::AsRawFd;
+    let out_fence_fd = ownership.out_fence.as_ref().unwrap().as_raw_fd();
+    let current_output_epoch = oblivion_one::native::OutputEpochId::initial().next();
+
+    assert!(retire_stale_submitted_completion(ownership, current_output_epoch).is_ok());
+
+    assert_eq!(cleanup_count.load(std::sync::atomic::Ordering::Acquire), 1);
+    assert_eq!(unsafe { libc::fcntl(out_fence_fd, libc::F_GETFD) }, -1);
 }
 
 #[test]

@@ -14,6 +14,7 @@ use super::super::kms_worker::{
 };
 pub(super) use super::kms_worker_teardown::{
     retain_complete_submitted_ownership, retain_uncertain_job_with_suspension,
+    retire_stale_submitted_completion,
 };
 pub(super) use super::plane_cycle::{WorkerQueueOutcome, queue_plane_delta};
 use super::presentation_transactions::{
@@ -387,7 +388,8 @@ pub(super) fn queue_explicit_composited_frame(
         output_id: output_transactions.output_id(),
         transaction_id,
         token,
-        output_generation,
+        output_epoch: crate::native_output::OutputEpochId::new(output_generation)
+            .expect("KMS output epoch is nonzero"),
         crtc_id,
         kind,
         reservation,
@@ -625,7 +627,8 @@ pub(super) fn queue_atomic_compatibility_frame(
         output_id: output_transactions.output_id(),
         transaction_id,
         token,
-        output_generation,
+        output_epoch: crate::native_output::OutputEpochId::new(output_generation)
+            .expect("KMS output epoch is nonzero"),
         crtc_id,
         kind,
         reservation: FramePresentationReservation::Fixed(target),
@@ -960,7 +963,7 @@ impl NativeRuntime {
 
     fn validate_submitted_ownership(&self, ownership: &KmsSubmittedOwnership) -> NativeResult<()> {
         let job = &ownership.job;
-        if job.output_generation != self.drm_file_generation
+        if job.output_epoch != self.output_epoch
             || self.atomic_commit_arbiter.worker_queued_token() != Some(job.token)
             || self.atomic_commit_arbiter.worker_queued_kind() != Some(job.kind)
             || !self.atomic_commit_arbiter.worker_job_queued()
@@ -1035,6 +1038,29 @@ impl NativeRuntime {
     pub(super) fn process_kms_worker_event(&mut self, event: KmsWorkerEvent) -> NativeResult<()> {
         let KmsWorkerEvent::Submitted { ownership } = event else {
             return self.process_kms_worker_event_inner(event);
+        };
+        let completion_output_epoch = ownership.job.output_epoch.get();
+        let completion_job_id = ownership.job.bundle_id.get();
+        let ownership = match retire_stale_submitted_completion(ownership, self.output_epoch) {
+            Ok(()) => {
+                self.perf
+                    .log("native.kms_commit_worker.stale_completion", || {
+                        vec![
+                            NativePerfField::u64(
+                                "completion_output_epoch",
+                                completion_output_epoch,
+                            ),
+                            NativePerfField::u64("current_output_epoch", self.output_epoch.get()),
+                            NativePerfField::u64("job_id", completion_job_id),
+                            NativePerfField::str(
+                                "disposition",
+                                "retired_stale_transport_ownership",
+                            ),
+                        ]
+                    });
+                return Ok(());
+            }
+            Err(ownership) => ownership,
         };
         let pacing = match self.acknowledge_submitted_worker_pacing(&ownership) {
             Ok(pacing) => pacing,
@@ -1133,7 +1159,7 @@ impl NativeRuntime {
                 let trace_snapshot = ownership.job.owners.trace_reveal();
                 let trace_identity = crate::native_output::CursorRevealPhysicalIdentity {
                     output_id: ownership.job.output_id,
-                    output_generation: ownership.job.output_generation,
+                    output_generation: ownership.job.output_epoch.get(),
                     crtc_id: ownership.job.crtc_id,
                     token: ownership.job.token,
                 };
@@ -1160,7 +1186,7 @@ impl NativeRuntime {
                         submission_budget_ns: ownership.submission_budget_ns,
                     },
                 );
-                let _output_generation = ownership.job.output_generation;
+                let _output_epoch = ownership.job.output_epoch;
                 let cursor = ownership.job.cursor.clone();
                 let sidecar_owner = ownership
                     .job
@@ -1324,7 +1350,7 @@ impl NativeRuntime {
                         &mut self.output_transactions,
                         transaction_id,
                         sidecar.transaction.id(),
-                        ownership.job.output_generation,
+                        ownership.job.output_epoch.get(),
                         MonotonicTimestampNs::new(queued_at),
                     )?;
                 }
@@ -1764,8 +1790,8 @@ impl NativeRuntime {
                 let disposition = validation_base_invalidation_disposition(
                     self.session.permits_output(),
                     self.shutdown.is_shutting_down(),
-                    self.drm_file_generation,
-                    job.output_generation,
+                    self.output_epoch.get(),
+                    job.output_epoch.get(),
                     reason,
                 );
                 match disposition {
@@ -1808,7 +1834,8 @@ impl NativeRuntime {
             self.validate_output_pipeline().map_err(|error| {
                 io::Error::other(format!(
                     "worker completion pipeline mismatch: generation={} crtc={} error={error}",
-                    self.drm_file_generation, self.target.crtc_id,
+                    self.output_epoch.get(),
+                    self.target.crtc_id,
                 ))
             })?;
         }

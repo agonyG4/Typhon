@@ -31,6 +31,62 @@ mod tests {
     }
 
     #[test]
+    fn physical_ready_owned_by_active_pacing_frame_terminalizes_after_overtake() {
+        let mut pacing = NativeFramePacing::from_env();
+        pacing.enabled = true;
+        pacing.queue_visual(1, 1);
+        pacing.note_render_started(NativeOutputPacingMode::ReactiveDouble, false);
+        let physical_ready = predictive_physical_identity(9, 12);
+        pacing
+            .bind_physical_output_frame(physical_ready)
+            .expect("rendered physical READY binds to the active logical owner");
+
+        assert!(pacing.active.is_some());
+        assert!(pacing.ready.is_none());
+        assert!(pacing.active_physical_identity() == Some(physical_ready));
+        assert!(
+            !pacing.abandon_ready_frame(),
+            "the live failure state has no separate pacing READY lane"
+        );
+
+        pacing
+            .terminalize_unsubmitted_physical_frame(physical_ready)
+            .expect("exact active physical owner is terminalized instead of reported missing");
+
+        assert!(!pacing.has_unsettled_output_frame_ownership());
+        assert_eq!(pacing.active_physical_identity(), None);
+        assert_eq!(pacing.unsubmitted_physical_identity(), None);
+    }
+
+    #[test]
+    fn deferred_physical_ready_moves_to_ready_before_a_successor_binds() {
+        let mut pacing = NativeFramePacing::from_env();
+        pacing.enabled = true;
+        pacing.queue_visual(1, 1);
+        pacing
+            .note_render_started(NativeOutputPacingMode::ReactiveDouble, false)
+            .unwrap();
+        let first_ready = predictive_physical_identity(9, 12);
+        pacing.bind_physical_output_frame(first_ready).unwrap();
+
+        pacing.note_ready_frame(2, false);
+        assert_eq!(pacing.active, None);
+        assert_eq!(pacing.ready_physical_identity, Some(first_ready));
+
+        pacing.queue_visual(3, 2);
+        pacing
+            .note_render_started(NativeOutputPacingMode::ReactiveDouble, false)
+            .unwrap();
+        let successor = predictive_physical_identity(10, 13);
+        pacing
+            .bind_physical_output_frame(successor)
+            .expect("a deferred READY owner and its successor occupy separate lanes");
+
+        assert_eq!(pacing.ready_physical_identity, Some(first_ready));
+        assert_eq!(pacing.active_physical_identity(), Some(successor));
+    }
+
+    #[test]
     fn frame_ids_are_nonzero_and_wrap_to_one() {
         let mut ids = NativeOutputFrameIdSequence::new(u64::MAX);
         assert_eq!(ids.next().get(), u64::MAX);
@@ -2978,36 +3034,126 @@ impl NativeFramePacing {
 
     /// Transfer a predictive attempt from the scheduler namespace to the
     /// exact output frame created by the physical scanout backend.
+    pub(crate) fn bind_physical_output_frame(
+        &mut self,
+        physical_identity: OutputFrameIdentitySnapshot,
+    ) -> Result<(), &'static str> {
+        if !self.enabled {
+            return Ok(());
+        }
+        let physical_key = OutputFrameKey::from(&physical_identity);
+        if self.active.is_none() {
+            return Err("physical output frame has no active pacing owner");
+        }
+        if self
+            .active_physical_identity
+            .is_some_and(|identity| identity != physical_identity)
+        {
+            return Err("active pacing owner is already bound to another physical frame");
+        }
+        if self.active_origin == PreparedFrameOrigin::PredictiveO1 {
+            let attempt_id = self
+                .active_predictive_attempt
+                .ok_or("Predictive O1 physical frame has no active attempt")?;
+            self.predictive_o1_lifecycle
+                .bind(attempt_id, physical_identity)?;
+            self.log(
+                "predictive_attempt_bound",
+                vec![
+                    PacingField::u64("predictive_attempt_id", attempt_id.get()),
+                    PacingField::u64("output_frame_id", physical_identity.frame_id),
+                    PacingField::u64("transaction_id", physical_identity.transaction_id.get()),
+                    PacingField::u64(
+                        "protocol_batch_id",
+                        physical_identity.protocol_batch_id.get(),
+                    ),
+                    PacingField::u64("pool_generation", physical_identity.pool_generation),
+                    PacingField::u64("render_generation", physical_identity.render_generation),
+                ],
+            );
+        }
+        self.active_physical_identity = Some(physical_identity);
+        self.active_physical_key = Some(physical_key);
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub(crate) fn bind_predictive_o1(
         &mut self,
         physical_identity: OutputFrameIdentitySnapshot,
     ) -> Result<(), &'static str> {
-        if !self.enabled || self.active_origin != PreparedFrameOrigin::PredictiveO1 {
+        self.bind_physical_output_frame(physical_identity)
+    }
+
+    pub(crate) fn unsubmitted_physical_identity(&self) -> Option<OutputFrameIdentitySnapshot> {
+        self.ready_physical_identity
+            .or(self.active_physical_identity)
+    }
+
+    pub(crate) fn active_physical_identity(&self) -> Option<OutputFrameIdentitySnapshot> {
+        self.active_physical_identity
+    }
+
+    pub(crate) fn validate_physical_ready_owner(
+        &self,
+        physical_identity: OutputFrameIdentitySnapshot,
+    ) -> bool {
+        if !self.enabled {
+            return true;
+        }
+        let ready_match =
+            self.ready.is_some() && self.ready_physical_identity == Some(physical_identity);
+        let active_match =
+            self.active.is_some() && self.active_physical_identity == Some(physical_identity);
+        let ready_mismatch =
+            self.ready.is_some() && self.ready_physical_identity != Some(physical_identity);
+        !(ready_mismatch || (!ready_match && !active_match))
+    }
+
+    pub(crate) fn has_unbound_ready_owner(&self) -> bool {
+        self.ready.is_some() && self.ready_physical_identity.is_none()
+    }
+
+    pub(crate) fn has_unsettled_output_frame_ownership(&self) -> bool {
+        self.enabled
+            && (self.active.is_some()
+                || self.ready.is_some()
+                || self.pending.is_some()
+                || self.worker_reservation.is_some())
+    }
+
+    pub(crate) fn rebase_after_output_epoch(&mut self) {
+        debug_assert!(
+            !self.has_unsettled_output_frame_ownership(),
+            "output epoch rebase requires every old pacing owner to be terminal"
+        );
+        self.active_physical_identity = None;
+        self.active_physical_key = None;
+        self.ready_physical_identity = None;
+        self.ready_physical_key = None;
+        self.pending_physical_identity = None;
+        self.pending_physical_key = None;
+        self.last_prediction = None;
+    }
+
+    pub(crate) fn terminalize_unsubmitted_physical_frame(
+        &mut self,
+        physical_identity: OutputFrameIdentitySnapshot,
+    ) -> Result<(), &'static str> {
+        if !self.enabled {
             return Ok(());
         }
-        let attempt_id = self
-            .active_predictive_attempt
-            .ok_or("Predictive O1 physical frame has no active attempt")?;
-        let physical_key = OutputFrameKey::from(&physical_identity);
-        self.predictive_o1_lifecycle
-            .bind(attempt_id, physical_identity)?;
-        self.active_physical_identity = Some(physical_identity);
-        self.active_physical_key = Some(physical_key);
-        self.log(
-            "predictive_attempt_bound",
-            vec![
-                PacingField::u64("predictive_attempt_id", attempt_id.get()),
-                PacingField::u64("output_frame_id", physical_identity.frame_id),
-                PacingField::u64("transaction_id", physical_identity.transaction_id.get()),
-                PacingField::u64(
-                    "protocol_batch_id",
-                    physical_identity.protocol_batch_id.get(),
-                ),
-                PacingField::u64("pool_generation", physical_identity.pool_generation),
-                PacingField::u64("render_generation", physical_identity.render_generation),
-            ],
-        );
-        Ok(())
+        if self.ready_physical_identity == Some(physical_identity) {
+            return self
+                .abandon_ready_frame()
+                .then_some(())
+                .ok_or("physical READY frame has no pacing READY owner");
+        }
+        if self.active_physical_identity == Some(physical_identity) && self.active.is_some() {
+            self.clear_unsubmitted_render(PredictiveReadyTerminal::OtherSafeAbandonment);
+            return Ok(());
+        }
+        Err("physical READY frame has no matching active or READY pacing owner")
     }
 
     pub(crate) fn active_predictive_attempt_id(&self) -> Option<PredictiveO1AttemptId> {

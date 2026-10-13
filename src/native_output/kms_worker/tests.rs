@@ -199,7 +199,7 @@ pub(super) fn test_job(token: u64) -> KmsCommitJob {
         output_id: oblivion_one::core::OutputId::from_raw(1).expect("nonzero output id"),
         transaction_id,
         token: oblivion_one::native::kms::PageFlipToken::new(token).unwrap(),
-        output_generation: 1,
+        output_epoch: oblivion_one::native::OutputEpochId::initial(),
         crtc_id: 7,
         kind: AtomicCommitKind::DirectPrimary {
             transaction_id,
@@ -649,7 +649,7 @@ fn test_pending_sidecar(job: &KmsCommitJob, id: u64) -> CursorSidecar {
         crate::native_output::OutputTransaction::cursor_plane_delta(
             job.output_id,
             transaction_id,
-            job.output_generation,
+            job.output_epoch.get(),
             MonotonicTimestampNs::new(id),
             target,
             oblivion_one::native::scheduler::NativeOutputPacingMode::ReactiveDouble,

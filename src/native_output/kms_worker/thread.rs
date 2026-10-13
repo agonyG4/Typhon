@@ -726,7 +726,7 @@ impl ExecutingDirectCandidateGuard {
             bundle: job.identity(),
             token: job.token,
             transaction_id: job.transaction_id,
-            output_generation: job.output_generation,
+            output_generation: job.output_epoch.get(),
             kind: job.kind,
             direct_content_key: self.candidate,
             submit_returned_at_ns,
@@ -826,7 +826,7 @@ fn collect_cursor_sidecar_before_freeze(
             match (eligible_job, job.reservation) {
                 (true, FramePresentationReservation::Fixed(target)) => state
                     .cursor_sidecar
-                    .claim_for(job.output_generation, job.crtc_id, target, primary_id),
+                    .claim_for(job.output_epoch.get(), job.crtc_id, target, primary_id),
                 (
                     true,
                     FramePresentationReservation::Variable(_)
@@ -961,7 +961,7 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
             let mode_key = job
                 .fixed_submit_window()
                 .and_then(|window| window.mode_key());
-            dispatch_models.rebind_cursor_timing_domain(job.output_generation, mode_key);
+            dispatch_models.rebind_cursor_timing_domain(job.output_epoch.get(), mode_key);
             if let FramePresentationReservation::Fixed(target) = job.reservation {
                 dispatch_models
                     .model_mut(service_class)
@@ -1203,7 +1203,7 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
                     let dispatch_budget_ns = dispatch_budget.dispatch_budget_ns;
                     shared.metrics.timing.record_service_class_dispatch(
                         service_class,
-                        job.output_generation,
+                        job.output_epoch.get(),
                         dispatch_budget_ns,
                         dispatch_model.adaptive_tail_guard_ns(),
                     );
@@ -1581,7 +1581,7 @@ fn take_next_work(shared: &Arc<WorkerShared>) -> Option<WorkerWork> {
                             transaction_id,
                             bundle_identity: job.identity(),
                             validation_base: job.validation_base,
-                            output_generation: job.output_generation,
+                            output_generation: job.output_epoch.get(),
                             crtc_id: job.crtc_id,
                             target,
                             phase: AttachablePrimaryPhase::DequeuedWaitingPredecessor,

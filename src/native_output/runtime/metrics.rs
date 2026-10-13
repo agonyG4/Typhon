@@ -278,7 +278,7 @@ impl NativeRuntime {
             .primary_dispatch_budget_ns
             .max(crate::native_output::kms_worker::DISPATCH_GUARD_NS);
         let cursor_dispatch_generation_matches =
-            worker.timing.cursor_dispatch_generation == self.drm_file_generation;
+            worker.timing.cursor_dispatch_generation == self.output_epoch.get();
         let cursor_dispatch_budget_ns = if cursor_dispatch_generation_matches {
             worker.timing.cursor_dispatch_budget_ns
         } else {

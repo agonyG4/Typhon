@@ -311,7 +311,8 @@ pub(super) fn queue_plane_delta(
         output_id: output_transactions.output_id(),
         transaction_id,
         token,
-        output_generation,
+        output_epoch: crate::native_output::OutputEpochId::new(output_generation)
+            .expect("KMS output epoch is nonzero"),
         crtc_id,
         kind,
         reservation: FramePresentationReservation::Fixed(target),

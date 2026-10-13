@@ -29,7 +29,7 @@ impl CursorRevealPhysicalIdentity {
     pub(crate) const fn from_pageflip(identity: PlanePageflipIdentity) -> Self {
         Self {
             output_id: identity.output_id,
-            output_generation: identity.output_generation,
+            output_generation: identity.output_epoch.get(),
             crtc_id: identity.crtc_id,
             token: identity.token,
         }

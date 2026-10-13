@@ -861,24 +861,40 @@ impl NativeScanoutBackend {
         Ok(())
     }
 
-    pub(crate) fn rebind_session_generation(
+    pub(crate) fn rebind_output_epoch(
         &mut self,
-        generation: u64,
+        output_epoch: oblivion_one::native::OutputEpochId,
+        drm_session_generation: crate::native_output::output::DrmSessionGeneration,
         vrr_connector_capable: bool,
         vrr_crtc_property_available: bool,
     ) -> io::Result<()> {
         match self {
-            Self::AtomicEglGbm(scanout) => scanout.rebind_session_generation(
-                generation,
+            Self::AtomicEglGbm(scanout) => scanout.rebind_output_epoch(
+                output_epoch,
+                drm_session_generation,
                 vrr_connector_capable,
                 vrr_crtc_property_available,
             )?,
-            Self::NativeEglGbm(scanout) => scanout.rebind_session_generation(generation),
-            Self::Gbm(scanout) => scanout.rebind_session_generation(generation),
+            Self::NativeEglGbm(scanout) => scanout.rebind_output_epoch(output_epoch.get()),
+            Self::Gbm(scanout) => scanout.rebind_output_epoch(output_epoch.get()),
             Self::Dumb(_) => {}
         }
         self.invalidate_direct_validation_cache();
         Ok(())
+    }
+
+    pub(crate) fn bind_output_epoch(&mut self, output_epoch: oblivion_one::native::OutputEpochId) {
+        if let Self::AtomicEglGbm(scanout) = self {
+            scanout.bind_output_epoch(output_epoch);
+        }
+        self.invalidate_direct_validation_cache();
+    }
+
+    pub(crate) fn explicit_output_pool_generation(&self) -> Option<u64> {
+        match self {
+            Self::AtomicEglGbm(scanout) => scanout.physical_pool_generation(),
+            Self::NativeEglGbm(_) | Self::Gbm(_) | Self::Dumb(_) => None,
+        }
     }
 
     pub(crate) fn invalidate_direct_validation_cache(&mut self) {

@@ -169,7 +169,8 @@ struct NativeRuntimeBootstrapTail {
     output_capabilities: NativeOutputCapabilities,
     mode_label: String,
     output_refresh_rate: oblivion_one::compositor::OutputRefreshRate,
-    drm_file_generation: u64,
+    drm_session_generation: DrmSessionGeneration,
+    output_epoch: OutputEpochId,
     drm_timestamp_clock: DrmTimestampClock,
     presentation_clock: PresentationClock,
     scanout: NativeScanoutBackend,
@@ -210,7 +211,8 @@ impl NativeRuntime {
             output_capabilities,
             mode_label,
             output_refresh_rate,
-            drm_file_generation,
+            drm_session_generation,
+            output_epoch,
             drm_timestamp_clock,
             presentation_clock,
             mut scanout,
@@ -232,6 +234,7 @@ impl NativeRuntime {
             vrr_policy,
             initial_presented_scene,
         } = parts;
+        let output_generation = output_epoch.get();
         let mut legacy_cursor = pre_kms_legacy_cursor;
         scanout.finish_initial_scanout();
         if let Some(cursor) = legacy_cursor.as_mut() {
@@ -391,8 +394,7 @@ impl NativeRuntime {
         });
         let refresh_interval_ns = output_refresh_rate.interval_ns();
         let acquire_notifier = DrmAcquirePointNotifier;
-        let acquire_watches =
-            ExplicitSyncWatchRegistry::new(refresh_interval_ns, drm_file_generation);
+        let acquire_watches = ExplicitSyncWatchRegistry::new(refresh_interval_ns, output_epoch);
         server.enable_external_acquire_readiness();
         let mut event_loop = NativeEventLoop::new()?;
         let controller_manager = (controller_policy == ControllerPolicy::Observe)
@@ -521,12 +523,12 @@ impl NativeRuntime {
         let presentation_deadline = PresentationDeadlinePlanner::new(refresh_interval);
         let presentation_timing = KmsPresentationTimingModel::new(
             KmsModeTiming::from_mode(&target.mode, refresh_interval_ns),
-            drm_file_generation,
+            output_generation,
         );
         let cursor_timing =
             crate::native_output::presentation::cursor_timing::CursorTimingDomain::new(
                 KmsModeTiming::from_mode(&target.mode, refresh_interval_ns),
-                drm_file_generation,
+                output_generation,
             );
         let scheduled_presentation_target = None;
         let render_journal = AdaptiveRenderJournal::default();
@@ -695,7 +697,8 @@ impl NativeRuntime {
             pending_output_configuration: None,
             mode_label,
             output_refresh_rate,
-            drm_file_generation,
+            drm_session_generation,
+            output_epoch,
             drm_timestamp_clock,
             presentation_clock,
             scanout: mem::ManuallyDrop::new(scanout),
@@ -915,7 +918,9 @@ impl NativeRuntime {
         println!("native DRM backend target: {}", drm_plan.primary.as_str());
         let kms = NativeDrmDevice::open(drm_plan, kms_device, seat_session.clone())?;
         println!("native DRM backend active: {}", kms.kind().as_str());
-        let drm_file_generation = allocate_native_drm_file_generation();
+        let drm_session_generation = allocate_native_drm_session_generation();
+        let output_epoch = OutputEpochId::initial();
+        let output_generation = output_epoch.get();
         let kms_policy = KmsPolicy::parse(std::env::var("OBLIVION_ONE_KMS_MODE").ok().as_deref())?;
         println!("native KMS policy requested: {}", kms_policy.as_str());
         let drm_timestamp_clock = query_drm_timestamp_clock(kms.file().as_fd())?;
@@ -1110,7 +1115,9 @@ impl NativeRuntime {
                         &discovery,
                         target.width,
                         target.height,
-                        drm_file_generation,
+                        output_epoch,
+                        drm_session_generation,
+                        1,
                         output_id,
                         std::sync::Arc::clone(&initial_renderer_generation),
                         cursor_image.clone(),
@@ -1140,7 +1147,7 @@ impl NativeRuntime {
                         kms.file(),
                         target.width,
                         target.height,
-                        drm_file_generation,
+                        output_generation,
                     )?;
                     let discovery = if kms_policy == KmsPolicy::Legacy {
                         Err(AtomicKmsError::new(
@@ -1167,7 +1174,7 @@ impl NativeRuntime {
                 kms.file(),
                 target.width,
                 target.height,
-                drm_file_generation,
+                output_generation,
             )?;
             let discovery = if kms_policy == KmsPolicy::Legacy {
                 Err(AtomicKmsError::new(
@@ -1246,7 +1253,7 @@ impl NativeRuntime {
                         plane,
                         discovery.cursor_width,
                         discovery.cursor_height,
-                        drm_file_generation,
+                        output_generation,
                         CursorOutputIdentity::new(
                             output_id,
                             target.crtc_id,
@@ -1488,7 +1495,7 @@ impl NativeRuntime {
                         kms.file(),
                         target.width,
                         target.height,
-                        drm_file_generation,
+                        output_generation,
                     )?;
                     let effect_generation = server.trusted_effect_registry().current();
                     scanout
@@ -1758,7 +1765,7 @@ impl NativeRuntime {
                 NativePerfField::str("async_blocker", "not_requested_at_bootstrap"),
                 NativePerfField::str("submitted_mode", "vsync"),
                 NativePerfField::str("pageflip_confirmed_mode", "unconfirmed"),
-                NativePerfField::u64("output_generation", drm_file_generation),
+                NativePerfField::u64("output_generation", output_generation),
             ]
         });
         Self::finish_bootstrap(
@@ -1775,7 +1782,8 @@ impl NativeRuntime {
                 output_capabilities,
                 mode_label,
                 output_refresh_rate,
-                drm_file_generation,
+                drm_session_generation,
+                output_epoch,
                 drm_timestamp_clock,
                 presentation_clock,
                 scanout,

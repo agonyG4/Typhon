@@ -36,7 +36,7 @@ pub(super) fn settle_direct_pageflip(
     output_transactions: &mut OutputTransactionLedger,
     presentation_trace: &mut PresentationTransactionTraceRing,
     atomic_cursor: &mut Option<NativeAtomicCursor>,
-    drm_file_generation: u64,
+    output_epoch: u64,
     pageflip_identity: crate::native_output::presentation::plane::PlanePageflipIdentity,
     transaction_id: OutputTransactionId,
     pageflip_token: PageFlipToken,
@@ -55,12 +55,12 @@ pub(super) fn settle_direct_pageflip(
     let prepared_physical =
         scanout.prepare_direct_pageflip(transaction_id, pageflip_token, presented_at)?;
     let prepared_cursor =
-        prepare_primary_cursor_pageflip(atomic_cursor, pageflip_user_data, drm_file_generation)?;
+        prepare_primary_cursor_pageflip(atomic_cursor, pageflip_user_data, output_epoch)?;
     let prepared_logical = prepare_presented_output_transaction(
         output_transactions,
         transaction_id,
         pageflip_token,
-        drm_file_generation,
+        output_epoch,
         presented_at,
         Some(u64::from(pageflip_sequence)),
     )?;
@@ -103,7 +103,7 @@ pub(super) fn settle_direct_pageflip(
     let completion = scanout.commit_prepared_direct_pageflip(prepared_physical);
     output_transactions.commit_prepared_terminal(prepared_logical);
     if prepared_cursor {
-        commit_primary_cursor_pageflip(atomic_cursor, pageflip_user_data, drm_file_generation);
+        commit_primary_cursor_pageflip(atomic_cursor, pageflip_user_data, output_epoch);
     }
     server.commit_surface_damage_presented(completion.surface_damage);
     complete_presentation_feedback_obligation(server, logical_obligations, presentation)?;

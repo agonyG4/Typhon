@@ -991,7 +991,7 @@ mod ownership_tests {
             output_id: oblivion_one::core::OutputId::from_raw(1).expect("nonzero output id"),
             transaction_id,
             token: oblivion_one::native::kms::PageFlipToken::new(token).unwrap(),
-            output_generation: 1,
+            output_epoch: crate::native_output::OutputEpochId::initial(),
             crtc_id: 7,
             kind: AtomicCommitKind::CompositedPrimary {
                 transaction_id,

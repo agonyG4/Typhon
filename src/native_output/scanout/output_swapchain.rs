@@ -1227,21 +1227,28 @@ impl AtomicOutputSwapchain {
     }
 
     pub(crate) fn suspend_abandon_ready(&mut self) -> io::Result<bool> {
-        self.ensure_suspendable()?;
-        let Some(ready) = self.ready.as_ref() else {
-            return Ok(false);
-        };
+        self.validate_suspend_abandon_ready()?;
+        let ready = self.ready.as_ref().expect("ready frame was preflighted");
         let slot = ready.slot;
-        if self.suspended_slot_id(slot).is_some() {
-            return Err(io::Error::other(
-                "output slot is already owned by suspended output",
-            ));
-        }
         let suspended_index = self.empty_suspended_slot_index()?;
         let mut frame = self.ready.take().expect("ready was observed above");
         let timing_fence = frame.render_fence.take_timing_fd();
         self.suspend_owned_slot(suspended_index, slot, timing_fence, frame);
         Ok(true)
+    }
+
+    pub(crate) fn validate_suspend_abandon_ready(&self) -> io::Result<()> {
+        self.ensure_suspendable()?;
+        let ready = self.ready.as_ref().ok_or_else(|| {
+            io::Error::other("no ready frame exists for reconfiguration retirement")
+        })?;
+        if self.suspended_slot_id(ready.slot).is_some() {
+            return Err(io::Error::other(
+                "output slot is already owned by suspended output",
+            ));
+        }
+        self.empty_suspended_slot_index()?;
+        Ok(())
     }
 
     pub(crate) fn suspend_abandon_worker_queued(
@@ -1331,7 +1338,9 @@ impl AtomicOutputSwapchain {
         if let Some(token) = self.worker_queued_token() {
             self.suspend_abandon_worker_queued(token)?;
         }
-        self.suspend_abandon_ready()?;
+        if self.ready.is_some() {
+            self.suspend_abandon_ready()?;
+        }
         Ok(())
     }
 
@@ -2261,7 +2270,7 @@ impl AtomicOutputSwapchain {
             .map(|suspended| suspended.slot)
     }
 
-    fn has_suspended_ownership(&self) -> bool {
+    pub(crate) fn has_suspended_ownership(&self) -> bool {
         self.suspended.iter().any(Option::is_some)
     }
 

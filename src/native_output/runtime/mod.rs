@@ -297,7 +297,8 @@ pub(super) use xwayland_reactor::{
 struct PendingSessionRecovery {
     output_id: OutputId,
     scanout: NativeScanoutRecovery,
-    generation: u64,
+    drm_session_generation: DrmSessionGeneration,
+    output_epoch: OutputEpochId,
     cursor: crate::native_output::presentation::plane::PresentedCursorState,
 }
 
@@ -727,11 +728,11 @@ pub(crate) struct NativeRuntime {
     pending_output_configuration: Option<PendingOutputConfigurationRequest>,
     mode_label: String,
     output_refresh_rate: oblivion_one::compositor::OutputRefreshRate,
-    // Shared native-output ownership epoch. It changes after DRM session-file
-    // replacement and successful output modesets, and qualifies scanout pools,
-    // explicit-sync watches, pageflips, workers, cursor state, and presentation.
-    // It is not the semantic OutputConfigurationGeneration exposed to Settings.
-    drm_file_generation: u64,
+    // Session-file lifetime is independent of the physical output pipeline.
+    drm_session_generation: DrmSessionGeneration,
+    // Physical presentation lifetime; modesets and successful session recovery
+    // advance it independently of the semantic Settings generation.
+    output_epoch: OutputEpochId,
     drm_timestamp_clock: DrmTimestampClock,
     presentation_clock: PresentationClock,
     scanout: mem::ManuallyDrop<NativeScanoutBackend>,

@@ -18,6 +18,7 @@ use crate::native_output::{
 use oblivion_one::compositor::{DrmContentType, OutputPresentationMode};
 use oblivion_one::core::OutputId;
 use oblivion_one::native::{
+    OutputEpochId,
     buffering::PresentationOpportunity,
     kms::{AtomicCursorVisualState, FramebufferId, PageFlipToken},
     presentation_deadline::{MonotonicTimestampNs, PresentationTarget, PresentationTargetReason},
@@ -32,7 +33,7 @@ pub(crate) struct KmsCommitJob {
     pub(crate) output_id: OutputId,
     pub(crate) transaction_id: OutputTransactionId,
     pub(crate) token: PageFlipToken,
-    pub(crate) output_generation: u64,
+    pub(crate) output_epoch: OutputEpochId,
     pub(crate) crtc_id: u32,
     pub(crate) kind: AtomicCommitKind,
     pub(crate) reservation: FramePresentationReservation,
@@ -330,7 +331,7 @@ impl KmsCommitJob {
             id: self.bundle_id,
             token: self.token,
             output_id: self.output_id,
-            output_generation: self.output_generation,
+            output_generation: self.output_epoch.get(),
             crtc_id: self.crtc_id,
             primary_transaction_id: self.owners.primary_transaction_id(),
             cursor_transaction_id: self.owners.cursor_transaction_id(),
@@ -373,7 +374,7 @@ impl KmsCommitJob {
                 crtc_id,
                 ..
             }) if output_id != self.identity().output_id
-                || output_generation != self.output_generation
+                || output_generation != self.output_epoch.get()
                 || crtc_id != self.crtc_id =>
             {
                 return Err(KmsCommitPayloadError::ValidationBaseMismatch);
@@ -401,7 +402,7 @@ impl KmsCommitJob {
                 if owner.output_id() != self.output_id {
                     return Err(KmsCommitPayloadError::OutputMismatch);
                 }
-                if owner.output_generation() != self.output_generation {
+                if owner.output_generation() != self.output_epoch.get() {
                     return Err(KmsCommitPayloadError::OwnerGenerationMismatch);
                 }
                 self.validate_reservation_owner(owner.reservation())?;
@@ -438,7 +439,7 @@ impl KmsCommitJob {
         if self.transaction_id != transaction.id() {
             return Err(KmsCommitPayloadError::TransactionIdentityMismatch);
         }
-        if self.output_generation != transaction.output_generation() {
+        if self.output_epoch.get() != transaction.output_generation() {
             return Err(KmsCommitPayloadError::GenerationMismatch);
         }
         if self.reservation != transaction.reservation() {

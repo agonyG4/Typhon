@@ -49,7 +49,7 @@ fn test_sidecar(job: &KmsCommitJob) -> CursorSidecar {
         OutputTransaction::cursor_plane_delta(
             job.output_id,
             transaction_id,
-            job.output_generation,
+            job.output_epoch.get(),
             target.presentation_time,
             target,
             oblivion_one::native::scheduler::NativeOutputPacingMode::ReactiveDouble,
@@ -87,7 +87,7 @@ fn test_job_with_cursor_owner(token: u64) -> KmsCommitJob {
         OutputTransaction::composited(
             job.output_id,
             job.transaction_id,
-            job.output_generation,
+            job.output_epoch.get(),
             MonotonicTimestampNs::new(0),
             target,
             NativeOutputPacingMode::ReactiveDouble,

@@ -12,6 +12,9 @@ pub(super) mod direct_fallback;
 #[path = "cycle/pageflip.rs"]
 mod pageflip;
 pub(super) use pageflip::abandon_overtaken_ready;
+pub(crate) use pageflip::register_suspended_fence_if_needed;
+pub(super) use pageflip::terminalize_unsubmitted_frame_for_reconfiguration;
+pub(super) use pageflip::validate_reconfiguration_frame_ownership;
 pub fn run(
     server: OwnCompositorServer,
     app: Vec<String>,
@@ -84,7 +87,7 @@ impl NativeRuntime {
         let pending_target = super::planner::pending_fixed_target_for_scanout(&self.scanout)?;
         let cursor_dispatch_budget_ns = worker.dispatch_budget_ns(
             crate::native_output::kms_worker::KmsServiceClass::CursorPlaneDelta,
-            self.drm_file_generation,
+            self.output_epoch.get(),
         );
         let candidate = super::planner::plan_cursor_service_opportunity_with_current(
             &self.presentation_deadline,
@@ -126,7 +129,7 @@ impl NativeRuntime {
             return Ok(false);
         };
         let attachable_primary = worker.attachable_primary(
-            self.drm_file_generation,
+            self.output_epoch.get(),
             self.target.crtc_id,
             opportunity.target,
         );
@@ -194,7 +197,7 @@ impl NativeRuntime {
         let validation_base = crate::native_output::kms_worker::KmsValidationBase::Presented {
             output_id: self.output_id,
             snapshot: self.presented_planes,
-            output_generation: self.drm_file_generation,
+            output_generation: self.output_epoch.get(),
             crtc_id: self.target.crtc_id,
         };
         let decision = super::presentation_worker::present_cursor_for_presentation(
@@ -210,7 +213,7 @@ impl NativeRuntime {
             opportunity.target,
             Some(opportunity.submit_window),
             self.target.crtc_id,
-            self.drm_file_generation,
+            self.output_epoch.get(),
             super::planner::pacing_mode_for_target(Some(opportunity.target)),
             cursor_epoch,
             validation_base,
@@ -1664,7 +1667,7 @@ impl NativeRuntime {
             kms_backend,
             target,
             mode_label,
-            drm_file_generation,
+            output_epoch,
             drm_timestamp_clock,
             presentation_clock,
             scanout,
@@ -1746,7 +1749,7 @@ impl NativeRuntime {
                 match acquire_watches.handle_ready(
                     token,
                     event_loop,
-                    *drm_file_generation,
+                    *output_epoch,
                     acquire_notifier,
                 )? {
                     AcquireReadyResult::Ready(request) => {

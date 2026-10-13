@@ -87,3 +87,32 @@ For every case, verify and record:
 Do not claim hardware qualification unless the complete A–F matrix passes and
 the recorded evidence covers each required check. Any failure, unavailable
 capability, or ambiguous output snapshot stops the matrix for diagnosis.
+
+## READY ownership failure discovered during qualification
+
+The first NVIDIA apply attempt reached Settings draft, `outputs.configure`,
+runtime output mutation, and Apply, then terminated with
+`overtaken READY has no pacing owner`. The explicit swapchain still held the
+expected physical READY identity, but frame pacing no longer reported the
+matching logical READY owner. This exposed a real ownership divergence; the
+failure must remain an invariant error until every sidecar is settled together.
+
+The runtime fix binds physical rendered-frame identity to pacing ownership and
+retires an unsubmitted READY frame through one reconfiguration operation. That
+operation validates the swapchain, pacing, scene history, scheduler, output
+transaction, and protocol batch before retiring them. Structural modesets,
+including Revert rollback, publish a new output epoch after the old epoch is
+quiesced. DRM session and buffer-pool generations remain separate lifetimes.
+
+After deterministic regression coverage passes, rerun this exact NVIDIA case
+first and capture the termination journal plus Display transaction state:
+
+```text
+1920x1080@165 → 1920x1080@60 → Apply → Revert
+```
+
+Use the explicit qualification session above. Continue the larger matrix only
+after this case completes and restores the exact starting mode without an
+ownership invariant failure. The production qualification constant remains
+`false`; this regression and a single successful retry do not qualify the
+Display mode-selection path.

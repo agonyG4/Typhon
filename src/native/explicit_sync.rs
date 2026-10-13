@@ -8,6 +8,7 @@ use crate::{
     compositor::{
         AcquireCommitId, AcquireWatchCancelReason, AcquireWatchRequest, ExplicitSyncPoint,
     },
+    native::OutputEpochId,
     syncobj::{SyncobjEventfdErrnoClass, SyncobjEventfdError},
 };
 
@@ -62,7 +63,7 @@ impl AcquirePointNotifier for DrmAcquirePointNotifier {
 struct AcquireWatch {
     token: ReactorToken,
     event_fd: OwnedFd,
-    drm_file_generation: u64,
+    output_epoch: OutputEpochId,
     request: AcquireWatchRequest,
 }
 
@@ -143,16 +144,15 @@ pub struct ExplicitSyncWatchRegistry {
     fallback_schedule: FallbackSchedule,
     capability: SyncobjEventfdCapability,
     // Generalized native-output ownership epoch. A synchronous output modeset
-    // advances it alongside DRM session-file replacement so stale acquire
-    // watches cannot outlive the KMS/framebuffer binding they were registered
-    // against; it is not a DRM file descriptor identity.
-    drm_file_generation: u64,
+    // identifies the physical presentation pipeline that owns a watch, so a
+    // wake from an earlier output epoch cannot re-enter the current output.
+    output_epoch: OutputEpochId,
     metrics: ExplicitSyncWatchMetrics,
     recent_completed_tokens: std::collections::VecDeque<ReactorToken>,
 }
 
 impl ExplicitSyncWatchRegistry {
-    pub fn new(refresh_interval_ns: u64, drm_file_generation: u64) -> Self {
+    pub fn new(refresh_interval_ns: u64, output_epoch: OutputEpochId) -> Self {
         Self {
             watches_by_token: HashMap::new(),
             watch_by_commit: HashMap::new(),
@@ -160,7 +160,7 @@ impl ExplicitSyncWatchRegistry {
             parked_requests: Vec::new(),
             fallback_schedule: FallbackSchedule::new(refresh_interval_ns),
             capability: SyncobjEventfdCapability::Unknown,
-            drm_file_generation,
+            output_epoch,
             metrics: ExplicitSyncWatchMetrics::default(),
             recent_completed_tokens: std::collections::VecDeque::new(),
         }
@@ -181,13 +181,13 @@ impl ExplicitSyncWatchRegistry {
         self.fallback_schedule.next_deadline_ns()
     }
 
-    pub fn set_drm_file_generation(&mut self, generation: u64) {
+    pub fn set_output_epoch(&mut self, output_epoch: OutputEpochId) {
         // Callers must park every request before changing this epoch. Parked
         // requests are owned outside the registry and are explicitly rebound.
         debug_assert!(self.watches_by_token.is_empty());
         debug_assert!(self.fallback_requests.is_empty());
         debug_assert!(self.parked_requests.is_empty());
-        self.drm_file_generation = generation;
+        self.output_epoch = output_epoch;
     }
 
     pub fn register<N: AcquirePointNotifier>(
@@ -291,7 +291,7 @@ impl ExplicitSyncWatchRegistry {
             AcquireWatch {
                 token,
                 event_fd,
-                drm_file_generation: self.drm_file_generation,
+                output_epoch: self.output_epoch,
                 request,
             },
         );
@@ -385,7 +385,7 @@ impl ExplicitSyncWatchRegistry {
         &mut self,
         token: ReactorToken,
         event_loop: &mut NativeEventLoop,
-        drm_file_generation: u64,
+        output_epoch: OutputEpochId,
         notifier: &N,
     ) -> io::Result<AcquireReadyResult> {
         let Some(watch) = self.watches_by_token.get(&token) else {
@@ -396,7 +396,7 @@ impl ExplicitSyncWatchRegistry {
             }
             return Ok(AcquireReadyResult::Stale);
         };
-        if watch.drm_file_generation != drm_file_generation {
+        if watch.output_epoch != output_epoch {
             let commit_id = watch.request.commit_id;
             self.remove_eventfd_watch(token, event_loop)?;
             return Ok(AcquireReadyResult::BackendMismatch(commit_id));
@@ -808,7 +808,7 @@ mod tests {
     fn eventfd_wakeup_completes_exact_watch_once() {
         let notifier = FakeNotifier::pending();
         let mut event_loop = NativeEventLoop::new().unwrap();
-        let mut registry = ExplicitSyncWatchRegistry::new(10, 7);
+        let mut registry = ExplicitSyncWatchRegistry::new(10, OutputEpochId::initial());
         let registration = registry
             .register(request(1, 20), &mut event_loop, 100, &notifier)
             .unwrap();
@@ -823,7 +823,7 @@ mod tests {
         let wakeup = event_loop.wait().unwrap();
         assert_eq!(wakeup.explicit_sync_acquire_tokens, vec![token]);
         let result = registry
-            .handle_ready(token, &mut event_loop, 7, &notifier)
+            .handle_ready(token, &mut event_loop, OutputEpochId::initial(), &notifier)
             .unwrap();
         let AcquireReadyResult::Ready(ready) = result else {
             panic!("expected exact ready result");
@@ -831,7 +831,7 @@ mod tests {
         assert_eq!(ready.commit_id, commit_id);
         assert!(matches!(
             registry
-                .handle_ready(token, &mut event_loop, 7, &notifier)
+                .handle_ready(token, &mut event_loop, OutputEpochId::initial(), &notifier)
                 .unwrap(),
             AcquireReadyResult::Stale
         ));
@@ -848,7 +848,7 @@ mod tests {
             fail_registration_on: None,
         };
         let mut event_loop = NativeEventLoop::new().unwrap();
-        let mut registry = ExplicitSyncWatchRegistry::new(10, 7);
+        let mut registry = ExplicitSyncWatchRegistry::new(10, OutputEpochId::initial());
 
         let result = registry
             .register(request(1, 20), &mut event_loop, 100, &notifier)
@@ -869,7 +869,7 @@ mod tests {
             fail_registration_on: None,
         };
         let mut event_loop = NativeEventLoop::new().unwrap();
-        let mut registry = ExplicitSyncWatchRegistry::new(10, 7);
+        let mut registry = ExplicitSyncWatchRegistry::new(10, OutputEpochId::initial());
 
         assert!(matches!(
             registry
@@ -889,7 +889,7 @@ mod tests {
     fn canceled_watch_turns_already_returned_token_stale() {
         let notifier = FakeNotifier::pending();
         let mut event_loop = NativeEventLoop::new().unwrap();
-        let mut registry = ExplicitSyncWatchRegistry::new(10, 7);
+        let mut registry = ExplicitSyncWatchRegistry::new(10, OutputEpochId::initial());
         let AcquireRegistrationResult::EventfdBacked(id) = registry
             .register(request(1, 20), &mut event_loop, 100, &notifier)
             .unwrap()
@@ -905,7 +905,7 @@ mod tests {
         );
         assert!(matches!(
             registry
-                .handle_ready(token, &mut event_loop, 7, &notifier)
+                .handle_ready(token, &mut event_loop, OutputEpochId::initial(), &notifier)
                 .unwrap(),
             AcquireReadyResult::Stale
         ));
@@ -915,7 +915,7 @@ mod tests {
     fn defensive_check_keeps_watch_when_counter_wakes_before_point_is_signaled() {
         let notifier = FakeNotifier::pending();
         let mut event_loop = NativeEventLoop::new().unwrap();
-        let mut registry = ExplicitSyncWatchRegistry::new(10, 7);
+        let mut registry = ExplicitSyncWatchRegistry::new(10, OutputEpochId::initial());
         let AcquireRegistrationResult::EventfdBacked(id) = registry
             .register(request(1, 20), &mut event_loop, 100, &notifier)
             .unwrap()
@@ -927,7 +927,7 @@ mod tests {
 
         assert!(matches!(
             registry
-                .handle_ready(token, &mut event_loop, 7, &notifier)
+                .handle_ready(token, &mut event_loop, OutputEpochId::initial(), &notifier)
                 .unwrap(),
             AcquireReadyResult::Pending
         ));
@@ -938,7 +938,7 @@ mod tests {
     fn backend_generation_mismatch_cancels_without_readiness() {
         let notifier = FakeNotifier::pending();
         let mut event_loop = NativeEventLoop::new().unwrap();
-        let mut registry = ExplicitSyncWatchRegistry::new(10, 7);
+        let mut registry = ExplicitSyncWatchRegistry::new(10, OutputEpochId::initial());
         let AcquireRegistrationResult::EventfdBacked(id) = registry
             .register(request(1, 20), &mut event_loop, 100, &notifier)
             .unwrap()
@@ -949,7 +949,7 @@ mod tests {
 
         assert!(matches!(
             registry
-                .handle_ready(token, &mut event_loop, 8, &notifier)
+                .handle_ready(token, &mut event_loop, OutputEpochId::new(2).unwrap(), &notifier)
                 .unwrap(),
             AcquireReadyResult::BackendMismatch(mismatch) if mismatch == id
         ));
@@ -960,7 +960,7 @@ mod tests {
     fn shutdown_removes_all_eventfd_and_fallback_watches() {
         let notifier = FakeNotifier::pending();
         let mut event_loop = NativeEventLoop::new().unwrap();
-        let mut registry = ExplicitSyncWatchRegistry::new(10, 7);
+        let mut registry = ExplicitSyncWatchRegistry::new(10, OutputEpochId::initial());
         registry
             .register(request(1, 20), &mut event_loop, 100, &notifier)
             .unwrap();
@@ -982,7 +982,7 @@ mod tests {
     fn park_for_session_suspend_returns_every_removed_request() {
         let notifier = FakeNotifier::pending();
         let mut event_loop = NativeEventLoop::new().unwrap();
-        let mut registry = ExplicitSyncWatchRegistry::new(10, 7);
+        let mut registry = ExplicitSyncWatchRegistry::new(10, OutputEpochId::initial());
         registry
             .register(request(1, 20), &mut event_loop, 100, &notifier)
             .unwrap();
@@ -1002,7 +1002,7 @@ mod tests {
     fn parked_watch_rearms_in_new_generation_and_old_token_stays_stale() {
         let notifier = FakeNotifier::pending();
         let mut event_loop = NativeEventLoop::new().unwrap();
-        let mut registry = ExplicitSyncWatchRegistry::new(10, 7);
+        let mut registry = ExplicitSyncWatchRegistry::new(10, OutputEpochId::initial());
         let AcquireRegistrationResult::EventfdBacked(id) = registry
             .register(request(1, 20), &mut event_loop, 100, &notifier)
             .unwrap()
@@ -1011,7 +1011,7 @@ mod tests {
         };
         let old_token = registry.watch_by_commit[&id];
         let parked = registry.park_for_session_suspend(&mut event_loop).unwrap();
-        registry.set_drm_file_generation(8);
+        registry.set_output_epoch(OutputEpochId::new(2).unwrap());
         registry
             .register(
                 parked.into_iter().next().unwrap(),
@@ -1023,7 +1023,12 @@ mod tests {
 
         assert!(matches!(
             registry
-                .handle_ready(old_token, &mut event_loop, 8, &notifier)
+                .handle_ready(
+                    old_token,
+                    &mut event_loop,
+                    OutputEpochId::new(2).unwrap(),
+                    &notifier
+                )
                 .unwrap(),
             AcquireReadyResult::Stale
         ));
@@ -1034,8 +1039,8 @@ mod tests {
                 .values()
                 .next()
                 .unwrap()
-                .drm_file_generation,
-            8
+                .output_epoch,
+            OutputEpochId::new(2).unwrap()
         );
     }
 
@@ -1043,7 +1048,7 @@ mod tests {
     fn permanently_unsignaled_watch_is_parked_and_rearmed_for_output_generation() {
         let notifier = FakeNotifier::pending();
         let mut event_loop = NativeEventLoop::new().unwrap();
-        let mut registry = ExplicitSyncWatchRegistry::new(10, 7);
+        let mut registry = ExplicitSyncWatchRegistry::new(10, OutputEpochId::initial());
         let request = request(31, 41);
         let AcquireRegistrationResult::EventfdBacked(commit_id) = registry
             .register(request.clone(), &mut event_loop, 100, &notifier)
@@ -1053,13 +1058,13 @@ mod tests {
         };
 
         let parked = registry.park_for_session_suspend(&mut event_loop).unwrap();
-        registry.set_drm_file_generation(8);
+        registry.set_output_epoch(OutputEpochId::new(2).unwrap());
         let ready = registry
             .rearm_parked_requests(parked, &mut event_loop, 200, &notifier)
             .expect("an unsignaled fence remains a valid pending obligation");
 
         assert!(ready.is_empty());
-        assert_eq!(registry.drm_file_generation, 8);
+        assert_eq!(registry.output_epoch, OutputEpochId::new(2).unwrap());
         assert_eq!(registry.metrics().active_eventfd_watches, 1);
         let rebound = &registry.watches_by_token[&registry.watch_by_commit[&commit_id]].request;
         assert_eq!(rebound.commit_id, request.commit_id);
@@ -1083,7 +1088,7 @@ mod tests {
     fn parked_rearm_failure_on_first_request_preserves_every_request() {
         let notifier = FakeNotifier::failing_on_registration(1);
         let mut event_loop = NativeEventLoop::new().unwrap();
-        let mut registry = ExplicitSyncWatchRegistry::new(10, 7);
+        let mut registry = ExplicitSyncWatchRegistry::new(10, OutputEpochId::initial());
 
         let failure = registry
             .rearm_parked_requests(parked_requests(3), &mut event_loop, 100, &notifier)
@@ -1099,7 +1104,7 @@ mod tests {
     fn parked_rearm_failure_in_middle_rolls_back_registered_requests_and_suffix() {
         let notifier = FakeNotifier::failing_on_registration(3);
         let mut event_loop = NativeEventLoop::new().unwrap();
-        let mut registry = ExplicitSyncWatchRegistry::new(10, 7);
+        let mut registry = ExplicitSyncWatchRegistry::new(10, OutputEpochId::initial());
 
         let failure = registry
             .rearm_parked_requests(parked_requests(5), &mut event_loop, 100, &notifier)
@@ -1118,7 +1123,7 @@ mod tests {
             registration_calls: Cell::new(0),
         };
         let mut event_loop = NativeEventLoop::new().unwrap();
-        let mut registry = ExplicitSyncWatchRegistry::new(10, 7);
+        let mut registry = ExplicitSyncWatchRegistry::new(10, OutputEpochId::initial());
 
         let failure = registry
             .rearm_parked_requests(parked_requests(3), &mut event_loop, 100, &notifier)
@@ -1134,7 +1139,7 @@ mod tests {
     fn parked_rearm_failure_on_final_request_preserves_all_requests() {
         let notifier = FakeNotifier::failing_on_registration(3);
         let mut event_loop = NativeEventLoop::new().unwrap();
-        let mut registry = ExplicitSyncWatchRegistry::new(10, 7);
+        let mut registry = ExplicitSyncWatchRegistry::new(10, OutputEpochId::initial());
 
         let failure = registry
             .rearm_parked_requests(parked_requests(3), &mut event_loop, 100, &notifier)
@@ -1150,7 +1155,7 @@ mod tests {
     fn parked_rearm_full_success_activates_each_request_once() {
         let notifier = FakeNotifier::pending();
         let mut event_loop = NativeEventLoop::new().unwrap();
-        let mut registry = ExplicitSyncWatchRegistry::new(10, 7);
+        let mut registry = ExplicitSyncWatchRegistry::new(10, OutputEpochId::initial());
 
         let already_ready = registry
             .rearm_parked_requests(parked_requests(3), &mut event_loop, 100, &notifier)
@@ -1177,7 +1182,7 @@ mod tests {
         let failing_notifier = FakeNotifier::failing_on_registration(2);
         let success_notifier = FakeNotifier::pending();
         let mut event_loop = NativeEventLoop::new().unwrap();
-        let mut registry = ExplicitSyncWatchRegistry::new(10, 7);
+        let mut registry = ExplicitSyncWatchRegistry::new(10, OutputEpochId::initial());
 
         let AcquireRegistrationResult::EventfdBacked(old_commit_id) = registry
             .register(request(99, 119), &mut event_loop, 100, &initial_notifier)
@@ -1187,7 +1192,7 @@ mod tests {
         };
         let old_token = registry.watch_by_commit[&old_commit_id];
         let mut parked = registry.park_for_session_suspend(&mut event_loop).unwrap();
-        registry.set_drm_file_generation(8);
+        registry.set_output_epoch(OutputEpochId::new(2).unwrap());
         parked.extend(parked_requests(3));
 
         let failure = registry
@@ -1199,12 +1204,17 @@ mod tests {
             .expect("preserved requests should rearm later");
 
         assert!(already_ready.is_empty());
-        assert_eq!(registry.drm_file_generation, 8);
+        assert_eq!(registry.output_epoch, OutputEpochId::new(2).unwrap());
         assert_eq!(registry.metrics().active_eventfd_watches, 4);
         assert_eq!(registry.metrics().active_fallback_watches, 0);
         assert!(matches!(
             registry
-                .handle_ready(old_token, &mut event_loop, 8, &success_notifier)
+                .handle_ready(
+                    old_token,
+                    &mut event_loop,
+                    OutputEpochId::new(2).unwrap(),
+                    &success_notifier
+                )
                 .unwrap(),
             AcquireReadyResult::Stale
         ));

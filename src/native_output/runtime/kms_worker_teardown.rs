@@ -25,6 +25,20 @@ pub(super) fn retain_complete_submitted_ownership(
     emergency_ownership.push(ownership);
 }
 
+pub(super) fn retire_stale_submitted_completion(
+    ownership: KmsSubmittedOwnership,
+    current_output_epoch: crate::native_output::OutputEpochId,
+) -> Result<(), KmsSubmittedOwnership> {
+    if ownership.job.output_epoch == current_output_epoch {
+        return Err(ownership);
+    }
+    // Epoch publication proves that the old physical pipeline has already
+    // been replaced. The worker transport owner is now stale and may release
+    // its fence and scanout lease without publishing into the current output.
+    drop(ownership);
+    Ok(())
+}
+
 pub(super) fn retain_uncertain_job_with_suspension(
     job: KmsCommitJob,
     suspended_jobs: &mut Vec<KmsCommitJob>,

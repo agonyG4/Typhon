@@ -382,7 +382,7 @@ impl AtomicEglGbmScanout {
                             },
                         )
                     }),
-                output_generation_qualified: candidate.generation == self.direct.drm_generation,
+                output_generation_qualified: candidate.generation == self.direct.output_epoch.get(),
                 explicit_sync_ready: matches!(
                     &sync_readiness,
                     DirectSyncReadiness::Qualified { .. }
@@ -403,7 +403,7 @@ impl AtomicEglGbmScanout {
                     == oblivion_one::native::kms::KmsBackendKind::Atomic,
                 connector_capable: kms.atomic_connector_vrr_capable(),
                 crtc_property_available: kms.atomic_crtc_vrr_property_available(),
-                output_generation_qualified: candidate.generation == self.direct.drm_generation,
+                output_generation_qualified: candidate.generation == self.direct.output_epoch.get(),
                 exact_kms_qualified: true,
                 transition_supported: true,
             },
@@ -415,7 +415,7 @@ impl AtomicEglGbmScanout {
         let Some(candidate_key) = direct_candidate_key(
             &candidate,
             self.direct.output_id,
-            self.direct.drm_generation,
+            self.direct.output_epoch,
             cursor,
         ) else {
             return Ok(DirectScanoutAttempt::Fallback("candidate_key_invalid"));
@@ -469,7 +469,7 @@ impl AtomicEglGbmScanout {
         let requested_state = OutputPresentationStateKey {
             mode: presentation_mode,
             content_type,
-            output_generation: self.direct.drm_generation,
+            output_generation: self.direct.output_epoch.get(),
         };
         let presentation_flow = DirectCandidatePresentationFlow::new(
             candidate_key,
@@ -518,7 +518,7 @@ impl AtomicEglGbmScanout {
         };
         let validation_key = DirectPlaneValidationKey {
             output_id: self.direct.output_id,
-            output_generation: self.direct.drm_generation,
+            output_generation: self.direct.output_epoch.get(),
             crtc_id: atomic.discovery().pipeline.crtc.get(),
             primary_plane_id: atomic.discovery().pipeline.plane.get(),
             mode_width: self.width,
@@ -761,7 +761,7 @@ impl AtomicEglGbmScanout {
         let transaction = match build_direct_output_transaction(
             self.direct.output_id,
             transaction_id,
-            self.direct.drm_generation,
+            self.direct.output_epoch.get(),
             transaction_created_at,
             target,
             pacing_mode,

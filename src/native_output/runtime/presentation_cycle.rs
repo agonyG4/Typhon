@@ -103,7 +103,7 @@ pub(crate) const fn render_worker_received_visual_demand(
 pub(super) struct AtomicRenderOuterContinuation {
     pub(super) scene_generation: u64,
     pub(super) render_generation: u64,
-    pub(super) output_generation: u64,
+    pub(super) output_epoch: OutputEpochId,
     pub(super) render_ahead: bool,
     pub(super) pacing_mode: NativeOutputPacingMode,
     pub(super) can_queue_worker_next: bool,
@@ -177,8 +177,8 @@ fn run_scaled_probe_candidate(
     worker: Option<&crate::native_output::kms_worker::KmsCommitWorkerHandle>,
     candidate: &oblivion_one::compositor::DirectScanoutProbeCandidate,
     output_id: OutputId,
-    drm_generation: u64,
-    output_generation: u64,
+    drm_session_generation: DrmSessionGeneration,
+    output_epoch: OutputEpochId,
     pipeline: Option<&oblivion_one::native::kms::AtomicPipelineProperties>,
     mode_width: u32,
     mode_height: u32,
@@ -211,8 +211,8 @@ fn run_scaled_probe_candidate(
     };
     let Some(key) = ScaledPrimaryProbeKey::new(
         output_id,
-        drm_generation,
-        output_generation,
+        drm_session_generation,
+        output_epoch,
         pipeline,
         mode_width,
         mode_height,
@@ -292,7 +292,8 @@ impl NativeRuntime {
             target,
             mode_label,
             output_refresh_rate,
-            drm_file_generation,
+            drm_session_generation,
+            output_epoch,
             drm_timestamp_clock: _,
             presentation_clock: _,
             scanout,
@@ -376,7 +377,7 @@ impl NativeRuntime {
         let validation_base_context = (
             kms_commit_worker.as_ref(),
             *presented_planes,
-            *drm_file_generation,
+            output_epoch.get(),
             target.crtc_id,
             output_transactions.output_id(),
         );
@@ -427,7 +428,7 @@ impl NativeRuntime {
                     last_client_cursor_damage,
                 },
                 kms_commit_worker.as_ref(),
-                *drm_file_generation,
+                output_epoch.get(),
                 target.crtc_id,
                 *scheduled_presentation_target,
                 presented_planes.cursor,
@@ -517,7 +518,7 @@ impl NativeRuntime {
             |worker| {
                 worker.dispatch_budget_ns(
                     crate::native_output::kms_worker::KmsServiceClass::CursorPlaneDelta,
-                    *drm_file_generation,
+                    output_epoch.get(),
                 )
             },
         );
@@ -633,7 +634,9 @@ impl NativeRuntime {
                         .is_some_and(|worker| worker.fatal_reason().is_none()),
                 },
                 session_active: session.permits_output(),
-                output_generation_stable: swapchain.pool_generation() == *drm_file_generation,
+                pool_generation_stable: scanout
+                    .explicit_output_pool_generation()
+                    .is_some_and(|pool_generation| pool_generation == swapchain.pool_generation()),
                 ordinary_vsync: true,
                 swapchain_poisoned: swapchain.is_poisoned(),
                 software_cursor_visible: cursor_visible && cursor_render_mode.is_software(),
@@ -690,7 +693,7 @@ impl NativeRuntime {
             let swapchain =
                 super::presentation_pipeline::require_explicit_output_swapchain(scanout)?;
             let pipeline = build_output_pipeline_snapshot_with_presented(
-                *drm_file_generation,
+                output_epoch.get(),
                 target.crtc_id,
                 pacing_mode,
                 desired_credit,
@@ -705,7 +708,7 @@ impl NativeRuntime {
             .map_err(|error| {
                 io::Error::other(format!(
                     "output pipeline snapshot mismatch: generation={} crtc={} kernel={:?} worker={:?} error={error}",
-                    drm_file_generation,
+                    output_epoch.get(),
                     target.crtc_id,
                     atomic_commit_arbiter.pending_atomic_commit(),
                     swapchain.worker_queued_identity(),
@@ -771,7 +774,7 @@ impl NativeRuntime {
                         "pending_token",
                         scanout.pending_page_flip_token().unwrap_or(0),
                     ),
-                    NativePerfField::u64("backend_generation", *drm_file_generation),
+                    NativePerfField::u64("backend_generation", output_epoch.get()),
                     NativePerfField::u64("timeout_count", frame_scheduler.watchdog_timeout_count()),
                     NativePerfField::bool("drm_ready", wakeup.reasons.drm()),
                     NativePerfField::bool("final_drain_completed", pageflip_completed),
@@ -819,7 +822,7 @@ impl NativeRuntime {
                 legacy_cursor_available: legacy_cursor.is_some(),
                 page_flip_pending: scanout.page_flip_pending(),
                 atomic_commit_pending: atomic_commit_arbiter.atomic_commit_pending(),
-                drm_file_generation: *drm_file_generation,
+                output_epoch: *output_epoch,
                 effective_cursor: effective_cursor.as_ref(),
                 last_direct_candidate_key,
                 scene_changed,
@@ -863,8 +866,8 @@ impl NativeRuntime {
                 kms_commit_worker.as_ref(),
                 candidate,
                 *output_id,
-                *drm_file_generation,
-                confirmed_kms_presentation.output_generation,
+                *drm_session_generation,
+                *output_epoch,
                 atomic_pipeline,
                 target.width,
                 target.height,
@@ -1043,7 +1046,7 @@ impl NativeRuntime {
                 cursor_target,
                 cursor_submit_window,
                 target.crtc_id,
-                *drm_file_generation,
+                output_epoch.get(),
                 pacing_mode,
                 cursor_epoch,
                 validation_base,
@@ -1158,7 +1161,7 @@ impl NativeRuntime {
                 kms_backend,
                 scanout,
                 target.crtc_id,
-                *drm_file_generation,
+                output_epoch.get(),
                 mode_label,
                 output_refresh_rate.rounded_hz(),
                 compatibility_target,
@@ -1404,7 +1407,7 @@ impl NativeRuntime {
                                     primary_cursor,
                                 ),
                                 direct_trace_snapshot,
-                                *drm_file_generation,
+                                output_epoch.get(),
                                 target.crtc_id,
                                 scene_generation,
                                 cursor_epoch,
@@ -1543,7 +1546,7 @@ impl NativeRuntime {
                     NativeScanoutBackend::AtomicEglGbm(explicit) => {
                         Some(explicit.prepare_composited_presentation_state(
                             server,
-                            *drm_file_generation,
+                            output_epoch.get(),
                             pacing_mode,
                             async_policy_inputs,
                             cursor_assignment_for_policy.as_ref(),
@@ -1612,7 +1615,7 @@ impl NativeRuntime {
                         cycle.present_us,
                         kms_backend,
                         scanout,
-                        *drm_file_generation,
+                        output_epoch.get(),
                         render_generation,
                         render_cause,
                         surface_damage,
@@ -1794,7 +1797,7 @@ impl NativeRuntime {
                         let mut worker_outer_continuation = Some(AtomicRenderOuterContinuation {
                             scene_generation,
                             render_generation,
-                            output_generation: *drm_file_generation,
+                            output_epoch: *output_epoch,
                             render_ahead,
                             pacing_mode,
                             can_queue_worker_next,
@@ -1827,7 +1830,7 @@ impl NativeRuntime {
                             &output_damage,
                             resolved_scene,
                             render_generation,
-                            *drm_file_generation,
+                            *output_epoch,
                             prepared_reservation,
                             prepared_presentation,
                             pacing_mode,
@@ -2031,6 +2034,8 @@ impl NativeRuntime {
                                     debug_assert!(render_ahead && waits_for_target);
                                     server.note_frame_callbacks_deferred_ready(protocol_batch_id);
                                     frame_pacing.note_ready_frame(ready_at_ns, waits_for_target);
+                                    frame_scheduler
+                                        .note_ready_frame(prepared_reservation.fixed_target());
                                     let owner = explicit.swapchain()?.ready_identity().ok_or_else(
                                         || {
                                             io::Error::other(
@@ -2055,6 +2060,7 @@ impl NativeRuntime {
                                     super::cycle::abandon_overtaken_ready(
                                         explicit,
                                         owner,
+                                        *output_epoch,
                                         scene_history,
                                         frame_pacing,
                                         frame_scheduler,
@@ -2067,6 +2073,8 @@ impl NativeRuntime {
                                     if waits_for_target {
                                         server.note_frame_callbacks_deferred_ready(protocol_batch_id);
                                         frame_pacing.note_ready_frame(ready_at_ns, waits_for_target);
+                                        frame_scheduler
+                                            .note_ready_frame(prepared_reservation.fixed_target());
                                     }
                                     if prepared_reservation.fixed_target().is_some() {
                                         match super::presentation_ready::pull_ready_frame_into_reachable_opportunity(
@@ -2076,7 +2084,7 @@ impl NativeRuntime {
                                             presentation_timing,
                                             frame_pacing,
                                             MonotonicTimestampNs::new(ready_at_ns),
-                                            *drm_file_generation,
+                                            output_epoch.get(),
                                             prediction.kms_dispatch_budget_ns,
                                         )? {
                                             super::presentation_ready::ReadyPullInResult::PulledIn => {}
@@ -2097,7 +2105,10 @@ impl NativeRuntime {
                                     if !waits_for_target {
                                     #[rustfmt::skip] let async_render_fence_ready = super::presentation_ready::ensure_async_render_fence_ready(explicit, output_transactions, transaction_id, output_render_fence_token, event_loop)?;
                                     if !async_render_fence_ready {
-                                        server.note_frame_callback_admission_failure(protocol_batch_id);
+                                        server.note_frame_callbacks_deferred_ready(protocol_batch_id);
+                                        frame_pacing.note_ready_frame(ready_at_ns, false);
+                                        frame_scheduler
+                                            .note_ready_frame(prepared_reservation.fixed_target());
                                         *queued_redraw_requested = true;
                                         return Ok(());
                                     }
@@ -2117,7 +2128,7 @@ impl NativeRuntime {
                                         atomic_commit_arbiter,
                                         presentation_trace,
                                         transaction_id,
-                                        *drm_file_generation,
+                                        output_epoch.get(),
                                         target.crtc_id,
                                         worker_ctx(
                                             atomic_cursor.as_ref(),
@@ -2149,7 +2160,7 @@ impl NativeRuntime {
                                             server,
                                             kms_backend.effective_kind(),
                                             token,
-                                            *drm_file_generation,
+                                            output_epoch.get(),
                                             target.crtc_id,
                                             Some(transaction_id),
                                             *frame_index,
@@ -2451,7 +2462,7 @@ impl NativeRuntime {
                                 .map(|(before, after)| after.delta_us_since(before))
                                 .unwrap_or((0, 0));
                             let repaint_present_start = Instant::now();
-                            #[rustfmt::skip] let (present_result, compatibility_transaction_id) = if render_ahead { (NativePresentResult::Noop, None) } else { present_composited_compatibility_frame(scanout, server, output_transactions, *drm_file_generation, target.crtc_id, presentation_deadline, *scheduled_presentation_target, scheduler_now, predicted_total_cost, pacing_mode, render_generation, effective_cursor.as_ref(), cursor_epoch, *frame_index, kms_backend, scene_history, vrr_policy)? };
+                            #[rustfmt::skip] let (present_result, compatibility_transaction_id) = if render_ahead { (NativePresentResult::Noop, None) } else { present_composited_compatibility_frame(scanout, server, output_transactions, output_epoch.get(), target.crtc_id, presentation_deadline, *scheduled_presentation_target, scheduler_now, predicted_total_cost, pacing_mode, render_generation, effective_cursor.as_ref(), cursor_epoch, *frame_index, kms_backend, scene_history, vrr_policy)? };
                             #[cfg(test)]
                             if !render_ahead {
                                 native_io_recorder.record(NativeIoOperation::ScanoutPresent);
@@ -2489,7 +2500,7 @@ impl NativeRuntime {
                                         server,
                                         kms_backend.effective_kind(),
                                         token,
-                                        *drm_file_generation,
+                                        output_epoch.get(),
                                         target.crtc_id,
                                         transaction_id,
                                         *frame_index,

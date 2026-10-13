@@ -1,9 +1,11 @@
 use std::os::fd::OwnedFd;
 
+use crate::native_output::output::DrmSessionGeneration;
 use oblivion_one::compositor::{
     CompositorFrameBatchId, DirectScanoutSceneCandidate, DirectScanoutSceneRejection,
     PresentationRect,
 };
+use oblivion_one::native::OutputEpochId;
 
 use super::*;
 
@@ -280,7 +282,8 @@ pub(crate) struct DirectScanoutControl {
     pub(crate) framebuffer_cache: DirectFramebufferCache,
     pub(crate) inhibit_until_composited_present: bool,
     pub(crate) counters: DirectScanoutCounters,
-    pub(crate) drm_generation: u64,
+    pub(crate) drm_session_generation: DrmSessionGeneration,
+    pub(crate) output_epoch: OutputEpochId,
     pub(crate) validation_cache: DirectPlaneValidationCache,
     pub(crate) live_lease_count: std::sync::Arc<std::sync::atomic::AtomicU64>,
     pub(super) identity_viewport_metadata_logged: bool,
@@ -290,13 +293,13 @@ pub(crate) struct DirectScanoutControl {
 pub(super) fn direct_candidate_key(
     candidate: &DirectScanoutSceneCandidate,
     output_id: OutputId,
-    drm_generation: u64,
+    output_epoch: OutputEpochId,
     cursor: Option<&AtomicCursorVisualState>,
 ) -> Option<DirectScanoutCandidateKey> {
     DirectScanoutCandidateKey::from_candidate(
         candidate,
         output_id,
-        drm_generation,
+        output_epoch.get(),
         direct_cursor_content_key(cursor, true),
         0,
     )
@@ -725,16 +728,18 @@ impl DirectScanoutControl {
 
     pub(super) fn new(
         drm: std::os::fd::BorrowedFd<'_>,
-        generation: u64,
+        drm_session_generation: DrmSessionGeneration,
+        output_epoch: OutputEpochId,
         output_id: OutputId,
     ) -> Self {
         Self {
             output_id,
             ownership: DirectPrimaryOwnership::default(),
-            framebuffer_cache: DirectFramebufferCache::new(drm, generation),
+            framebuffer_cache: DirectFramebufferCache::new(drm, drm_session_generation),
             inhibit_until_composited_present: true,
             counters: DirectScanoutCounters::default(),
-            drm_generation: generation,
+            drm_session_generation,
+            output_epoch,
             validation_cache: DirectPlaneValidationCache::default(),
             live_lease_count: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             identity_viewport_metadata_logged: false,

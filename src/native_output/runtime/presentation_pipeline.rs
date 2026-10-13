@@ -334,7 +334,7 @@ fn validate_presented_primary(
                     transaction_id,
                 ));
             }
-            if pageflip.output_generation != output_generation {
+            if pageflip.output_epoch.get() != output_generation {
                 return Err(identity_mismatch(
                     "current_composed",
                     "output_generation",
@@ -404,7 +404,7 @@ fn validate_presented_primary(
                     transaction_id,
                 ));
             }
-            if pageflip.output_generation != output_generation {
+            if pageflip.output_epoch.get() != output_generation {
                 return Err(identity_mismatch(
                     "current_direct",
                     "output_generation",
@@ -698,7 +698,7 @@ impl NativeRuntime {
             TripleCapability::Capable
         };
         let snapshot = build_output_pipeline_snapshot_with_presented(
-            self.drm_file_generation,
+            self.output_epoch.get(),
             self.target.crtc_id,
             self.adaptive_buffering.pacing_mode(),
             self.adaptive_buffering.desired_credit(),
@@ -1630,7 +1630,7 @@ mod tests {
         assert_eq!(presented.primary, None);
         assert_eq!(presented.cursor, cursor);
         assert_ne!(presented.revision, revision_before);
-        assert_eq!(current.pageflip_identity().output_generation, 1);
+        assert_eq!(current.pageflip_identity().output_epoch.get(), 1);
         assert!(
             build_output_pipeline_snapshot_with_presented(
                 2,
@@ -1700,7 +1700,7 @@ mod tests {
         .expect("the first genuine G2 pageflip must establish valid provenance");
 
         assert_eq!(snapshot.presented_planes.primary, Some(current));
-        assert_eq!(current.pageflip_identity().output_generation, 2);
+        assert_eq!(current.pageflip_identity().output_epoch.get(), 2);
         assert_eq!(current.pageflip_identity().crtc_id, 7);
     }
 
@@ -1742,7 +1742,7 @@ mod tests {
         presented.rebase_after_session_recovery(hidden);
 
         assert_eq!(presented.primary, None);
-        assert_eq!(direct.pageflip_identity().output_generation, 1);
+        assert_eq!(direct.pageflip_identity().output_epoch.get(), 1);
         assert_eq!(direct.pageflip_identity().token, token);
     }
 }

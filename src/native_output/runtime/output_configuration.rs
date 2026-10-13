@@ -275,6 +275,53 @@ impl PendingOutputConfigurationRequest {
 }
 
 impl NativeRuntime {
+    pub(super) fn rebase_output_epoch_frame_lanes(&mut self, now_ns: u64) {
+        debug_assert!(
+            !self.frame_pacing.has_unsettled_output_frame_ownership(),
+            "scheduler/pacing rebase requires old output ownership to be terminal"
+        );
+        debug_assert!(!self.frame_scheduler.ready_frame_queued());
+        debug_assert!(!self.frame_scheduler.page_flip_pending());
+        debug_assert!(!self.frame_scheduler.worker_submission_queued());
+        self.frame_pacing.rebase_after_output_epoch();
+        self.frame_scheduler = NativeFrameScheduler::new_with_refresh_interval_ns(
+            self.output_refresh_rate.interval_ns(),
+            now_ns,
+        );
+    }
+
+    pub(super) fn settle_and_rebase_session_output_frame_lanes(
+        &mut self,
+        now_ns: u64,
+    ) -> NativeResult<()> {
+        if self.output_transactions.active_count() != 0 {
+            return Err(io::Error::other(
+                "session output epoch still owns active output transactions",
+            )
+            .into());
+        }
+        if let Some(physical_identity) = self.frame_pacing.unsubmitted_physical_identity() {
+            self.frame_pacing
+                .terminalize_unsubmitted_physical_frame(physical_identity)
+                .map_err(io::Error::other)?;
+        } else if self.frame_pacing.active.is_some() {
+            self.frame_pacing
+                .complete_unsubmitted_render_without_visual_change();
+        }
+        if self.frame_pacing.has_unsettled_output_frame_ownership()
+            || self.frame_scheduler.ready_frame_queued()
+            || self.frame_scheduler.page_flip_pending()
+            || self.frame_scheduler.worker_submission_queued()
+        {
+            return Err(io::Error::other(
+                "session output epoch retained frame ownership before rebase",
+            )
+            .into());
+        }
+        self.rebase_output_epoch_frame_lanes(now_ns);
+        Ok(())
+    }
+
     pub(super) fn render_worker_candidate_prepared(
         &mut self,
         identity: AtomicRenderCandidateIdentity,
@@ -683,10 +730,12 @@ trait OutputConfigurationRuntime {
     ) -> Result<Option<Self::ConfirmationReservation>, String>;
     fn cancel_confirmation_reservation(&mut self, reservation: Self::ConfirmationReservation);
     fn park_acquire_watches(&mut self) -> Result<(), String>;
+    fn quiesce_old_output_epoch(&mut self) -> Result<QuiescedOutputEpoch, String>;
     fn commit_started_at_ns(&mut self, cycle_started_at: Instant, now_ns: u64) -> u64;
     fn commit_candidate(
         &mut self,
         candidate: &mut Self::Candidate,
+        quiesced_epoch: QuiescedOutputEpoch,
         commit_started_at_ns: u64,
     ) -> Result<u64, String>;
     fn adopt_committed_candidate(&mut self, candidate: Self::Candidate) -> Self::Candidate;
@@ -781,24 +830,37 @@ fn advance_output_configuration_transition<R: OutputConfigurationRuntime>(
         return Ok(OutputConfigurationAdvance::Completed);
     }
 
-    let commit_started_at_ns = runtime.commit_started_at_ns(cycle_started_at, now_ns);
-    let committed_at_ns = match runtime.commit_candidate(&mut candidate, commit_started_at_ns) {
-        Ok(committed_at_ns) => committed_at_ns,
+    let quiesced_epoch = match runtime.quiesce_old_output_epoch() {
+        Ok(epoch) => epoch,
         Err(detail) => {
             if let Some(reservation) = reservation {
                 runtime.cancel_confirmation_reservation(reservation);
             }
-            runtime.rearm_acquire_watches(commit_started_at_ns);
-            runtime.queue_failure_response(
-                operation,
-                target,
-                response,
-                failure_code,
-                format!("real commit: {detail}"),
-            )?;
+            runtime.rearm_acquire_watches(now_ns);
+            runtime.queue_failure_response(operation, target, response, failure_code, detail)?;
             return Ok(OutputConfigurationAdvance::Completed);
         }
     };
+
+    let commit_started_at_ns = runtime.commit_started_at_ns(cycle_started_at, now_ns);
+    let committed_at_ns =
+        match runtime.commit_candidate(&mut candidate, quiesced_epoch, commit_started_at_ns) {
+            Ok(committed_at_ns) => committed_at_ns,
+            Err(detail) => {
+                if let Some(reservation) = reservation {
+                    runtime.cancel_confirmation_reservation(reservation);
+                }
+                runtime.rearm_acquire_watches(commit_started_at_ns);
+                runtime.queue_failure_response(
+                    operation,
+                    target,
+                    response,
+                    failure_code,
+                    format!("real commit: {detail}"),
+                )?;
+                return Ok(OutputConfigurationAdvance::Completed);
+            }
+        };
 
     let candidate = runtime.adopt_committed_candidate(candidate);
     runtime.finalize_committed_transaction(operation, reservation, committed_at_ns);
@@ -823,6 +885,23 @@ pub(crate) struct PendingOutputPersistence {
 }
 
 impl NativeRuntime {
+    fn commit_modeset_after_quiescence(
+        &mut self,
+        modeset: &mut PreparedAtomicRuntimeModeset<DrmModeBlobIo>,
+        quiesced_epoch: QuiescedOutputEpoch,
+        commit_started_at_ns: u64,
+    ) -> Result<u64, String> {
+        if quiesced_epoch.output_epoch() != self.output_epoch {
+            return Err("quiescence proof belongs to a stale output epoch".into());
+        }
+        let commit_started = Instant::now();
+        self.kms_backend
+            .commit_runtime_modeset_candidate(modeset)
+            .map_err(|error| error.to_string())?;
+        Ok(commit_started_at_ns
+            .saturating_add(u64::try_from(commit_started.elapsed().as_nanos()).unwrap_or(u64::MAX)))
+    }
+
     pub(crate) fn mode_selection_supported(&self) -> bool {
         self.output_mode_mutation_support().is_ok()
     }
@@ -1255,13 +1334,32 @@ impl NativeRuntime {
             return Ok(OutputConfigurationAdvance::Completed);
         };
         let candidate_render_fence_owned = pending.waiting_on_render_fence();
-        let boundary = self.output_configuration_safe_boundary();
-        if self.scanout.ready_frame_queued() && boundary.is_safe_to_retire_unsubmitted_ready_frame()
-        {
+        if let NativeScanoutBackend::AtomicEglGbm(explicit) = &*self.scanout {
+            super::cycle::validate_reconfiguration_frame_ownership(
+                explicit,
+                self.output_epoch,
+                &self.scene_history,
+                &self.frame_pacing,
+                &self.frame_scheduler,
+                &self.output_transactions,
+            )?;
+        }
+        let boundary = self.native_output_reconfiguration_boundary();
+        if boundary.is_safe_to_retire_unsubmitted_ready_frame() {
             self.abandon_unsubmitted_output_frame()?;
         }
+        if let NativeScanoutBackend::AtomicEglGbm(explicit) = &*self.scanout {
+            super::cycle::validate_reconfiguration_frame_ownership(
+                explicit,
+                self.output_epoch,
+                &self.scene_history,
+                &self.frame_pacing,
+                &self.frame_scheduler,
+                &self.output_transactions,
+            )?;
+        }
         if !self
-            .output_configuration_safe_boundary()
+            .native_output_reconfiguration_boundary()
             .is_safe_with_candidate_render_fence(candidate_render_fence_owned)
         {
             self.pending_output_configuration = Some(pending);
@@ -1730,33 +1828,54 @@ impl NativeRuntime {
             }
         }
 
+        let quiesced_epoch = match OutputConfigurationRuntime::quiesce_old_output_epoch(self) {
+            Ok(epoch) => epoch,
+            Err(detail) => {
+                if let Some(prepared) = prepared_transaction {
+                    self.output_configuration_transactions
+                        .cancel_prepared_temporary_apply(prepared);
+                }
+                self.rearm_output_acquire_watches(now_ns);
+                pending.candidate = Some(CandidateScanoutState::WorkerReady {
+                    candidate,
+                    frame,
+                    render_info,
+                    modeset,
+                    cursor,
+                });
+                self.fail_pending_output_configuration(pending, detail)?;
+                return Ok(OutputConfigurationAdvance::Waiting);
+            }
+        };
+
         let commit_started_at_ns = now_ns.saturating_add(
             u64::try_from(advance_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
         );
-        let commit_started = Instant::now();
-        if let Err(error) = self
-            .kms_backend
-            .commit_runtime_modeset_candidate(&mut modeset)
-        {
-            if let Some(prepared) = prepared_transaction {
-                self.output_configuration_transactions
-                    .cancel_prepared_temporary_apply(prepared);
+        let committed_at_ns = match self.commit_modeset_after_quiescence(
+            &mut modeset,
+            quiesced_epoch,
+            commit_started_at_ns,
+        ) {
+            Ok(committed_at_ns) => committed_at_ns,
+            Err(error) => {
+                if let Some(prepared) = prepared_transaction {
+                    self.output_configuration_transactions
+                        .cancel_prepared_temporary_apply(prepared);
+                }
+                self.rearm_output_acquire_watches(commit_started_at_ns);
+                pending.candidate = Some(CandidateScanoutState::WorkerReady {
+                    candidate,
+                    frame,
+                    render_info,
+                    modeset,
+                    cursor,
+                });
+                self.fail_pending_output_configuration(pending, format!("real commit: {error}"))?;
+                return Ok(OutputConfigurationAdvance::Waiting);
             }
-            self.rearm_output_acquire_watches(commit_started_at_ns);
-            pending.candidate = Some(CandidateScanoutState::WorkerReady {
-                candidate,
-                frame,
-                render_info,
-                modeset,
-                cursor,
-            });
-            self.fail_pending_output_configuration(pending, format!("real commit: {error}"))?;
-            return Ok(OutputConfigurationAdvance::Waiting);
-        }
+        };
         self.kms_backend
             .adopt_committed_runtime_modeset_candidate(modeset);
-        let committed_at_ns = commit_started_at_ns
-            .saturating_add(u64::try_from(commit_started.elapsed().as_nanos()).unwrap_or(u64::MAX));
         pending.prepared_transaction = prepared_transaction;
         pending.candidate = Some(CandidateScanoutState::WorkerPromotionQueued {
             candidate,
@@ -1885,23 +2004,25 @@ impl NativeRuntime {
         }
     }
 
-    fn output_configuration_safe_boundary(&self) -> OutputConfigurationSafeBoundary {
+    fn native_output_reconfiguration_boundary(&self) -> NativeOutputReconfigurationBoundary {
         let worker_in_flight_owned = self
             .kms_commit_worker
             .as_ref()
-            .is_some_and(|worker| worker.submission_active() || worker.inflight());
+            .is_some_and(|worker| worker.submission_active() || worker.inflight())
+            || self.forced_shutdown_inflight.is_some();
         let worker_queued_next_owned = self
             .kms_commit_worker
             .as_ref()
             .is_some_and(|worker| worker.queue_depth() > 0)
+            || !self.worker_quarantine.jobs.is_empty()
+            || !self.worker_quarantine.cursor_sidecars.is_empty()
             || !self.submitted_worker_ownership.is_empty()
             || !self.emergency_quarantined_worker_jobs.is_empty()
-            || !self.emergency_quarantined_submitted_ownership.is_empty();
-        let explicit_sync_obligation_owned = self.acquire_watches.metrics().active_eventfd_watches
-            > 0
-            || self.acquire_watches.metrics().active_fallback_watches > 0
-            || !self.parked_acquire_watches.is_empty();
-        OutputConfigurationSafeBoundary {
+            || !self.emergency_quarantined_submitted_ownership.is_empty()
+            || self.forced_shutdown_pacing_settled.is_some();
+        let explicit_sync_watch_owned = self.acquire_watches.metrics().active_eventfd_watches > 0
+            || self.acquire_watches.metrics().active_fallback_watches > 0;
+        NativeOutputReconfigurationBoundary {
             main_thread_pageflip_owned: self.scanout.page_flip_pending(),
             worker_in_flight_owned,
             worker_queued_next_owned,
@@ -1916,24 +2037,24 @@ impl NativeRuntime {
             output_render_fence_owned: self.output_render_fence_token.is_some(),
             deferred_worker_event_owned: self.deferred_worker_pageflip.is_some()
                 || self.deferred_worker_completion.is_some()
-                || self.worker_timeout_pending.is_some(),
-            explicit_sync_obligation_owned,
+                || self.worker_timeout_pending.is_some()
+                || self.pending_render_worker_identity.is_some()
+                || self.pending_render_worker_context.is_some()
+                || self.pending_render_worker_outer.is_some()
+                || self.pending_render_worker_completion.is_some()
+                || self.pending_render_worker_capture.is_some()
+                || self.pending_worker_effect_reload.is_some()
+                || self.pending_dmabuf_release_fence.is_some(),
+            explicit_sync_watch_owned,
+            parked_explicit_sync_obligation_owned: !self.parked_acquire_watches.is_empty(),
         }
     }
 
     fn abandon_unsubmitted_output_frame(&mut self) -> NativeResult<()> {
-        if !self.scanout.ready_frame_queued() {
-            return Ok(());
-        }
         if let NativeScanoutBackend::AtomicEglGbm(explicit) = &mut *self.scanout {
-            let Some(identity) = explicit.swapchain()?.ready_identity() else {
-                return Err(
-                    io::Error::other("explicit READY scanout has no frame identity").into(),
-                );
-            };
-            super::cycle::abandon_overtaken_ready(
+            super::cycle::terminalize_unsubmitted_frame_for_reconfiguration(
                 explicit,
-                identity,
+                self.output_epoch,
                 &mut self.scene_history,
                 &mut self.frame_pacing,
                 &mut self.frame_scheduler,
@@ -1941,16 +2062,35 @@ impl NativeRuntime {
                 &mut self.output_transactions,
                 MonotonicTimestampNs::new(monotonic_now_ns()?),
             )?;
-        } else {
-            if !self.scanout.abandon_unsubmitted_compatibility_ready()? {
-                return Err(io::Error::other("compatibility READY ownership disappeared").into());
+            if explicit.has_suspended_output_ownership()? {
+                if explicit.recover_suspended_ready_if_signaled()? {
+                    return Ok(());
+                }
+                super::cycle::register_suspended_fence_if_needed(
+                    explicit,
+                    &mut self.event_loop,
+                    &mut self.output_render_fence_token,
+                )?;
+                if self.output_render_fence_token.is_none() {
+                    return Err(io::Error::other(
+                        "suspended output ownership has no readiness fence to wait for",
+                    )
+                    .into());
+                }
             }
-            self.scene_history.discard_ready();
-            if !self.frame_pacing.abandon_ready_frame() {
-                self.frame_pacing.cancel_unsubmitted_render();
-            }
-            self.frame_scheduler.discard_ready_frame();
+            return Ok(());
         }
+        if !self.scanout.ready_frame_queued() {
+            return Ok(());
+        }
+        if !self.scanout.abandon_unsubmitted_compatibility_ready()? {
+            return Err(io::Error::other("compatibility READY ownership disappeared").into());
+        }
+        self.scene_history.discard_ready();
+        if !self.frame_pacing.abandon_ready_frame() {
+            self.frame_pacing.cancel_unsubmitted_render();
+        }
+        self.frame_scheduler.discard_ready_frame();
         Ok(())
     }
 
@@ -1969,7 +2109,12 @@ impl NativeRuntime {
         &mut self,
         target: &NativeAppliedOutputConfiguration,
     ) -> io::Result<CandidateScanoutState> {
-        let generation = self.drm_file_generation.wrapping_add(1).max(1);
+        let output_epoch = self.output_epoch.next();
+        let generation = output_epoch.get();
+        let pool_generation = match &*self.scanout {
+            NativeScanoutBackend::AtomicEglGbm(explicit) => explicit.next_pool_generation()?,
+            _ => generation,
+        };
         let output_id = self.output_id;
         let current_format = self.scanout.scanout_format();
         let cursor = self.candidate_cursor_state(target);
@@ -2022,8 +2167,8 @@ impl NativeRuntime {
                 discovery,
                 target.width,
                 target.height,
-                generation,
-                generation,
+                output_epoch,
+                pool_generation,
                 job_id,
                 self.frame_index.wrapping_add(1).max(1),
                 frozen_frame,
@@ -2053,7 +2198,9 @@ impl NativeRuntime {
                     &discovery,
                     target.width,
                     target.height,
-                    generation,
+                    output_epoch,
+                    self.drm_session_generation,
+                    pool_generation,
                     output_id,
                     initial_generation,
                     self.cursor_image.clone(),
@@ -2187,7 +2334,7 @@ impl NativeRuntime {
         self.scanout.retire_direct_after_synchronous_modeset();
         std::mem::swap(&mut *self.scanout, candidate_scanout);
 
-        self.publish_output_configuration_state(target, cursor, now_ns);
+        self.publish_new_output_epoch(target, self.output_epoch.next(), cursor, now_ns);
     }
 
     fn publish_worker_output_configuration(
@@ -2207,20 +2354,21 @@ impl NativeRuntime {
             .into());
         };
         explicit.adopt_worker_output_candidate(candidate, frame, render_info)?;
-        self.publish_output_configuration_state(target, cursor, now_ns);
+        self.publish_new_output_epoch(target, self.output_epoch.next(), cursor, now_ns);
         Ok(())
     }
 
-    fn publish_output_configuration_state(
+    fn publish_new_output_epoch(
         &mut self,
         target: NativeAppliedOutputConfiguration,
+        output_epoch: OutputEpochId,
         cursor: Option<AtomicCursorVisualState>,
         now_ns: u64,
     ) {
         self.target = target;
-        self.drm_file_generation = self.drm_file_generation.wrapping_add(1).max(1);
-        self.acquire_watches
-            .set_drm_file_generation(self.drm_file_generation);
+        self.output_epoch = output_epoch;
+        self.scanout.bind_output_epoch(output_epoch);
+        self.acquire_watches.set_output_epoch(output_epoch);
         let generation = self.output_configuration_generation.advance();
         self.output_capabilities
             .mode_inventory
@@ -2245,7 +2393,7 @@ impl NativeRuntime {
         }
         if let Some(runtime_cursor) = self.atomic_cursor.as_mut() {
             runtime_cursor.reconfigure_output_identity(
-                self.drm_file_generation,
+                output_epoch.get(),
                 target.crtc_id,
                 target.width,
                 target.height,
@@ -2279,32 +2427,41 @@ impl NativeRuntime {
             .map_or(0, |cursor| cursor.desired_epoch());
         self.presentation_timing.reconfigure(
             KmsModeTiming::from_mode(&target.mode, self.output_refresh_rate.interval_ns()),
-            self.drm_file_generation,
+            output_epoch.get(),
         );
         self.cursor_timing.reconfigure(
             KmsModeTiming::from_mode(&target.mode, self.output_refresh_rate.interval_ns()),
-            self.drm_file_generation,
+            output_epoch.get(),
         );
         let interval = Duration::from_nanos(self.output_refresh_rate.interval_ns());
         self.presentation_deadline.invalidate(interval);
         self.scheduled_presentation_target = None;
         self.server.invalidate_commit_timing_targets();
-        self.frame_scheduler = NativeFrameScheduler::new_with_refresh_interval_ns(
-            self.output_refresh_rate.interval_ns(),
-            now_ns,
-        );
+        self.rebase_output_epoch_frame_lanes(now_ns);
         self.render_journal.reset();
         self.adaptive_buffering.reset();
         self.pending_proven_deadline_miss = None;
         self.direct_fallback_tracker = None;
         self.queued_redraw_requested = true;
-        self.frame_pacing.cancel_unsubmitted_render();
         super::queue_visual_work_after_synchronous_modeset(
             &mut self.frame_pacing,
             &mut self.frame_scheduler,
             now_ns,
             self.server.scene_render_generation(),
         );
+        if let NativeScanoutBackend::AtomicEglGbm(explicit) = &*self.scanout {
+            debug_assert!(
+                super::cycle::validate_reconfiguration_frame_ownership(
+                    explicit,
+                    output_epoch,
+                    &self.scene_history,
+                    &self.frame_pacing,
+                    &self.frame_scheduler,
+                    &self.output_transactions,
+                )
+                .is_ok()
+            );
+        }
     }
 
     fn fail_pending_output_configuration(
@@ -2497,6 +2654,48 @@ impl OutputConfigurationRuntime for NativeRuntime {
         Ok(())
     }
 
+    fn quiesce_old_output_epoch(&mut self) -> Result<QuiescedOutputEpoch, String> {
+        if let NativeScanoutBackend::AtomicEglGbm(explicit) = &*self.scanout {
+            super::cycle::validate_reconfiguration_frame_ownership(
+                explicit,
+                self.output_epoch,
+                &self.scene_history,
+                &self.frame_pacing,
+                &self.frame_scheduler,
+                &self.output_transactions,
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        let boundary = self.native_output_reconfiguration_boundary();
+        let epoch =
+            QuiescedOutputEpoch::from_boundary(self.output_epoch, boundary).ok_or_else(|| {
+                format!(
+                    "old output epoch {} is not quiesced: {boundary:?}",
+                    self.output_epoch.get()
+                )
+            })?;
+        if self.scanout.ready_frame_queued() {
+            return Err("old output epoch still owns an unsubmitted physical READY frame".into());
+        }
+        if let NativeScanoutBackend::AtomicEglGbm(explicit) = &*self.scanout
+            && explicit
+                .has_suspended_output_ownership()
+                .map_err(|error| error.to_string())?
+        {
+            return Err("old output epoch still owns a suspended physical frame".into());
+        }
+        if self.frame_pacing.has_unsettled_output_frame_ownership() {
+            return Err("old output epoch still owns pacing frame state".into());
+        }
+        if self.frame_scheduler.ready_frame_queued() {
+            return Err("old output epoch still owns scheduler READY state".into());
+        }
+        if self.scene_history.has_ready_frame() {
+            return Err("old output epoch still owns scene-history READY state".into());
+        }
+        Ok(epoch)
+    }
+
     fn commit_started_at_ns(&mut self, cycle_started_at: Instant, now_ns: u64) -> u64 {
         now_ns.saturating_add(
             u64::try_from(cycle_started_at.elapsed().as_nanos()).unwrap_or(u64::MAX),
@@ -2506,17 +2705,13 @@ impl OutputConfigurationRuntime for NativeRuntime {
     fn commit_candidate(
         &mut self,
         candidate: &mut Self::Candidate,
+        quiesced_epoch: QuiescedOutputEpoch,
         commit_started_at_ns: u64,
     ) -> Result<u64, String> {
         let OutputConfigurationTransitionCandidate::Ready { modeset, .. } = candidate else {
             return Err("output candidate is not ready for real commit".to_string());
         };
-        let commit_started = Instant::now();
-        self.kms_backend
-            .commit_runtime_modeset_candidate(modeset)
-            .map_err(|error| error.to_string())?;
-        Ok(commit_started_at_ns
-            .saturating_add(u64::try_from(commit_started.elapsed().as_nanos()).unwrap_or(u64::MAX)))
+        self.commit_modeset_after_quiescence(modeset, quiesced_epoch, commit_started_at_ns)
     }
 
     fn adopt_committed_candidate(&mut self, candidate: Self::Candidate) -> Self::Candidate {

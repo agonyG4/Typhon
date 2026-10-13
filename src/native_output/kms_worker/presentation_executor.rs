@@ -101,7 +101,7 @@ impl KmsCommitExecutor for AtomicKmsWorkerExecutor {
                 },
                 CursorKmsSubmitContext {
                     output_id: job.output_id,
-                    output_generation: job.output_generation,
+                    output_generation: job.output_epoch.get(),
                     transaction_id: Some(job.transaction_id),
                     token: job.token,
                     crtc_id: job.crtc_id,

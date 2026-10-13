@@ -48,7 +48,7 @@ impl NativeRuntime {
                         bundle: ownership.job.identity(),
                         token: ownership.job.token,
                         transaction_id: ownership.job.transaction_id,
-                        output_generation: ownership.job.output_generation,
+                        output_generation: ownership.job.output_epoch.get(),
                         kind: ownership.job.kind,
                         direct_content_key: None,
                         submit_returned_at_ns: ownership.submit_returned_at.get(),

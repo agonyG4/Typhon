@@ -202,7 +202,10 @@ pub(super) fn settle_atomic_rendered_outcome(
             return Err(Box::new(error));
         }
     };
-    if let Err(error) = context.frame_pacing.bind_predictive_o1(physical_identity) {
+    if let Err(error) = context
+        .frame_pacing
+        .bind_physical_output_frame(physical_identity)
+    {
         if context.finish_render_work_on_failure {
             context.explicit.finish_render_work();
         }
@@ -1669,7 +1672,8 @@ pub(super) fn finish_direct_worker_queued(
         output_id: output_transactions.output_id(),
         transaction_id,
         token: commit_token,
-        output_generation,
+        output_epoch: crate::native_output::OutputEpochId::new(output_generation)
+            .expect("KMS output epoch is nonzero"),
         crtc_id,
         kind,
         reservation:

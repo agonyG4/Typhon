@@ -1,5 +1,4 @@
 use super::*;
-use crate::native_output::scanout::NativeScanoutKind;
 use oblivion_one::compositor::OutputRefreshRate;
 use oblivion_one::control::ControlErrorCode;
 use oblivion_one::control_snapshots::OutputTransformSnapshot;
@@ -54,7 +53,7 @@ struct FakeOutputRuntime {
     now_ns: u64,
     current: NativeAppliedOutputConfiguration,
     generation: OutputConfigurationGeneration,
-    output_ownership_generation: u64,
+    output_epoch: OutputEpochId,
     scanout_id: u64,
     scanout_dimensions: (u32, u32),
     server_geometry: (u32, u32),
@@ -102,7 +101,7 @@ impl FakeOutputRuntime {
             now_ns: 0,
             current,
             generation: OutputConfigurationGeneration::initial(),
-            output_ownership_generation: 1,
+            output_epoch: OutputEpochId::initial(),
             scanout_id: 1,
             scanout_dimensions: (1920, 1080),
             server_geometry: (1920, 1080),
@@ -166,7 +165,7 @@ impl FakeOutputRuntime {
         self.events.push(TransitionEvent::SafeBoundaryChecked);
         let safe_boundary = OutputConfigurationSafeBoundary {
             main_thread_pageflip_owned: self.submitted_pageflip_owned,
-            explicit_sync_obligation_owned: !self.acquire_obligations.is_empty(),
+            explicit_sync_watch_owned: !self.acquire_obligations.is_empty(),
             ..OutputConfigurationSafeBoundary::default()
         };
         if !safe_boundary.is_safe() {
@@ -339,6 +338,16 @@ impl OutputConfigurationRuntime for FakeOutputRuntime {
         Ok(())
     }
 
+    fn quiesce_old_output_epoch(&mut self) -> Result<QuiescedOutputEpoch, String> {
+        let boundary = NativeOutputReconfigurationBoundary {
+            main_thread_pageflip_owned: self.submitted_pageflip_owned,
+            parked_explicit_sync_obligation_owned: !self.parked_acquire_obligations.is_empty(),
+            ..NativeOutputReconfigurationBoundary::default()
+        };
+        QuiescedOutputEpoch::from_boundary(self.output_epoch, boundary)
+            .ok_or_else(|| format!("fake epoch {} did not quiesce", self.output_epoch.get()))
+    }
+
     fn commit_started_at_ns(&mut self, _cycle_started_at: Instant, now_ns: u64) -> u64 {
         assert_eq!(
             self.now_ns, now_ns,
@@ -350,8 +359,10 @@ impl OutputConfigurationRuntime for FakeOutputRuntime {
     fn commit_candidate(
         &mut self,
         candidate: &mut Self::Candidate,
+        quiesced_epoch: QuiescedOutputEpoch,
         commit_started_at_ns: u64,
     ) -> Result<u64, String> {
+        assert_eq!(quiesced_epoch.output_epoch(), self.output_epoch);
         assert!(candidate.rendered);
         self.direct_owned_during_commit = self.direct_scanout_owned;
         if self.failure == Some(FailurePoint::RealCommit) {
@@ -410,8 +421,8 @@ impl OutputConfigurationRuntime for FakeOutputRuntime {
         self.scanout_id = candidate.id;
         self.scanout_dimensions = (target.width, target.height);
         self.generation.advance();
-        self.output_ownership_generation = self.output_ownership_generation.wrapping_add(1).max(1);
-        self.acquire_watch_generation = self.output_ownership_generation;
+        self.output_epoch = self.output_epoch.next();
+        self.acquire_watch_generation = self.output_epoch.get();
         self.server_geometry = (target.width, target.height);
         self.server_refresh_millihz = output_rate(&target).refresh_millihz();
         self.input_geometry = (target.width, target.height);
@@ -420,7 +431,7 @@ impl OutputConfigurationRuntime for FakeOutputRuntime {
         self.cursor_position.0 = self.cursor_position.0.min(target.width.saturating_sub(1));
         self.cursor_position.1 = self.cursor_position.1.min(target.height.saturating_sub(1));
         self.cursor_output_identity = (
-            self.output_ownership_generation,
+            self.output_epoch.get(),
             target.crtc_id,
             target.width,
             target.height,
@@ -445,7 +456,7 @@ impl OutputConfigurationRuntime for FakeOutputRuntime {
         }
         for obligation in &mut self.acquire_obligations {
             if self.parked_acquire_obligations.contains(&obligation.id) {
-                obligation.rearmed_generation = Some(self.output_ownership_generation);
+                obligation.rearmed_generation = Some(self.output_epoch.get());
             }
         }
         self.parked_acquire_obligations.clear();
@@ -572,6 +583,7 @@ fn refresh_change_and_timeout_rollback_publish_coordinated_state() {
         "temporary apply selects the exact requested native mode",
     );
     assert_eq!(runtime.generation.get(), initial_generation + 1);
+    assert_eq!(runtime.output_epoch, OutputEpochId::initial().next());
     assert_eq!(
         active.phase,
         OutputConfigurationTransactionPhase::PendingConfirmation
@@ -614,6 +626,7 @@ fn refresh_change_and_timeout_rollback_publish_coordinated_state() {
         "rollback restores the exact previous native mode timing",
     );
     assert_eq!(runtime.generation.get(), initial_generation + 2);
+    assert_eq!(runtime.output_epoch, OutputEpochId::initial().next().next());
     assert_eq!(runtime.rate().refresh_millihz(), 165_000);
     assert_eq!(runtime.server_refresh_millihz, 165_000);
     assert_eq!(runtime.scheduler_interval_ns, runtime.rate().interval_ns());
@@ -811,7 +824,7 @@ fn unsignaled_acquire_obligation_does_not_starve_mutation_and_rearm_is_bounded()
         OutputConfigurationAdvance::Completed
     );
     assert_eq!(runtime.current.mode_id, temporary.mode_id);
-    assert_eq!(runtime.output_ownership_generation, 2);
+    assert_eq!(runtime.output_epoch.get(), 2);
     assert_eq!(runtime.parked_acquire_obligations, vec![77]);
     assert_eq!(runtime.acquire_obligations[0].registered_generation, 1);
     assert_eq!(runtime.acquire_obligations[0].rearmed_generation, None);

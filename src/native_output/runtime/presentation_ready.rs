@@ -577,6 +577,9 @@ pub(super) fn submit_ready_frame(
                     frame_scheduler.defer_page_flip_watchdog_to_atomic_arbiter();
                 }
             }
+            if explicit_submission {
+                frame_scheduler.consume_ready_frame();
+            }
             if let Some(batch_id) = callback_batch_id {
                 server.complete_frame_callbacks_after_admission(
                     batch_id,

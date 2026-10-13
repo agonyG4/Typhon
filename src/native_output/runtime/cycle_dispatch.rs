@@ -2065,7 +2065,7 @@ impl NativeRuntime {
             kms_backend,
             target,
             mode_label,
-            drm_file_generation,
+            output_epoch,
             drm_timestamp_clock,
             presentation_clock,
             scanout,
@@ -2682,7 +2682,7 @@ impl NativeRuntime {
                     |worker| {
                         worker.dispatch_budget_ns(
                             crate::native_output::kms_worker::KmsServiceClass::CursorPlaneDelta,
-                            *drm_file_generation,
+                            output_epoch.get(),
                         )
                     },
                 );
@@ -4650,7 +4650,7 @@ impl NativeRuntime {
                 state: runtime_vrr_feature_state(
                     self.kms_backend.atomic_vrr_capable(),
                     self.confirmed_kms_presentation
-                        .vrr_request_confirmed_for(self.drm_file_generation),
+                        .vrr_request_confirmed_for(self.output_epoch.get()),
                 ),
             },
             direct_scanout: FeatureStateSnapshot {

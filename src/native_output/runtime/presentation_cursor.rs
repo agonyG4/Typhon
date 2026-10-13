@@ -629,7 +629,7 @@ pub(super) fn trace_presented_cursor(
                 |reveal| reveal.constraint.generation.to_string()
             ),
             identity.token.get(),
-            identity.output_generation,
+            identity.output_epoch.get(),
             identity.crtc_id,
             cursor.revision,
             cursor.delivery,

@@ -1003,6 +1003,203 @@ fn worker_test_frame_batch(frame_id: u64) -> oblivion_one::compositor::Composito
     server.take_frame_batch_for_render(frame_id)
 }
 
+#[test]
+fn nvidia_ready_pacing_divergence_is_terminalized_before_a_new_output_epoch() {
+    use crate::egl_renderer::native_fence::NativeRenderFence;
+    use crate::native_output::NativeCursorDamageBounds;
+    use crate::native_output::pacing::NativeFramePacing;
+    use crate::native_output::presentation::plane::{
+        FrozenCursorTestPolicy, FrozenPrimaryCursorPlan, FrozenPrimaryCursorPresentation,
+        PresentedCursorDelivery,
+    };
+    use crate::native_output::presentation::transaction::OutputTransaction;
+    use crate::native_output::runtime::scene_history::NativeFrameSceneSnapshot;
+    use crate::native_output::runtime::{NativeFrameScheduler, NativeSceneHistory};
+    use crate::native_output::scanout::{AtomicOutputSwapchain, OutputSlotId, OutputSlotSet};
+    use oblivion_one::compositor::PresentationFrameSnapshot;
+    use oblivion_one::core::OutputId;
+    use oblivion_one::native::presentation_deadline::MonotonicTimestampNs;
+    use oblivion_one::window_lifecycle_animation::LifecycleFrameSnapshot;
+    use std::cell::Cell;
+    use std::os::fd::{FromRawFd, OwnedFd};
+
+    let output_id = OutputId::from_raw(1).expect("test output ID is nonzero");
+    let output_epoch = oblivion_one::native::OutputEpochId::initial();
+    let slots = OutputSlotSet::new([
+        OutputSlotId::new(0).unwrap(),
+        OutputSlotId::new(1).unwrap(),
+        OutputSlotId::new(2).unwrap(),
+    ])
+    .unwrap();
+    let mut swapchain =
+        AtomicOutputSwapchain::from_presented_slots(slots, OutputSlotId::new(0).unwrap(), 1)
+            .unwrap();
+    let slot = swapchain.acquire_render_slot().unwrap();
+    let mut pipe = [-1; 2];
+    assert_eq!(
+        unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) },
+        0
+    );
+    unsafe { libc::close(pipe[1]) };
+    let render_fence =
+        NativeRenderFence::from_submission_fd(unsafe { OwnedFd::from_raw_fd(pipe[0]) });
+    let cursor_plan = FrozenPrimaryCursorPlan {
+        delivery: PresentedCursorDelivery::Hidden,
+        primary_presentation: FrozenPrimaryCursorPresentation::Preserve,
+        cursor_test_policy: FrozenCursorTestPolicy::Required,
+    };
+    swapchain
+        .prepare_ready_for_test(slot, render_fence, cursor_plan, None)
+        .unwrap();
+    let owner = swapchain.ready_identity().expect("physical READY exists");
+    let batch_id = owner.protocol_batch_id;
+
+    let mut scene_history = NativeSceneHistory::new(NativeFrameSceneSnapshot {
+        output_id,
+        frame_id: 0,
+        render_generation: 0,
+        scene: NativeSceneSnapshot::from_surfaces_with_scene_nodes(&[], &[], Vec::new(), &[]),
+        cursor_damage: NativeCursorDamageBounds::default(),
+        presentation: PresentationFrameSnapshot::empty_for_output(output_id),
+        lifecycle: LifecycleFrameSnapshot::default(),
+        canonical_scene_evidence: None,
+        window_exit_evidence: Vec::new(),
+    });
+    assert!(scene_history.replace_ready(NativeFrameSceneSnapshot {
+        output_id,
+        frame_id: owner.frame_id,
+        render_generation: owner.render_generation,
+        scene: NativeSceneSnapshot::from_surfaces_with_scene_nodes(&[], &[], Vec::new(), &[]),
+        cursor_damage: NativeCursorDamageBounds::default(),
+        presentation: PresentationFrameSnapshot::empty_for_output(output_id),
+        lifecycle: LifecycleFrameSnapshot::default(),
+        canonical_scene_evidence: None,
+        window_exit_evidence: Vec::new(),
+    }));
+
+    let mut frame_pacing = NativeFramePacing::from_env();
+    frame_pacing.queue_visual(1, owner.render_generation);
+    frame_pacing
+        .note_render_started(NativeOutputPacingMode::ReactiveDouble, false)
+        .unwrap();
+    frame_pacing.bind_physical_output_frame(owner).unwrap();
+    assert!(frame_pacing.active.is_some());
+    assert!(frame_pacing.ready.is_none());
+    assert!(
+        !frame_pacing.abandon_ready_frame(),
+        "reproduces the observed READY state with no pacing READY lane"
+    );
+
+    let mut frame_scheduler = NativeFrameScheduler::new_with_refresh_interval_ns(10, 0);
+    frame_scheduler.note_render_ahead_ready();
+    assert!(frame_scheduler.ready_frame_queued());
+
+    let mut output_transactions = OutputTransactionLedger::new_for_output(output_id);
+    let transaction = OutputTransaction::composited(
+        output_id,
+        owner.transaction_id,
+        output_epoch.get(),
+        MonotonicTimestampNs::new(1),
+        owner.fixed_target().expect("test frame has a fixed target"),
+        NativeOutputPacingMode::ReactiveDouble,
+        owner.frame_id,
+        owner.render_generation,
+        owner.pool_generation,
+        owner.slot,
+        owner.framebuffer_id.get(),
+        None,
+        batch_id,
+    )
+    .unwrap();
+    output_transactions.insert(transaction).unwrap();
+    output_transactions
+        .mark_ready(owner.transaction_id, MonotonicTimestampNs::new(2))
+        .unwrap();
+
+    let protocol_settlements = Cell::new(0);
+    terminalize_unsubmitted_ready_frame(
+        &mut swapchain,
+        owner,
+        output_epoch,
+        &mut scene_history,
+        &mut frame_pacing,
+        &mut frame_scheduler,
+        &mut output_transactions,
+        MonotonicTimestampNs::new(3),
+        |obligations| {
+            assert_eq!(obligations.frame_batch_id(), Some(batch_id));
+            protocol_settlements.set(protocol_settlements.get() + 1);
+            Ok(())
+        },
+    )
+    .expect("old READY has one authoritative terminalization path");
+
+    assert_eq!(protocol_settlements.get(), 1);
+    assert!(output_transactions.active_transaction_ids().is_empty());
+    assert!(matches!(
+        output_transactions
+            .transaction_including_terminal(owner.transaction_id)
+            .expect("old transaction is retained as a terminal record")
+            .state(),
+        OutputTransactionState::Terminal(OutputTransactionTerminal::Dropped {
+            reason: OutputTransactionDropReason::SafeAbandonment,
+            ..
+        })
+    ));
+    assert!(!scene_history.has_ready_frame());
+    assert!(!frame_scheduler.ready_frame_queued());
+    assert!(!frame_pacing.has_unsettled_output_frame_ownership());
+    assert_eq!(frame_pacing.unsubmitted_physical_identity(), None);
+    assert_eq!(swapchain.ready_identity(), None);
+    assert!(swapchain.has_suspended_ownership());
+    assert!(swapchain.suspended_fences_signaled().unwrap());
+    while let Some(frame) = swapchain.take_suspended_frame() {
+        drop(frame);
+    }
+    swapchain.recover_suspended_slot(true).unwrap();
+    assert!(!swapchain.has_suspended_ownership());
+
+    let new_output_epoch = output_epoch.next();
+    frame_pacing.rebase_after_output_epoch();
+    let mut new_frame_scheduler = NativeFrameScheduler::new_with_refresh_interval_ns(10, 4);
+    frame_pacing.queue_visual(4, owner.render_generation + 1);
+    new_frame_scheduler.queue_visual_work();
+    assert!(frame_pacing.active.is_some());
+    assert!(new_frame_scheduler.visual_work_queued());
+
+    let stale_predecessor_token =
+        PageFlipToken::new(owner.transaction_id.get()).expect("old predecessor token is nonzero");
+    let mut current_pageflip_arbiter = AtomicCommitArbiter::new();
+    assert_eq!(
+        current_pageflip_arbiter.complete(stale_predecessor_token, new_output_epoch.get(), 12,),
+        AtomicCommitCompletion::Stale,
+        "a predecessor pageflip arriving after publication has no current owner"
+    );
+    assert!(!current_pageflip_arbiter.atomic_commit_pending());
+
+    assert!(!new_frame_scheduler.ready_frame_queued());
+    assert_eq!(new_output_epoch.get(), output_epoch.get() + 1);
+
+    let repeated_retirement = terminalize_unsubmitted_ready_frame(
+        &mut swapchain,
+        owner,
+        new_output_epoch,
+        &mut scene_history,
+        &mut frame_pacing,
+        &mut new_frame_scheduler,
+        &mut output_transactions,
+        MonotonicTimestampNs::new(5),
+        |_| {
+            protocol_settlements.set(protocol_settlements.get() + 1);
+            Ok(())
+        },
+    );
+    assert!(repeated_retirement.is_err());
+    assert_eq!(protocol_settlements.get(), 1);
+    assert!(frame_pacing.active.is_some());
+    assert!(new_frame_scheduler.visual_work_queued());
+}
+
 fn worker_composited_job() -> (KmsCommitJob, AtomicOutputSwapchain) {
     let transaction_id = OutputTransactionId::new(NonZeroU64::new(41).unwrap());
     let token = PageFlipToken::new(41).unwrap();
@@ -1038,7 +1235,7 @@ fn worker_composited_job() -> (KmsCommitJob, AtomicOutputSwapchain) {
         output_id: oblivion_one::core::OutputId::from_raw(1).expect("nonzero output id"),
         transaction_id,
         token,
-        output_generation: 1,
+        output_epoch: crate::native_output::OutputEpochId::initial(),
         crtc_id: 7,
         kind,
         reservation:

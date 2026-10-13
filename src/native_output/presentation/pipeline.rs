@@ -23,7 +23,7 @@ pub(crate) struct TripleCapabilityInputs {
     pub(crate) render_fence_export: bool,
     pub(crate) submission_transport_healthy: bool,
     pub(crate) session_active: bool,
-    pub(crate) output_generation_stable: bool,
+    pub(crate) pool_generation_stable: bool,
     pub(crate) ordinary_vsync: bool,
     pub(crate) swapchain_poisoned: bool,
     pub(crate) software_cursor_visible: bool,
@@ -44,7 +44,7 @@ pub(crate) const fn derive_triple_capability(inputs: TripleCapabilityInputs) -> 
         TripleCapability::Unavailable(TripleCapabilityBlocker::SubmissionTransportUnhealthy)
     } else if !inputs.session_active {
         TripleCapability::Unavailable(TripleCapabilityBlocker::SessionInactive)
-    } else if !inputs.output_generation_stable {
+    } else if !inputs.pool_generation_stable {
         TripleCapability::Unavailable(TripleCapabilityBlocker::OutputGenerationUnstable)
     } else if !inputs.ordinary_vsync {
         TripleCapability::Unavailable(TripleCapabilityBlocker::UnsupportedPresentationMode)

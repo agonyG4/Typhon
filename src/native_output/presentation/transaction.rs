@@ -1168,6 +1168,20 @@ impl OutputTransaction {
     pub(crate) const fn obligations(&self) -> OutputProtocolObligations {
         self.obligations
     }
+
+    pub(crate) const fn composited_frame_identity(&self) -> Option<(u64, u64, u64)> {
+        match self.content {
+            OutputTransactionContent::Composited {
+                frame_id,
+                render_generation,
+                pool_generation,
+                ..
+            } => Some((frame_id, render_generation, pool_generation)),
+            OutputTransactionContent::Direct { .. }
+            | OutputTransactionContent::CompatibilityImmediate { .. }
+            | OutputTransactionContent::PlaneDelta { .. } => None,
+        }
+    }
 }
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

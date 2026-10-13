@@ -994,15 +994,21 @@ impl AtomicEglGbmScanout {
             .request_direct_release(DirectReleaseProof::Unproven, false);
     }
 
-    pub(crate) fn rebind_session_generation(
+    pub(crate) fn rebind_output_epoch(
         &mut self,
-        generation: u64,
+        output_epoch: crate::native_output::OutputEpochId,
+        drm_session_generation: crate::native_output::output::DrmSessionGeneration,
         vrr_connector_capable: bool,
         vrr_crtc_property_available: bool,
     ) -> io::Result<()> {
         self.vrr_connector_capable = vrr_connector_capable;
         self.vrr_crtc_property_available = vrr_crtc_property_available;
         let Some(pool) = self.physical_pool.as_ref() else {
+            self.bind_output_epoch(output_epoch);
+            self.direct
+                .framebuffer_cache
+                .rebind_session_generation(drm_session_generation);
+            self.direct.drm_session_generation = drm_session_generation;
             return Ok(());
         };
         validate_split_slot_pairing(
@@ -1011,20 +1017,27 @@ impl AtomicEglGbmScanout {
             pool.pool_generation(),
         )
         .expect("session recovery starts with exactly paired Atomic pools");
+        let pool_generation = self.swapchain().and_then(|swapchain| {
+            swapchain
+                .pool_generation()
+                .checked_add(1)
+                .filter(|generation| *generation != 0)
+                .ok_or_else(|| io::Error::other("output pool generation exhausted"))
+        })?;
         if let Some(swapchain) = self.swapchain.as_mut() {
             swapchain
-                .rebind_pool_generation(generation)
+                .rebind_pool_generation(pool_generation)
                 .expect("recovery retires all non-current explicit output ownership");
         }
         self.physical_pool
             .as_mut()
             .expect("physical pool was checked above")
-            .rebind_pool_generation(generation);
-        self.queue_render_control(AtomicRenderControl::RebindPoolGeneration(generation))?;
+            .rebind_pool_generation(pool_generation);
+        self.queue_render_control(AtomicRenderControl::RebindPoolGeneration(pool_generation))?;
         self.render_slot_identities = self
             .render_slot_identities
             .iter()
-            .map(|(id, _)| (*id, generation))
+            .map(|(id, _)| (*id, pool_generation))
             .collect();
         validate_split_slot_pairing(
             &self
@@ -1033,21 +1046,14 @@ impl AtomicEglGbmScanout {
                 .expect("physical pool remains installed during recovery")
                 .identities(),
             &self.render_slot_identities,
-            generation,
+            pool_generation,
         )
         .expect("session recovery rebinds physical and render pools together");
+        self.bind_output_epoch(output_epoch);
         self.direct
             .framebuffer_cache
-            .clear_for_generation(generation);
-        self.direct.drm_generation = generation;
-        self.direct.inhibit_until_composited_present = true;
-        self.direct.identity_viewport_metadata_logged = false;
-        self.direct.last_debug_candidate = None;
-        self.dmabuf_scanout_capabilities.output_generation = generation;
-        self.async_output_generation = generation;
-        self.presentation_validation_accepted.clear();
-        self.presentation_validation_rejected.clear();
-        self.variable_pageflip_qualification.clear();
+            .rebind_session_generation(drm_session_generation);
+        self.direct.drm_session_generation = drm_session_generation;
         self.queue_render_control(AtomicRenderControl::InvalidatePresentedDamageHistory)?;
         if matches!(&self.render_transport, AtomicRenderTransport::Worker(_)) {
             let (controls, required_epoch) = self.take_render_controls_for_job()?;
@@ -1062,6 +1068,33 @@ impl AtomicEglGbmScanout {
             }
         }
         Ok(())
+    }
+
+    pub(crate) fn bind_output_epoch(&mut self, output_epoch: crate::native_output::OutputEpochId) {
+        let generation = output_epoch.get();
+        self.direct.output_epoch = output_epoch;
+        self.direct.inhibit_until_composited_present = true;
+        self.direct.identity_viewport_metadata_logged = false;
+        self.direct.last_debug_candidate = None;
+        self.dmabuf_scanout_capabilities.output_generation = generation;
+        self.async_output_generation = generation;
+        self.presentation_validation_accepted.clear();
+        self.presentation_validation_rejected.clear();
+        self.variable_pageflip_qualification.clear();
+    }
+
+    pub(crate) fn physical_pool_generation(&self) -> Option<u64> {
+        self.physical_pool
+            .as_ref()
+            .map(AtomicPhysicalOutputPool::pool_generation)
+    }
+
+    pub(crate) fn next_pool_generation(&self) -> io::Result<u64> {
+        self.swapchain()?
+            .pool_generation()
+            .checked_add(1)
+            .filter(|generation| *generation != 0)
+            .ok_or_else(|| io::Error::other("output pool generation exhausted"))
     }
 
     pub(crate) fn composited_presentation_validation_key(
@@ -1346,7 +1379,7 @@ impl AtomicEglGbmScanout {
         discovery: AtomicDiscovery,
         width: u32,
         height: u32,
-        output_generation: u64,
+        output_epoch: oblivion_one::native::OutputEpochId,
         pool_generation: u64,
         job_id: RenderWorkerJobId,
         frame_id: u64,
@@ -1383,7 +1416,7 @@ impl AtomicEglGbmScanout {
             &self.renderable_dmabuf_formats,
             &mut probe,
         )?;
-        let mut physical_pool = create_physical_output_pool(
+        let physical_pool = create_physical_output_pool(
             &physical_device,
             kms.as_fd(),
             width,
@@ -1414,7 +1447,7 @@ impl AtomicEglGbmScanout {
             }
         };
         let identity =
-            AtomicRenderCandidateIdentity::new(job_id, output_generation, pool_generation, slot);
+            AtomicRenderCandidateIdentity::new(job_id, output_epoch, pool_generation, slot);
         let (controls_before, required_control_epoch) = match self.take_render_controls_for_job() {
             Ok(controls) => controls,
             Err(error) => {
@@ -1610,7 +1643,8 @@ impl AtomicEglGbmScanout {
         .collect();
         self.async_crtc_id = discovery.pipeline.crtc.get();
         self.async_primary_plane_id = discovery.pipeline.plane.get();
-        self.async_output_generation = candidate.identity.pool_generation;
+        let output_epoch = candidate.identity.output_epoch;
+        self.async_output_generation = output_epoch.get();
 
         let output_id = self.direct.output_id;
         let old_pool = self.physical_pool.replace(physical_pool);
@@ -1620,7 +1654,8 @@ impl AtomicEglGbmScanout {
                 .as_ref()
                 .expect("candidate physical device installed")
                 .as_fd(),
-            candidate.identity.pool_generation,
+            self.direct.drm_session_generation,
+            output_epoch,
             output_id,
         );
         self.width = width;
@@ -1644,6 +1679,8 @@ impl AtomicEglGbmScanout {
         discovery: &AtomicDiscovery,
         width: u32,
         height: u32,
+        output_epoch: crate::native_output::OutputEpochId,
+        drm_session_generation: crate::native_output::output::DrmSessionGeneration,
         pool_generation: u64,
         output_id: OutputId,
         initial_generation: std::sync::Arc<oblivion_one::effects::EffectRegistryGeneration>,
@@ -1658,6 +1695,8 @@ impl AtomicEglGbmScanout {
             discovery,
             width,
             height,
+            output_epoch,
+            drm_session_generation,
             pool_generation,
             output_id,
             worker_policy,
@@ -1673,6 +1712,8 @@ impl AtomicEglGbmScanout {
         discovery: &AtomicDiscovery,
         width: u32,
         height: u32,
+        output_epoch: crate::native_output::OutputEpochId,
+        drm_session_generation: crate::native_output::output::DrmSessionGeneration,
         pool_generation: u64,
         output_id: OutputId,
         initial_generation: std::sync::Arc<oblivion_one::effects::EffectRegistryGeneration>,
@@ -1683,6 +1724,8 @@ impl AtomicEglGbmScanout {
             discovery,
             width,
             height,
+            output_epoch,
+            drm_session_generation,
             pool_generation,
             output_id,
             AtomicRenderWorkerPolicy::Off,
@@ -1696,6 +1739,8 @@ impl AtomicEglGbmScanout {
         discovery: &AtomicDiscovery,
         width: u32,
         height: u32,
+        output_epoch: crate::native_output::OutputEpochId,
+        drm_session_generation: crate::native_output::output::DrmSessionGeneration,
         pool_generation: u64,
         output_id: OutputId,
         worker_policy: AtomicRenderWorkerPolicy,
@@ -1841,7 +1886,12 @@ impl AtomicEglGbmScanout {
             lifecycle_animation_available: render_info.lifecycle_animation_available,
             squash_animation_available: render_info.squash_animation_available,
             swapchain: None,
-            direct: DirectScanoutControl::new(kms.as_fd(), pool_generation, output_id),
+            direct: DirectScanoutControl::new(
+                kms.as_fd(),
+                drm_session_generation,
+                output_epoch,
+                output_id,
+            ),
             width,
             height,
             dmabuf_feedback,
@@ -1883,7 +1933,7 @@ impl AtomicEglGbmScanout {
             .collect(),
             async_crtc_id: discovery.pipeline.crtc.get(),
             async_primary_plane_id: discovery.pipeline.plane.get(),
-            async_output_generation: pool_generation,
+            async_output_generation: output_epoch.get(),
             presentation_validation_accepted: HashSet::new(),
             presentation_validation_rejected: HashSet::new(),
             variable_pageflip_qualification: VariablePageflipQualification::default(),
@@ -2168,7 +2218,7 @@ impl AtomicEglGbmScanout {
         damage: &NativeOutputDamage,
         resolved_scene: ResolvedNativeFrameScene<'static>,
         render_generation: u64,
-        output_generation: u64,
+        output_epoch: oblivion_one::native::OutputEpochId,
         reservation: PreparedCompositedReservation,
         prepared_presentation: PreparedCompositedPresentationState,
         pacing_mode: NativeOutputPacingMode,
@@ -2186,6 +2236,7 @@ impl AtomicEglGbmScanout {
         dmabuf_gpu_release_lease_id: Option<oblivion_one::compositor::DmabufGpuReleaseLeaseId>,
         mut phase_durations: Option<&mut AtomicRenderPhaseDurations>,
     ) -> io::Result<AtomicFrameRenderOutcome> {
+        let output_generation = output_epoch.get();
         let presentation_mode = prepared_presentation.mode;
         let content_type = prepared_presentation.content_type;
         let presentation_validation_key = prepared_presentation.validation_key;
@@ -2514,7 +2565,7 @@ impl AtomicEglGbmScanout {
             frame_id,
             transaction_id,
             protocol_batch_id,
-            output_generation,
+            output_epoch,
             render_generation,
             pool_generation,
             reservation,
@@ -2572,7 +2623,7 @@ impl AtomicEglGbmScanout {
                 job_id,
                 frame_id,
                 transaction_id,
-                output_generation,
+                output_epoch,
                 render_generation,
                 control_epoch,
                 target,
@@ -2581,7 +2632,7 @@ impl AtomicEglGbmScanout {
                 job_id,
                 frame_id,
                 transaction_id,
-                output_generation,
+                output_epoch,
                 render_generation,
                 target,
                 frozen_frame: frozen_render_frame,
@@ -2651,7 +2702,7 @@ impl AtomicEglGbmScanout {
             frame_id,
             transaction_id,
             protocol_batch_id,
-            output_generation,
+            output_epoch,
             render_generation,
             pool_generation,
             reservation,
@@ -2672,6 +2723,7 @@ impl AtomicEglGbmScanout {
             dmabuf_gpu_release_lease_id,
             render_target: _,
         } = context;
+        let output_generation = output_epoch.get();
         let resolved_scene = &frozen_render_frame.scene;
         let parts = match render_outcome {
             Ok(AtomicSlotRenderOutcome::Rendered(parts)) => *parts,
@@ -3226,8 +3278,13 @@ impl AtomicEglGbmScanout {
             .and_then(AtomicOutputSwapchain::suspended_fence_fd)
     }
 
+    pub(crate) fn has_suspended_output_ownership(&self) -> io::Result<bool> {
+        self.swapchain()
+            .map(AtomicOutputSwapchain::has_suspended_ownership)
+    }
+
     pub(crate) fn recover_suspended_ready_if_signaled(&mut self) -> io::Result<bool> {
-        if !self.swapchain()?.has_suspended_frame() {
+        if !self.swapchain()?.has_suspended_ownership() {
             return Ok(false);
         }
         if !self.swapchain()?.suspended_fences_signaled()? {
@@ -3385,7 +3442,7 @@ pub(crate) struct AtomicRenderSettlementContext {
     pub(crate) frame_id: u64,
     pub(crate) transaction_id: OutputTransactionId,
     pub(crate) protocol_batch_id: CompositorFrameBatchId,
-    pub(crate) output_generation: u64,
+    pub(crate) output_epoch: oblivion_one::native::OutputEpochId,
     pub(crate) render_generation: u64,
     pub(crate) pool_generation: u64,
     pub(crate) reservation: PreparedCompositedReservation,

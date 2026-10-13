@@ -422,7 +422,9 @@ impl NativeSessionIo for NativeRuntime {
             self.kms_backend
                 .rediscover_atomic_pipeline_for_recovery(self.kms.file().as_fd())?;
         }
-        let generation = allocate_native_drm_file_generation();
+        let drm_session_generation = allocate_native_drm_session_generation();
+        let output_epoch = self.output_epoch.next();
+        let output_generation = output_epoch.get();
         let recovery = self.scanout.prepare_session_recovery()?;
         let framebuffer = recovery.framebuffer_id();
         let _prepared_cursor_state = if self.atomic_cursor.is_some() {
@@ -437,7 +439,7 @@ impl NativeSessionIo for NativeRuntime {
                             plane,
                             atomic.discovery().cursor_width,
                             atomic.discovery().cursor_height,
-                            generation,
+                            output_generation,
                         )?)
                     } else {
                         None
@@ -482,7 +484,8 @@ impl NativeSessionIo for NativeRuntime {
         self.pending_session_recovery = Some(PendingSessionRecovery {
             output_id: self.output_id,
             scanout: recovery,
-            generation,
+            drm_session_generation,
+            output_epoch,
             cursor,
         });
         self.perf.log("native.session_recovery", || {
@@ -491,7 +494,8 @@ impl NativeSessionIo for NativeRuntime {
                 NativePerfField::str("kms_backend", self.kms_backend.effective_kind().as_str()),
                 NativePerfField::u64("framebuffer", u64::from(framebuffer.get())),
                 NativePerfField::u64("output_id", self.output_id.get()),
-                NativePerfField::u64("prepared_generation", generation),
+                NativePerfField::u64("prepared_session_generation", drm_session_generation.get()),
+                NativePerfField::u64("prepared_output_epoch", output_epoch.get()),
             ]
         });
         Ok(())
@@ -587,10 +591,18 @@ impl NativeSessionIo for NativeRuntime {
                 });
         self.presented_planes
             .rebase_after_synchronous_modeset(recovery.cursor);
-        self.perf.log("native.session_generation_barrier", || {
+        self.perf.log("native.output_epoch_barrier", || {
             vec![
-                NativePerfField::u64("old_generation", self.drm_file_generation),
-                NativePerfField::u64("new_generation", recovery.generation),
+                NativePerfField::u64("old_output_epoch", self.output_epoch.get()),
+                NativePerfField::u64("new_output_epoch", recovery.output_epoch.get()),
+                NativePerfField::u64(
+                    "old_session_generation",
+                    self.drm_session_generation.get(),
+                ),
+                NativePerfField::u64(
+                    "new_session_generation",
+                    recovery.drm_session_generation.get(),
+                ),
                 NativePerfField::bool("had_presented_primary", had_presented_primary),
                 NativePerfField::str("old_primary_kind", primary_kind),
                 NativePerfField::bool("primary_pageflip_provenance_retired", true),
@@ -638,33 +650,37 @@ impl NativeSessionIo for NativeRuntime {
     }
 
     fn rebind_render_generation(&mut self) -> NativeResult<()> {
-        let generation = self
+        let recovery = self
             .pending_session_recovery
-            .ok_or_else(|| io::Error::other("session recovery has no prepared generation"))?
-            .generation;
+            .ok_or_else(|| io::Error::other("session recovery has no prepared generation"))?;
+        let output_epoch = recovery.output_epoch;
         self.presentation_timing.reconfigure(
             KmsModeTiming::from_mode(&self.target.mode, self.output_refresh_rate.interval_ns()),
-            generation,
+            output_epoch.get(),
         );
         self.cursor_timing.reconfigure(
             KmsModeTiming::from_mode(&self.target.mode, self.output_refresh_rate.interval_ns()),
-            generation,
+            output_epoch.get(),
         );
         self.abandon_direct_fallback();
-        self.scanout.rebind_session_generation(
-            generation,
+        self.scanout.rebind_output_epoch(
+            output_epoch,
+            recovery.drm_session_generation,
             self.kms_backend.atomic_connector_vrr_capable(),
             self.kms_backend.atomic_crtc_vrr_property_available(),
         )?;
+        self.settle_and_rebase_session_output_frame_lanes(monotonic_now_ns()?)?;
+        self.output_epoch = output_epoch;
+        self.drm_session_generation = recovery.drm_session_generation;
         self.observe(NativeIoOperation::RenderWorkerRebindAcknowledged);
         Ok(())
     }
 
     fn rearm_explicit_sync(&mut self) -> NativeResult<()> {
-        let generation = self
+        let output_epoch = self
             .pending_session_recovery
             .ok_or_else(|| io::Error::other("session recovery has no prepared generation"))?
-            .generation;
+            .output_epoch;
         if !apply_native_scanout_feedback(
             &mut self.server,
             &self.scanout,
@@ -672,7 +688,7 @@ impl NativeSessionIo for NativeRuntime {
         ) {
             self.scanout.note_dmabuf_feedback_unchanged_rebuild();
         }
-        self.acquire_watches.set_drm_file_generation(generation);
+        self.acquire_watches.set_output_epoch(output_epoch);
         self.restart_kms_commit_worker_after_recovery()?;
         self.rearm_parked_acquire_watches()?;
         let configuration_generation = self.output_configuration_generation.advance();
@@ -688,7 +704,7 @@ impl NativeSessionIo for NativeRuntime {
             return Ok(());
         }
         if let Some(cursor) = self.atomic_cursor.as_mut() {
-            cursor.rearm_generation(self.drm_file_generation);
+            cursor.rearm_generation(self.output_epoch.get());
             self.cursor_render_mode = NativeCursorRenderMode::Hardware;
             return Ok(());
         }
@@ -1068,20 +1084,22 @@ mod tests {
     #[test]
     fn session_recovery_keeps_logical_output_id_when_drm_generation_changes() {
         let output_id = OutputId::from_raw(7).expect("nonzero output id");
-        let old_drm_generation = 41;
-        let new_drm_generation = 42;
+        let old_drm_generation = DrmSessionGeneration::new(41).unwrap();
+        let new_drm_generation = DrmSessionGeneration::new(42).unwrap();
         let recovery = PendingSessionRecovery {
             output_id,
             scanout: NativeScanoutRecovery::Dumb(FramebufferId::new(1).unwrap()),
-            generation: new_drm_generation,
+            drm_session_generation: new_drm_generation,
+            output_epoch: OutputEpochId::initial().next(),
             cursor: crate::native_output::presentation::plane::PresentedCursorState::hidden(),
         };
 
         assert_eq!(recovery.output_id, output_id);
         assert_eq!(recovery.output_id.get(), 7);
-        assert_eq!(old_drm_generation, 41);
-        assert_eq!(recovery.generation, new_drm_generation);
-        assert_ne!(old_drm_generation, recovery.generation);
+        assert_eq!(old_drm_generation.get(), 41);
+        assert_eq!(recovery.drm_session_generation, new_drm_generation);
+        assert_ne!(old_drm_generation, recovery.drm_session_generation);
+        assert_ne!(OutputEpochId::initial(), recovery.output_epoch);
         validate_pending_session_recovery_output(output_id, recovery.output_id)
             .expect("matching logical output survives a DRM generation change");
 

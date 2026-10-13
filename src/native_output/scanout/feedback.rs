@@ -1,6 +1,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::{NativeScanoutBackend, OwnCompositorServer};
+use crate::native_output::output::DrmSessionGeneration;
 
 pub(crate) use oblivion_one::compositor::DirectScanoutFeedbackCapabilities;
 
@@ -33,7 +34,7 @@ pub(crate) fn apply_native_scanout_feedback(
 }
 
 pub(crate) static NEXT_NATIVE_PAGE_FLIP_TOKEN: AtomicU64 = AtomicU64::new(1);
-pub(crate) static NEXT_NATIVE_DRM_FILE_GENERATION: AtomicU64 = AtomicU64::new(1);
+pub(crate) static NEXT_NATIVE_DRM_SESSION_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) fn allocate_native_page_flip_token() -> u64 {
     loop {
@@ -49,16 +50,17 @@ pub(crate) fn allocate_native_page_flip_token() -> u64 {
     }
 }
 
-pub(crate) fn allocate_native_drm_file_generation() -> u64 {
+pub(crate) fn allocate_native_drm_session_generation() -> DrmSessionGeneration {
     loop {
-        let current = NEXT_NATIVE_DRM_FILE_GENERATION.load(Ordering::Relaxed);
+        let current = NEXT_NATIVE_DRM_SESSION_GENERATION.load(Ordering::Relaxed);
         let generation = current.max(1);
         let next = generation.checked_add(1).unwrap_or(1);
-        if NEXT_NATIVE_DRM_FILE_GENERATION
+        if NEXT_NATIVE_DRM_SESSION_GENERATION
             .compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed)
             .is_ok()
         {
-            return generation;
+            return DrmSessionGeneration::new(generation)
+                .expect("allocated DRM session generations are nonzero");
         }
     }
 }

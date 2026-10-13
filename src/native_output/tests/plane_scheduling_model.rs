@@ -447,7 +447,7 @@ fn presented_cursor_promotes_only_on_the_exact_bundle_pageflip() {
         output_id: oblivion_one::core::OutputId::from_raw(1).expect("nonzero output id"),
         bundle_id: bundle_id(7),
         token: token(8),
-        output_generation: 9,
+        output_epoch: oblivion_one::native::OutputEpochId::new(9).unwrap(),
         crtc_id: 10,
     };
     let promotion = PresentedCursorPromotion {
@@ -483,7 +483,7 @@ fn presented_bundle_promotes_primary_and_cursor_atomically() {
         output_id: oblivion_one::core::OutputId::from_raw(1).expect("nonzero output id"),
         bundle_id: bundle_id(70),
         token: token(71),
-        output_generation: 72,
+        output_epoch: oblivion_one::native::OutputEpochId::new(72).unwrap(),
         crtc_id: 73,
     };
     let primary = PresentedPrimaryState::Composed {
@@ -529,7 +529,7 @@ fn presented_snapshot_preserves_the_other_plane_and_rejects_every_stale_identity
         output_id: oblivion_one::core::OutputId::from_raw(1).expect("nonzero output id"),
         bundle_id: bundle_id(82),
         token: token(81),
-        output_generation: 83,
+        output_epoch: oblivion_one::native::OutputEpochId::new(83).unwrap(),
         crtc_id: 84,
     };
     let primary = PresentedPrimaryState::Composed {
@@ -564,7 +564,7 @@ fn presented_snapshot_preserves_the_other_plane_and_rejects_every_stale_identity
             ..identity
         },
         PlanePageflipIdentity {
-            output_generation: 82,
+            output_epoch: oblivion_one::native::OutputEpochId::new(82).unwrap(),
             ..identity
         },
         PlanePageflipIdentity {
@@ -634,7 +634,7 @@ fn pageflip_identity_is_qualified_by_logical_output() {
         output_id: oblivion_one::core::OutputId::from_raw(1).expect("nonzero output id"),
         bundle_id: bundle_id(1),
         token: token(1),
-        output_generation: 1,
+        output_epoch: oblivion_one::native::OutputEpochId::initial(),
         crtc_id: 1,
     };
     let mut second = first;

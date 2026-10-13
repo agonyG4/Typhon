@@ -345,7 +345,8 @@ fn direct_control_for_transition_test() -> DirectScanoutControl {
     let drm = std::fs::File::open("/dev/null").expect("test DRM file");
     DirectScanoutControl::new(
         drm.as_fd(),
-        1,
+        crate::native_output::output::DrmSessionGeneration::new(1).unwrap(),
+        oblivion_one::native::OutputEpochId::initial(),
         OutputId::from_raw(1).expect("nonzero output id"),
     )
 }
@@ -692,7 +693,7 @@ fn worker_queue_owns_direct_resource_before_submit() {
         output_id: oblivion_one::core::OutputId::from_raw(1).expect("nonzero output id"),
         transaction_id: OutputTransactionId::new(std::num::NonZeroU64::new(80).unwrap()),
         token: PageFlipToken::new(80).unwrap(),
-        output_generation: 1,
+        output_epoch: crate::native_output::OutputEpochId::initial(),
         crtc_id: 7,
         kind: AtomicCommitKind::DirectPrimary {
             transaction_id: OutputTransactionId::new(std::num::NonZeroU64::new(80).unwrap()),

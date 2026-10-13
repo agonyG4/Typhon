@@ -9,6 +9,9 @@ pub mod event_loop;
 #[doc(hidden)]
 pub mod explicit_sync;
 pub mod kms;
+#[doc(hidden)]
+pub mod output_epoch;
+pub use output_epoch::OutputEpochId;
 pub mod presentation_deadline;
 pub mod presentation_timing;
 pub mod scheduler;

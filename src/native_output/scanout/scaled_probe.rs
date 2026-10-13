@@ -12,14 +12,16 @@ use oblivion_one::{
 
 use super::direct_validation::CursorAtomicValidationKey;
 use super::direct_validation::plane_layout_hash;
+use crate::native_output::output::DrmSessionGeneration;
+use oblivion_one::native::OutputEpochId;
 
 const SCALED_PROBE_CACHE_CAPACITY: usize = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct ScaledPrimaryProbeKey {
     pub(crate) output_id: OutputId,
-    pub(crate) drm_generation: u64,
-    pub(crate) output_generation: u64,
+    pub(crate) drm_session_generation: DrmSessionGeneration,
+    pub(crate) output_epoch: OutputEpochId,
     pub(crate) connector_id: u32,
     pub(crate) connector_content_type_property: Option<u32>,
     pub(crate) connector_content_type_value: Option<u64>,
@@ -41,8 +43,8 @@ pub(crate) struct ScaledPrimaryProbeKey {
 impl ScaledPrimaryProbeKey {
     pub(crate) fn new(
         output_id: OutputId,
-        drm_generation: u64,
-        output_generation: u64,
+        drm_session_generation: DrmSessionGeneration,
+        output_epoch: OutputEpochId,
         pipeline: &AtomicPipelineProperties,
         mode_width: u32,
         mode_height: u32,
@@ -53,8 +55,8 @@ impl ScaledPrimaryProbeKey {
         let modifier = buffer.planes().first()?.descriptor().modifier.0;
         Some(Self {
             output_id,
-            drm_generation,
-            output_generation,
+            drm_session_generation,
+            output_epoch,
             connector_id: pipeline.connector.get(),
             connector_content_type_property: pipeline
                 .connector_props
@@ -308,8 +310,8 @@ mod tests {
     fn key() -> ScaledPrimaryProbeKey {
         ScaledPrimaryProbeKey {
             output_id: OutputId::from_raw(1).unwrap(),
-            drm_generation: 5,
-            output_generation: 6,
+            drm_session_generation: DrmSessionGeneration::new(5).unwrap(),
+            output_epoch: OutputEpochId::new(6).unwrap(),
             connector_id: 10,
             connector_content_type_property: Some(100),
             connector_content_type_value: Some(0),
@@ -383,11 +385,11 @@ mod tests {
                 ..key
             },
             ScaledPrimaryProbeKey {
-                drm_generation: 6,
+                drm_session_generation: DrmSessionGeneration::new(6).unwrap(),
                 ..key
             },
             ScaledPrimaryProbeKey {
-                output_generation: 7,
+                output_epoch: OutputEpochId::new(7).unwrap(),
                 ..key
             },
             ScaledPrimaryProbeKey {
