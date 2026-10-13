@@ -163,6 +163,13 @@ impl CompositorState {
         old_surface_id: u32,
         replacement_surface_id: u32,
     ) {
+        if let Some(ownership) = self
+            .window_open_presentation_ownership
+            .remove(&old_surface_id)
+        {
+            self.window_open_presentation_ownership
+                .insert(replacement_surface_id, ownership);
+        }
         if self.pending_xwayland_visual_content.remove(&old_surface_id) {
             self.pending_xwayland_visual_content
                 .insert(replacement_surface_id);

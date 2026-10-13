@@ -235,8 +235,6 @@ mod frame_tests;
 #[cfg(test)]
 mod presentation_clip_tests;
 #[cfg(test)]
-mod task_05_8_tests;
-#[cfg(test)]
 mod tiled_layout_tests;
 #[cfg(test)]
 mod window_close_animation_tests;

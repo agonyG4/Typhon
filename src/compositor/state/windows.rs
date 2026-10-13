@@ -2689,10 +2689,15 @@ impl CompositorState {
             self.pending_x11_activation = None;
             return;
         }
+        self.pending_x11_activation = None;
         if self.activate_desktop_window(pending.window_id, WindowFocusReason::ShellActivation)
-            != WindowActivationOutcome::Unavailable
+            == WindowActivationOutcome::Unavailable
+            && self.pending_x11_activation.is_none()
         {
-            self.pending_x11_activation = None;
+            // Keep the original activation intent when the retry could not
+            // progress. A waiting XWayland restore may requeue the same
+            // intent while the window remains minimized.
+            self.pending_x11_activation = Some(pending);
         }
     }
 

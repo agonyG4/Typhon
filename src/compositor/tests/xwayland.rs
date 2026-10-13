@@ -27,6 +27,70 @@ use wayland_protocols::xwayland::shell::v1::client::{
 #[path = "xwayland_admission_lifecycle.rs"]
 mod xwayland_admission_lifecycle;
 
+fn assert_window_open_ownership(
+    state: &crate::compositor::CompositorState,
+    root_surface_id: u32,
+    scene_node_id: crate::core::SceneNodeId,
+) -> crate::animation_control::AnimationEffect {
+    let effect = state.animation_control.effective_effect(
+        crate::animation_control::AnimationSlot::WindowOpen,
+        state.animation_runtime_capabilities(),
+    );
+    assert!(
+        matches!(
+            effect,
+            crate::animation_control::AnimationEffect::WindowScale
+                | crate::animation_control::AnimationEffect::WindowGlide
+        ),
+        "expected an active WindowOpen effect, got {effect:?}"
+    );
+
+    let geometry_transaction = state
+        .presentation_animator
+        .track_transaction(scene_node_id)
+        .expect("WindowOpen geometry transaction");
+    let opacity_transaction = state
+        .presentation_animator
+        .opacity_track_transaction(scene_node_id);
+    match effect {
+        crate::animation_control::AnimationEffect::WindowScale => assert!(
+            opacity_transaction.is_none(),
+            "WindowScale owns Geometry only"
+        ),
+        crate::animation_control::AnimationEffect::WindowGlide => assert_eq!(
+            opacity_transaction,
+            Some(geometry_transaction),
+            "WindowGlide Geometry and Opacity belong to one open transaction"
+        ),
+        _ => unreachable!("effect was checked above"),
+    }
+
+    let activity = state.window_open_presentation_activity(root_surface_id);
+    assert!(
+        activity.geometry_exact,
+        "WindowOpen owns the exact Geometry member: root={root_surface_id}, attached_root={:?}, owner_keys={:?}, active_member={:?}",
+        state
+            .window_id_for_surface(root_surface_id)
+            .and_then(|window_id| state.window(window_id))
+            .map(|window| window.root_surface_id),
+        state
+            .window_open_presentation_ownership
+            .keys()
+            .copied()
+            .collect::<Vec<_>>(),
+        state.presentation_animator.active_transaction_member(
+            scene_node_id,
+            crate::presentation_animation::PresentationPropertyKind::Geometry,
+        )
+    );
+    assert_eq!(
+        activity.opacity_exact,
+        effect == crate::animation_control::AnimationEffect::WindowGlide,
+        "WindowOpen Opacity ownership follows the effective effect"
+    );
+    effect
+}
+
 #[test]
 fn xwayland_shell_protocol_error_is_attributed() {
     let socket_name = super::unique_socket_name();
@@ -1600,6 +1664,22 @@ fn pending_x11_activation_completes_on_the_same_window_replacement_surface() {
         .expect("admitted X11 window");
     assert!(fixture.server.state.minimize_desktop_window(window_id));
     let _ = fixture.server.state.take_backend_commands();
+    let replacement_source_content = fixture
+        .server
+        .state
+        .current_surface_buffers
+        .get(&fixture.parent_surface_id)
+        .cloned()
+        .expect("admitted root content for replacement commit");
+    let replacement_content =
+        replacement_xwayland_content(&replacement_source_content, 800, 600, 0, 0);
+    // Seed the replacement's already-committed logical content before its
+    // association event so attachment can adopt it without another commit.
+    fixture
+        .server
+        .state
+        .current_surface_buffers
+        .insert(fixture.popup_surface_id, replacement_content);
     fixture
         .server
         .state
@@ -1611,7 +1691,16 @@ fn pending_x11_activation_completes_on_the_same_window_replacement_surface() {
             .activate_desktop_window_action(window_id),
         crate::compositor::state::WindowActionOutcome::Changed
     );
+    assert!(fixture.server.state.pending_x11_activation.is_some());
+    assert!(
+        fixture
+            .server
+            .state
+            .pending_xwayland_restores
+            .contains_key(&window_id)
+    );
     let _ = fixture.server.state.take_backend_commands();
+    let _ = fixture.server.take_xwayland_backend_commands(0);
 
     fixture
         .server
@@ -1633,39 +1722,25 @@ fn pending_x11_activation_completes_on_the_same_window_replacement_surface() {
             .and_then(|window| window.x11_surface_id),
         Some(fixture.popup_surface_id)
     );
-    assert_eq!(fixture.server.state.focused_window_id, None);
-    assert!(fixture.server.state.pending_x11_activation.is_some());
-    assert!(
+    assert_eq!(fixture.server.state.focused_window_id, Some(window_id));
+    assert_eq!(
         fixture
             .server
             .state
-            .pending_xwayland_restores
-            .contains_key(&window_id)
+            .focused_surface
+            .as_ref()
+            .map(crate::compositor::compositor_surface_id),
+        Some(fixture.popup_surface_id)
     );
-    assert!(
-        fixture
-            .server
-            .state
-            .window(window_id)
-            .is_some_and(|window| window.state.is_minimized())
-    );
-
-    let replacement_source_content = fixture
-        .server
-        .state
-        .current_surface_buffers
-        .get(&fixture.popup_surface_id)
-        .cloned()
-        .expect("replacement surface content before matching geometry commit");
-    commit_replacement_xwayland_content(&mut fixture, &replacement_source_content, 800, 600, 0, 0);
-
     assert!(fixture.server.state.pending_x11_activation.is_none());
     assert!(
-        !fixture
+        fixture
             .server
             .state
             .pending_xwayland_restores
-            .contains_key(&window_id)
+            .get(&window_id)
+            .is_none(),
+        "compatible committed replacement content restores immediately after association"
     );
     assert!(
         fixture
@@ -1674,7 +1749,18 @@ fn pending_x11_activation_completes_on_the_same_window_replacement_surface() {
             .window(window_id)
             .is_some_and(|window| !window.state.is_minimized())
     );
-    assert_eq!(fixture.server.state.focused_window_id, Some(window_id));
+    let commands = fixture.server.take_xwayland_backend_commands(1);
+    assert_eq!(
+        commands
+            .iter()
+            .filter(|command| matches!(
+                command,
+                XwmCommand::Focus { window: Some(window), .. } if *window == handle
+            ))
+            .count(),
+        1,
+        "association must complete activation once without another content commit"
+    );
 }
 
 #[test]
@@ -1771,6 +1857,11 @@ fn xwayland_attachment_replacement_preserves_frame_and_keyboard_focus() {
         .state
         .scene_node_id_for_window_group(window_id)
         .expect("admitted window group node");
+    let open_effect = assert_window_open_ownership(
+        &fixture.server.state,
+        fixture.parent_surface_id,
+        scene_node_id,
+    );
     let open_geometry_transaction = fixture
         .server
         .state
@@ -1781,9 +1872,21 @@ fn xwayland_attachment_replacement_preserves_frame_and_keyboard_focus() {
         .server
         .state
         .presentation_animator
-        .opacity_track_transaction(scene_node_id)
-        .expect("new X11 window starts Open opacity");
-    assert_eq!(open_geometry_transaction, open_opacity_transaction);
+        .opacity_track_transaction(scene_node_id);
+    assert!(
+        fixture
+            .server
+            .state
+            .window_open_presentation_ownership
+            .contains_key(&fixture.parent_surface_id),
+        "initial WindowOpen ownership is keyed by the attached root"
+    );
+    assert_eq!(
+        open_opacity_transaction,
+        (open_effect == crate::animation_control::AnimationEffect::WindowGlide)
+            .then_some(open_geometry_transaction),
+        "initial opacity ownership follows the effective WindowOpen effect"
+    );
     assert_eq!(
         fixture
             .server
@@ -1804,6 +1907,27 @@ fn xwayland_attachment_replacement_preserves_frame_and_keyboard_focus() {
     assert_eq!(
         fixture.server.state.window_id_for_x11_handle(handle),
         Some(window_id)
+    );
+    assert_window_open_ownership(
+        &fixture.server.state,
+        fixture.popup_surface_id,
+        scene_node_id,
+    );
+    assert!(
+        fixture
+            .server
+            .state
+            .window_open_presentation_ownership
+            .contains_key(&fixture.popup_surface_id),
+        "WindowOpen ownership must follow the replacement root"
+    );
+    assert!(
+        !fixture
+            .server
+            .state
+            .window_open_presentation_ownership
+            .contains_key(&fixture.parent_surface_id),
+        "retired root must not retain stale WindowOpen ownership"
     );
     assert_eq!(
         fixture
@@ -1839,8 +1963,8 @@ fn xwayland_attachment_replacement_preserves_frame_and_keyboard_focus() {
             .state
             .presentation_animator
             .opacity_track_transaction(scene_node_id),
-        Some(open_opacity_transaction),
-        "backing replacement must not start a second Open opacity transaction"
+        open_opacity_transaction,
+        "backing replacement must preserve the effect-specific Open opacity transaction"
     );
     fixture
         .server
@@ -2562,6 +2686,202 @@ fn pending_xwayland_restore_is_cancelled_when_its_generation_ends() {
 }
 
 #[test]
+fn pending_x11_activation_waits_for_replacement_readiness() {
+    let mut fixture = stationary_pointer_xwayland_fixture();
+    let mut snapshot = fake_snapshot();
+    snapshot.surface_id = fixture.parent_surface_id;
+    let handle = snapshot.handle;
+    fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::WindowReady(snapshot));
+    let window_id = fixture
+        .server
+        .state
+        .window_id_for_x11_handle(handle)
+        .expect("admitted X11 window");
+    let source = fixture
+        .server
+        .state
+        .current_surface_buffers
+        .get(&fixture.parent_surface_id)
+        .cloned()
+        .expect("admitted root content for replacement commits");
+    fixture
+        .server
+        .set_lifecycle_animation_renderer_available(false);
+    assert!(fixture.server.state.minimize_desktop_window(window_id));
+    let _ = fixture.server.state.take_backend_commands();
+    fixture
+        .server
+        .state
+        .remove_current_surface_buffer(fixture.popup_surface_id);
+    fixture
+        .server
+        .state
+        .unregister_surface_resource(fixture.parent_surface_id);
+    assert_eq!(
+        fixture
+            .server
+            .state
+            .activate_desktop_window_action(window_id),
+        crate::compositor::state::WindowActionOutcome::Changed
+    );
+    assert!(fixture.server.state.pending_x11_activation.is_some());
+    assert!(
+        fixture
+            .server
+            .state
+            .pending_xwayland_restores
+            .contains_key(&window_id)
+    );
+    let _ = fixture.server.take_xwayland_backend_commands(0);
+
+    fixture
+        .server
+        .apply_xwayland_association_event(XwmAssociationEvent::Associated {
+            generation: handle.generation(),
+            window: handle,
+            surface_id: fixture.popup_surface_id,
+        });
+    assert!(fixture.server.state.pending_x11_activation.is_some());
+    assert!(
+        fixture
+            .server
+            .state
+            .pending_xwayland_restores
+            .contains_key(&window_id)
+    );
+    assert!(
+        fixture
+            .server
+            .state
+            .window(window_id)
+            .is_some_and(|window| window.state.is_minimized())
+    );
+    assert_eq!(fixture.server.state.focused_window_id, None);
+    assert!(
+        fixture
+            .server
+            .take_xwayland_backend_commands(1)
+            .iter()
+            .all(|command| !matches!(
+                command,
+                XwmCommand::Focus { window: Some(window), .. } if *window == handle
+            ))
+    );
+
+    commit_replacement_xwayland_content(&mut fixture, &source, 640, 480, 0, 0);
+    assert!(fixture.server.state.pending_x11_activation.is_some());
+    assert!(
+        fixture
+            .server
+            .state
+            .pending_xwayland_restores
+            .contains_key(&window_id)
+    );
+    assert!(
+        fixture
+            .server
+            .state
+            .window(window_id)
+            .is_some_and(|window| window.state.is_minimized())
+    );
+    assert!(
+        fixture
+            .server
+            .take_xwayland_backend_commands(1)
+            .iter()
+            .all(|command| !matches!(
+                command,
+                XwmCommand::Focus { window: Some(window), .. } if *window == handle
+            ))
+    );
+
+    let mismatched_generation = XwaylandGeneration::new(
+        NonZeroU64::new(handle.generation().get() + 1).expect("next generation"),
+    );
+    fixture
+        .server
+        .state
+        .xwayland
+        .surface_states
+        .get_mut(&fixture.popup_surface_id)
+        .expect("live replacement surface state")
+        .generation = mismatched_generation;
+    assert!(
+        !fixture
+            .server
+            .state
+            .complete_pending_xwayland_restore_for_surface(fixture.popup_surface_id)
+    );
+    fixture.server.state.complete_pending_x11_activation(handle);
+    assert!(fixture.server.state.pending_x11_activation.is_some());
+    assert!(
+        fixture
+            .server
+            .state
+            .pending_xwayland_restores
+            .contains_key(&window_id)
+    );
+    assert!(
+        fixture
+            .server
+            .state
+            .window(window_id)
+            .is_some_and(|window| window.state.is_minimized())
+    );
+    assert!(
+        fixture
+            .server
+            .take_xwayland_backend_commands(1)
+            .iter()
+            .all(|command| !matches!(
+                command,
+                XwmCommand::Focus { window: Some(window), .. } if *window == handle
+            ))
+    );
+
+    fixture
+        .server
+        .state
+        .xwayland
+        .surface_states
+        .get_mut(&fixture.popup_surface_id)
+        .expect("live replacement surface state")
+        .generation = handle.generation();
+    commit_replacement_xwayland_content(&mut fixture, &source, 800, 600, 0, 0);
+    assert!(fixture.server.state.pending_x11_activation.is_none());
+    assert!(
+        !fixture
+            .server
+            .state
+            .pending_xwayland_restores
+            .contains_key(&window_id)
+    );
+    assert!(
+        fixture
+            .server
+            .state
+            .window(window_id)
+            .is_some_and(|window| !window.state.is_minimized())
+    );
+    assert_eq!(fixture.server.state.focused_window_id, Some(window_id));
+    assert_eq!(
+        fixture
+            .server
+            .take_xwayland_backend_commands(2)
+            .iter()
+            .filter(|command| matches!(
+                command,
+                XwmCommand::Focus { window: Some(window), .. } if *window == handle
+            ))
+            .count(),
+        1,
+        "compatible content with the matching generation completes activation exactly once"
+    );
+}
+
+#[test]
 fn another_x11_windows_surface_cannot_satisfy_a_pending_restore() {
     let mut fixture = stationary_pointer_xwayland_fixture();
     let mut first_snapshot = fake_snapshot();
@@ -2896,47 +3216,55 @@ fn x11_window_ready_initial_focus_activates_normal_toplevel() {
         .state
         .scene_node_id_for_window_group(window_id)
         .expect("window group node");
+    let open_effect =
+        assert_window_open_ownership(&fixture.server.state, fixture.surface_id, scene_node_id);
     let open_start = fixture
         .server
         .state
         .presentation_animator
         .sample_at_transition_start_for_scene_node(scene_node_id)
         .expect("admission starts Geometry after canonical state is applied");
-    assert!(
-        fixture
-            .server
-            .state
-            .presentation_animator
-            .has_opacity_track(scene_node_id)
-    );
-    assert_eq!(
-        fixture
-            .server
-            .state
-            .presentation_animator
-            .track_transaction(scene_node_id),
-        fixture
-            .server
-            .state
-            .presentation_animator
-            .opacity_track_transaction(scene_node_id)
-    );
     let target = fixture
         .server
         .state
         .current_presentation_rect_for_root(fixture.surface_id)
         .expect("final canonical X11 target");
+    let expected_start = match open_effect {
+        crate::animation_control::AnimationEffect::WindowScale => {
+            crate::presentation_animation::PresentationRect::new(
+                target.x() + target.width() * 0.03,
+                target.y() + target.height() * 0.03,
+                target.width() * 0.94,
+                target.height() * 0.94,
+            )
+            .expect("scale start rect from post-admission canonical geometry")
+        }
+        crate::animation_control::AnimationEffect::WindowGlide => {
+            crate::presentation_animation::PresentationRect::new(
+                target.x(),
+                target.y() + 24.0,
+                target.width(),
+                target.height(),
+            )
+            .expect("glide start rect below post-admission canonical geometry")
+        }
+        _ => unreachable!("WindowOpen helper validates the effective effect"),
+    };
     assert_eq!(
-        open_start.rect,
-        crate::presentation_animation::PresentationRect::new(
-            target.x() + target.width() * 0.03,
-            target.y() + target.height() * 0.03,
-            target.width() * 0.94,
-            target.height() * 0.94,
-        )
-        .expect("scale start rect from post-admission canonical geometry")
+        open_start.rect, expected_start,
+        "WindowOpen source geometry must match the effective effect"
     );
     assert!(canonical_frame.width > 0 && canonical_frame.height > 0);
+    assert_eq!(fixture.server.state.focused_window_id, Some(window_id));
+    assert_eq!(
+        fixture
+            .server
+            .state
+            .focused_surface
+            .as_ref()
+            .map(crate::compositor::compositor_surface_id),
+        Some(fixture.surface_id)
+    );
 
     assert!(
         fixture

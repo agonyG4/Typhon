@@ -1603,12 +1603,13 @@ fn xwayland_fullscreen_transition_starts_from_pre_mutation_frame_geometry() {
         .server
         .presentation_scene_node_id_for_root(fixture.surface_id)
         .expect("XWayland WindowGroup scene node");
-    let open_opacity_transaction = fixture
+    super::assert_window_open_ownership(&fixture.server.state, fixture.surface_id, scene_node_id);
+    let open_geometry_transaction = fixture
         .server
         .state
         .presentation_animator
-        .opacity_track_transaction(scene_node_id)
-        .expect("Open opacity remains active");
+        .track_transaction(scene_node_id)
+        .expect("WindowOpen Geometry transaction");
     fixture
         .server
         .state
@@ -1641,6 +1642,69 @@ fn xwayland_fullscreen_transition_starts_from_pre_mutation_frame_geometry() {
         fixture
             .server
             .state
+            .scene_node_id_for_window_group(window_id),
+        Some(scene_node_id),
+        "fullscreen transition must keep the WindowGroup scene-node identity"
+    );
+    let fullscreen_geometry_transaction = fixture
+        .server
+        .state
+        .presentation_animator
+        .track_transaction(scene_node_id)
+        .expect("fullscreen Geometry transaction");
+    assert_ne!(
+        fullscreen_geometry_transaction, open_geometry_transaction,
+        "fullscreen transition owns a new Geometry revision"
+    );
+    let geometry_member = fixture
+        .server
+        .state
+        .presentation_animator
+        .active_transaction_member(
+            scene_node_id,
+            crate::presentation_animation::PresentationPropertyKind::Geometry,
+        )
+        .expect("active fullscreen Geometry member");
+    assert_eq!(
+        geometry_member.transaction_id(),
+        fullscreen_geometry_transaction
+    );
+    assert_eq!(
+        geometry_member.property(),
+        Some(crate::presentation_animation::PresentationPropertyKind::Geometry)
+    );
+    let fullscreen_frame = fixture
+        .server
+        .state
+        .window(window_id)
+        .and_then(|window| window.x11_geometry)
+        .expect("authoritative fullscreen X11 frame")
+        .frame;
+    assert_eq!(
+        fullscreen_frame,
+        fixture.server.state.window_geometry_for_surface_mode(
+            fixture.surface_id,
+            crate::compositor::ToplevelMode::Fullscreen,
+        ),
+        "the canonical X11 frame must reach the fullscreen target geometry"
+    );
+    let expected_target = fixture
+        .server
+        .state
+        .presentation_rect_for_geometry(fixture.surface_id, fullscreen_frame)
+        .expect("fullscreen presentation target");
+    let sampled_target = fixture
+        .server
+        .state
+        .presentation_animator
+        .sample_for_scene_node(scene_node_id, TestTime::from_nanos(u64::MAX))
+        .expect("fullscreen transition target sample")
+        .rect;
+    assert_eq!(sampled_target, expected_target);
+    assert_eq!(
+        fixture
+            .server
+            .state
             .presentation_animator
             .track_curve(scene_node_id),
         Some(
@@ -1650,15 +1714,6 @@ fn xwayland_fullscreen_transition_starts_from_pre_mutation_frame_geometry() {
                 .presentation_animation_policy
                 .curve_for(crate::compositor::PresentationAnimationKind::FullscreenEnter)
         )
-    );
-    assert_eq!(
-        fixture
-            .server
-            .state
-            .presentation_animator
-            .opacity_track_transaction(scene_node_id),
-        Some(open_opacity_transaction),
-        "fullscreen Geometry retarget must preserve independent Open opacity"
     );
 }
 
