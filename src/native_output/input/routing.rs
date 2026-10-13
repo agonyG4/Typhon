@@ -862,21 +862,55 @@ fn update_libinput_device_registry(
     match event {
         ::input::Event::Device(::input::event::DeviceEvent::Added(_)) => {
             let device = event.device();
-            if device.has_capability(::input::DeviceCapability::Keyboard) {
-                let _ = keyboard_devices.register(device, keyboard_id_allocator);
+            if device.has_capability(::input::DeviceCapability::Keyboard)
+                && keyboard_devices.get(&device).is_none()
+            {
+                let metadata = libinput_device_trace_metadata(&device);
+                if let Some(device_id) = keyboard_devices.register(device, keyboard_id_allocator) {
+                    trace_libinput_keyboard_source_registered(device_id, metadata);
+                }
             }
             None
         }
         ::input::Event::Device(::input::event::DeviceEvent::Removed(_)) => {
             let device = event.device();
-            keyboard_devices.remove(&device).map(|device| {
+            keyboard_devices.remove(&device).map(|device_id| {
+                input_trace_log(|| {
+                    format!(
+                        "event=keyboard_source_removed backend=libinput device={} sysname={} name={}",
+                        device_id.get(),
+                        device.sysname(),
+                        device.name(),
+                    )
+                });
                 NativeHardwareInputEvent::Keyboard(NativeKeyboardInputEvent::SourceRemoved {
-                    device,
+                    device: device_id,
                 })
             })
         }
         _ => None,
     }
+}
+
+fn libinput_device_trace_metadata(device: &::input::Device) -> Option<(String, String)> {
+    input_trace_enabled().then(|| (device.sysname().to_owned(), device.name().into_owned()))
+}
+
+fn trace_libinput_keyboard_source_registered(
+    device_id: KeyboardDeviceId,
+    metadata: Option<(String, String)>,
+) {
+    input_trace_log(|| {
+        let (sysname, name) = metadata
+            .as_ref()
+            .map_or(("not_available", "not_available"), |(sysname, name)| {
+                (sysname.as_str(), name.as_str())
+            });
+        format!(
+            "event=keyboard_source_registered backend=libinput device={} sysname={sysname} name={name}",
+            device_id.get(),
+        )
+    });
 }
 
 fn hardware_input_event_from_libinput(
@@ -903,16 +937,31 @@ fn hardware_input_event_from_libinput(
             let code = u16::try_from(event.key()).ok()?;
             let device = event.device();
             let device_id = keyboard_devices.get(&device).or_else(|| {
-                device
-                    .has_capability(::input::DeviceCapability::Keyboard)
-                    .then(|| keyboard_devices.register(device, keyboard_id_allocator))
-                    .flatten()
+                if !device.has_capability(::input::DeviceCapability::Keyboard) {
+                    return None;
+                }
+                let metadata = libinput_device_trace_metadata(&device);
+                let device_id = keyboard_devices.register(device, keyboard_id_allocator)?;
+                trace_libinput_keyboard_source_registered(device_id, metadata);
+                Some(device_id)
             })?;
+            let pressed = event.key_state() == KeyState::Pressed;
+            input_trace_log(|| {
+                format!(
+                    "event=libinput_key device={} code={} key_name={} pressed={} hardware_time_us={} seat_key_count={}",
+                    device_id.get(),
+                    code,
+                    linux_key_name(code),
+                    pressed,
+                    event.time_usec(),
+                    event.seat_key_count(),
+                )
+            });
             Some(NativeHardwareInputEvent::Keyboard(
                 NativeKeyboardInputEvent::Key {
                     device: device_id,
                     code,
-                    pressed: event.key_state() == KeyState::Pressed,
+                    pressed,
                 },
             ))
         }
@@ -935,10 +984,17 @@ fn hardware_input_event_from_libinput(
             )),
         ),
         ::input::Event::Pointer(PointerEvent::Button(event)) => {
-            Some(NativeHardwareInputEvent::PointerButton {
-                button: event.button(),
-                pressed: event.button_state() == ButtonState::Pressed,
-            })
+            let button = event.button();
+            let pressed = event.button_state() == ButtonState::Pressed;
+            input_trace_log(|| {
+                format!(
+                    "event=libinput_button button={button} button_name={} pressed={pressed} hardware_time_us={} seat_button_count={}",
+                    linux_pointer_button_name(button),
+                    event.time_usec(),
+                    event.seat_button_count(),
+                )
+            });
+            Some(NativeHardwareInputEvent::PointerButton { button, pressed })
         }
         #[allow(deprecated)]
         ::input::Event::Pointer(PointerEvent::Axis(event)) => {
@@ -1278,18 +1334,32 @@ impl NativeInputDevices {
             loop {
                 match read_linux_input_event(&mut self.devices[device_index]) {
                     NativeInputRead::Event(event) => {
-                        let keyboard_device = if event.type_ == EV_KEY
+                        let (keyboard_device, newly_registered_keyboard) = if event.type_ == EV_KEY
                             && event.value != 2
                             && !is_pointer_button(event.code)
                         {
                             let device = &mut self.devices[device_index];
-                            if device.keyboard_device_id.is_none() {
-                                device.keyboard_device_id = self.keyboard_id_allocator.allocate();
-                            }
-                            device.keyboard_device_id
+                            let newly_registered = if device.keyboard_device_id.is_none() {
+                                let id = self.keyboard_id_allocator.allocate();
+                                device.keyboard_device_id = id;
+                                id
+                            } else {
+                                None
+                            };
+                            (device.keyboard_device_id, newly_registered)
                         } else {
-                            None
+                            (None, None)
                         };
+                        if let Some(device_id) = newly_registered_keyboard {
+                            let path = &self.devices[device_index].path;
+                            input_trace_log(|| {
+                                format!(
+                                    "event=keyboard_source_registered backend=raw_evdev device={} path={}",
+                                    device_id.get(),
+                                    path.display(),
+                                )
+                            });
+                        }
                         if let Some(event) =
                             NativeHardwareInputEvent::from_linux_event(event, keyboard_device)
                         {
@@ -1321,7 +1391,16 @@ impl NativeInputDevices {
     }
 
     fn retire_device(&mut self, device_index: usize, events: &mut Vec<NativeHardwareInputEvent>) {
+        let path =
+            input_trace_enabled().then(|| self.devices[device_index].path.display().to_string());
         if let Some(device) = self.devices[device_index].keyboard_device_id.take() {
+            input_trace_log(|| {
+                format!(
+                    "event=keyboard_source_removed backend=raw_evdev device={} path={}",
+                    device.get(),
+                    path.as_deref().unwrap_or("not_available"),
+                )
+            });
             events.push(NativeHardwareInputEvent::Keyboard(
                 NativeKeyboardInputEvent::SourceRemoved { device },
             ));
@@ -2250,6 +2329,7 @@ pub(crate) fn apply_native_window_action(
     perf: NativePerfLogger,
     resize_perf: &mut NativeResizePerfState,
 ) -> bool {
+    let input_trace_action = native_window_action_trace_name(&action);
     let changed = match action {
         NativeWindowAction::BeginMove {
             x,
@@ -2299,6 +2379,14 @@ pub(crate) fn apply_native_window_action(
             server.move_focused_window_to_or_from_special_workspace()
         }
     };
+    if let Some(action_name) = input_trace_action {
+        input_trace_log(|| {
+            format!(
+                "event=window_interaction action={action_name} accepted={changed} interaction_active={}",
+                server.window_interaction_active(),
+            )
+        });
+    }
     resize_perf.observe_action(action, changed, perf);
     changed
 }

@@ -2346,6 +2346,7 @@ fn native_input_ctrl_c_is_forwarded_to_clients() {
 fn native_input_super_mouse_buttons_start_window_interactions() {
     let mut input = NativeInputState::new(320, 200);
     input.handle_key_event(KEY_LEFTMETA, 1);
+    assert!(input.active_modifier_mask().contains(ModifierMask::SUPER));
 
     let move_start = input.handle_pointer_button(u32::from(BTN_LEFT), true);
     let motion = input.handle_pointer_motion_delta(24.0, 12.0);
@@ -2374,6 +2375,55 @@ fn native_input_super_mouse_buttons_start_window_interactions() {
             200,
         )]
     );
+
+    let mut resize_input = NativeInputState::new(320, 200);
+    resize_input.handle_key_event(KEY_LEFTMETA, 1);
+    let resize_start = resize_input.handle_pointer_button(u32::from(BTN_RIGHT), true);
+    assert_eq!(
+        resize_start.window_actions,
+        vec![NativeWindowAction::BeginResize {
+            x: 160.0,
+            y: 100.0,
+            trigger_button: Some(u32::from(BTN_RIGHT)),
+        }]
+    );
+    assert!(resize_start.pointer_buttons.is_empty());
+}
+
+#[test]
+fn removing_the_final_meta_owner_explains_a_pointer_binding_pass() {
+    let mut input = NativeInputState::new(320, 200);
+    let device = k1_keyboard_id(111);
+    input.handle_key_event_from(device, KEY_LEFTMETA, 1);
+
+    input.handle_hardware_input_event(remove_k1_keyboard(device));
+    assert!(!input.active_modifier_mask().contains(ModifierMask::SUPER));
+
+    let click = input.handle_pointer_button(u32::from(BTN_LEFT), true);
+
+    assert!(click.window_actions.is_empty());
+    assert_eq!(click.pointer_buttons.len(), 1);
+}
+
+#[test]
+fn super_remains_active_after_removing_one_of_two_keyboard_sources() {
+    let mut input = NativeInputState::new(320, 200);
+    let first = k1_keyboard_id(112);
+    let second = k1_keyboard_id(113);
+    input.handle_key_event_from(first, KEY_LEFTMETA, 1);
+    input.handle_key_event_from(second, KEY_RIGHTMETA, 1);
+
+    input.handle_hardware_input_event(remove_k1_keyboard(first));
+    assert!(input.active_modifier_mask().contains(ModifierMask::SUPER));
+
+    let move_start = input.handle_pointer_button(u32::from(BTN_LEFT), true);
+    assert!(matches!(
+        move_start.window_actions.as_slice(),
+        [NativeWindowAction::BeginMove { .. }]
+    ));
+
+    input.handle_key_event_from(second, KEY_RIGHTMETA, 0);
+    assert!(!input.active_modifier_mask().contains(ModifierMask::SUPER));
 }
 
 #[test]

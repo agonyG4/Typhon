@@ -13,7 +13,6 @@ impl KeyboardDeviceId {
         if value == 0 { None } else { Some(Self(value)) }
     }
 
-    #[cfg(test)]
     pub(crate) const fn get(self) -> u32 {
         self.0
     }
@@ -166,6 +165,10 @@ impl KeyboardSourceLedger {
 
     pub(crate) fn is_logically_pressed(&self, code: u16) -> bool {
         key_index(code).is_some_and(|index| self.aggregate_counts[index] != 0)
+    }
+
+    pub(crate) fn aggregate_ownership_count(&self, code: u16) -> u32 {
+        key_index(code).map_or(0, |index| self.aggregate_counts[index])
     }
 
     pub(crate) fn logical_pressed_keys(&self) -> Vec<u16> {
@@ -323,6 +326,21 @@ mod tests {
 
         ledger.press(first, KEY_Q);
         assert_eq!(ledger.remove_source(first), vec![KEY_Q]);
+    }
+
+    #[test]
+    fn removing_one_meta_source_preserves_the_other_meta_key_owner() {
+        let [first, second] = allocate_ids(2).try_into().unwrap();
+        let mut ledger = KeyboardSourceLedger::default();
+        ledger.press(first, KEY_LEFTMETA);
+        ledger.press(second, KEY_RIGHTMETA);
+
+        assert_eq!(ledger.remove_source(first), vec![KEY_LEFTMETA]);
+        assert!(!ledger.is_logically_pressed(KEY_LEFTMETA));
+        assert!(ledger.is_logically_pressed(KEY_RIGHTMETA));
+
+        assert_eq!(ledger.remove_source(second), vec![KEY_RIGHTMETA]);
+        assert!(!ledger.is_logically_pressed(KEY_RIGHTMETA));
     }
 
     #[test]

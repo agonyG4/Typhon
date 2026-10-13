@@ -11,6 +11,7 @@ mod repeat;
 mod routing;
 mod state;
 mod symbolic;
+mod trace;
 
 pub(crate) use backend::*;
 pub(crate) use batch::*;
@@ -23,3 +24,4 @@ pub(crate) use repeat::*;
 pub(crate) use routing::*;
 pub(crate) use state::*;
 pub(crate) use symbolic::*;
+pub(crate) use trace::*;

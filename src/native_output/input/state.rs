@@ -101,13 +101,27 @@ impl NativeInputState {
             return NativeInputEffect::default();
         }
 
+        let generation_before = self.keyboard_shortcut_inhibition_generation;
+        let inhibited_before = self.keyboard_shortcuts_inhibited;
         self.keyboard_shortcut_inhibition_generation = snapshot.generation;
         if self.keyboard_shortcuts_inhibited == snapshot.effective {
+            input_trace_log(|| {
+                format!(
+                    "event=shortcut_inhibition generation={} generation_before={} before={} after={}",
+                    snapshot.generation, generation_before, inhibited_before, snapshot.effective,
+                )
+            });
             return NativeInputEffect::default();
         }
 
         let was_inhibited = self.keyboard_shortcuts_inhibited;
         self.keyboard_shortcuts_inhibited = snapshot.effective;
+        input_trace_log(|| {
+            format!(
+                "event=shortcut_inhibition generation={} generation_before={} before={} after={}",
+                snapshot.generation, generation_before, inhibited_before, snapshot.effective,
+            )
+        });
         self.cancel_keyboard_repeat_if_shortcut_inhibited(snapshot);
         let mut effect = NativeInputEffect::default();
         if !was_inhibited && snapshot.effective {
@@ -144,6 +158,58 @@ impl NativeInputState {
     ) {
         self.debug_input_epoch = epoch;
         self.debug_constraint_id = constraint_id;
+    }
+
+    pub(crate) fn trace_semantic_input_event(
+        &self,
+        epoch: u64,
+        event_index: usize,
+        event: &NativeHardwareInputEvent,
+    ) {
+        if !input_trace_enabled() {
+            return;
+        }
+        match event {
+            NativeHardwareInputEvent::Keyboard(NativeKeyboardInputEvent::Key {
+                device,
+                code,
+                pressed,
+            }) => {
+                let modifiers_before = self.active_modifier_mask();
+                input_trace_log(|| {
+                    format!(
+                        "event=semantic_input epoch={epoch} index={event_index} kind=keyboard_key device={} code={} key_name={} pressed={} modifiers_before={modifiers_before:?}",
+                        device.get(),
+                        code,
+                        linux_key_name(*code),
+                        pressed,
+                    )
+                });
+            }
+            NativeHardwareInputEvent::Keyboard(NativeKeyboardInputEvent::SourceRemoved {
+                device,
+            }) => {
+                let modifiers_before = self.active_modifier_mask();
+                input_trace_log(|| {
+                    format!(
+                        "event=semantic_input epoch={epoch} index={event_index} kind=keyboard_source_removed device={} modifiers_before={modifiers_before:?}",
+                        device.get(),
+                    )
+                });
+            }
+            NativeHardwareInputEvent::PointerButton { button, pressed } => {
+                let modifiers_before = self.active_modifier_mask();
+                input_trace_log(|| {
+                    format!(
+                        "event=semantic_input epoch={epoch} index={event_index} kind=pointer_button button={button} button_name={} pressed={} modifiers_before={modifiers_before:?}",
+                        linux_pointer_button_name(*button),
+                        pressed,
+                    )
+                });
+            }
+            NativeHardwareInputEvent::PointerMotion(_)
+            | NativeHardwareInputEvent::PointerAxis(_) => {}
+        }
     }
 
     pub(crate) fn set_pointer_locked_at(&mut self, anchor: CompositorOutputPosition) {
@@ -261,11 +327,52 @@ impl NativeInputState {
         now_ns: u64,
     ) -> NativeInputEffect {
         let modifiers_before = self.active_modifier_mask();
+        let trace_enabled = input_trace_enabled();
+        let (aggregate_owners_before, left_meta_owners_before, right_meta_owners_before) =
+            if trace_enabled {
+                (
+                    self.keyboard_sources.aggregate_ownership_count(code),
+                    self.keyboard_sources
+                        .aggregate_ownership_count(KEY_LEFTMETA),
+                    self.keyboard_sources
+                        .aggregate_ownership_count(KEY_RIGHTMETA),
+                )
+            } else {
+                (0, 0, 0)
+            };
         let transition = if pressed {
             self.keyboard_sources.press(device, code)
         } else {
             self.keyboard_sources.release(device, code)
         };
+        let modifiers_after = self.active_modifier_mask();
+        if trace_enabled {
+            let aggregate_owners_after = self.keyboard_sources.aggregate_ownership_count(code);
+            let left_meta_owners_after = self
+                .keyboard_sources
+                .aggregate_ownership_count(KEY_LEFTMETA);
+            let right_meta_owners_after = self
+                .keyboard_sources
+                .aggregate_ownership_count(KEY_RIGHTMETA);
+            input_trace_log(|| {
+                format!(
+                    "event=keyboard_ledger device={} code={} key_name={} pressed={} aggregate_transition={} modifiers_before={modifiers_before:?} modifiers_after={modifiers_after:?} aggregate_owners_before={aggregate_owners_before} aggregate_owners_after={aggregate_owners_after} left_meta_pressed_before={} left_meta_pressed_after={} left_meta_owners_before={left_meta_owners_before} left_meta_owners_after={left_meta_owners_after} right_meta_pressed_before={} right_meta_pressed_after={} right_meta_owners_before={right_meta_owners_before} right_meta_owners_after={right_meta_owners_after}",
+                    device.get(),
+                    code,
+                    linux_key_name(code),
+                    pressed,
+                    match transition {
+                        KeyboardAggregateTransition::None => "none",
+                        KeyboardAggregateTransition::Pressed => "pressed",
+                        KeyboardAggregateTransition::Released => "released",
+                    },
+                    left_meta_owners_before != 0,
+                    left_meta_owners_after != 0,
+                    right_meta_owners_before != 0,
+                    right_meta_owners_after != 0,
+                )
+            });
+        }
         if transition == KeyboardAggregateTransition::None {
             if !pressed {
                 self.release_suppressed_vt_switch_key(code);
@@ -273,7 +380,6 @@ impl NativeInputState {
             return NativeInputEffect::default();
         }
 
-        let modifiers_after = self.active_modifier_mask();
         let modifier_family_released = !pressed
             && modifier_family_for_key(code).is_some_and(|family| {
                 modifiers_before.contains(family) && !modifiers_after.contains(family)
@@ -301,8 +407,40 @@ impl NativeInputState {
         now_ns: u64,
     ) -> NativeInputEffect {
         let modifiers_before = self.active_modifier_mask();
+        let trace_enabled = input_trace_enabled();
+        let (left_meta_owners_before, right_meta_owners_before) = if trace_enabled {
+            (
+                self.keyboard_sources
+                    .aggregate_ownership_count(KEY_LEFTMETA),
+                self.keyboard_sources
+                    .aggregate_ownership_count(KEY_RIGHTMETA),
+            )
+        } else {
+            (0, 0)
+        };
         let released = self.keyboard_sources.remove_source(device);
         let modifiers_after = self.active_modifier_mask();
+        if trace_enabled {
+            let left_meta_owners_after = self
+                .keyboard_sources
+                .aggregate_ownership_count(KEY_LEFTMETA);
+            let right_meta_owners_after = self
+                .keyboard_sources
+                .aggregate_ownership_count(KEY_RIGHTMETA);
+            input_trace_log(|| {
+                format!(
+                    "event=keyboard_source_removed device={} modifiers_before={modifiers_before:?} modifiers_after={modifiers_after:?} super_before={} super_after={} logical_meta_left_before={} logical_meta_right_before={} logical_meta_left_after={} logical_meta_right_after={} left_meta_owners_before={left_meta_owners_before} left_meta_owners_after={left_meta_owners_after} right_meta_owners_before={right_meta_owners_before} right_meta_owners_after={right_meta_owners_after} released_keys={released:?} modifier_families_released={}",
+                    device.get(),
+                    modifiers_before.contains(ModifierMask::SUPER),
+                    modifiers_after.contains(ModifierMask::SUPER),
+                    left_meta_owners_before != 0,
+                    right_meta_owners_before != 0,
+                    left_meta_owners_after != 0,
+                    right_meta_owners_after != 0,
+                    modifier_families_released(modifiers_before, modifiers_after),
+                )
+            });
+        }
         let mut effect = NativeInputEffect::default();
 
         // Removal snapshots both sides of the whole ledger mutation. If this
@@ -692,18 +830,31 @@ impl NativeInputState {
         let mut effect = NativeInputEffect::default();
         self.set_pointer_button_pressed(button, pressed);
 
-        let binding_match = self.binding_manager.handle_pointer_button(
-            self.active_modifier_mask(),
-            button,
-            pressed,
-            self.keyboard_shortcuts_inhibited,
-        );
+        let modifiers = self.active_modifier_mask();
+        let inhibited = self.keyboard_shortcuts_inhibited;
+        let binding_match = self
+            .binding_manager
+            .handle_pointer_button(modifiers, button, pressed, inhibited);
+        input_trace_log(|| match &binding_match {
+            AstreaBindingMatch::Consumed { action, .. } => format!(
+                "event=pointer_binding button={button} button_name={} pressed={pressed} modifiers={modifiers:?} shortcut_inhibited={inhibited} binding_result=consumed binding_action={action:?} cursor_x={} cursor_y={}",
+                linux_pointer_button_name(button),
+                self.cursor_x,
+                self.cursor_y,
+            ),
+            AstreaBindingMatch::Pass => format!(
+                "event=pointer_binding button={button} button_name={} pressed={pressed} modifiers={modifiers:?} shortcut_inhibited={inhibited} binding_result=pass binding_action=none cursor_x={} cursor_y={}",
+                linux_pointer_button_name(button),
+                self.cursor_x,
+                self.cursor_y,
+            ),
+        });
         resize_debug_log(|| {
             format!(
                 "event=hardware_button button={} pressed={} modifiers={:?} binding_result={} binding_action={}",
                 button,
                 pressed,
-                self.active_modifier_mask(),
+                modifiers,
                 match &binding_match {
                     AstreaBindingMatch::Consumed { .. } => "consumed",
                     AstreaBindingMatch::Pass => "pass",
@@ -741,6 +892,7 @@ impl NativeInputState {
                 button, pressed, !binding_consumed, effect.window_actions,
             )
         });
+        trace_native_input_effect_actions(&effect);
         effect
     }
 

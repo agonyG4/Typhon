@@ -2445,6 +2445,7 @@ impl NativeRuntime {
                     let mut effect = input_state.reconcile_keyboard_shortcut_inhibition(
                         server.keyboard_shortcut_inhibition_snapshot(),
                     );
+                    input_state.trace_semantic_input_event(input_epoch_id, event_index, &event);
                     effect.append(input_state.handle_hardware_input_event_at_with_symbolic(
                         event,
                         symbolic,

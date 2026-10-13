@@ -89,4 +89,37 @@ mod tests {
             vec![motion(1, 1.0), key, motion(2, 2.0), removed, motion(3, 3.0)]
         );
     }
+
+    #[test]
+    fn super_pointer_button_and_release_keep_materialized_order() {
+        let device = KeyboardDeviceId::from_raw(1).unwrap();
+        let meta_press = NativeHardwareInputEvent::Keyboard(NativeKeyboardInputEvent::Key {
+            device,
+            code: KEY_LEFTMETA,
+            pressed: true,
+        });
+        let pointer_motion = NativeHardwareInputEvent::PointerMotion(
+            PointerMotionSample::relative(10, RelativeMotion::accelerated_only(1.0, 0.0)),
+        );
+        let button_press = NativeHardwareInputEvent::PointerButton {
+            button: u32::from(BTN_LEFT),
+            pressed: true,
+        };
+        let meta_release = NativeHardwareInputEvent::Keyboard(NativeKeyboardInputEvent::Key {
+            device,
+            code: KEY_LEFTMETA,
+            pressed: false,
+        });
+        let mut batch = NativeInputBatch {
+            raw: vec![meta_press, pointer_motion, button_press, meta_release],
+            ..NativeInputBatch::default()
+        };
+
+        batch.coalesce_pointer_motion_events();
+
+        assert_eq!(
+            batch.coalesced,
+            vec![meta_press, pointer_motion, button_press, meta_release]
+        );
+    }
 }

@@ -21,6 +21,19 @@ fn native_input_shortcut_inhibition_forwards_window_shortcuts_to_client() {
 }
 
 #[test]
+fn shortcut_inhibition_does_not_clear_a_physically_held_super_modifier() {
+    let mut input = NativeInputState::new(320, 200);
+    input.handle_key_event(KEY_LEFTMETA, 1);
+    input.reconcile_keyboard_shortcut_inhibition(KeyboardShortcutInhibitionSnapshot::new(true, 1));
+
+    let click = input.handle_pointer_button(u32::from(BTN_LEFT), true);
+
+    assert!(input.active_modifier_mask().contains(ModifierMask::SUPER));
+    assert!(click.window_actions.is_empty());
+    assert_eq!(click.pointer_buttons.len(), 1);
+}
+
+#[test]
 fn native_input_shortcut_inhibition_keeps_emergency_exit_shortcut() {
     let mut input = NativeInputState::new(320, 200);
     input.reconcile_keyboard_shortcut_inhibition(KeyboardShortcutInhibitionSnapshot::new(true, 1));
