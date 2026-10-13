@@ -1380,9 +1380,12 @@ mod tests {
         let summary = pacing.content_summary_line();
         for field in [
             "prediction_independent_total_cost_ns=5350000",
-            "prediction_warm_paired_total_cost_ns=1350000",
+            "prediction_warm_paired_total_cost_ns=1100000",
             "prediction_independent_p90_floor_ns=1350000",
             "prediction_worker_non_ioctl_lead_ns=250000",
+            "prediction_exact_critical_path_p95_ns=0",
+            "prediction_exact_critical_path_samples=0",
+            "prediction_cold_wake_guard=false",
             "prediction_miss_recovery_remaining=0",
             "prediction_estimator_mode=cold_start",
             "prediction_total_cost_ns=5350000",
@@ -5112,6 +5115,14 @@ impl NativeFramePacing {
                     "prediction_paired_service_samples",
                     prediction.map_or(0, |value| value.paired_service_samples as u64),
                 ),
+                PacingField::u64(
+                    "prediction_exact_critical_path_p95_ns",
+                    prediction.map_or(0, |value| value.paired_service_p95_ns),
+                ),
+                PacingField::u64(
+                    "prediction_exact_critical_path_samples",
+                    prediction.map_or(0, |value| value.paired_service_samples as u64),
+                ),
                 PacingField::str(
                     "prediction_estimator_mode",
                     prediction.map_or("cold_start", |value| value.estimator_mode.as_str()),
@@ -5133,8 +5144,8 @@ impl NativeFramePacing {
                     prediction.map_or(0, |value| value.total_cost_ns),
                 ),
                 PacingField::bool(
-                    "prediction_idle_wake_guard",
-                    prediction.is_some_and(|value| value.idle_wake_guard),
+                    "prediction_cold_wake_guard",
+                    prediction.is_some_and(|value| value.cold_wake_guard),
                 ),
             ],
         )

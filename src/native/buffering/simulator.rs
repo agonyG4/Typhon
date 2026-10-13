@@ -898,7 +898,7 @@ mod tests {
 
     #[test]
     fn low_load_stays_at_one_credit_across_refresh_rates() {
-        for refresh in [60, 120, 165, 240] {
+        for refresh in [60, 120, 144, 165, 240] {
             let mut test_config = config(500_000);
             test_config.refresh_interval_ns = 1_000_000_000 / refresh;
             test_config.frames = 48;
@@ -935,6 +935,44 @@ mod tests {
         assert!(result.drain_events > 0);
         assert!(result.refill_suppressed_while_draining > 0);
         assert!(result.owned_depth_two_observations > 0);
+    }
+
+    #[test]
+    fn simulator_keeps_credit_two_through_short_clean_streak_after_165_hz_cold_spike() {
+        let mut test_config = config(500_000);
+        test_config.refresh_interval_ns = 6_060_606;
+        test_config.frames = 10;
+        let mut services = vec![500_000; test_config.frames as usize];
+        services[0] = 5_800_000;
+        let result = simulate_o1_with_render_services(test_config, &services);
+
+        assert_eq!(result.render_readiness_misses, 0);
+        assert_eq!(result.credit_grants, 1);
+        assert_eq!(result.credit_revokes, 0);
+        assert_eq!(
+            result.desired_credit_two_observations,
+            test_config.frames as u64
+        );
+        assert_eq!(result.desired_credit_one_observations, 0);
+        assert!(result.max_future_primary_depth <= 2);
+        assert_eq!(result.target_mutations, 0);
+    }
+
+    #[test]
+    fn simulator_165_hz_cold_spike_releases_credit_after_sustained_clean_frames() {
+        let mut test_config = config(500_000);
+        test_config.refresh_interval_ns = 6_060_606;
+        test_config.frames = 40;
+        let mut services = vec![500_000; test_config.frames as usize];
+        services[0] = 5_800_000;
+        let result = simulate_o1_with_render_services(test_config, &services);
+
+        assert_eq!(result.render_readiness_misses, 0);
+        assert_eq!(result.credit_grants, 1);
+        assert_eq!(result.credit_revokes, 1);
+        assert!(result.desired_credit_one_observations > 0);
+        assert!(result.max_future_primary_depth <= 2);
+        assert_eq!(result.target_mutations, 0);
     }
 
     #[test]
@@ -1017,21 +1055,24 @@ mod tests {
                 refresh + 750_000,
             ] {
                 for dispatch in [100_000, refresh / 16, refresh / 4] {
-                    let mut test_config = config(service);
-                    test_config.refresh_interval_ns = refresh;
-                    test_config.dispatch_service_ns = dispatch;
-                    test_config.apply_guard_ns = refresh / 16;
-                    test_config.apply_delay_ns = test_config.apply_guard_ns;
-                    test_config.frames = 24;
-                    let mut services = vec![service; test_config.frames as usize];
-                    for position in [0, test_config.frames as usize / 2] {
-                        services[position] = refresh + service;
-                    }
-                    let result = simulate_o1_with_render_services(test_config, &services);
+                    for worker_enabled in [false, true] {
+                        let mut test_config = config(service);
+                        test_config.refresh_interval_ns = refresh;
+                        test_config.dispatch_service_ns = dispatch;
+                        test_config.apply_guard_ns = refresh / 16;
+                        test_config.apply_delay_ns = test_config.apply_guard_ns;
+                        test_config.frames = 24;
+                        test_config.worker_enabled = worker_enabled;
+                        let mut services = vec![service; test_config.frames as usize];
+                        for position in [0, test_config.frames as usize / 2] {
+                            services[position] = refresh + service;
+                        }
+                        let result = simulate_o1_with_render_services(test_config, &services);
 
-                    assert!(result.max_future_primary_depth <= 2);
-                    assert_eq!(result.target_mutations, 0);
-                    assert!(result.drain_events <= u64::from(test_config.frames));
+                        assert!(result.max_future_primary_depth <= 2);
+                        assert_eq!(result.target_mutations, 0);
+                        assert!(result.drain_events <= u64::from(test_config.frames));
+                    }
                 }
             }
         }

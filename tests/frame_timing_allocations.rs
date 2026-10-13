@@ -77,6 +77,15 @@ fn populated_render_prediction_does_not_allocate() {
     }
     let allocations = allocations_during(|| {
         black_box(black_box(&journal).prediction(Duration::from_millis(6)));
+        black_box(black_box(&journal).prediction_at(
+            MonotonicTimestampNs::new(1_000_000_000),
+            Duration::from_millis(6),
+        ));
+        black_box(black_box(&journal).prediction_at_with_kms_guard(
+            MonotonicTimestampNs::new(1_000_000_000),
+            Duration::from_millis(6),
+            500_000,
+        ));
     });
     assert_eq!(allocations, 0);
 }

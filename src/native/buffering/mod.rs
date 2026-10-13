@@ -400,12 +400,12 @@ mod tests {
     }
 
     #[test]
-    fn extra_credit_revokes_after_three_negative_observations() {
+    fn extra_credit_revokes_after_sustained_clean_opportunities() {
         let mut credit = ElasticFuturePrimaryCredit::new();
         credit.observe_overlap(1);
         assert_eq!(credit.effective(), 2);
 
-        for _ in 0..3 {
+        for _ in 0..10 {
             credit.observe_overlap(0);
         }
         assert_eq!(credit.effective(), 1);

@@ -241,7 +241,6 @@ fn record_variable_composited_pageflip(
         ));
     }
 
-    render_journal.note_matching_presentation(presented_at);
     record_composited_service_costs(frame, transport, render_journal, frame_pacing);
 
     if frame_pacing.trace_enabled() {
@@ -2715,7 +2714,6 @@ impl NativeRuntime {
                                 .into());
                             }
                         };
-                    render_journal.note_matching_presentation(presented_at);
                     render_journal.record_target_slip(
                         presented_at
                             .get()

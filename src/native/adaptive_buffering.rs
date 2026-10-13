@@ -12,6 +12,7 @@ use std::time::Duration;
 const SAMPLE_CAPACITY: usize = 120;
 const WARM_PAIRED_MIN_SAMPLES: usize = 20;
 const MISS_RECOVERY_PAIRED_SUCCESSES: usize = 20;
+const COLD_WAKE_REFRESH_INTERVALS: u64 = 100;
 
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,6 +209,33 @@ pub struct FrameTimingObservation {
     pub submit_returned_at: Option<MonotonicTimestampNs>,
 }
 
+/// Return the exact same-frame critical path when all timestamps are complete
+/// and monotonic. GPU completion and KMS submission can overlap, so service is
+/// measured to the later readiness point rather than by summing both branches.
+fn exact_same_frame_critical_path_ns(observation: &FrameTimingObservation) -> Option<u64> {
+    let (fence_signaled_at, FenceTimestampQuality::ExactSyncFile) = observation.fence_signaled_at?
+    else {
+        return None;
+    };
+    let submit_started_at = observation.submit_started_at?;
+    let submit_returned_at = observation.submit_returned_at?;
+    let composite_started_ns = observation.composite_started_at.get();
+    let fence_exported_ns = observation.fence_exported_at.get();
+    let fence_signaled_ns = fence_signaled_at.get();
+    let submit_started_ns = submit_started_at.get();
+    let submit_returned_ns = submit_returned_at.get();
+
+    if composite_started_ns > fence_exported_ns
+        || composite_started_ns > fence_signaled_ns
+        || fence_exported_ns > submit_started_ns
+        || submit_started_ns > submit_returned_ns
+    {
+        return None;
+    }
+
+    Some(fence_signaled_ns.max(submit_returned_ns) - composite_started_ns)
+}
+
 pub fn render_sample_duration_ns(
     composite_started_at: MonotonicTimestampNs,
     fence_signaled_at: MonotonicTimestampNs,
@@ -235,6 +263,8 @@ pub struct RenderPrediction {
     pub kms_apply_guard_ns: u64,
     pub kms_total_lead_ns: u64,
     pub p95_target_slip_ns: u64,
+    /// Exact same-frame critical-path p95: max(GPU fence, KMS submit return)
+    /// minus compositor start. The branches may overlap.
     pub paired_service_p95_ns: u64,
     pub paired_service_samples: usize,
     pub estimator_mode: PredictionEstimatorMode,
@@ -244,7 +274,7 @@ pub struct RenderPrediction {
     pub worker_non_ioctl_lead_ns: u64,
     pub miss_recovery_remaining: usize,
     pub total_cost_ns: u64,
-    pub idle_wake_guard: bool,
+    pub cold_wake_guard: bool,
 }
 
 #[doc(hidden)]
@@ -259,12 +289,11 @@ pub struct AdaptiveRenderJournal {
     worker_dispatch_samples_ns: VecDeque<u64>,
     fixed_submission_budget_samples_ns: VecDeque<u64>,
     target_slip_samples_ns: VecDeque<u64>,
+    /// Exact paired same-frame critical-path service samples.
     paired_service_samples_ns: VecDeque<u64>,
     ewma_render_ns: u64,
     upper_render_deviation_ns: u64,
     last_sample_at: Option<MonotonicTimestampNs>,
-    last_presented_at: Option<MonotonicTimestampNs>,
-    idle_guard_consumed: bool,
     pub(crate) missed_deadlines: u64,
     miss_recovery_remaining: usize,
 }
@@ -285,8 +314,6 @@ impl Default for AdaptiveRenderJournal {
             ewma_render_ns: 0,
             upper_render_deviation_ns: 0,
             last_sample_at: None,
-            last_presented_at: None,
-            idle_guard_consumed: false,
             missed_deadlines: 0,
             miss_recovery_remaining: 0,
         }
@@ -348,27 +375,10 @@ impl AdaptiveRenderJournal {
     }
 
     pub fn record_frame_service_observation(&mut self, observation: FrameTimingObservation) {
-        let Some((signaled_at, FenceTimestampQuality::ExactSyncFile)) =
-            observation.fence_signaled_at
-        else {
+        let Some(critical_path_ns) = exact_same_frame_critical_path_ns(&observation) else {
             return;
         };
-        let (Some(submit_started_at), Some(submit_returned_at)) = (
-            observation.submit_started_at,
-            observation.submit_returned_at,
-        ) else {
-            return;
-        };
-        let render_service_ns = signaled_at
-            .get()
-            .saturating_sub(observation.composite_started_at.get());
-        let submit_service_ns = submit_returned_at
-            .get()
-            .saturating_sub(submit_started_at.get());
-        push_bounded(
-            &mut self.paired_service_samples_ns,
-            render_service_ns.saturating_add(submit_service_ns),
-        );
+        push_bounded(&mut self.paired_service_samples_ns, critical_path_ns);
         self.miss_recovery_remaining = self.miss_recovery_remaining.saturating_sub(1);
     }
 
@@ -389,10 +399,6 @@ impl AdaptiveRenderJournal {
         }
     }
 
-    pub fn note_matching_presentation(&mut self, at: MonotonicTimestampNs) {
-        self.last_presented_at = Some(at);
-    }
-
     pub fn prediction(&self, refresh_interval: Duration) -> RenderPrediction {
         self.base_prediction(refresh_interval, false, 0)
     }
@@ -406,36 +412,35 @@ impl AdaptiveRenderJournal {
     }
 
     pub fn prediction_at(
-        &mut self,
+        &self,
         now: MonotonicTimestampNs,
         refresh_interval: Duration,
     ) -> RenderPrediction {
-        let refresh_ns = duration_ns(refresh_interval).max(1);
-        let idle = !self.idle_guard_consumed
-            && self.last_presented_at.is_some_and(|last| {
-                now.get().saturating_sub(last.get()) >= refresh_ns.saturating_mul(100)
-            });
-        if idle {
-            self.idle_guard_consumed = true;
-        }
-        self.base_prediction(refresh_interval, idle, 0)
+        let cold = self.is_cold(now, refresh_interval);
+        self.base_prediction(refresh_interval, cold, 0)
     }
 
     pub fn prediction_at_with_kms_guard(
-        &mut self,
+        &self,
         now: MonotonicTimestampNs,
         refresh_interval: Duration,
         kms_apply_guard_ns: u64,
     ) -> RenderPrediction {
-        let refresh_ns = duration_ns(refresh_interval).max(1);
-        let idle = !self.idle_guard_consumed
-            && self.last_presented_at.is_some_and(|last| {
-                now.get().saturating_sub(last.get()) >= refresh_ns.saturating_mul(100)
-            });
-        if idle {
-            self.idle_guard_consumed = true;
+        let cold = self.is_cold(now, refresh_interval);
+        self.base_prediction(refresh_interval, cold, kms_apply_guard_ns)
+    }
+
+    fn is_cold(&self, now: MonotonicTimestampNs, refresh_interval: Duration) -> bool {
+        let cold_threshold_ns = duration_ns(refresh_interval)
+            .max(1)
+            .saturating_mul(COLD_WAKE_REFRESH_INTERVALS);
+        match self.last_sample_at {
+            None => true,
+            Some(last_sample_at) => now
+                .get()
+                .checked_sub(last_sample_at.get())
+                .is_none_or(|elapsed_ns| elapsed_ns >= cold_threshold_ns),
         }
-        self.base_prediction(refresh_interval, idle, kms_apply_guard_ns)
     }
 
     pub(crate) const fn ewma_render_ns(&self) -> u64 {
@@ -457,7 +462,7 @@ impl AdaptiveRenderJournal {
     fn base_prediction(
         &self,
         refresh_interval: Duration,
-        idle: bool,
+        cold_wake: bool,
         kms_apply_guard_ns: u64,
     ) -> RenderPrediction {
         let refresh_ns = duration_ns(refresh_interval).max(1);
@@ -510,7 +515,6 @@ impl AdaptiveRenderJournal {
         let worker_non_ioctl_lead_ns = kms_dispatch_budget.saturating_sub(p95_ioctl);
         let warm_paired_total_cost_ns = paired_service_p95_ns
             .saturating_add(main_event_loop_wake_guard)
-            .saturating_add(worker_non_ioctl_lead_ns)
             .saturating_add(kms_apply_guard_ns);
         let independent_p90_floor_ns = p90
             .saturating_add(main_event_loop_wake_guard)
@@ -525,7 +529,7 @@ impl AdaptiveRenderJournal {
                 warm_paired_total_cost_ns.max(independent_p90_floor_ns)
             }
         };
-        if idle {
+        if cold_wake {
             total = total.max(refresh_ns.saturating_sub(100_000));
         }
         RenderPrediction {
@@ -553,7 +557,7 @@ impl AdaptiveRenderJournal {
             worker_non_ioctl_lead_ns,
             miss_recovery_remaining: self.miss_recovery_remaining,
             total_cost_ns: total,
-            idle_wake_guard: idle,
+            cold_wake_guard: cold_wake,
         }
     }
 }
@@ -754,6 +758,14 @@ impl AdaptiveBufferingController {
 
     pub const fn desired_credit(&self) -> u8 {
         self.o1_credit.desired_credit()
+    }
+
+    pub const fn clean_release_progress(&self) -> u8 {
+        self.o1_credit.clean_release_progress()
+    }
+
+    pub const fn clean_release_horizon(&self) -> u8 {
+        self.o1_credit.clean_release_horizon()
     }
 
     pub const fn admission_allows_future_primary(&self, owned_depth: u8) -> bool {
@@ -1072,13 +1084,68 @@ mod tests {
     }
 
     #[test]
-    fn paired_service_excludes_ready_binding_and_predecessor_waits() {
+    fn paired_critical_path_includes_worker_delay_without_recounting_it() {
         let mut journal = AdaptiveRenderJournal::default();
         journal.record_frame_service_observation(service_observation(100, 1_100, 9_000, 9_300));
 
         let prediction = journal.prediction(Duration::from_millis(10));
         assert_eq!(prediction.paired_service_samples, 1);
-        assert_eq!(prediction.paired_service_p95_ns, 1_300);
+        assert_eq!(prediction.paired_service_p95_ns, 9_200);
+    }
+
+    #[test]
+    fn exact_critical_path_uses_gpu_branch_when_gpu_dominates() {
+        let mut journal = AdaptiveRenderJournal::default();
+        journal.record_frame_service_observation(service_observation(
+            0, 5_000_000, 1_000_000, 2_000_000,
+        ));
+
+        let prediction = journal.prediction(Duration::from_millis(10));
+        assert_eq!(prediction.paired_service_samples, 1);
+        assert_eq!(prediction.paired_service_p95_ns, 5_000_000);
+    }
+
+    #[test]
+    fn exact_critical_path_uses_submit_branch_when_kms_dominates() {
+        let mut journal = AdaptiveRenderJournal::default();
+        journal.record_frame_service_observation(service_observation(
+            0, 2_000_000, 1_000_000, 5_000_000,
+        ));
+
+        let prediction = journal.prediction(Duration::from_millis(10));
+        assert_eq!(prediction.paired_service_samples, 1);
+        assert_eq!(prediction.paired_service_p95_ns, 5_000_000);
+    }
+
+    #[test]
+    fn approximate_fence_timestamps_do_not_enter_exact_critical_path_history() {
+        let mut journal = AdaptiveRenderJournal::default();
+        let mut observation = service_observation(0, 5_000_000, 1_000_000, 2_000_000);
+        observation.fence_signaled_at = Some((
+            MonotonicTimestampNs::new(5_000_000),
+            FenceTimestampQuality::ObservedApproximate,
+        ));
+
+        journal.record_frame_service_observation(observation);
+
+        let prediction = journal.prediction(Duration::from_millis(10));
+        assert_eq!(prediction.paired_service_samples, 0);
+        assert_eq!(prediction.paired_service_p95_ns, 0);
+    }
+
+    #[test]
+    fn non_monotonic_frame_service_observations_are_ignored() {
+        let mut journal = AdaptiveRenderJournal::default();
+        journal.record_frame_service_observation(service_observation(
+            0, 5_000_000, 2_000_000, 1_000_000,
+        ));
+        journal.record_frame_service_observation(service_observation(
+            5_000_000, 4_000_000, 6_000_000, 7_000_000,
+        ));
+
+        let prediction = journal.prediction(Duration::from_millis(10));
+        assert_eq!(prediction.paired_service_samples, 0);
+        assert_eq!(prediction.miss_recovery_remaining, 0);
     }
 
     #[test]
@@ -1093,9 +1160,9 @@ mod tests {
                 );
                 journal.record_frame_service_observation(service_observation(
                     base_ns,
-                    base_ns + paired_service_ns.saturating_sub(1_000_000),
-                    base_ns + 5_000_000,
-                    base_ns + 6_000_000,
+                    base_ns + paired_service_ns,
+                    base_ns + 500_000,
+                    base_ns + 1_000_000,
                 ));
             }
             journal
@@ -1130,7 +1197,7 @@ mod tests {
     }
 
     #[test]
-    fn paired_service_tail_includes_real_same_frame_work_but_not_unrelated_tails() {
+    fn paired_critical_path_includes_same_frame_worker_delay_but_not_unrelated_tails() {
         let mut journal = AdaptiveRenderJournal::default();
         for sample in 0..20 {
             journal.record_render_sample(1_000_000, MonotonicTimestampNs::new(sample + 1));
@@ -1145,7 +1212,7 @@ mod tests {
         }
 
         let prediction = journal.prediction(Duration::from_millis(10));
-        assert_eq!(prediction.paired_service_p95_ns, 7_000_000);
+        assert_eq!(prediction.paired_service_p95_ns, 13_000_000);
         assert_eq!(prediction.paired_service_samples, 20);
         assert_eq!(
             prediction.estimator_mode,
@@ -1153,13 +1220,21 @@ mod tests {
         );
         assert_eq!(prediction.worker_non_ioctl_lead_ns, 2_050_000);
         assert_eq!(prediction.independent_total_cost_ns, 5_050_000);
-        assert_eq!(prediction.warm_paired_total_cost_ns, 11_050_000);
+        assert_eq!(
+            prediction.warm_paired_total_cost_ns,
+            prediction
+                .paired_service_p95_ns
+                .saturating_add(prediction.main_event_loop_wake_guard_ns)
+                .saturating_add(prediction.kms_apply_guard_ns),
+            "same-frame critical path already includes queue and submit delay"
+        );
+        assert_eq!(prediction.warm_paired_total_cost_ns, 15_000_000);
         assert_eq!(prediction.independent_p90_floor_ns, 5_050_000);
-        assert_eq!(prediction.total_cost_ns, 11_050_000);
+        assert_eq!(prediction.total_cost_ns, 15_000_000);
     }
 
     #[test]
-    fn warm_estimator_uses_saturating_worker_residual_and_p90_floor() {
+    fn warm_estimator_does_not_add_worker_residual_to_absolute_critical_path() {
         for (kms_budget_ns, ioctl_ns, expected_residual_ns) in [
             (700_000, 400_000, 300_000),
             (400_000, 400_000, 0),
@@ -1176,7 +1251,7 @@ mod tests {
                 kms_budget_ns,
             );
             let prediction = journal.prediction_with_kms_guard(Duration::from_millis(10), 100_000);
-            let expected_warm_ns = 7_000_000 + 1_000_000 / 2 + expected_residual_ns + 100_000;
+            let expected_warm_ns = 8_000_000 + 1_000_000 / 2 + 100_000;
             let expected_floor_ns = 1_000_000 + 1_000_000 / 2 + kms_budget_ns + 100_000;
 
             assert_eq!(prediction.worker_non_ioctl_lead_ns, expected_residual_ns);
@@ -1204,21 +1279,20 @@ mod tests {
 
         let prediction = journal.prediction_with_kms_guard(Duration::from_millis(10), 100_000);
 
-        assert_eq!(prediction.paired_service_p95_ns, 3_500_000);
+        assert_eq!(prediction.paired_service_p95_ns, 4_500_000);
         assert_eq!(prediction.p95_atomic_ioctl_ns, 500_000);
         assert_eq!(prediction.kms_dispatch_budget_ns, 1_200_000);
         assert_eq!(prediction.worker_non_ioctl_lead_ns, 700_000);
-        assert_eq!(prediction.warm_paired_total_cost_ns, 4_800_000);
-        assert_eq!(prediction.total_cost_ns, 4_800_000);
-        assert_ne!(
-            prediction.total_cost_ns,
+        assert_eq!(
+            prediction.warm_paired_total_cost_ns,
             prediction
                 .paired_service_p95_ns
                 .saturating_add(prediction.main_event_loop_wake_guard_ns)
-                .saturating_add(prediction.kms_dispatch_budget_ns)
                 .saturating_add(prediction.kms_apply_guard_ns),
-            "the submit ioctl must not be paid for a second time"
+            "absolute same-frame submit completion already includes worker and ioctl delay"
         );
+        assert_eq!(prediction.warm_paired_total_cost_ns, 5_100_000);
+        assert_eq!(prediction.total_cost_ns, 5_100_000);
     }
 
     #[test]
@@ -1236,7 +1310,7 @@ mod tests {
 
         let prediction = journal.prediction_with_kms_guard(Duration::from_millis(20), 100_000);
 
-        assert_eq!(prediction.warm_paired_total_cost_ns, 1_600_000);
+        assert_eq!(prediction.warm_paired_total_cost_ns, 2_200_000);
         assert_eq!(prediction.independent_p90_floor_ns, 11_100_000);
         assert_eq!(prediction.total_cost_ns, 11_100_000);
     }
@@ -1503,26 +1577,18 @@ mod tests {
         assert_eq!(policy.future_primary_credit(), 2);
 
         policy.observe_overlap_for_target(None, 0);
-        let target = crate::native::presentation_deadline::PresentationTarget {
-            sequence: 11,
-            physical_claim: crate::native::presentation_deadline::PrimaryRefreshClaim {
-                sequence: 11,
-                presentation_time: MonotonicTimestampNs::new(100),
-                clock_generation: 1,
-            },
-            ..target
-        };
-        policy.observe_overlap_for_target(Some(target), 0);
-        let target = crate::native::presentation_deadline::PresentationTarget {
-            sequence: 12,
-            physical_claim: crate::native::presentation_deadline::PrimaryRefreshClaim {
-                sequence: 12,
-                presentation_time: MonotonicTimestampNs::new(100),
-                clock_generation: 1,
-            },
-            ..target
-        };
-        policy.observe_overlap_for_target(Some(target), 0);
+        for sequence in 11..=20 {
+            let target = crate::native::presentation_deadline::PresentationTarget {
+                sequence,
+                physical_claim: crate::native::presentation_deadline::PrimaryRefreshClaim {
+                    sequence,
+                    presentation_time: MonotonicTimestampNs::new(100),
+                    clock_generation: 1,
+                },
+                ..target
+            };
+            policy.observe_overlap_for_target(Some(target), 0);
+        }
         assert_eq!(policy.future_primary_credit(), 1);
         assert_eq!(policy.extra_credit_revokes(), 1);
     }
@@ -1617,7 +1683,7 @@ mod tests {
         };
 
         policy.observe_overlap_for_target(Some(predecessor), 1);
-        for sequence in 11..=13 {
+        for sequence in 11..=20 {
             policy.observe_overlap_for_target(
                 Some(crate::native::presentation_deadline::PresentationTarget {
                     sequence,
@@ -1696,17 +1762,52 @@ mod tests {
     }
 
     #[test]
-    fn idle_guard_applies_to_exactly_one_post_idle_prediction() {
+    fn cold_wake_guard_rearms_for_each_compositor_idle_episode() {
         let refresh = Duration::from_millis(10);
         let mut journal = AdaptiveRenderJournal::default();
-        journal.note_matching_presentation(MonotonicTimestampNs::new(10_000_000));
+        journal.record_render_sample(1_000_000, MonotonicTimestampNs::new(10_000_000));
 
-        let first = journal.prediction_at(MonotonicTimestampNs::new(1_010_000_000), refresh);
-        let second = journal.prediction_at(MonotonicTimestampNs::new(1_010_000_001), refresh);
+        let first_cold = journal.prediction_at(MonotonicTimestampNs::new(1_010_000_000), refresh);
+        journal.record_render_sample(1_000_000, MonotonicTimestampNs::new(1_010_000_000));
+        let warm = journal.prediction_at(MonotonicTimestampNs::new(1_010_000_001), refresh);
+        let second_cold = journal.prediction_at(MonotonicTimestampNs::new(2_010_000_000), refresh);
 
-        assert!(first.idle_wake_guard);
-        assert_eq!(first.total_cost_ns, 9_900_000);
-        assert!(!second.idle_wake_guard);
+        assert!(first_cold.cold_wake_guard);
+        assert_eq!(first_cold.total_cost_ns, 9_900_000);
+        assert!(!warm.cold_wake_guard);
+        assert!(second_cold.cold_wake_guard);
+        assert_eq!(second_cold.total_cost_ns, 9_900_000);
+    }
+
+    #[test]
+    fn cold_wake_prediction_remains_guarded_until_real_composited_sample() {
+        let refresh = Duration::from_millis(10);
+        let mut journal = AdaptiveRenderJournal::default();
+        journal.record_render_sample(1_000_000, MonotonicTimestampNs::new(10_000_000));
+
+        for now in [1_010_000_000, 1_010_000_001, 1_010_000_002] {
+            assert!(
+                journal
+                    .prediction_at(MonotonicTimestampNs::new(now), refresh)
+                    .cold_wake_guard
+            );
+        }
+
+        journal.record_render_sample(1_000_000, MonotonicTimestampNs::new(1_010_000_002));
+        let warm = journal.prediction_at(MonotonicTimestampNs::new(1_010_000_003), refresh);
+        assert!(!warm.cold_wake_guard);
+    }
+
+    #[test]
+    fn prediction_without_compositor_render_history_is_conservatively_cold() {
+        let journal = AdaptiveRenderJournal::default();
+        let prediction = journal.prediction_at(
+            MonotonicTimestampNs::new(50_000_000_000),
+            Duration::from_nanos(6_060_606),
+        );
+
+        assert!(prediction.cold_wake_guard);
+        assert_eq!(prediction.total_cost_ns, 5_960_606);
     }
 
     #[test]
@@ -1842,7 +1943,7 @@ mod o1_tests {
         controller.apply_capability(TripleCapability::Capable);
         controller.observe_overlap_required(1);
 
-        for _ in 0..3 {
+        for _ in 0..10 {
             controller.observe_overlap_required(0);
         }
 

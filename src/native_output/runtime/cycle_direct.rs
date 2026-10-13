@@ -47,7 +47,7 @@ pub(super) fn settle_direct_pageflip(
     actual_logical_sequence: u64,
     presentation: FramePresentation,
     presented_primary: &mut Option<PresentedPrimaryAssignment>,
-    render_journal: &mut AdaptiveRenderJournal,
+    _render_journal: &mut AdaptiveRenderJournal,
     frame_pacing: &mut NativeFramePacing,
     scheduled_presentation_target: &mut Option<PresentationTarget>,
 ) -> NativeResult<()> {
@@ -161,7 +161,6 @@ pub(super) fn settle_direct_pageflip(
     let target = direct_info.target;
     let submit_started_at = direct_info.submit_started_at;
     let submit_returned_at = direct_info.submit_returned_at;
-    render_journal.note_matching_presentation(presented_at);
     frame_pacing.note_explicit_present(ExplicitPresentationObservation {
         planned_sequence: target.sequence,
         actual_sequence: actual_logical_sequence,

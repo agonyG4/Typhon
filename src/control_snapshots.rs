@@ -757,13 +757,19 @@ pub struct RepaintPerformanceSnapshot {
     pub full_repaint_reasons: std::collections::BTreeMap<String, u64>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
 pub struct BufferingPerformanceSnapshot {
     pub reactive_double_frames: u64,
     pub predictive_triple_frames: u64,
     pub future_primary_credit: u8,
+    #[serde(default)]
+    pub desired_future_primary_credit: u8,
+    #[serde(default)]
+    pub credit_release_clean_opportunities: u8,
+    #[serde(default)]
+    pub credit_release_horizon: u8,
     pub extra_credit_grants: u64,
     pub extra_credit_revokes: u64,
     pub o1_credit2_useful_hits: u64,
@@ -779,8 +785,17 @@ pub struct BufferingPerformanceSnapshot {
     pub predicted_independent_kms_lead_ns: u64,
     #[serde(default)]
     pub predicted_independent_total_service_ns: u64,
+    /// Warm exact same-frame critical-path estimate; GPU and KMS branches may overlap.
     #[serde(default)]
     pub predicted_warm_paired_total_service_ns: u64,
+    #[serde(default)]
+    pub predicted_cold_wake_guard: bool,
+    #[serde(default)]
+    pub predicted_estimator_mode: String,
+    #[serde(default)]
+    pub predicted_paired_critical_path_p95_ns: u64,
+    #[serde(default)]
+    pub predicted_paired_critical_path_samples: u64,
     #[serde(default)]
     pub predicted_independent_p90_floor_ns: u64,
     #[serde(default)]
@@ -1228,7 +1243,7 @@ mod tests {
             "buffering": {
                 "reactiveDoubleFrames": 0,
                 "predictiveTripleFrames": 0,
-                "futurePrimaryCredit": 0,
+                "futurePrimaryCredit": 2,
                 "extraCreditGrants": 0,
                 "extraCreditRevokes": 0,
                 "o1Credit2UsefulHits": 0,
@@ -1240,6 +1255,13 @@ mod tests {
                 "preRenderAbandoned": 0,
                 "predictedIndependentRenderReadyServiceNs": 0,
                 "predictedIndependentKmsLeadNs": 0,
+                "predictedColdWakeGuard": true,
+                "predictedEstimatorMode": "warm_paired",
+                "predictedPairedCriticalPathP95Ns": 3000000,
+                "predictedPairedCriticalPathSamples": 20,
+                "desiredFuturePrimaryCredit": 2,
+                "creditReleaseCleanOpportunities": 9,
+                "creditReleaseHorizon": 10,
                 "predictedIndependentTotalServiceNs": 0,
                 "predictedWarmPairedTotalServiceNs": 0,
                 "predictedIndependentP90FloorNs": 0,
@@ -1368,7 +1390,18 @@ mod tests {
         }
 
         let snapshot = serde_json::from_value::<PerformanceSnapshot>(value.clone()).unwrap();
-        assert_eq!(serde_json::to_value(snapshot).unwrap(), value);
+        assert_eq!(
+            serde_json::to_value(&snapshot.buffering).unwrap(),
+            value["buffering"]
+        );
+        let human = crate::astreactl::output::human(&AstreactlResult::Performance(Box::new(
+            snapshot.clone(),
+        )));
+        assert!(human.contains("O1 estimator/cold wake guard: warm_paired/true"));
+        assert!(human.contains("Exact critical path p95/samples: 3000000 ns/20"));
+        assert!(human.contains("O1 desired/effective credit: 2/2"));
+        assert!(human.contains("Credit release clean/horizon: 9/10"));
+        assert_eq!(serde_json::to_value(&snapshot).unwrap(), value);
     }
 
     #[test]

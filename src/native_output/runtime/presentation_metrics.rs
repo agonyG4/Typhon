@@ -108,7 +108,27 @@ pub(super) fn build_render_begin_fields(
         ),
         PacingField::u64("predicted_total_cost_ns", prediction.total_cost_ns),
         PacingField::u64("refresh_interval_ns", duration_ns(refresh_interval)),
-        PacingField::bool("idle_wake_guard", prediction.idle_wake_guard),
+        PacingField::bool("cold_wake_guard", prediction.cold_wake_guard),
+        PacingField::u64(
+            "o1_desired_future_primary_credit",
+            u64::from(buffering.desired_credit()),
+        ),
+        PacingField::u64(
+            "o1_credit_release_clean_opportunities",
+            u64::from(buffering.clean_release_progress()),
+        ),
+        PacingField::u64(
+            "o1_credit_release_horizon",
+            u64::from(buffering.clean_release_horizon()),
+        ),
+        PacingField::u64(
+            "prediction_exact_critical_path_p95_ns",
+            prediction.paired_service_p95_ns,
+        ),
+        PacingField::usize(
+            "prediction_exact_critical_path_samples",
+            prediction.paired_service_samples,
+        ),
     ];
     fields.extend(snapshot_fields(buffer_snapshot));
     fields
@@ -124,6 +144,9 @@ pub(super) fn build_buffering_performance_snapshot(
         reactive_double_frames: buffering.reactive_double_frames,
         predictive_triple_frames: buffering.predictive_triple_frames,
         future_primary_credit: adaptive_buffering.future_primary_credit(),
+        desired_future_primary_credit: adaptive_buffering.desired_credit(),
+        credit_release_clean_opportunities: adaptive_buffering.clean_release_progress(),
+        credit_release_horizon: adaptive_buffering.clean_release_horizon(),
         extra_credit_grants: adaptive_buffering.extra_credit_grants(),
         extra_credit_revokes: adaptive_buffering.extra_credit_revokes(),
         o1_credit2_useful_hits: buffering.o1_credit2_useful_hits,
@@ -140,6 +163,10 @@ pub(super) fn build_buffering_performance_snapshot(
         predicted_independent_kms_lead_ns: prediction.kms_total_lead_ns,
         predicted_independent_total_service_ns: prediction.independent_total_cost_ns,
         predicted_warm_paired_total_service_ns: prediction.warm_paired_total_cost_ns,
+        predicted_cold_wake_guard: prediction.cold_wake_guard,
+        predicted_estimator_mode: prediction.estimator_mode.as_str().to_string(),
+        predicted_paired_critical_path_p95_ns: prediction.paired_service_p95_ns,
+        predicted_paired_critical_path_samples: prediction.paired_service_samples as u64,
         predicted_independent_p90_floor_ns: prediction.independent_p90_floor_ns,
         predicted_worker_non_ioctl_lead_ns: prediction.worker_non_ioctl_lead_ns,
         predicted_miss_recovery_remaining: prediction.miss_recovery_remaining as u64,
@@ -394,6 +421,10 @@ mod tests {
     use crate::native_output::pacing::NativeBufferingMetrics;
     use oblivion_one::native::adaptive_buffering::{
         AdaptiveBufferingController, AdaptiveRenderJournal, AdaptiveTripleBufferPolicy,
+        FenceTimestampQuality, FrameTimingObservation,
+    };
+    use oblivion_one::native::presentation_deadline::{
+        MonotonicTimestampNs, PresentationTarget, PresentationTargetReason, PrimaryRefreshClaim,
     };
     use std::time::Duration;
 
@@ -507,5 +538,62 @@ mod tests {
         assert_eq!(snapshot.ready_pull_in_rejected_owned, 20);
         assert_eq!(snapshot.ready_pull_in_rejected_identity, 21);
         assert_eq!(snapshot.ready_pull_in_advanced_intervals, 22);
+    }
+
+    #[test]
+    fn buffering_snapshot_exposes_cold_and_exact_critical_path_evidence() {
+        let mut journal = AdaptiveRenderJournal::default();
+        let target_time = MonotonicTimestampNs::new(10_000_000);
+        let target = PresentationTarget {
+            sequence: 1,
+            presentation_time: target_time,
+            submit_not_before: target_time,
+            render_start_deadline: target_time,
+            refresh_interval: Duration::from_nanos(6_060_606),
+            reason: PresentationTargetReason::Normal,
+            clock_generation: 1,
+            estimated: false,
+            predicted_unreachable: false,
+            physical_claim: PrimaryRefreshClaim {
+                sequence: 1,
+                presentation_time: target_time,
+                clock_generation: 1,
+            },
+            selection_evidence: Default::default(),
+        };
+        journal.record_frame_service_observation(FrameTimingObservation {
+            frame_id: 7,
+            target,
+            composite_started_at: MonotonicTimestampNs::new(0),
+            fence_exported_at: MonotonicTimestampNs::new(1),
+            fence_signaled_at: Some((
+                MonotonicTimestampNs::new(5_000_000),
+                FenceTimestampQuality::ExactSyncFile,
+            )),
+            submit_started_at: Some(MonotonicTimestampNs::new(1_000_000)),
+            submit_returned_at: Some(MonotonicTimestampNs::new(2_000_000)),
+        });
+        let prediction = journal.prediction_at_with_kms_guard(
+            MonotonicTimestampNs::new(50_000_000_000),
+            Duration::from_millis(10),
+            100_000,
+        );
+        let adaptive = AdaptiveBufferingController::new(AdaptiveTripleBufferPolicy::Auto);
+        let snapshot = build_buffering_performance_snapshot(
+            NativeBufferingMetrics::default(),
+            &adaptive,
+            0,
+            &prediction,
+        );
+        let value = serde_json::to_value(snapshot).unwrap();
+
+        assert!(value["predictedColdWakeGuard"].as_bool().unwrap());
+        assert_eq!(value["predictedEstimatorMode"], "cold_start");
+        assert_eq!(value["predictedPairedCriticalPathP95Ns"], 5_000_000);
+        assert_eq!(value["predictedPairedCriticalPathSamples"], 1);
+        assert_eq!(value["desiredFuturePrimaryCredit"], 1);
+        assert_eq!(value["futurePrimaryCredit"], 1);
+        assert_eq!(value["creditReleaseCleanOpportunities"], 0);
+        assert_eq!(value["creditReleaseHorizon"], 10);
     }
 }

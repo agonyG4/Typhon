@@ -19,7 +19,7 @@ pub fn human(result: &AstreactlResult) -> String {
             snapshot.minimized_window_count
         ),
         AstreactlResult::Performance(snapshot) => format!(
-            "CPU render p50/p95/p99: {}/{}/{} us\nRepaint skip/partial/full: {}/{}/{}\nTriple render-ahead attempts/ready: {}/{}",
+            "CPU render p50/p95/p99: {}/{}/{} us\nRepaint skip/partial/full: {}/{}/{}\nTriple render-ahead attempts/ready: {}/{}\nO1 estimator/cold wake guard: {}/{}\nExact critical path p95/samples: {} ns/{}\nO1 desired/effective credit: {}/{}\nCredit release clean/horizon: {}/{}",
             snapshot.compositor_cpu_render.p50_us,
             snapshot.compositor_cpu_render.p95_us,
             snapshot.compositor_cpu_render.p99_us,
@@ -28,6 +28,14 @@ pub fn human(result: &AstreactlResult) -> String {
             snapshot.repaint.full_frames,
             snapshot.buffering.render_ahead_attempts,
             snapshot.buffering.render_ahead_ready,
+            snapshot.buffering.predicted_estimator_mode,
+            snapshot.buffering.predicted_cold_wake_guard,
+            snapshot.buffering.predicted_paired_critical_path_p95_ns,
+            snapshot.buffering.predicted_paired_critical_path_samples,
+            snapshot.buffering.desired_future_primary_credit,
+            snapshot.buffering.future_primary_credit,
+            snapshot.buffering.credit_release_clean_opportunities,
+            snapshot.buffering.credit_release_horizon,
         ),
         AstreactlResult::Doctor(snapshot) => snapshot
             .checks
