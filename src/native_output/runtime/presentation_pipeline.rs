@@ -798,6 +798,24 @@ mod tests {
         framebuffer_id: u32,
         output_generation: u64,
     ) {
+        insert_composited_for_generation_at(
+            ledger,
+            identity,
+            slot,
+            framebuffer_id,
+            output_generation,
+            MonotonicTimestampNs::new(0),
+        );
+    }
+
+    fn insert_composited_for_generation_at(
+        ledger: &mut OutputTransactionLedger,
+        identity: OutputFrameIdentitySnapshot,
+        slot: OutputSlotId,
+        framebuffer_id: u32,
+        output_generation: u64,
+        ready_at: MonotonicTimestampNs,
+    ) {
         let transaction = OutputTransaction::composited(
             ledger.output_id(),
             identity.transaction_id,
@@ -818,7 +836,7 @@ mod tests {
         .unwrap();
         ledger.insert(transaction).unwrap();
         ledger
-            .mark_ready(identity.transaction_id, MonotonicTimestampNs::new(0))
+            .mark_ready(identity.transaction_id, ready_at)
             .unwrap();
     }
 
@@ -1109,6 +1127,190 @@ mod tests {
                 && slot == ready.slot
                 && reservation == ready.reservation
         ));
+    }
+
+    #[test]
+    fn validation_base_invalidated_replan_restores_ready_pipeline_and_resubmits_same_frame() {
+        let output_generation = 2;
+        let crtc_id = 205;
+        let mut swapchain = ready_swapchain();
+        let ready = swapchain.ready_identity().expect("physical READY frame");
+        let ready_at = MonotonicTimestampNs::new(17);
+        let mut ledger = OutputTransactionLedger::with_capacities(8, 16);
+        insert_composited_for_generation_at(
+            &mut ledger,
+            ready,
+            ready.slot,
+            42,
+            output_generation,
+            ready_at,
+        );
+        let kind = AtomicCommitKind::CompositedPrimary {
+            transaction_id: ready.transaction_id,
+            frame_id: ready.frame_id,
+            framebuffer_id: 42,
+        };
+        let mut arbiter = AtomicCommitArbiter::new();
+        let mut frame_pacing = NativeFramePacing::from_env();
+        frame_pacing.queue_visual(10, ready.render_generation);
+        frame_pacing
+            .note_render_started(NativeOutputPacingMode::PredictiveTriple, false)
+            .expect("pacing render starts");
+        frame_pacing
+            .bind_physical_output_frame(ready)
+            .expect("pacing owner binds to the READY frame");
+        frame_pacing.note_ready_frame(11, false);
+        let pacing_ticket = frame_pacing
+            .reserve_worker_submission(true)
+            .expect("READY pacing reservation")
+            .expect("worker pacing ticket");
+
+        let worker_token = token(2051);
+        let queued_at = MonotonicTimestampNs::new(30);
+        let (submission_fence, _) = swapchain
+            .take_ready_for_worker(worker_token, queued_at)
+            .expect("physical READY moves to WORKER_QUEUED");
+        ledger
+            .mark_queued(ready.transaction_id, output_generation, queued_at)
+            .expect("logical READY moves to Queued");
+        arbiter
+            .reserve_worker_queued(
+                worker_token,
+                output_generation,
+                crtc_id,
+                kind,
+                queued_at.get(),
+            )
+            .expect("Atomic worker ownership is reserved");
+        assert_eq!(
+            swapchain
+                .worker_queued_identity()
+                .map(|identity| identity.frame),
+            Some(ready)
+        );
+        assert!(matches!(
+            ledger.transaction(ready.transaction_id).unwrap().state(),
+            OutputTransactionState::Queued {
+                predecessor: OutputTransactionQueuedPredecessor::Ready {
+                    ready_at: actual_ready_at,
+                },
+                ..
+            } if actual_ready_at == ready_at
+        ));
+        assert_eq!(
+            crate::native_output::runtime::kms_worker::validation_base_invalidation_disposition(
+                true,
+                false,
+                output_generation,
+                output_generation,
+                crate::native_output::kms_worker::ValidationBaseInvalidationReason::PresentedRevisionChanged,
+            ),
+            crate::native_output::runtime::kms_worker::ValidationBaseInvalidationDisposition::Replan
+        );
+
+        assert!(frame_pacing.cancel_worker_submission(Some(pacing_ticket)));
+        let mut submission_fence = Some(submission_fence);
+        let mut cursor_owner = None;
+        assert!(
+            swapchain
+                .return_worker_queued_for_replan(
+                    worker_token,
+                    &mut submission_fence,
+                    &mut cursor_owner,
+                )
+                .expect("physical frame returns to READY")
+        );
+        assert!(arbiter.reject_worker_queued(worker_token).is_some());
+        ledger
+            .rollback_queued(ready.transaction_id)
+            .expect("logical transaction returns to READY");
+
+        assert_eq!(
+            ledger.transaction(ready.transaction_id).unwrap().state(),
+            OutputTransactionState::Ready { ready_at }
+        );
+        assert_eq!(swapchain.ready_identity(), Some(ready));
+        assert_eq!(swapchain.worker_queued_identity(), None);
+        assert_eq!(arbiter.worker_queued_token(), None);
+        assert!(!frame_pacing.ready_worker_submission_reserved());
+        assert_eq!(ledger.counters().ready, 1);
+        assert_eq!(ledger.counters().queued, 0);
+
+        let snapshot = build_output_pipeline_snapshot_with_presented(
+            output_generation,
+            crtc_id,
+            NativeOutputPacingMode::PredictiveTriple,
+            2,
+            &swapchain,
+            &ledger,
+            &arbiter,
+            None,
+            None,
+            TripleCapability::Capable,
+            PresentedPlaneSnapshot::legacy(None),
+        )
+        .expect("strict pipeline validation accepts the restored prepared READY frame");
+        assert!(matches!(
+            snapshot.prepared,
+            PreparedCompositedState::Ready {
+                transaction_id,
+                slot,
+                ..
+            } if transaction_id == ready.transaction_id && slot == ready.slot
+        ));
+
+        let retry_token = token(2052);
+        let retry_queued_at = MonotonicTimestampNs::new(35);
+        let (retry_fence, _) = swapchain
+            .take_ready_for_worker(retry_token, retry_queued_at)
+            .expect("the same READY frame can be queued again");
+        drop(retry_fence);
+        ledger
+            .mark_queued(ready.transaction_id, output_generation, retry_queued_at)
+            .expect("same transaction can be requeued");
+        arbiter
+            .reserve_worker_queued(
+                retry_token,
+                output_generation,
+                crtc_id,
+                kind,
+                retry_queued_at.get(),
+            )
+            .expect("retry obtains worker Atomic ownership");
+        let submitted_at = MonotonicTimestampNs::new(40);
+        let submit_returned_at = MonotonicTimestampNs::new(41);
+        swapchain
+            .promote_worker_queued(retry_token, None, submitted_at, submit_returned_at)
+            .expect("same physical frame enters the submitted lane");
+        ledger
+            .mark_submitted(ready.transaction_id, retry_token, submitted_at)
+            .expect("same transaction reaches Submitted");
+        arbiter
+            .mark_kernel_submitted(retry_token, submitted_at.get(), submit_returned_at.get())
+            .expect("retry worker ownership is acknowledged");
+
+        assert!(matches!(
+            ledger.transaction(ready.transaction_id).unwrap().state(),
+            OutputTransactionState::Submitted { token: actual, .. } if actual == retry_token
+        ));
+        assert_eq!(
+            swapchain.pending_identity().map(|identity| identity.frame),
+            Some(ready)
+        );
+        build_output_pipeline_snapshot_with_presented(
+            output_generation,
+            crtc_id,
+            NativeOutputPacingMode::PredictiveTriple,
+            2,
+            &swapchain,
+            &ledger,
+            &arbiter,
+            None,
+            None,
+            TripleCapability::Capable,
+            PresentedPlaneSnapshot::legacy(None),
+        )
+        .expect("the re-planned frame continues through normal submission");
     }
 
     #[test]
