@@ -229,6 +229,280 @@ fn acknowledge_test_xdg_configure(state: &mut CompositorState, surface_id: u32, 
     state.ack_xdg_surface_configure(surface_id, acknowledgement);
 }
 
+struct PointerTestWaylandClient {
+    _display: wayland_server::Display<CompositorState>,
+    client: wayland_server::Client,
+    display_handle: wayland_server::DisplayHandle,
+}
+
+fn pointer_test_wayland_client() -> PointerTestWaylandClient {
+    let display = wayland_server::Display::<CompositorState>::new().expect("test display");
+    let mut display_handle = display.handle();
+    let (server_end, _peer) = std::os::unix::net::UnixStream::pair().expect("test socket");
+    let client = display_handle
+        .insert_client(server_end, std::sync::Arc::new(()))
+        .expect("test client");
+    PointerTestWaylandClient {
+        _display: display,
+        client,
+        display_handle,
+    }
+}
+
+fn append_pointer_test_toplevel(
+    state: &mut CompositorState,
+    client: &PointerTestWaylandClient,
+    placement: SurfacePlacement,
+    visual_clip: Option<crate::compositor::render::SurfaceVisualAperture>,
+) -> (u32, WindowId) {
+    let resource = state.test_create_unmapped_surface_resource_at_version(
+        &client.client,
+        &client.display_handle,
+        1,
+    );
+    let surface_id = compositor_surface_id(&resource);
+    state
+        .assign_surface_role(surface_id, SurfaceRole::XdgToplevel)
+        .expect("client surface role");
+    let window_id = state.allocate_window_id().expect("window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_xdg(window_id, surface_id))
+        .expect("client window");
+    state.xdg_decoration_states.insert(
+        surface_id,
+        WindowDecorationState::with_published_mode(DecorationMode::ClientSide),
+    );
+    let mut surface = test_surface(surface_id);
+    surface.placement = placement;
+    surface.visual_clip = visual_clip;
+    state.append_renderable_surface(surface);
+    state.set_test_effective_xdg_window_geometry(
+        surface_id,
+        XdgWindowGeometry::new(0, 0, SURFACE_WIDTH as i32, SURFACE_HEIGHT as i32),
+    );
+    (surface_id, window_id)
+}
+
+fn prime_pointer_test_certificate(state: &mut CompositorState, surface_id: u32) -> (f64, f64) {
+    state.rebuild_active_scene_view();
+    state.pointer_hit_instrumentation_enabled = true;
+    let surface_index = state
+        .active_scene_surface_index(surface_id)
+        .expect("active pointer test surface");
+    let target = state.active_scene_surface_render_assignments()[surface_index].target;
+    let point = (
+        f64::from(target.x() + target.width() as i32 / 2),
+        f64::from(target.y() + target.height() as i32 / 2),
+    );
+    assert!(matches!(
+        state.pointer_scene_hit_at(point.0, point.1),
+        PointerSceneHit::Client { ref target }
+            if compositor_surface_id(&target.surface) == surface_id
+    ));
+    assert_eq!(state.pointer_hit_metrics.pointer_hit_certificate_builds, 1);
+    assert!(
+        state
+            .pointer_scene_hit_cache
+            .as_ref()
+            .and_then(PointerSceneHitCache::pointer_hit_certificate_safe_rect)
+            .is_some()
+    );
+    point
+}
+
+fn assert_pointer_certificate_revalidated_after_mutation(
+    state: &mut CompositorState,
+    surface_id: u32,
+    previous_generation: u64,
+    expected_surface_id: Option<u32>,
+) {
+    assert_ne!(state.pointer_hit_generation, previous_generation);
+    if let Some(cached_certificate_generation) = state
+        .pointer_scene_hit_cache
+        .as_ref()
+        .and_then(PointerSceneHitCache::pointer_hit_certificate_generation)
+    {
+        assert!(
+            cached_certificate_generation == previous_generation
+                || cached_certificate_generation == state.pointer_hit_generation,
+            "a cached certificate must be old or already rebuilt for the current generation"
+        );
+    }
+    let surface_index = state
+        .active_scene_surface_index(surface_id)
+        .expect("mutated pointer test surface remains active");
+    let target = state.active_scene_surface_render_assignments()[surface_index].target;
+    let point = (
+        f64::from(target.x() + target.width() as i32 / 3),
+        f64::from(target.y() + target.height() as i32 / 3),
+    );
+    let reference = state.pointer_scene_hit_reference_at(point.0, point.1);
+    let hit = state.pointer_scene_hit_at(point.0, point.1);
+    assert_pointer_scene_hits_equal(&hit, &reference);
+    match expected_surface_id {
+        Some(expected_surface_id) => assert!(matches!(
+            hit,
+            PointerSceneHit::Client { ref target }
+                if compositor_surface_id(&target.surface) == expected_surface_id
+        )),
+        None => assert!(matches!(hit, PointerSceneHit::None)),
+    }
+    let refreshed_cache = state
+        .pointer_scene_hit_cache
+        .as_ref()
+        .expect("optimized hit test refreshes the exact cache");
+    assert_eq!(
+        refreshed_cache.pointer_hit_generation(),
+        state.pointer_hit_generation
+    );
+    if let Some(certificate_generation) = refreshed_cache.pointer_hit_certificate_generation() {
+        assert_eq!(certificate_generation, state.pointer_hit_generation);
+    }
+}
+
+fn append_pointer_test_subsurface(
+    state: &mut CompositorState,
+    client: &PointerTestWaylandClient,
+    parent_surface_id: u32,
+    x: i32,
+    y: i32,
+) -> u32 {
+    let resource = state.test_create_unmapped_surface_resource_at_version(
+        &client.client,
+        &client.display_handle,
+        1,
+    );
+    let surface_id = compositor_surface_id(&resource);
+    state
+        .assign_surface_role(
+            surface_id,
+            SurfaceRole::Subsurface {
+                parent_id: parent_surface_id,
+            },
+        )
+        .expect("subsurface role");
+    let mut surface = test_surface(surface_id);
+    surface.placement = SurfacePlacement::subsurface(parent_surface_id, x, y);
+    state.store_surface_placement(surface_id, surface.placement);
+    state.append_renderable_surface(surface);
+    surface_id
+}
+
+fn append_pointer_test_popup(
+    state: &mut CompositorState,
+    client: &PointerTestWaylandClient,
+    parent_surface_id: u32,
+    placement: SurfacePlacement,
+) -> u32 {
+    use wayland_protocols::xdg::shell::server::{xdg_popup, xdg_surface};
+
+    let resource = state.test_create_unmapped_surface_resource_at_version(
+        &client.client,
+        &client.display_handle,
+        1,
+    );
+    let surface_id = compositor_surface_id(&resource);
+    state
+        .assign_surface_role(surface_id, SurfaceRole::XdgPopup)
+        .expect("popup surface role");
+    let xdg_surface = client
+        .client
+        .create_resource::<xdg_surface::XdgSurface, XdgSurfaceData, CompositorState>(
+            &client.display_handle,
+            20,
+            XdgSurfaceData {
+                surface: resource.clone(),
+                reservation: XdgAssociationReservation::Fresh,
+            },
+        )
+        .expect("popup XDG surface");
+    let popup = client
+        .client
+        .create_resource::<xdg_popup::XdgPopup, XdgPopupData, CompositorState>(
+            &client.display_handle,
+            21,
+            XdgPopupData {
+                surface: resource.clone(),
+            },
+        )
+        .expect("XDG popup resource");
+    let parent = state
+        .surface_resource_by_id(parent_surface_id)
+        .expect("popup parent surface");
+    state.register_popup_surface(
+        resource,
+        Some(parent),
+        xdg_surface,
+        popup,
+        XdgPositionerState::default(),
+    );
+    let mut surface = test_surface(surface_id);
+    let parent_placement = state.surface_placement(parent_surface_id);
+    surface.placement = SurfacePlacement::subsurface(
+        parent_surface_id,
+        placement.local_x.saturating_sub(parent_placement.local_x),
+        placement.local_y.saturating_sub(parent_placement.local_y),
+    );
+    state.store_surface_placement(surface_id, surface.placement);
+    state.append_renderable_surface(surface);
+    let node = state
+        .popup_nodes
+        .get_mut(&surface_id)
+        .expect("registered popup node");
+    node.mapped = true;
+    node.configured = true;
+    state.refresh_active_scene_popup_view();
+    surface_id
+}
+
+fn set_test_committed_input_region(
+    state: &CompositorState,
+    surface_id: u32,
+    region: crate::compositor::state_data::SurfaceInputRegion,
+) {
+    let surface = state
+        .surface_resource_by_id(surface_id)
+        .expect("test surface resource");
+    surface
+        .data::<crate::compositor::state_data::SurfaceData>()
+        .expect("test surface data")
+        .apply_input_region_change(Some(region));
+}
+
+fn assert_pointer_scene_hits_equal(optimized: &PointerSceneHit, reference: &PointerSceneHit) {
+    match (optimized, reference) {
+        (PointerSceneHit::None, PointerSceneHit::None) => {}
+        (
+            PointerSceneHit::Client { target: optimized },
+            PointerSceneHit::Client { target: reference },
+        ) => {
+            assert_eq!(
+                compositor_surface_id(&optimized.surface),
+                compositor_surface_id(&reference.surface)
+            );
+            assert!((optimized.surface_x - reference.surface_x).abs() <= 1.0e-6);
+            assert!((optimized.surface_y - reference.surface_y).abs() <= 1.0e-6);
+        }
+        (
+            PointerSceneHit::Decoration {
+                window_id: optimized_window,
+                root_surface_id: optimized_root,
+                hit: optimized_hit,
+            },
+            PointerSceneHit::Decoration {
+                window_id: reference_window,
+                root_surface_id: reference_root,
+                hit: reference_hit,
+            },
+        ) => {
+            assert_eq!(optimized_window, reference_window);
+            assert_eq!(optimized_root, reference_root);
+            assert_eq!(optimized_hit, reference_hit);
+        }
+        _ => panic!("optimized pointer hit differs from exact reference"),
+    }
+}
+
 struct XdgWindowOpenFixture {
     state: CompositorState,
     _display: wayland_server::Display<CompositorState>,
@@ -2945,6 +3219,1151 @@ fn pointer_scene_hit_cache_requires_current_pointer_hit_generation() {
             .pointer_hit_generation(),
         11
     );
+}
+
+#[test]
+fn pointer_hit_certificate_reuses_stable_client_mapping_without_locality_scan() {
+    let mut state = CompositorState::new(None);
+    let display = wayland_server::Display::<CompositorState>::new().expect("test display");
+    let mut display_handle = display.handle();
+    let (server_end, _peer) = std::os::unix::net::UnixStream::pair().expect("test socket");
+    let client = display_handle
+        .insert_client(server_end, std::sync::Arc::new(()))
+        .expect("test client");
+    let resource =
+        state.test_create_unmapped_surface_resource_at_version(&client, &display_handle, 1);
+    let surface_id = compositor_surface_id(&resource);
+    let window_id = state.allocate_window_id().expect("window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_xdg(window_id, surface_id))
+        .expect("client window");
+    state.append_renderable_surface(test_surface(surface_id));
+    state.rebuild_active_scene_view();
+    state.set_test_effective_xdg_window_geometry(
+        surface_id,
+        XdgWindowGeometry::new(0, 0, SURFACE_WIDTH as i32, SURFACE_HEIGHT as i32),
+    );
+    state
+        .assign_surface_role(surface_id, SurfaceRole::XdgToplevel)
+        .expect("eligible client role");
+    state.pointer_hit_instrumentation_enabled = true;
+
+    let assignment = &state.active_scene_surface_render_assignments()[0];
+    let target = assignment.target;
+    let target_origin = (f64::from(target.x()), f64::from(target.y()));
+    let first_point = (f64::from(target.x() + 40), f64::from(target.y() + 30));
+    let first = state.pointer_scene_hit_at(first_point.0, first_point.1);
+    assert!(matches!(
+        first,
+        PointerSceneHit::Client { ref target }
+            if compositor_surface_id(&target.surface) == surface_id
+    ));
+    let after_first = state.pointer_input_metrics_snapshot();
+
+    for step in 0..128 {
+        let x = f64::from(target.x() + 20 + step % 240);
+        let y = f64::from(target.y() + 15 + step % 170);
+        let hit = state.pointer_scene_hit_at(x, y);
+        let PointerSceneHit::Client { target } = hit else {
+            panic!("stable client area should remain a client hit");
+        };
+        assert_eq!(compositor_surface_id(&target.surface), surface_id);
+        assert!((target.surface_x - (x - target_origin.0)).abs() < 1.0e-9);
+        assert!((target.surface_y - (y - target_origin.1)).abs() < 1.0e-9);
+    }
+
+    let after_motion = state.pointer_input_metrics_snapshot();
+    assert_eq!(after_first.pointer_hit_certificate_builds, 1);
+    assert_eq!(after_motion.pointer_hit_certificate_hits, 128);
+    assert_eq!(
+        after_motion.full_scene_hit_scans,
+        after_first.full_scene_hit_scans
+    );
+    assert_eq!(
+        after_motion.owner_locality_fast_hits, after_first.owner_locality_fast_hits,
+        "stable motion should be served by the certificate rather than locality traversal"
+    );
+    assert_eq!(
+        after_motion.visual_stack_groups_cache_rebuilds,
+        after_first.visual_stack_groups_cache_rebuilds
+    );
+}
+
+#[test]
+fn pointer_hit_certificate_is_not_reused_after_interaction_generation_changes() {
+    let mut state = CompositorState::new(None);
+    let client = pointer_test_wayland_client();
+    let (surface_id, _) = append_pointer_test_toplevel(
+        &mut state,
+        &client,
+        SurfacePlacement::absolute_root_at(100, 100),
+        None,
+    );
+    state.rebuild_active_scene_view();
+    state.pointer_hit_instrumentation_enabled = true;
+    let surface_index = state
+        .active_scene_surface_index(surface_id)
+        .expect("active client surface");
+    let target = state.active_scene_surface_render_assignments()[surface_index].target;
+    let first_point = (f64::from(target.x() + 80), f64::from(target.y() + 60));
+    assert!(matches!(
+        state.pointer_scene_hit_at(first_point.0, first_point.1),
+        PointerSceneHit::Client { .. }
+    ));
+    let certificate_generation = state.pointer_hit_generation;
+    let metrics_before_change = state.pointer_input_metrics_snapshot();
+    assert_eq!(metrics_before_change.pointer_hit_certificate_builds, 1);
+
+    state.advance_pointer_hit_generation();
+    let next_point = (f64::from(target.x() + 120), f64::from(target.y() + 90));
+    let hit = state.pointer_scene_hit_at(next_point.0, next_point.1);
+
+    assert_ne!(state.pointer_hit_generation, certificate_generation);
+    assert!(matches!(
+        hit,
+        PointerSceneHit::Client { ref target }
+            if compositor_surface_id(&target.surface) == surface_id
+    ));
+    let metrics_after_change = state.pointer_input_metrics_snapshot();
+    assert_eq!(metrics_after_change.pointer_hit_certificate_hits, 0);
+    assert_eq!(metrics_after_change.pointer_hit_certificate_misses, 1);
+    assert_eq!(metrics_after_change.pointer_hit_certificate_builds, 2);
+    assert_eq!(
+        metrics_after_change.full_scene_hit_scans,
+        metrics_before_change.full_scene_hit_scans + 1
+    );
+}
+
+#[test]
+fn pointer_hit_certificate_expires_after_interaction_mutations() {
+    let mut geometry_state = CompositorState::new(None);
+    let geometry_client = pointer_test_wayland_client();
+    let (geometry_surface_id, _) = append_pointer_test_toplevel(
+        &mut geometry_state,
+        &geometry_client,
+        SurfacePlacement::absolute_root_at(100, 100),
+        None,
+    );
+    prime_pointer_test_certificate(&mut geometry_state, geometry_surface_id);
+    let generation = geometry_state.pointer_hit_generation;
+    geometry_state.install_toplevel_visual_geometry(
+        geometry_surface_id,
+        WindowGeometry::new(
+            SurfacePlacement::absolute_root_at(130, 125),
+            SURFACE_WIDTH,
+            SURFACE_HEIGHT,
+        ),
+    );
+    assert_pointer_certificate_revalidated_after_mutation(
+        &mut geometry_state,
+        geometry_surface_id,
+        generation,
+        Some(geometry_surface_id),
+    );
+
+    let mut placement_state = CompositorState::new(None);
+    let placement_client = pointer_test_wayland_client();
+    let (placement_surface_id, _) = append_pointer_test_toplevel(
+        &mut placement_state,
+        &placement_client,
+        SurfacePlacement::absolute_root_at(100, 100),
+        None,
+    );
+    prime_pointer_test_certificate(&mut placement_state, placement_surface_id);
+    let generation = placement_state.pointer_hit_generation;
+    assert!(placement_state.set_surface_placement(
+        placement_surface_id,
+        SurfacePlacement::absolute_root_at(145, 135),
+    ));
+    assert_pointer_certificate_revalidated_after_mutation(
+        &mut placement_state,
+        placement_surface_id,
+        generation,
+        Some(placement_surface_id),
+    );
+
+    let mut input_state = CompositorState::new(None);
+    let input_client = pointer_test_wayland_client();
+    let (input_surface_id, _) = append_pointer_test_toplevel(
+        &mut input_state,
+        &input_client,
+        SurfacePlacement::absolute_root_at(100, 100),
+        None,
+    );
+    prime_pointer_test_certificate(&mut input_state, input_surface_id);
+    let generation = input_state.pointer_hit_generation;
+    let mut commit = empty_cached_subsurface_commit();
+    commit.commit_sequence = SurfaceCommitSequence(1);
+    commit.input_region = Some(crate::compositor::state_data::SurfaceInputRegion::Custom(
+        Vec::new(),
+    ));
+    input_state.publish_surface_tree(input_surface_id, vec![(input_surface_id, commit)]);
+    assert_pointer_certificate_revalidated_after_mutation(
+        &mut input_state,
+        input_surface_id,
+        generation,
+        None,
+    );
+
+    let mut stacking_state = CompositorState::new(None);
+    let stacking_client = pointer_test_wayland_client();
+    let (winner_surface_id, winner_window_id) = append_pointer_test_toplevel(
+        &mut stacking_state,
+        &stacking_client,
+        SurfacePlacement::absolute_root_at(100, 100),
+        None,
+    );
+    let (raised_surface_id, raised_window_id) = append_pointer_test_toplevel(
+        &mut stacking_state,
+        &stacking_client,
+        SurfacePlacement::absolute_root_at(1_000, 1_000),
+        None,
+    );
+    stacking_state.window_stacking = vec![raised_window_id, winner_window_id];
+    prime_pointer_test_certificate(&mut stacking_state, winner_surface_id);
+    let generation = stacking_state.pointer_hit_generation;
+    assert!(stacking_state.raise_root_window(raised_surface_id));
+    assert_pointer_certificate_revalidated_after_mutation(
+        &mut stacking_state,
+        winner_surface_id,
+        generation,
+        Some(winner_surface_id),
+    );
+
+    let mut popup_state = CompositorState::new(None);
+    let popup_client = pointer_test_wayland_client();
+    let (parent_surface_id, _) = append_pointer_test_toplevel(
+        &mut popup_state,
+        &popup_client,
+        SurfacePlacement::absolute_root_at(100, 100),
+        None,
+    );
+    prime_pointer_test_certificate(&mut popup_state, parent_surface_id);
+    let generation = popup_state.pointer_hit_generation;
+    append_pointer_test_popup(
+        &mut popup_state,
+        &popup_client,
+        parent_surface_id,
+        SurfacePlacement::absolute_root_at(1_000, 1_000),
+    );
+    popup_state.rebuild_active_scene_view();
+    assert_pointer_certificate_revalidated_after_mutation(
+        &mut popup_state,
+        parent_surface_id,
+        generation,
+        Some(parent_surface_id),
+    );
+}
+
+#[test]
+fn pointer_hit_certificate_falls_back_at_the_client_boundary() {
+    let mut state = CompositorState::new(None);
+    let client = pointer_test_wayland_client();
+    let (surface_id, _window_id) = append_pointer_test_toplevel(
+        &mut state,
+        &client,
+        SurfacePlacement::absolute_root_at(100, 100),
+        None,
+    );
+    state.rebuild_active_scene_view();
+    state.pointer_hit_instrumentation_enabled = true;
+    let surface_index = state
+        .active_scene_surface_index(surface_id)
+        .expect("active client surface");
+    let target = state.active_scene_surface_render_assignments()[surface_index].target;
+    let inside = (f64::from(target.x() + 80), f64::from(target.y() + 60));
+    assert!(matches!(
+        state.pointer_scene_hit_at(inside.0, inside.1),
+        PointerSceneHit::Client { .. }
+    ));
+    assert!(
+        state
+            .pointer_scene_hit_cache
+            .as_ref()
+            .and_then(PointerSceneHitCache::pointer_hit_certificate_safe_rect)
+            .is_some(),
+        "the interior client point should establish a certificate"
+    );
+
+    let boundary = (
+        f64::from(target.x()) + f64::from(target.width()),
+        f64::from(target.y() + 60),
+    );
+    let optimized = state.pointer_scene_hit_at(boundary.0, boundary.1);
+    let reference = state.pointer_scene_hit_reference_at(boundary.0, boundary.1);
+    assert!(matches!(optimized, PointerSceneHit::None));
+    assert!(matches!(reference, PointerSceneHit::None));
+    assert_eq!(state.pointer_hit_metrics.pointer_hit_certificate_misses, 1);
+    assert!(state.pointer_hit_metrics.full_scene_hit_scans > 1);
+}
+
+#[test]
+fn pointer_hit_certificate_clips_before_a_higher_window_envelope() {
+    let mut state = CompositorState::new(None);
+    let client = pointer_test_wayland_client();
+    let (lower_id, lower_window_id) = append_pointer_test_toplevel(
+        &mut state,
+        &client,
+        SurfacePlacement::absolute_root_at(100, 100),
+        None,
+    );
+    let (upper_id, upper_window_id) = append_pointer_test_toplevel(
+        &mut state,
+        &client,
+        SurfacePlacement::absolute_root_at(250, 100),
+        None,
+    );
+    state.window_stacking = vec![lower_window_id, upper_window_id];
+    state.rebuild_active_scene_view();
+    state.pointer_hit_instrumentation_enabled = true;
+    let lower_index = state
+        .active_scene_surface_index(lower_id)
+        .expect("lower surface active");
+    let upper_index = state
+        .active_scene_surface_index(upper_id)
+        .expect("upper surface active");
+    let lower_target = state.active_scene_surface_render_assignments()[lower_index].target;
+    let upper_target = state.active_scene_surface_render_assignments()[upper_index].target;
+    let point = (
+        f64::from(lower_target.x() + 80),
+        f64::from(lower_target.y() + 60),
+    );
+    assert!(point.0 < f64::from(upper_target.x()));
+    assert!(matches!(
+        state.pointer_scene_hit_at(point.0, point.1),
+        PointerSceneHit::Client { ref target }
+            if compositor_surface_id(&target.surface) == lower_id
+    ));
+    let safe_rect = state
+        .pointer_scene_hit_cache
+        .as_ref()
+        .and_then(PointerSceneHitCache::pointer_hit_certificate_safe_rect)
+        .expect("exposed lower region gets a certificate");
+    assert_eq!(safe_rect.2, f64::from(upper_target.x()));
+
+    let inside_clipped_cell = (f64::from(upper_target.x() - 1), point.1);
+    assert!(matches!(
+        state.pointer_scene_hit_at(inside_clipped_cell.0, inside_clipped_cell.1),
+        PointerSceneHit::Client { ref target }
+            if compositor_surface_id(&target.surface) == lower_id
+    ));
+    let before_crossing = state.pointer_hit_metrics;
+    let crossing = (f64::from(upper_target.x()), point.1);
+    let optimized = state.pointer_scene_hit_at(crossing.0, crossing.1);
+    let reference = state.pointer_scene_hit_reference_at(crossing.0, crossing.1);
+    assert!(matches!(
+        optimized,
+        PointerSceneHit::Client { ref target }
+            if compositor_surface_id(&target.surface) == upper_id
+    ));
+    assert_pointer_scene_hits_equal(&optimized, &reference);
+    assert_eq!(
+        state.pointer_hit_metrics.pointer_hit_certificate_misses,
+        before_crossing.pointer_hit_certificate_misses + 1
+    );
+}
+
+#[test]
+fn pointer_hit_certificate_clips_before_a_higher_subsurface_target() {
+    let mut state = CompositorState::new(None);
+    let client = pointer_test_wayland_client();
+    let (parent_id, _) = append_pointer_test_toplevel(
+        &mut state,
+        &client,
+        SurfacePlacement::absolute_root_at(100, 100),
+        None,
+    );
+    let child_id = append_pointer_test_subsurface(&mut state, &client, parent_id, 180, 20);
+    state.rebuild_active_scene_view();
+    state.pointer_hit_instrumentation_enabled = true;
+    let parent_index = state
+        .active_scene_surface_index(parent_id)
+        .expect("parent active");
+    let child_index = state
+        .active_scene_surface_index(child_id)
+        .expect("subsurface active");
+    let parent_target = state.active_scene_surface_render_assignments()[parent_index].target;
+    let child_target = state.active_scene_surface_render_assignments()[child_index].target;
+    let point = (
+        f64::from(parent_target.x() + 50),
+        f64::from(parent_target.y() + 50),
+    );
+    assert!(point.0 < f64::from(child_target.x()));
+    assert!(matches!(
+        state.pointer_scene_hit_at(point.0, point.1),
+        PointerSceneHit::Client { ref target }
+            if compositor_surface_id(&target.surface) == parent_id
+    ));
+    let safe_rect = state
+        .pointer_scene_hit_cache
+        .as_ref()
+        .and_then(PointerSceneHitCache::pointer_hit_certificate_safe_rect)
+        .expect("exposed parent area gets a certificate");
+    assert_eq!(safe_rect.2, f64::from(child_target.x()));
+
+    let before_crossing = state.pointer_input_metrics_snapshot();
+    let crossing = (f64::from(child_target.x()), point.1);
+    let optimized = state.pointer_scene_hit_at(crossing.0, crossing.1);
+    let reference = state.pointer_scene_hit_reference_at(crossing.0, crossing.1);
+    assert!(matches!(
+        optimized,
+        PointerSceneHit::Client { ref target }
+            if compositor_surface_id(&target.surface) == child_id
+    ));
+    assert_pointer_scene_hits_equal(&optimized, &reference);
+    assert_eq!(
+        state.pointer_hit_metrics.pointer_hit_certificate_misses,
+        before_crossing.pointer_hit_certificate_misses + 1
+    );
+}
+
+#[test]
+fn pointer_hit_certificate_clips_before_a_higher_popup_target() {
+    let mut state = CompositorState::new(None);
+    let client = pointer_test_wayland_client();
+    let (parent_id, _) = append_pointer_test_toplevel(
+        &mut state,
+        &client,
+        SurfacePlacement::absolute_root_at(100, 100),
+        None,
+    );
+    let popup_id = append_pointer_test_popup(
+        &mut state,
+        &client,
+        parent_id,
+        SurfacePlacement::absolute_root_at(230, 100),
+    );
+    state.rebuild_active_scene_view();
+    state.pointer_hit_instrumentation_enabled = true;
+    let parent_index = state
+        .active_scene_surface_index(parent_id)
+        .expect("parent active");
+    let popup_index = state
+        .active_scene_surface_index(popup_id)
+        .expect("popup active");
+    let parent_target = state.active_scene_surface_render_assignments()[parent_index].target;
+    let popup_target = state.active_scene_surface_render_assignments()[popup_index].target;
+    let point = (
+        f64::from(parent_target.x() + 50),
+        f64::from(parent_target.y() + 50),
+    );
+    assert!(point.0 < f64::from(popup_target.x()));
+    assert!(matches!(
+        state.pointer_scene_hit_at(point.0, point.1),
+        PointerSceneHit::Client { ref target }
+            if compositor_surface_id(&target.surface) == parent_id
+    ));
+    let safe_rect = state
+        .pointer_scene_hit_cache
+        .as_ref()
+        .and_then(PointerSceneHitCache::pointer_hit_certificate_safe_rect)
+        .expect("exposed parent area gets a certificate");
+    assert_eq!(safe_rect.2, f64::from(popup_target.x()));
+
+    let inside_clipped_cell = (f64::from(popup_target.x() - 1), point.1);
+    assert!(matches!(
+        state.pointer_scene_hit_at(inside_clipped_cell.0, inside_clipped_cell.1),
+        PointerSceneHit::Client { ref target }
+            if compositor_surface_id(&target.surface) == parent_id
+    ));
+    let before_crossing = state.pointer_input_metrics_snapshot();
+    let crossing = (f64::from(popup_target.x()), point.1);
+    let optimized = state.pointer_scene_hit_at(crossing.0, crossing.1);
+    let reference = state.pointer_scene_hit_reference_at(crossing.0, crossing.1);
+    assert!(matches!(
+        optimized,
+        PointerSceneHit::Client { ref target }
+            if compositor_surface_id(&target.surface) == popup_id
+    ));
+    assert_pointer_scene_hits_equal(&optimized, &reference);
+    assert_eq!(
+        state.pointer_hit_metrics.pointer_hit_certificate_misses,
+        before_crossing.pointer_hit_certificate_misses + 1
+    );
+}
+
+#[test]
+fn higher_custom_input_hole_rejects_a_lower_surface_certificate() {
+    let mut state = CompositorState::new(None);
+    let client = pointer_test_wayland_client();
+    let (lower_id, lower_window_id) = append_pointer_test_toplevel(
+        &mut state,
+        &client,
+        SurfacePlacement::absolute_root_at(100, 100),
+        None,
+    );
+    let (upper_id, upper_window_id) = append_pointer_test_toplevel(
+        &mut state,
+        &client,
+        SurfacePlacement::absolute_root_at(150, 120),
+        None,
+    );
+    state.window_stacking = vec![lower_window_id, upper_window_id];
+    state.rebuild_active_scene_view();
+    set_test_committed_input_region(
+        &state,
+        upper_id,
+        crate::compositor::state_data::SurfaceInputRegion::Custom(Vec::new()),
+    );
+    state.pointer_hit_instrumentation_enabled = true;
+    let lower_index = state
+        .active_scene_surface_index(lower_id)
+        .expect("lower surface active");
+    let lower_target = state.active_scene_surface_render_assignments()[lower_index].target;
+    let point = (
+        f64::from(lower_target.x() + 100),
+        f64::from(lower_target.y() + 80),
+    );
+    let hit = state.pointer_scene_hit_at(point.0, point.1);
+    assert!(matches!(
+        hit,
+        PointerSceneHit::Client { ref target }
+            if compositor_surface_id(&target.surface) == lower_id
+    ));
+    let reference = state.pointer_scene_hit_reference_at(point.0, point.1);
+    assert_pointer_scene_hits_equal(&hit, &reference);
+    assert_eq!(state.pointer_hit_metrics.pointer_hit_certificate_builds, 0);
+    assert_eq!(
+        state.pointer_hit_metrics.pointer_hit_certificate_rejections, 1,
+        "the upper custom-input hole is inside its broad blocker envelope"
+    );
+}
+
+#[test]
+fn higher_subsurface_input_hole_rejects_a_parent_certificate() {
+    let mut state = CompositorState::new(None);
+    let client = pointer_test_wayland_client();
+    let (parent_id, _window_id) = append_pointer_test_toplevel(
+        &mut state,
+        &client,
+        SurfacePlacement::absolute_root_at(100, 100),
+        None,
+    );
+    let child_id = append_pointer_test_subsurface(&mut state, &client, parent_id, 20, 20);
+    state.rebuild_active_scene_view();
+    set_test_committed_input_region(
+        &state,
+        child_id,
+        crate::compositor::state_data::SurfaceInputRegion::Custom(Vec::new()),
+    );
+    state.pointer_hit_instrumentation_enabled = true;
+    let parent_index = state
+        .active_scene_surface_index(parent_id)
+        .expect("parent surface active");
+    let parent_target = state.active_scene_surface_render_assignments()[parent_index].target;
+    let point = (
+        f64::from(parent_target.x() + 50),
+        f64::from(parent_target.y() + 50),
+    );
+    let hit = state.pointer_scene_hit_at(point.0, point.1);
+    assert!(matches!(
+        hit,
+        PointerSceneHit::Client { ref target }
+            if compositor_surface_id(&target.surface) == parent_id
+    ));
+    let reference = state.pointer_scene_hit_reference_at(point.0, point.1);
+    assert_pointer_scene_hits_equal(&hit, &reference);
+    assert_eq!(state.pointer_hit_metrics.pointer_hit_certificate_builds, 0);
+    assert_eq!(
+        state.pointer_hit_metrics.pointer_hit_certificate_rejections,
+        1
+    );
+}
+
+#[test]
+fn higher_popup_input_hole_rejects_a_parent_certificate() {
+    let mut state = CompositorState::new(None);
+    let client = pointer_test_wayland_client();
+    let (parent_id, _window_id) = append_pointer_test_toplevel(
+        &mut state,
+        &client,
+        SurfacePlacement::absolute_root_at(100, 100),
+        None,
+    );
+    let popup_id = append_pointer_test_popup(
+        &mut state,
+        &client,
+        parent_id,
+        SurfacePlacement::absolute_root_at(150, 120),
+    );
+    state.rebuild_active_scene_view();
+    assert!(state.active_scene_popup_surface_ids().contains(&popup_id));
+    set_test_committed_input_region(
+        &state,
+        popup_id,
+        crate::compositor::state_data::SurfaceInputRegion::Custom(Vec::new()),
+    );
+    state.pointer_hit_instrumentation_enabled = true;
+    let parent_index = state
+        .active_scene_surface_index(parent_id)
+        .expect("parent surface active");
+    let parent_target = state.active_scene_surface_render_assignments()[parent_index].target;
+    let point = (
+        f64::from(parent_target.x() + 100),
+        f64::from(parent_target.y() + 80),
+    );
+    let hit = state.pointer_scene_hit_at(point.0, point.1);
+    assert!(matches!(
+        hit,
+        PointerSceneHit::Client { ref target }
+            if compositor_surface_id(&target.surface) == parent_id
+    ));
+    let reference = state.pointer_scene_hit_reference_at(point.0, point.1);
+    assert_pointer_scene_hits_equal(&hit, &reference);
+    assert_eq!(state.pointer_hit_metrics.pointer_hit_certificate_builds, 0);
+    assert_eq!(
+        state.pointer_hit_metrics.pointer_hit_certificate_rejections,
+        1
+    );
+}
+
+#[test]
+fn custom_input_and_visual_aperture_targets_do_not_get_certificates() {
+    let mut custom_state = CompositorState::new(None);
+    let custom_client = pointer_test_wayland_client();
+    let (custom_id, _custom_window_id) = append_pointer_test_toplevel(
+        &mut custom_state,
+        &custom_client,
+        SurfacePlacement::absolute_root_at(100, 100),
+        None,
+    );
+    custom_state.rebuild_active_scene_view();
+    set_test_committed_input_region(
+        &custom_state,
+        custom_id,
+        crate::compositor::state_data::SurfaceInputRegion::Custom(vec![
+            crate::compositor::state_data::InputRegionOp::Add(
+                crate::compositor::state_data::InputRegionRect::new(0, 0, 100, 100)
+                    .expect("custom input rectangle"),
+            ),
+        ]),
+    );
+    let custom_index = custom_state
+        .active_scene_surface_index(custom_id)
+        .expect("custom surface active");
+    let custom_target = custom_state.active_scene_surface_render_assignments()[custom_index].target;
+    let custom_point = (
+        f64::from(custom_target.x() + 20),
+        f64::from(custom_target.y() + 20),
+    );
+    assert!(matches!(
+        custom_state.pointer_scene_hit_at(custom_point.0, custom_point.1),
+        PointerSceneHit::Client { ref target }
+            if compositor_surface_id(&target.surface) == custom_id
+    ));
+    assert_eq!(
+        custom_state
+            .pointer_hit_metrics
+            .pointer_hit_certificate_builds,
+        0
+    );
+    assert_eq!(
+        custom_state
+            .pointer_hit_metrics
+            .pointer_hit_certificate_rejections,
+        1
+    );
+
+    let mut clipped_state = CompositorState::new(None);
+    let clipped_client = pointer_test_wayland_client();
+    let aperture = crate::compositor::render::SurfaceVisualAperture::logical_only(
+        render::SurfaceTargetRect::new(0, 0, 150, 200),
+    );
+    let (clipped_id, _clipped_window_id) = append_pointer_test_toplevel(
+        &mut clipped_state,
+        &clipped_client,
+        SurfacePlacement::root(),
+        Some(aperture),
+    );
+    clipped_state.rebuild_active_scene_view();
+    let clipped_index = clipped_state
+        .active_scene_surface_index(clipped_id)
+        .expect("clipped surface active");
+    let clipped_target =
+        clipped_state.active_scene_surface_render_assignments()[clipped_index].target;
+    let clipped_point = (
+        f64::from(clipped_target.x() + 30),
+        f64::from(clipped_target.y() + 30),
+    );
+    assert!(matches!(
+        clipped_state.pointer_scene_hit_at(clipped_point.0, clipped_point.1),
+        PointerSceneHit::Client { ref target }
+            if compositor_surface_id(&target.surface) == clipped_id
+    ));
+    assert_eq!(
+        clipped_state
+            .pointer_hit_metrics
+            .pointer_hit_certificate_builds,
+        0
+    );
+    assert_eq!(
+        clipped_state
+            .pointer_hit_metrics
+            .pointer_hit_certificate_rejections,
+        1
+    );
+}
+
+#[test]
+fn server_decoration_complexity_rejects_client_certificates() {
+    let mut state = CompositorState::new(None);
+    let client = pointer_test_wayland_client();
+    let (surface_id, _) = append_pointer_test_toplevel(
+        &mut state,
+        &client,
+        SurfacePlacement::absolute_root_at(100, 100),
+        None,
+    );
+    state.xdg_decoration_states.insert(
+        surface_id,
+        WindowDecorationState::with_published_mode(DecorationMode::ServerSide),
+    );
+    state.rebuild_active_scene_view();
+    let surface_index = state
+        .active_scene_surface_index(surface_id)
+        .expect("active decorated surface");
+    let target = state.active_scene_surface_render_assignments()[surface_index].target;
+    let point = (f64::from(target.x() + 80), f64::from(target.y() + 60));
+    assert!(matches!(
+        state.pointer_scene_hit_at(point.0, point.1),
+        PointerSceneHit::Client { ref target }
+            if compositor_surface_id(&target.surface) == surface_id
+    ));
+    assert_eq!(state.pointer_hit_metrics.pointer_hit_certificate_builds, 0);
+    assert_eq!(
+        state.pointer_hit_metrics.pointer_hit_certificate_rejections, 1,
+        "the server-decoration resize envelope overlaps the client area"
+    );
+}
+
+#[test]
+fn pointer_hit_certificate_survives_identical_physical_frame_churn() {
+    let mut state = CompositorState::new(None);
+    let client = pointer_test_wayland_client();
+    let (surface_id, _window_id) = append_pointer_test_toplevel(
+        &mut state,
+        &client,
+        SurfacePlacement::absolute_root_at(100, 100),
+        None,
+    );
+    state.rebuild_active_scene_view();
+    state.pointer_hit_instrumentation_enabled = true;
+    let output_id = state.native_output_id().expect("test output id");
+    let scene_node_id = state
+        .scene_node_id_for_window_group(
+            state
+                .window_id_for_surface(surface_id)
+                .expect("test window"),
+        )
+        .expect("test scene node");
+    let canonical_rect = state
+        .current_presentation_rect_for_root(surface_id)
+        .expect("canonical presentation rectangle");
+    let presented_rect = PresentationRect::new(
+        canonical_rect.x() + 400.0,
+        canonical_rect.y() + 300.0,
+        canonical_rect.width(),
+        canonical_rect.height(),
+    )
+    .expect("translated physical rectangle");
+    let sample = PresentationSceneSample::empty_for_output(
+        output_id,
+        AnimationTime::from_nanos(1_000_000),
+        PresentationSampleTimeSource::MonotonicFallback,
+    );
+    let initial_presentation = PresentationFrameSnapshot::from_sample_with_presented_windows(
+        &sample,
+        vec![PresentedWindowGeometry::with_scene_node(
+            scene_node_id,
+            surface_id,
+            presented_rect,
+        )],
+    );
+    state.publish_presented_presentation(1, &initial_presentation);
+    let transform = PresentationGeometryTransform::new(canonical_rect, presented_rect);
+    let initial_point = transform.map_point((canonical_rect.x() + 50.0, canonical_rect.y() + 50.0));
+    assert!(matches!(
+        state.pointer_scene_hit_at(initial_point.0, initial_point.1),
+        PointerSceneHit::Client { ref target }
+            if compositor_surface_id(&target.surface) == surface_id
+    ));
+    let pointer_generation = state.pointer_hit_generation;
+    let topology_generation = state.interaction_topology_generation;
+    let before_churn = state.pointer_input_metrics_snapshot();
+    assert_eq!(before_churn.pointer_hit_certificate_builds, 1);
+
+    for frame_id in 2..=12 {
+        let node = if frame_id % 2 == 0 {
+            SceneNodeId::from_raw(u64::from(frame_id) + 20_000).expect("replacement node")
+        } else {
+            scene_node_id
+        };
+        let sample = PresentationSceneSample::empty_for_output(
+            output_id,
+            AnimationTime::from_nanos(frame_id * 1_000_000),
+            PresentationSampleTimeSource::MonotonicFallback,
+        );
+        let mut presentation = PresentationFrameSnapshot::from_sample_with_presented_windows(
+            &sample,
+            vec![PresentedWindowGeometry::with_scene_node(
+                node,
+                surface_id,
+                presented_rect,
+            )],
+        );
+        presentation.signature = frame_id;
+        state.publish_presented_presentation(frame_id, &presentation);
+
+        let point = (
+            presented_rect.x() + 25.0 + (frame_id * 7) as f64,
+            presented_rect.y() + 35.0 + (frame_id * 3) as f64,
+        );
+        assert!(matches!(
+            state.pointer_scene_hit_at(point.0, point.1),
+            PointerSceneHit::Client { ref target }
+                if compositor_surface_id(&target.surface) == surface_id
+        ));
+    }
+
+    let after_churn = state.pointer_input_metrics_snapshot();
+    assert_eq!(state.pointer_hit_generation, pointer_generation);
+    assert_eq!(state.interaction_topology_generation, topology_generation);
+    assert_eq!(
+        after_churn.full_scene_hit_scans,
+        before_churn.full_scene_hit_scans
+    );
+    assert_eq!(
+        after_churn.owner_locality_fast_hits,
+        before_churn.owner_locality_fast_hits
+    );
+    assert_eq!(
+        after_churn.visual_stack_groups_cache_rebuilds,
+        before_churn.visual_stack_groups_cache_rebuilds
+    );
+    assert_eq!(after_churn.pointer_hit_certificate_hits, 11);
+}
+
+#[test]
+fn pointer_hit_certificate_affine_matches_physical_presentation_mapping() {
+    let mut state = CompositorState::new(None);
+    let client = pointer_test_wayland_client();
+    let (surface_id, _window_id) = append_pointer_test_toplevel(
+        &mut state,
+        &client,
+        SurfacePlacement::absolute_root_at(100, 100),
+        None,
+    );
+    state.rebuild_active_scene_view();
+    state.pointer_hit_instrumentation_enabled = true;
+    let output_id = state.native_output_id().expect("test output id");
+    let scene_node_id = state
+        .scene_node_id_for_window_group(
+            state
+                .window_id_for_surface(surface_id)
+                .expect("test window"),
+        )
+        .expect("test scene node");
+    let canonical_rect = state
+        .current_presentation_rect_for_root(surface_id)
+        .expect("canonical presentation rectangle");
+    let presented_rect = PresentationRect::new(
+        500.25,
+        320.5,
+        canonical_rect.width() * 1.5,
+        canonical_rect.height() * 0.75,
+    )
+    .expect("scaled physical rectangle");
+    let sample = PresentationSceneSample::empty_for_output(
+        output_id,
+        AnimationTime::from_nanos(1_000_000),
+        PresentationSampleTimeSource::MonotonicFallback,
+    );
+    let presentation = PresentationFrameSnapshot::from_sample_with_presented_windows(
+        &sample,
+        vec![PresentedWindowGeometry::with_scene_node(
+            scene_node_id,
+            surface_id,
+            presented_rect,
+        )],
+    );
+    state.publish_presented_presentation(1, &presentation);
+
+    let surface_index = state
+        .active_scene_surface_index(surface_id)
+        .expect("active surface");
+    let renderable = state.active_scene_surfaces()[surface_index].clone();
+    let assignment = state.active_scene_surface_render_assignments()[surface_index].clone();
+    let target = assignment.target;
+    let transform = PresentationGeometryTransform::new(canonical_rect, presented_rect);
+    let first_point = transform.map_point((f64::from(target.x() + 50), f64::from(target.y() + 40)));
+    assert!(matches!(
+        state.pointer_scene_hit_at(first_point.0, first_point.1),
+        PointerSceneHit::Client { ref target }
+            if compositor_surface_id(&target.surface) == surface_id
+    ));
+
+    for step in 0..32 {
+        let canonical_point = (
+            f64::from(target.x() + 10 + step * 7),
+            f64::from(target.y() + 15 + step % 150),
+        );
+        let output_point = transform.map_point(canonical_point);
+        let optimized = state.pointer_scene_hit_at(output_point.0, output_point.1);
+        let PointerSceneHit::Client {
+            target: optimized_target,
+        } = optimized
+        else {
+            panic!("certified transformed client point must remain a client hit");
+        };
+        let (canonical_x, canonical_y, _) = state
+            .presentation_input_point_for_root(surface_id, output_point.0, output_point.1)
+            .expect("physical point maps through current interaction projection");
+        let (expected_x, expected_y) = render::surface_local_point_for_assignment(
+            &renderable,
+            &assignment,
+            canonical_x,
+            canonical_y,
+        )
+        .expect("mapped point belongs to the render assignment");
+        assert_eq!(compositor_surface_id(&optimized_target.surface), surface_id);
+        assert!((optimized_target.surface_x - expected_x).abs() <= 1.0e-6);
+        assert!((optimized_target.surface_y - expected_y).abs() <= 1.0e-6);
+    }
+}
+
+#[test]
+fn pointer_hit_certificate_keeps_fifty_window_motion_scene_independent() {
+    let mut state = CompositorState::new(None);
+    let client = pointer_test_wayland_client();
+    let (winner_id, winner_window_id) = append_pointer_test_toplevel(
+        &mut state,
+        &client,
+        SurfacePlacement::absolute_root_at(100, 100),
+        None,
+    );
+    let mut stacking = vec![winner_window_id];
+    for index in 0..49 {
+        let surface_id = state.allocate_surface_id();
+        let window_id = state.allocate_window_id().expect("extra window id");
+        state
+            .insert_desktop_window(DesktopWindow::new_xdg(window_id, surface_id))
+            .expect("extra window");
+        let mut surface = test_surface_with_size(surface_id, SURFACE_WIDTH, SURFACE_HEIGHT);
+        surface.placement = SurfacePlacement::absolute_root_at(1_000 + index * 400, 1_000);
+        state.append_renderable_surface(surface);
+        stacking.push(window_id);
+    }
+    state.window_stacking = stacking;
+    state.rebuild_active_scene_view();
+    state.pointer_hit_instrumentation_enabled = true;
+    let winner_index = state
+        .active_scene_surface_index(winner_id)
+        .expect("winner active");
+    let target = state.active_scene_surface_render_assignments()[winner_index].target;
+    let first = (f64::from(target.x() + 20), f64::from(target.y() + 20));
+    assert!(matches!(
+        state.pointer_scene_hit_at(first.0, first.1),
+        PointerSceneHit::Client { ref target }
+            if compositor_surface_id(&target.surface) == winner_id
+    ));
+    assert_eq!(state.visual_stack_groups_cache.len(), 50);
+    let before_motion = state.pointer_input_metrics_snapshot();
+
+    for step in 0..2_000 {
+        let x = f64::from(target.x() + 1 + step % 250);
+        let y = f64::from(target.y() + 1 + step / 250);
+        let hit = state.pointer_scene_hit_at(x, y);
+        assert!(matches!(
+            hit,
+            PointerSceneHit::Client { ref target }
+                if compositor_surface_id(&target.surface) == winner_id
+        ));
+    }
+
+    let after_motion = state.pointer_input_metrics_snapshot();
+    assert_eq!(
+        after_motion.full_scene_hit_scans,
+        before_motion.full_scene_hit_scans
+    );
+    assert_eq!(
+        after_motion.owner_locality_fast_hits,
+        before_motion.owner_locality_fast_hits
+    );
+    assert_eq!(
+        after_motion.visual_stack_groups_cache_rebuilds,
+        before_motion.visual_stack_groups_cache_rebuilds
+    );
+    assert_eq!(
+        after_motion.pointer_hit_certificate_hits - before_motion.pointer_hit_certificate_hits,
+        2_000
+    );
+}
+
+#[test]
+fn pointer_hit_certificate_matches_exact_reference_over_overlapping_scene_grid() {
+    let mut state = CompositorState::new(None);
+    let client = pointer_test_wayland_client();
+    let (lower_id, lower_window_id) = append_pointer_test_toplevel(
+        &mut state,
+        &client,
+        SurfacePlacement::absolute_root_at(100, 100),
+        None,
+    );
+    let (upper_id, upper_window_id) = append_pointer_test_toplevel(
+        &mut state,
+        &client,
+        SurfacePlacement::absolute_root_at(200, 150),
+        None,
+    );
+    state.window_stacking = vec![lower_window_id, upper_window_id];
+    state.rebuild_active_scene_view();
+    set_test_committed_input_region(
+        &state,
+        upper_id,
+        crate::compositor::state_data::SurfaceInputRegion::Custom(vec![
+            crate::compositor::state_data::InputRegionOp::Add(
+                crate::compositor::state_data::InputRegionRect::new(0, 0, 75, 200)
+                    .expect("partial upper input rectangle"),
+            ),
+        ]),
+    );
+    let lower_index = state
+        .active_scene_surface_index(lower_id)
+        .expect("lower surface active");
+    let upper_index = state
+        .active_scene_surface_index(upper_id)
+        .expect("upper surface active");
+    let lower_target = state.active_scene_surface_render_assignments()[lower_index].target;
+    let upper_target = state.active_scene_surface_render_assignments()[upper_index].target;
+    let left = lower_target.x() - 2;
+    let top = lower_target.y() - 2;
+    let right = upper_target.x() + upper_target.width() as i32 + 2;
+    let bottom = upper_target.y() + upper_target.height() as i32 + 2;
+
+    for y in (top..=bottom).step_by(17) {
+        for x in (left..=right).step_by(19) {
+            let point = (f64::from(x), f64::from(y));
+            let optimized = state.pointer_scene_hit_at(point.0, point.1);
+            let reference = state.pointer_scene_hit_reference_at(point.0, point.1);
+            assert_pointer_scene_hits_equal(&optimized, &reference);
+        }
+    }
+
+    let mut nested_state = CompositorState::new(None);
+    let nested_client = pointer_test_wayland_client();
+    let (parent_id, _) = append_pointer_test_toplevel(
+        &mut nested_state,
+        &nested_client,
+        SurfacePlacement::absolute_root_at(100, 100),
+        None,
+    );
+    append_pointer_test_subsurface(&mut nested_state, &nested_client, parent_id, 35, 25);
+    let popup_id = append_pointer_test_popup(
+        &mut nested_state,
+        &nested_client,
+        parent_id,
+        SurfacePlacement::absolute_root_at(190, 150),
+    );
+    nested_state.rebuild_active_scene_view();
+    let parent_index = nested_state
+        .active_scene_surface_index(parent_id)
+        .expect("nested parent active");
+    let popup_index = nested_state
+        .active_scene_surface_index(popup_id)
+        .expect("nested popup active");
+    let parent_target = nested_state.active_scene_surface_render_assignments()[parent_index].target;
+    let popup_target = nested_state.active_scene_surface_render_assignments()[popup_index].target;
+    let nested_left = parent_target.x().min(popup_target.x()) - 4;
+    let nested_top = parent_target.y().min(popup_target.y()) - 4;
+    let nested_right = (parent_target.x() + parent_target.width() as i32)
+        .max(popup_target.x() + popup_target.width() as i32)
+        + 4;
+    let nested_bottom = (parent_target.y() + parent_target.height() as i32)
+        .max(popup_target.y() + popup_target.height() as i32)
+        + 4;
+    for y in (nested_top..=nested_bottom).step_by(23) {
+        for x in (nested_left..=nested_right).step_by(29) {
+            let point = (f64::from(x), f64::from(y));
+            let optimized = nested_state.pointer_scene_hit_at(point.0, point.1);
+            let reference = nested_state.pointer_scene_hit_reference_at(point.0, point.1);
+            assert_pointer_scene_hits_equal(&optimized, &reference);
+        }
+    }
+
+    let mut decorated = xdg_state(
+        test_surface(42),
+        DecorationPreference::ServerSide,
+        ToplevelMode::Normal,
+    );
+    let origin = decorated.active_scene_surface_origins()[0];
+    for y in (origin.1 - 20..origin.1 + SURFACE_HEIGHT as i32 + 10).step_by(13) {
+        for x in (origin.0 - 10..origin.0 + SURFACE_WIDTH as i32 + 10).step_by(17) {
+            let optimized = decorated.pointer_scene_hit_at(f64::from(x), f64::from(y));
+            let reference = decorated.pointer_scene_hit_reference_at(f64::from(x), f64::from(y));
+            assert_pointer_scene_hits_equal(&optimized, &reference);
+        }
+    }
+
+    let mut physical_state = CompositorState::new(None);
+    let physical_client = pointer_test_wayland_client();
+    let (physical_surface_id, _) = append_pointer_test_toplevel(
+        &mut physical_state,
+        &physical_client,
+        SurfacePlacement::absolute_root_at(100, 100),
+        None,
+    );
+    physical_state.rebuild_active_scene_view();
+    let output_id = physical_state.native_output_id().expect("test output");
+    let scene_node_id = physical_state
+        .scene_node_id_for_window_group(
+            physical_state
+                .window_id_for_surface(physical_surface_id)
+                .expect("physical test window"),
+        )
+        .expect("physical test scene node");
+    let canonical_rect = physical_state
+        .current_presentation_rect_for_root(physical_surface_id)
+        .expect("physical canonical rectangle");
+    let presented_rect = PresentationRect::new(
+        470.5,
+        290.25,
+        canonical_rect.width() * 1.25,
+        canonical_rect.height() * 0.8,
+    )
+    .expect("physical output rectangle");
+    let sample = PresentationSceneSample::empty_for_output(
+        output_id,
+        AnimationTime::from_nanos(1),
+        PresentationSampleTimeSource::MonotonicFallback,
+    );
+    let presentation = PresentationFrameSnapshot::from_sample_with_presented_windows(
+        &sample,
+        vec![PresentedWindowGeometry::with_scene_node(
+            scene_node_id,
+            physical_surface_id,
+            presented_rect,
+        )],
+    );
+    physical_state.publish_presented_presentation(1, &presentation);
+    let physical_transform = PresentationGeometryTransform::new(canonical_rect, presented_rect);
+    let physical_index = physical_state
+        .active_scene_surface_index(physical_surface_id)
+        .expect("physical surface active");
+    let physical_target =
+        physical_state.active_scene_surface_render_assignments()[physical_index].target;
+    for y in (-3..=SURFACE_HEIGHT as i32 + 3).step_by(19) {
+        for x in (-3..=SURFACE_WIDTH as i32 + 3).step_by(23) {
+            let canonical_point = (
+                f64::from(physical_target.x()) + f64::from(x),
+                f64::from(physical_target.y()) + f64::from(y),
+            );
+            let output_point = physical_transform.map_point(canonical_point);
+            let optimized = physical_state.pointer_scene_hit_at(output_point.0, output_point.1);
+            let reference =
+                physical_state.pointer_scene_hit_reference_at(output_point.0, output_point.1);
+            assert_pointer_scene_hits_equal(&optimized, &reference);
+        }
+    }
 }
 
 #[test]

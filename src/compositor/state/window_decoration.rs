@@ -14,7 +14,7 @@ use super::super::{
     RenderGenerationCause, RenderableSurface, ResizeEdges, ToplevelMode, WindowBackend, WindowId,
     WindowInteractionKind, WindowInteractionSource,
 };
-use super::hit_testing::PointerSceneHit;
+use super::hit_testing::{PointerCertificateRejection, PointerSafeRect, PointerSceneHit};
 use super::surface_focus::WindowFocusReason;
 use crate::compositor::render;
 use crate::compositor::runtime_files::compositor_debug_surface_logging_enabled;
@@ -697,6 +697,62 @@ impl super::super::CompositorState {
         x: f64,
         y: f64,
     ) -> Option<DecorationHit> {
+        let (window_id, layout, tiled_minimal) =
+            self.decoration_layout_for_root(root_surface_id)?;
+        let local_x = x - f64::from(root_origin.0) + f64::from(layout.client.x);
+        let local_y = y - f64::from(root_origin.1) + f64::from(layout.client.y);
+        layout.hit_test(local_x, local_y).or_else(|| {
+            if !tiled_minimal {
+                return None;
+            }
+            let edge = layout.logical_resize_edge_at(local_x, local_y)?;
+            let edges = resize_edges_for_decoration_edge(edge);
+            self.prepare_tiled_resize(window_id, edges)
+                .is_some()
+                .then_some(DecorationHit::Resize(edge))
+        })
+    }
+
+    pub(super) fn decoration_resize_input_envelope_for_root(
+        &self,
+        root_surface_id: u32,
+        root_origin: (i32, i32),
+    ) -> Result<Option<PointerSafeRect>, PointerCertificateRejection> {
+        if self.window_id_for_surface(root_surface_id).is_none() {
+            return Ok(None);
+        }
+        let Some((_window_id, layout, _tiled_minimal, has_decoration_input)) =
+            self.decoration_layout_for_root_with_envelope(root_surface_id)
+        else {
+            return Err(PointerCertificateRejection::Unprovable);
+        };
+        if !has_decoration_input {
+            return Ok(None);
+        }
+        let left = f64::from(root_origin.0) + f64::from(layout.resize_input.x)
+            - f64::from(layout.client.x);
+        let top = f64::from(root_origin.1) + f64::from(layout.resize_input.y)
+            - f64::from(layout.client.y);
+        let right = left + f64::from(layout.resize_input.width);
+        let bottom = top + f64::from(layout.resize_input.height);
+        PointerSafeRect::new(left, top, right, bottom)
+            .map(Some)
+            .ok_or(PointerCertificateRejection::Unprovable)
+    }
+
+    fn decoration_layout_for_root(
+        &self,
+        root_surface_id: u32,
+    ) -> Option<(WindowId, DecorationLayout, bool)> {
+        let (window_id, layout, tiled_minimal, _) =
+            self.decoration_layout_for_root_with_envelope(root_surface_id)?;
+        Some((window_id, layout, tiled_minimal))
+    }
+
+    fn decoration_layout_for_root_with_envelope(
+        &self,
+        root_surface_id: u32,
+    ) -> Option<(WindowId, DecorationLayout, bool, bool)> {
         let window_id = self.window_id_for_surface(root_surface_id)?;
         let window = self.window(window_id)?;
         let visual_geometry = self.current_visual_root_window_geometry(root_surface_id)?;
@@ -718,22 +774,13 @@ impl super::super::CompositorState {
             chrome_policy,
             self.decoration_theme.metrics(),
         )?;
-        let local_x = x - f64::from(root_origin.0) + f64::from(layout.client.x);
-        let local_y = y - f64::from(root_origin.1) + f64::from(layout.client.y);
-        layout.hit_test(local_x, local_y).or_else(|| {
-            let tiled_minimal = chrome_policy == crate::wm::WindowChromePolicy::Minimal
-                && window.management.is_some_and(|management| {
-                    management.layout() == crate::wm::LayoutMembership::Tiled
-                });
-            if !tiled_minimal {
-                return None;
-            }
-            let edge = layout.logical_resize_edge_at(local_x, local_y)?;
-            let edges = resize_edges_for_decoration_edge(edge);
-            self.prepare_tiled_resize(window_id, edges)
-                .is_some()
-                .then_some(DecorationHit::Resize(edge))
-        })
+        let tiled_minimal = chrome_policy == crate::wm::WindowChromePolicy::Minimal
+            && window.management.is_some_and(|management| {
+                management.layout() == crate::wm::LayoutMembership::Tiled
+            });
+        let has_decoration_input =
+            layout.titlebar.height > 0 || layout.resize_input.x < 0 || tiled_minimal;
+        Some((window_id, layout, tiled_minimal, has_decoration_input))
     }
 
     pub(in crate::compositor) fn decoration_theme_status(

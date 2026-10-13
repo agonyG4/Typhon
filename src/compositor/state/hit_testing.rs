@@ -23,6 +23,218 @@ pub(in crate::compositor) struct PointerSceneHitCache {
     scene_render_generation: u64,
     pointer_hit_generation: u64,
     hit: PointerSceneHit,
+    pointer_hit_certificate: Option<PointerHitCertificate>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PointerHitCertificate {
+    pointer_hit_generation: u64,
+    surface_id: u32,
+    presentation_owner_root_id: u32,
+    safe_rect: PointerSafeRect,
+    local_mapping: PointerLocalAffineMapping,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) enum PointerCertificateRejection {
+    Unprovable,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PointerLocalAffineMapping {
+    scale_x: f64,
+    scale_y: f64,
+    offset_x: f64,
+    offset_y: f64,
+}
+
+impl PointerLocalAffineMapping {
+    fn map(self, x: f64, y: f64) -> (f64, f64) {
+        (
+            x * self.scale_x + self.offset_x,
+            y * self.scale_y + self.offset_y,
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct PointerSafeRect {
+    left: f64,
+    top: f64,
+    right: f64,
+    bottom: f64,
+}
+
+#[cfg(test)]
+impl PointerSceneHitCache {
+    pub(super) fn pointer_hit_certificate_safe_rect(&self) -> Option<(f64, f64, f64, f64)> {
+        self.pointer_hit_certificate.map(|certificate| {
+            (
+                certificate.safe_rect.left,
+                certificate.safe_rect.top,
+                certificate.safe_rect.right,
+                certificate.safe_rect.bottom,
+            )
+        })
+    }
+
+    pub(super) fn pointer_hit_certificate_generation(&self) -> Option<u64> {
+        self.pointer_hit_certificate
+            .map(|certificate| certificate.pointer_hit_generation)
+    }
+}
+
+impl PointerSafeRect {
+    pub(super) fn new(left: f64, top: f64, right: f64, bottom: f64) -> Option<Self> {
+        (left.is_finite()
+            && top.is_finite()
+            && right.is_finite()
+            && bottom.is_finite()
+            && right > left
+            && bottom > top)
+            .then_some(Self {
+                left,
+                top,
+                right,
+                bottom,
+            })
+    }
+
+    fn strictly_contains(self, x: f64, y: f64) -> bool {
+        x > self.left && x < self.right && y > self.top && y < self.bottom
+    }
+
+    fn half_open_contains(self, x: f64, y: f64) -> bool {
+        x >= self.left && x < self.right && y >= self.top && y < self.bottom
+    }
+
+    fn map_to_output(self, projection: InteractionRootProjection) -> Option<Self> {
+        match projection {
+            InteractionRootProjection::Inactive => None,
+            InteractionRootProjection::Identity { .. } => Some(self),
+            InteractionRootProjection::Presented { transform, .. } => {
+                let rect = crate::presentation_animation::PresentationRect::new(
+                    self.left,
+                    self.top,
+                    self.right - self.left,
+                    self.bottom - self.top,
+                )?;
+                let mapped = transform.map_rect(rect)?;
+                Self::new(
+                    mapped.x(),
+                    mapped.y(),
+                    mapped.x() + mapped.width(),
+                    mapped.y() + mapped.height(),
+                )
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum InteractionRootProjection {
+    Inactive,
+    Identity {
+        origin: (i32, i32),
+    },
+    Presented {
+        presented_origin: (i32, i32),
+        transform: PresentationGeometryTransform,
+    },
+}
+
+impl InteractionRootProjection {
+    fn output_point_to_canonical(self, x: f64, y: f64) -> Option<(f64, f64, (i32, i32))> {
+        match self {
+            Self::Inactive => Some((x, y, (0, 0))),
+            Self::Identity { origin } => Some((x, y, origin)),
+            Self::Presented {
+                presented_origin,
+                transform,
+                ..
+            } => {
+                let canonical = transform.inverse_map_point_unbounded((x, y))?;
+                Some((canonical.0, canonical.1, presented_origin))
+            }
+        }
+    }
+
+    fn local_affine_mapping(
+        self,
+        target: render::SurfaceTargetRect,
+        logical_extent: (u32, u32),
+    ) -> Option<PointerLocalAffineMapping> {
+        if target.width() == 0 || target.height() == 0 {
+            return None;
+        }
+        let (canonical_scale_x, canonical_offset_x, canonical_scale_y, canonical_offset_y) =
+            match self {
+                Self::Inactive => return None,
+                Self::Identity { .. } => (1.0, 0.0, 1.0, 0.0),
+                Self::Presented { transform, .. } => {
+                    let scale_x = transform.scale_x();
+                    let scale_y = transform.scale_y();
+                    if !scale_x.is_finite()
+                        || !scale_y.is_finite()
+                        || scale_x <= 0.0
+                        || scale_y <= 0.0
+                    {
+                        return None;
+                    }
+                    (
+                        1.0 / scale_x,
+                        transform.canonical_rect.x() - transform.presented_rect.x() / scale_x,
+                        1.0 / scale_y,
+                        transform.canonical_rect.y() - transform.presented_rect.y() / scale_y,
+                    )
+                }
+            };
+        let target_width = f64::from(target.width());
+        let target_height = f64::from(target.height());
+        let logical_width = f64::from(logical_extent.0);
+        let logical_height = f64::from(logical_extent.1);
+        let target_x = f64::from(target.x());
+        let target_y = f64::from(target.y());
+        let local_mapping = PointerLocalAffineMapping {
+            scale_x: canonical_scale_x * logical_width / target_width,
+            scale_y: canonical_scale_y * logical_height / target_height,
+            offset_x: (canonical_offset_x - target_x) * logical_width / target_width,
+            offset_y: (canonical_offset_y - target_y) * logical_height / target_height,
+        };
+        (local_mapping.scale_x.is_finite()
+            && local_mapping.scale_x > 0.0
+            && local_mapping.scale_y.is_finite()
+            && local_mapping.scale_y > 0.0
+            && local_mapping.offset_x.is_finite()
+            && local_mapping.offset_y.is_finite())
+        .then_some(local_mapping)
+    }
+}
+
+fn shrink_pointer_safe_rect_away_from_blocker(
+    safe_rect: &mut PointerSafeRect,
+    blocker: PointerSafeRect,
+    x: f64,
+    y: f64,
+) -> Result<(), PointerCertificateRejection> {
+    if blocker.half_open_contains(x, y) {
+        return Err(PointerCertificateRejection::Unprovable);
+    }
+    if x < blocker.left {
+        safe_rect.right = safe_rect.right.min(blocker.left);
+    } else if x >= blocker.right {
+        safe_rect.left = safe_rect.left.max(blocker.right);
+    }
+    if y < blocker.top {
+        safe_rect.bottom = safe_rect.bottom.min(blocker.top);
+    } else if y >= blocker.bottom {
+        safe_rect.top = safe_rect.top.max(blocker.bottom);
+    }
+    (safe_rect.right > safe_rect.left
+        && safe_rect.bottom > safe_rect.top
+        && safe_rect.strictly_contains(x, y))
+    .then_some(())
+    .ok_or(PointerCertificateRejection::Unprovable)
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -32,6 +244,10 @@ pub(in crate::compositor) struct PointerInputMetrics {
     pub(in crate::compositor) pointer_scene_hit_cache_misses: u64,
     pub(in crate::compositor) full_scene_hit_scans: u64,
     pub(in crate::compositor) owner_locality_fast_hits: u64,
+    pub(in crate::compositor) pointer_hit_certificate_hits: u64,
+    pub(in crate::compositor) pointer_hit_certificate_misses: u64,
+    pub(in crate::compositor) pointer_hit_certificate_builds: u64,
+    pub(in crate::compositor) pointer_hit_certificate_rejections: u64,
     pub(in crate::compositor) pointer_hit_generation_invalidations: u64,
     pub(in crate::compositor) interaction_topology_invalidations: u64,
     pub(in crate::compositor) visual_stack_groups_cache_rebuilds: u64,
@@ -77,6 +293,7 @@ impl PointerSceneHitCache {
             scene_render_generation,
             pointer_hit_generation,
             hit,
+            pointer_hit_certificate: None,
         }
     }
 
@@ -318,7 +535,68 @@ impl CompositorState {
             }
             return cache.hit.clone();
         }
+
+        let certificate = self
+            .pointer_scene_hit_cache
+            .as_ref()
+            .and_then(|cache| cache.pointer_hit_certificate);
+        if let Some(certificate) = certificate {
+            let certified_target = self
+                .pointer_scene_hit_cache
+                .as_ref()
+                .filter(|cache| {
+                    cache.pointer_hit_generation == self.pointer_hit_generation
+                        && certificate.pointer_hit_generation == self.pointer_hit_generation
+                        && certificate.safe_rect.strictly_contains(x, y)
+                        && fullscreen_plan
+                            .allows_interaction_root(certificate.presentation_owner_root_id)
+                })
+                .and_then(|cache| match &cache.hit {
+                    PointerSceneHit::Client { target }
+                        if compositor_surface_id(&target.surface) == certificate.surface_id =>
+                    {
+                        Some(target.surface.clone())
+                    }
+                    _ => None,
+                });
+            if let Some(surface) = certified_target {
+                let (surface_x, surface_y) = certificate.local_mapping.map(x, y);
+                let hit = PointerSceneHit::Client {
+                    target: PointerTarget {
+                        surface,
+                        surface_x,
+                        surface_y,
+                    },
+                };
+                if let Some(cache) = self.pointer_scene_hit_cache.as_mut() {
+                    cache.x = x;
+                    cache.y = y;
+                    cache.scene_render_generation = self.scene_render_generation;
+                    cache.hit = hit.clone();
+                }
+                self.pointer_hit_metrics.pointer_hit_certificate_hits = self
+                    .pointer_hit_metrics
+                    .pointer_hit_certificate_hits
+                    .saturating_add(1);
+                if instrumentation_enabled {
+                    self.pointer_hit_metrics.pointer_scene_hit_cpu_nanos += started_at
+                        .expect("instrumented hit-test has a start time")
+                        .elapsed()
+                        .as_nanos()
+                        .min(u128::from(u64::MAX))
+                        as u64;
+                }
+                return hit;
+            }
+            self.pointer_hit_metrics.pointer_hit_certificate_misses = self
+                .pointer_hit_metrics
+                .pointer_hit_certificate_misses
+                .saturating_add(1);
+        }
+
         if let Some(hit) = self.pointer_scene_hit_locality_at(x, y, &fullscreen_plan) {
+            let pointer_hit_certificate =
+                self.try_build_pointer_hit_certificate(&hit, x, y, &fullscreen_plan);
             if instrumentation_enabled {
                 self.pointer_hit_metrics.owner_locality_fast_hits = self
                     .pointer_hit_metrics
@@ -337,6 +615,7 @@ impl CompositorState {
                 scene_render_generation: self.scene_render_generation,
                 pointer_hit_generation: self.pointer_hit_generation,
                 hit: hit.clone(),
+                pointer_hit_certificate,
             });
             return hit;
         }
@@ -351,6 +630,8 @@ impl CompositorState {
         self.refresh_visual_stack_groups_cache();
         let (hit, groups_inspected, surfaces_inspected) =
             self.pointer_scene_hit_uncached(x, y, instrumentation_enabled, &fullscreen_plan);
+        let pointer_hit_certificate =
+            self.try_build_pointer_hit_certificate(&hit, x, y, &fullscreen_plan);
         if instrumentation_enabled {
             self.pointer_hit_metrics.pointer_scene_hit_groups_inspected += groups_inspected;
             self.pointer_hit_metrics
@@ -368,8 +649,17 @@ impl CompositorState {
             scene_render_generation: self.scene_render_generation,
             pointer_hit_generation: self.pointer_hit_generation,
             hit: hit.clone(),
+            pointer_hit_certificate,
         });
         hit
+    }
+
+    #[cfg(test)]
+    pub(super) fn pointer_scene_hit_reference_at(&mut self, x: f64, y: f64) -> PointerSceneHit {
+        self.refresh_visual_stack_groups_cache();
+        let fullscreen_plan = self.fullscreen_composition_plan();
+        self.pointer_scene_hit_uncached(x, y, false, &fullscreen_plan)
+            .0
     }
 
     pub(in crate::compositor) fn presentation_input_point_for_root(
@@ -378,14 +668,22 @@ impl CompositorState {
         x: f64,
         y: f64,
     ) -> Option<(f64, f64, (i32, i32))> {
+        self.interaction_root_projection(root_surface_id)?
+            .output_point_to_canonical(x, y)
+    }
+
+    fn interaction_root_projection(
+        &self,
+        root_surface_id: u32,
+    ) -> Option<InteractionRootProjection> {
         if self.lifecycle_root_restore_suppressed(root_surface_id) {
             return None;
         }
         let Some(index) = self.active_scene_surface_index(root_surface_id) else {
-            return Some((x, y, (0, 0)));
+            return Some(InteractionRootProjection::Inactive);
         };
         let Some(origin) = self.active_scene_surface_origins().get(index).copied() else {
-            return Some((x, y, (0, 0)));
+            return Some(InteractionRootProjection::Inactive);
         };
         let presentation_owner = self.presentation_owner_root_for_surface(root_surface_id);
         if self.window_id_for_surface(presentation_owner).is_some()
@@ -398,7 +696,7 @@ impl CompositorState {
             .window_interaction
             .is_some_and(|interaction| interaction.root_surface_id == presentation_owner);
         if interaction_takes_over {
-            return Some((x, y, origin));
+            return Some(InteractionRootProjection::Identity { origin });
         }
 
         if self.presented_presentation_frame_id != 0
@@ -410,18 +708,232 @@ impl CompositorState {
                 canonical_rect,
                 presented_window.presented_rect(),
             );
-            let canonical = transform.inverse_map_point_unbounded((x, y))?;
-            return Some((
-                canonical.0,
-                canonical.1,
-                (
+            return Some(InteractionRootProjection::Presented {
+                presented_origin: (
                     saturating_i32_from_f64(presented_window.presented_rect().x().floor()),
                     saturating_i32_from_f64(presented_window.presented_rect().y().floor()),
                 ),
-            ));
+                transform,
+            });
         }
 
-        Some((x, y, origin))
+        Some(InteractionRootProjection::Identity { origin })
+    }
+
+    fn try_build_pointer_hit_certificate(
+        &mut self,
+        hit: &PointerSceneHit,
+        x: f64,
+        y: f64,
+        fullscreen_plan: &FullscreenCompositionPlan,
+    ) -> Option<PointerHitCertificate> {
+        match self.build_pointer_hit_certificate(hit, x, y, fullscreen_plan) {
+            Ok(Some(certificate)) => {
+                self.pointer_hit_metrics.pointer_hit_certificate_builds = self
+                    .pointer_hit_metrics
+                    .pointer_hit_certificate_builds
+                    .saturating_add(1);
+                Some(certificate)
+            }
+            Ok(None) => None,
+            Err(PointerCertificateRejection::Unprovable) => {
+                self.pointer_hit_metrics.pointer_hit_certificate_rejections = self
+                    .pointer_hit_metrics
+                    .pointer_hit_certificate_rejections
+                    .saturating_add(1);
+                None
+            }
+        }
+    }
+
+    fn build_pointer_hit_certificate(
+        &self,
+        hit: &PointerSceneHit,
+        x: f64,
+        y: f64,
+        fullscreen_plan: &FullscreenCompositionPlan,
+    ) -> Result<Option<PointerHitCertificate>, PointerCertificateRejection> {
+        let PointerSceneHit::Client { target } = hit else {
+            return Ok(None);
+        };
+        if !x.is_finite() || !y.is_finite() || self.window_interaction.is_some() {
+            return Err(PointerCertificateRejection::Unprovable);
+        }
+
+        let surface_id = compositor_surface_id(&target.surface);
+        if !matches!(
+            self.surface_role(surface_id),
+            SurfaceRole::XdgToplevel
+                | SurfaceRole::XdgPopup
+                | SurfaceRole::LayerSurface
+                | SurfaceRole::Subsurface { .. }
+                | SurfaceRole::Xwayland
+        ) {
+            return Err(PointerCertificateRejection::Unprovable);
+        }
+        let Some(surface_resource) = self.surface_resource_by_id(surface_id) else {
+            return Err(PointerCertificateRejection::Unprovable);
+        };
+        let Some(surface_data) =
+            surface_resource.data::<crate::compositor::state_data::SurfaceData>()
+        else {
+            return Err(PointerCertificateRejection::Unprovable);
+        };
+        if !matches!(
+            surface_data.committed_input_region_snapshot(),
+            crate::compositor::state_data::SurfaceInputRegion::Default
+        ) {
+            return Err(PointerCertificateRejection::Unprovable);
+        }
+
+        if self.visual_stack_groups_cache_topology_generation
+            != Some(self.interaction_topology_generation)
+        {
+            return Err(PointerCertificateRejection::Unprovable);
+        }
+        let surface_index = self
+            .active_scene_surface_index(surface_id)
+            .ok_or(PointerCertificateRejection::Unprovable)?;
+        let renderable = self
+            .active_scene_surfaces()
+            .get(surface_index)
+            .ok_or(PointerCertificateRejection::Unprovable)?;
+        let assignment = self
+            .active_scene_surface_render_assignments()
+            .get(surface_index)
+            .ok_or(PointerCertificateRejection::Unprovable)?;
+        if renderable.visual_clip.is_some() || assignment.visual_clip.is_some() {
+            return Err(PointerCertificateRejection::Unprovable);
+        }
+        let logical_extent = render::surface_logical_extent(renderable)
+            .ok_or(PointerCertificateRejection::Unprovable)?;
+        let target_rect = assignment.target;
+        if target_rect.width() == 0 || target_rect.height() == 0 {
+            return Err(PointerCertificateRejection::Unprovable);
+        }
+
+        let groups = &self.visual_stack_groups_cache;
+        let winner_group_index = groups
+            .iter()
+            .position(|group| group.surface_indices().contains(&surface_index))
+            .ok_or(PointerCertificateRejection::Unprovable)?;
+        let winner_group = &groups[winner_group_index];
+        let root_surface_id = winner_group.root_surface_id();
+        let presentation_owner_root_id = self.presentation_owner_root_for_surface(root_surface_id);
+        if !fullscreen_plan.allows_interaction_root(presentation_owner_root_id) {
+            return Err(PointerCertificateRejection::Unprovable);
+        }
+        let projection = self
+            .interaction_root_projection(root_surface_id)
+            .ok_or(PointerCertificateRejection::Unprovable)?;
+        if matches!(projection, InteractionRootProjection::Inactive) {
+            return Err(PointerCertificateRejection::Unprovable);
+        }
+        let canonical_target = PointerSafeRect::new(
+            f64::from(target_rect.x()),
+            f64::from(target_rect.y()),
+            f64::from(target_rect.x()) + f64::from(target_rect.width()),
+            f64::from(target_rect.y()) + f64::from(target_rect.height()),
+        )
+        .ok_or(PointerCertificateRejection::Unprovable)?;
+        let mut safe_rect = canonical_target
+            .map_to_output(projection)
+            .ok_or(PointerCertificateRejection::Unprovable)?;
+        let local_mapping = projection
+            .local_affine_mapping(target_rect, logical_extent)
+            .ok_or(PointerCertificateRejection::Unprovable)?;
+        if !safe_rect.strictly_contains(x, y) {
+            return Err(PointerCertificateRejection::Unprovable);
+        }
+
+        for (group_index, group) in groups.iter().enumerate().rev() {
+            if group_index < winner_group_index {
+                break;
+            }
+            let group_root_id = group.root_surface_id();
+            let root_index = group.root_surface_index();
+            let Some(root_surface) = self.active_scene_surfaces().get(root_index) else {
+                continue;
+            };
+            if root_surface.surface_id != group_root_id
+                || !fullscreen_plan.allows_interaction_root(
+                    self.presentation_owner_root_for_surface(group_root_id),
+                )
+                || self.lifecycle_root_restore_suppressed(group_root_id)
+            {
+                continue;
+            }
+            let candidate_projection = self
+                .interaction_root_projection(group_root_id)
+                .ok_or(PointerCertificateRejection::Unprovable)?;
+            if matches!(candidate_projection, InteractionRootProjection::Inactive) {
+                return Err(PointerCertificateRejection::Unprovable);
+            }
+            let root_origin = self
+                .active_scene_surface_origins()
+                .get(root_index)
+                .copied()
+                .ok_or(PointerCertificateRejection::Unprovable)?;
+
+            if !group.is_popup() {
+                let decoration_envelope = self
+                    .decoration_resize_input_envelope_for_root(group_root_id, root_origin)?
+                    .map(|envelope| {
+                        envelope
+                            .map_to_output(candidate_projection)
+                            .ok_or(PointerCertificateRejection::Unprovable)
+                    })
+                    .transpose()?;
+                if let Some(blocker) = decoration_envelope {
+                    shrink_pointer_safe_rect_away_from_blocker(&mut safe_rect, blocker, x, y)?;
+                }
+            }
+
+            for &candidate_index in group.surface_indices().iter().rev() {
+                if group_index == winner_group_index && candidate_index == surface_index {
+                    break;
+                }
+                let candidate = self
+                    .active_scene_surfaces()
+                    .get(candidate_index)
+                    .ok_or(PointerCertificateRejection::Unprovable)?;
+                if candidate.surface_id == surface_id {
+                    return Err(PointerCertificateRejection::Unprovable);
+                }
+                if self.surface_role(candidate.surface_id) == SurfaceRole::DragIcon {
+                    continue;
+                }
+                if self.surface_resource_by_id(candidate.surface_id).is_none() {
+                    continue;
+                }
+                let candidate_assignment = self
+                    .active_scene_surface_render_assignments()
+                    .get(candidate_index)
+                    .ok_or(PointerCertificateRejection::Unprovable)?;
+                let candidate_target = candidate_assignment.target;
+                let blocker = PointerSafeRect::new(
+                    f64::from(candidate_target.x()),
+                    f64::from(candidate_target.y()),
+                    f64::from(candidate_target.x()) + f64::from(candidate_target.width()),
+                    f64::from(candidate_target.y()) + f64::from(candidate_target.height()),
+                )
+                .ok_or(PointerCertificateRejection::Unprovable)?
+                .map_to_output(candidate_projection)
+                .ok_or(PointerCertificateRejection::Unprovable)?;
+                shrink_pointer_safe_rect_away_from_blocker(&mut safe_rect, blocker, x, y)?;
+            }
+        }
+
+        if !safe_rect.strictly_contains(x, y) {
+            return Err(PointerCertificateRejection::Unprovable);
+        }
+        Ok(Some(PointerHitCertificate {
+            pointer_hit_generation: self.pointer_hit_generation,
+            surface_id,
+            presentation_owner_root_id,
+            safe_rect,
+            local_mapping,
+        }))
     }
 
     fn pointer_scene_hit_uncached(
