@@ -15,6 +15,11 @@ pub(super) use pageflip::abandon_overtaken_ready;
 pub(crate) use pageflip::register_suspended_fence_if_needed;
 pub(super) use pageflip::terminalize_unsubmitted_frame_for_reconfiguration;
 pub(super) use pageflip::validate_reconfiguration_frame_ownership;
+#[cfg(test)]
+pub(crate) use pageflip::validate_reconfiguration_frame_ownership_for_swapchain;
+pub(crate) use pageflip::{
+    ExplicitWorkerReplanRequest, preflight_explicit_worker_replan, restore_explicit_worker_replan,
+};
 pub fn run(
     server: OwnCompositorServer,
     app: Vec<String>,

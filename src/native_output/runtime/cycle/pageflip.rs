@@ -12,11 +12,15 @@ use super::super::*;
 use super::cycle_direct;
 use crate::native_output::kms_worker::{
     KmsCommitJob, KmsCommitWorkerHandle, KmsCursorUpdate, KmsPrimaryCursorPresentation,
-    KmsWorkerDispatchTailObservation, KmsWorkerQueuedCancellation,
+    KmsPrimaryUpdate, KmsWorkerDispatchTailObservation, KmsWorkerQueuedCancellation,
 };
+use crate::native_output::pacing::WorkerPacingTicket;
 use crate::native_output::presentation::kms_timing::{KmsPresentationOutcome, KmsSubmitWindow};
 use crate::native_output::presentation::plane::{
     CursorCoupling, CursorRevision, PresentedCursorState,
+};
+use crate::native_output::scanout::{
+    AtomicOutputSwapchain, FrozenCursorPlaneOwner, OutputFrameIdentitySnapshot,
 };
 use oblivion_one::native::adaptive_buffering::{
     AdaptiveRenderJournal, EstimatorRecoveryDisposition, FenceTimestampQuality, ProvenDeadlineMiss,
@@ -953,6 +957,294 @@ fn validate_unsubmitted_ready_owners(
     )
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ExplicitWorkerReplanRequest {
+    pub(crate) output_id: OutputId,
+    pub(crate) output_epoch: OutputEpochId,
+    pub(crate) crtc_id: u32,
+    pub(crate) transaction_id: OutputTransactionId,
+    pub(crate) token: PageFlipToken,
+    pub(crate) kind: AtomicCommitKind,
+    pub(crate) frame_id: u64,
+    pub(crate) framebuffer_id: u32,
+    pub(crate) reservation: FramePresentationReservation,
+    pub(crate) queued_at: MonotonicTimestampNs,
+    pub(crate) ready_submit: bool,
+    pub(crate) pacing_ticket: Option<WorkerPacingTicket>,
+    pub(crate) submission_fence_available: bool,
+}
+
+impl ExplicitWorkerReplanRequest {
+    pub(crate) fn from_job(job: &KmsCommitJob) -> NativeResult<Self> {
+        let AtomicCommitKind::CompositedPrimary {
+            transaction_id,
+            frame_id,
+            framebuffer_id,
+        } = job.kind
+        else {
+            return Err(io::Error::other(
+                "explicit worker re-plan requires a composited primary job",
+            )
+            .into());
+        };
+        let KmsPrimaryUpdate::Framebuffer {
+            framebuffer,
+            in_fence,
+            ..
+        } = &job.primary
+        else {
+            return Err(io::Error::other(
+                "explicit composited re-plan has no primary framebuffer payload",
+            )
+            .into());
+        };
+        if transaction_id != job.transaction_id
+            || framebuffer.get() != framebuffer_id
+            || job
+                .pacing_ticket
+                .is_some_and(|ticket| ticket.ready_submit() != job.ready_submit)
+        {
+            return Err(io::Error::other("explicit worker re-plan job identities disagree").into());
+        }
+        Ok(Self {
+            output_id: job.output_id,
+            output_epoch: job.output_epoch,
+            crtc_id: job.crtc_id,
+            transaction_id,
+            token: job.token,
+            kind: job.kind,
+            frame_id,
+            framebuffer_id,
+            reservation: job.reservation,
+            queued_at: job.queued_at,
+            ready_submit: job.ready_submit,
+            pacing_ticket: job.pacing_ticket,
+            submission_fence_available: in_fence.is_some(),
+        })
+    }
+
+    pub(crate) fn pacing_origin(self) -> &'static str {
+        match self.pacing_ticket {
+            Some(ticket) if ticket.ready_submit() => "ready",
+            Some(_) => "active",
+            None => "untracked",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ValidatedExplicitWorkerReplan {
+    request: ExplicitWorkerReplanRequest,
+    identity: OutputFrameIdentitySnapshot,
+    ready_at: MonotonicTimestampNs,
+}
+
+impl ValidatedExplicitWorkerReplan {
+    pub(crate) const fn frame_identity(self) -> OutputFrameIdentitySnapshot {
+        self.identity
+    }
+}
+
+pub(crate) fn preflight_explicit_worker_replan(
+    swapchain: &AtomicOutputSwapchain,
+    request: ExplicitWorkerReplanRequest,
+    scene_history: &NativeSceneHistory,
+    frame_pacing: &NativeFramePacing,
+    frame_scheduler: &NativeFrameScheduler,
+    atomic_commit_arbiter: &AtomicCommitArbiter,
+    output_transactions: &OutputTransactionLedger,
+) -> NativeResult<ValidatedExplicitWorkerReplan> {
+    let queued = swapchain
+        .worker_queued_identity()
+        .ok_or_else(|| io::Error::other("explicit worker re-plan has no physical worker owner"))?;
+    let identity = queued.frame;
+    if queued.token != request.token
+        || identity.output_id != request.output_id
+        || identity.transaction_id != request.transaction_id
+        || identity.frame_id != request.frame_id
+        || identity.framebuffer_id.get() != request.framebuffer_id
+        || identity.reservation != request.reservation
+        || request.kind
+            != (AtomicCommitKind::CompositedPrimary {
+                transaction_id: request.transaction_id,
+                frame_id: request.frame_id,
+                framebuffer_id: request.framebuffer_id,
+            })
+    {
+        return Err(io::Error::other(
+            "explicit worker re-plan job does not match its physical owner",
+        )
+        .into());
+    }
+    swapchain.validate_worker_queued_for_replan(
+        request.token,
+        identity,
+        request.submission_fence_available,
+    )?;
+
+    if atomic_commit_arbiter
+        .worker_queued_commit()
+        .is_none_or(|commit| {
+            commit.token != request.token
+                || commit.generation != request.output_epoch.get()
+                || commit.crtc_id != request.crtc_id
+                || commit.kind != request.kind
+                || !matches!(
+                    commit.phase,
+                    AtomicCommitPhase::WorkerQueued { queued_at_ns }
+                        if queued_at_ns == request.queued_at.get()
+                )
+        })
+    {
+        return Err(io::Error::other(
+            "explicit worker re-plan job does not match Atomic arbiter ownership",
+        )
+        .into());
+    }
+
+    let record = output_transactions
+        .transaction(request.transaction_id)
+        .ok_or_else(|| io::Error::other("explicit worker re-plan transaction is missing"))?;
+    let ready_at = match record.state() {
+        OutputTransactionState::Queued {
+            queued_at,
+            worker_generation,
+            predecessor:
+                crate::native_output::presentation::ledger::OutputTransactionQueuedPredecessor::Ready {
+                    ready_at,
+                },
+        } if queued_at == request.queued_at && worker_generation == request.output_epoch.get() => {
+            ready_at
+        }
+        _ => {
+            return Err(io::Error::other(
+                "explicit worker re-plan transaction has no matching READY predecessor",
+            )
+            .into());
+        }
+    };
+    let descriptor = record.descriptor();
+    if descriptor.id() != identity.transaction_id
+        || descriptor.output_id() != identity.output_id
+        || descriptor.output_generation() != request.output_epoch.get()
+        || descriptor.reservation() != identity.reservation
+        || descriptor.composited_frame_identity()
+            != Some((
+                identity.frame_id,
+                identity.render_generation,
+                identity.pool_generation,
+            ))
+        || descriptor.planes().primary()
+            != (PrimaryPlaneAssignment::CompositorFramebuffer {
+                slot: identity.slot,
+                framebuffer_id: request.framebuffer_id,
+            })
+        || descriptor.obligations().frame_batch_id() != Some(identity.protocol_batch_id)
+    {
+        return Err(io::Error::other(
+            "explicit worker re-plan transaction identity does not match its physical frame",
+        )
+        .into());
+    }
+    scene_history
+        .validate_submission_to_ready_rollback(
+            request.token.get(),
+            request.output_id,
+            identity.frame_id,
+            identity.render_generation,
+        )
+        .map_err(io::Error::other)?;
+    frame_pacing
+        .validate_optional_worker_submission_replan(
+            request.pacing_ticket,
+            identity,
+            request.ready_submit,
+        )
+        .map_err(io::Error::other)?;
+    if frame_scheduler.ready_frame_queued() {
+        return Err(io::Error::other("explicit worker re-plan scheduler still owns READY").into());
+    }
+
+    Ok(ValidatedExplicitWorkerReplan {
+        request,
+        identity,
+        ready_at,
+    })
+}
+
+pub(crate) fn restore_explicit_worker_replan(
+    validated: ValidatedExplicitWorkerReplan,
+    swapchain: &mut AtomicOutputSwapchain,
+    submission_fence: &mut Option<std::os::fd::OwnedFd>,
+    cursor_owner: &mut Option<FrozenCursorPlaneOwner>,
+    scene_history: &mut NativeSceneHistory,
+    frame_pacing: &mut NativeFramePacing,
+    frame_scheduler: &mut NativeFrameScheduler,
+    atomic_commit_arbiter: &mut AtomicCommitArbiter,
+    output_transactions: &mut OutputTransactionLedger,
+    now_ns: u64,
+) -> NativeResult<()> {
+    let request = validated.request;
+    let identity = validated.identity;
+    if !swapchain.return_worker_queued_for_replan(request.token, submission_fence, cursor_owner)? {
+        return Err(io::Error::other(
+            "explicit worker re-plan could not return its physical frame",
+        )
+        .into());
+    }
+    if atomic_commit_arbiter
+        .reject_worker_queued(request.token)
+        .is_none()
+    {
+        return Err(
+            io::Error::other("explicit worker re-plan lost Atomic arbiter ownership").into(),
+        );
+    }
+    output_transactions
+        .rollback_queued(request.transaction_id)
+        .map_err(io::Error::other)?;
+    scene_history
+        .rollback_submission_to_ready(
+            request.token.get(),
+            request.output_id,
+            identity.frame_id,
+            identity.render_generation,
+        )
+        .map_err(io::Error::other)?;
+    frame_pacing
+        .replan_optional_worker_submission(
+            request.pacing_ticket,
+            identity,
+            request.ready_submit,
+            now_ns,
+        )
+        .map_err(io::Error::other)?;
+    frame_scheduler.note_ready_frame(identity.reservation.fixed_target());
+
+    if output_transactions
+        .transaction(request.transaction_id)
+        .is_none_or(|record| {
+            record.state()
+                != OutputTransactionState::Ready {
+                    ready_at: validated.ready_at,
+                }
+        })
+    {
+        return Err(io::Error::other(
+            "explicit worker re-plan did not restore the exact READY transaction predecessor",
+        )
+        .into());
+    }
+    validate_reconfiguration_frame_ownership_for_swapchain(
+        swapchain,
+        request.output_epoch,
+        scene_history,
+        frame_pacing,
+        frame_scheduler,
+        output_transactions,
+    )
+}
+
 pub(crate) fn validate_reconfiguration_frame_ownership(
     explicit: &AtomicEglGbmScanout,
     output_epoch: OutputEpochId,
@@ -962,6 +1254,24 @@ pub(crate) fn validate_reconfiguration_frame_ownership(
     output_transactions: &OutputTransactionLedger,
 ) -> NativeResult<()> {
     let swapchain = explicit.swapchain()?;
+    validate_reconfiguration_frame_ownership_for_swapchain(
+        swapchain,
+        output_epoch,
+        scene_history,
+        frame_pacing,
+        frame_scheduler,
+        output_transactions,
+    )
+}
+
+pub(crate) fn validate_reconfiguration_frame_ownership_for_swapchain(
+    swapchain: &AtomicOutputSwapchain,
+    output_epoch: OutputEpochId,
+    scene_history: &NativeSceneHistory,
+    frame_pacing: &NativeFramePacing,
+    frame_scheduler: &NativeFrameScheduler,
+    output_transactions: &OutputTransactionLedger,
+) -> NativeResult<()> {
     let physical_ready = swapchain.ready_identity();
     if let Some(owner) = physical_ready {
         validate_unsubmitted_ready_owners(

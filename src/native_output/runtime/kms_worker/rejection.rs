@@ -306,6 +306,96 @@ fn take_embedded_cursor_owner(
     }
 }
 
+fn preflight_compatibility_replan_scene(
+    job: &KmsCommitJob,
+    scene_history: &NativeSceneHistory,
+    atomic_commit_arbiter: &AtomicCommitArbiter,
+    output_transactions: &OutputTransactionLedger,
+) -> NativeResult<(u64, u64)> {
+    let AtomicCommitKind::CompositedPrimary {
+        transaction_id,
+        frame_id,
+        framebuffer_id,
+    } = job.kind
+    else {
+        return Err(
+            io::Error::other("compatibility worker re-plan is not a composited primary").into(),
+        );
+    };
+    let KmsPrimaryUpdate::Framebuffer { framebuffer, .. } = &job.primary else {
+        return Err(io::Error::other(
+            "compatibility worker re-plan has no primary framebuffer payload",
+        )
+        .into());
+    };
+    if transaction_id != job.transaction_id || framebuffer.get() != framebuffer_id {
+        return Err(
+            io::Error::other("compatibility worker re-plan job identities disagree").into(),
+        );
+    }
+    let record = output_transactions
+        .transaction(job.transaction_id)
+        .ok_or_else(|| io::Error::other("compatibility worker transaction is missing"))?;
+    if !matches!(
+        record.state(),
+        OutputTransactionState::Queued {
+            queued_at,
+            worker_generation,
+            ..
+        } if queued_at == job.queued_at
+            && worker_generation == job.output_epoch.get()
+    ) {
+        return Err(io::Error::other(
+            "compatibility worker transaction is not owned by this queued job",
+        )
+        .into());
+    }
+    let descriptor = record.descriptor();
+    let Some((descriptor_frame_id, render_generation, _pool_generation)) =
+        descriptor.composited_frame_identity()
+    else {
+        return Err(io::Error::other(
+            "compatibility worker transaction has no composited frame identity",
+        )
+        .into());
+    };
+    if descriptor.id() != job.transaction_id
+        || descriptor.output_id() != job.output_id
+        || descriptor.output_generation() != job.output_epoch.get()
+        || descriptor.reservation() != job.reservation
+        || descriptor_frame_id != frame_id
+        || descriptor.planes().primary()
+            != (PrimaryPlaneAssignment::CompatibilityFramebuffer { framebuffer_id })
+        || !matches!(
+            atomic_commit_arbiter.worker_queued_commit(),
+            Some(commit)
+                if commit.token == job.token
+                    && commit.generation == job.output_epoch.get()
+                    && commit.crtc_id == job.crtc_id
+                    && commit.kind == job.kind
+                    && matches!(
+                        commit.phase,
+                        AtomicCommitPhase::WorkerQueued { queued_at_ns }
+                            if queued_at_ns == job.queued_at.get()
+                    )
+        )
+    {
+        return Err(io::Error::other(
+            "compatibility worker re-plan transaction or arbiter identity mismatch",
+        )
+        .into());
+    }
+    if scene_history.submitted_identity(job.token.get())
+        != Some((job.output_id, frame_id, render_generation))
+    {
+        return Err(io::Error::other(
+            "compatibility worker re-plan has no matching submitted scene",
+        )
+        .into());
+    }
+    Ok((frame_id, render_generation))
+}
+
 impl NativeRuntime {
     pub(super) fn replan_invalidated_worker_job(
         &mut self,
@@ -326,6 +416,83 @@ impl NativeRuntime {
                         PrimaryPlaneAssignment::CompatibilityFramebuffer { .. }
                     )
                 });
+        let explicit_request = if matches!(job.kind, AtomicCommitKind::CompositedPrimary { .. })
+            && !compatibility_primary
+        {
+            match super::super::cycle::ExplicitWorkerReplanRequest::from_job(&job) {
+                Ok(request) => Some(request),
+                Err(error) => {
+                    self.emergency_quarantined_worker_jobs.push(job);
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
+        let explicit_validated = if let Some(request) = explicit_request {
+            let crate::native_output::scanout::NativeScanoutBackend::AtomicEglGbm(explicit) =
+                &*self.scanout
+            else {
+                self.emergency_quarantined_worker_jobs.push(job);
+                return Err(io::Error::other(
+                    "explicit worker re-plan requires Atomic EGL/GBM scanout",
+                )
+                .into());
+            };
+            let swapchain = match explicit.swapchain() {
+                Ok(swapchain) => swapchain,
+                Err(error) => {
+                    self.emergency_quarantined_worker_jobs.push(job);
+                    return Err(error.into());
+                }
+            };
+            let preflight = super::super::cycle::preflight_explicit_worker_replan(
+                swapchain,
+                request,
+                &self.scene_history,
+                &self.frame_pacing,
+                &self.frame_scheduler,
+                &self.atomic_commit_arbiter,
+                &self.output_transactions,
+            );
+            match preflight {
+                Ok(validated) => Some(validated),
+                Err(error) => {
+                    self.emergency_quarantined_worker_jobs.push(job);
+                    return Err(io::Error::other(error.to_string()).into());
+                }
+            }
+        } else {
+            None
+        };
+        let compatibility_scene_identity = if compatibility_primary {
+            let preflight = preflight_compatibility_replan_scene(
+                &job,
+                &self.scene_history,
+                &self.atomic_commit_arbiter,
+                &self.output_transactions,
+            );
+            match preflight {
+                Ok(identity) => Some(identity),
+                Err(error) => {
+                    self.emergency_quarantined_worker_jobs.push(job);
+                    return Err(io::Error::other(error.to_string()).into());
+                }
+            }
+        } else {
+            None
+        };
+        let explicit_replan_now_ns = if explicit_validated.is_some() {
+            match monotonic_now_ns() {
+                Ok(now_ns) => Some(now_ns),
+                Err(error) => {
+                    self.emergency_quarantined_worker_jobs.push(job);
+                    return Err(error.into());
+                }
+            }
+        } else {
+            None
+        };
         if let AtomicCommitKind::PlaneDelta { cursor_epoch, .. } = job.kind {
             let cursor = self
                 .atomic_cursor
@@ -333,9 +500,10 @@ impl NativeRuntime {
                 .ok_or_else(|| io::Error::other("invalidated cursor job has no cursor"))?;
             cursor.cancel_worker_submission(job.transaction_id, job.token, cursor_epoch)?;
             self.cursor_output_arbitration.clear_pending();
-        } else if !self
-            .frame_pacing
-            .cancel_worker_submission(job.pacing_ticket)
+        } else if explicit_validated.is_none()
+            && !self
+                .frame_pacing
+                .cancel_worker_submission(job.pacing_ticket)
         {
             return Err(io::Error::other("invalidated worker pacing identity mismatch").into());
         }
@@ -361,10 +529,17 @@ impl NativeRuntime {
         let mut cursor_owner = if matches!(job.kind, AtomicCommitKind::CompositedPrimary { .. })
             && !compatibility_primary
         {
-            take_embedded_cursor_owner(&mut job)?
+            match take_embedded_cursor_owner(&mut job) {
+                Ok(owner) => owner,
+                Err(error) => {
+                    self.emergency_quarantined_worker_jobs.push(job);
+                    return Err(error);
+                }
+            }
         } else {
             None
         };
+        let mut explicit_scene_restored = false;
         if matches!(job.kind, AtomicCommitKind::CompositedPrimary { .. }) {
             if compatibility_primary {
                 let mut no_submission_fence = None;
@@ -375,23 +550,47 @@ impl NativeRuntime {
                         &mut cursor_owner,
                     )
                     .map_err(io::Error::other)?;
+                let (frame_id, render_generation) = compatibility_scene_identity
+                    .expect("compatibility scene identity was preflighted");
+                self.scene_history
+                    .discard_submission_exact(
+                        job.token.get(),
+                        job.output_id,
+                        frame_id,
+                        render_generation,
+                    )
+                    .map_err(io::Error::other)?;
             } else {
+                let validated =
+                    explicit_validated.expect("explicit worker ownership was preflighted");
+                let crate::native_output::scanout::NativeScanoutBackend::AtomicEglGbm(explicit) =
+                    &mut *self.scanout
+                else {
+                    return Err(io::Error::other(
+                        "explicit worker re-plan scanout changed after preflight",
+                    )
+                    .into());
+                };
                 let result = match &mut job.primary {
                     KmsPrimaryUpdate::Framebuffer { in_fence, .. } => {
-                        self.scanout.return_worker_submission_for_replan(
-                            job.token,
+                        let swapchain = explicit.swapchain_mut()?;
+                        super::super::cycle::restore_explicit_worker_replan(
+                            validated,
+                            swapchain,
                             in_fence,
                             &mut cursor_owner,
+                            &mut self.scene_history,
+                            &mut self.frame_pacing,
+                            &mut self.frame_scheduler,
+                            &mut self.atomic_commit_arbiter,
+                            &mut self.output_transactions,
+                            explicit_replan_now_ns.expect("explicit re-plan timestamp exists"),
                         )
                     }
-                    KmsPrimaryUpdate::Unchanged => {
-                        let mut no_submission_fence = None;
-                        self.scanout.return_worker_submission_for_replan(
-                            job.token,
-                            &mut no_submission_fence,
-                            &mut cursor_owner,
-                        )
-                    }
+                    KmsPrimaryUpdate::Unchanged => Err(io::Error::other(
+                        "explicit worker re-plan has no primary input fence",
+                    )
+                    .into()),
                 };
                 if let Err(error) = result {
                     if let Some(owner) = cursor_owner.take() {
@@ -399,21 +598,24 @@ impl NativeRuntime {
                         job.cursor_pin = owner.pin;
                     }
                     self.emergency_quarantined_worker_jobs.push(job);
-                    return Err(io::Error::other(error).into());
+                    return Err(io::Error::other(error.to_string()).into());
                 }
+                explicit_scene_restored = true;
             }
         }
 
-        if self
-            .atomic_commit_arbiter
-            .reject_worker_queued(job.token)
-            .is_none()
-        {
-            return Err(io::Error::other("invalidated worker Atomic identity mismatch").into());
+        if !explicit_scene_restored {
+            if self
+                .atomic_commit_arbiter
+                .reject_worker_queued(job.token)
+                .is_none()
+            {
+                return Err(io::Error::other("invalidated worker Atomic identity mismatch").into());
+            }
+            self.output_transactions
+                .rollback_queued(job.transaction_id)
+                .map_err(io::Error::other)?;
         }
-        self.output_transactions
-            .rollback_queued(job.transaction_id)
-            .map_err(io::Error::other)?;
         if let Some(sidecar_transaction_id) = sidecar_transaction_id
             && let Some(sidecar) = self.output_transactions.transaction(sidecar_transaction_id)
             && matches!(
@@ -436,11 +638,37 @@ impl NativeRuntime {
             )?;
         }
         self.perf.log("native.kms_commit_worker", || {
-            vec![
+            let mut fields = vec![
                 NativePerfField::str("event", "validation_base_invalidated_replanned"),
                 NativePerfField::u64("transaction_id", job.transaction_id.get()),
                 NativePerfField::u64("token", job.token.get()),
-            ]
+                NativePerfField::u64("old_token", job.token.get()),
+                NativePerfField::str(
+                    "pacing_origin",
+                    explicit_request.map_or_else(
+                        || match job.pacing_ticket {
+                            Some(ticket) if ticket.ready_submit() => "ready",
+                            Some(_) => "active",
+                            None => "untracked",
+                        },
+                        |request| request.pacing_origin(),
+                    ),
+                ),
+                NativePerfField::bool("scene_restored", explicit_scene_restored),
+                NativePerfField::bool("scheduler_ready", self.frame_scheduler.ready_frame_queued()),
+            ];
+            if let Some(validated) = explicit_validated {
+                let identity = validated.frame_identity();
+                fields.push(NativePerfField::u64("frame_id", identity.frame_id));
+                fields.push(NativePerfField::u64(
+                    "render_generation",
+                    identity.render_generation,
+                ));
+            } else if let Some((frame_id, render_generation)) = compatibility_scene_identity {
+                fields.push(NativePerfField::u64("frame_id", frame_id));
+                fields.push(NativePerfField::u64("render_generation", render_generation));
+            }
+            fields
         });
         Ok(())
     }

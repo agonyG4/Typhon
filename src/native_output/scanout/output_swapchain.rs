@@ -1047,39 +1047,15 @@ impl AtomicOutputSwapchain {
         submission_fence: &mut Option<OwnedFd>,
         cursor_owner: &mut Option<FrozenCursorPlaneOwner>,
     ) -> io::Result<bool> {
-        if self.quarantine.is_some() {
-            return Err(io::Error::other(
-                "cannot re-plan an output while a slot is quarantined",
-            ));
-        }
-        if self.ready.is_some() {
-            return Err(io::Error::other(
-                "cannot return worker output while another frame is ready",
-            ));
-        }
         let Some(queued) = self.worker_queued.as_ref() else {
             return Ok(false);
         };
-        if queued.token != token {
-            return Err(io::Error::other(
-                "re-planned worker output token does not match queued ownership",
-            ));
-        }
-        if queued.frame.pool_generation != self.pool_generation {
-            return Err(io::Error::other(
-                "re-planned worker output frame belongs to an old pool generation",
-            ));
-        }
-        if queued.frame.frozen_cursor_plane_owner.is_some() {
-            return Err(io::Error::other(
-                "re-planned worker output frame already owns a frozen cursor",
-            ));
-        }
-        if submission_fence.is_none() {
-            return Err(io::Error::other(
-                "re-planned worker output is missing its input fence",
-            ));
-        }
+        let expected_identity = (&queued.frame).into();
+        self.validate_worker_queued_for_replan(
+            token,
+            expected_identity,
+            submission_fence.is_some(),
+        )?;
         let mut queued = self
             .worker_queued
             .take()
@@ -1095,6 +1071,62 @@ impl AtomicOutputSwapchain {
         queued.frame.frozen_cursor_plane_owner = cursor_owner.take();
         self.ready = Some(queued.frame);
         Ok(true)
+    }
+
+    pub(crate) fn validate_worker_queued_for_replan(
+        &self,
+        token: PageFlipToken,
+        expected_identity: OutputFrameIdentitySnapshot,
+        submission_fence_available: bool,
+    ) -> io::Result<()> {
+        if self.quarantine.is_some() {
+            return Err(io::Error::other(
+                "cannot re-plan an output while a slot is quarantined",
+            ));
+        }
+        if self.ready.is_some() {
+            return Err(io::Error::other(
+                "cannot return worker output while another frame is ready",
+            ));
+        }
+        let queued = self
+            .worker_queued
+            .as_ref()
+            .ok_or_else(|| io::Error::other("re-planned worker output has no queued owner"))?;
+        if queued.token != token {
+            return Err(io::Error::other(
+                "re-planned worker output token does not match queued ownership",
+            ));
+        }
+        let current_identity: OutputFrameIdentitySnapshot = (&queued.frame).into();
+        if current_identity != expected_identity {
+            return Err(io::Error::other(
+                "re-planned worker output identity does not match queued ownership",
+            ));
+        }
+        if queued.frame.pool_generation != self.pool_generation {
+            return Err(io::Error::other(
+                "re-planned worker output frame belongs to an old pool generation",
+            ));
+        }
+        if queued.frame.frozen_cursor_plane_owner.is_some() {
+            return Err(io::Error::other(
+                "re-planned worker output frame already owns a frozen cursor",
+            ));
+        }
+        if !submission_fence_available {
+            return Err(io::Error::other(
+                "re-planned worker output is missing its input fence",
+            ));
+        }
+        self.ensure_suspendable()?;
+        if self.suspended_slot_id(queued.frame.slot).is_some() {
+            return Err(io::Error::other(
+                "re-planned worker output slot is already suspend-owned",
+            ));
+        }
+        self.empty_suspended_slot_index()?;
+        Ok(())
     }
 
     pub(crate) fn fail_worker_queued(
