@@ -919,6 +919,9 @@ fn planned_cursor_update(
 pub(super) struct WorkerPrimarySubmissionContext<'a> {
     atomic_cursor: Option<&'a NativeAtomicCursor>,
     frame_pacing: &'a mut NativeFramePacing,
+    frame_scheduler: &'a mut NativeFrameScheduler,
+    scene_history: &'a mut NativeSceneHistory,
+    perf: &'a NativePerfLogger,
     validation_base: KmsValidationBase,
     cursor_delivery: crate::native_output::presentation::plane::PresentedCursorDelivery,
     primary_cursor_presentation: KmsPrimaryCursorPresentation,
@@ -927,6 +930,9 @@ pub(super) struct WorkerPrimarySubmissionContext<'a> {
 pub(super) fn worker_ctx<'a>(
     atomic_cursor: Option<&'a NativeAtomicCursor>,
     frame_pacing: &'a mut NativeFramePacing,
+    frame_scheduler: &'a mut NativeFrameScheduler,
+    scene_history: &'a mut NativeSceneHistory,
+    perf: &'a NativePerfLogger,
     validation_base: KmsValidationBase,
     cursor_delivery: crate::native_output::presentation::plane::PresentedCursorDelivery,
     primary_cursor_presentation: KmsPrimaryCursorPresentation,
@@ -934,6 +940,9 @@ pub(super) fn worker_ctx<'a>(
     WorkerPrimarySubmissionContext {
         atomic_cursor,
         frame_pacing,
+        frame_scheduler,
+        scene_history,
+        perf,
         validation_base,
         cursor_delivery,
         primary_cursor_presentation,
@@ -1318,8 +1327,8 @@ pub(super) fn queue_explicit_ready_for_presentation(
     test_policy: KmsCommitTestPolicy,
     ready_submit: bool,
     validation_base: KmsValidationBase,
-) -> NativeResult<Option<(u64, u32, OutputTransactionId)>> {
-    match queue_explicit_composited_frame(
+) -> NativeResult<WorkerQueueOutcome> {
+    let outcome = queue_explicit_composited_frame(
         worker,
         explicit,
         server,
@@ -1336,17 +1345,50 @@ pub(super) fn queue_explicit_ready_for_presentation(
         test_policy,
         ready_submit,
         validation_base,
-    )? {
-        WorkerQueueOutcome::Queued {
-            transaction_id,
-            token,
-            framebuffer_id,
-        } => Ok(Some((token.get(), framebuffer_id.get(), transaction_id))),
-        WorkerQueueOutcome::Unavailable(_) => Ok(None),
+    )?;
+    match outcome {
+        WorkerQueueOutcome::Queued { .. } | WorkerQueueOutcome::Unavailable(_) => Ok(outcome),
         WorkerQueueOutcome::CursorQueued { .. } | WorkerQueueOutcome::SidecarQueued { .. } => Err(
             io::Error::other("composited worker admission returned a cursor queue result").into(),
         ),
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ExplicitSubmissionTransport {
+    Synchronous,
+    WorkerQueued,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ExplicitReadySubmissionOutcome {
+    Submitted {
+        token: u64,
+        framebuffer_id: u32,
+        transaction_id: OutputTransactionId,
+        transport: ExplicitSubmissionTransport,
+    },
+    AdmissionDeferred {
+        reason: KmsWorkerAdmissionError,
+    },
+    VariableRetryRequired {
+        owner: OutputFrameIdentitySnapshot,
+        rejection: VariableRetryRejection,
+    },
+}
+
+pub(super) fn defer_explicit_worker_submission(
+    frame_pacing: &mut NativeFramePacing,
+    pacing_ticket: Option<WorkerPacingTicket>,
+    reason: KmsWorkerAdmissionError,
+) -> NativeResult<ExplicitReadySubmissionOutcome> {
+    if pacing_ticket.is_some() && !frame_pacing.defer_worker_submission(pacing_ticket) {
+        return Err(io::Error::other(
+            "deferred explicit worker admission lost its pacing identity",
+        )
+        .into());
+    }
+    Ok(ExplicitReadySubmissionOutcome::AdmissionDeferred { reason })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1366,7 +1408,7 @@ pub(super) fn submit_explicit_ready_for_presentation(
     ready_submit: bool,
     cursor_reveal_trace: &mut Option<CursorRevealTraceLedger>,
     vrr_policy: VrrPolicy,
-) -> NativeResult<Option<(u64, u32, OutputTransactionId, bool)>> {
+) -> NativeResult<ExplicitReadySubmissionOutcome> {
     if worker_mode {
         let worker = worker.ok_or_else(|| io::Error::other("worker transport has no worker"))?;
         let frozen_cursor_plan = explicit
@@ -1421,9 +1463,39 @@ pub(super) fn submit_explicit_ready_for_presentation(
             ready_submit,
             context.validation_base,
         ) {
-            Ok(result) => result.map(|(token, framebuffer_id, transaction_id)| {
-                (token, framebuffer_id, transaction_id, true)
-            }),
+            Ok(WorkerQueueOutcome::Queued {
+                transaction_id,
+                token,
+                framebuffer_id,
+            }) => ExplicitReadySubmissionOutcome::Submitted {
+                token: token.get(),
+                framebuffer_id: framebuffer_id.get(),
+                transaction_id,
+                transport: ExplicitSubmissionTransport::WorkerQueued,
+            },
+            Ok(WorkerQueueOutcome::Unavailable(reason)) => {
+                return defer_explicit_worker_submission(
+                    context.frame_pacing,
+                    pacing_ticket,
+                    reason,
+                );
+            }
+            Ok(
+                WorkerQueueOutcome::CursorQueued { .. } | WorkerQueueOutcome::SidecarQueued { .. },
+            ) => {
+                if pacing_ticket.is_some()
+                    && !context.frame_pacing.cancel_worker_submission(pacing_ticket)
+                {
+                    return Err(io::Error::other(
+                        "unexpected explicit worker queue result left pacing ownership",
+                    )
+                    .into());
+                }
+                return Err(io::Error::other(
+                    "composited worker admission returned a cursor queue result",
+                )
+                .into());
+            }
             Err(error) => {
                 if pacing_ticket.is_some()
                     && !context.frame_pacing.cancel_worker_submission(pacing_ticket)
@@ -1436,15 +1508,6 @@ pub(super) fn submit_explicit_ready_for_presentation(
                 return Err(error);
             }
         };
-        if result.is_none()
-            && pacing_ticket.is_some()
-            && !context.frame_pacing.cancel_worker_submission(pacing_ticket)
-        {
-            return Err(io::Error::other(
-                "unavailable explicit worker submission pacing identity mismatch",
-            )
-            .into());
-        }
         return Ok(result);
     }
     let trace_snapshot = explicit.swapchain()?.ready_cursor_trace_reveal();
@@ -1459,15 +1522,33 @@ pub(super) fn submit_explicit_ready_for_presentation(
         });
     }
     let (token, framebuffer_id, transaction_id) =
-        match explicit.submit_ready_frame(kms_backend, server, output_transactions, vrr_policy) {
-            Ok(submitted) => submitted,
-            Err(error)
-                if error.kind() == io::ErrorKind::WouldBlock
-                    && explicit.swapchain()?.has_suspended_frame() =>
-            {
-                return Ok(None);
+        match explicit.submit_ready_frame(kms_backend, server, output_transactions, vrr_policy)? {
+            AtomicReadySubmissionOutcome::Submitted {
+                token,
+                framebuffer_id,
+                transaction_id,
+            } => (token, framebuffer_id, transaction_id),
+            AtomicReadySubmissionOutcome::VariableRetryRequired { owner, rejection } => {
+                let output_epoch = OutputEpochId::new(output_generation)
+                    .ok_or_else(|| io::Error::other("Variable retry has no output epoch"))?;
+                super::cycle::terminalize_suspended_frame_for_variable_retry(
+                    explicit.swapchain_mut()?,
+                    owner,
+                    output_epoch,
+                    context.scene_history,
+                    context.frame_pacing,
+                    context.frame_scheduler,
+                    server,
+                    output_transactions,
+                    MonotonicTimestampNs::new(monotonic_now_ns()?),
+                    rejection,
+                    context.perf,
+                )?;
+                return Ok(ExplicitReadySubmissionOutcome::VariableRetryRequired {
+                    owner,
+                    rejection,
+                });
             }
-            Err(error) => return Err(error.into()),
         };
     if let Some(snapshot) = trace_snapshot
         && let Some(ledger) = cursor_reveal_trace.as_mut()
@@ -1483,7 +1564,12 @@ pub(super) fn submit_explicit_ready_for_presentation(
             snapshot,
         );
     }
-    Ok(Some((token, framebuffer_id, transaction_id, false)))
+    Ok(ExplicitReadySubmissionOutcome::Submitted {
+        token,
+        framebuffer_id,
+        transaction_id,
+        transport: ExplicitSubmissionTransport::Synchronous,
+    })
 }
 
 fn kms_primary_cursor_presentation(
@@ -1599,7 +1685,6 @@ pub(super) fn finish_direct_worker_queued(
     output_transactions: &mut OutputTransactionLedger,
     atomic_commit_arbiter: &mut AtomicCommitArbiter,
     presentation_trace: &mut PresentationTransactionTraceRing,
-    frame_scheduler: &mut NativeFrameScheduler,
     _cursor_output_arbitration: &mut NativeCursorOutputArbitration,
     effective_cursor: Option<&AtomicCursorVisualState>,
     cursor_revision: Option<CursorRevision>,
@@ -1742,7 +1827,7 @@ pub(super) fn finish_direct_worker_queued(
                 worker,
                 guard,
                 job,
-                frame_scheduler,
+                context.frame_scheduler,
                 atomic_commit_arbiter,
                 scanout,
                 reason,
@@ -1780,7 +1865,7 @@ pub(super) fn finish_direct_worker_queued(
                 worker,
                 guard,
                 job,
-                frame_scheduler,
+                context.frame_scheduler,
                 atomic_commit_arbiter,
                 scanout,
                 reason,
@@ -1818,7 +1903,7 @@ pub(super) fn finish_direct_worker_queued(
                 worker,
                 guard,
                 job,
-                frame_scheduler,
+                context.frame_scheduler,
                 atomic_commit_arbiter,
                 scanout,
                 reason,
@@ -1871,7 +1956,7 @@ pub(super) fn finish_direct_worker_queued(
                 worker,
                 guard,
                 returned_job,
-                frame_scheduler,
+                context.frame_scheduler,
                 atomic_commit_arbiter,
                 scanout,
                 reason,

@@ -125,6 +125,9 @@ mod worker;
 
 #[path = "atomic_egl_gbm_transactions.rs"]
 mod atomic_egl_gbm_transactions;
+pub(crate) use atomic_egl_gbm_transactions::{
+    AtomicReadySubmissionOutcome, VariableRetryRejection,
+};
 
 pub(crate) struct AtomicEglGbmScanout {
     _physical_device: Option<gbm::Device<std::os::fd::OwnedFd>>,

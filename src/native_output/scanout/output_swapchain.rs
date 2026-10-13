@@ -889,6 +889,26 @@ impl AtomicOutputSwapchain {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_ready_variable_presentation_for_test(
+        &mut self,
+        reservation: crate::native_output::presentation::transaction::VariablePresentationReservation,
+        presentation_timing: KmsPresentationTiming,
+    ) -> io::Result<()> {
+        if !matches!(presentation_timing, KmsPresentationTiming::Variable { .. }) {
+            return Err(io::Error::other(
+                "test Variable reservation requires Variable KMS timing",
+            ));
+        }
+        let ready = self
+            .ready
+            .as_mut()
+            .ok_or_else(|| io::Error::other("no rendered output frame is ready"))?;
+        ready.reservation = FramePresentationReservation::Variable(reservation);
+        ready.presentation_timing = presentation_timing;
+        Ok(())
+    }
+
     pub(crate) fn submit_ready(
         &mut self,
         token: PageFlipToken,
@@ -1413,6 +1433,15 @@ impl AtomicOutputSwapchain {
             .iter()
             .flatten()
             .any(|suspended| suspended.abandoned_frame.is_some())
+    }
+
+    pub(crate) fn contains_suspended_frame(&self, expected: OutputFrameIdentitySnapshot) -> bool {
+        self.suspended.iter().flatten().any(|suspended| {
+            suspended
+                .abandoned_frame
+                .as_ref()
+                .is_some_and(|frame| OutputFrameIdentitySnapshot::from(frame) == expected)
+        })
     }
 
     pub(crate) fn retire_pending_after_recovery(&mut self) -> Option<RenderedOutputFrame> {

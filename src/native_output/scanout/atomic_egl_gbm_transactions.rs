@@ -1,10 +1,26 @@
 use super::*;
-use crate::native_output::runtime::{
-    restore_presentation_feedback_obligation, settle_dropped_output_transaction,
-    settle_failed_output_transaction,
-};
+use crate::native_output::runtime::settle_failed_output_transaction;
 use oblivion_one::native::kms::AtomicFlipRequest;
 use oblivion_one::native::sync_file::SyncFileDeadlineHint;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VariableRetryRejection {
+    TestOnly,
+    RealSubmit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AtomicReadySubmissionOutcome {
+    Submitted {
+        token: u64,
+        framebuffer_id: u32,
+        transaction_id: OutputTransactionId,
+    },
+    VariableRetryRequired {
+        owner: OutputFrameIdentitySnapshot,
+        rejection: VariableRetryRejection,
+    },
+}
 
 const ADAPTIVE_ASYNC_FALLBACKS: &[OutputPresentationMode] = &[
     OutputPresentationMode::AdaptiveSync,
@@ -13,28 +29,6 @@ const ADAPTIVE_ASYNC_FALLBACKS: &[OutputPresentationMode] = &[
 ];
 const FIXED_REFRESH_FALLBACK: &[OutputPresentationMode] = &[OutputPresentationMode::Vsync];
 const NO_PRESENTATION_FALLBACKS: &[OutputPresentationMode] = &[];
-
-fn settle_variable_rejection_for_retry(
-    server: &mut OwnCompositorServer,
-    output_transactions: &mut OutputTransactionLedger,
-    transaction_id: OutputTransactionId,
-) -> io::Result<()> {
-    settle_dropped_output_transaction(
-        output_transactions,
-        transaction_id,
-        crate::native_output::presentation::ledger::OutputTransactionDropReason::SafeAbandonment,
-        MonotonicTimestampNs::new(monotonic_now_ns()?),
-        |obligations| {
-            restore_presentation_feedback_obligation(server, obligations);
-            let batch_id = obligations.frame_batch_id().ok_or_else(|| {
-                io::Error::other("rejected Variable transaction has no compositor frame batch")
-            })?;
-            server.restore_frame_batch_after_render_failure(batch_id);
-            Ok(())
-        },
-    )
-    .map_err(|error| io::Error::other(error.to_string()))
-}
 
 fn presentation_fallback_candidates(
     mode: OutputPresentationMode,
@@ -199,7 +193,7 @@ impl AtomicEglGbmScanout {
         server: &mut OwnCompositorServer,
         output_transactions: &mut OutputTransactionLedger,
         vrr_policy: VrrPolicy,
-    ) -> io::Result<(u64, u32, OutputTransactionId)> {
+    ) -> io::Result<AtomicReadySubmissionOutcome> {
         let ready_identity = self
             .swapchain()?
             .ready_identity()
@@ -332,15 +326,10 @@ impl AtomicEglGbmScanout {
                         "rejected Variable READY ownership disappeared before suspension",
                     ));
                 }
-                settle_variable_rejection_for_retry(
-                    server,
-                    output_transactions,
-                    ready_transaction_id,
-                )?;
-                return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "Variable AdaptiveSync test-only validation was rejected; retrying fixed",
-                ));
+                return Ok(AtomicReadySubmissionOutcome::VariableRetryRequired {
+                    owner: ready_identity,
+                    rejection: VariableRetryRejection::TestOnly,
+                });
             }
             let qualified_modes: Vec<_> =
                 qualified_fallbacks.iter().map(|(mode, _)| *mode).collect();
@@ -526,13 +515,13 @@ impl AtomicEglGbmScanout {
                 output_generation,
                 "variable_real_submit_rejected_retry_fixed",
             );
+            let owner = OutputFrameIdentitySnapshot::from(&frame);
             self.swapchain_mut()?
                 .suspend_failed_submission(frame, &mut retry_fence)?;
-            settle_variable_rejection_for_retry(server, output_transactions, transaction_id)?;
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "Variable AdaptiveSync submit was rejected; retrying in fixed mode",
-            ));
+            return Ok(AtomicReadySubmissionOutcome::VariableRetryRequired {
+                owner,
+                rejection: VariableRetryRejection::RealSubmit,
+            });
         }
         if let Err(error) = &submission
             && error.kind == AtomicKmsErrorKind::FlipRejected
@@ -717,7 +706,11 @@ impl AtomicEglGbmScanout {
                 output_transactions
                     .mark_submitted(transaction_id, token, submit_returned_at)
                     .map_err(io::Error::other)?;
-                Ok((token.get(), framebuffer.get(), transaction_id))
+                Ok(AtomicReadySubmissionOutcome::Submitted {
+                    token: token.get(),
+                    framebuffer_id: framebuffer.get(),
+                    transaction_id,
+                })
             }
             Err(error) => {
                 if presentation_mode != OutputPresentationMode::Vsync

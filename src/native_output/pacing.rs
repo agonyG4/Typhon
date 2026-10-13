@@ -1861,6 +1861,13 @@ pub(crate) struct WorkerPacingTicket {
     physical_key: Option<OutputFrameKey>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnsubmittedPhysicalFrameLane {
+    Active,
+    Ready,
+    Untracked,
+}
+
 impl WorkerPacingTicket {
     pub(crate) const fn reservation_id(self) -> WorkerPacingReservationId {
         self.reservation_id
@@ -3090,6 +3097,22 @@ impl NativeFramePacing {
             .or(self.active_physical_identity)
     }
 
+    pub(crate) fn unsubmitted_physical_frame_lane(
+        &self,
+        physical_identity: OutputFrameIdentitySnapshot,
+    ) -> Option<UnsubmittedPhysicalFrameLane> {
+        if !self.enabled {
+            return Some(UnsubmittedPhysicalFrameLane::Untracked);
+        }
+        if self.ready.is_some() && self.ready_physical_identity == Some(physical_identity) {
+            return Some(UnsubmittedPhysicalFrameLane::Ready);
+        }
+        if self.active.is_some() && self.active_physical_identity == Some(physical_identity) {
+            return Some(UnsubmittedPhysicalFrameLane::Active);
+        }
+        None
+    }
+
     pub(crate) fn active_physical_identity(&self) -> Option<OutputFrameIdentitySnapshot> {
         self.active_physical_identity
     }
@@ -3848,6 +3871,35 @@ impl NativeFramePacing {
         self.log(
             "worker_submit_cancelled",
             Self::worker_ticket_fields(reservation),
+        );
+        true
+    }
+
+    /// Release a reservation when worker admission did not move the physical
+    /// READY frame. Preserve the exact active/READY pacing owner for retry.
+    pub(crate) fn defer_worker_submission(&mut self, ticket: Option<WorkerPacingTicket>) -> bool {
+        if !self.enabled {
+            return true;
+        }
+        let Some(ticket) = ticket else {
+            return true;
+        };
+        let Some(reservation) = self.worker_reservation else {
+            return false;
+        };
+        if reservation.reservation_id() != ticket.reservation_id() {
+            return false;
+        }
+        self.worker_reservation = None;
+        if self.active_worker_reservation_id == Some(ticket.reservation_id()) {
+            self.active_worker_reservation_id = None;
+        }
+        if self.ready_worker_reservation_id == Some(ticket.reservation_id()) {
+            self.ready_worker_reservation_id = None;
+        }
+        self.log(
+            "worker_admission_deferred",
+            Self::worker_ticket_fields(ticket),
         );
         true
     }

@@ -1207,6 +1207,15 @@ impl NativeRuntime {
                     *queued_redraw_requested = true;
                     return Ok(());
                 }
+                super::presentation_ready::ReadySubmissionResult::AdmissionDeferred => {
+                    return Ok(());
+                }
+                super::presentation_ready::ReadySubmissionResult::VariableRetryRequired => {
+                    presentation_deadline.clear_scheduled_target();
+                    *scheduled_presentation_target = None;
+                    *queued_redraw_requested = true;
+                    return Ok(());
+                }
             }
         } else if matches!(
             scheduler_decision,
@@ -1395,13 +1404,15 @@ impl NativeRuntime {
                                 output_transactions,
                                 atomic_commit_arbiter,
                                 presentation_trace,
-                                frame_scheduler,
                                 cursor_output_arbitration,
                                 effective_cursor.as_ref(),
                                 cursor_revision,
                                 worker_ctx(
                                     atomic_cursor.as_ref(),
                                     frame_pacing,
+                                    frame_scheduler,
+                                    scene_history,
+                                    &perf,
                                     validation_base,
                                     planned_cursor_delivery,
                                     primary_cursor,
@@ -2113,12 +2124,7 @@ impl NativeRuntime {
                                         return Ok(());
                                     }
                                     #[rustfmt::skip] let validation_base = require_validation_base!(validation_base_context, queued_redraw_requested);
-                                    let Some((
-                                        token,
-                                        framebuffer_id,
-                                        transaction_id,
-                                        worker_queued,
-                                    )) = submit_explicit_ready_for_presentation(
+                                    let explicit_outcome = submit_explicit_ready_for_presentation(
                                         worker_mode,
                                         kms_commit_worker.as_ref(),
                                         explicit,
@@ -2133,6 +2139,9 @@ impl NativeRuntime {
                                         worker_ctx(
                                             atomic_cursor.as_ref(),
                                             frame_pacing,
+                                            frame_scheduler,
+                                            scene_history,
+                                            &perf,
                                             validation_base,
                                             planned_cursor_delivery,
                                             primary_cursor,
@@ -2140,11 +2149,45 @@ impl NativeRuntime {
                                         false,
                                         cursor_reveal_trace,
                                         vrr_policy,
-                                    )?
-                                    else {
-                                        server.note_frame_callback_admission_failure(protocol_batch_id);
-                                        *queued_redraw_requested = true;
-                                        return Ok(());
+                                    )?;
+                                    let (token, framebuffer_id, transaction_id, worker_queued) =
+                                        match explicit_outcome {
+                                            super::presentation_worker::ExplicitReadySubmissionOutcome::Submitted {
+                                                token,
+                                                framebuffer_id,
+                                                transaction_id,
+                                                transport,
+                                            } => (
+                                                token,
+                                                framebuffer_id,
+                                                transaction_id,
+                                                transport == super::presentation_worker::ExplicitSubmissionTransport::WorkerQueued,
+                                            ),
+                                            super::presentation_worker::ExplicitReadySubmissionOutcome::AdmissionDeferred {
+                                                reason: _,
+                                            } => {
+                                                server.note_frame_callbacks_deferred_ready(protocol_batch_id);
+                                                frame_pacing.note_ready_frame(monotonic_now_ns()?, false);
+                                                frame_scheduler.note_ready_frame(prepared_reservation.fixed_target());
+                                                return Ok(());
+                                            }
+                                            super::presentation_worker::ExplicitReadySubmissionOutcome::VariableRetryRequired {
+                                                owner: _,
+                                                rejection: _,
+                                            } => {
+                                                if output_render_fence_token.is_none()
+                                                    && let Some(fd) = explicit.suspended_fence_fd()?
+                                                {
+                                                    *output_render_fence_token = Some(
+                                                        event_loop.register(
+                                                            fd,
+                                                            NativeEventSource::OutputRenderFence,
+                                                        )?,
+                                                    );
+                                                }
+                                                *queued_redraw_requested = true;
+                                                return Ok(());
+                                            }
                                     };
                                     // This token is the presentation identity
                                     // for the rendered scene. Queue the exact

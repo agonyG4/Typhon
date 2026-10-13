@@ -181,6 +181,8 @@ pub(super) fn ensure_async_render_fence_ready(
 pub(super) enum ReadySubmissionResult {
     Submitted,
     Unavailable,
+    AdmissionDeferred,
+    VariableRetryRequired,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -307,46 +309,54 @@ pub(super) fn submit_ready_frame(
                 }
                 return Ok(ReadySubmissionResult::Unavailable);
             }
-            let Some((token, framebuffer_id, transaction_id, _worker_queued)) =
-                submit_explicit_ready_for_presentation(
-                    worker_mode,
-                    worker,
-                    explicit,
-                    kms_backend,
-                    server,
-                    output_transactions,
-                    atomic_commit_arbiter,
-                    presentation_trace,
+            let explicit_outcome = submit_explicit_ready_for_presentation(
+                worker_mode,
+                worker,
+                explicit,
+                kms_backend,
+                server,
+                output_transactions,
+                atomic_commit_arbiter,
+                presentation_trace,
+                transaction_id,
+                output_generation,
+                crtc_id,
+                worker_ctx(
+                    atomic_cursor.as_ref(),
+                    frame_pacing,
+                    frame_scheduler,
+                    scene_history,
+                    &perf,
+                    validation_base,
+                    cursor_delivery,
+                    primary_cursor_presentation,
+                ),
+                true,
+                cursor_reveal_trace,
+                vrr_policy,
+            )?;
+            let (token, framebuffer_id, transaction_id) = match explicit_outcome {
+                super::presentation_worker::ExplicitReadySubmissionOutcome::Submitted {
+                    token,
+                    framebuffer_id,
                     transaction_id,
-                    output_generation,
-                    crtc_id,
-                    worker_ctx(
-                        atomic_cursor.as_ref(),
-                        frame_pacing,
-                        validation_base,
-                        cursor_delivery,
-                        primary_cursor_presentation,
-                    ),
-                    true,
-                    cursor_reveal_trace,
-                    vrr_policy,
-                )?
-            else {
-                if explicit.swapchain()?.ready_identity().is_none()
-                    && explicit.swapchain()?.has_suspended_frame()
-                {
-                    scene_history.discard_ready();
+                    transport: _,
+                } => (token, framebuffer_id, transaction_id),
+                super::presentation_worker::ExplicitReadySubmissionOutcome::AdmissionDeferred {
+                    reason: _,
+                } => return Ok(ReadySubmissionResult::AdmissionDeferred),
+                super::presentation_worker::ExplicitReadySubmissionOutcome::VariableRetryRequired {
+                    owner: _,
+                    rejection: _,
+                } => {
                     if output_render_fence_token.is_none()
                         && let Some(fd) = explicit.suspended_fence_fd()?
                     {
                         *output_render_fence_token =
                             Some(event_loop.register(fd, NativeEventSource::OutputRenderFence)?);
                     }
+                    return Ok(ReadySubmissionResult::VariableRetryRequired);
                 }
-                if let Some(batch_id) = callback_batch_id {
-                    server.note_frame_callback_admission_failure(batch_id);
-                }
-                return Ok(ReadySubmissionResult::Unavailable);
             };
             // The explicit Atomic path owns the KMS presentation token. Move
             // the exact rendered scene from ready to submitted only after the

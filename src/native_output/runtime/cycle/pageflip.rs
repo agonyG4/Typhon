@@ -4,7 +4,8 @@ use super::super::presentation_cursor::trace_presented_cursor;
 use super::super::presentation_transactions::{
     commit_prepared_presented_output_transaction, complete_presentation_feedback_obligation,
     complete_presented_output_transaction, discard_presentation_feedback_obligation,
-    prepare_presented_output_transaction, settle_dropped_output_transaction,
+    prepare_presented_output_transaction, restore_presentation_feedback_obligation,
+    settle_dropped_output_transaction,
 };
 use super::super::presentation_worker::promote_pageflip_and_publish;
 use super::super::*;
@@ -810,6 +811,7 @@ fn select_cursor_promotion(
 #[derive(Debug)]
 enum OutputFrameRetirementInvariantError {
     PhysicalReadyIdentityChanged,
+    SuspendedPhysicalIdentityMissing,
     PacingOwnerMissing,
     SceneReadyIdentityMismatch,
     SchedulerReadyOwnershipMismatch,
@@ -825,6 +827,9 @@ impl std::fmt::Display for OutputFrameRetirementInvariantError {
         match self {
             Self::PhysicalReadyIdentityChanged => {
                 formatter.write_str("unsubmitted READY identity changed before terminalization")
+            }
+            Self::SuspendedPhysicalIdentityMissing => {
+                formatter.write_str("Variable retry has no matching suspended physical frame")
             }
             Self::PacingOwnerMissing => formatter.write_str("overtaken READY has no pacing owner"),
             Self::SceneReadyIdentityMismatch => {
@@ -854,26 +859,35 @@ impl std::fmt::Display for OutputFrameRetirementInvariantError {
 
 impl std::error::Error for OutputFrameRetirementInvariantError {}
 
-fn validate_unsubmitted_ready_owners(
-    swapchain: &crate::native_output::scanout::AtomicOutputSwapchain,
+#[derive(Debug, Clone, Copy)]
+struct ValidatedUnsubmittedFrameOwners {
+    owner: OutputFrameIdentitySnapshot,
+    pacing_lane: crate::native_output::pacing::UnsubmittedPhysicalFrameLane,
+}
+
+fn validate_unsubmitted_output_frame_owners(
     owner: OutputFrameIdentitySnapshot,
     output_epoch: OutputEpochId,
     scene_history: &NativeSceneHistory,
     frame_pacing: &NativeFramePacing,
     frame_scheduler: &NativeFrameScheduler,
     output_transactions: &OutputTransactionLedger,
-) -> NativeResult<()> {
-    if swapchain.ready_identity() != Some(owner) {
-        return Err(OutputFrameRetirementInvariantError::PhysicalReadyIdentityChanged.into());
-    }
+) -> NativeResult<ValidatedUnsubmittedFrameOwners> {
     if !frame_pacing.validate_physical_ready_owner(owner) {
         return Err(OutputFrameRetirementInvariantError::PacingOwnerMissing.into());
     }
+    let pacing_lane = frame_pacing
+        .unsubmitted_physical_frame_lane(owner)
+        .ok_or(OutputFrameRetirementInvariantError::PacingOwnerMissing)?;
+    if matches!(
+        pacing_lane,
+        crate::native_output::pacing::UnsubmittedPhysicalFrameLane::Ready
+    ) && !frame_scheduler.ready_frame_queued()
+    {
+        return Err(OutputFrameRetirementInvariantError::SchedulerReadyOwnershipMismatch.into());
+    }
     if scene_history.ready_frame_identity() != Some((owner.frame_id, owner.render_generation)) {
         return Err(OutputFrameRetirementInvariantError::SceneReadyIdentityMismatch.into());
-    }
-    if !frame_scheduler.ready_frame_queued() {
-        return Err(OutputFrameRetirementInvariantError::SchedulerReadyOwnershipMismatch.into());
     }
     let transaction = output_transactions
         .transaction(owner.transaction_id)
@@ -902,10 +916,42 @@ fn validate_unsubmitted_ready_owners(
     if descriptor.obligations().frame_batch_id() != Some(owner.protocol_batch_id) {
         return Err(OutputFrameRetirementInvariantError::ProtocolObligationMismatch.into());
     }
+    let pacing_lane = match pacing_lane {
+        crate::native_output::pacing::UnsubmittedPhysicalFrameLane::Untracked => {
+            if frame_scheduler.ready_frame_queued() {
+                crate::native_output::pacing::UnsubmittedPhysicalFrameLane::Ready
+            } else {
+                crate::native_output::pacing::UnsubmittedPhysicalFrameLane::Active
+            }
+        }
+        lane => lane,
+    };
+    Ok(ValidatedUnsubmittedFrameOwners { owner, pacing_lane })
+}
+
+fn validate_unsubmitted_ready_owners(
+    swapchain: &crate::native_output::scanout::AtomicOutputSwapchain,
+    owner: OutputFrameIdentitySnapshot,
+    output_epoch: OutputEpochId,
+    scene_history: &NativeSceneHistory,
+    frame_pacing: &NativeFramePacing,
+    frame_scheduler: &NativeFrameScheduler,
+    output_transactions: &OutputTransactionLedger,
+) -> NativeResult<ValidatedUnsubmittedFrameOwners> {
+    if swapchain.ready_identity() != Some(owner) {
+        return Err(OutputFrameRetirementInvariantError::PhysicalReadyIdentityChanged.into());
+    }
     swapchain
         .validate_suspend_abandon_ready()
         .map_err(|_| OutputFrameRetirementInvariantError::PhysicalReadyCannotBeSuspended)?;
-    Ok(())
+    validate_unsubmitted_output_frame_owners(
+        owner,
+        output_epoch,
+        scene_history,
+        frame_pacing,
+        frame_scheduler,
+        output_transactions,
+    )
 }
 
 pub(crate) fn validate_reconfiguration_frame_ownership(
@@ -919,7 +965,7 @@ pub(crate) fn validate_reconfiguration_frame_ownership(
     let swapchain = explicit.swapchain()?;
     let physical_ready = swapchain.ready_identity();
     if let Some(owner) = physical_ready {
-        return validate_unsubmitted_ready_owners(
+        validate_unsubmitted_ready_owners(
             swapchain,
             owner,
             output_epoch,
@@ -927,7 +973,8 @@ pub(crate) fn validate_reconfiguration_frame_ownership(
             frame_pacing,
             frame_scheduler,
             output_transactions,
-        );
+        )?;
+        return Ok(());
     }
     if frame_pacing.ready.is_some()
         || frame_pacing.has_unbound_ready_owner()
@@ -990,7 +1037,7 @@ where
         crate::native_output::presentation::transaction::OutputProtocolObligations,
     ) -> NativeResult<()>,
 {
-    validate_unsubmitted_ready_owners(
+    let validated = validate_unsubmitted_ready_owners(
         swapchain,
         owner,
         output_epoch,
@@ -999,6 +1046,36 @@ where
         frame_scheduler,
         output_transactions,
     )?;
+    terminalize_unsubmitted_output_frame_owners(
+        validated,
+        scene_history,
+        frame_pacing,
+        frame_scheduler,
+        output_transactions,
+        retired_at,
+        settle_protocol_obligations,
+    )?;
+    if !swapchain.suspend_abandon_ready()? {
+        return Err(OutputFrameRetirementInvariantError::PhysicalReadyCannotBeSuspended.into());
+    }
+    Ok(())
+}
+
+fn terminalize_unsubmitted_output_frame_owners<F>(
+    validated: ValidatedUnsubmittedFrameOwners,
+    scene_history: &mut NativeSceneHistory,
+    frame_pacing: &mut NativeFramePacing,
+    frame_scheduler: &mut NativeFrameScheduler,
+    output_transactions: &mut OutputTransactionLedger,
+    retired_at: MonotonicTimestampNs,
+    settle_protocol_obligations: F,
+) -> NativeResult<()>
+where
+    F: FnOnce(
+        crate::native_output::presentation::transaction::OutputProtocolObligations,
+    ) -> NativeResult<()>,
+{
+    let owner = validated.owner;
     settle_dropped_output_transaction(
         output_transactions,
         owner.transaction_id,
@@ -1012,10 +1089,71 @@ where
     frame_pacing
         .terminalize_unsubmitted_physical_frame(owner)
         .map_err(|_| OutputFrameRetirementInvariantError::PacingOwnerMissing)?;
-    frame_scheduler.discard_ready_frame();
-    if !swapchain.suspend_abandon_ready()? {
-        return Err(OutputFrameRetirementInvariantError::PhysicalReadyCannotBeSuspended.into());
+    if frame_scheduler.ready_frame_queued() {
+        frame_scheduler.discard_ready_frame();
     }
+    Ok(())
+}
+
+pub(crate) fn terminalize_suspended_frame_for_variable_retry(
+    swapchain: &mut crate::native_output::scanout::AtomicOutputSwapchain,
+    owner: OutputFrameIdentitySnapshot,
+    output_epoch: OutputEpochId,
+    scene_history: &mut NativeSceneHistory,
+    frame_pacing: &mut NativeFramePacing,
+    frame_scheduler: &mut NativeFrameScheduler,
+    server: &mut OwnCompositorServer,
+    output_transactions: &mut OutputTransactionLedger,
+    retired_at: MonotonicTimestampNs,
+    rejection: crate::native_output::scanout::VariableRetryRejection,
+    perf: &NativePerfLogger,
+) -> NativeResult<()> {
+    if !swapchain.contains_suspended_frame(owner) {
+        return Err(OutputFrameRetirementInvariantError::SuspendedPhysicalIdentityMissing.into());
+    }
+    let validated = validate_unsubmitted_output_frame_owners(
+        owner,
+        output_epoch,
+        scene_history,
+        frame_pacing,
+        frame_scheduler,
+        output_transactions,
+    )?;
+    let pacing_lane = match validated.pacing_lane {
+        crate::native_output::pacing::UnsubmittedPhysicalFrameLane::Ready => "ready",
+        crate::native_output::pacing::UnsubmittedPhysicalFrameLane::Active
+        | crate::native_output::pacing::UnsubmittedPhysicalFrameLane::Untracked => "active",
+    };
+    terminalize_unsubmitted_output_frame_owners(
+        validated,
+        scene_history,
+        frame_pacing,
+        frame_scheduler,
+        output_transactions,
+        retired_at,
+        |obligations| {
+            restore_presentation_feedback_obligation(server, obligations);
+            let batch_id = obligations.frame_batch_id().ok_or_else(|| {
+                io::Error::other("rejected Variable transaction has no compositor frame batch")
+            })?;
+            server.restore_frame_batch_after_render_failure(batch_id);
+            Ok(())
+        },
+    )?;
+    let rejection = match rejection {
+        crate::native_output::scanout::VariableRetryRejection::TestOnly => "test_only",
+        crate::native_output::scanout::VariableRetryRejection::RealSubmit => "real_submit",
+    };
+    perf.log("native.variable_presentation_retry", || {
+        vec![
+            NativePerfField::str("rejection", rejection),
+            NativePerfField::u64("frame_id", owner.frame_id),
+            NativePerfField::u64("transaction_id", owner.transaction_id.get()),
+            NativePerfField::u64("output_epoch", output_epoch.get()),
+            NativePerfField::str("pacing_lane", pacing_lane),
+            NativePerfField::str("physical_state", "suspended"),
+        ]
+    });
     Ok(())
 }
 
