@@ -6,11 +6,8 @@ use std::hint::black_box;
 use std::time::Duration;
 
 use oblivion_one::native::adaptive_buffering::AdaptiveRenderJournal;
+use oblivion_one::native::kms_worker_dispatch_timing::KmsWorkerDispatchModel;
 use oblivion_one::native::presentation_deadline::MonotonicTimestampNs;
-
-// Exercise the binary's actual worker timing implementation without starting DRM.
-#[path = "../src/native_output/kms_worker/timing.rs"]
-mod worker_timing;
 
 thread_local! {
     static ALLOCATIONS: Cell<Option<usize>> = const { Cell::new(None) };
@@ -86,7 +83,7 @@ fn populated_render_prediction_does_not_allocate() {
 
 #[test]
 fn populated_worker_dispatch_budget_does_not_allocate() {
-    let mut model = worker_timing::KmsWorkerDispatchModel::default();
+    let mut model = KmsWorkerDispatchModel::default();
     for value in 1..=241 {
         model.record_fixed_timed_wake(value);
         model.record_worker_service(value * 2, value * 3, value * 4);
