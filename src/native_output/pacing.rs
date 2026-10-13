@@ -477,6 +477,105 @@ mod tests {
     }
 
     #[test]
+    fn worker_replan_of_ready_origin_preserves_exact_ready_owner_without_terminal_failure() {
+        let mut pacing = NativeFramePacing::from_env();
+        pacing.enabled = true;
+        let physical_identity = predictive_physical_identity(71, 81);
+        pacing.queue_visual(1, physical_identity.render_generation);
+        pacing
+            .note_render_started(NativeOutputPacingMode::PredictiveTriple, true)
+            .expect("Predictive O1 render starts");
+        pacing
+            .bind_predictive_o1(physical_identity)
+            .expect("Predictive O1 frame binds to physical identity");
+        pacing.note_render_ready();
+        pacing.note_ready_frame(2, false);
+        let ticket = pacing
+            .reserve_worker_submission(true)
+            .expect("READY-origin worker reservation")
+            .expect("READY-origin ticket");
+        let stale_stage_events = pacing.predictive_o1_stale_stage_events;
+
+        pacing
+            .replan_worker_submission(ticket, physical_identity, 3)
+            .expect("READY-origin worker reservation is released without losing READY");
+
+        assert_eq!(pacing.ready, Some(ticket.frame_id()));
+        assert_eq!(
+            pacing.unsubmitted_physical_identity(),
+            Some(physical_identity)
+        );
+        assert!(!pacing.worker_reservation_present());
+        assert!(!pacing.ready_worker_submission_reserved());
+        assert_eq!(pacing.predictive_o1_failed, 0);
+
+        let retry = pacing
+            .reserve_worker_submission(true)
+            .expect("same READY frame can be reserved again")
+            .expect("replacement worker ticket");
+        assert_eq!(retry.physical_identity(), Some(physical_identity));
+        assert_eq!(pacing.predictive_o1_failed, 0);
+        assert_eq!(pacing.predictive_o1_invalid_stage_transitions, 0);
+        assert_eq!(
+            pacing.predictive_o1_stale_stage_events,
+            stale_stage_events.saturating_add(1),
+            "the repeated WorkerQueued stage is counted as a duplicate, not a failure"
+        );
+        pacing
+            .note_worker_submit_exact(Some(retry), 42, 4, NativeOutputPacingMode::PredictiveTriple)
+            .expect("replacement worker ticket reaches normal Submitted ownership");
+        assert_eq!(pacing.predictive_o1_submitted, 1);
+        assert_eq!(pacing.predictive_o1_failed, 0);
+        assert_eq!(pacing.predictive_o1_invalid_stage_transitions, 0);
+    }
+
+    #[test]
+    fn worker_replan_of_active_origin_hands_exact_owner_to_ready() {
+        let mut pacing = NativeFramePacing::from_env();
+        pacing.enabled = true;
+        let physical_identity = predictive_physical_identity(72, 82);
+        pacing.queue_visual(1, physical_identity.render_generation);
+        pacing
+            .note_render_started(NativeOutputPacingMode::ReactiveDouble, false)
+            .expect("ACTIVE-origin render starts");
+        pacing
+            .bind_physical_output_frame(physical_identity)
+            .expect("ACTIVE-origin frame binds to physical identity");
+        let ticket = pacing
+            .reserve_worker_submission(false)
+            .expect("ACTIVE-origin worker reservation")
+            .expect("ACTIVE-origin ticket");
+
+        let wrong_identity = predictive_physical_identity(73, 82);
+        assert!(
+            pacing
+                .validate_worker_submission_replan(ticket, wrong_identity)
+                .is_err()
+        );
+        assert_eq!(pacing.worker_reservation, Some(ticket));
+        assert_eq!(pacing.active_physical_identity(), Some(physical_identity));
+
+        pacing
+            .replan_worker_submission(ticket, physical_identity, 3)
+            .expect("ACTIVE-origin worker owner transfers into READY");
+
+        assert_eq!(pacing.active, None);
+        assert_eq!(pacing.ready, Some(ticket.frame_id()));
+        assert_eq!(pacing.active_physical_identity(), None);
+        assert_eq!(
+            pacing.unsubmitted_physical_identity(),
+            Some(physical_identity)
+        );
+        assert!(!pacing.worker_reservation_present());
+        assert!(!pacing.ready_worker_submission_reserved());
+        let retry = pacing
+            .reserve_worker_submission(true)
+            .expect("replanned ACTIVE owner can receive a READY reservation")
+            .expect("replacement READY ticket");
+        assert_eq!(retry.physical_identity(), Some(physical_identity));
+    }
+
+    #[test]
     fn stale_worker_reservation_cannot_settle_or_remove_newer_frame() {
         let mut pacing = NativeFramePacing::from_env();
         pacing.enabled = true;
@@ -3876,6 +3975,94 @@ impl NativeFramePacing {
             Self::worker_ticket_fields(reservation),
         );
         true
+    }
+
+    pub(crate) fn validate_worker_submission_replan(
+        &self,
+        ticket: WorkerPacingTicket,
+        expected_identity: OutputFrameIdentitySnapshot,
+    ) -> Result<(), &'static str> {
+        if !self.enabled {
+            return Err("cannot re-plan an untracked pacing owner");
+        }
+        if self.worker_reservation != Some(ticket) {
+            return Err("worker pacing reservation does not match re-plan ticket");
+        }
+        let expected_key = OutputFrameKey::from(&expected_identity);
+        if ticket.physical_identity() != Some(expected_identity)
+            || ticket.physical_key() != Some(expected_key)
+        {
+            return Err("worker pacing ticket does not match re-planned physical identity");
+        }
+        let reservation_id = ticket.reservation_id();
+        if ticket.ready_submit() {
+            if self.ready_worker_reservation_id != Some(reservation_id)
+                || self.ready != Some(ticket.frame_id())
+                || self.ready_physical_identity != Some(expected_identity)
+                || self.ready_physical_key != Some(expected_key)
+                || self.active_worker_reservation_id == Some(reservation_id)
+            {
+                return Err("READY pacing owner does not match re-plan ticket");
+            }
+        } else if self.active_worker_reservation_id != Some(reservation_id)
+            || self.active != Some(ticket.frame_id())
+            || self.active_physical_identity != Some(expected_identity)
+            || self.active_physical_key != Some(expected_key)
+            || self.ready_worker_reservation_id == Some(reservation_id)
+        {
+            return Err("ACTIVE pacing owner does not match re-plan ticket");
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_optional_worker_submission_replan(
+        &self,
+        ticket: Option<WorkerPacingTicket>,
+        expected_identity: OutputFrameIdentitySnapshot,
+        ready_submit: bool,
+    ) -> Result<(), &'static str> {
+        match ticket {
+            Some(ticket) if ticket.ready_submit() == ready_submit => {
+                self.validate_worker_submission_replan(ticket, expected_identity)
+            }
+            Some(_) => Err("worker pacing origin does not match re-plan job"),
+            None if !self.enabled && self.worker_reservation.is_none() => Ok(()),
+            None => Err("explicit worker re-plan is missing its pacing ticket"),
+        }
+    }
+
+    pub(crate) fn replan_worker_submission(
+        &mut self,
+        ticket: WorkerPacingTicket,
+        expected_identity: OutputFrameIdentitySnapshot,
+        now_ns: u64,
+    ) -> Result<(), &'static str> {
+        self.validate_worker_submission_replan(ticket, expected_identity)?;
+        self.worker_reservation = None;
+        if ticket.ready_submit() {
+            self.ready_worker_reservation_id = None;
+        } else {
+            self.active_worker_reservation_id = None;
+            self.note_ready_frame(now_ns, false);
+        }
+        let mut fields = Self::worker_ticket_fields(ticket);
+        fields.push(PacingField::u64("replan_ns", now_ns));
+        self.log("worker_submission_replanned", fields);
+        Ok(())
+    }
+
+    pub(crate) fn replan_optional_worker_submission(
+        &mut self,
+        ticket: Option<WorkerPacingTicket>,
+        expected_identity: OutputFrameIdentitySnapshot,
+        ready_submit: bool,
+        now_ns: u64,
+    ) -> Result<(), &'static str> {
+        self.validate_optional_worker_submission_replan(ticket, expected_identity, ready_submit)?;
+        if let Some(ticket) = ticket {
+            self.replan_worker_submission(ticket, expected_identity, now_ns)?;
+        }
+        Ok(())
     }
 
     /// Release a reservation when worker admission did not move the physical
