@@ -14,6 +14,43 @@ enum RegionPlanScissorMode {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CaptureTargetGlScissor {
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+}
+
+/// Convert a logical top-left output-space clip to a capture-local GL scissor.
+/// The offscreen capture framebuffer always uses GL's bottom-left origin, so
+/// its own height and the translated capture domain determine the conversion;
+/// the output framebuffer origin does not.
+fn capture_target_gl_scissor_for_output_clip(
+    output_clip: OutputRect,
+    capture_domain: OutputRect,
+    target_size: (u32, u32),
+) -> Option<CaptureTargetGlScissor> {
+    let clipped_output = intersect_output_rect(output_clip, capture_domain)?;
+    let capture_local_top_left = OutputRect::new(
+        clipped_output.x.checked_sub(capture_domain.x)?,
+        clipped_output.y.checked_sub(capture_domain.y)?,
+        clipped_output.width,
+        clipped_output.height,
+    );
+    let target_bounds = OutputRect::new(0, 0, target_size.0, target_size.1);
+    let capture_local_top_left = intersect_output_rect(capture_local_top_left, target_bounds)?;
+    let target_height = i32::try_from(target_size.1).ok()?;
+    let height = i32::try_from(capture_local_top_left.height).ok()?;
+    let y = target_height.checked_sub(capture_local_top_left.y.checked_add(height)?)?;
+    Some(CaptureTargetGlScissor {
+        x: capture_local_top_left.x,
+        y,
+        width: i32::try_from(capture_local_top_left.width).ok()?,
+        height,
+    })
+}
+
 /// Temporary borrowed access to the renderer's authoritative scene and effect
 /// owners. It never owns or clones GL resources, scene commands, or caches.
 pub(in crate::egl_renderer) struct EffectExecutionContext<'a> {
@@ -320,13 +357,6 @@ impl EffectExecutionContext<'_> {
         scissor_mode: RegionPlanScissorMode,
     ) -> RendererResult<()> {
         let capture_plan = matches!(scissor_mode, RegionPlanScissorMode::CaptureTarget { .. });
-        let framebuffer_origin = match scissor_mode {
-            RegionPlanScissorMode::Framebuffer(origin)
-            | RegionPlanScissorMode::CaptureTarget {
-                framebuffer_origin: origin,
-                ..
-            } => origin,
-        };
         let target_space = match scissor_mode {
             RegionPlanScissorMode::Framebuffer(origin) => {
                 crate::egl_renderer::lifecycle::LifecycleRenderTargetSpace::output(
@@ -563,24 +593,7 @@ impl EffectExecutionContext<'_> {
                     let Some(effective_scissor) = effective_scissor else {
                         continue;
                     };
-                    match scissor_mode {
-                        RegionPlanScissorMode::Framebuffer(origin) => {
-                            self.set_scene_scissor_with_origin(Some(effective_scissor), origin);
-                        }
-                        RegionPlanScissorMode::CaptureTarget {
-                            target_domain,
-                            target_size,
-                            ..
-                        } => {
-                            self.set_capture_target_scissor(repair, target_domain, target_size);
-                            if output_clip.is_some() && effective_scissor != repair {
-                                self.set_scene_scissor_with_origin(
-                                    Some(effective_scissor),
-                                    framebuffer_origin,
-                                );
-                            }
-                        }
-                    }
+                    self.set_scissor_for_target_space(Some(effective_scissor), target_space);
                     if command.bounds.intersects_output_rect(effective_scissor) {
                         self.dispatch_lifecycle_overlay(
                             identity,
@@ -643,24 +656,7 @@ impl EffectExecutionContext<'_> {
                 let Some(effective_scissor) = effective_scissor else {
                     continue;
                 };
-                match scissor_mode {
-                    RegionPlanScissorMode::Framebuffer(origin) => {
-                        self.set_scene_scissor_with_origin(Some(effective_scissor), origin);
-                    }
-                    RegionPlanScissorMode::CaptureTarget {
-                        target_domain,
-                        target_size,
-                        ..
-                    } => {
-                        self.set_capture_target_scissor(repair, target_domain, target_size);
-                        if output_clip.is_some() && effective_scissor != repair {
-                            self.set_scene_scissor_with_origin(
-                                Some(effective_scissor),
-                                framebuffer_origin,
-                            );
-                        }
-                    }
-                }
+                self.set_scissor_for_target_space(Some(effective_scissor), target_space);
                 if !command.bounds.intersects_output_rect(effective_scissor) {
                     commands_rejected_outside_damage += 1;
                     continue;
@@ -676,7 +672,7 @@ impl EffectExecutionContext<'_> {
                 draw_calls += 1;
             }
         }
-        self.set_scene_scissor_with_origin(None, framebuffer_origin);
+        self.set_scissor_for_target_space(None, target_space);
         unsafe {
             self.gl.bind_texture(glow::TEXTURE_2D, None);
         }
@@ -776,37 +772,55 @@ impl EffectExecutionContext<'_> {
         }
     }
 
+    fn set_scissor_for_target_space(
+        &self,
+        output_scissor: Option<OutputRect>,
+        target_space: crate::egl_renderer::lifecycle::LifecycleRenderTargetSpace,
+    ) -> bool {
+        match (output_scissor, target_space) {
+            (
+                Some(output_scissor),
+                crate::egl_renderer::lifecycle::LifecycleRenderTargetSpace::Output {
+                    framebuffer_origin,
+                    ..
+                },
+            ) => {
+                self.set_scene_scissor_with_origin(Some(output_scissor), framebuffer_origin);
+                true
+            }
+            (
+                Some(output_scissor),
+                crate::egl_renderer::lifecycle::LifecycleRenderTargetSpace::Capture {
+                    capture_domain,
+                    target_size,
+                    ..
+                },
+            ) => self.set_capture_target_scissor(output_scissor, capture_domain, target_size),
+            (None, target_space) => {
+                self.set_scene_scissor_with_origin(None, target_space.framebuffer_origin());
+                false
+            }
+        }
+    }
+
     fn set_capture_target_scissor(
         &self,
         output_rect: OutputRect,
-        target_domain: EffectRect,
+        capture_domain: OutputRect,
         target_size: (u32, u32),
-    ) {
-        let requested = EffectRect::new(
-            output_rect.x,
-            output_rect.y,
-            output_rect.width,
-            output_rect.height,
-        )
-        .and_then(|rect| rect.intersect(target_domain));
-        let Some(requested) = requested else {
+    ) -> bool {
+        let Some(scissor) =
+            capture_target_gl_scissor_for_output_clip(output_rect, capture_domain, target_size)
+        else {
             unsafe { self.gl.disable(glow::SCISSOR_TEST) };
-            return;
+            return false;
         };
-        let local_x = requested.x.saturating_sub(target_domain.x);
-        let local_y = requested.y.saturating_sub(target_domain.y);
-        let gl_y = i32::try_from(target_size.1)
-            .unwrap_or(i32::MAX)
-            .saturating_sub(local_y.saturating_add(requested.height as i32));
         unsafe {
             self.gl.enable(glow::SCISSOR_TEST);
-            self.gl.scissor(
-                local_x,
-                gl_y,
-                requested.width as i32,
-                requested.height as i32,
-            );
+            self.gl
+                .scissor(scissor.x, scissor.y, scissor.width, scissor.height);
         }
+        true
     }
 
     pub(super) fn begin_effect_repaint(
@@ -1165,7 +1179,7 @@ impl EffectExecutionContext<'_> {
                 scissor
             };
             if current_scissor != effective_scissor {
-                self.set_scene_scissor(effective_scissor);
+                self.set_scissor_for_target_space(effective_scissor, target_space);
                 current_scissor = effective_scissor;
             }
             if effective_scissor.is_some_and(|rect| !command.bounds.intersects_output_rect(rect)) {
@@ -1227,7 +1241,7 @@ impl EffectExecutionContext<'_> {
             draw_calls += 1;
         }
         if current_scissor != initial_scissor {
-            self.set_scene_scissor(initial_scissor);
+            self.set_scissor_for_target_space(initial_scissor, target_space);
         }
         self.scene.frame_stats.commands_considered = self
             .scene
@@ -1283,10 +1297,6 @@ impl EffectExecutionContext<'_> {
         Ok(())
     }
 
-    pub(super) fn set_scene_scissor(&self, scissor: Option<OutputRect>) {
-        self.scene.set_scene_scissor(self.gl, scissor)
-    }
-
     pub(super) fn draw_capture_commands(
         &mut self,
         command_indices: &[usize],
@@ -1296,29 +1306,19 @@ impl EffectExecutionContext<'_> {
         framebuffer_origin: OutputFramebufferOrigin,
         host_timing_enabled: bool,
     ) -> RendererResult<ReplayCaptureExecutionDetail> {
-        let requested = EffectRect::new(
-            output_rect.x,
-            output_rect.y,
-            output_rect.width,
-            output_rect.height,
-        )
-        .and_then(|rect| rect.intersect(target_domain));
-        let Some(requested) = requested else {
+        let target_space = crate::egl_renderer::lifecycle::LifecycleRenderTargetSpace::capture(
+            self.output_target_space.output_size(),
+            OutputRect::new(
+                target_domain.x,
+                target_domain.y,
+                target_domain.width,
+                target_domain.height,
+            ),
+            target_size,
+            framebuffer_origin,
+        );
+        if !self.set_scissor_for_target_space(Some(output_rect), target_space) {
             return Ok(ReplayCaptureExecutionDetail::default());
-        };
-        let local_x = requested.x.saturating_sub(target_domain.x);
-        let local_y = requested.y.saturating_sub(target_domain.y);
-        let gl_y = i32::try_from(target_size.1)
-            .unwrap_or(i32::MAX)
-            .saturating_sub(local_y.saturating_add(requested.height as i32));
-        unsafe {
-            self.gl.enable(glow::SCISSOR_TEST);
-            self.gl.scissor(
-                local_x,
-                gl_y,
-                requested.width as i32,
-                requested.height as i32,
-            );
         }
         let saved_visibility = std::mem::take(&mut self.scene.scene_visibility_plan);
         let repair = EglRect::new(
@@ -1340,17 +1340,6 @@ impl EffectExecutionContext<'_> {
         let commands_executed_before = self.scene.frame_stats.commands_executed;
         let draw_calls_before = self.scene.frame_stats.draw_calls;
         let draw_submit_start = host_timing_enabled.then(Instant::now);
-        let target_space = crate::egl_renderer::lifecycle::LifecycleRenderTargetSpace::capture(
-            self.output_target_space.output_size(),
-            OutputRect::new(
-                target_domain.x,
-                target_domain.y,
-                target_domain.width,
-                target_domain.height,
-            ),
-            target_size,
-            framebuffer_origin,
-        );
         let result = self.draw_command_batch_with_visibility_and_range_in_target_space(
             true,
             Some(output_rect),
@@ -1625,5 +1614,153 @@ impl EffectExecutionContext<'_> {
             layer,
             EglDrawLayer::SolidRgba(_) | EglDrawLayer::DecorationAsset(_)
         )
+    }
+}
+
+#[cfg(test)]
+mod capture_target_scissor_tests {
+    use super::*;
+
+    #[test]
+    fn capture_target_scissor_maps_origin_and_translated_full_domains() {
+        let origin_domain = OutputRect::new(0, 0, 10, 8);
+        assert_eq!(
+            capture_target_gl_scissor_for_output_clip(origin_domain, origin_domain, (10, 8),),
+            Some(CaptureTargetGlScissor {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 8,
+            })
+        );
+
+        let translated_domain = OutputRect::new(73, 41, 131, 89);
+        assert_eq!(
+            capture_target_gl_scissor_for_output_clip(
+                translated_domain,
+                translated_domain,
+                (131, 89),
+            ),
+            Some(CaptureTargetGlScissor {
+                x: 0,
+                y: 0,
+                width: 131,
+                height: 89,
+            })
+        );
+    }
+
+    #[test]
+    fn capture_target_scissor_maps_each_domain_edge_to_local_gl_coordinates() {
+        let domain = OutputRect::new(73, 41, 131, 89);
+        let cases = [
+            (
+                "left edge",
+                OutputRect::new(73, 49, 5, 4),
+                CaptureTargetGlScissor {
+                    x: 0,
+                    y: 77,
+                    width: 5,
+                    height: 4,
+                },
+            ),
+            (
+                "right edge",
+                OutputRect::new(199, 49, 5, 4),
+                CaptureTargetGlScissor {
+                    x: 126,
+                    y: 77,
+                    width: 5,
+                    height: 4,
+                },
+            ),
+            (
+                "top edge",
+                OutputRect::new(77, 41, 5, 1),
+                CaptureTargetGlScissor {
+                    x: 4,
+                    y: 88,
+                    width: 5,
+                    height: 1,
+                },
+            ),
+            (
+                "bottom edge",
+                OutputRect::new(77, 129, 5, 1),
+                CaptureTargetGlScissor {
+                    x: 4,
+                    y: 0,
+                    width: 5,
+                    height: 1,
+                },
+            ),
+        ];
+
+        for (edge, output_clip, expected) in cases {
+            assert_eq!(
+                capture_target_gl_scissor_for_output_clip(output_clip, domain, (131, 89)),
+                Some(expected),
+                "unexpected GL scissor at the {edge}"
+            );
+        }
+    }
+
+    #[test]
+    fn capture_target_scissor_preserves_half_open_one_pixel_intersections() {
+        let domain = OutputRect::new(73, 41, 131, 89);
+        assert_eq!(
+            capture_target_gl_scissor_for_output_clip(
+                OutputRect::new(203, 58, 8, 2),
+                domain,
+                (131, 89),
+            ),
+            Some(CaptureTargetGlScissor {
+                x: 130,
+                y: 70,
+                width: 1,
+                height: 2,
+            })
+        );
+        assert_eq!(
+            capture_target_gl_scissor_for_output_clip(
+                OutputRect::new(80, 129, 3, 4),
+                domain,
+                (131, 89),
+            ),
+            Some(CaptureTargetGlScissor {
+                x: 7,
+                y: 0,
+                width: 3,
+                height: 1,
+            })
+        );
+        assert_eq!(
+            capture_target_gl_scissor_for_output_clip(
+                OutputRect::new(204, 50, 1, 1),
+                domain,
+                (131, 89),
+            ),
+            None,
+            "a clip starting at the half-open right edge has no intersection"
+        );
+    }
+
+    #[test]
+    fn capture_target_scissor_converts_the_presentation_clipped_repair() {
+        let domain = OutputRect::new(20, 30, 40, 30);
+        let repair = OutputRect::new(24, 34, 28, 22);
+        let presentation_clip = OutputRect::new(30, 40, 18, 10);
+        let effective_clip = intersect_output_rect(repair, presentation_clip)
+            .expect("presentation clip intersects the repair");
+
+        assert_eq!(
+            capture_target_gl_scissor_for_output_clip(effective_clip, domain, (40, 30)),
+            Some(CaptureTargetGlScissor {
+                x: 10,
+                y: 10,
+                width: 18,
+                height: 10,
+            })
+        );
     }
 }

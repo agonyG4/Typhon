@@ -1,4 +1,5 @@
 use super::super::*;
+use super::super::{EglUvRect, push_draw_command_with_uv};
 use super::geometry::scaled_presentation_rect;
 #[cfg(test)]
 use super::geometry::{ndc_to_output_point, output_point_to_ndc};
@@ -219,7 +220,9 @@ impl SquashRenderState {
             let target = scaled_presentation_rect(target_rect, output_scale);
             let mut vertices = Vec::new();
             let mut commands = Vec::new();
-            push_draw_command(
+            // Retained lifecycle visuals are FBO textures, whose GL row origin
+            // is opposite the top-left UV convention used by scene surfaces.
+            push_draw_command_with_uv(
                 &mut vertices,
                 &mut commands,
                 EglDrawLayer::LifecycleResolvedVisual(sample.visual_source.resource_payload_id),
@@ -229,6 +232,8 @@ impl SquashRenderState {
                     target.width() as f32,
                     target.height() as f32,
                 ),
+                EglUvRect::new(0.0, 1.0, 1.0, 0.0),
+                SurfaceSampling::ScaledLinear,
                 output_size.0,
                 output_size.1,
                 framebuffer_origin,

@@ -3484,8 +3484,11 @@ fn assert_lifecycle_replay_capture_matches_full_output_crop(effect: LifecycleEff
     harness.install_texture_backed_output();
 
     let mut buffer_ids = BufferIdAllocator::default();
-    let lower = lifecycle_test_surface(640, 0, 0, 320, 200, 0xff20_2010, &mut buffer_ids);
-    let retained = lifecycle_test_surface_with_row_colors(
+    let mut lower = lifecycle_test_surface(640, 0, 0, 320, 200, 0xff20_2010, &mut buffer_ids);
+    // SurfacePlacement offsets are added to each fixture's x/y coordinates.
+    // Zero-offset absolute placements keep those coordinates authoritative.
+    lower.placement = SurfacePlacement::absolute_root_at(0, 0);
+    let mut retained = lifecycle_test_surface_with_row_colors(
         641,
         60,
         40,
@@ -3494,7 +3497,9 @@ fn assert_lifecycle_replay_capture_matches_full_output_crop(effect: LifecycleEff
         [0xffee_2211, 0xff12_ea14, 0xff12_22ee],
         &mut buffer_ids,
     );
-    let upper = lifecycle_test_surface(642, 170, 100, 30, 20, 0xffdd_22cc, &mut buffer_ids);
+    retained.placement = SurfacePlacement::absolute_root_at(0, 0);
+    let mut upper = lifecycle_test_surface(642, 170, 100, 30, 20, 0xffdd_22cc, &mut buffer_ids);
+    upper.placement = SurfacePlacement::absolute_root_at(0, 0);
     let lower_window = oblivion_one::compositor::WindowId::from_raw(1).expect("lower window");
     let retained_window = oblivion_one::compositor::WindowId::from_raw(2).expect("retained window");
     let upper_window = oblivion_one::compositor::WindowId::from_raw(3).expect("upper window");
