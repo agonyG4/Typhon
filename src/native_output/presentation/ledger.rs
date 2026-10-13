@@ -15,6 +15,17 @@ use std::collections::{HashMap, VecDeque};
 pub(crate) const DEFAULT_OUTPUT_TRANSACTION_ACTIVE_CAPACITY: usize = 8;
 pub(crate) const DEFAULT_OUTPUT_TRANSACTION_HISTORY_CAPACITY: usize = 512;
 
+/// Exact source state for a reversible queue transition.
+///
+/// Any reversible transition must retain enough information in its
+/// authoritative state to restore its exact predecessor without consulting a
+/// sidecar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OutputTransactionQueuedPredecessor {
+    Built,
+    Ready { ready_at: MonotonicTimestampNs },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OutputTransactionState {
     Built,
@@ -27,6 +38,8 @@ pub(crate) enum OutputTransactionState {
     Queued {
         queued_at: MonotonicTimestampNs,
         worker_generation: u64,
+        /// `Queued` is reversible, so it owns the exact predecessor state.
+        predecessor: OutputTransactionQueuedPredecessor,
     },
     Submitted {
         token: PageFlipToken,
@@ -662,16 +675,20 @@ impl OutputTransactionLedger {
         queued_at: MonotonicTimestampNs,
     ) -> Result<(), OutputTransactionError> {
         let state = self.state(id)?;
-        if !matches!(
-            state,
-            OutputTransactionState::Built | OutputTransactionState::Ready { .. }
-        ) {
-            return Err(self.invalid_transition(state, OutputTransactionTransitionKind::Queued));
-        }
+        let predecessor = match state {
+            OutputTransactionState::Built => OutputTransactionQueuedPredecessor::Built,
+            OutputTransactionState::Ready { ready_at } => {
+                OutputTransactionQueuedPredecessor::Ready { ready_at }
+            }
+            _ => {
+                return Err(self.invalid_transition(state, OutputTransactionTransitionKind::Queued));
+            }
+        };
         self.transition(id, OutputTransactionTransitionKind::Queued, |state| {
             *state = OutputTransactionState::Queued {
                 queued_at,
                 worker_generation,
+                predecessor,
             };
             Ok(())
         })?;
@@ -697,9 +714,12 @@ impl OutputTransactionLedger {
         id: OutputTransactionId,
     ) -> Result<(), OutputTransactionError> {
         let state = self.state(id)?;
-        if !matches!(state, OutputTransactionState::Queued { .. }) {
-            return Err(self.invalid_transition(state, OutputTransactionTransitionKind::Queued));
-        }
+        let predecessor = match state {
+            OutputTransactionState::Queued { predecessor, .. } => predecessor,
+            _ => {
+                return Err(self.invalid_transition(state, OutputTransactionTransitionKind::Queued));
+            }
+        };
         let content = self
             .active
             .get(&id)
@@ -709,7 +729,12 @@ impl OutputTransactionLedger {
         self.active
             .get_mut(&id)
             .expect("queued transaction was observed above")
-            .state = OutputTransactionState::Built;
+            .state = match predecessor {
+            OutputTransactionQueuedPredecessor::Built => OutputTransactionState::Built,
+            OutputTransactionQueuedPredecessor::Ready { ready_at } => {
+                OutputTransactionState::Ready { ready_at }
+            }
+        };
         self.counters.queued = self.counters.queued.saturating_sub(1);
         match content {
             OutputTransactionContent::Composited { .. } => {

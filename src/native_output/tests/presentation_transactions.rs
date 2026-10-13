@@ -596,12 +596,48 @@ fn ready_transaction_can_be_worker_queued() {
     ledger
         .mark_queued(id, 4, MonotonicTimestampNs::new(21))
         .unwrap();
-    assert!(matches!(
+    assert_eq!(
         ledger.transaction(id).unwrap().state(),
         super::OutputTransactionState::Queued {
+            queued_at: MonotonicTimestampNs::new(21),
             worker_generation: 4,
-            ..
+            predecessor: super::OutputTransactionQueuedPredecessor::Ready {
+                ready_at: MonotonicTimestampNs::new(20),
+            },
         }
+    );
+}
+
+#[test]
+fn queued_rollback_restores_exact_ready_predecessor_and_allows_requeue() {
+    let mut ledger = super::OutputTransactionLedger::with_capacities(8, 64);
+    let transaction = test_composited_transaction(&mut ledger, test_batch(104), 1);
+    let id = transaction.id();
+    ledger.insert(transaction).unwrap();
+    let ready_at = MonotonicTimestampNs::new(20);
+    ledger.mark_ready(id, ready_at).unwrap();
+    ledger
+        .mark_queued(id, 4, MonotonicTimestampNs::new(21))
+        .unwrap();
+
+    ledger.rollback_queued(id).unwrap();
+
+    assert_eq!(
+        ledger.transaction(id).unwrap().state(),
+        super::OutputTransactionState::Ready { ready_at }
+    );
+    assert_eq!(ledger.counters().ready, 1);
+    assert_eq!(ledger.counters().queued, 0);
+    ledger
+        .mark_queued(id, 4, MonotonicTimestampNs::new(22))
+        .unwrap();
+    let token = PageFlipToken::new(10).unwrap();
+    ledger
+        .mark_submitted(id, token, MonotonicTimestampNs::new(30))
+        .unwrap();
+    assert!(matches!(
+        ledger.transaction(id).unwrap().state(),
+        super::OutputTransactionState::Submitted { token: actual, .. } if actual == token
     ));
 }
 

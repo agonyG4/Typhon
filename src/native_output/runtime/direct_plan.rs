@@ -354,6 +354,7 @@ mod tests {
                 state: OutputTransactionState::Queued {
                     queued_at: MonotonicTimestampNs::new(10),
                     worker_generation: 1,
+                    predecessor: OutputTransactionQueuedPredecessor::Built,
                 },
                 output_generation: 1,
                 equivalent_direct_key: Some(key),

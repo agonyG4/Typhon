@@ -4,9 +4,9 @@ use super::{
     DirectScanoutFeedbackCapabilities, DirectScanoutFormatCapability, OutputContentKey,
     OutputPresentationStateKey, OutputReleasePlan, OutputTransaction, OutputTransactionError,
     OutputTransactionFailureStage, OutputTransactionId, OutputTransactionLedger,
-    OutputTransactionState, OutputTransactionTerminal, PrimaryPlaneAssignment,
-    classify_direct_content, classify_direct_presentation_state, feedback_capabilities_changed,
-    first_qualified_direct_presentation_state,
+    OutputTransactionQueuedPredecessor, OutputTransactionState, OutputTransactionTerminal,
+    PrimaryPlaneAssignment, classify_direct_content, classify_direct_presentation_state,
+    feedback_capabilities_changed, first_qualified_direct_presentation_state,
 };
 use oblivion_one::compositor::{CompositorFrameBatchId, DrmContentType, OutputPresentationMode};
 use oblivion_one::native::kms::PageFlipToken;
@@ -673,6 +673,17 @@ fn direct_admission_rollback_restores_built_transaction_before_enqueue() {
     ledger
         .mark_queued(transaction_id, 1, MonotonicTimestampNs::new(11))
         .expect("queue direct transaction");
+    assert_eq!(
+        ledger
+            .transaction(transaction_id)
+            .expect("queued transaction")
+            .state(),
+        OutputTransactionState::Queued {
+            queued_at: MonotonicTimestampNs::new(11),
+            worker_generation: 1,
+            predecessor: OutputTransactionQueuedPredecessor::Built,
+        }
+    );
 
     ledger
         .rollback_queued(transaction_id)
