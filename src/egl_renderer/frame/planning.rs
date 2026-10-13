@@ -5,8 +5,9 @@ use khronos_egl as egl;
 use oblivion_one::{
     compositor::{self, RenderableSurface},
     effects::{
-        CompiledPrecomputedBackdropPlan, EffectExecutionDemand, FrameExecutionPlan,
-        compile_frame_execution_variants, configured_effect_demand_planner_policy,
+        CompiledPrecomputedBackdropPlan, EffectExecutionDemand, FrameExecutionCompileOptions,
+        FrameExecutionPlan, compile_frame_execution_variants_with_options,
+        configured_effect_demand_planner_policy,
     },
 };
 
@@ -439,13 +440,21 @@ impl FramePipeline<'_> {
                 Some(super::super::effects::EffectFailureReason::GraphCompile);
             (FrameExecutionPlan::LegacyScene, None, None, 0)
         } else {
-            match compile_frame_execution_variants(
+            let debug_config = *super::super::effects::effect_debug_config();
+            let terminal_kawase_fusion = super::super::effects::terminal_fusion_enabled(
+                self.effects.terminal_blur_fusion_policy,
+                debug_config.kawase_mode(),
+            );
+            match compile_frame_execution_variants_with_options(
                 request.effects,
                 &effect_source_damage,
                 output_bounds,
                 &self.effects.effect_registry,
-                self.effects.precomputed_window_blur_policy
-                    == super::super::effects::PrecomputedWindowBlurPolicy::On,
+                FrameExecutionCompileOptions {
+                    precomputed_window_blur: self.effects.precomputed_window_blur_policy
+                        == super::super::effects::PrecomputedWindowBlurPolicy::On,
+                    terminal_kawase_fusion,
+                },
             ) {
                 Ok(variants) => {
                     let has_precomputed = variants.precomputed_backdrop.is_some();
@@ -488,6 +497,19 @@ impl FramePipeline<'_> {
             FrameExecutionPlan::EffectGraph(graph) => Some(graph),
             FrameExecutionPlan::LegacyScene => None,
         };
+        let terminal_fusion_stats = compiled_graph.map_or((0, 0, 0), |graph| {
+            (
+                graph.stats.terminal_blur_fusion_candidates,
+                graph.stats.terminal_blur_fusions,
+                graph.stats.terminal_blur_passes_elided,
+            )
+        });
+        self.effects.effect_trace.terminal_blur_fusion(
+            self.effects.terminal_blur_fusion_policy.as_str(),
+            terminal_fusion_stats.0,
+            terminal_fusion_stats.1,
+            terminal_fusion_stats.2,
+        );
         self.effects.effect_trace.frame_boundary(
             "effect_graph_compile",
             "end",

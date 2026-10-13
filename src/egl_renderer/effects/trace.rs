@@ -949,6 +949,21 @@ impl EffectExecutionTrace {
         });
     }
 
+    pub(crate) fn terminal_blur_fusion(
+        &self,
+        policy: &'static str,
+        candidates: usize,
+        fusions: usize,
+        passes_elided: usize,
+    ) {
+        self.event(|| {
+            format!(
+                "event=effect_terminal_blur_fusion frame_id={} terminal_blur_fusion_policy={policy} terminal_blur_fusion_candidates={candidates} terminal_blur_fusions={fusions} terminal_blur_passes_elided={passes_elided}",
+                optional_u64(self.frame_id),
+            )
+        });
+    }
+
     pub(crate) fn visible_clip_fallback(
         &self,
         pass: &CompiledRenderPass,
@@ -1548,6 +1563,7 @@ mod tests {
             visual_group: None,
             anchor_scope: EffectAnchorScope::VisualGroup,
             visible_clip_fallback: None,
+            terminal_kawase: None,
         };
 
         clear_test_events();
@@ -1589,6 +1605,7 @@ mod tests {
             visual_group: None,
             anchor_scope: EffectAnchorScope::VisualGroup,
             visible_clip_fallback: None,
+            terminal_kawase: None,
         };
 
         clear_test_events();
@@ -1630,6 +1647,7 @@ mod tests {
             visual_group: None,
             anchor_scope: EffectAnchorScope::VisualGroup,
             visible_clip_fallback: None,
+            terminal_kawase: None,
         };
 
         clear_test_events();
@@ -1689,6 +1707,7 @@ mod tests {
             visual_group: None,
             anchor_scope: EffectAnchorScope::VisualGroup,
             visible_clip_fallback: None,
+            terminal_kawase: None,
         };
 
         clear_test_events();

@@ -1,5 +1,366 @@
 use super::*;
 
+fn terminal_builtin_blur_scene(
+    rect: EffectRect,
+    visual_group: VisualGroupId,
+    material: oblivion_one::material::EffectiveMaterial,
+    coverage: Option<oblivion_one::effects::EffectCoverage>,
+) -> (ResolvedEffectScene, oblivion_one::effects::EffectRegistry) {
+    let program = oblivion_one::effects::builtin_background_material_program(material);
+    let program_id = program.program.id;
+    let mut registry = oblivion_one::effects::EffectRegistry::empty();
+    registry
+        .insert(program)
+        .expect("canonical material inserts");
+    let anchor = oblivion_one::compositor::EffectAnchor::BeforeSurface(42);
+    let instance = oblivion_one::compositor::ResolvedEffectInstance {
+        id: oblivion_one::effects::EffectInstanceId::new(1).expect("test effect id"),
+        program: program_id,
+        anchor,
+        target_bounds: rect,
+        region: EffectRegion::from_rect(rect),
+        parameter_block: EffectParameterBlock::default(),
+        coverage,
+        signature: 1,
+        frame_demand: EffectFrameDemand::OnDamage,
+        visual_group: Some(visual_group),
+        anchor_scope: oblivion_one::compositor::EffectAnchorScope::VisualGroup,
+        backdrop_reuse: oblivion_one::compositor::EffectBackdropReuse::Exact,
+        scene_order: oblivion_one::compositor::EffectSceneOrder::for_anchor(anchor),
+    };
+    (ResolvedEffectScene::new(1, vec![instance]), registry)
+}
+
+fn terminal_graph_variant(
+    scene: &ResolvedEffectScene,
+    registry: &oblivion_one::effects::EffectRegistry,
+    bounds: EffectRect,
+    enabled: bool,
+) -> CompiledFrameGraph {
+    let variants = oblivion_one::effects::compile_frame_execution_variants_with_options(
+        scene,
+        &EffectRegion::empty(),
+        bounds,
+        registry,
+        oblivion_one::effects::FrameExecutionCompileOptions {
+            precomputed_window_blur: false,
+            terminal_kawase_fusion: enabled,
+        },
+    )
+    .expect("terminal blur graph compiles");
+    let oblivion_one::effects::FrameExecutionPlan::EffectGraph(graph) = variants.exact else {
+        panic!("canonical blur compiles to an effect graph");
+    };
+    graph
+}
+
+fn render_terminal_graph(
+    graph: &CompiledFrameGraph,
+    size: (u32, u32),
+    origin: OutputFramebufferOrigin,
+    install_scene: impl FnOnce(&mut GlesEffectTestHarness),
+) -> Vec<u8> {
+    let mut harness = GlesEffectTestHarness::new(size.0, size.1);
+    install_scene(&mut harness);
+    let bounds = EffectRect::new(0, 0, size.0, size.1).expect("output bounds");
+    execute_diagnostic_frame_with_origin(
+        &mut harness,
+        graph,
+        &diagnostic_repaint_plan_for_repairs_in_size(&[], true, size),
+        EffectRegion::from_rect(bounds),
+        true,
+        effects::EffectDebugConfig::new(
+            effects::EffectDebugCaptureMode::Replay,
+            effects::EffectDebugKawaseMode::Partial,
+        ),
+        origin,
+    );
+    read_diagnostic_pixels(&harness)
+}
+
+fn render_terminal_graph_after_partial_edge_damage(
+    graph: &CompiledFrameGraph,
+    size: (u32, u32),
+    origin: OutputFramebufferOrigin,
+    install_scene: impl FnOnce(&mut GlesEffectTestHarness),
+    repair: OutputRect,
+) -> Vec<u8> {
+    let mut harness = GlesEffectTestHarness::new(size.0, size.1);
+    install_scene(&mut harness);
+    let bounds = EffectRect::new(0, 0, size.0, size.1).expect("output bounds");
+    let config = effects::EffectDebugConfig::new(
+        effects::EffectDebugCaptureMode::Replay,
+        effects::EffectDebugKawaseMode::Partial,
+    );
+    execute_diagnostic_frame_with_origin(
+        &mut harness,
+        graph,
+        &diagnostic_repaint_plan_for_repairs_in_size(&[], true, size),
+        EffectRegion::from_rect(bounds),
+        true,
+        config,
+        origin,
+    );
+    update_diagnostic_background_for_surface(&harness, 7, repair, [207, 43, 89, 255]);
+    execute_diagnostic_frame_with_origin(
+        &mut harness,
+        graph,
+        &diagnostic_repaint_plan_for_repairs_in_size(&[repair], false, size),
+        diagnostic_region(repair),
+        false,
+        config,
+        origin,
+    );
+    read_diagnostic_pixels(&harness)
+}
+
+fn terminal_pixel_difference_summary(expected: &[u8], actual: &[u8], width: u32) -> String {
+    assert_eq!(expected.len(), actual.len(), "output lengths differ");
+    let mut changed_pixels = 0usize;
+    let mut max_channel_delta = 0u8;
+    let mut bounds = [u32::MAX, u32::MAX, 0, 0];
+    let mut samples = Vec::new();
+    for (pixel_index, (expected, actual)) in expected
+        .chunks_exact(4)
+        .zip(actual.chunks_exact(4))
+        .enumerate()
+    {
+        if expected == actual {
+            continue;
+        }
+        changed_pixels += 1;
+        let x = u32::try_from(pixel_index).unwrap() % width;
+        let y = u32::try_from(pixel_index).unwrap() / width;
+        bounds[0] = bounds[0].min(x);
+        bounds[1] = bounds[1].min(y);
+        bounds[2] = bounds[2].max(x);
+        bounds[3] = bounds[3].max(y);
+        for (expected, actual) in expected.iter().zip(actual) {
+            max_channel_delta = max_channel_delta.max(expected.abs_diff(*actual));
+        }
+        if samples.len() < 8 {
+            samples.push((x, y, expected.to_vec(), actual.to_vec()));
+        }
+    }
+    if changed_pixels == 0 {
+        String::new()
+    } else {
+        format!(
+            "changed pixels={changed_pixels}, bounds={bounds:?}, \
+             max channel delta={max_channel_delta}, samples={samples:?}"
+        )
+    }
+}
+
+#[test]
+fn terminal_kawase_gles_matches_causal_unfused_frames_exactly() {
+    let translated_odd_bounds = EffectRect::new(0, 0, 161, 121).expect("odd output bounds");
+    let translated_odd_rect = EffectRect::new(19, 13, 101, 75).expect("odd translated blur");
+    let rounded = oblivion_one::effects::EffectCoverage {
+        rounded_rect: Some(oblivion_one::effects::EffectCoverageRoundedRect {
+            x: translated_odd_rect.x as f64,
+            y: translated_odd_rect.y as f64,
+            width: translated_odd_rect.width as f64,
+            height: translated_odd_rect.height as f64,
+            radius: 13.5,
+        }),
+        triangle: Some(oblivion_one::effects::EffectCoverageTriangle {
+            a: [27.0, 23.0],
+            b: [108.0, 20.0],
+            c: [78.0, 79.0],
+        }),
+    };
+    let (odd_scene, odd_registry) = terminal_builtin_blur_scene(
+        translated_odd_rect,
+        VisualGroupId::new(77).expect("odd test visual group"),
+        oblivion_one::material::EffectiveMaterial {
+            blur: 0.42,
+            saturation: 0.31,
+            noise: 0.0,
+        },
+        Some(rounded),
+    );
+    let odd_off = terminal_graph_variant(&odd_scene, &odd_registry, translated_odd_bounds, false);
+    let odd_on = terminal_graph_variant(&odd_scene, &odd_registry, translated_odd_bounds, true);
+    assert_eq!(odd_off.stats.terminal_blur_fusions, 0);
+    assert_eq!(
+        odd_on.stats.terminal_blur_fusions, 1,
+        "terminal candidate count={}, passes={:#?}, textures={:#?}",
+        odd_on.stats.terminal_blur_fusion_candidates, odd_on.passes, odd_on.textures
+    );
+    let odd_composite = odd_on
+        .passes
+        .iter()
+        .find(|pass| pass.kind == RenderPassKind::Composite)
+        .expect("fused graph retains its final Composite");
+    assert_eq!(odd_composite.coverage, odd_scene.instances[0].coverage);
+    assert_eq!(
+        odd_off
+            .passes
+            .iter()
+            .filter(|pass| pass.kind == RenderPassKind::SceneCapture)
+            .count(),
+        odd_on
+            .passes
+            .iter()
+            .filter(|pass| pass.kind == RenderPassKind::SceneCapture)
+            .count(),
+        "fusion must retain causal capture topology"
+    );
+    let odd_off_pixels = render_terminal_graph(
+        &odd_off,
+        (161, 121),
+        OutputFramebufferOrigin::TopLeftScanout,
+        |harness| {
+            install_diagnostic_scene(
+                harness,
+                translated_odd_rect,
+                VisualGroupId::new(77).unwrap(),
+            );
+        },
+    );
+    let odd_on_pixels = render_terminal_graph(
+        &odd_on,
+        (161, 121),
+        OutputFramebufferOrigin::TopLeftScanout,
+        |harness| {
+            install_diagnostic_scene(
+                harness,
+                translated_odd_rect,
+                VisualGroupId::new(77).unwrap(),
+            );
+        },
+    );
+    let odd_diff = terminal_pixel_difference_summary(&odd_off_pixels, &odd_on_pixels, 161);
+
+    let repair = OutputRect::new(20, 14, 3, 2);
+    let odd_off_partial = render_terminal_graph_after_partial_edge_damage(
+        &odd_off,
+        (161, 121),
+        OutputFramebufferOrigin::TopLeftScanout,
+        |harness| {
+            install_diagnostic_scene(
+                harness,
+                translated_odd_rect,
+                VisualGroupId::new(77).unwrap(),
+            );
+        },
+        repair,
+    );
+    let odd_on_partial = render_terminal_graph_after_partial_edge_damage(
+        &odd_on,
+        (161, 121),
+        OutputFramebufferOrigin::TopLeftScanout,
+        |harness| {
+            install_diagnostic_scene(
+                harness,
+                translated_odd_rect,
+                VisualGroupId::new(77).unwrap(),
+            );
+        },
+        repair,
+    );
+    let partial_diff = terminal_pixel_difference_summary(&odd_off_partial, &odd_on_partial, 161);
+
+    let even_bounds = EffectRect::new(0, 0, 160, 120).expect("even output bounds");
+    let even_rect = EffectRect::new(18, 14, 96, 72).expect("even blur domain");
+    let (even_scene, even_registry) = terminal_builtin_blur_scene(
+        even_rect,
+        VisualGroupId::new(78).expect("even test visual group"),
+        oblivion_one::material::EffectiveMaterial {
+            blur: 0.37,
+            saturation: 1.0,
+            noise: 0.0,
+        },
+        None,
+    );
+    let even_off = terminal_graph_variant(&even_scene, &even_registry, even_bounds, false);
+    let even_on = terminal_graph_variant(&even_scene, &even_registry, even_bounds, true);
+    let even_off_pixels = render_terminal_graph(
+        &even_off,
+        (160, 120),
+        OutputFramebufferOrigin::BottomLeft,
+        |harness| {
+            install_diagnostic_scene(harness, even_rect, VisualGroupId::new(78).unwrap());
+        },
+    );
+    let even_on_pixels = render_terminal_graph(
+        &even_on,
+        (160, 120),
+        OutputFramebufferOrigin::BottomLeft,
+        |harness| {
+            install_diagnostic_scene(harness, even_rect, VisualGroupId::new(78).unwrap());
+        },
+    );
+    let even_diff = terminal_pixel_difference_summary(&even_off_pixels, &even_on_pixels, 160);
+
+    // Keep the real A -> C -> B causal checkpoint chain while comparing the
+    // same canonical local material under the two physical graph variants.
+    let fixture = native_three_checkpoint_fixture();
+    let (mut causal_scene, _) = native_three_checkpoint_backdrop_scene(fixture);
+    let program = oblivion_one::effects::builtin_background_material_program(
+        oblivion_one::material::EffectiveMaterial {
+            blur: 0.4,
+            saturation: 0.52,
+            noise: 0.3,
+        },
+    );
+    let program_id = program.program.id;
+    let mut causal_registry = oblivion_one::effects::EffectRegistry::empty();
+    causal_registry
+        .insert(program)
+        .expect("causal material inserts");
+    for instance in &mut causal_scene.instances {
+        instance.program = program_id;
+    }
+    let causal_off = terminal_graph_variant(
+        &causal_scene,
+        &causal_registry,
+        fixture.output_bounds,
+        false,
+    );
+    let causal_on =
+        terminal_graph_variant(&causal_scene, &causal_registry, fixture.output_bounds, true);
+    assert_eq!(causal_off.stats.terminal_blur_fusions, 0);
+    assert_eq!(causal_on.stats.terminal_blur_fusions, 3);
+    let capture_dependencies = |graph: &CompiledFrameGraph| {
+        graph
+            .passes
+            .iter()
+            .filter(|pass| pass.kind == RenderPassKind::SceneCapture)
+            .map(|pass| (pass.instance, pass.checkpoint_dependencies.clone()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        capture_dependencies(&causal_off),
+        capture_dependencies(&causal_on)
+    );
+    let causal_off_pixels = render_terminal_graph(
+        &causal_off,
+        fixture.output_size,
+        OutputFramebufferOrigin::BottomLeft,
+        |harness| install_native_three_checkpoint_diagnostic_scene(harness, fixture.scene),
+    );
+    let causal_on_pixels = render_terminal_graph(
+        &causal_on,
+        fixture.output_size,
+        OutputFramebufferOrigin::BottomLeft,
+        |harness| install_native_three_checkpoint_diagnostic_scene(harness, fixture.scene),
+    );
+    let causal_diff = terminal_pixel_difference_summary(
+        &causal_off_pixels,
+        &causal_on_pixels,
+        fixture.output_size.0,
+    );
+    assert!(
+        odd_diff.is_empty()
+            && partial_diff.is_empty()
+            && even_diff.is_empty()
+            && causal_diff.is_empty(),
+        "pixel differences: odd={odd_diff}; partial={partial_diff}; even={even_diff}; causal={causal_diff}"
+    );
+}
+
 fn precomputed_baseline_safety_scene(
     exact_region: EffectRect,
     candidate_regions: [EffectRect; 2],

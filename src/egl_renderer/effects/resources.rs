@@ -152,6 +152,13 @@ pub(crate) struct CheckpointCaptureCacheKey {
     dependencies: Vec<CheckpointDependencySemanticIdentity>,
 }
 
+/// Non-authoritative grouping for identity-churn classification.
+///
+/// Backdrop source nodes compiled within one effect instance share the same
+/// capture domain and ordered checkpoint dependencies, so source-node identity
+/// does not distinguish their captured-scene semantics. This family key never
+/// authorizes checkpoint pixel reuse; `CheckpointCaptureCacheKey` remains the
+/// cache authority.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct CheckpointCaptureFamilyKey {
     consumer: EffectInstanceId,
@@ -3866,6 +3873,7 @@ mod tests {
                 visual_group: None,
                 anchor_scope: oblivion_one::compositor::EffectAnchorScope::VisualGroup,
                 visible_clip_fallback: None,
+                terminal_kawase: None,
             })
             .collect();
         CompiledFrameGraph {
@@ -4007,6 +4015,7 @@ mod tests {
                 visual_group: None,
                 anchor_scope: oblivion_one::compositor::EffectAnchorScope::VisualGroup,
                 visible_clip_fallback: None,
+                terminal_kawase: None,
             })
             .collect();
         let graph = CompiledFrameGraph {

@@ -387,6 +387,25 @@ pub struct CompiledRenderPass {
     pub visual_group: Option<VisualGroupId>,
     pub anchor_scope: EffectAnchorScope,
     pub visible_clip_fallback: Option<(usize, usize)>,
+    /// Physical terminal Kawase/material work carried by the final Composite.
+    pub terminal_kawase: Option<CompiledTerminalKawaseComposite>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CompiledTerminalKawaseComposite {
+    pub blur_radius: f32,
+    pub local_stage: EffectNodeKind,
+    pub fused_local_stages: Vec<EffectNodeKind>,
+    pub virtual_full_resolution: CompiledTerminalTextureLayout,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CompiledTerminalTextureLayout {
+    pub width: u32,
+    pub height: u32,
+    pub domain: EffectRect,
+    pub working_space: EffectWorkingSpace,
+    pub origin: GraphTextureOrigin,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -399,6 +418,9 @@ pub struct RenderGraphCompileStats {
     pub region_representation_overflows: usize,
     pub visible_clip_fallbacks: usize,
     pub work_region_bbox_coalesces: usize,
+    pub terminal_blur_fusion_candidates: usize,
+    pub terminal_blur_fusions: usize,
+    pub terminal_blur_passes_elided: usize,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -469,6 +491,12 @@ pub struct CompiledFrameExecutionVariants {
     pub precomputed_graph: Option<CompiledFrameGraph>,
     pub precomputed_backdrop: Option<CompiledPrecomputedBackdropPlan>,
     pub eligible_instances: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct FrameExecutionCompileOptions {
+    pub precomputed_window_blur: bool,
+    pub terminal_kawase_fusion: bool,
 }
 
 pub fn compile_precomputed_backdrop_build(
@@ -1327,9 +1355,8 @@ fn pass_input_sampling_radius(pass: &CompiledRenderPass) -> Option<(f64, f64, bo
             Some((f64::from(radius), f64::from(radius), false, true))
         }
         RenderPassKind::NormalizeInput => Some((0.0, 0.0, true, true)),
-        RenderPassKind::Composite | RenderPassKind::OutputPostProcess => {
-            Some((0.0, 0.0, true, true))
-        }
+        RenderPassKind::Composite => Some((0.0, 0.0, true, true)),
+        RenderPassKind::OutputPostProcess => Some((0.0, 0.0, true, true)),
         RenderPassKind::SceneCapture | RenderPassKind::SurfaceCapture => {
             Some((0.0, 0.0, false, false))
         }
@@ -1558,6 +1585,15 @@ pub fn required_input_region(
     output: &GraphTexturePlan,
     input: &GraphTexturePlan,
 ) -> Option<EffectRegion> {
+    if let Some(terminal) = pass.terminal_kawase.as_ref() {
+        return required_terminal_kawase_input_region(
+            pass,
+            demanded_output,
+            output,
+            input,
+            terminal,
+        );
+    }
     let (mut radius_x, mut radius_y, logical_mapping, linear_filter_support) =
         pass_input_sampling_radius(pass)?;
     if let Some(EffectNodeKind::CustomFragment(_)) = pass.stage.as_ref() {
@@ -1572,6 +1608,79 @@ pub fn required_input_region(
         radius_y,
         logical_mapping,
         linear_filter_support,
+    )
+}
+
+fn required_terminal_kawase_input_region(
+    pass: &CompiledRenderPass,
+    demanded_output: &EffectRegion,
+    output: &GraphTexturePlan,
+    input: &GraphTexturePlan,
+    terminal: &CompiledTerminalKawaseComposite,
+) -> Option<EffectRegion> {
+    if pass.kind != RenderPassKind::Composite
+        || pass.inputs.as_slice() != [input.id]
+        || pass.output != Some(output.id)
+        || output.source != GraphTextureSource::Output
+        || !terminal.blur_radius.is_finite()
+        || terminal.blur_radius.is_sign_negative()
+        || terminal.virtual_full_resolution.width == 0
+        || terminal.virtual_full_resolution.height == 0
+        || terminal.virtual_full_resolution.width != terminal.virtual_full_resolution.domain.width
+        || terminal.virtual_full_resolution.height != terminal.virtual_full_resolution.domain.height
+        || terminal.virtual_full_resolution.domain != input.domain
+        || input.width != ceil_div(terminal.virtual_full_resolution.width, 2)
+        || input.height != ceil_div(terminal.virtual_full_resolution.height, 2)
+        || terminal.virtual_full_resolution.working_space != EffectWorkingSpace::LinearSrgb
+        || terminal.virtual_full_resolution.working_space != input.working_space
+        || terminal.virtual_full_resolution.origin != input.origin
+    {
+        return None;
+    }
+
+    // Recreate the three removed logical mappings exactly: the old Composite
+    // sampled the Fragment output, the Fragment sampled the final Upsample
+    // output, and that Upsample sampled the retained half-resolution texture.
+    let virtual_layout = terminal.virtual_full_resolution;
+    let virtual_upsample_output = GraphTexturePlan {
+        id: input.id,
+        source: GraphTextureSource::Intermediate,
+        width: virtual_layout.width,
+        height: virtual_layout.height,
+        domain: virtual_layout.domain,
+        working_space: virtual_layout.working_space,
+        origin: virtual_layout.origin,
+        first_use: None,
+        last_use: None,
+    };
+    let virtual_fragment_output = virtual_upsample_output.clone();
+    let composite_input = map_region_to_input_texture(
+        demanded_output,
+        output,
+        &virtual_fragment_output,
+        0.0,
+        0.0,
+        true,
+        true,
+    )?;
+    let fragment_input = map_region_to_input_texture(
+        &composite_input,
+        &virtual_fragment_output,
+        &virtual_upsample_output,
+        0.0,
+        0.0,
+        false,
+        false,
+    )?;
+    let radius = f64::from(terminal.blur_radius);
+    map_region_to_input_texture(
+        &fragment_input,
+        &virtual_upsample_output,
+        input,
+        radius,
+        radius,
+        false,
+        true,
     )
 }
 
@@ -2216,6 +2325,7 @@ impl GraphBuilder {
             visual_group: None,
             anchor_scope,
             visible_clip_fallback: None,
+            terminal_kawase: None,
         });
         Ok(id)
     }
@@ -2260,7 +2370,7 @@ pub fn compile_frame_execution_plan(
     output_bounds: EffectRect,
     registry: &EffectRegistry,
 ) -> Result<FrameExecutionPlan, RenderGraphCompileError> {
-    compile_frame_execution_graph(scene, source_damage, output_bounds, registry, &[])
+    compile_frame_execution_graph(scene, source_damage, output_bounds, registry, &[], false)
 }
 
 /// Compile the exact graph and, when explicitly requested and eligible, a
@@ -2274,7 +2384,39 @@ pub fn compile_frame_execution_variants(
     registry: &EffectRegistry,
     precomputed_window_blur_enabled: bool,
 ) -> Result<CompiledFrameExecutionVariants, RenderGraphCompileError> {
-    let exact = compile_frame_execution_plan(scene, source_damage, output_bounds, registry)?;
+    compile_frame_execution_variants_with_options(
+        scene,
+        source_damage,
+        output_bounds,
+        registry,
+        FrameExecutionCompileOptions {
+            precomputed_window_blur: precomputed_window_blur_enabled,
+            terminal_kawase_fusion: false,
+        },
+    )
+}
+
+/// Compile exact causal execution with explicitly selected physical graph
+/// optimizations. Terminal Kawase fusion remains exact; precomputed backdrop
+/// construction remains a separate, non-causal execution variant.
+pub fn compile_frame_execution_variants_with_options(
+    scene: &ResolvedEffectScene,
+    source_damage: &EffectRegion,
+    output_bounds: EffectRect,
+    registry: &EffectRegistry,
+    options: FrameExecutionCompileOptions,
+) -> Result<CompiledFrameExecutionVariants, RenderGraphCompileError> {
+    let exact = match compile_frame_execution_graph(
+        scene,
+        source_damage,
+        output_bounds,
+        registry,
+        &[],
+        options.terminal_kawase_fusion,
+    )? {
+        plan @ FrameExecutionPlan::LegacyScene => plan,
+        FrameExecutionPlan::EffectGraph(graph) => FrameExecutionPlan::EffectGraph(graph),
+    };
     let mut eligible = scene
         .instances
         .iter()
@@ -2288,7 +2430,7 @@ pub fn compile_frame_execution_variants(
         .collect::<Vec<_>>();
     eligible.sort_by_key(|(instance, _)| (instance.scene_order, instance.id));
     let eligible_instances = eligible.len();
-    if !precomputed_window_blur_enabled || eligible_instances < 2 {
+    if !options.precomputed_window_blur || eligible_instances < 2 {
         return Ok(CompiledFrameExecutionVariants {
             exact,
             precomputed_graph: None,
@@ -2324,6 +2466,7 @@ pub fn compile_frame_execution_variants(
         output_bounds,
         registry,
         &candidates,
+        options.terminal_kawase_fusion,
     )? {
         FrameExecutionPlan::LegacyScene => None,
         FrameExecutionPlan::EffectGraph(graph) => Some(graph),
@@ -2425,6 +2568,7 @@ fn compile_frame_execution_graph(
     output_bounds: EffectRect,
     registry: &EffectRegistry,
     precomputed_consumers: &[EffectInstanceId],
+    terminal_kawase_fusion: bool,
 ) -> Result<FrameExecutionPlan, RenderGraphCompileError> {
     #[cfg(test)]
     note_graph_compile();
@@ -2508,6 +2652,9 @@ fn compile_frame_execution_graph(
     }
 
     fuse_compatible_local_stages(&mut builder);
+    let terminal_fusion_stats =
+        fuse_terminal_kawase_composites(&mut builder, terminal_kawase_fusion);
+    rebuild_texture_lifetimes(&mut builder);
     let intermediate_textures = builder
         .textures
         .iter()
@@ -2523,6 +2670,9 @@ fn compile_frame_execution_graph(
         region_representation_overflows,
         visible_clip_fallbacks,
         work_region_bbox_coalesces: 0,
+        terminal_blur_fusion_candidates: terminal_fusion_stats.candidates,
+        terminal_blur_fusions: terminal_fusion_stats.fusions,
+        terminal_blur_passes_elided: terminal_fusion_stats.passes_elided,
     };
     Ok(FrameExecutionPlan::EffectGraph(CompiledFrameGraph {
         passes: builder.passes,
@@ -2680,6 +2830,236 @@ fn fuse_compatible_local_stages(builder: &mut GraphBuilder) {
             if texture.last_use == Some(second_id) {
                 texture.last_use = Some(first_id);
             }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct TerminalKawaseFusionStats {
+    candidates: usize,
+    fusions: usize,
+    passes_elided: usize,
+}
+
+struct TerminalKawaseTailRewrite {
+    retained_input: GraphTextureId,
+    composite_index: usize,
+    metadata: CompiledTerminalKawaseComposite,
+    parameter_block: super::EffectParameterBlock,
+}
+
+fn fuse_terminal_kawase_composites(
+    builder: &mut GraphBuilder,
+    enabled: bool,
+) -> TerminalKawaseFusionStats {
+    let mut stats = TerminalKawaseFusionStats::default();
+    let mut index = 0;
+    while index + 2 < builder.passes.len() {
+        let is_terminal_shape = builder.passes[index].kind == RenderPassKind::DualKawaseUpsample
+            && builder.passes[index + 1].kind == RenderPassKind::Fragment
+            && builder.passes[index + 2].kind == RenderPassKind::Composite;
+        if !is_terminal_shape {
+            index += 1;
+            continue;
+        }
+
+        stats.candidates = stats.candidates.saturating_add(1);
+        let rewrite = enabled
+            .then(|| terminal_kawase_tail_rewrite(builder, index, index + 1, index + 2))
+            .flatten();
+        let Some(rewrite) = rewrite else {
+            index += 1;
+            continue;
+        };
+
+        let TerminalKawaseTailRewrite {
+            retained_input,
+            composite_index,
+            metadata,
+            parameter_block,
+        } = rewrite;
+        let composite = &mut builder.passes[composite_index];
+        composite.inputs[0] = retained_input;
+        composite.terminal_kawase = Some(metadata);
+        composite.parameter_block = parameter_block;
+        builder.passes.remove(index + 1);
+        builder.passes.remove(index);
+        stats.fusions = stats.fusions.saturating_add(1);
+        stats.passes_elided = stats.passes_elided.saturating_add(2);
+        index += 1;
+    }
+    stats
+}
+
+fn terminal_kawase_tail_rewrite(
+    builder: &GraphBuilder,
+    upsample_index: usize,
+    fragment_index: usize,
+    composite_index: usize,
+) -> Option<TerminalKawaseTailRewrite> {
+    let upsample = builder.passes.get(upsample_index)?;
+    let fragment = builder.passes.get(fragment_index)?;
+    let composite = builder.passes.get(composite_index)?;
+    if upsample.kind != RenderPassKind::DualKawaseUpsample
+        || fragment.kind != RenderPassKind::Fragment
+        || composite.kind != RenderPassKind::Composite
+        || upsample.instance != fragment.instance
+        || fragment.instance != composite.instance
+        || upsample.anchor != fragment.anchor
+        || fragment.anchor != composite.anchor
+        || upsample.anchor_scope != fragment.anchor_scope
+        || fragment.anchor_scope != composite.anchor_scope
+        || upsample.inputs.len() != 1
+        || fragment.inputs.len() != 1
+        || composite.inputs.len() != 1
+        || upsample.stage.is_some()
+        || fragment.stage.is_none()
+        || composite.stage.is_some()
+        || !upsample.fused_stages.is_empty()
+        || composite.terminal_kawase.is_some()
+        || !pass_has_transferable_intermediate_metadata(upsample)
+        || !pass_has_transferable_intermediate_metadata(fragment)
+        || fragment.visual_group != composite.visual_group
+    {
+        return None;
+    }
+
+    let upsample_output = upsample.output?;
+    let fragment_output = fragment.output?;
+    let retained_input = upsample.inputs[0];
+    if fragment.inputs[0] != upsample_output || composite.inputs[0] != fragment_output {
+        return None;
+    }
+    let radius = upsample.blur_radius?;
+    if !radius.is_finite() || radius.is_sign_negative() {
+        return None;
+    }
+
+    let upsample_texture = builder
+        .textures
+        .iter()
+        .find(|texture| texture.id == upsample_output)?;
+    let fragment_texture = builder
+        .textures
+        .iter()
+        .find(|texture| texture.id == fragment_output)?;
+    let retained_texture = builder
+        .textures
+        .iter()
+        .find(|texture| texture.id == retained_input)?;
+    let composite_output = composite
+        .output
+        .and_then(|output| builder.textures.iter().find(|texture| texture.id == output))?;
+    if retained_texture.source != GraphTextureSource::Intermediate
+        || upsample_texture.source != GraphTextureSource::Intermediate
+        || fragment_texture.source != GraphTextureSource::Intermediate
+        || composite_output.source != GraphTextureSource::Output
+        || retained_texture.domain != upsample_texture.domain
+        || upsample_texture.domain != fragment_texture.domain
+        || retained_texture.working_space != EffectWorkingSpace::LinearSrgb
+        || upsample_texture.working_space != EffectWorkingSpace::LinearSrgb
+        || fragment_texture.working_space != EffectWorkingSpace::LinearSrgb
+        || upsample.color_conversion != EffectColorConversion::None
+        || fragment.color_conversion != EffectColorConversion::None
+        || composite.color_conversion != EffectColorConversion::EncodeLinearToSrgb
+        || !composite.encode_output
+        || fragment_texture.width != fragment_texture.domain.width
+        || fragment_texture.height != fragment_texture.domain.height
+        || upsample_texture.width != fragment_texture.width
+        || upsample_texture.height != fragment_texture.height
+        || retained_texture.width != ceil_div(fragment_texture.width, 2)
+        || retained_texture.height != ceil_div(fragment_texture.height, 2)
+        || retained_texture.origin != upsample_texture.origin
+        || upsample_texture.origin != fragment_texture.origin
+        || count_texture_consumers(&builder.passes, upsample_output) != 1
+        || count_texture_consumers(&builder.passes, fragment_output) != 1
+    {
+        return None;
+    }
+
+    let local_stage = fragment.stage.as_ref()?.clone();
+    if !valid_terminal_local_stage_chain(&local_stage, &fragment.fused_stages) {
+        return None;
+    }
+    Some(TerminalKawaseTailRewrite {
+        retained_input,
+        composite_index,
+        metadata: CompiledTerminalKawaseComposite {
+            blur_radius: radius,
+            local_stage,
+            fused_local_stages: fragment.fused_stages.clone(),
+            virtual_full_resolution: CompiledTerminalTextureLayout {
+                width: fragment_texture.width,
+                height: fragment_texture.height,
+                domain: fragment_texture.domain,
+                working_space: fragment_texture.working_space,
+                origin: fragment_texture.origin,
+            },
+        },
+        parameter_block: fragment.parameter_block.clone(),
+    })
+}
+
+fn pass_has_transferable_intermediate_metadata(pass: &CompiledRenderPass) -> bool {
+    pass.coverage.is_none()
+        && pass.alpha_mode == EffectAlphaMode::Preserve
+        && !pass.encode_output
+        && pass.color_conversion == EffectColorConversion::None
+        && pass.checkpoint_dependencies.is_empty()
+        && pass.visible_clip_fallback.is_none()
+        && pass.terminal_kawase.is_none()
+}
+
+fn valid_terminal_local_stage_chain(first: &EffectNodeKind, fused: &[EffectNodeKind]) -> bool {
+    fn rank(stage: &EffectNodeKind) -> Option<u8> {
+        Some(match stage {
+            EffectNodeKind::ColorMatrix(_) => 0,
+            EffectNodeKind::Tint(_) => 1,
+            EffectNodeKind::Noise(_) => 2,
+            _ => return None,
+        })
+    }
+    let Some(mut previous) = rank(first) else {
+        return false;
+    };
+    for stage in fused {
+        let Some(current) = rank(stage) else {
+            return false;
+        };
+        if current <= previous {
+            return false;
+        }
+        previous = current;
+    }
+    true
+}
+
+fn count_texture_consumers(passes: &[CompiledRenderPass], texture: GraphTextureId) -> usize {
+    passes
+        .iter()
+        .filter(|pass| pass.inputs.contains(&texture))
+        .count()
+}
+
+fn rebuild_texture_lifetimes(builder: &mut GraphBuilder) {
+    for texture in &mut builder.textures {
+        texture.first_use = None;
+        texture.last_use = None;
+    }
+    for pass in &builder.passes {
+        for texture_id in pass.inputs.iter().copied().chain(pass.output) {
+            let Some(texture) = builder
+                .textures
+                .iter_mut()
+                .find(|texture| texture.id == texture_id)
+            else {
+                debug_assert!(false, "compiled pass must reference a planned texture");
+                continue;
+            };
+            if texture.first_use.is_none() {
+                texture.first_use = Some(pass.id);
+            }
+            texture.last_use = Some(pass.id);
         }
     }
 }
@@ -3773,6 +4153,7 @@ mod tests {
             visual_group: None,
             anchor_scope: EffectAnchorScope::VisualGroup,
             visible_clip_fallback: None,
+            terminal_kawase: None,
         }
     }
 
@@ -4590,6 +4971,89 @@ mod tests {
     }
 
     #[test]
+    fn backdrop_sources_in_one_effect_instance_share_capture_semantics() {
+        let first_source = EffectNodeId::new(1).unwrap();
+        let second_source = EffectNodeId::new(2).unwrap();
+        let blend = EffectNodeId::new(3).unwrap();
+        let blur = EffectNodeId::new(4).unwrap();
+        let program_id = EffectProgramId::new(2).unwrap();
+        let program = EffectProgram {
+            id: program_id,
+            nodes: vec![
+                EffectNode::source(first_source, EffectSource::Backdrop),
+                EffectNode::source(second_source, EffectSource::Backdrop),
+                EffectNode::blend(
+                    blend,
+                    vec![first_source, second_source],
+                    BlendSpec::new(BlendMode::SourceOver, 1.0).unwrap(),
+                ),
+                EffectNode::dual_kawase(blur, blend, DualKawaseBlurSpec::new(4.0, 2, 1.0).unwrap()),
+            ],
+            output: blur,
+            working_space: EffectWorkingSpace::LinearSrgb,
+            alpha_mode: EffectAlphaMode::Opaque,
+            outsets: EffectOutsets::ZERO,
+            frame_demand: EffectFrameDemand::OnDamage,
+            failure_policy: EffectFailurePolicy::Passthrough,
+        };
+        let (scene, mut registry) = blur_scene();
+        let prior_instance = scene.instances[0].clone();
+        let region = prior_instance.region.clone();
+        registry
+            .insert(validate_effect_program(program).unwrap())
+            .unwrap();
+
+        let scene = ResolvedEffectScene::new(
+            1,
+            vec![prior_instance, test_instance(program_id, 2, region.clone())],
+        );
+        let FrameExecutionPlan::EffectGraph(graph) = compile_frame_execution_plan(
+            &scene,
+            &region,
+            EffectRect::new(0, 0, 1920, 1080).unwrap(),
+            &registry,
+        )
+        .unwrap() else {
+            panic!("visible effects must compile to an effect graph");
+        };
+        let current_instance = EffectInstanceId::new(2).unwrap();
+        let captures = graph
+            .passes
+            .iter()
+            .filter(|pass| {
+                pass.kind == RenderPassKind::SceneCapture && pass.instance == current_instance
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(captures.len(), 2);
+        assert_eq!(captures[0].instance, captures[1].instance);
+        assert_eq!(captures[0].checkpoint_dependencies.len(), 1);
+        assert_eq!(
+            captures[0].checkpoint_dependencies,
+            captures[1].checkpoint_dependencies
+        );
+
+        let first_texture = graph
+            .textures
+            .iter()
+            .find(|texture| Some(texture.id) == captures[0].output)
+            .unwrap();
+        let second_texture = graph
+            .textures
+            .iter()
+            .find(|texture| Some(texture.id) == captures[1].output)
+            .unwrap();
+        assert_eq!(first_texture.source, GraphTextureSource::CapturedScene);
+        assert_eq!(second_texture.source, GraphTextureSource::CapturedScene);
+        assert_eq!(first_texture.domain, second_texture.domain);
+        assert_eq!(
+            (first_texture.width, first_texture.height),
+            (second_texture.width, second_texture.height)
+        );
+        assert_eq!(first_texture.working_space, second_texture.working_space);
+        assert_eq!(first_texture.origin, second_texture.origin);
+    }
+
+    #[test]
     fn overlapping_backdrop_stacks_expose_ordered_checkpoint_dependencies() {
         let (scene, registry) = blur_scene();
         let mut second = scene.instances[0].clone();
@@ -4813,6 +5277,7 @@ mod tests {
             visual_group: None,
             anchor_scope: EffectAnchorScope::VisualGroup,
             visible_clip_fallback: None,
+            terminal_kawase: None,
         }
     }
 
@@ -8260,5 +8725,561 @@ mod tests {
         );
         assert!(demand.contains(EffectInstanceId::new(2).unwrap()));
         assert!(!demand.contains(EffectInstanceId::new(1).unwrap()));
+    }
+
+    fn compile_terminal_fusion_variant(
+        count: usize,
+        bounds: EffectRect,
+        enabled: bool,
+    ) -> CompiledFrameGraph {
+        let (scene, registry) = synthesized_builtin_blur_scene(count);
+        let variants = compile_frame_execution_variants_with_options(
+            &scene,
+            &full_test_damage(bounds),
+            bounds,
+            &registry,
+            FrameExecutionCompileOptions {
+                precomputed_window_blur: false,
+                terminal_kawase_fusion: enabled,
+            },
+        )
+        .expect("terminal-fusion graph compiles");
+        let FrameExecutionPlan::EffectGraph(graph) = variants.exact else {
+            panic!("visible built-in blur compiles to a graph");
+        };
+        graph
+    }
+
+    #[test]
+    fn fifteen_builtin_blurs_elide_only_the_terminal_upsample_and_fragment() {
+        let bounds = EffectRect::new(0, 0, 2_400, 600).unwrap();
+        let off = compile_terminal_fusion_variant(15, bounds, false);
+        let on = compile_terminal_fusion_variant(15, bounds, true);
+
+        assert_eq!(off.stats.passes, 105);
+        assert_eq!(
+            off.passes
+                .iter()
+                .filter(|pass| pass.kind == RenderPassKind::SceneCapture)
+                .count(),
+            15
+        );
+        assert_eq!(
+            off.passes
+                .iter()
+                .filter(|pass| pass.kind == RenderPassKind::DualKawaseDownsample)
+                .count(),
+            30
+        );
+        assert_eq!(
+            off.passes
+                .iter()
+                .filter(|pass| pass.kind == RenderPassKind::DualKawaseUpsample)
+                .count(),
+            30
+        );
+        assert_eq!(
+            off.passes
+                .iter()
+                .filter(|pass| pass.kind == RenderPassKind::Fragment)
+                .count(),
+            15
+        );
+        assert_eq!(
+            off.passes
+                .iter()
+                .filter(|pass| pass.kind == RenderPassKind::Composite)
+                .count(),
+            15
+        );
+        assert_eq!(off.stats.terminal_blur_fusion_candidates, 15);
+        assert_eq!(off.stats.terminal_blur_fusions, 0);
+        assert_eq!(off.stats.terminal_blur_passes_elided, 0);
+
+        assert_eq!(on.stats.passes, 75);
+        assert_eq!(
+            on.passes
+                .iter()
+                .filter(|pass| pass.kind == RenderPassKind::SceneCapture)
+                .count(),
+            15
+        );
+        assert_eq!(
+            on.passes
+                .iter()
+                .filter(|pass| pass.kind == RenderPassKind::DualKawaseDownsample)
+                .count(),
+            30
+        );
+        assert_eq!(
+            on.passes
+                .iter()
+                .filter(|pass| pass.kind == RenderPassKind::DualKawaseUpsample)
+                .count(),
+            15
+        );
+        assert_eq!(
+            on.passes
+                .iter()
+                .filter(|pass| pass.kind == RenderPassKind::Fragment)
+                .count(),
+            0
+        );
+        assert_eq!(
+            on.passes
+                .iter()
+                .filter(|pass| pass.kind == RenderPassKind::Composite)
+                .count(),
+            15
+        );
+        assert_eq!(on.stats.terminal_blur_fusion_candidates, 15);
+        assert_eq!(on.stats.terminal_blur_fusions, 15);
+        assert_eq!(on.stats.terminal_blur_passes_elided, 30);
+        let live_intermediate_lifetimes = |graph: &CompiledFrameGraph| {
+            graph
+                .textures
+                .iter()
+                .filter(|texture| {
+                    texture.source == GraphTextureSource::Intermediate
+                        && texture.first_use.is_some()
+                        && texture.last_use.is_some()
+                })
+                .count()
+        };
+        assert_eq!(live_intermediate_lifetimes(&off), 75);
+        assert_eq!(live_intermediate_lifetimes(&on), 45);
+        assert!(on.stats.peak_live_intermediates <= off.stats.peak_live_intermediates);
+    }
+
+    #[test]
+    fn one_canonical_tail_keeps_composite_id_and_rewrites_its_input() {
+        let bounds = EffectRect::new(0, 0, 300, 200).unwrap();
+        let off = compile_terminal_fusion_variant(1, bounds, false);
+        let on = compile_terminal_fusion_variant(1, bounds, true);
+        let instance = EffectInstanceId::new(1).unwrap();
+        let kinds = |graph: &CompiledFrameGraph| {
+            graph
+                .passes
+                .iter()
+                .filter(|pass| pass.instance == instance)
+                .map(|pass| pass.kind)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            kinds(&off),
+            [
+                RenderPassKind::SceneCapture,
+                RenderPassKind::DualKawaseDownsample,
+                RenderPassKind::DualKawaseDownsample,
+                RenderPassKind::DualKawaseUpsample,
+                RenderPassKind::DualKawaseUpsample,
+                RenderPassKind::Fragment,
+                RenderPassKind::Composite,
+            ]
+        );
+        assert_eq!(
+            kinds(&on),
+            [
+                RenderPassKind::SceneCapture,
+                RenderPassKind::DualKawaseDownsample,
+                RenderPassKind::DualKawaseDownsample,
+                RenderPassKind::DualKawaseUpsample,
+                RenderPassKind::Composite,
+            ]
+        );
+        let off_composite = off
+            .passes
+            .iter()
+            .find(|pass| pass.kind == RenderPassKind::Composite)
+            .unwrap();
+        let on_composite = on
+            .passes
+            .iter()
+            .find(|pass| pass.kind == RenderPassKind::Composite)
+            .unwrap();
+        assert_eq!(off_composite.id, on_composite.id);
+        assert!(off_composite.terminal_kawase.is_none());
+        assert!(on_composite.terminal_kawase.is_some());
+        assert_eq!(on_composite.inputs.len(), 1);
+        let retained_input = on_composite.inputs[0];
+        let retained = on
+            .textures
+            .iter()
+            .find(|texture| texture.id == retained_input)
+            .unwrap();
+        assert_eq!(retained.last_use, Some(on_composite.id));
+        let removed_upsample_output = off
+            .passes
+            .iter()
+            .rev()
+            .find(|pass| pass.kind == RenderPassKind::DualKawaseUpsample)
+            .and_then(|pass| pass.output)
+            .unwrap();
+        let removed_fragment_output = off
+            .passes
+            .iter()
+            .find(|pass| pass.kind == RenderPassKind::Fragment)
+            .and_then(|pass| pass.output)
+            .unwrap();
+        for removed in [removed_upsample_output, removed_fragment_output] {
+            let dead = on
+                .textures
+                .iter()
+                .find(|texture| texture.id == removed)
+                .unwrap();
+            assert_eq!((dead.first_use, dead.last_use), (None, None));
+            assert!(
+                on.passes
+                    .iter()
+                    .all(|pass| !pass.inputs.contains(&removed) && pass.output != Some(removed))
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_tail_optimizer_fails_closed_for_unsupported_or_mismatched_metadata() {
+        fn candidate_builder() -> GraphBuilder {
+            let graph =
+                compile_terminal_fusion_variant(1, EffectRect::new(0, 0, 300, 200).unwrap(), false);
+            GraphBuilder {
+                passes: graph.passes,
+                textures: graph.textures,
+            }
+        }
+
+        fn indices(builder: &GraphBuilder) -> (usize, usize, usize) {
+            let upsample = builder
+                .passes
+                .iter()
+                .rposition(|pass| pass.kind == RenderPassKind::DualKawaseUpsample)
+                .unwrap();
+            let fragment = builder
+                .passes
+                .iter()
+                .position(|pass| pass.kind == RenderPassKind::Fragment)
+                .unwrap();
+            let composite = builder
+                .passes
+                .iter()
+                .position(|pass| pass.kind == RenderPassKind::Composite)
+                .unwrap();
+            (upsample, fragment, composite)
+        }
+
+        fn assert_rejected(
+            mut builder: GraphBuilder,
+            mutate: impl FnOnce(&mut GraphBuilder, usize, usize, usize),
+        ) {
+            let (upsample, fragment, composite) = indices(&builder);
+            mutate(&mut builder, upsample, fragment, composite);
+            assert!(
+                terminal_kawase_tail_rewrite(&builder, upsample, fragment, composite).is_none()
+            );
+        }
+
+        assert_rejected(candidate_builder(), |builder, _, fragment, _| {
+            builder.passes[fragment].stage =
+                Some(EffectNodeKind::CustomFragment(CustomFragmentSpec {
+                    shader: ShaderModuleId::new(9_001).unwrap(),
+                    declared_footprint: EffectFootprint::symmetric(1),
+                    uniforms: Vec::new(),
+                    auxiliary_inputs: Vec::new(),
+                }));
+        });
+        assert_rejected(candidate_builder(), |builder, _, fragment, _| {
+            builder.passes[fragment].stage = Some(EffectNodeKind::Blend(BlendSpec {
+                mode: BlendMode::SourceOver,
+                opacity: 1.0,
+            }));
+        });
+        assert_rejected(candidate_builder(), |builder, _, fragment, _| {
+            builder.passes[fragment].stage = Some(EffectNodeKind::Mask(MaskSpec {
+                mode: MaskMode::Alpha,
+            }));
+        });
+        assert_rejected(candidate_builder(), |builder, _, fragment, _| {
+            let input = builder.passes[fragment].inputs[0];
+            builder.passes[fragment].inputs.push(input);
+        });
+        assert_rejected(candidate_builder(), |builder, _, _, composite| {
+            let input = builder.passes[composite].inputs[0];
+            builder.passes[composite].inputs.push(input);
+        });
+        assert_rejected(candidate_builder(), |builder, _, _, composite| {
+            builder.passes[composite].kind = RenderPassKind::OutputPostProcess;
+        });
+        assert_rejected(candidate_builder(), |builder, _, fragment, _| {
+            builder.passes[fragment].instance = EffectInstanceId::new(2).unwrap();
+        });
+        assert_rejected(candidate_builder(), |builder, _, fragment, _| {
+            builder.passes[fragment].anchor = EffectAnchor::AfterSurface(19);
+        });
+        assert_rejected(candidate_builder(), |builder, _, fragment, _| {
+            builder.passes[fragment].anchor_scope = EffectAnchorScope::Surface;
+        });
+        assert_rejected(candidate_builder(), |builder, _, _, composite| {
+            builder.passes[composite].visual_group = Some(VisualGroupId::new(99).unwrap());
+        });
+        assert_rejected(candidate_builder(), |builder, upsample, _, _| {
+            let retained = builder.passes[upsample].inputs[0];
+            builder.textures[usize::from(retained.get() - 1)].domain =
+                EffectRect::new(1, 0, 300, 200).unwrap();
+        });
+        assert_rejected(candidate_builder(), |builder, upsample, _, _| {
+            let output = builder.passes[upsample].output.unwrap();
+            builder.textures[usize::from(output.get() - 1)].working_space =
+                EffectWorkingSpace::OutputEncodedSrgb;
+        });
+        assert_rejected(candidate_builder(), |builder, _, fragment, _| {
+            builder.passes[fragment].color_conversion = EffectColorConversion::EncodeLinearToSrgb;
+        });
+        assert_rejected(candidate_builder(), |builder, upsample, _, _| {
+            builder.passes[upsample].blur_radius = None;
+        });
+        assert_rejected(candidate_builder(), |builder, upsample, _, _| {
+            builder.passes[upsample].blur_radius = Some(f32::NAN);
+        });
+        assert_rejected(candidate_builder(), |builder, upsample, _, _| {
+            let output = builder.passes[upsample].output.unwrap();
+            let mut extra_consumer = builder.passes[upsample].clone();
+            extra_consumer.inputs = vec![output];
+            builder.passes.push(extra_consumer);
+        });
+        assert_rejected(candidate_builder(), |builder, _, fragment, _| {
+            let output = builder.passes[fragment].output.unwrap();
+            let mut extra_consumer = builder.passes[fragment].clone();
+            extra_consumer.inputs = vec![output];
+            builder.passes.push(extra_consumer);
+        });
+        assert_rejected(candidate_builder(), |builder, upsample, fragment, _| {
+            let retained = builder.passes[upsample].inputs[0];
+            let output = builder.passes[upsample].output.unwrap();
+            builder.passes[fragment].inputs[0] = retained;
+            assert_ne!(retained, output);
+        });
+
+        let mut coverage_builder = candidate_builder();
+        let (upsample, fragment, composite) = indices(&coverage_builder);
+        coverage_builder.passes[composite].coverage = Some(EffectCoverage {
+            rounded_rect: Some(EffectCoverageRoundedRect {
+                x: 2.0,
+                y: 3.0,
+                width: 180.0,
+                height: 120.0,
+                radius: 9.0,
+            }),
+            triangle: None,
+        });
+        let coverage = coverage_builder.passes[composite].coverage.clone();
+        let rewrite =
+            terminal_kawase_tail_rewrite(&coverage_builder, upsample, fragment, composite)
+                .expect("final Composite coverage stays eligible");
+        assert_eq!(coverage_builder.passes[composite].coverage, coverage);
+        assert_eq!(rewrite.composite_index, composite);
+    }
+
+    #[test]
+    fn fused_composite_input_region_matches_the_virtual_legacy_tail() {
+        let output_bounds = EffectRect::new(0, 0, 1_200, 900).unwrap();
+        for (domain, repairs) in [
+            (
+                EffectRect::new(101, 77, 80, 60).unwrap(),
+                vec![
+                    EffectRect::new(138, 104, 4, 4).unwrap(),
+                    EffectRect::new(101, 77, 3, 3).unwrap(),
+                    EffectRect::new(178, 77, 3, 3).unwrap(),
+                    EffectRect::new(101, 134, 3, 3).unwrap(),
+                    EffectRect::new(178, 134, 3, 3).unwrap(),
+                    EffectRect::new(139, 77, 4, 3).unwrap(),
+                    EffectRect::new(139, 134, 4, 3).unwrap(),
+                    EffectRect::new(101, 105, 3, 4).unwrap(),
+                    EffectRect::new(178, 105, 3, 4).unwrap(),
+                ],
+            ),
+            (
+                EffectRect::new(607, 403, 83, 61).unwrap(),
+                vec![
+                    EffectRect::new(647, 430, 4, 4).unwrap(),
+                    EffectRect::new(607, 403, 3, 3).unwrap(),
+                    EffectRect::new(687, 403, 3, 3).unwrap(),
+                    EffectRect::new(607, 461, 3, 3).unwrap(),
+                    EffectRect::new(687, 461, 3, 3).unwrap(),
+                    EffectRect::new(648, 403, 4, 3).unwrap(),
+                    EffectRect::new(648, 461, 4, 3).unwrap(),
+                    EffectRect::new(607, 431, 3, 4).unwrap(),
+                    EffectRect::new(687, 431, 3, 4).unwrap(),
+                ],
+            ),
+        ] {
+            let mut scene = synthesized_builtin_blur_scene(1).0;
+            scene.instances[0].region = EffectRegion::from_rect(domain);
+            scene.instances[0].target_bounds = domain;
+            let registry = EffectRegistry::with_builtin_background_blur();
+            let source_damage = EffectRegion::empty();
+            let options = |enabled| FrameExecutionCompileOptions {
+                precomputed_window_blur: false,
+                terminal_kawase_fusion: enabled,
+            };
+            let off = compile_frame_execution_variants_with_options(
+                &scene,
+                &source_damage,
+                output_bounds,
+                &registry,
+                options(false),
+            )
+            .unwrap();
+            let on = compile_frame_execution_variants_with_options(
+                &scene,
+                &source_damage,
+                output_bounds,
+                &registry,
+                options(true),
+            )
+            .unwrap();
+            let FrameExecutionPlan::EffectGraph(off) = off.exact else {
+                panic!("legacy graph exists");
+            };
+            let FrameExecutionPlan::EffectGraph(on) = on.exact else {
+                panic!("fused graph exists");
+            };
+            let final_composite = off
+                .passes
+                .iter()
+                .find(|pass| pass.kind == RenderPassKind::Composite)
+                .unwrap();
+            let legacy_fragment = off
+                .passes
+                .iter()
+                .find(|pass| pass.kind == RenderPassKind::Fragment)
+                .unwrap();
+            let final_upsample = off
+                .passes
+                .iter()
+                .rev()
+                .find(|pass| pass.kind == RenderPassKind::DualKawaseUpsample)
+                .unwrap();
+            let output_plan = off
+                .textures
+                .iter()
+                .find(|texture| texture.source == GraphTextureSource::Output)
+                .unwrap();
+            let fragment_output = off
+                .textures
+                .iter()
+                .find(|texture| texture.id == legacy_fragment.output.unwrap())
+                .unwrap();
+            let upsample_output = off
+                .textures
+                .iter()
+                .find(|texture| texture.id == final_upsample.output.unwrap())
+                .unwrap();
+            let retained_input = off
+                .textures
+                .iter()
+                .find(|texture| texture.id == final_upsample.inputs[0])
+                .unwrap();
+            let fused_composite = on
+                .passes
+                .iter()
+                .find(|pass| pass.kind == RenderPassKind::Composite)
+                .unwrap();
+            let fused_input = on
+                .textures
+                .iter()
+                .find(|texture| texture.id == fused_composite.inputs[0])
+                .unwrap();
+            let fused_output = on
+                .textures
+                .iter()
+                .find(|texture| texture.source == GraphTextureSource::Output)
+                .unwrap();
+
+            let mut demands = repairs
+                .iter()
+                .map(|repair| EffectRegion::from_rect(*repair))
+                .collect::<Vec<_>>();
+            demands.push(
+                EffectRegion::from_rect(repairs[0]).union(&EffectRegion::from_rect(repairs[4])),
+            );
+            for demand in demands {
+                let composite_input =
+                    required_input_region(final_composite, &demand, output_plan, fragment_output)
+                        .unwrap();
+                let fragment_input = required_input_region(
+                    legacy_fragment,
+                    &composite_input,
+                    fragment_output,
+                    upsample_output,
+                )
+                .unwrap();
+                let legacy_required = required_input_region(
+                    final_upsample,
+                    &fragment_input,
+                    upsample_output,
+                    retained_input,
+                )
+                .unwrap();
+                let fused_required =
+                    required_input_region(fused_composite, &demand, fused_output, fused_input)
+                        .unwrap();
+                if domain == EffectRect::new(101, 77, 80, 60).unwrap()
+                    && demand == EffectRegion::from_rect(repairs[0])
+                {
+                    let terminal = fused_composite
+                        .terminal_kawase
+                        .as_ref()
+                        .expect("canonical tail carries terminal metadata");
+                    let radius = f64::from(terminal.blur_radius);
+                    let single_radius_mapping = map_region_to_input_texture(
+                        &demand,
+                        fused_output,
+                        fused_input,
+                        radius,
+                        radius,
+                        true,
+                        true,
+                    )
+                    .unwrap();
+                    assert!(
+                        !legacy_required.subtract(&single_radius_mapping).is_empty(),
+                        "a single logical Composite radius must not replace the virtual pass chain"
+                    );
+                }
+                assert_eq!(
+                    fused_required, legacy_required,
+                    "fused footprint differs for domain {domain:?}, demand {demand:?}"
+                );
+                for policy in [
+                    EffectDemandPlannerPolicy::Legacy,
+                    EffectDemandPlannerPolicy::Regional,
+                ] {
+                    let planned = plan_effect_execution_demand_with_policy(
+                        &on, &demand, false, false, policy,
+                    );
+                    let demanded_composite = planned
+                        .pass_output_region(fused_composite.id)
+                        .expect("both planners demand the final Composite");
+                    let required = required_input_region(
+                        fused_composite,
+                        demanded_composite,
+                        fused_output,
+                        fused_input,
+                    )
+                    .expect("fused Composite maps its required input");
+                    let producer = on
+                        .passes
+                        .iter()
+                        .find(|pass| pass.output == Some(fused_input.id))
+                        .expect("retained half-resolution texture has a producer");
+                    let produced = planned
+                        .pass_output_region(producer.id)
+                        .expect("both planners demand the retained texture producer");
+                    assert!(
+                        required.subtract(produced).is_empty(),
+                        "{policy:?} planner under-selected the fused input for {domain:?} / {demand:?}"
+                    );
+                }
+            }
+        }
     }
 }

@@ -285,6 +285,7 @@ pub(in crate::egl_renderer::tests) fn translated_capture_test_graph() -> (
         visual_group: None,
         anchor_scope: oblivion_one::compositor::EffectAnchorScope::Surface,
         visible_clip_fallback: None,
+        terminal_kawase: None,
     };
     let materialization =
         EffectRect::new(62, 62, 2, 2).expect("translated capture materialization region");

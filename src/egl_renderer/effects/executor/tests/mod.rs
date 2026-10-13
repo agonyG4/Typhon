@@ -47,6 +47,7 @@ fn test_pass(
         visual_group: None,
         anchor_scope: oblivion_one::compositor::EffectAnchorScope::VisualGroup,
         visible_clip_fallback: None,
+        terminal_kawase: None,
     }
 }
 

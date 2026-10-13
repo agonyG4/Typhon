@@ -173,6 +173,63 @@ fn composite_shader_applies_presentation_opacity_after_effect_alpha_mode() {
 }
 
 #[test]
+fn terminal_composite_shader_preserves_kawase_material_and_presentation_order() {
+    let shader = TERMINAL_KAWASE_COMPOSITE_FRAGMENT_SHADER;
+    for uniform in [
+        "u_effect_input",
+        "u_effect_input_flip_y",
+        "u_effect_texel_size",
+        "u_effect_blur_radius",
+        "u_effect_input_domain",
+        "u_effect_output_size",
+        "u_effect_encode_srgb",
+        "u_effect_force_opaque",
+        "u_presentation_opacity",
+        "u_effect_coverage_enabled",
+        "u_effect_color_matrix",
+        "u_effect_tint_color",
+        "u_effect_noise_amount",
+    ] {
+        assert!(
+            shader.contains(uniform),
+            "missing terminal uniform {uniform}"
+        );
+    }
+    for weight in ["0.40", "0.15"] {
+        assert!(
+            shader.contains(weight),
+            "missing legacy Kawase weight {weight}"
+        );
+    }
+    assert!(shader.contains("floor(output_position - u_effect_input_domain.xy)"));
+    assert!(shader.contains("vec2 effect_local_uv ="));
+    assert!(shader.contains("dot(effect_local_uv, vec2(12.9898, 78.233))"));
+    assert!(!shader.contains("dot(v_uv,"));
+
+    let kawase = shader.find("vec4 result = texture(u_effect_input").unwrap();
+    let matrix = shader.find("u_effect_color_matrix * result").unwrap();
+    let sanitize = shader
+        .find("result = typhon_sanitize_premultiplied(result);")
+        .unwrap();
+    let encoding = shader
+        .find("typhon_encode_premultiplied_srgb(result)")
+        .unwrap();
+    let opacity = shader
+        .find("result *= clamp(u_presentation_opacity, 0.0, 1.0)")
+        .unwrap();
+    let coverage = shader
+        .find("result *= typhon_analytic_coverage(output_position)")
+        .unwrap();
+    let final_sanitize = shader
+        .find("out_color = typhon_sanitize_premultiplied(result)")
+        .unwrap();
+    assert!(kawase < matrix);
+    assert!(matrix < sanitize && sanitize < encoding);
+    assert!(encoding < opacity && opacity < coverage && coverage < final_sanitize);
+    assert!(shader.contains("typhon_effect_sample_uv(effect_local_uv)"));
+}
+
+#[test]
 fn every_fullscreen_pass_family_uses_the_shared_sample_orientation_contract() {
     for shader in [
         blur::DUAL_KAWASE_DOWNSAMPLE_SHADER,

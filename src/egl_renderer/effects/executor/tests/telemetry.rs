@@ -525,6 +525,7 @@ fn effect_surface_consumer_plan_keeps_capture_only_source() {
         visual_group: None,
         anchor_scope: oblivion_one::compositor::EffectAnchorScope::Surface,
         visible_clip_fallback: None,
+        terminal_kawase: None,
     };
     let graph = CompiledFrameGraph {
         passes: vec![pass],
@@ -825,6 +826,7 @@ fn effect_selection_follows_direct_presentation_and_graph_dependencies() {
         visual_group: None,
         anchor_scope: oblivion_one::compositor::EffectAnchorScope::VisualGroup,
         visible_clip_fallback: None,
+        terminal_kawase: None,
     };
     let texture = |id| oblivion_one::effects::GraphTexturePlan {
         id: GraphTextureId::new(id).unwrap(),

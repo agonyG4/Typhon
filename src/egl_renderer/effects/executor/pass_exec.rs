@@ -346,13 +346,18 @@ pub(super) fn execute_pass(
             )?;
         }
         RenderPassKind::Composite | RenderPassKind::OutputPostProcess => {
+            let fragment_shader = if pass.terminal_kawase.is_some() {
+                TERMINAL_KAWASE_COMPOSITE_FRAGMENT_SHADER
+            } else {
+                COMPOSITE_FRAGMENT_SHADER
+            };
             execute_fullscreen_pass(
                 renderer,
                 graph,
                 textures,
                 pass,
                 targets,
-                COMPOSITE_FRAGMENT_SHADER,
+                fragment_shader,
                 framebuffer_origin,
                 false,
                 execution_damage,
@@ -1023,7 +1028,9 @@ pub(super) fn execute_fullscreen_pass(
     };
     let shader_key = ShaderProgramKey::new(
         ShaderModuleId::new(module).expect("static effect shader ids are non-zero"),
-        if capture_fusion.is_some() {
+        if pass.terminal_kawase.is_some() {
+            1
+        } else if capture_fusion.is_some() {
             2
         } else if pass.kind == RenderPassKind::NormalizeInput
             || (pass.kind == RenderPassKind::DualKawaseDownsample
@@ -1036,6 +1043,47 @@ pub(super) fn execute_fullscreen_pass(
         oblivion_one::effects::EffectWorkingSpace::LinearSrgb,
     );
     let program = renderer.runtime.effect_shaders.lookup(shader_key)?;
+    if pass.terminal_kawase.is_some() {
+        for name in [
+            "u_effect_input",
+            "u_effect_input_flip_y",
+            "u_effect_texel_size",
+            "u_effect_blur_radius",
+            "u_effect_input_domain",
+            "u_effect_output_size",
+            "u_effect_encode_srgb",
+            "u_effect_force_opaque",
+            "u_presentation_opacity",
+            "u_effect_coverage_enabled",
+            "u_effect_coverage_has_rounded_rect",
+            "u_effect_coverage_rounded_rect",
+            "u_effect_coverage_radius",
+            "u_effect_coverage_has_triangle",
+            "u_effect_coverage_triangle_a",
+            "u_effect_coverage_triangle_b",
+            "u_effect_coverage_triangle_c",
+            "u_effect_color_matrix",
+            "u_effect_color_bias",
+            "u_effect_tint_color",
+            "u_effect_tint_amount",
+            "u_effect_noise_amount",
+        ] {
+            if uniform_location(
+                &mut renderer.runtime.effect_shaders,
+                renderer.gl,
+                shader_key,
+                program,
+                name,
+            )
+            .is_none()
+            {
+                return Err(io::Error::other(format!(
+                    "terminal composite shader is missing uniform {name}"
+                ))
+                .into());
+            }
+        }
+    }
     let (vertex_array, _) = renderer.ensure_effect_quad()?;
     if capture_fusion.is_some() {
         for name in [
@@ -1272,7 +1320,7 @@ pub(super) fn execute_fullscreen_pass(
         ) {
             renderer.gl.uniform_1_i32(Some(&location), 0);
         }
-        if blur_shader
+        if (blur_shader || pass.terminal_kawase.is_some())
             && let Some(location) = uniform_location(
                 &mut renderer.runtime.effect_shaders,
                 renderer.gl,
@@ -1287,7 +1335,7 @@ pub(super) fn execute_fullscreen_pass(
                 1.0 / input_plan.height.max(1) as f32,
             );
         }
-        if blur_shader
+        if (blur_shader || pass.terminal_kawase.is_some())
             && let Some(location) = uniform_location(
                 &mut renderer.runtime.effect_shaders,
                 renderer.gl,
@@ -1296,9 +1344,13 @@ pub(super) fn execute_fullscreen_pass(
                 "u_effect_blur_radius",
             )
         {
-            renderer
-                .gl
-                .uniform_1_f32(Some(&location), pass.blur_radius.unwrap_or(1.0));
+            renderer.gl.uniform_1_f32(
+                Some(&location),
+                pass.terminal_kawase.as_ref().map_or_else(
+                    || pass.blur_radius.unwrap_or(1.0),
+                    |terminal| terminal.blur_radius,
+                ),
+            );
         }
         if let Some(fusion) = capture_fusion {
             if let Some(location) = uniform_location(
@@ -1373,6 +1425,28 @@ pub(super) fn execute_fullscreen_pass(
                 input_plan.domain.y as f32,
                 input_plan.domain.width.max(1) as f32,
                 input_plan.domain.height.max(1) as f32,
+            );
+        }
+        if let Some(terminal) = pass.terminal_kawase.as_ref() {
+            set_stage_uniforms(
+                &mut renderer.runtime.effect_shaders,
+                renderer.gl,
+                shader_key,
+                program,
+                &terminal.local_stage,
+                StageUniformContext {
+                    parameters: &pass.parameter_block,
+                    input_plan,
+                    output_size: trusted_effect_output_size(
+                        renderer.scene.current_size,
+                        (output_plan.width, output_plan.height),
+                    ),
+                    output_scale: renderer.runtime.effect_output_scale,
+                    effect_time_seconds: renderer.runtime.effect_time_seconds,
+                    effect_delta_seconds: renderer.runtime.effect_delta_seconds,
+                    color_conversion: EffectColorConversion::None,
+                    fused_stages: &terminal.fused_local_stages,
+                },
             );
         }
         if !blur_shader

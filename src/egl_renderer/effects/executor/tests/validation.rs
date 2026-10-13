@@ -361,6 +361,7 @@ fn pruned_instance_does_not_realize_textures() {
         visual_group: None,
         anchor_scope: oblivion_one::compositor::EffectAnchorScope::VisualGroup,
         visible_clip_fallback: None,
+        terminal_kawase: None,
     };
     let graph = CompiledFrameGraph {
         passes: vec![

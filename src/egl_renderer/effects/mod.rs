@@ -5,6 +5,8 @@ mod gpu_timing;
 mod metrics;
 mod precomputed_window_blur;
 pub(crate) use precomputed_window_blur::PrecomputedWindowBlurPolicy;
+mod terminal_blur_fusion;
+pub(crate) use terminal_blur_fusion::terminal_fusion_enabled;
 mod resources;
 mod runtime;
 mod shader_cache;
