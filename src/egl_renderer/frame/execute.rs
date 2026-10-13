@@ -490,6 +490,35 @@ impl FramePipeline<'_> {
             debug_config,
             scene_replay_work_mode_override,
             HashMap::new(),
+            #[cfg(test)]
+            None,
+        )
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::egl_renderer) fn execute_effect_graph_with_terminal_replay(
+        &mut self,
+        graph: &CompiledFrameGraph,
+        framebuffer_origin: super::super::OutputFramebufferOrigin,
+        repaint_plan: &RepaintPlan,
+        demand: &oblivion_one::effects::EffectExecutionDemand,
+        selection: &EffectExecutionSelection,
+        debug_config: EffectDebugConfig,
+        scene_replay_work_mode_override: Option<SceneReplayWorkMode>,
+        terminal_replay: &mut super::super::effects::TerminalBoundaryReplayExecution,
+    ) -> RendererResult<EffectExecutionStats> {
+        self.execute_effect_graph_with_overlays_config_and_bindings(
+            graph,
+            framebuffer_origin,
+            repaint_plan,
+            demand,
+            selection,
+            debug_config,
+            scene_replay_work_mode_override,
+            HashMap::new(),
+            #[cfg(test)]
+            Some(terminal_replay),
         )
     }
 
@@ -503,6 +532,9 @@ impl FramePipeline<'_> {
         debug_config: EffectDebugConfig,
         scene_replay_work_mode_override: Option<SceneReplayWorkMode>,
         external_bindings: HashMap<GraphTextureId, GraphTextureBinding>,
+        #[cfg(test)] mut terminal_replay: Option<
+            &mut super::super::effects::TerminalBoundaryReplayExecution,
+        >,
     ) -> RendererResult<EffectExecutionStats> {
         let mut prepared = {
             let mut context = self.effect_execution_context();
@@ -520,6 +552,23 @@ impl FramePipeline<'_> {
         };
         let promotes_checkpoint_cache = prepared.promotes_checkpoint_cache();
         let composition_target = prepared.composition_target();
+        #[cfg(test)]
+        let mut result = {
+            let mut context = self.effect_execution_context();
+            if let Some(terminal_replay) = terminal_replay.as_deref_mut() {
+                super::super::effects::execute_prepared_effect_graph_core_with_terminal_replay(
+                    &mut context,
+                    &mut prepared,
+                    terminal_replay,
+                )
+            } else {
+                super::super::effects::execute_prepared_effect_graph_core(
+                    &mut context,
+                    &mut prepared,
+                )
+            }
+        };
+        #[cfg(not(test))]
         let mut result = {
             let mut context = self.effect_execution_context();
             super::super::effects::execute_prepared_effect_graph_core(&mut context, &mut prepared)
@@ -585,6 +634,8 @@ impl FramePipeline<'_> {
             *super::super::effects::effect_debug_config(),
             None,
             bindings,
+            #[cfg(test)]
+            None,
         )
     }
 

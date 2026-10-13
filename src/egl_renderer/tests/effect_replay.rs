@@ -152,6 +152,672 @@ fn terminal_pixel_difference_summary(expected: &[u8], actual: &[u8], width: u32)
     }
 }
 
+#[derive(Clone, Debug)]
+struct Rgba16fDifferenceSample {
+    storage_coordinate: [u32; 2],
+    logical_effect_local_coordinate: [i32; 2],
+    legacy_rgba: [f32; 4],
+    diagnostic_rgba: [f32; 4],
+    absolute_difference: [f32; 4],
+    ulp_difference: [u32; 4],
+}
+
+#[derive(Clone, Debug)]
+struct Rgba16fDifferenceSummary {
+    total_texels: usize,
+    differing_texels: usize,
+    differing_channels: usize,
+    differing_alpha_texels: usize,
+    first: Option<Rgba16fDifferenceSample>,
+    maximum_absolute_difference: f32,
+    maximum_ulp_difference: u32,
+    logical_bounds: Option<[i32; 4]>,
+    exactly_equal: bool,
+}
+
+fn ordered_f32_bits(value: f32) -> u32 {
+    let bits = value.to_bits();
+    if bits & 0x8000_0000 == 0 {
+        bits | 0x8000_0000
+    } else {
+        !bits
+    }
+}
+
+fn summarize_rgba16f_difference(
+    legacy: &effects::DiagnosticTextureCapture,
+    diagnostic: &effects::DiagnosticTextureCapture,
+) -> Rgba16fDifferenceSummary {
+    assert_eq!(
+        (legacy.width, legacy.height),
+        (diagnostic.width, diagnostic.height)
+    );
+    assert_eq!(legacy.domain, diagnostic.domain);
+    assert_eq!(legacy.origin, diagnostic.origin);
+    let total_texels = legacy.width as usize * legacy.height as usize;
+    assert_eq!(legacy.pixels.len(), total_texels);
+    assert_eq!(diagnostic.pixels.len(), total_texels);
+
+    let mut summary = Rgba16fDifferenceSummary {
+        total_texels,
+        differing_texels: 0,
+        differing_channels: 0,
+        differing_alpha_texels: 0,
+        first: None,
+        maximum_absolute_difference: 0.0,
+        maximum_ulp_difference: 0,
+        logical_bounds: None,
+        exactly_equal: true,
+    };
+    for logical_y in 0..legacy.height {
+        let storage_y = match legacy.origin {
+            oblivion_one::effects::GraphTextureOrigin::BottomLeft => legacy.height - 1 - logical_y,
+        };
+        for x in 0..legacy.width {
+            let offset = (storage_y * legacy.width + x) as usize;
+            let left = legacy.pixels[offset];
+            let right = diagnostic.pixels[offset];
+            if left == right {
+                continue;
+            }
+            summary.exactly_equal = false;
+            summary.differing_texels += 1;
+            if left[3] != right[3] {
+                summary.differing_alpha_texels += 1;
+            }
+            let mut absolute_difference = [0.0; 4];
+            let mut ulp_difference = [0; 4];
+            for channel in 0..4 {
+                absolute_difference[channel] = (left[channel] - right[channel]).abs();
+                ulp_difference[channel] =
+                    ordered_f32_bits(left[channel]).abs_diff(ordered_f32_bits(right[channel]));
+                if ulp_difference[channel] != 0 {
+                    summary.differing_channels += 1;
+                }
+                summary.maximum_absolute_difference = summary
+                    .maximum_absolute_difference
+                    .max(absolute_difference[channel]);
+                summary.maximum_ulp_difference =
+                    summary.maximum_ulp_difference.max(ulp_difference[channel]);
+            }
+            let logical_x = legacy.domain.x + x as i32;
+            let logical_y = legacy.domain.y + logical_y as i32;
+            summary.logical_bounds = Some(summary.logical_bounds.map_or(
+                [logical_x, logical_y, logical_x, logical_y],
+                |bounds| {
+                    [
+                        bounds[0].min(logical_x),
+                        bounds[1].min(logical_y),
+                        bounds[2].max(logical_x),
+                        bounds[3].max(logical_y),
+                    ]
+                },
+            ));
+            summary.first.get_or_insert(Rgba16fDifferenceSample {
+                storage_coordinate: [x, storage_y],
+                logical_effect_local_coordinate: [logical_x, logical_y],
+                legacy_rgba: left,
+                diagnostic_rgba: right,
+                absolute_difference,
+                ulp_difference,
+            });
+        }
+    }
+    summary
+}
+
+#[test]
+fn rgba16f_texture_diff_reports_storage_and_logical_coordinates() {
+    let domain = EffectRect::new(100, 200, 2, 3).expect("capture domain");
+    let legacy = effects::DiagnosticTextureCapture {
+        width: 2,
+        height: 3,
+        domain,
+        origin: oblivion_one::effects::GraphTextureOrigin::BottomLeft,
+        pixels: vec![[0.5, 0.25, 0.125, 1.0]; 6],
+    };
+    let mut diagnostic = legacy.clone();
+    // Logical local row 2 is stored in framebuffer row 0 for BottomLeft origin.
+    diagnostic.pixels[1][0] = f32::from_bits(legacy.pixels[1][0].to_bits() + 1);
+
+    let difference = summarize_rgba16f_difference(&legacy, &diagnostic);
+
+    assert_eq!(difference.total_texels, 6);
+    assert_eq!(difference.differing_texels, 1);
+    assert_eq!(difference.differing_channels, 1);
+    let first = difference.first.expect("one differing sample");
+    assert_eq!(first.storage_coordinate, [1, 0]);
+    assert_eq!(first.logical_effect_local_coordinate, [101, 202]);
+    assert_eq!(first.legacy_rgba, legacy.pixels[1]);
+    assert_eq!(first.diagnostic_rgba, diagnostic.pixels[1]);
+    assert_eq!(first.ulp_difference, [1, 0, 0, 0]);
+    assert!(!difference.exactly_equal);
+}
+
+#[derive(Clone, Debug)]
+struct Rgba8DifferenceSummary {
+    changed_pixels: usize,
+    changed_ratio: f64,
+    max_rgb_delta: u8,
+    mean_absolute_rgb_error: f64,
+    rms_rgb_error: f64,
+    bounds: Option<[u32; 4]>,
+    alpha_changed_pixels: usize,
+}
+
+fn summarize_rgba8_difference(
+    expected: &[u8],
+    actual: &[u8],
+    width: u32,
+) -> Rgba8DifferenceSummary {
+    assert_eq!(expected.len(), actual.len());
+    assert_eq!(expected.len() % 4, 0);
+    let total_pixels = expected.len() / 4;
+    let mut summary = Rgba8DifferenceSummary {
+        changed_pixels: 0,
+        changed_ratio: 0.0,
+        max_rgb_delta: 0,
+        mean_absolute_rgb_error: 0.0,
+        rms_rgb_error: 0.0,
+        bounds: None,
+        alpha_changed_pixels: 0,
+    };
+    let mut absolute_sum = 0.0;
+    let mut squared_sum = 0.0;
+    for (index, (left, right)) in expected
+        .chunks_exact(4)
+        .zip(actual.chunks_exact(4))
+        .enumerate()
+    {
+        let rgb_deltas = [
+            left[0].abs_diff(right[0]),
+            left[1].abs_diff(right[1]),
+            left[2].abs_diff(right[2]),
+        ];
+        let changed = rgb_deltas.iter().any(|delta| *delta != 0) || left[3] != right[3];
+        if changed {
+            summary.changed_pixels += 1;
+            let x = (index as u32) % width;
+            let y = (index as u32) / width;
+            summary.bounds = Some(summary.bounds.map_or([x, y, x, y], |bounds| {
+                [
+                    bounds[0].min(x),
+                    bounds[1].min(y),
+                    bounds[2].max(x),
+                    bounds[3].max(y),
+                ]
+            }));
+        }
+        if left[3] != right[3] {
+            summary.alpha_changed_pixels += 1;
+        }
+        for delta in rgb_deltas {
+            summary.max_rgb_delta = summary.max_rgb_delta.max(delta);
+            absolute_sum += f64::from(delta);
+            squared_sum += f64::from(delta) * f64::from(delta);
+        }
+    }
+    summary.changed_ratio = summary.changed_pixels as f64 / total_pixels.max(1) as f64;
+    summary.mean_absolute_rgb_error = absolute_sum / (total_pixels.max(1) * 3) as f64;
+    summary.rms_rgb_error = (squared_sum / (total_pixels.max(1) * 3) as f64).sqrt();
+    summary
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TerminalTailCaptureIds {
+    instance: oblivion_one::effects::EffectInstanceId,
+    upsample: oblivion_one::effects::GraphPassId,
+    fragment: oblivion_one::effects::GraphPassId,
+    composite: oblivion_one::effects::GraphPassId,
+}
+
+fn terminal_tail_capture_ids(graph: &CompiledFrameGraph) -> Vec<TerminalTailCaptureIds> {
+    graph
+        .passes
+        .windows(3)
+        .filter_map(|passes| {
+            let [upsample, fragment, composite] = passes else {
+                return None;
+            };
+            (upsample.kind == RenderPassKind::DualKawaseUpsample
+                && fragment.kind == RenderPassKind::Fragment
+                && composite.kind == RenderPassKind::Composite)
+                .then_some(TerminalTailCaptureIds {
+                    instance: upsample.instance,
+                    upsample: upsample.id,
+                    fragment: fragment.id,
+                    composite: composite.id,
+                })
+        })
+        .collect()
+}
+
+fn render_terminal_replay_mode(
+    graph: &CompiledFrameGraph,
+    output_size: (u32, u32),
+    origin: OutputFramebufferOrigin,
+    install_scene: impl FnOnce(&mut GlesEffectTestHarness),
+    mode: effects::TerminalBoundaryReplay,
+    capture_passes: impl IntoIterator<Item = oblivion_one::effects::GraphPassId>,
+    probe_passes: impl IntoIterator<Item = oblivion_one::effects::GraphPassId>,
+) -> (effects::TerminalBoundaryReplayExecution, Vec<u8>) {
+    let mut harness = GlesEffectTestHarness::new(output_size.0, output_size.1);
+    install_scene(&mut harness);
+    let bounds = EffectRect::new(0, 0, output_size.0, output_size.1).expect("output bounds");
+    let plan = diagnostic_repaint_plan_for_repairs_in_size(&[], true, output_size);
+    let config = effects::EffectDebugConfig::new(
+        effects::EffectDebugCaptureMode::Replay,
+        effects::EffectDebugKawaseMode::Partial,
+    );
+    let replay = execute_diagnostic_frame_with_terminal_replay(
+        &mut harness,
+        graph,
+        &plan,
+        EffectRegion::from_rect(bounds),
+        true,
+        config,
+        origin,
+        mode,
+        capture_passes,
+        probe_passes,
+    );
+    (replay, read_diagnostic_pixels(&harness))
+}
+
+fn report_rgba16f_comparison(
+    label: &str,
+    legacy: &effects::DiagnosticTextureCapture,
+    diagnostic: &effects::DiagnosticTextureCapture,
+) -> Rgba16fDifferenceSummary {
+    let summary = summarize_rgba16f_difference(legacy, diagnostic);
+    println!("    {label}: {summary:?}");
+    summary
+}
+
+fn report_rgba8_comparison(
+    label: &str,
+    legacy: &[u8],
+    diagnostic: &[u8],
+    width: u32,
+) -> Rgba8DifferenceSummary {
+    let summary = summarize_rgba8_difference(legacy, diagnostic, width);
+    println!("    {label}: {summary:?}");
+    summary
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_terminal_builtin_diagnostic_case(
+    name: &str,
+    output_size: (u32, u32),
+    rect: EffectRect,
+    visual_group: VisualGroupId,
+    blur: f32,
+    saturation: f32,
+    noise: f32,
+    coverage: Option<oblivion_one::effects::EffectCoverage>,
+    origin: OutputFramebufferOrigin,
+) {
+    let material = oblivion_one::material::EffectiveMaterial {
+        blur,
+        saturation,
+        noise,
+    };
+    let (scene, registry) = terminal_builtin_blur_scene(rect, visual_group, material, coverage);
+    let bounds = EffectRect::new(0, 0, output_size.0, output_size.1).expect("output bounds");
+    let legacy_graph = terminal_graph_variant(&scene, &registry, bounds, false);
+    let terminal_graph = terminal_graph_variant(&scene, &registry, bounds, true);
+    let tails = terminal_tail_capture_ids(&legacy_graph);
+    assert_eq!(tails.len(), 1, "single blur has one canonical tail");
+    let tail = tails[0];
+    let fused_composite = terminal_graph
+        .passes
+        .iter()
+        .find(|pass| pass.instance == tail.instance && pass.terminal_kawase.is_some())
+        .expect("L3 retains the terminal Composite");
+    assert_eq!(fused_composite.id, tail.composite);
+    let install = |harness: &mut GlesEffectTestHarness| {
+        install_diagnostic_scene(harness, rect, visual_group);
+    };
+
+    let (l0, c0) = render_terminal_replay_mode(
+        &legacy_graph,
+        output_size,
+        origin,
+        install,
+        effects::TerminalBoundaryReplay::Legacy,
+        [tail.upsample, tail.fragment],
+        [],
+    );
+    let (l1, c1) = render_terminal_replay_mode(
+        &legacy_graph,
+        output_size,
+        origin,
+        |harness| install_diagnostic_scene(harness, rect, visual_group),
+        effects::TerminalBoundaryReplay::FuseUp2AndFragment,
+        [tail.fragment],
+        [],
+    );
+    let (l2, c2) = render_terminal_replay_mode(
+        &legacy_graph,
+        output_size,
+        origin,
+        |harness| install_diagnostic_scene(harness, rect, visual_group),
+        effects::TerminalBoundaryReplay::FuseFragmentAndComposite,
+        [tail.upsample],
+        [],
+    );
+    let (material_probe, c_material_probe) = render_terminal_replay_mode(
+        &legacy_graph,
+        output_size,
+        origin,
+        |harness| install_diagnostic_scene(harness, rect, visual_group),
+        effects::TerminalBoundaryReplay::MaterialOnlyProbe,
+        [tail.fragment],
+        [],
+    );
+    let (kawase_probe, _) = render_terminal_replay_mode(
+        &legacy_graph,
+        output_size,
+        origin,
+        |harness| install_diagnostic_scene(harness, rect, visual_group),
+        effects::TerminalBoundaryReplay::KawaseOnlyProbe,
+        [],
+        [tail.upsample],
+    );
+    let (l3, c3) = render_terminal_replay_mode(
+        &terminal_graph,
+        output_size,
+        origin,
+        |harness| install_diagnostic_scene(harness, rect, visual_group),
+        effects::TerminalBoundaryReplay::CaptureTerminalStages,
+        [],
+        [tail.composite],
+    );
+
+    let a0 = l0.captures.get(&tail.upsample).expect("L0 captures A0");
+    let b0 = l0.captures.get(&tail.fragment).expect("L0 captures B0");
+    let a1 = kawase_probe
+        .stage_probes
+        .get(&(tail.upsample, effects::TerminalDiagnosticStage::Up2))
+        .expect("A1 terminal-style Up2 probe");
+    let b1 = l1.captures.get(&tail.fragment).expect("L1 captures B1");
+    let a2 = l2.captures.get(&tail.upsample).expect("L2 captures A2");
+    let b2 = material_probe
+        .captures
+        .get(&tail.fragment)
+        .expect("material-only probe captures B2");
+    let a3 = l3
+        .stage_probes
+        .get(&(tail.composite, effects::TerminalDiagnosticStage::Up2))
+        .expect("A3 terminal Up2 probe");
+    let b3 = l3
+        .stage_probes
+        .get(&(tail.composite, effects::TerminalDiagnosticStage::Fragment))
+        .expect("B3 terminal Up2+Fragment probe");
+
+    let pass_count_l1 = legacy_graph.passes.len() - 1;
+    let pass_count_l2 = legacy_graph.passes.len() - 1;
+    println!(
+        "KAWASE_DIAG case={name} origin={origin:?} size={output_size:?} domain={rect:?} saturation={saturation} noise={noise} passes=L0:{} L1:{pass_count_l1} L2:{pass_count_l2} L3:{}",
+        legacy_graph.passes.len(),
+        terminal_graph.passes.len()
+    );
+    let a0_a1 = report_rgba16f_comparison("A0 vs A1", a0, a1);
+    report_rgba16f_comparison("A0 vs A2", a0, a2);
+    let a0_a3 = report_rgba16f_comparison("A0 vs A3", a0, a3);
+    let b0_b1 = report_rgba16f_comparison("B0 vs B1", b0, b1);
+    let b0_b2 = report_rgba16f_comparison("B0 vs B2", b0, b2);
+    let b0_b3 = report_rgba16f_comparison("B0 vs B3", b0, b3);
+    report_rgba8_comparison("C0 vs C1", &c0, &c1, output_size.0);
+    report_rgba8_comparison("C0 vs C2", &c0, &c2, output_size.0);
+    report_rgba8_comparison("C0 vs C_B2", &c0, &c_material_probe, output_size.0);
+    report_rgba8_comparison("C0 vs C3", &c0, &c3, output_size.0);
+    let first_divergence = if !a0_a1.exactly_equal || !a0_a3.exactly_equal {
+        "final Up2 reconstruction/rasterization"
+    } else if !b0_b1.exactly_equal || !b0_b3.exactly_equal {
+        if b0_b2.exactly_equal {
+            "removing the stored Up2 RGBA16F boundary before local Fragment"
+        } else {
+            "local Fragment operation after Up2"
+        }
+    } else {
+        "Fragment materialization or Composite"
+    };
+    println!("    first_divergent_boundary={first_divergence}");
+}
+
+fn run_terminal_causal_diagnostic_case(noise: f32, origin: OutputFramebufferOrigin) {
+    let fixture = native_three_checkpoint_fixture();
+    let (mut scene, _) = native_three_checkpoint_backdrop_scene(fixture);
+    let program = oblivion_one::effects::builtin_background_material_program(
+        oblivion_one::material::EffectiveMaterial {
+            blur: 0.4,
+            saturation: 0.52,
+            noise,
+        },
+    );
+    let program_id = program.program.id;
+    let mut registry = oblivion_one::effects::EffectRegistry::empty();
+    registry.insert(program).expect("causal material inserts");
+    for instance in &mut scene.instances {
+        instance.program = program_id;
+    }
+    let legacy_graph = terminal_graph_variant(&scene, &registry, fixture.output_bounds, false);
+    let terminal_graph = terminal_graph_variant(&scene, &registry, fixture.output_bounds, true);
+    let tails = terminal_tail_capture_ids(&legacy_graph);
+    assert_eq!(tails.len(), 3, "causal A/B/C has three terminal tails");
+    let composite_ids = tails.iter().map(|tail| tail.composite).collect::<Vec<_>>();
+    let upsample_ids = tails.iter().map(|tail| tail.upsample).collect::<Vec<_>>();
+    let fragment_ids = tails.iter().map(|tail| tail.fragment).collect::<Vec<_>>();
+    for tail in &tails {
+        assert!(
+            terminal_graph
+                .passes
+                .iter()
+                .any(|pass| { pass.id == tail.composite && pass.terminal_kawase.is_some() })
+        );
+    }
+    let install = |harness: &mut GlesEffectTestHarness| {
+        install_native_three_checkpoint_diagnostic_scene(harness, fixture.scene);
+    };
+    let (l0, c0) = render_terminal_replay_mode(
+        &legacy_graph,
+        fixture.output_size,
+        origin,
+        install,
+        effects::TerminalBoundaryReplay::Legacy,
+        upsample_ids
+            .iter()
+            .copied()
+            .chain(fragment_ids.iter().copied()),
+        [],
+    );
+    let (l1, c1) = render_terminal_replay_mode(
+        &legacy_graph,
+        fixture.output_size,
+        origin,
+        |harness| install_native_three_checkpoint_diagnostic_scene(harness, fixture.scene),
+        effects::TerminalBoundaryReplay::FuseUp2AndFragment,
+        fragment_ids.iter().copied(),
+        [],
+    );
+    let (l2, c2) = render_terminal_replay_mode(
+        &legacy_graph,
+        fixture.output_size,
+        origin,
+        |harness| install_native_three_checkpoint_diagnostic_scene(harness, fixture.scene),
+        effects::TerminalBoundaryReplay::FuseFragmentAndComposite,
+        upsample_ids.iter().copied(),
+        [],
+    );
+    let (b2_probe, c_b2_probe) = render_terminal_replay_mode(
+        &legacy_graph,
+        fixture.output_size,
+        origin,
+        |harness| install_native_three_checkpoint_diagnostic_scene(harness, fixture.scene),
+        effects::TerminalBoundaryReplay::MaterialOnlyProbe,
+        fragment_ids.iter().copied(),
+        [],
+    );
+    let (a1_probe, _) = render_terminal_replay_mode(
+        &legacy_graph,
+        fixture.output_size,
+        origin,
+        |harness| install_native_three_checkpoint_diagnostic_scene(harness, fixture.scene),
+        effects::TerminalBoundaryReplay::KawaseOnlyProbe,
+        [],
+        upsample_ids.iter().copied(),
+    );
+    let (l3, c3) = render_terminal_replay_mode(
+        &terminal_graph,
+        fixture.output_size,
+        origin,
+        |harness| install_native_three_checkpoint_diagnostic_scene(harness, fixture.scene),
+        effects::TerminalBoundaryReplay::CaptureTerminalStages,
+        [],
+        composite_ids.iter().copied(),
+    );
+    println!(
+        "KAWASE_DIAG case=causal_abc origin={origin:?} size={:?} tails={} noise={noise} passes=L0:{} L1:{} L2:{} L3:{}",
+        fixture.output_size,
+        tails.len(),
+        legacy_graph.passes.len(),
+        legacy_graph.passes.len() - tails.len(),
+        legacy_graph.passes.len() - tails.len(),
+        terminal_graph.passes.len()
+    );
+    for tail in &tails {
+        let a0 = l0.captures.get(&tail.upsample).expect("causal A0");
+        let b0 = l0.captures.get(&tail.fragment).expect("causal B0");
+        let a1 = a1_probe
+            .stage_probes
+            .get(&(tail.upsample, effects::TerminalDiagnosticStage::Up2))
+            .expect("causal A1");
+        let b1 = l1.captures.get(&tail.fragment).expect("causal B1");
+        let a2 = l2.captures.get(&tail.upsample).expect("causal A2");
+        let b2 = b2_probe.captures.get(&tail.fragment).expect("causal B2");
+        let a3 = l3
+            .stage_probes
+            .get(&(tail.composite, effects::TerminalDiagnosticStage::Up2))
+            .expect("causal A3");
+        let b3 = l3
+            .stage_probes
+            .get(&(tail.composite, effects::TerminalDiagnosticStage::Fragment))
+            .expect("causal B3");
+        println!("    causal_instance={:?}", tail.instance);
+        report_rgba16f_comparison("A0 vs A1", a0, a1);
+        report_rgba16f_comparison("A0 vs A2", a0, a2);
+        report_rgba16f_comparison("A0 vs A3", a0, a3);
+        report_rgba16f_comparison("B0 vs B1", b0, b1);
+        report_rgba16f_comparison("B0 vs B2", b0, b2);
+        report_rgba16f_comparison("B0 vs B3", b0, b3);
+    }
+    report_rgba8_comparison("C0 vs C1", &c0, &c1, fixture.output_size.0);
+    report_rgba8_comparison("C0 vs C2", &c0, &c2, fixture.output_size.0);
+    report_rgba8_comparison("C0 vs C_B2", &c0, &c_b2_probe, fixture.output_size.0);
+    report_rgba8_comparison("C0 vs C3", &c0, &c3, fixture.output_size.0);
+}
+
+#[test]
+fn terminal_boundary_rgba16f_noise_free_matrix_and_legacy_noise_attribution() {
+    let odd_bounds = (161, 121);
+    let odd_rect = EffectRect::new(19, 13, 101, 75).expect("odd translated blur");
+    let even_rect = EffectRect::new(18, 14, 96, 72).expect("even blur");
+    let rounded_triangle = oblivion_one::effects::EffectCoverage {
+        rounded_rect: Some(oblivion_one::effects::EffectCoverageRoundedRect {
+            x: odd_rect.x as f64,
+            y: odd_rect.y as f64,
+            width: odd_rect.width as f64,
+            height: odd_rect.height as f64,
+            radius: 13.5,
+        }),
+        triangle: Some(oblivion_one::effects::EffectCoverageTriangle {
+            a: [27.0, 23.0],
+            b: [108.0, 20.0],
+            c: [78.0, 79.0],
+        }),
+    };
+    for origin in [
+        OutputFramebufferOrigin::BottomLeft,
+        OutputFramebufferOrigin::TopLeftScanout,
+    ] {
+        run_terminal_builtin_diagnostic_case(
+            "single_sat_1_noise_0",
+            (160, 120),
+            even_rect,
+            VisualGroupId::new(71).expect("visual group"),
+            0.37,
+            1.0,
+            0.0,
+            None,
+            origin,
+        );
+        run_terminal_builtin_diagnostic_case(
+            "single_sat_031_noise_0",
+            (160, 120),
+            even_rect,
+            VisualGroupId::new(72).expect("visual group"),
+            0.37,
+            0.31,
+            0.0,
+            None,
+            origin,
+        );
+        run_terminal_builtin_diagnostic_case(
+            "odd_translated_sat_031_noise_0",
+            odd_bounds,
+            odd_rect,
+            VisualGroupId::new(73).expect("visual group"),
+            0.42,
+            0.31,
+            0.0,
+            None,
+            origin,
+        );
+        run_terminal_builtin_diagnostic_case(
+            "even_translated_sat_1_noise_0",
+            (160, 120),
+            even_rect,
+            VisualGroupId::new(74).expect("visual group"),
+            0.37,
+            1.0,
+            0.0,
+            None,
+            origin,
+        );
+        run_terminal_builtin_diagnostic_case(
+            "rounded_triangle_coverage_noise_0",
+            odd_bounds,
+            odd_rect,
+            VisualGroupId::new(75).expect("visual group"),
+            0.42,
+            0.31,
+            0.0,
+            Some(rounded_triangle.clone()),
+            origin,
+        );
+        run_terminal_causal_diagnostic_case(0.0, origin);
+    }
+
+    for origin in [
+        OutputFramebufferOrigin::BottomLeft,
+        OutputFramebufferOrigin::TopLeftScanout,
+    ] {
+        run_terminal_builtin_diagnostic_case(
+            "single_sat_031_noise_03_attribution",
+            (160, 120),
+            even_rect,
+            VisualGroupId::new(76).expect("visual group"),
+            0.37,
+            0.31,
+            0.3,
+            None,
+            origin,
+        );
+        run_terminal_causal_diagnostic_case(0.3, origin);
+    }
+}
+
 #[test]
 fn terminal_kawase_gles_matches_causal_unfused_frames_exactly() {
     let translated_odd_bounds = EffectRect::new(0, 0, 161, 121).expect("odd output bounds");

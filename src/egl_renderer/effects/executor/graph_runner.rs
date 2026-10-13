@@ -1,5 +1,255 @@
 use super::*;
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TerminalBoundaryReplay {
+    Legacy,
+    FuseUp2AndFragment,
+    FuseFragmentAndComposite,
+    KawaseOnlyProbe,
+    MaterialOnlyProbe,
+    CaptureTerminalStages,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) struct DiagnosticTextureCapture {
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) domain: EffectRect,
+    pub(crate) origin: oblivion_one::effects::GraphTextureOrigin,
+    pub(crate) pixels: Vec<[f32; 4]>,
+}
+
+#[cfg(test)]
+pub(crate) struct TerminalBoundaryReplayExecution {
+    #[cfg(test)]
+    pub(crate) mode: TerminalBoundaryReplay,
+    #[cfg(test)]
+    pub(crate) capture_passes: std::collections::HashSet<GraphPassId>,
+    #[cfg(test)]
+    pub(crate) probe_passes: std::collections::HashSet<GraphPassId>,
+    #[cfg(test)]
+    pub(crate) captures: std::collections::HashMap<GraphPassId, DiagnosticTextureCapture>,
+    #[cfg(test)]
+    pub(crate) stage_probes:
+        std::collections::HashMap<(GraphPassId, TerminalDiagnosticStage), DiagnosticTextureCapture>,
+}
+
+#[cfg(test)]
+impl TerminalBoundaryReplayExecution {
+    pub(crate) fn new(
+        mode: TerminalBoundaryReplay,
+        capture_passes: impl IntoIterator<Item = GraphPassId>,
+        probe_passes: impl IntoIterator<Item = GraphPassId>,
+    ) -> Self {
+        Self {
+            mode,
+            capture_passes: capture_passes.into_iter().collect(),
+            probe_passes: probe_passes.into_iter().collect(),
+            captures: std::collections::HashMap::new(),
+            stage_probes: std::collections::HashMap::new(),
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum TerminalDiagnosticStage {
+    Up2,
+    Fragment,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct DiagnosticTerminalTail {
+    upsample: CompiledRenderPass,
+    fragment: CompiledRenderPass,
+    composite: CompiledRenderPass,
+    retained_input: GraphTextureId,
+    upsample_output: GraphTextureId,
+    fragment_output: GraphTextureId,
+}
+
+#[cfg(test)]
+fn diagnostic_terminal_tails(graph: &CompiledFrameGraph) -> Vec<DiagnosticTerminalTail> {
+    graph
+        .passes
+        .windows(3)
+        .filter_map(|passes| {
+            let [upsample, fragment, composite] = passes else {
+                return None;
+            };
+            if upsample.kind != RenderPassKind::DualKawaseUpsample
+                || fragment.kind != RenderPassKind::Fragment
+                || composite.kind != RenderPassKind::Composite
+            {
+                return None;
+            }
+            Some(DiagnosticTerminalTail {
+                upsample: upsample.clone(),
+                fragment: fragment.clone(),
+                composite: composite.clone(),
+                retained_input: *upsample.inputs.first()?,
+                upsample_output: upsample.output?,
+                fragment_output: fragment.output?,
+            })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+fn capture_graph_texture(
+    renderer: &mut EffectExecutionContext<'_>,
+    target: &PooledEffectTexture,
+    plan: &oblivion_one::effects::GraphTexturePlan,
+    composition_target: crate::egl_renderer::EffectFramebufferTarget,
+) -> RendererResult<DiagnosticTextureCapture> {
+    let pixels = renderer
+        .runtime
+        .effect_resources
+        .read_effect_texture_rgba_f32(renderer.gl, target, plan.width, plan.height)?;
+    renderer.establish_effect_composition_state(composition_target);
+    unsafe {
+        renderer.gl.viewport(
+            0,
+            0,
+            renderer.scene.current_size.0 as i32,
+            renderer.scene.current_size.1 as i32,
+        );
+        renderer.gl.disable(glow::SCISSOR_TEST);
+    }
+    Ok(DiagnosticTextureCapture {
+        width: plan.width,
+        height: plan.height,
+        domain: plan.domain,
+        origin: plan.origin,
+        pixels,
+    })
+}
+
+#[cfg(test)]
+fn crop_full_output_capture(
+    pixels: &[[f32; 4]],
+    output_size: (u32, u32),
+    domain: EffectRect,
+) -> DiagnosticTextureCapture {
+    assert!(domain.x >= 0 && domain.y >= 0);
+    assert!(domain.x as u32 + domain.width <= output_size.0);
+    assert!(domain.y as u32 + domain.height <= output_size.1);
+    assert_eq!(
+        pixels.len(),
+        output_size.0 as usize * output_size.1 as usize
+    );
+    let mut cropped = vec![[0.0; 4]; domain.width as usize * domain.height as usize];
+    for local_storage_y in 0..domain.height {
+        let logical_output_y = domain.y as u32 + domain.height - 1 - local_storage_y;
+        let output_storage_y = output_size.1 - 1 - logical_output_y;
+        for x in 0..domain.width {
+            let output_x = domain.x as u32 + x;
+            cropped[(local_storage_y * domain.width + x) as usize] =
+                pixels[(output_storage_y * output_size.0 + output_x) as usize];
+        }
+    }
+    DiagnosticTextureCapture {
+        width: domain.width,
+        height: domain.height,
+        domain,
+        origin: oblivion_one::effects::GraphTextureOrigin::BottomLeft,
+        pixels: cropped,
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn capture_terminal_stage_probe(
+    renderer: &mut EffectExecutionContext<'_>,
+    graph: &CompiledFrameGraph,
+    textures: &mut std::collections::HashMap<GraphTextureId, GraphTextureBinding>,
+    pass: &CompiledRenderPass,
+    targets: EffectExecutionTargets,
+    framebuffer_origin: OutputFramebufferOrigin,
+    shader: super::pass_exec::DiagnosticFullscreenShader,
+) -> RendererResult<DiagnosticTextureCapture> {
+    let output_id = pass
+        .output
+        .ok_or_else(|| io::Error::other("terminal diagnostic pass has no output ID"))?;
+    let output_size = renderer.scene.current_size;
+    let output_domain = EffectRect::new(0, 0, output_size.0, output_size.1)
+        .ok_or_else(|| io::Error::other("terminal diagnostic output size is invalid"))?;
+    let full_output_damage = EffectRegion::from_rect(output_domain);
+    let mut output_plan = graph_texture(graph, output_id)?.clone();
+    output_plan.source = GraphTextureSource::Intermediate;
+    output_plan.width = output_size.0;
+    output_plan.height = output_size.1;
+    output_plan.domain = output_domain;
+    output_plan.working_space = oblivion_one::effects::EffectWorkingSpace::LinearSrgb;
+    output_plan.origin = oblivion_one::effects::GraphTextureOrigin::BottomLeft;
+    output_plan.first_use = None;
+    output_plan.last_use = None;
+    let previous_binding = textures.remove(&output_id);
+    let target = match renderer
+        .runtime
+        .effect_resources
+        .acquire_plan(renderer.gl, &output_plan)
+    {
+        Ok(target) => target,
+        Err(error) => {
+            if let Some(binding) = previous_binding {
+                textures.insert(output_id, binding);
+            }
+            return Err(error.into());
+        }
+    };
+    textures.insert(output_id, GraphTextureBinding::transient(target));
+
+    let mut diagnostic_pass = pass.clone();
+    diagnostic_pass.output = Some(output_id);
+    let draw_result = super::pass_exec::execute_fullscreen_pass_diagnostic(
+        renderer,
+        graph,
+        textures,
+        &diagnostic_pass,
+        targets,
+        shader,
+        None,
+        Some(&output_plan),
+        framebuffer_origin,
+        true,
+        &full_output_damage,
+    );
+    let capture_result = if draw_result.is_ok() {
+        let binding = textures
+            .get(&output_id)
+            .ok_or_else(|| io::Error::other("terminal diagnostic output was released"))?;
+        let full_capture =
+            capture_graph_texture(renderer, binding, &output_plan, targets.composition_draw)?;
+        let domain = pass.terminal_kawase.as_ref().map_or_else(
+            || graph_texture(graph, output_id).map(|plan| plan.domain),
+            |terminal| Ok(terminal.virtual_full_resolution.domain),
+        )?;
+        Ok(crop_full_output_capture(
+            &full_capture.pixels,
+            output_size,
+            domain,
+        ))
+    } else {
+        Err(io::Error::other("terminal stage probe draw failed").into())
+    };
+    let pooled = textures
+        .remove(&output_id)
+        .and_then(GraphTextureBinding::into_transient)
+        .ok_or_else(|| io::Error::other("terminal diagnostic target ownership was lost"));
+    if let Some(binding) = previous_binding {
+        textures.insert(output_id, binding);
+    }
+    let pooled = pooled?;
+    let release_result = renderer.runtime.effect_resources.release(pooled);
+    draw_result?;
+    release_result?;
+    capture_result
+}
+
 pub(super) fn scene_advance_reason(
     pass: &CompiledRenderPass,
     scene_baseline_authority: SceneBaselineAuthority,
@@ -51,6 +301,7 @@ pub(super) fn execute_graph_passes_inner(
     fusion_plan: &CaptureDownsampleFusionPlan,
     ordinary_overlay_rects: &mut Vec<OutputRect>,
     skip_final_scene_replay: bool,
+    #[cfg(test)] mut terminal_replay: Option<&mut TerminalBoundaryReplayExecution>,
 ) -> RendererResult<EffectExecutionStats> {
     let mut stats = EffectExecutionStats::default();
     stats.capture_downsample_fusion_candidates = fusion_plan.candidates;
@@ -117,10 +368,79 @@ pub(super) fn execute_graph_passes_inner(
             )?;
         }
         let mut scene_cursor = 0;
+        #[cfg(test)]
+        let diagnostic_tails = if matches!(
+            terminal_replay.as_ref().map(|replay| replay.mode),
+            Some(
+                TerminalBoundaryReplay::FuseUp2AndFragment
+                    | TerminalBoundaryReplay::FuseFragmentAndComposite
+                    | TerminalBoundaryReplay::KawaseOnlyProbe
+                    | TerminalBoundaryReplay::MaterialOnlyProbe
+            )
+        ) {
+            diagnostic_terminal_tails(graph)
+        } else {
+            Vec::new()
+        };
         for pass in &graph.passes {
             if !selection.executed_passes.contains(&pass.id) {
                 continue;
             }
+            #[cfg(test)]
+            let diagnostic_tail = diagnostic_tails.iter().find(|tail| {
+                tail.upsample.id == pass.id
+                    || tail.fragment.id == pass.id
+                    || tail.composite.id == pass.id
+            });
+            #[cfg(test)]
+            let skip_for_boundary_replay = match (
+                terminal_replay.as_ref().map(|replay| replay.mode),
+                diagnostic_tail,
+            ) {
+                (Some(TerminalBoundaryReplay::FuseUp2AndFragment), Some(tail)) => {
+                    tail.upsample.id == pass.id
+                }
+                (Some(TerminalBoundaryReplay::FuseFragmentAndComposite), Some(tail)) => {
+                    tail.fragment.id == pass.id
+                }
+                _ => false,
+            };
+            #[cfg(test)]
+            if skip_for_boundary_replay {
+                // The removed logical pass has one input and one output. Keep
+                // any input whose compiler lifetime ends here alive for the
+                // next physical pass; final session cleanup releases it.
+                continue;
+            }
+
+            #[cfg(test)]
+            let mut diagnostic_pass = None;
+            #[cfg(test)]
+            if let Some(tail) = diagnostic_tail {
+                let mode = terminal_replay.as_ref().map(|replay| replay.mode);
+                match mode {
+                    Some(TerminalBoundaryReplay::FuseUp2AndFragment)
+                        if tail.fragment.id == pass.id =>
+                    {
+                        let mut physical = pass.clone();
+                        physical.inputs[0] = tail.retained_input;
+                        physical.blur_radius = tail.upsample.blur_radius;
+                        diagnostic_pass = Some(physical);
+                    }
+                    Some(TerminalBoundaryReplay::FuseFragmentAndComposite)
+                        if tail.composite.id == pass.id =>
+                    {
+                        let mut physical = pass.clone();
+                        physical.inputs[0] = tail.upsample_output;
+                        diagnostic_pass = Some(physical);
+                    }
+                    _ => {}
+                }
+            }
+            #[cfg(test)]
+            let physical_pass = diagnostic_pass.as_ref().unwrap_or(pass);
+            #[cfg(not(test))]
+            let physical_pass = pass;
             let execution_damage = prepare_effect_execution_region(
                 graph,
                 pass,
@@ -208,7 +528,8 @@ pub(super) fn execute_graph_passes_inner(
                     ),
                 );
             }
-            let resource_result = ensure_pass_textures(renderer, graph, pass, textures, &mut stats);
+            let resource_result =
+                ensure_pass_textures(renderer, graph, physical_pass, textures, &mut stats);
             if renderer.runtime.effect_trace.enabled() {
                 renderer.runtime.effect_trace.pass_boundary(
                     "resources_end",
@@ -493,7 +814,7 @@ pub(super) fn execute_graph_passes_inner(
             let validation_result = validate_effect_pass_resources(
                 renderer,
                 graph,
-                pass,
+                physical_pass,
                 textures,
                 &execution_damage.region,
                 framebuffer_origin,
@@ -525,7 +846,7 @@ pub(super) fn execute_graph_passes_inner(
             #[cfg(any(debug_assertions, test))]
             if let Err(error) = validate_current_frame_input_regions(
                 graph,
-                pass,
+                physical_pass,
                 &execution_damage.region,
                 &valid_regions,
             ) {
@@ -587,11 +908,108 @@ pub(super) fn execute_graph_passes_inner(
             let execute_host_start = pass_timing
                 .filter(|span| span.host_timing_enabled())
                 .map(|_| Instant::now());
+            #[cfg(test)]
+            let execute_result = match (
+                terminal_replay.as_ref().map(|replay| replay.mode),
+                diagnostic_tail,
+            ) {
+                (Some(TerminalBoundaryReplay::FuseUp2AndFragment), Some(tail))
+                    if tail.fragment.id == pass.id =>
+                {
+                    let stage = physical_pass
+                        .stage
+                        .as_ref()
+                        .expect("diagnostic fused Fragment retains its stage");
+                    super::pass_exec::execute_fullscreen_pass_diagnostic(
+                        renderer,
+                        graph,
+                        textures,
+                        physical_pass,
+                        targets,
+                        super::pass_exec::DiagnosticFullscreenShader::LegacyUp2AndFragment,
+                        Some((stage, &physical_pass.fused_stages)),
+                        None,
+                        framebuffer_origin,
+                        true,
+                        &execution_damage.region,
+                    )
+                    .map(|()| None)
+                }
+                (Some(TerminalBoundaryReplay::FuseFragmentAndComposite), Some(tail))
+                    if tail.composite.id == pass.id =>
+                {
+                    let stage = tail
+                        .fragment
+                        .stage
+                        .as_ref()
+                        .expect("diagnostic composite retains its local Fragment stage");
+                    super::pass_exec::execute_fullscreen_pass_diagnostic(
+                        renderer,
+                        graph,
+                        textures,
+                        physical_pass,
+                        targets,
+                        super::pass_exec::DiagnosticFullscreenShader::MaterialAndComposite,
+                        Some((stage, &tail.fragment.fused_stages)),
+                        None,
+                        framebuffer_origin,
+                        false,
+                        &execution_damage.region,
+                    )
+                    .map(|()| {
+                        stats.composites = stats.composites.saturating_add(1);
+                        None
+                    })
+                }
+                (Some(TerminalBoundaryReplay::MaterialOnlyProbe), Some(tail))
+                    if tail.fragment.id == pass.id =>
+                {
+                    let stage = physical_pass
+                        .stage
+                        .as_ref()
+                        .expect("material-only probe retains its local stage");
+                    super::pass_exec::execute_fullscreen_pass_diagnostic(
+                        renderer,
+                        graph,
+                        textures,
+                        physical_pass,
+                        targets,
+                        super::pass_exec::DiagnosticFullscreenShader::MaterialOnly,
+                        Some((stage, &physical_pass.fused_stages)),
+                        None,
+                        framebuffer_origin,
+                        false,
+                        &execution_damage.region,
+                    )
+                    .map(|()| None)
+                }
+                _ => execute_pass(
+                    renderer,
+                    graph,
+                    textures,
+                    physical_pass,
+                    targets,
+                    framebuffer_origin,
+                    &execution_damage.region,
+                    scene_baseline_authority,
+                    debug_config,
+                    capture_plan,
+                    &checkpoint_causal_stability,
+                    graph_scope.is_some(),
+                    fusion_plan
+                        .by_capture
+                        .get(&pass.id)
+                        .or_else(|| fusion_plan.by_consumer.get(&pass.id))
+                        .copied(),
+                    &mut stats,
+                ),
+            };
+            #[cfg(not(test))]
             let execute_result = execute_pass(
                 renderer,
                 graph,
                 textures,
-                pass,
+                physical_pass,
                 targets,
                 framebuffer_origin,
                 &execution_damage.region,
@@ -646,6 +1064,83 @@ pub(super) fn execute_graph_passes_inner(
                     renderer.runtime.effect_trace.invariant_failure(invariant);
                 }
                 return Err(error);
+            }
+            #[cfg(test)]
+            if let Some(replay) = terminal_replay.as_deref_mut() {
+                match replay.mode {
+                    TerminalBoundaryReplay::KawaseOnlyProbe
+                        if replay.probe_passes.contains(&pass.id)
+                            && pass.kind == RenderPassKind::DualKawaseUpsample =>
+                    {
+                        let capture = capture_terminal_stage_probe(
+                            renderer,
+                            graph,
+                            textures,
+                            pass,
+                            targets,
+                            framebuffer_origin,
+                            super::pass_exec::DiagnosticFullscreenShader::TerminalKawaseOnly,
+                        )?;
+                        replay
+                            .stage_probes
+                            .insert((pass.id, TerminalDiagnosticStage::Up2), capture);
+                    }
+                    TerminalBoundaryReplay::CaptureTerminalStages
+                        if replay.probe_passes.contains(&pass.id)
+                            && pass.terminal_kawase.is_some() =>
+                    {
+                        let upsample_capture = capture_terminal_stage_probe(
+                            renderer,
+                            graph,
+                            textures,
+                            pass,
+                            targets,
+                            framebuffer_origin,
+                            super::pass_exec::DiagnosticFullscreenShader::TerminalKawaseOnly,
+                        )?;
+                        let fragment_capture = capture_terminal_stage_probe(
+                            renderer,
+                            graph,
+                            textures,
+                            pass,
+                            targets,
+                            framebuffer_origin,
+                            super::pass_exec::DiagnosticFullscreenShader::TerminalUp2AndFragment,
+                        )?;
+                        replay
+                            .stage_probes
+                            .insert((pass.id, TerminalDiagnosticStage::Up2), upsample_capture);
+                        replay.stage_probes.insert(
+                            (pass.id, TerminalDiagnosticStage::Fragment),
+                            fragment_capture,
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            #[cfg(test)]
+            if terminal_replay.as_ref().is_some_and(|replay| {
+                replay.capture_passes.contains(&pass.id)
+                    && graph
+                        .textures
+                        .iter()
+                        .find(|texture| Some(texture.id) == physical_pass.output)
+                        .is_some_and(|plan| plan.source == GraphTextureSource::Intermediate)
+            }) {
+                let output_id = physical_pass
+                    .output
+                    .expect("captured pass output was validated");
+                let output_plan = graph_texture(graph, output_id)?;
+                let target = textures
+                    .get(&output_id)
+                    .ok_or_else(|| io::Error::other("captured pass output is not realized"))?;
+                let capture =
+                    capture_graph_texture(renderer, target, output_plan, targets.composition_draw)?;
+                terminal_replay
+                    .as_deref_mut()
+                    .expect("capture request retains its observer")
+                    .captures
+                    .insert(pass.id, capture);
             }
             if let Some(fusion) = fusion_plan.by_consumer.get(&pass.id) {
                 debug_assert_eq!(fusion.consumer_pass, pass.id);

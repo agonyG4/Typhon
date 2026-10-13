@@ -399,6 +399,260 @@ void main() {
 }
 "#;
 
+#[cfg(test)]
+pub(crate) const DIAGNOSTIC_KAWASE_ONLY_FRAGMENT_SHADER: &str = r#"#version 300 es
+precision highp float;
+uniform sampler2D u_effect_input;
+uniform vec2 u_effect_texel_size;
+uniform float u_effect_blur_radius;
+uniform vec2 u_effect_output_size;
+uniform vec4 u_effect_input_domain;
+uniform int u_effect_input_flip_y;
+in vec2 v_uv;
+out vec4 out_color;
+
+vec2 typhon_effect_sample_uv(vec2 logical_uv) {
+    return u_effect_input_flip_y != 0
+        ? vec2(logical_uv.x, 1.0 - logical_uv.y)
+        : logical_uv;
+}
+
+void main() {
+    vec2 output_position = v_uv * u_effect_output_size;
+    vec2 local_pixel = floor(output_position - u_effect_input_domain.xy);
+    vec2 local_uv = (local_pixel + vec2(0.5)) / u_effect_input_domain.zw;
+    vec2 sample_uv = typhon_effect_sample_uv(local_uv);
+    vec2 offset = u_effect_texel_size * u_effect_blur_radius;
+    vec4 result = texture(u_effect_input, sample_uv) * 0.40;
+    result += texture(u_effect_input, sample_uv + vec2(offset.x, 0.0)) * 0.15;
+    result += texture(u_effect_input, sample_uv - vec2(offset.x, 0.0)) * 0.15;
+    result += texture(u_effect_input, sample_uv + vec2(0.0, offset.y)) * 0.15;
+    result += texture(u_effect_input, sample_uv - vec2(0.0, offset.y)) * 0.15;
+    out_color = result;
+}
+"#;
+
+#[cfg(test)]
+pub(crate) const DIAGNOSTIC_LEGACY_UP2_FRAGMENT_SHADER: &str = r#"#version 300 es
+precision highp float;
+uniform sampler2D u_effect_input;
+uniform vec2 u_effect_texel_size;
+uniform float u_effect_blur_radius;
+uniform mat4 u_effect_color_matrix;
+uniform vec4 u_effect_color_bias;
+uniform vec4 u_effect_tint_color;
+uniform float u_effect_tint_amount;
+uniform float u_effect_noise_amount;
+uniform int u_effect_input_flip_y;
+in vec2 v_uv;
+out vec4 out_color;
+
+vec2 typhon_effect_sample_uv(vec2 logical_uv) {
+    return u_effect_input_flip_y != 0
+        ? vec2(logical_uv.x, 1.0 - logical_uv.y)
+        : logical_uv;
+}
+
+vec4 typhon_sanitize_premultiplied(vec4 value) {
+    if (any(isnan(value)) || any(isinf(value))) return vec4(0.0);
+    float alpha = clamp(value.a, 0.0, 1.0);
+    return vec4(clamp(value.rgb, vec3(0.0), vec3(alpha)), alpha);
+}
+
+void main() {
+    vec2 sample_uv = typhon_effect_sample_uv(v_uv);
+    vec2 offset = u_effect_texel_size * u_effect_blur_radius;
+    vec4 result = texture(u_effect_input, sample_uv) * 0.40;
+    result += texture(u_effect_input, sample_uv + vec2(offset.x, 0.0)) * 0.15;
+    result += texture(u_effect_input, sample_uv - vec2(offset.x, 0.0)) * 0.15;
+    result += texture(u_effect_input, sample_uv + vec2(0.0, offset.y)) * 0.15;
+    result += texture(u_effect_input, sample_uv - vec2(0.0, offset.y)) * 0.15;
+    result = u_effect_color_matrix * result + u_effect_color_bias;
+    result.rgb = mix(result.rgb, result.rgb * u_effect_tint_color.rgb, clamp(u_effect_tint_amount, 0.0, 1.0));
+    float noise = fract(sin(dot(v_uv, vec2(12.9898, 78.233))) * 43758.5453) - 0.5;
+    result.rgb += noise * u_effect_noise_amount;
+    out_color = typhon_sanitize_premultiplied(result);
+}
+"#;
+
+#[cfg(test)]
+pub(crate) const DIAGNOSTIC_TERMINAL_UP2_FRAGMENT_STAGE_SHADER: &str = r#"#version 300 es
+precision highp float;
+uniform sampler2D u_effect_input;
+uniform vec2 u_effect_texel_size;
+uniform float u_effect_blur_radius;
+uniform vec2 u_effect_output_size;
+uniform vec4 u_effect_input_domain;
+uniform int u_effect_input_flip_y;
+uniform mat4 u_effect_color_matrix;
+uniform vec4 u_effect_color_bias;
+uniform vec4 u_effect_tint_color;
+uniform float u_effect_tint_amount;
+uniform float u_effect_noise_amount;
+in vec2 v_uv;
+out vec4 out_color;
+
+vec2 typhon_effect_sample_uv(vec2 logical_uv) {
+    return u_effect_input_flip_y != 0
+        ? vec2(logical_uv.x, 1.0 - logical_uv.y)
+        : logical_uv;
+}
+
+vec4 typhon_sanitize_premultiplied(vec4 value) {
+    if (any(isnan(value)) || any(isinf(value))) return vec4(0.0);
+    float alpha = clamp(value.a, 0.0, 1.0);
+    return vec4(clamp(value.rgb, vec3(0.0), vec3(alpha)), alpha);
+}
+
+void main() {
+    vec2 output_position = v_uv * u_effect_output_size;
+    vec2 local_pixel = floor(output_position - u_effect_input_domain.xy);
+    vec2 local_uv = (local_pixel + vec2(0.5)) / u_effect_input_domain.zw;
+    vec2 sample_uv = typhon_effect_sample_uv(local_uv);
+    vec2 offset = u_effect_texel_size * u_effect_blur_radius;
+    vec4 result = texture(u_effect_input, sample_uv) * 0.40;
+    result += texture(u_effect_input, sample_uv + vec2(offset.x, 0.0)) * 0.15;
+    result += texture(u_effect_input, sample_uv - vec2(offset.x, 0.0)) * 0.15;
+    result += texture(u_effect_input, sample_uv + vec2(0.0, offset.y)) * 0.15;
+    result += texture(u_effect_input, sample_uv - vec2(0.0, offset.y)) * 0.15;
+    result = u_effect_color_matrix * result + u_effect_color_bias;
+    result.rgb = mix(result.rgb, result.rgb * u_effect_tint_color.rgb, clamp(u_effect_tint_amount, 0.0, 1.0));
+    float noise = fract(sin(dot(local_uv, vec2(12.9898, 78.233))) * 43758.5453) - 0.5;
+    result.rgb += noise * u_effect_noise_amount;
+    out_color = typhon_sanitize_premultiplied(result);
+}
+"#;
+
+#[cfg(test)]
+pub(crate) const DIAGNOSTIC_MATERIAL_COMPOSITE_VERTEX_SHADER: &str = r#"#version 300 es
+layout(location = 0) in vec2 a_position;
+layout(location = 1) in vec2 a_uv;
+uniform int u_effect_target_flip_y;
+uniform vec2 u_effect_output_size;
+uniform vec4 u_effect_input_domain;
+out vec2 v_uv;
+out vec2 v_output_uv;
+out vec2 v_legacy_noise_uv;
+
+void main() {
+    gl_Position = vec4(a_position, 0.0, 1.0);
+    v_uv = a_uv;
+    v_output_uv = u_effect_target_flip_y != 0
+        ? vec2(a_uv.x, 1.0 - a_uv.y)
+        : a_uv;
+    vec2 output_position = v_output_uv * u_effect_output_size;
+    vec2 local_uv = (output_position - u_effect_input_domain.xy) /
+        u_effect_input_domain.zw;
+    v_legacy_noise_uv = vec2(
+        local_uv.x,
+        u_effect_target_flip_y != 0 ? 1.0 - local_uv.y : local_uv.y
+    );
+}
+"#;
+
+#[cfg(test)]
+pub(crate) const DIAGNOSTIC_MATERIAL_COMPOSITE_FRAGMENT_SHADER: &str = r#"#version 300 es
+precision highp float;
+uniform sampler2D u_effect_input;
+uniform float u_presentation_opacity;
+uniform vec4 u_effect_input_domain;
+uniform vec2 u_effect_output_size;
+uniform int u_effect_encode_srgb;
+uniform int u_effect_force_opaque;
+uniform int u_effect_input_flip_y;
+uniform int u_effect_coverage_enabled;
+uniform int u_effect_coverage_has_rounded_rect;
+uniform vec4 u_effect_coverage_rounded_rect;
+uniform float u_effect_coverage_radius;
+uniform int u_effect_coverage_has_triangle;
+uniform vec2 u_effect_coverage_triangle_a;
+uniform vec2 u_effect_coverage_triangle_b;
+uniform vec2 u_effect_coverage_triangle_c;
+uniform mat4 u_effect_color_matrix;
+uniform vec4 u_effect_color_bias;
+uniform vec4 u_effect_tint_color;
+uniform float u_effect_tint_amount;
+uniform float u_effect_noise_amount;
+in vec2 v_uv;
+in vec2 v_output_uv;
+in vec2 v_legacy_noise_uv;
+out vec4 out_color;
+
+vec2 typhon_effect_sample_uv(vec2 logical_uv) {
+    return u_effect_input_flip_y != 0
+        ? vec2(logical_uv.x, 1.0 - logical_uv.y)
+        : logical_uv;
+}
+float typhon_encode_srgb_channel(float value) {
+    value = max(value, 0.0);
+    if (value <= 0.0031308) return value * 12.92;
+    return 1.055 * pow(value, 1.0 / 2.4) - 0.055;
+}
+vec4 typhon_sanitize_premultiplied(vec4 value) {
+    if (any(isnan(value)) || any(isinf(value))) return vec4(0.0);
+    float alpha = clamp(value.a, 0.0, 1.0);
+    return vec4(clamp(value.rgb, vec3(0.0), vec3(alpha)), alpha);
+}
+vec4 typhon_encode_premultiplied_srgb(vec4 value) {
+    value = typhon_sanitize_premultiplied(value);
+    if (value.a <= 0.00001) return vec4(0.0);
+    vec3 straight = clamp(value.rgb / value.a, vec3(0.0), vec3(1.0));
+    vec3 encoded = vec3(typhon_encode_srgb_channel(straight.r), typhon_encode_srgb_channel(straight.g), typhon_encode_srgb_channel(straight.b));
+    return typhon_sanitize_premultiplied(vec4(encoded * value.a, value.a));
+}
+float typhon_rounded_rect_distance(vec2 p) {
+    vec2 size = u_effect_coverage_rounded_rect.zw;
+    float radius = max(u_effect_coverage_radius, 0.0);
+    vec2 half_size = size * 0.5;
+    vec2 center = u_effect_coverage_rounded_rect.xy + half_size;
+    vec2 q = abs(p - center) - (half_size - vec2(radius));
+    return length(max(q, vec2(0.0))) + min(max(q.x, q.y), 0.0) - radius;
+}
+float typhon_cross(vec2 a, vec2 b) { return a.x * b.y - a.y * b.x; }
+float typhon_segment_distance(vec2 p, vec2 a, vec2 b) {
+    vec2 edge = b - a;
+    float length_squared = dot(edge, edge);
+    float t = clamp(dot(p - a, edge) / max(length_squared, 1.0e-8), 0.0, 1.0);
+    return length(p - (a + t * edge));
+}
+float typhon_triangle_distance(vec2 p) {
+    vec2 a = u_effect_coverage_triangle_a;
+    vec2 b = u_effect_coverage_triangle_b;
+    vec2 c = u_effect_coverage_triangle_c;
+    float area = typhon_cross(b - a, c - a);
+    if (isnan(area) || isinf(area) || abs(area) <= 1.0e-6) return 1.0e20;
+    vec3 side = vec3(typhon_cross(b - a, p - a), typhon_cross(c - b, p - b), typhon_cross(a - c, p - c));
+    bool inside = all(greaterThanEqual(side, vec3(0.0))) || all(lessThanEqual(side, vec3(0.0)));
+    float distance = min(typhon_segment_distance(p, a, b), min(typhon_segment_distance(p, b, c), typhon_segment_distance(p, c, a)));
+    return inside ? -distance : distance;
+}
+float typhon_analytic_coverage(vec2 p) {
+    if (u_effect_coverage_enabled == 0) return 1.0;
+    float distance = 1.0e20;
+    if (u_effect_coverage_has_rounded_rect != 0) distance = min(distance, typhon_rounded_rect_distance(p));
+    if (u_effect_coverage_has_triangle != 0) distance = min(distance, typhon_triangle_distance(p));
+    if (isnan(distance) || isinf(distance)) return 0.0;
+    float aa_width = max(fwidth(distance), 1.0e-4);
+    return clamp(1.0 - smoothstep(-aa_width, aa_width, distance), 0.0, 1.0);
+}
+void main() {
+    vec2 output_position = v_output_uv * u_effect_output_size;
+    vec2 logical_input_uv = (output_position - u_effect_input_domain.xy) / u_effect_input_domain.zw;
+    if (any(lessThan(logical_input_uv, vec2(0.0))) || any(greaterThan(logical_input_uv, vec2(1.0)))) discard;
+    vec4 result = texture(u_effect_input, typhon_effect_sample_uv(logical_input_uv));
+    result = u_effect_color_matrix * result + u_effect_color_bias;
+    result.rgb = mix(result.rgb, result.rgb * u_effect_tint_color.rgb, clamp(u_effect_tint_amount, 0.0, 1.0));
+    float noise = fract(sin(dot(v_legacy_noise_uv, vec2(12.9898, 78.233))) * 43758.5453) - 0.5;
+    result.rgb += noise * u_effect_noise_amount;
+    result = typhon_sanitize_premultiplied(result);
+    if (u_effect_encode_srgb != 0) result = typhon_encode_premultiplied_srgb(result);
+    if (u_effect_force_opaque != 0) result.a = 1.0;
+    result *= clamp(u_presentation_opacity, 0.0, 1.0);
+    result *= typhon_analytic_coverage(output_position);
+    out_color = typhon_sanitize_premultiplied(result);
+}
+"#;
+
 pub(crate) const MASK_STAGE_FRAGMENT_SHADER: &str = r#"#version 300 es
 precision highp float;
 uniform sampler2D u_effect_input;

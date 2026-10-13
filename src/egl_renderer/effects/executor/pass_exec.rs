@@ -6,6 +6,46 @@ pub(crate) enum EffectPassBlendMode {
     PremultipliedSourceOver,
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum DiagnosticFullscreenShader {
+    TerminalKawaseOnly,
+    LegacyUp2AndFragment,
+    TerminalUp2AndFragment,
+    MaterialOnly,
+    MaterialAndComposite,
+}
+
+#[cfg(test)]
+impl DiagnosticFullscreenShader {
+    fn cache_variant(self) -> u64 {
+        match self {
+            Self::TerminalKawaseOnly => 0xD101,
+            Self::LegacyUp2AndFragment => 0xD102,
+            Self::TerminalUp2AndFragment => 0xD103,
+            Self::MaterialOnly => 0xD104,
+            Self::MaterialAndComposite => 0xD105,
+        }
+    }
+
+    fn source(self) -> &'static str {
+        match self {
+            Self::TerminalKawaseOnly => DIAGNOSTIC_KAWASE_ONLY_FRAGMENT_SHADER,
+            Self::LegacyUp2AndFragment => DIAGNOSTIC_LEGACY_UP2_FRAGMENT_SHADER,
+            Self::TerminalUp2AndFragment => DIAGNOSTIC_TERMINAL_UP2_FRAGMENT_STAGE_SHADER,
+            Self::MaterialOnly => FRAGMENT_STAGE_FRAGMENT_SHADER,
+            Self::MaterialAndComposite => DIAGNOSTIC_MATERIAL_COMPOSITE_FRAGMENT_SHADER,
+        }
+    }
+
+    fn vertex_source(self) -> &'static str {
+        match self {
+            Self::MaterialAndComposite => DIAGNOSTIC_MATERIAL_COMPOSITE_VERTEX_SHADER,
+            _ => blur::DUAL_KAWASE_VERTEX_SHADER,
+        }
+    }
+}
+
 pub(super) fn effect_pass_blend_mode(
     kind: RenderPassKind,
     output_is_framebuffer: bool,
@@ -947,6 +987,74 @@ pub(super) fn execute_fullscreen_pass(
     execution_damage: &EffectRegion,
     capture_fusion: Option<CaptureDownsampleFusion>,
 ) -> RendererResult<()> {
+    execute_fullscreen_pass_impl(
+        renderer,
+        graph,
+        textures,
+        pass,
+        targets,
+        fragment_shader,
+        framebuffer_origin,
+        blur_shader,
+        execution_damage,
+        capture_fusion,
+        None,
+        None,
+        None,
+    )
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn execute_fullscreen_pass_diagnostic(
+    renderer: &mut EffectExecutionContext<'_>,
+    graph: &CompiledFrameGraph,
+    textures: &std::collections::HashMap<GraphTextureId, GraphTextureBinding>,
+    pass: &CompiledRenderPass,
+    targets: EffectExecutionTargets,
+    diagnostic_shader: DiagnosticFullscreenShader,
+    diagnostic_stage: Option<(&EffectNodeKind, &[EffectNodeKind])>,
+    output_plan_override: Option<&oblivion_one::effects::GraphTexturePlan>,
+    framebuffer_origin: OutputFramebufferOrigin,
+    blur_shader: bool,
+    execution_damage: &EffectRegion,
+) -> RendererResult<()> {
+    execute_fullscreen_pass_impl(
+        renderer,
+        graph,
+        textures,
+        pass,
+        targets,
+        "",
+        framebuffer_origin,
+        blur_shader,
+        execution_damage,
+        None,
+        Some(diagnostic_shader),
+        diagnostic_stage,
+        output_plan_override,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_fullscreen_pass_impl(
+    renderer: &mut EffectExecutionContext<'_>,
+    graph: &CompiledFrameGraph,
+    textures: &std::collections::HashMap<GraphTextureId, GraphTextureBinding>,
+    pass: &CompiledRenderPass,
+    targets: EffectExecutionTargets,
+    fragment_shader: &str,
+    framebuffer_origin: OutputFramebufferOrigin,
+    blur_shader: bool,
+    execution_damage: &EffectRegion,
+    capture_fusion: Option<CaptureDownsampleFusion>,
+    #[cfg(test)] diagnostic_shader: Option<DiagnosticFullscreenShader>,
+    #[cfg(not(test))] _diagnostic_shader: Option<()>,
+    #[cfg(test)] diagnostic_stage: Option<(&EffectNodeKind, &[EffectNodeKind])>,
+    #[cfg(not(test))] _diagnostic_stage: Option<()>,
+    #[cfg(test)] output_plan_override: Option<&oblivion_one::effects::GraphTexturePlan>,
+    #[cfg(not(test))] _output_plan_override: Option<&oblivion_one::effects::GraphTexturePlan>,
+) -> RendererResult<()> {
     let input = pass
         .inputs
         .first()
@@ -972,9 +1080,28 @@ pub(super) fn execute_fullscreen_pass(
         .output
         .ok_or_else(|| io::Error::other("effect pass has no output target"))?;
     let input_plan = graph_texture(graph, input)?;
-    let output_plan = graph_texture(graph, output)?;
+    let output_plan = {
+        #[cfg(test)]
+        {
+            output_plan_override.unwrap_or(graph_texture(graph, output)?)
+        }
+        #[cfg(not(test))]
+        {
+            graph_texture(graph, output)?
+        }
+    };
     let output_is_framebuffer = output_plan.source == GraphTextureSource::Output;
     if blur_shader
+        && {
+            #[cfg(test)]
+            {
+                diagnostic_shader.is_none()
+            }
+            #[cfg(not(test))]
+            {
+                true
+            }
+        }
         && capture_fusion.is_none()
         && !output_is_framebuffer
         && matches!(
@@ -1042,8 +1169,37 @@ pub(super) fn execute_fullscreen_pass(
         },
         oblivion_one::effects::EffectWorkingSpace::LinearSrgb,
     );
+    #[cfg(test)]
+    let (shader_key, program) = if let Some(diagnostic_shader) = diagnostic_shader {
+        let key = ShaderProgramKey::new(
+            ShaderModuleId::new(oblivion_one::effects::INTERNAL_EFFECT_SHADER_MODULE_COPY)
+                .expect("copy shader id is non-zero"),
+            diagnostic_shader.cache_variant(),
+            oblivion_one::effects::EffectWorkingSpace::LinearSrgb,
+        );
+        let program = renderer.runtime.effect_shaders.get_or_compile(
+            renderer.gl,
+            key,
+            diagnostic_shader.vertex_source(),
+            diagnostic_shader.source(),
+        )?;
+        (key, program)
+    } else {
+        let program = renderer.runtime.effect_shaders.lookup(shader_key)?;
+        (shader_key, program)
+    };
+    #[cfg(not(test))]
     let program = renderer.runtime.effect_shaders.lookup(shader_key)?;
-    if pass.terminal_kawase.is_some() {
+    if pass.terminal_kawase.is_some() && {
+        #[cfg(test)]
+        {
+            diagnostic_shader.is_none()
+        }
+        #[cfg(not(test))]
+        {
+            true
+        }
+    } {
         for name in [
             "u_effect_input",
             "u_effect_input_flip_y",
@@ -1155,13 +1311,13 @@ pub(super) fn execute_fullscreen_pass(
             .is_some_and(oblivion_one::effects::EffectCoverage::is_enabled),
     );
     establish_effect_pass_blend_state(renderer.gl, blend_mode);
+    let target_flip_y =
+        effect_target_requires_logical_y_flip(output_is_framebuffer, framebuffer_origin);
     unsafe {
         renderer
             .gl
             .viewport(0, 0, output_plan.width as i32, output_plan.height as i32);
     }
-    let target_flip_y =
-        effect_target_requires_logical_y_flip(output_is_framebuffer, framebuffer_origin);
     let input_flip_y = effect_input_requires_sample_y_flip(input_plan.origin);
     unsafe {
         renderer.gl.use_program(Some(program));
@@ -1449,6 +1605,29 @@ pub(super) fn execute_fullscreen_pass(
                 },
             );
         }
+        #[cfg(test)]
+        if let Some((stage, fused_stages)) = diagnostic_stage {
+            set_stage_uniforms(
+                &mut renderer.runtime.effect_shaders,
+                renderer.gl,
+                shader_key,
+                program,
+                stage,
+                StageUniformContext {
+                    parameters: &pass.parameter_block,
+                    input_plan,
+                    output_size: trusted_effect_output_size(
+                        renderer.scene.current_size,
+                        (output_plan.width, output_plan.height),
+                    ),
+                    output_scale: renderer.runtime.effect_output_scale,
+                    effect_time_seconds: renderer.runtime.effect_time_seconds,
+                    effect_delta_seconds: renderer.runtime.effect_delta_seconds,
+                    color_conversion: pass.color_conversion,
+                    fused_stages,
+                },
+            );
+        }
         if !blur_shader
             && let Some(location) = uniform_location(
                 &mut renderer.runtime.effect_shaders,
@@ -1537,6 +1716,37 @@ pub(super) fn execute_fullscreen_pass(
                     Some(&location),
                     output_plan.domain.width.max(1) as f32,
                     output_plan.domain.height.max(1) as f32,
+                );
+            }
+        }
+        #[cfg(test)]
+        if diagnostic_shader.is_some() {
+            if let Some(location) = uniform_location(
+                &mut renderer.runtime.effect_shaders,
+                renderer.gl,
+                shader_key,
+                program,
+                "u_effect_output_size",
+            ) {
+                renderer.gl.uniform_2_f32(
+                    Some(&location),
+                    output_plan.width.max(1) as f32,
+                    output_plan.height.max(1) as f32,
+                );
+            }
+            if let Some(location) = uniform_location(
+                &mut renderer.runtime.effect_shaders,
+                renderer.gl,
+                shader_key,
+                program,
+                "u_effect_input_domain",
+            ) {
+                renderer.gl.uniform_4_f32(
+                    Some(&location),
+                    input_plan.domain.x as f32,
+                    input_plan.domain.y as f32,
+                    input_plan.domain.width.max(1) as f32,
+                    input_plan.domain.height.max(1) as f32,
                 );
             }
         }

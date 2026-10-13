@@ -1076,3 +1076,19 @@ pub(in crate::egl_renderer::tests) fn read_effect_texture_pixels(
     harness.renderer.establish_ordinary_scene_state();
     pixels
 }
+
+pub(in crate::egl_renderer::tests) fn read_effect_texture_pixels_f32(
+    harness: &mut GlesEffectTestHarness,
+    target: &PooledEffectTexture,
+    width: u32,
+    height: u32,
+) -> Vec<[f32; 4]> {
+    let pixels = harness
+        .renderer
+        .effect_runtime
+        .effect_resources
+        .read_effect_texture_rgba_f32(&harness.gl, target, width, height)
+        .expect("RGBA16F target supports float readback");
+    harness.renderer.establish_ordinary_scene_state();
+    pixels
+}

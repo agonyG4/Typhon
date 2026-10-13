@@ -509,6 +509,28 @@ pub(crate) fn execute_prepared_effect_graph_core(
     context: &mut EffectExecutionContext<'_>,
     prepared: &mut PreparedEffectGraphExecution<'_>,
 ) -> RendererResult<EffectExecutionStats> {
+    execute_prepared_effect_graph_core_impl(
+        context,
+        prepared,
+        #[cfg(test)]
+        None,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn execute_prepared_effect_graph_core_with_terminal_replay(
+    context: &mut EffectExecutionContext<'_>,
+    prepared: &mut PreparedEffectGraphExecution<'_>,
+    terminal_replay: &mut super::graph_runner::TerminalBoundaryReplayExecution,
+) -> RendererResult<EffectExecutionStats> {
+    execute_prepared_effect_graph_core_impl(context, prepared, Some(terminal_replay))
+}
+
+fn execute_prepared_effect_graph_core_impl(
+    context: &mut EffectExecutionContext<'_>,
+    prepared: &mut PreparedEffectGraphExecution<'_>,
+    #[cfg(test)] terminal_replay: Option<&mut super::graph_runner::TerminalBoundaryReplayExecution>,
+) -> RendererResult<EffectExecutionStats> {
     let fusion_plan = plan_capture_downsample_fusions(
         prepared.graph,
         prepared.selection,
@@ -545,6 +567,8 @@ pub(crate) fn execute_prepared_effect_graph_core(
         &fusion_plan,
         &mut prepared.overlay_rects,
         prepared.skip_final_scene_replay,
+        #[cfg(test)]
+        terminal_replay,
     );
     if let Ok(stats) = &mut result {
         stats.checkpoint_cache_admission = prepared.checkpoint_cache_admission;

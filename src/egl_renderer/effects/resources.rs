@@ -1286,6 +1286,40 @@ impl EffectGlResourceCache {
         self.bind_render_target_to(gl, texture, glow::READ_FRAMEBUFFER)
     }
 
+    #[cfg(test)]
+    pub(crate) fn read_effect_texture_rgba_f32(
+        &mut self,
+        gl: &glow::Context,
+        texture: &PooledEffectTexture,
+        width: u32,
+        height: u32,
+    ) -> Result<Vec<[f32; 4]>, Box<dyn std::error::Error>> {
+        self.bind_read_target(gl, texture)?;
+        let mut bytes =
+            vec![0_u8; width as usize * height as usize * 4 * std::mem::size_of::<f32>()];
+        unsafe {
+            gl.pixel_store_i32(glow::PACK_ALIGNMENT, 1);
+            gl.read_pixels(
+                0,
+                0,
+                width as i32,
+                height as i32,
+                glow::RGBA,
+                glow::FLOAT,
+                glow::PixelPackData::Slice(Some(&mut bytes)),
+            );
+        }
+        Ok(bytes
+            .chunks_exact(4 * std::mem::size_of::<f32>())
+            .map(|pixel| {
+                std::array::from_fn(|channel| {
+                    let start = channel * std::mem::size_of::<f32>();
+                    f32::from_ne_bytes(pixel[start..start + 4].try_into().unwrap())
+                })
+            })
+            .collect())
+    }
+
     fn bind_render_target_to(
         &mut self,
         gl: &glow::Context,

@@ -33,12 +33,19 @@ pub(super) use executor::composition_range_with_metadata;
 pub(crate) use executor::execute_effect_graph_with_debug_config_and_scene_replay_mode;
 pub(crate) use executor::execute_precomputed_backdrop_build;
 #[cfg(test)]
+pub(crate) use executor::execute_prepared_effect_graph_core_with_terminal_replay;
+#[cfg(test)]
 pub(crate) use executor::plan_effect_surface_consumers_with_debug_config;
 pub(crate) use executor::plan_effect_surface_consumers_with_metadata;
 #[cfg(test)]
 pub(crate) use executor::prepare_effect_graph_execution;
 #[cfg(test)]
 pub(crate) use executor::replay_capture_region_layout;
+#[cfg(test)]
+pub(crate) use executor::{
+    DiagnosticTextureCapture, TerminalBoundaryReplay, TerminalBoundaryReplayExecution,
+    TerminalDiagnosticStage,
+};
 pub(crate) use executor::{EffectExecutionSelection, EffectExecutionStats};
 #[cfg(test)]
 pub(crate) use executor::{

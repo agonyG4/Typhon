@@ -62,6 +62,8 @@ pub(crate) use session::checkpoint_capture_cache_candidates;
 pub(crate) use session::execute_effect_graph_for_lifecycle;
 pub(crate) use session::execute_precomputed_backdrop_build;
 #[cfg(test)]
+pub(crate) use session::execute_prepared_effect_graph_core_with_terminal_replay;
+#[cfg(test)]
 pub(crate) use session::prepare_effect_graph_execution;
 #[cfg(test)]
 pub(crate) use session::{
@@ -74,6 +76,11 @@ pub(in crate::egl_renderer) use session::{
 };
 mod graph_runner;
 use graph_runner::*;
+#[cfg(test)]
+pub(crate) use graph_runner::{
+    DiagnosticTextureCapture, TerminalBoundaryReplay, TerminalBoundaryReplayExecution,
+    TerminalDiagnosticStage,
+};
 mod planning;
 use planning::*;
 mod validation;
@@ -107,6 +114,12 @@ pub(crate) use shaders::{
     BLEND_STAGE_FRAGMENT_SHADER, COMPOSITE_FRAGMENT_SHADER, COPY_FRAGMENT_SHADER,
     FRAGMENT_STAGE_FRAGMENT_SHADER, MASK_STAGE_FRAGMENT_SHADER, NORMALIZE_FRAGMENT_SHADER,
     TERMINAL_KAWASE_COMPOSITE_FRAGMENT_SHADER,
+};
+#[cfg(test)]
+pub(crate) use shaders::{
+    DIAGNOSTIC_KAWASE_ONLY_FRAGMENT_SHADER, DIAGNOSTIC_LEGACY_UP2_FRAGMENT_SHADER,
+    DIAGNOSTIC_MATERIAL_COMPOSITE_FRAGMENT_SHADER, DIAGNOSTIC_MATERIAL_COMPOSITE_VERTEX_SHADER,
+    DIAGNOSTIC_TERMINAL_UP2_FRAGMENT_STAGE_SHADER,
 };
 
 #[cfg(test)]

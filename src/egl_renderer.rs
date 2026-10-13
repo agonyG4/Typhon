@@ -449,6 +449,52 @@ impl GlesSceneRenderer {
         )
     }
 
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::egl_renderer) fn execute_effect_graph_with_terminal_replay(
+        &mut self,
+        graph: &oblivion_one::effects::CompiledFrameGraph,
+        framebuffer_origin: OutputFramebufferOrigin,
+        repaint_plan: &RepaintPlan,
+        demand: &oblivion_one::effects::EffectExecutionDemand,
+        selection: &effects::EffectExecutionSelection,
+        debug_config: effects::EffectDebugConfig,
+        scene_replay_work_mode_override: Option<effects::SceneReplayWorkMode>,
+        terminal_replay: &mut effects::TerminalBoundaryReplayExecution,
+    ) -> RendererResult<effects::EffectExecutionStats> {
+        let Self {
+            gl,
+            cursor_image,
+            scene_state,
+            lifecycle,
+            effect_runtime,
+            resources,
+        } = self;
+        let output_target_space = lifecycle::LifecycleRenderTargetSpace::output(
+            scene_state.current_size,
+            framebuffer_origin,
+        );
+        frame::FramePipeline::new(
+            gl,
+            cursor_image,
+            scene_state,
+            lifecycle,
+            effect_runtime,
+            resources,
+            output_target_space,
+        )
+        .execute_effect_graph_with_terminal_replay(
+            graph,
+            framebuffer_origin,
+            repaint_plan,
+            demand,
+            selection,
+            debug_config,
+            scene_replay_work_mode_override,
+            terminal_replay,
+        )
+    }
+
     pub(crate) const fn last_frame_stats(&self) -> GlesSceneFrameStats {
         self.scene_state.frame_stats
     }

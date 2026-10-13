@@ -84,6 +84,44 @@ pub(in crate::egl_renderer::tests) fn execute_diagnostic_frame_with_origin_and_s
     stats.checkpoint_capture_execution_pixels
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(in crate::egl_renderer::tests) fn execute_diagnostic_frame_with_terminal_replay(
+    harness: &mut GlesEffectTestHarness,
+    graph: &oblivion_one::effects::CompiledFrameGraph,
+    plan: &RepaintPlan,
+    region: EffectRegion,
+    conservative_full: bool,
+    config: effects::EffectDebugConfig,
+    framebuffer_origin: OutputFramebufferOrigin,
+    mode: effects::TerminalBoundaryReplay,
+    capture_passes: impl IntoIterator<Item = oblivion_one::effects::GraphPassId>,
+    probe_passes: impl IntoIterator<Item = oblivion_one::effects::GraphPassId>,
+) -> effects::TerminalBoundaryReplayExecution {
+    let demand = oblivion_one::effects::plan_effect_execution_demand_with_kawase_mode(
+        graph,
+        &region,
+        conservative_full,
+        config.kawase_mode() == effects::EffectDebugKawaseMode::Full,
+    );
+    let selection = effects::select_effect_execution(graph, &demand);
+    let mut replay =
+        effects::TerminalBoundaryReplayExecution::new(mode, capture_passes, probe_passes);
+    harness
+        .renderer
+        .execute_effect_graph_with_terminal_replay(
+            graph,
+            framebuffer_origin,
+            plan,
+            &demand,
+            &selection,
+            config,
+            None,
+            &mut replay,
+        )
+        .expect("diagnostic terminal graph executes");
+    replay
+}
+
 pub(in crate::egl_renderer::tests) fn render_native_stacked_candidate(
     fixture: NativeStackedDiagnosticFixture,
     config: effects::EffectDebugConfig,
