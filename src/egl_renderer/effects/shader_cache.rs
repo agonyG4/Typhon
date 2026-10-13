@@ -215,6 +215,13 @@ impl ShaderProgramCache {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn reserve_test_entries(&mut self, additional: usize) {
+        self.capacity = self
+            .capacity
+            .max(self.entries.len().saturating_add(additional));
+    }
+
     pub(crate) fn remember_source(
         &mut self,
         key: ShaderProgramKey,

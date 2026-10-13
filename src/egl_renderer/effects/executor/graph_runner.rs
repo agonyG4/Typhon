@@ -4,10 +4,15 @@ use super::*;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TerminalBoundaryReplay {
     Legacy,
+    CanonicalLegacyUp2,
     FuseUp2AndFragment,
     FuseFragmentAndComposite,
+    TerminalQ1Only,
+    TerminalQ2Only,
+    TerminalQ1Q2,
     KawaseOnlyProbe,
     MaterialOnlyProbe,
+    FragmentBoundaryProbe,
     CaptureTerminalStages,
 }
 
@@ -57,6 +62,19 @@ impl TerminalBoundaryReplayExecution {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum TerminalDiagnosticStage {
     Up2,
+    Up2Q1,
+    Up2RawBlueBits,
+    Up2RawRedBits,
+    Up2RawGreenBits,
+    Up2Q1BlueBits,
+    Up2Q1RedBits,
+    Up2Q1GreenBits,
+    FragmentRawBlueBits,
+    FragmentRawRedBits,
+    FragmentRawGreenBits,
+    FragmentQ2BlueBits,
+    FragmentQ2RedBits,
+    FragmentQ2GreenBits,
     Fragment,
 }
 
@@ -170,6 +188,7 @@ fn capture_terminal_stage_probe(
     targets: EffectExecutionTargets,
     framebuffer_origin: OutputFramebufferOrigin,
     shader: super::pass_exec::DiagnosticFullscreenShader,
+    diagnostic_stage: Option<(&EffectNodeKind, &[EffectNodeKind])>,
 ) -> RendererResult<DiagnosticTextureCapture> {
     let output_id = pass
         .output
@@ -212,10 +231,14 @@ fn capture_terminal_stage_probe(
         &diagnostic_pass,
         targets,
         shader,
-        None,
+        diagnostic_stage,
         Some(&output_plan),
         framebuffer_origin,
-        true,
+        pass.terminal_kawase.is_some()
+            || matches!(
+                pass.kind,
+                RenderPassKind::DualKawaseDownsample | RenderPassKind::DualKawaseUpsample
+            ),
         &full_output_damage,
     );
     let capture_result = if draw_result.is_ok() {
@@ -373,6 +396,7 @@ pub(super) fn execute_graph_passes_inner(
             terminal_replay.as_ref().map(|replay| replay.mode),
             Some(
                 TerminalBoundaryReplay::FuseUp2AndFragment
+                    | TerminalBoundaryReplay::CanonicalLegacyUp2
                     | TerminalBoundaryReplay::FuseFragmentAndComposite
                     | TerminalBoundaryReplay::KawaseOnlyProbe
                     | TerminalBoundaryReplay::MaterialOnlyProbe
@@ -913,6 +937,24 @@ pub(super) fn execute_graph_passes_inner(
                 terminal_replay.as_ref().map(|replay| replay.mode),
                 diagnostic_tail,
             ) {
+                (Some(TerminalBoundaryReplay::CanonicalLegacyUp2), Some(tail))
+                    if tail.upsample.id == pass.id =>
+                {
+                    super::pass_exec::execute_fullscreen_pass_diagnostic(
+                        renderer,
+                        graph,
+                        textures,
+                        physical_pass,
+                        targets,
+                        super::pass_exec::DiagnosticFullscreenShader::LegacyCanonicalUp2,
+                        None,
+                        None,
+                        framebuffer_origin,
+                        true,
+                        &execution_damage.region,
+                    )
+                    .map(|()| None)
+                }
                 (Some(TerminalBoundaryReplay::FuseUp2AndFragment), Some(tail))
                     if tail.fragment.id == pass.id =>
                 {
@@ -934,6 +976,69 @@ pub(super) fn execute_graph_passes_inner(
                         &execution_damage.region,
                     )
                     .map(|()| None)
+                }
+                (Some(TerminalBoundaryReplay::TerminalQ1Only), _)
+                    if pass.terminal_kawase.is_some() =>
+                {
+                    super::pass_exec::execute_fullscreen_pass_diagnostic(
+                        renderer,
+                        graph,
+                        textures,
+                        physical_pass,
+                        targets,
+                        super::pass_exec::DiagnosticFullscreenShader::TerminalQ1Only,
+                        None,
+                        None,
+                        framebuffer_origin,
+                        true,
+                        &execution_damage.region,
+                    )
+                    .map(|()| {
+                        stats.composites = stats.composites.saturating_add(1);
+                        None
+                    })
+                }
+                (Some(TerminalBoundaryReplay::TerminalQ2Only), _)
+                    if pass.terminal_kawase.is_some() =>
+                {
+                    super::pass_exec::execute_fullscreen_pass_diagnostic(
+                        renderer,
+                        graph,
+                        textures,
+                        physical_pass,
+                        targets,
+                        super::pass_exec::DiagnosticFullscreenShader::TerminalQ2Only,
+                        None,
+                        None,
+                        framebuffer_origin,
+                        true,
+                        &execution_damage.region,
+                    )
+                    .map(|()| {
+                        stats.composites = stats.composites.saturating_add(1);
+                        None
+                    })
+                }
+                (Some(TerminalBoundaryReplay::TerminalQ1Q2), _)
+                    if pass.terminal_kawase.is_some() =>
+                {
+                    super::pass_exec::execute_fullscreen_pass_diagnostic(
+                        renderer,
+                        graph,
+                        textures,
+                        physical_pass,
+                        targets,
+                        super::pass_exec::DiagnosticFullscreenShader::TerminalQ1Q2,
+                        None,
+                        None,
+                        framebuffer_origin,
+                        true,
+                        &execution_damage.region,
+                    )
+                    .map(|()| {
+                        stats.composites = stats.composites.saturating_add(1);
+                        None
+                    })
                 }
                 (Some(TerminalBoundaryReplay::FuseFragmentAndComposite), Some(tail))
                     if tail.composite.id == pass.id =>
@@ -974,7 +1079,7 @@ pub(super) fn execute_graph_passes_inner(
                         textures,
                         physical_pass,
                         targets,
-                        super::pass_exec::DiagnosticFullscreenShader::MaterialOnly,
+                        super::pass_exec::DiagnosticFullscreenShader::MaterialOnlyQ2,
                         Some((stage, &physical_pass.fused_stages)),
                         None,
                         framebuffer_origin,
@@ -1080,10 +1185,100 @@ pub(super) fn execute_graph_passes_inner(
                             targets,
                             framebuffer_origin,
                             super::pass_exec::DiagnosticFullscreenShader::TerminalKawaseOnly,
+                            None,
                         )?;
                         replay
                             .stage_probes
                             .insert((pass.id, TerminalDiagnosticStage::Up2), capture);
+                        for (stage, shader) in [
+                            (
+                                TerminalDiagnosticStage::Up2Q1,
+                                super::pass_exec::DiagnosticFullscreenShader::TerminalKawaseQ1Only,
+                            ),
+                            (
+                                TerminalDiagnosticStage::Up2RawBlueBits,
+                                super::pass_exec::DiagnosticFullscreenShader::TerminalKawaseRawBlueBits,
+                            ),
+                            (
+                                TerminalDiagnosticStage::Up2Q1BlueBits,
+                                super::pass_exec::DiagnosticFullscreenShader::TerminalKawaseQ1BlueBits,
+                            ),
+                            (
+                                TerminalDiagnosticStage::Up2RawRedBits,
+                                super::pass_exec::DiagnosticFullscreenShader::TerminalKawaseRawRedBits,
+                            ),
+                            (
+                                TerminalDiagnosticStage::Up2RawGreenBits,
+                                super::pass_exec::DiagnosticFullscreenShader::TerminalKawaseRawGreenBits,
+                            ),
+                            (
+                                TerminalDiagnosticStage::Up2Q1RedBits,
+                                super::pass_exec::DiagnosticFullscreenShader::TerminalKawaseQ1RedBits,
+                            ),
+                            (
+                                TerminalDiagnosticStage::Up2Q1GreenBits,
+                                super::pass_exec::DiagnosticFullscreenShader::TerminalKawaseQ1GreenBits,
+                            ),
+                        ] {
+                            let capture = capture_terminal_stage_probe(
+                                renderer,
+                                graph,
+                                textures,
+                                pass,
+                                targets,
+                                framebuffer_origin,
+                                shader,
+                                None,
+                            )?;
+                            replay.stage_probes.insert((pass.id, stage), capture);
+                        }
+                    }
+                    TerminalBoundaryReplay::FragmentBoundaryProbe
+                    | TerminalBoundaryReplay::CanonicalLegacyUp2
+                        if replay.probe_passes.contains(&pass.id)
+                            && pass.kind == RenderPassKind::Fragment =>
+                    {
+                        let local_stage = pass.stage.as_ref().ok_or_else(|| {
+                            io::Error::other("Fragment boundary probe has no stage")
+                        })?;
+                        for (probe_stage, shader) in [
+                            (
+                                TerminalDiagnosticStage::FragmentRawBlueBits,
+                                super::pass_exec::DiagnosticFullscreenShader::MaterialRawBlueBits,
+                            ),
+                            (
+                                TerminalDiagnosticStage::FragmentQ2BlueBits,
+                                super::pass_exec::DiagnosticFullscreenShader::MaterialQ2BlueBits,
+                            ),
+                            (
+                                TerminalDiagnosticStage::FragmentRawRedBits,
+                                super::pass_exec::DiagnosticFullscreenShader::MaterialRawRedBits,
+                            ),
+                            (
+                                TerminalDiagnosticStage::FragmentRawGreenBits,
+                                super::pass_exec::DiagnosticFullscreenShader::MaterialRawGreenBits,
+                            ),
+                            (
+                                TerminalDiagnosticStage::FragmentQ2RedBits,
+                                super::pass_exec::DiagnosticFullscreenShader::MaterialQ2RedBits,
+                            ),
+                            (
+                                TerminalDiagnosticStage::FragmentQ2GreenBits,
+                                super::pass_exec::DiagnosticFullscreenShader::MaterialQ2GreenBits,
+                            ),
+                        ] {
+                            let capture = capture_terminal_stage_probe(
+                                renderer,
+                                graph,
+                                textures,
+                                pass,
+                                targets,
+                                framebuffer_origin,
+                                shader,
+                                Some((local_stage, &pass.fused_stages)),
+                            )?;
+                            replay.stage_probes.insert((pass.id, probe_stage), capture);
+                        }
                     }
                     TerminalBoundaryReplay::CaptureTerminalStages
                         if replay.probe_passes.contains(&pass.id)
@@ -1097,6 +1292,7 @@ pub(super) fn execute_graph_passes_inner(
                             targets,
                             framebuffer_origin,
                             super::pass_exec::DiagnosticFullscreenShader::TerminalKawaseOnly,
+                            None,
                         )?;
                         let fragment_capture = capture_terminal_stage_probe(
                             renderer,
@@ -1106,6 +1302,7 @@ pub(super) fn execute_graph_passes_inner(
                             targets,
                             framebuffer_origin,
                             super::pass_exec::DiagnosticFullscreenShader::TerminalUp2AndFragment,
+                            None,
                         )?;
                         replay
                             .stage_probes

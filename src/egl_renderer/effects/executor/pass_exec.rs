@@ -10,10 +10,28 @@ pub(crate) enum EffectPassBlendMode {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum DiagnosticFullscreenShader {
     TerminalKawaseOnly,
+    TerminalKawaseQ1Only,
+    TerminalKawaseRawBlueBits,
+    TerminalKawaseRawRedBits,
+    TerminalKawaseRawGreenBits,
+    TerminalKawaseQ1BlueBits,
+    TerminalKawaseQ1RedBits,
+    TerminalKawaseQ1GreenBits,
+    LegacyCanonicalUp2,
     LegacyUp2AndFragment,
     TerminalUp2AndFragment,
     MaterialOnly,
+    MaterialOnlyQ2,
+    MaterialRawBlueBits,
+    MaterialRawRedBits,
+    MaterialRawGreenBits,
+    MaterialQ2BlueBits,
+    MaterialQ2RedBits,
+    MaterialQ2GreenBits,
     MaterialAndComposite,
+    TerminalQ1Only,
+    TerminalQ2Only,
+    TerminalQ1Q2,
 }
 
 #[cfg(test)]
@@ -25,16 +43,66 @@ impl DiagnosticFullscreenShader {
             Self::TerminalUp2AndFragment => 0xD103,
             Self::MaterialOnly => 0xD104,
             Self::MaterialAndComposite => 0xD105,
+            Self::TerminalKawaseQ1Only => 0xD106,
+            Self::TerminalKawaseRawBlueBits => 0xD107,
+            Self::TerminalKawaseRawRedBits => 0xD110,
+            Self::TerminalKawaseRawGreenBits => 0xD111,
+            Self::TerminalKawaseQ1BlueBits => 0xD108,
+            Self::TerminalKawaseQ1RedBits => 0xD112,
+            Self::TerminalKawaseQ1GreenBits => 0xD113,
+            Self::LegacyCanonicalUp2 => 0xD109,
+            Self::MaterialOnlyQ2 => 0xD10A,
+            Self::MaterialRawBlueBits => 0xD10E,
+            Self::MaterialRawRedBits => 0xD114,
+            Self::MaterialRawGreenBits => 0xD115,
+            Self::MaterialQ2BlueBits => 0xD10F,
+            Self::MaterialQ2RedBits => 0xD116,
+            Self::MaterialQ2GreenBits => 0xD117,
+            Self::TerminalQ1Only => 0xD10B,
+            Self::TerminalQ2Only => 0xD10C,
+            Self::TerminalQ1Q2 => 0xD10D,
         }
     }
 
-    fn source(self) -> &'static str {
+    fn source(self) -> String {
         match self {
-            Self::TerminalKawaseOnly => DIAGNOSTIC_KAWASE_ONLY_FRAGMENT_SHADER,
-            Self::LegacyUp2AndFragment => DIAGNOSTIC_LEGACY_UP2_FRAGMENT_SHADER,
-            Self::TerminalUp2AndFragment => DIAGNOSTIC_TERMINAL_UP2_FRAGMENT_STAGE_SHADER,
-            Self::MaterialOnly => FRAGMENT_STAGE_FRAGMENT_SHADER,
-            Self::MaterialAndComposite => DIAGNOSTIC_MATERIAL_COMPOSITE_FRAGMENT_SHADER,
+            Self::TerminalKawaseOnly => DIAGNOSTIC_KAWASE_ONLY_FRAGMENT_SHADER.to_owned(),
+            Self::TerminalKawaseQ1Only => diagnostic_kawase_only_shader(true, false),
+            Self::TerminalKawaseRawBlueBits => diagnostic_kawase_only_shader(false, true),
+            Self::TerminalKawaseRawRedBits => {
+                diagnostic_kawase_only_channel_bits_shader(false, Some("r"))
+            }
+            Self::TerminalKawaseRawGreenBits => {
+                diagnostic_kawase_only_channel_bits_shader(false, Some("g"))
+            }
+            Self::TerminalKawaseQ1BlueBits => diagnostic_kawase_only_shader(true, true),
+            Self::TerminalKawaseQ1RedBits => {
+                diagnostic_kawase_only_channel_bits_shader(true, Some("r"))
+            }
+            Self::TerminalKawaseQ1GreenBits => {
+                diagnostic_kawase_only_channel_bits_shader(true, Some("g"))
+            }
+            Self::LegacyCanonicalUp2 => diagnostic_legacy_up2_canonical_shader(),
+            Self::LegacyUp2AndFragment => DIAGNOSTIC_LEGACY_UP2_FRAGMENT_SHADER.to_owned(),
+            Self::TerminalUp2AndFragment => {
+                DIAGNOSTIC_TERMINAL_UP2_FRAGMENT_STAGE_SHADER.to_owned()
+            }
+            Self::MaterialOnly => FRAGMENT_STAGE_FRAGMENT_SHADER.to_owned(),
+            Self::MaterialOnlyQ2 => diagnostic_fragment_stage_q2_shader(),
+            Self::MaterialRawBlueBits => {
+                diagnostic_fragment_stage_boundary_probe_shader(false, "b")
+            }
+            Self::MaterialRawRedBits => diagnostic_fragment_stage_boundary_probe_shader(false, "r"),
+            Self::MaterialRawGreenBits => {
+                diagnostic_fragment_stage_boundary_probe_shader(false, "g")
+            }
+            Self::MaterialQ2BlueBits => diagnostic_fragment_stage_boundary_probe_shader(true, "b"),
+            Self::MaterialQ2RedBits => diagnostic_fragment_stage_boundary_probe_shader(true, "r"),
+            Self::MaterialQ2GreenBits => diagnostic_fragment_stage_boundary_probe_shader(true, "g"),
+            Self::MaterialAndComposite => DIAGNOSTIC_MATERIAL_COMPOSITE_FRAGMENT_SHADER.to_owned(),
+            Self::TerminalQ1Only => diagnostic_terminal_shader_with_virtual_boundaries(true, false),
+            Self::TerminalQ2Only => diagnostic_terminal_shader_with_virtual_boundaries(false, true),
+            Self::TerminalQ1Q2 => diagnostic_terminal_shader_with_virtual_boundaries(true, true),
         }
     }
 
@@ -1171,17 +1239,19 @@ fn execute_fullscreen_pass_impl(
     );
     #[cfg(test)]
     let (shader_key, program) = if let Some(diagnostic_shader) = diagnostic_shader {
+        renderer.runtime.effect_shaders.reserve_test_entries(32);
         let key = ShaderProgramKey::new(
             ShaderModuleId::new(oblivion_one::effects::INTERNAL_EFFECT_SHADER_MODULE_COPY)
                 .expect("copy shader id is non-zero"),
             diagnostic_shader.cache_variant(),
             oblivion_one::effects::EffectWorkingSpace::LinearSrgb,
         );
+        let diagnostic_source = diagnostic_shader.source();
         let program = renderer.runtime.effect_shaders.get_or_compile(
             renderer.gl,
             key,
             diagnostic_shader.vertex_source(),
-            diagnostic_shader.source(),
+            &diagnostic_source,
         )?;
         (key, program)
     } else {

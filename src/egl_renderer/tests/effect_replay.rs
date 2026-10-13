@@ -111,10 +111,32 @@ fn render_terminal_graph_after_partial_edge_damage(
         config,
         origin,
     );
-    read_diagnostic_pixels(&harness)
+    let partial_pixels = read_diagnostic_pixels(&harness);
+    execute_diagnostic_frame_with_origin(
+        &mut harness,
+        graph,
+        &diagnostic_repaint_plan_for_repairs_in_size(&[], true, size),
+        EffectRegion::from_rect(bounds),
+        true,
+        config,
+        origin,
+    );
+    let full_pixels = read_diagnostic_pixels(&harness);
+    println!(
+        "partial-vs-full fusions={} {origin:?}: {}",
+        graph.stats.terminal_blur_fusions,
+        terminal_pixel_difference_summary(&full_pixels, &partial_pixels, size.0, size.1, origin,)
+    );
+    partial_pixels
 }
 
-fn terminal_pixel_difference_summary(expected: &[u8], actual: &[u8], width: u32) -> String {
+fn terminal_pixel_difference_summary(
+    expected: &[u8],
+    actual: &[u8],
+    width: u32,
+    height: u32,
+    origin: OutputFramebufferOrigin,
+) -> String {
     assert_eq!(expected.len(), actual.len(), "output lengths differ");
     let mut changed_pixels = 0usize;
     let mut max_channel_delta = 0u8;
@@ -130,16 +152,31 @@ fn terminal_pixel_difference_summary(expected: &[u8], actual: &[u8], width: u32)
         }
         changed_pixels += 1;
         let x = u32::try_from(pixel_index).unwrap() % width;
-        let y = u32::try_from(pixel_index).unwrap() / width;
+        let storage_y = u32::try_from(pixel_index).unwrap() / width;
+        let logical_y = match origin {
+            OutputFramebufferOrigin::BottomLeft => height - 1 - storage_y,
+            OutputFramebufferOrigin::TopLeftScanout => storage_y,
+        };
         bounds[0] = bounds[0].min(x);
-        bounds[1] = bounds[1].min(y);
+        bounds[1] = bounds[1].min(storage_y);
         bounds[2] = bounds[2].max(x);
-        bounds[3] = bounds[3].max(y);
+        bounds[3] = bounds[3].max(storage_y);
+        let absolute_difference = expected
+            .iter()
+            .zip(actual)
+            .map(|(expected, actual)| expected.abs_diff(*actual))
+            .collect::<Vec<_>>();
         for (expected, actual) in expected.iter().zip(actual) {
             max_channel_delta = max_channel_delta.max(expected.abs_diff(*actual));
         }
         if samples.len() < 8 {
-            samples.push((x, y, expected.to_vec(), actual.to_vec()));
+            samples.push((
+                [x, storage_y],
+                [x, logical_y],
+                expected.to_vec(),
+                actual.to_vec(),
+                absolute_difference,
+            ));
         }
     }
     if changed_pixels == 0 {
@@ -295,6 +332,15 @@ fn rgba16f_texture_diff_reports_storage_and_logical_coordinates() {
 }
 
 #[derive(Clone, Debug)]
+struct Rgba8DifferenceSample {
+    storage_coordinate: [u32; 2],
+    logical_output_coordinate: [u32; 2],
+    legacy_rgba: [u8; 4],
+    candidate_rgba: [u8; 4],
+    absolute_difference: [u8; 4],
+}
+
+#[derive(Clone, Debug)]
 struct Rgba8DifferenceSummary {
     changed_pixels: usize,
     changed_ratio: f64,
@@ -303,12 +349,16 @@ struct Rgba8DifferenceSummary {
     rms_rgb_error: f64,
     bounds: Option<[u32; 4]>,
     alpha_changed_pixels: usize,
+    first: Option<Rgba8DifferenceSample>,
+    maximum_absolute_difference: u8,
 }
 
 fn summarize_rgba8_difference(
     expected: &[u8],
     actual: &[u8],
     width: u32,
+    height: u32,
+    origin: OutputFramebufferOrigin,
 ) -> Rgba8DifferenceSummary {
     assert_eq!(expected.len(), actual.len());
     assert_eq!(expected.len() % 4, 0);
@@ -321,6 +371,8 @@ fn summarize_rgba8_difference(
         rms_rgb_error: 0.0,
         bounds: None,
         alpha_changed_pixels: 0,
+        first: None,
+        maximum_absolute_difference: 0,
     };
     let mut absolute_sum = 0.0;
     let mut squared_sum = 0.0;
@@ -338,7 +390,12 @@ fn summarize_rgba8_difference(
         if changed {
             summary.changed_pixels += 1;
             let x = (index as u32) % width;
-            let y = (index as u32) / width;
+            let storage_y = (index as u32) / width;
+            let logical_y = match origin {
+                OutputFramebufferOrigin::BottomLeft => height - 1 - storage_y,
+                OutputFramebufferOrigin::TopLeftScanout => storage_y,
+            };
+            let y = storage_y;
             summary.bounds = Some(summary.bounds.map_or([x, y, x, y], |bounds| {
                 [
                     bounds[0].min(x),
@@ -347,6 +404,22 @@ fn summarize_rgba8_difference(
                     bounds[3].max(y),
                 ]
             }));
+            let absolute_difference = [
+                left[0].abs_diff(right[0]),
+                left[1].abs_diff(right[1]),
+                left[2].abs_diff(right[2]),
+                left[3].abs_diff(right[3]),
+            ];
+            summary.maximum_absolute_difference = summary
+                .maximum_absolute_difference
+                .max(*absolute_difference.iter().max().unwrap_or(&0));
+            summary.first.get_or_insert(Rgba8DifferenceSample {
+                storage_coordinate: [x, storage_y],
+                logical_output_coordinate: [x, logical_y],
+                legacy_rgba: left.try_into().expect("four RGBA channels"),
+                candidate_rgba: right.try_into().expect("four RGBA channels"),
+                absolute_difference,
+            });
         }
         if left[3] != right[3] {
             summary.alpha_changed_pixels += 1;
@@ -439,10 +512,109 @@ fn report_rgba8_comparison(
     legacy: &[u8],
     diagnostic: &[u8],
     width: u32,
+    height: u32,
+    origin: OutputFramebufferOrigin,
 ) -> Rgba8DifferenceSummary {
-    let summary = summarize_rgba8_difference(legacy, diagnostic, width);
+    let summary = summarize_rgba8_difference(legacy, diagnostic, width, height, origin);
     println!("    {label}: {summary:?}");
     summary
+}
+
+fn decode_float_bits_capture(capture: &effects::DiagnosticTextureCapture, index: usize) -> f32 {
+    let encoded = capture.pixels[index];
+    let bytes = encoded.map(|value| (value * 255.0).round().clamp(0.0, 255.0) as u8);
+    f32::from_bits(u32::from_le_bytes(bytes))
+}
+
+fn check_virtual_boundary_rgb_matches_legacy(
+    effect_rect: EffectRect,
+    boundary: &str,
+    name: &str,
+    legacy_stage: &effects::DiagnosticTextureCapture,
+    raw_bits: [&effects::DiagnosticTextureCapture; 3],
+    virtual_bits: [&effects::DiagnosticTextureCapture; 3],
+) -> Result<(), String> {
+    for capture in raw_bits.into_iter().chain(virtual_bits) {
+        assert_eq!(
+            (capture.width, capture.height),
+            (legacy_stage.width, legacy_stage.height)
+        );
+        assert_eq!(capture.domain, legacy_stage.domain);
+        assert_eq!(capture.origin, legacy_stage.origin);
+    }
+    let mut representative = None;
+    let mut first_pixel = None;
+    let mut first_mismatch = None;
+    let mut difference_count = 0usize;
+    let mut raw_virtual_difference_count = 0usize;
+    let mut maximum_absolute_difference = 0.0f32;
+    let channels = ["r", "g", "b"];
+    for index in 0..legacy_stage.pixels.len() {
+        let raw = raw_bits.map(|capture| decode_float_bits_capture(capture, index));
+        let virtual_value = virtual_bits.map(|capture| decode_float_bits_capture(capture, index));
+        let stored = [
+            legacy_stage.pixels[index][0],
+            legacy_stage.pixels[index][1],
+            legacy_stage.pixels[index][2],
+        ];
+        let storage = [
+            (index as u32) % legacy_stage.width,
+            (index as u32) / legacy_stage.width,
+        ];
+        let logical = [
+            legacy_stage.domain.x + storage[0] as i32,
+            legacy_stage.domain.y + (legacy_stage.height - 1 - storage[1]) as i32,
+        ];
+        if logical[0] < effect_rect.x
+            || logical[1] < effect_rect.y
+            || logical[0] >= effect_rect.x + effect_rect.width as i32
+            || logical[1] >= effect_rect.y + effect_rect.height as i32
+        {
+            continue;
+        }
+        first_pixel.get_or_insert((storage, logical, raw, virtual_value, stored));
+        if representative.is_none()
+            && (0..3).any(|channel| raw[channel].to_bits() != virtual_value[channel].to_bits())
+        {
+            representative = Some((storage, logical, raw, virtual_value, stored));
+        }
+        for channel in 0..3 {
+            if raw[channel].to_bits() != virtual_value[channel].to_bits() {
+                raw_virtual_difference_count += 1;
+            }
+            let difference = (virtual_value[channel] - stored[channel]).abs();
+            maximum_absolute_difference = maximum_absolute_difference.max(difference);
+            if virtual_value[channel].to_bits() != stored[channel].to_bits() {
+                difference_count += 1;
+                first_mismatch.get_or_insert((
+                    storage,
+                    channels[channel],
+                    raw[channel],
+                    virtual_value[channel],
+                    stored[channel],
+                ));
+            }
+        }
+    }
+    let sample = representative
+        .or(first_pixel)
+        .expect("non-empty RGBA16F capture");
+    let (storage, logical, raw, virtual_value, stored) = sample;
+    println!(
+        "    {boundary} raw boundary case={name} storage={storage:?} logical={logical:?} raw_rgb={raw:?} virtual_rgb={virtual_value:?} legacy_stored_rgb={stored:?} raw_virtual_differing_values={raw_virtual_difference_count} virtual_legacy_differing_values={difference_count} max_abs_delta={maximum_absolute_difference:?}"
+    );
+    if raw_virtual_difference_count == 0 {
+        println!(
+            "    {boundary} did not alter raw RGB values for {name}; the direct stored-stage comparison above determines whether this is exact"
+        );
+    }
+    if let Some((storage, channel, raw, virtual_value, stored)) = first_mismatch {
+        Err(format!(
+            "{boundary} mismatch {name} storage={storage:?} channel={channel}: raw={raw:?}, virtual={virtual_value:?}, legacy={stored:?}; differing_values={difference_count}, max_abs_delta={maximum_absolute_difference:?}"
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -456,7 +628,8 @@ fn run_terminal_builtin_diagnostic_case(
     noise: f32,
     coverage: Option<oblivion_one::effects::EffectCoverage>,
     origin: OutputFramebufferOrigin,
-) {
+) -> Vec<String> {
+    let mut exactness_failures = Vec::new();
     let material = oblivion_one::material::EffectiveMaterial {
         blur,
         saturation,
@@ -487,6 +660,15 @@ fn run_terminal_builtin_diagnostic_case(
         effects::TerminalBoundaryReplay::Legacy,
         [tail.upsample, tail.fragment],
         [],
+    );
+    let (l_canonical, c_canonical) = render_terminal_replay_mode(
+        &legacy_graph,
+        output_size,
+        origin,
+        |harness| install_diagnostic_scene(harness, rect, visual_group),
+        effects::TerminalBoundaryReplay::CanonicalLegacyUp2,
+        [tail.upsample, tail.fragment],
+        [tail.fragment],
     );
     let (l1, c1) = render_terminal_replay_mode(
         &legacy_graph,
@@ -533,13 +715,155 @@ fn run_terminal_builtin_diagnostic_case(
         [],
         [tail.composite],
     );
+    let c_q1_only = (noise == 0.0).then(|| {
+        render_terminal_replay_mode(
+            &terminal_graph,
+            output_size,
+            origin,
+            |harness| install_diagnostic_scene(harness, rect, visual_group),
+            effects::TerminalBoundaryReplay::TerminalQ1Only,
+            [],
+            [],
+        )
+        .1
+    });
+    let c_q2_only = (noise == 0.0).then(|| {
+        render_terminal_replay_mode(
+            &terminal_graph,
+            output_size,
+            origin,
+            |harness| install_diagnostic_scene(harness, rect, visual_group),
+            effects::TerminalBoundaryReplay::TerminalQ2Only,
+            [],
+            [],
+        )
+        .1
+    });
+    let c_q1_q2 = render_terminal_replay_mode(
+        &terminal_graph,
+        output_size,
+        origin,
+        |harness| install_diagnostic_scene(harness, rect, visual_group),
+        effects::TerminalBoundaryReplay::TerminalQ1Q2,
+        [],
+        [],
+    )
+    .1;
 
     let a0 = l0.captures.get(&tail.upsample).expect("L0 captures A0");
     let b0 = l0.captures.get(&tail.fragment).expect("L0 captures B0");
+    let a_canonical = l_canonical
+        .captures
+        .get(&tail.upsample)
+        .expect("canonical legacy replay captures Acanonical");
+    let b_canonical = l_canonical
+        .captures
+        .get(&tail.fragment)
+        .expect("canonical legacy replay captures Bcanonical");
     let a1 = kawase_probe
         .stage_probes
         .get(&(tail.upsample, effects::TerminalDiagnosticStage::Up2))
         .expect("A1 terminal-style Up2 probe");
+    let a_q1 = kawase_probe
+        .stage_probes
+        .get(&(tail.upsample, effects::TerminalDiagnosticStage::Up2Q1))
+        .expect("Q1-only Up2 probe");
+    let a_raw_bits = [
+        kawase_probe
+            .stage_probes
+            .get(&(
+                tail.upsample,
+                effects::TerminalDiagnosticStage::Up2RawRedBits,
+            ))
+            .expect("raw Up2 red-bit probe"),
+        kawase_probe
+            .stage_probes
+            .get(&(
+                tail.upsample,
+                effects::TerminalDiagnosticStage::Up2RawGreenBits,
+            ))
+            .expect("raw Up2 green-bit probe"),
+        kawase_probe
+            .stage_probes
+            .get(&(
+                tail.upsample,
+                effects::TerminalDiagnosticStage::Up2RawBlueBits,
+            ))
+            .expect("raw Up2 blue-bit probe"),
+    ];
+    let a_q1_bits = [
+        kawase_probe
+            .stage_probes
+            .get(&(
+                tail.upsample,
+                effects::TerminalDiagnosticStage::Up2Q1RedBits,
+            ))
+            .expect("Q1 Up2 red-bit probe"),
+        kawase_probe
+            .stage_probes
+            .get(&(
+                tail.upsample,
+                effects::TerminalDiagnosticStage::Up2Q1GreenBits,
+            ))
+            .expect("Q1 Up2 green-bit probe"),
+        kawase_probe
+            .stage_probes
+            .get(&(
+                tail.upsample,
+                effects::TerminalDiagnosticStage::Up2Q1BlueBits,
+            ))
+            .expect("Q1 Up2 blue-bit probe"),
+    ];
+    let b_raw_bits = (name == "single_sat_031_noise_0" && noise == 0.0).then(|| {
+        [
+            l_canonical
+                .stage_probes
+                .get(&(
+                    tail.fragment,
+                    effects::TerminalDiagnosticStage::FragmentRawRedBits,
+                ))
+                .expect("raw Fragment red-bit probe"),
+            l_canonical
+                .stage_probes
+                .get(&(
+                    tail.fragment,
+                    effects::TerminalDiagnosticStage::FragmentRawGreenBits,
+                ))
+                .expect("raw Fragment green-bit probe"),
+            l_canonical
+                .stage_probes
+                .get(&(
+                    tail.fragment,
+                    effects::TerminalDiagnosticStage::FragmentRawBlueBits,
+                ))
+                .expect("raw Fragment blue-bit probe"),
+        ]
+    });
+    let b_q2_bits = (name == "single_sat_031_noise_0" && noise == 0.0).then(|| {
+        [
+            l_canonical
+                .stage_probes
+                .get(&(
+                    tail.fragment,
+                    effects::TerminalDiagnosticStage::FragmentQ2RedBits,
+                ))
+                .expect("Q2 Fragment red-bit probe"),
+            l_canonical
+                .stage_probes
+                .get(&(
+                    tail.fragment,
+                    effects::TerminalDiagnosticStage::FragmentQ2GreenBits,
+                ))
+                .expect("Q2 Fragment green-bit probe"),
+            l_canonical
+                .stage_probes
+                .get(&(
+                    tail.fragment,
+                    effects::TerminalDiagnosticStage::FragmentQ2BlueBits,
+                ))
+                .expect("Q2 Fragment blue-bit probe"),
+        ]
+    });
     let b1 = l1.captures.get(&tail.fragment).expect("L1 captures B1");
     let a2 = l2.captures.get(&tail.upsample).expect("L2 captures A2");
     let b2 = material_probe
@@ -563,15 +887,136 @@ fn run_terminal_builtin_diagnostic_case(
         terminal_graph.passes.len()
     );
     let a0_a1 = report_rgba16f_comparison("A0 vs A1", a0, a1);
+    let a0_acanonical = report_rgba16f_comparison("A0 vs Acanonical", a0, a_canonical);
+    let acanonical_a1 = report_rgba16f_comparison("Acanonical vs A1", a_canonical, a1);
+    let acanonical_a3 = report_rgba16f_comparison("Acanonical vs A3", a_canonical, a3);
+    report_rgba16f_comparison("A0 vs Q1(raw)", a0, a_q1);
+    let acanonical_aq1 = report_rgba16f_comparison("Acanonical vs Q1(raw)", a_canonical, a_q1);
     report_rgba16f_comparison("A0 vs A2", a0, a2);
     let a0_a3 = report_rgba16f_comparison("A0 vs A3", a0, a3);
     let b0_b1 = report_rgba16f_comparison("B0 vs B1", b0, b1);
+    let bcanonical_b1 = report_rgba16f_comparison("Bcanonical vs B1", b_canonical, b1);
+    report_rgba16f_comparison("B0 vs Bcanonical", b0, b_canonical);
     let b0_b2 = report_rgba16f_comparison("B0 vs B2", b0, b2);
     let b0_b3 = report_rgba16f_comparison("B0 vs B3", b0, b3);
-    report_rgba8_comparison("C0 vs C1", &c0, &c1, output_size.0);
-    report_rgba8_comparison("C0 vs C2", &c0, &c2, output_size.0);
-    report_rgba8_comparison("C0 vs C_B2", &c0, &c_material_probe, output_size.0);
-    report_rgba8_comparison("C0 vs C3", &c0, &c3, output_size.0);
+    let bcanonical_b3 = report_rgba16f_comparison("Bcanonical vs B3", b_canonical, b3);
+    report_rgba8_comparison("C0 vs C1", &c0, &c1, output_size.0, output_size.1, origin);
+    report_rgba8_comparison("C0 vs C2", &c0, &c2, output_size.0, output_size.1, origin);
+    report_rgba8_comparison(
+        "C0 vs C_B2",
+        &c0,
+        &c_material_probe,
+        output_size.0,
+        output_size.1,
+        origin,
+    );
+    report_rgba8_comparison("C0 vs C3", &c0, &c3, output_size.0, output_size.1, origin);
+    report_rgba8_comparison(
+        "C0 vs Q1+Q2",
+        &c0,
+        &c_q1_q2,
+        output_size.0,
+        output_size.1,
+        origin,
+    );
+    if let Some(candidate) = &c_q1_only {
+        report_rgba8_comparison(
+            "C0 vs Q1 only",
+            &c0,
+            candidate,
+            output_size.0,
+            output_size.1,
+            origin,
+        );
+    }
+    if let Some(candidate) = &c_q2_only {
+        report_rgba8_comparison(
+            "C0 vs Q2 only",
+            &c0,
+            candidate,
+            output_size.0,
+            output_size.1,
+            origin,
+        );
+    }
+    for (label, summary) in [
+        ("A0 vs A1", &a0_a1),
+        ("A0 vs Acanonical", &a0_acanonical),
+        ("Acanonical vs A1", &acanonical_a1),
+        ("Acanonical vs A3", &acanonical_a3),
+        ("Acanonical vs Q1(raw)", &acanonical_aq1),
+        ("A0 vs A3", &a0_a3),
+    ] {
+        if !summary.exactly_equal {
+            exactness_failures.push(format!("{name} {origin:?}: {label} mismatch: {summary:?}"));
+        }
+    }
+    if !bcanonical_b1.exactly_equal {
+        exactness_failures.push(format!(
+            "{name} {origin:?}: Q1 B-stage differs from canonical legacy B: {bcanonical_b1:?}"
+        ));
+    }
+    if !bcanonical_b3.exactly_equal {
+        exactness_failures.push(format!(
+            "{name} {origin:?}: Q1/Q2 B-stage differs from canonical legacy B: {bcanonical_b3:?}"
+        ));
+    }
+    let c0_canonical = report_rgba8_comparison(
+        "C0 vs Ccanonical",
+        &c0,
+        &c_canonical,
+        output_size.0,
+        output_size.1,
+        origin,
+    );
+    if c0 != c_canonical {
+        exactness_failures.push(format!(
+            "{name} {origin:?}: canonical legacy Up2 changed final bytes: {c0_canonical:?}"
+        ));
+    }
+    if noise == 0.0 {
+        if !b0_b1.exactly_equal {
+            exactness_failures.push(format!("{name} {origin:?}: Q1 B-stage mismatch: {b0_b1:?}"));
+        }
+        if !b0_b2.exactly_equal {
+            exactness_failures.push(format!(
+                "{name} {origin:?}: Q2-only B-stage mismatch: {b0_b2:?}"
+            ));
+        }
+        if !b0_b3.exactly_equal {
+            exactness_failures.push(format!(
+                "{name} {origin:?}: Q1/Q2 B-stage mismatch: {b0_b3:?}"
+            ));
+        }
+        if c0 != c_q1_q2 {
+            exactness_failures.push(format!(
+                "{name} {origin:?}: Q1+Q2 candidate differs from legacy ({:?})",
+                summarize_rgba8_difference(&c0, &c_q1_q2, output_size.0, output_size.1, origin)
+            ));
+        }
+    }
+    if name == "single_sat_031_noise_0" && noise == 0.0 {
+        if let Err(error) = check_virtual_boundary_rgb_matches_legacy(
+            rect,
+            "Q1",
+            name,
+            a_canonical,
+            a_raw_bits,
+            a_q1_bits,
+        ) {
+            exactness_failures.push(error);
+        }
+        if let Err(error) = check_virtual_boundary_rgb_matches_legacy(
+            rect,
+            "Q2",
+            name,
+            b_canonical,
+            b_raw_bits.expect("Q2 raw probe exists for representative case"),
+            b_q2_bits.expect("Q2 virtual probe exists for representative case"),
+        ) {
+            exactness_failures.push(error);
+        }
+    }
     let first_divergence = if !a0_a1.exactly_equal || !a0_a3.exactly_equal {
         "final Up2 reconstruction/rasterization"
     } else if !b0_b1.exactly_equal || !b0_b3.exactly_equal {
@@ -584,9 +1029,11 @@ fn run_terminal_builtin_diagnostic_case(
         "Fragment materialization or Composite"
     };
     println!("    first_divergent_boundary={first_divergence}");
+    exactness_failures
 }
 
-fn run_terminal_causal_diagnostic_case(noise: f32, origin: OutputFramebufferOrigin) {
+fn run_terminal_causal_diagnostic_case(noise: f32, origin: OutputFramebufferOrigin) -> Vec<String> {
+    let mut exactness_failures = Vec::new();
     let fixture = native_three_checkpoint_fixture();
     let (mut scene, _) = native_three_checkpoint_backdrop_scene(fixture);
     let program = oblivion_one::effects::builtin_background_material_program(
@@ -631,6 +1078,18 @@ fn run_terminal_causal_diagnostic_case(noise: f32, origin: OutputFramebufferOrig
             .copied()
             .chain(fragment_ids.iter().copied()),
         [],
+    );
+    let (l_canonical, c_canonical) = render_terminal_replay_mode(
+        &legacy_graph,
+        fixture.output_size,
+        origin,
+        |harness| install_native_three_checkpoint_diagnostic_scene(harness, fixture.scene),
+        effects::TerminalBoundaryReplay::CanonicalLegacyUp2,
+        upsample_ids
+            .iter()
+            .copied()
+            .chain(fragment_ids.iter().copied()),
+        fragment_ids.iter().copied(),
     );
     let (l1, c1) = render_terminal_replay_mode(
         &legacy_graph,
@@ -677,6 +1136,40 @@ fn run_terminal_causal_diagnostic_case(noise: f32, origin: OutputFramebufferOrig
         [],
         composite_ids.iter().copied(),
     );
+    let c_q1_only = (noise == 0.0).then(|| {
+        render_terminal_replay_mode(
+            &terminal_graph,
+            fixture.output_size,
+            origin,
+            |harness| install_native_three_checkpoint_diagnostic_scene(harness, fixture.scene),
+            effects::TerminalBoundaryReplay::TerminalQ1Only,
+            [],
+            [],
+        )
+        .1
+    });
+    let c_q2_only = (noise == 0.0).then(|| {
+        render_terminal_replay_mode(
+            &terminal_graph,
+            fixture.output_size,
+            origin,
+            |harness| install_native_three_checkpoint_diagnostic_scene(harness, fixture.scene),
+            effects::TerminalBoundaryReplay::TerminalQ2Only,
+            [],
+            [],
+        )
+        .1
+    });
+    let c_q1_q2 = render_terminal_replay_mode(
+        &terminal_graph,
+        fixture.output_size,
+        origin,
+        |harness| install_native_three_checkpoint_diagnostic_scene(harness, fixture.scene),
+        effects::TerminalBoundaryReplay::TerminalQ1Q2,
+        [],
+        [],
+    )
+    .1;
     println!(
         "KAWASE_DIAG case=causal_abc origin={origin:?} size={:?} tails={} noise={noise} passes=L0:{} L1:{} L2:{} L3:{}",
         fixture.output_size,
@@ -688,7 +1181,15 @@ fn run_terminal_causal_diagnostic_case(noise: f32, origin: OutputFramebufferOrig
     );
     for tail in &tails {
         let a0 = l0.captures.get(&tail.upsample).expect("causal A0");
+        let a_canonical = l_canonical
+            .captures
+            .get(&tail.upsample)
+            .expect("causal canonical legacy A");
         let b0 = l0.captures.get(&tail.fragment).expect("causal B0");
+        let b_canonical = l_canonical
+            .captures
+            .get(&tail.fragment)
+            .expect("causal Bcanonical");
         let a1 = a1_probe
             .stage_probes
             .get(&(tail.upsample, effects::TerminalDiagnosticStage::Up2))
@@ -705,21 +1206,132 @@ fn run_terminal_causal_diagnostic_case(noise: f32, origin: OutputFramebufferOrig
             .get(&(tail.composite, effects::TerminalDiagnosticStage::Fragment))
             .expect("causal B3");
         println!("    causal_instance={:?}", tail.instance);
+        let a0_acanonical = report_rgba16f_comparison("A0 vs Acanonical", a0, a_canonical);
+        let acanonical_a1 = report_rgba16f_comparison("Acanonical vs A1", a_canonical, a1);
+        let acanonical_a3 = report_rgba16f_comparison("Acanonical vs A3", a_canonical, a3);
         report_rgba16f_comparison("A0 vs A1", a0, a1);
         report_rgba16f_comparison("A0 vs A2", a0, a2);
-        report_rgba16f_comparison("A0 vs A3", a0, a3);
         report_rgba16f_comparison("B0 vs B1", b0, b1);
+        let bcanonical_b1 = report_rgba16f_comparison("Bcanonical vs B1", b_canonical, b1);
         report_rgba16f_comparison("B0 vs B2", b0, b2);
         report_rgba16f_comparison("B0 vs B3", b0, b3);
+        let bcanonical_b3 = report_rgba16f_comparison("Bcanonical vs B3", b_canonical, b3);
+        if noise == 0.0 {
+            if !(a0_acanonical.exactly_equal
+                && acanonical_a1.exactly_equal
+                && acanonical_a3.exactly_equal)
+            {
+                exactness_failures.push(format!(
+                    "causal {:?} {origin:?}: A-stage mismatch A0/Acanonical={a0_acanonical:?}, Acanonical/A1={acanonical_a1:?}, Acanonical/A3={acanonical_a3:?}",
+                    tail.instance,
+                ));
+            }
+            if !bcanonical_b1.exactly_equal {
+                exactness_failures.push(format!(
+                    "causal {:?} {origin:?}: Q1 B-stage mismatch {bcanonical_b1:?}",
+                    tail.instance
+                ));
+            }
+            if !bcanonical_b3.exactly_equal {
+                exactness_failures.push(format!(
+                    "causal {:?} {origin:?}: Q1/Q2 B-stage mismatch {bcanonical_b3:?}",
+                    tail.instance
+                ));
+            }
+        }
     }
-    report_rgba8_comparison("C0 vs C1", &c0, &c1, fixture.output_size.0);
-    report_rgba8_comparison("C0 vs C2", &c0, &c2, fixture.output_size.0);
-    report_rgba8_comparison("C0 vs C_B2", &c0, &c_b2_probe, fixture.output_size.0);
-    report_rgba8_comparison("C0 vs C3", &c0, &c3, fixture.output_size.0);
+    report_rgba8_comparison(
+        "C0 vs Ccanonical",
+        &c0,
+        &c_canonical,
+        fixture.output_size.0,
+        fixture.output_size.1,
+        origin,
+    );
+    report_rgba8_comparison(
+        "C0 vs C1",
+        &c0,
+        &c1,
+        fixture.output_size.0,
+        fixture.output_size.1,
+        origin,
+    );
+    report_rgba8_comparison(
+        "C0 vs C2",
+        &c0,
+        &c2,
+        fixture.output_size.0,
+        fixture.output_size.1,
+        origin,
+    );
+    report_rgba8_comparison(
+        "C0 vs C_B2",
+        &c0,
+        &c_b2_probe,
+        fixture.output_size.0,
+        fixture.output_size.1,
+        origin,
+    );
+    report_rgba8_comparison(
+        "C0 vs C3",
+        &c0,
+        &c3,
+        fixture.output_size.0,
+        fixture.output_size.1,
+        origin,
+    );
+    report_rgba8_comparison(
+        "C0 vs Q1+Q2",
+        &c0,
+        &c_q1_q2,
+        fixture.output_size.0,
+        fixture.output_size.1,
+        origin,
+    );
+    if let Some(candidate) = &c_q1_only {
+        report_rgba8_comparison(
+            "C0 vs Q1 only",
+            &c0,
+            candidate,
+            fixture.output_size.0,
+            fixture.output_size.1,
+            origin,
+        );
+    }
+    if let Some(candidate) = &c_q2_only {
+        report_rgba8_comparison(
+            "C0 vs Q2 only",
+            &c0,
+            candidate,
+            fixture.output_size.0,
+            fixture.output_size.1,
+            origin,
+        );
+    }
+    if noise == 0.0 {
+        assert!(
+            c0 == c_canonical,
+            "canonical Up2 changed causal legacy output bytes"
+        );
+        if c0 != c_q1_q2 {
+            exactness_failures.push(format!(
+                "causal_abc {origin:?}: Q1+Q2 candidate differs from legacy ({:?})",
+                summarize_rgba8_difference(
+                    &c0,
+                    &c_q1_q2,
+                    fixture.output_size.0,
+                    fixture.output_size.1,
+                    origin,
+                )
+            ));
+        }
+    }
+    exactness_failures
 }
 
 #[test]
 fn terminal_boundary_rgba16f_noise_free_matrix_and_legacy_noise_attribution() {
+    let mut exactness_failures = Vec::new();
     let odd_bounds = (161, 121);
     let odd_rect = EffectRect::new(19, 13, 101, 75).expect("odd translated blur");
     let even_rect = EffectRect::new(18, 14, 96, 72).expect("even blur");
@@ -741,7 +1353,7 @@ fn terminal_boundary_rgba16f_noise_free_matrix_and_legacy_noise_attribution() {
         OutputFramebufferOrigin::BottomLeft,
         OutputFramebufferOrigin::TopLeftScanout,
     ] {
-        run_terminal_builtin_diagnostic_case(
+        exactness_failures.extend(run_terminal_builtin_diagnostic_case(
             "single_sat_1_noise_0",
             (160, 120),
             even_rect,
@@ -751,8 +1363,8 @@ fn terminal_boundary_rgba16f_noise_free_matrix_and_legacy_noise_attribution() {
             0.0,
             None,
             origin,
-        );
-        run_terminal_builtin_diagnostic_case(
+        ));
+        exactness_failures.extend(run_terminal_builtin_diagnostic_case(
             "single_sat_031_noise_0",
             (160, 120),
             even_rect,
@@ -762,8 +1374,8 @@ fn terminal_boundary_rgba16f_noise_free_matrix_and_legacy_noise_attribution() {
             0.0,
             None,
             origin,
-        );
-        run_terminal_builtin_diagnostic_case(
+        ));
+        exactness_failures.extend(run_terminal_builtin_diagnostic_case(
             "odd_translated_sat_031_noise_0",
             odd_bounds,
             odd_rect,
@@ -773,8 +1385,8 @@ fn terminal_boundary_rgba16f_noise_free_matrix_and_legacy_noise_attribution() {
             0.0,
             None,
             origin,
-        );
-        run_terminal_builtin_diagnostic_case(
+        ));
+        exactness_failures.extend(run_terminal_builtin_diagnostic_case(
             "even_translated_sat_1_noise_0",
             (160, 120),
             even_rect,
@@ -784,8 +1396,8 @@ fn terminal_boundary_rgba16f_noise_free_matrix_and_legacy_noise_attribution() {
             0.0,
             None,
             origin,
-        );
-        run_terminal_builtin_diagnostic_case(
+        ));
+        exactness_failures.extend(run_terminal_builtin_diagnostic_case(
             "rounded_triangle_coverage_noise_0",
             odd_bounds,
             odd_rect,
@@ -795,15 +1407,15 @@ fn terminal_boundary_rgba16f_noise_free_matrix_and_legacy_noise_attribution() {
             0.0,
             Some(rounded_triangle.clone()),
             origin,
-        );
-        run_terminal_causal_diagnostic_case(0.0, origin);
+        ));
+        exactness_failures.extend(run_terminal_causal_diagnostic_case(0.0, origin));
     }
 
     for origin in [
         OutputFramebufferOrigin::BottomLeft,
         OutputFramebufferOrigin::TopLeftScanout,
     ] {
-        run_terminal_builtin_diagnostic_case(
+        let _ = run_terminal_builtin_diagnostic_case(
             "single_sat_031_noise_03_attribution",
             (160, 120),
             even_rect,
@@ -814,8 +1426,13 @@ fn terminal_boundary_rgba16f_noise_free_matrix_and_legacy_noise_attribution() {
             None,
             origin,
         );
-        run_terminal_causal_diagnostic_case(0.3, origin);
+        let _ = run_terminal_causal_diagnostic_case(0.3, origin);
     }
+    assert!(
+        exactness_failures.is_empty(),
+        "Noise-free terminal boundary exactness failures: {}",
+        exactness_failures.join("; ")
+    );
 }
 
 #[test]
@@ -897,7 +1514,13 @@ fn terminal_kawase_gles_matches_causal_unfused_frames_exactly() {
             );
         },
     );
-    let odd_diff = terminal_pixel_difference_summary(&odd_off_pixels, &odd_on_pixels, 161);
+    let odd_diff = terminal_pixel_difference_summary(
+        &odd_off_pixels,
+        &odd_on_pixels,
+        161,
+        121,
+        OutputFramebufferOrigin::TopLeftScanout,
+    );
 
     let repair = OutputRect::new(20, 14, 3, 2);
     let odd_off_partial = render_terminal_graph_after_partial_edge_damage(
@@ -926,7 +1549,13 @@ fn terminal_kawase_gles_matches_causal_unfused_frames_exactly() {
         },
         repair,
     );
-    let partial_diff = terminal_pixel_difference_summary(&odd_off_partial, &odd_on_partial, 161);
+    let partial_diff = terminal_pixel_difference_summary(
+        &odd_off_partial,
+        &odd_on_partial,
+        161,
+        121,
+        OutputFramebufferOrigin::TopLeftScanout,
+    );
 
     let even_bounds = EffectRect::new(0, 0, 160, 120).expect("even output bounds");
     let even_rect = EffectRect::new(18, 14, 96, 72).expect("even blur domain");
@@ -958,7 +1587,13 @@ fn terminal_kawase_gles_matches_causal_unfused_frames_exactly() {
             install_diagnostic_scene(harness, even_rect, VisualGroupId::new(78).unwrap());
         },
     );
-    let even_diff = terminal_pixel_difference_summary(&even_off_pixels, &even_on_pixels, 160);
+    let even_diff = terminal_pixel_difference_summary(
+        &even_off_pixels,
+        &even_on_pixels,
+        160,
+        120,
+        OutputFramebufferOrigin::BottomLeft,
+    );
 
     // Keep the real A -> C -> B causal checkpoint chain while comparing the
     // same canonical local material under the two physical graph variants.
@@ -1017,6 +1652,8 @@ fn terminal_kawase_gles_matches_causal_unfused_frames_exactly() {
         &causal_off_pixels,
         &causal_on_pixels,
         fixture.output_size.0,
+        fixture.output_size.1,
+        OutputFramebufferOrigin::BottomLeft,
     );
     assert!(
         odd_diff.is_empty()

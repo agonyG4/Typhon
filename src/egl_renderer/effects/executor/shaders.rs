@@ -408,6 +408,7 @@ uniform float u_effect_blur_radius;
 uniform vec2 u_effect_output_size;
 uniform vec4 u_effect_input_domain;
 uniform int u_effect_input_flip_y;
+uniform highp int u_effect_target_flip_y;
 in vec2 v_uv;
 out vec4 out_color;
 
@@ -418,8 +419,12 @@ vec2 typhon_effect_sample_uv(vec2 logical_uv) {
 }
 
 void main() {
-    vec2 output_position = v_uv * u_effect_output_size;
-    vec2 local_pixel = floor(output_position - u_effect_input_domain.xy);
+    ivec2 storage_pixel = ivec2(floor(gl_FragCoord.xy));
+    int logical_y = u_effect_target_flip_y != 0
+        ? storage_pixel.y
+        : int(u_effect_output_size.y) - 1 - storage_pixel.y;
+    vec2 logical_output_pixel = vec2(float(storage_pixel.x), float(logical_y));
+    vec2 local_pixel = logical_output_pixel - u_effect_input_domain.xy;
     vec2 local_uv = (local_pixel + vec2(0.5)) / u_effect_input_domain.zw;
     vec2 sample_uv = typhon_effect_sample_uv(local_uv);
     vec2 offset = u_effect_texel_size * u_effect_blur_radius;
@@ -438,12 +443,14 @@ precision highp float;
 uniform sampler2D u_effect_input;
 uniform vec2 u_effect_texel_size;
 uniform float u_effect_blur_radius;
+uniform vec2 u_effect_output_size;
 uniform mat4 u_effect_color_matrix;
 uniform vec4 u_effect_color_bias;
 uniform vec4 u_effect_tint_color;
 uniform float u_effect_tint_amount;
 uniform float u_effect_noise_amount;
 uniform int u_effect_input_flip_y;
+uniform highp int u_effect_target_flip_y;
 in vec2 v_uv;
 out vec4 out_color;
 
@@ -459,14 +466,28 @@ vec4 typhon_sanitize_premultiplied(vec4 value) {
     return vec4(clamp(value.rgb, vec3(0.0), vec3(alpha)), alpha);
 }
 
+vec4 typhon_virtual_rgba16f_boundary(vec4 value) {
+    return vec4(
+        unpackHalf2x16(packHalf2x16(value.rg)),
+        unpackHalf2x16(packHalf2x16(value.ba))
+    );
+}
+
 void main() {
-    vec2 sample_uv = typhon_effect_sample_uv(v_uv);
+    ivec2 storage_pixel = ivec2(floor(gl_FragCoord.xy));
+    int logical_y = u_effect_target_flip_y != 0
+        ? storage_pixel.y
+        : int(u_effect_output_size.y) - 1 - storage_pixel.y;
+    vec2 local_pixel = vec2(float(storage_pixel.x), float(logical_y));
+    vec2 local_uv = (local_pixel + vec2(0.5)) / u_effect_output_size;
+    vec2 sample_uv = typhon_effect_sample_uv(local_uv);
     vec2 offset = u_effect_texel_size * u_effect_blur_radius;
     vec4 result = texture(u_effect_input, sample_uv) * 0.40;
     result += texture(u_effect_input, sample_uv + vec2(offset.x, 0.0)) * 0.15;
     result += texture(u_effect_input, sample_uv - vec2(offset.x, 0.0)) * 0.15;
     result += texture(u_effect_input, sample_uv + vec2(0.0, offset.y)) * 0.15;
     result += texture(u_effect_input, sample_uv - vec2(0.0, offset.y)) * 0.15;
+    result = typhon_virtual_rgba16f_boundary(result);
     result = u_effect_color_matrix * result + u_effect_color_bias;
     result.rgb = mix(result.rgb, result.rgb * u_effect_tint_color.rgb, clamp(u_effect_tint_amount, 0.0, 1.0));
     float noise = fract(sin(dot(v_uv, vec2(12.9898, 78.233))) * 43758.5453) - 0.5;
@@ -484,6 +505,7 @@ uniform float u_effect_blur_radius;
 uniform vec2 u_effect_output_size;
 uniform vec4 u_effect_input_domain;
 uniform int u_effect_input_flip_y;
+uniform highp int u_effect_target_flip_y;
 uniform mat4 u_effect_color_matrix;
 uniform vec4 u_effect_color_bias;
 uniform vec4 u_effect_tint_color;
@@ -504,21 +526,39 @@ vec4 typhon_sanitize_premultiplied(vec4 value) {
     return vec4(clamp(value.rgb, vec3(0.0), vec3(alpha)), alpha);
 }
 
+vec4 typhon_virtual_rgba16f_boundary(vec4 value) {
+    return vec4(
+        unpackHalf2x16(packHalf2x16(value.rg)),
+        unpackHalf2x16(packHalf2x16(value.ba))
+    );
+}
+
 void main() {
     vec2 output_position = v_uv * u_effect_output_size;
     vec2 local_pixel = floor(output_position - u_effect_input_domain.xy);
     vec2 local_uv = (local_pixel + vec2(0.5)) / u_effect_input_domain.zw;
-    vec2 sample_uv = typhon_effect_sample_uv(local_uv);
+    ivec2 storage_pixel = ivec2(floor(gl_FragCoord.xy));
+    int logical_y = u_effect_target_flip_y != 0
+        ? storage_pixel.y
+        : int(u_effect_output_size.y) - 1 - storage_pixel.y;
+    vec2 logical_output_pixel = vec2(float(storage_pixel.x), float(logical_y));
+    vec2 canonical_local_pixel = logical_output_pixel - u_effect_input_domain.xy;
+    vec2 canonical_uv =
+        (canonical_local_pixel + vec2(0.5)) / u_effect_input_domain.zw;
+    vec2 sample_uv = typhon_effect_sample_uv(canonical_uv);
     vec2 offset = u_effect_texel_size * u_effect_blur_radius;
     vec4 result = texture(u_effect_input, sample_uv) * 0.40;
     result += texture(u_effect_input, sample_uv + vec2(offset.x, 0.0)) * 0.15;
     result += texture(u_effect_input, sample_uv - vec2(offset.x, 0.0)) * 0.15;
     result += texture(u_effect_input, sample_uv + vec2(0.0, offset.y)) * 0.15;
     result += texture(u_effect_input, sample_uv - vec2(0.0, offset.y)) * 0.15;
+    result = typhon_virtual_rgba16f_boundary(result);
     result = u_effect_color_matrix * result + u_effect_color_bias;
     result.rgb = mix(result.rgb, result.rgb * u_effect_tint_color.rgb, clamp(u_effect_tint_amount, 0.0, 1.0));
     float noise = fract(sin(dot(local_uv, vec2(12.9898, 78.233))) * 43758.5453) - 0.5;
     result.rgb += noise * u_effect_noise_amount;
+    result = typhon_sanitize_premultiplied(result);
+    result = typhon_virtual_rgba16f_boundary(result);
     out_color = typhon_sanitize_premultiplied(result);
 }
 "#;
@@ -593,6 +633,12 @@ vec4 typhon_sanitize_premultiplied(vec4 value) {
     float alpha = clamp(value.a, 0.0, 1.0);
     return vec4(clamp(value.rgb, vec3(0.0), vec3(alpha)), alpha);
 }
+vec4 typhon_virtual_rgba16f_boundary(vec4 value) {
+    return vec4(
+        unpackHalf2x16(packHalf2x16(value.rg)),
+        unpackHalf2x16(packHalf2x16(value.ba))
+    );
+}
 vec4 typhon_encode_premultiplied_srgb(vec4 value) {
     value = typhon_sanitize_premultiplied(value);
     if (value.a <= 0.00001) return vec4(0.0);
@@ -645,6 +691,7 @@ void main() {
     float noise = fract(sin(dot(v_legacy_noise_uv, vec2(12.9898, 78.233))) * 43758.5453) - 0.5;
     result.rgb += noise * u_effect_noise_amount;
     result = typhon_sanitize_premultiplied(result);
+    result = typhon_virtual_rgba16f_boundary(result);
     if (u_effect_encode_srgb != 0) result = typhon_encode_premultiplied_srgb(result);
     if (u_effect_force_opaque != 0) result.a = 1.0;
     result *= clamp(u_presentation_opacity, 0.0, 1.0);
@@ -652,6 +699,142 @@ void main() {
     out_color = typhon_sanitize_premultiplied(result);
 }
 "#;
+
+#[cfg(test)]
+const DIAGNOSTIC_VIRTUAL_RGBA16F_BOUNDARY: &str = r#"vec4 typhon_virtual_rgba16f_boundary(vec4 value) {
+    return vec4(
+        unpackHalf2x16(packHalf2x16(value.rg)),
+        unpackHalf2x16(packHalf2x16(value.ba))
+    );
+}"#;
+
+#[cfg(test)]
+fn replace_diagnostic_shader_once(source: &mut String, before: &str, after: &str) {
+    assert_eq!(
+        source.matches(before).count(),
+        1,
+        "diagnostic shader anchor must be unique"
+    );
+    *source = source.replacen(before, after, 1);
+}
+
+#[cfg(test)]
+pub(crate) fn diagnostic_kawase_only_shader(q1: bool, encode_blue_bits: bool) -> String {
+    diagnostic_kawase_only_channel_bits_shader(q1, encode_blue_bits.then_some("b"))
+}
+
+#[cfg(test)]
+pub(crate) fn diagnostic_kawase_only_channel_bits_shader(
+    q1: bool,
+    encode_channel: Option<&str>,
+) -> String {
+    let mut source = DIAGNOSTIC_KAWASE_ONLY_FRAGMENT_SHADER.to_owned();
+    if q1 {
+        let main = format!("{DIAGNOSTIC_VIRTUAL_RGBA16F_BOUNDARY}\n\nvoid main() {{");
+        replace_diagnostic_shader_once(&mut source, "void main() {", &main);
+        replace_diagnostic_shader_once(
+            &mut source,
+            "    result += texture(u_effect_input, sample_uv - vec2(0.0, offset.y)) * 0.15;\n    out_color = result;",
+            "    result += texture(u_effect_input, sample_uv - vec2(0.0, offset.y)) * 0.15;\n    result = typhon_virtual_rgba16f_boundary(result);\n    out_color = result;",
+        );
+    }
+    if let Some(channel) = encode_channel {
+        let encode_statement = diagnostic_float_bits_output(channel);
+        replace_diagnostic_shader_once(&mut source, "    out_color = result;", &encode_statement);
+    }
+    source
+}
+
+#[cfg(test)]
+fn diagnostic_float_bits_output(channel: &str) -> String {
+    assert!(matches!(channel, "r" | "g" | "b" | "a"));
+    format!(
+        "    uint bits = floatBitsToUint(result.{channel});\n    out_color = vec4(\n        float((bits >> 0u) & 255u),\n        float((bits >> 8u) & 255u),\n        float((bits >> 16u) & 255u),\n        float((bits >> 24u) & 255u)\n    ) / 255.0;"
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn diagnostic_legacy_up2_canonical_shader() -> String {
+    let mut source = DIAGNOSTIC_KAWASE_ONLY_FRAGMENT_SHADER.to_owned();
+    replace_diagnostic_shader_once(
+        &mut source,
+        "    vec2 logical_output_pixel = vec2(float(storage_pixel.x), float(logical_y));\n    vec2 local_pixel = logical_output_pixel - u_effect_input_domain.xy;\n    vec2 local_uv = (local_pixel + vec2(0.5)) / u_effect_input_domain.zw;",
+        "    vec2 local_pixel = vec2(float(storage_pixel.x), float(logical_y));\n    vec2 local_uv = (local_pixel + vec2(0.5)) / u_effect_output_size;",
+    );
+    source
+}
+
+#[cfg(test)]
+pub(crate) fn diagnostic_fragment_stage_q2_shader() -> String {
+    let mut source = FRAGMENT_STAGE_FRAGMENT_SHADER.to_owned();
+    let main = format!("{DIAGNOSTIC_VIRTUAL_RGBA16F_BOUNDARY}\n\nvoid main() {{");
+    replace_diagnostic_shader_once(&mut source, "void main() {", &main);
+    replace_diagnostic_shader_once(
+        &mut source,
+        "    result = typhon_sanitize_premultiplied(result);\n    if (u_effect_encode_srgb != 0)",
+        "    result = typhon_sanitize_premultiplied(result);\n    result = typhon_virtual_rgba16f_boundary(result);\n    if (u_effect_encode_srgb != 0)",
+    );
+    source
+}
+
+#[cfg(test)]
+pub(crate) fn diagnostic_fragment_stage_boundary_probe_shader(q2: bool, channel: &str) -> String {
+    let mut source = FRAGMENT_STAGE_FRAGMENT_SHADER.to_owned();
+    if q2 {
+        let main = format!("{DIAGNOSTIC_VIRTUAL_RGBA16F_BOUNDARY}\n\nvoid main() {{");
+        replace_diagnostic_shader_once(&mut source, "void main() {", &main);
+        replace_diagnostic_shader_once(
+            &mut source,
+            "    result = typhon_sanitize_premultiplied(result);\n    if (u_effect_encode_srgb != 0)",
+            "    result = typhon_sanitize_premultiplied(result);\n    result = typhon_virtual_rgba16f_boundary(result);\n    if (u_effect_encode_srgb != 0)",
+        );
+    }
+    replace_diagnostic_shader_once(
+        &mut source,
+        "    if (u_effect_encode_srgb != 0) result = typhon_encode_premultiplied_srgb(result);\n    out_color = typhon_sanitize_premultiplied(result);",
+        &diagnostic_float_bits_output(channel),
+    );
+    source
+}
+
+#[cfg(test)]
+pub(crate) fn diagnostic_terminal_shader_with_virtual_boundaries(q1: bool, q2: bool) -> String {
+    let mut source = TERMINAL_KAWASE_COMPOSITE_FRAGMENT_SHADER.to_owned();
+    replace_diagnostic_shader_once(
+        &mut source,
+        "uniform vec2 u_effect_output_size;",
+        "uniform vec2 u_effect_output_size;\nuniform highp int u_effect_target_flip_y;",
+    );
+    replace_diagnostic_shader_once(
+        &mut source,
+        "    vec2 effect_local_pixel = floor(output_position - u_effect_input_domain.xy);\n    vec2 effect_local_uv =\n        (effect_local_pixel + vec2(0.5)) / u_effect_input_domain.zw;",
+        "    vec2 effect_local_pixel = floor(output_position - u_effect_input_domain.xy);\n    vec2 effect_local_uv =\n        (effect_local_pixel + vec2(0.5)) / u_effect_input_domain.zw;\n\n    ivec2 storage_pixel = ivec2(floor(gl_FragCoord.xy));\n    int logical_y = u_effect_target_flip_y != 0\n        ? storage_pixel.y\n        : int(u_effect_output_size.y) - 1 - storage_pixel.y;\n    vec2 logical_output_pixel = vec2(float(storage_pixel.x), float(logical_y));\n    vec2 canonical_local_pixel = logical_output_pixel - u_effect_input_domain.xy;\n    vec2 canonical_effect_local_uv =\n        (canonical_local_pixel + vec2(0.5)) / u_effect_input_domain.zw;",
+    );
+    replace_diagnostic_shader_once(
+        &mut source,
+        "vec2 sample_uv = typhon_effect_sample_uv(effect_local_uv);",
+        "vec2 sample_uv = typhon_effect_sample_uv(canonical_effect_local_uv);",
+    );
+    if q1 || q2 {
+        let main = format!("{DIAGNOSTIC_VIRTUAL_RGBA16F_BOUNDARY}\n\nvoid main() {{");
+        replace_diagnostic_shader_once(&mut source, "void main() {", &main);
+    }
+    if q1 {
+        replace_diagnostic_shader_once(
+            &mut source,
+            "    result = u_effect_color_matrix * result + u_effect_color_bias;",
+            "    result = typhon_virtual_rgba16f_boundary(result);\n    result = u_effect_color_matrix * result + u_effect_color_bias;",
+        );
+    }
+    if q2 {
+        replace_diagnostic_shader_once(
+            &mut source,
+            "    result = typhon_sanitize_premultiplied(result);\n    if (u_effect_encode_srgb != 0)",
+            "    result = typhon_sanitize_premultiplied(result);\n    result = typhon_virtual_rgba16f_boundary(result);\n    if (u_effect_encode_srgb != 0)",
+        );
+    }
+    source
+}
 
 pub(crate) const MASK_STAGE_FRAGMENT_SHADER: &str = r#"#version 300 es
 precision highp float;

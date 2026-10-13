@@ -119,7 +119,10 @@ pub(crate) use shaders::{
 pub(crate) use shaders::{
     DIAGNOSTIC_KAWASE_ONLY_FRAGMENT_SHADER, DIAGNOSTIC_LEGACY_UP2_FRAGMENT_SHADER,
     DIAGNOSTIC_MATERIAL_COMPOSITE_FRAGMENT_SHADER, DIAGNOSTIC_MATERIAL_COMPOSITE_VERTEX_SHADER,
-    DIAGNOSTIC_TERMINAL_UP2_FRAGMENT_STAGE_SHADER,
+    DIAGNOSTIC_TERMINAL_UP2_FRAGMENT_STAGE_SHADER, diagnostic_fragment_stage_boundary_probe_shader,
+    diagnostic_fragment_stage_q2_shader, diagnostic_kawase_only_channel_bits_shader,
+    diagnostic_kawase_only_shader, diagnostic_legacy_up2_canonical_shader,
+    diagnostic_terminal_shader_with_virtual_boundaries,
 };
 
 #[cfg(test)]
