@@ -334,7 +334,7 @@ fn workspace_slide_blur_reads_back_translated_lower_workspace_pixels() {
     let mut lower = lifecycle_test_surface(710, 0, 0, 320, 200, 0xffee_1010, &mut buffer_ids);
     let lower_pixels = (0..320 * 200)
         .map(|pixel| {
-            if pixel % 320 < 160 {
+            if pixel % 320 < 280 {
                 0xffee_1010
             } else {
                 0xff10_10ee
@@ -347,6 +347,8 @@ fn workspace_slide_blur_reads_back_translated_lower_workspace_pixels() {
         lower_pixels,
     );
     let upper = lifecycle_test_surface(711, 0, 70, 120, 60, 0x4000_0000, &mut buffer_ids);
+    let canonical_origins =
+        oblivion_one::compositor::surface_origins(&[lower.clone(), upper.clone()]);
     let lower_window = oblivion_one::compositor::WindowId::from_raw(1).expect("lower window");
     let upper_window = oblivion_one::compositor::WindowId::from_raw(2).expect("upper window");
     let socket_name = format!("typhon-workspace-slide-backdrop-egl-{}", std::process::id());
@@ -378,23 +380,29 @@ fn workspace_slide_blur_reads_back_translated_lower_workspace_pixels() {
         .expect("enable WorkspaceSlide");
     server.activate_workspace(target_workspace);
     assert!(server.workspace_presentation_active());
-    std::thread::sleep(std::time::Duration::from_millis(50));
+    std::thread::sleep(std::time::Duration::from_millis(200));
 
     let sampled_at = AnimationTime::monotonic_now().expect("monotonic frame time");
     let mut resolved =
         crate::native_output::ResolvedNativeFrameScene::from_server_at(&server, sampled_at);
-    let lower_frame = resolved
+    let lower_index = resolved
         .surfaces
         .iter()
-        .find(|surface| surface.surface_id == lower.surface_id)
+        .position(|surface| surface.surface_id == lower.surface_id)
         .expect("translated lower workspace surface");
-    let upper_frame = resolved
+    let upper_index = resolved
         .surfaces
         .iter()
-        .find(|surface| surface.surface_id == upper.surface_id)
+        .position(|surface| surface.surface_id == upper.surface_id)
         .expect("translated translucent window");
-    assert_ne!(lower_frame.x, lower.x);
-    assert_eq!(lower_frame.x, upper_frame.x);
+    let frame_origins = oblivion_one::compositor::surface_origins(&resolved.surfaces);
+    let (lower_x, _lower_y) = frame_origins[lower_index];
+    let (upper_x, upper_y) = frame_origins[upper_index];
+    let lower_translation_x = lower_x - canonical_origins[0].0;
+    let upper_translation_x = upper_x - canonical_origins[1].0;
+    let upper_width = resolved.surfaces[upper_index].width;
+    let upper_height = resolved.surfaces[upper_index].height;
+    assert_ne!(lower_translation_x, 0);
     let participant = resolved
         .workspace_presentation_sample
         .as_ref()
@@ -403,13 +411,16 @@ fn workspace_slide_blur_reads_back_translated_lower_workspace_pixels() {
         .iter()
         .find(|participant| participant.workspace == target_workspace)
         .expect("target workspace participates in this frame");
+    let expected_translation_x = participant.translation_x.round() as i32;
+    assert_eq!(lower_translation_x, expected_translation_x);
+    assert_eq!(upper_translation_x, expected_translation_x);
     let clip = participant.logical_cell_clip;
-    let left = upper_frame.x.max(clip.x.floor() as i32).max(0);
-    let top = upper_frame.y.max(clip.y.floor() as i32).max(0);
-    let right = (upper_frame.x + upper_frame.width as i32)
+    let left = upper_x.max(clip.x.floor() as i32).max(0);
+    let top = upper_y.max(clip.y.floor() as i32).max(0);
+    let right = (upper_x + upper_width as i32)
         .min((clip.x + clip.width).ceil() as i32)
         .min(320);
-    let bottom = (upper_frame.y + upper_frame.height as i32)
+    let bottom = (upper_y + upper_height as i32)
         .min((clip.y + clip.height).ceil() as i32)
         .min(200);
     assert!(
@@ -418,8 +429,8 @@ fn workspace_slide_blur_reads_back_translated_lower_workspace_pixels() {
     );
 
     let blur_bounds = EffectRect::new(
-        u32::try_from(left).expect("visible blur x"),
-        u32::try_from(top).expect("visible blur y"),
+        i32::try_from(left).expect("visible blur x"),
+        i32::try_from(top).expect("visible blur y"),
         u32::try_from(right - left).expect("visible blur width"),
         u32::try_from(bottom - top).expect("visible blur height"),
     )
@@ -465,7 +476,7 @@ fn workspace_slide_blur_reads_back_translated_lower_workspace_pixels() {
 
     harness.renderer.bind_active_output_framebuffer();
     let output_pixels = read_effect_test_pixels(&harness.gl, 320, 200);
-    let probe_x = left + (right - left) / 2;
+    let probe_x = left + 16;
     let probe_y = top + (bottom - top) / 2;
     let blurred_pixel = effect_test_pixel(
         &output_pixels,
@@ -476,7 +487,7 @@ fn workspace_slide_blur_reads_back_translated_lower_workspace_pixels() {
     assert!(
         blurred_pixel[0] > 60 && blurred_pixel[2] < 100,
         "translucent window at translated x={} must blur the translated red lower workspace pixel, got {blurred_pixel:?}",
-        upper_frame.x,
+        upper_x,
     );
 }
 

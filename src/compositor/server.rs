@@ -1804,7 +1804,6 @@ impl OwnCompositorServer {
         self.state.activate_workspace(workspace)
     }
 
-    #[cfg(test)]
     pub fn set_test_window_workspace(
         &mut self,
         window_id: crate::compositor::WindowId,
