@@ -1384,6 +1384,207 @@ fn activating_associationless_iconic_x11_window_requests_remap_and_cancels_on_re
 }
 
 #[test]
+fn deferred_xwayland_restore_clears_hidden_before_mapping() {
+    let mut fixture = stationary_pointer_xwayland_fixture();
+    let mut snapshot = fake_snapshot();
+    snapshot.surface_id = fixture.parent_surface_id;
+    snapshot.state.maximized = true;
+    let handle = snapshot.handle;
+    fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::WindowReady(snapshot));
+    let window_id = fixture
+        .server
+        .state
+        .window_id_for_x11_handle(handle)
+        .unwrap();
+    fixture
+        .server
+        .set_lifecycle_animation_renderer_available(false);
+    assert!(fixture.server.state.minimize_desktop_window(window_id));
+    let _ = fixture.server.take_xwayland_backend_commands(0);
+
+    assert!(
+        fixture
+            .server
+            .state
+            .restore_minimized_desktop_window(window_id)
+    );
+    assert!(
+        fixture
+            .server
+            .state
+            .window(window_id)
+            .unwrap()
+            .state
+            .is_minimized()
+    );
+    assert!(
+        fixture
+            .server
+            .state
+            .pending_xwayland_restores
+            .contains_key(&window_id)
+    );
+    let commands = fixture.server.take_xwayland_backend_commands(1);
+    let visible_state = commands
+        .iter()
+        .position(|command| {
+            matches!(
+                command, XwmCommand::SetState { window, state }
+                    if *window == handle && !state.hidden && state.maximized && !state.activated
+            )
+        })
+        .expect("deferred restore must tell the client it is visible before waiting for content");
+    let map = commands
+        .iter()
+        .position(|command| {
+            matches!(
+                command, XwmCommand::Map(window) if *window == handle
+            )
+        })
+        .expect("restore must remap the X11 window");
+    assert!(visible_state < map, "visible state must precede Map");
+
+    fixture.server.state.queue_backend_state(window_id);
+    assert!(
+        fixture
+            .server
+            .state
+            .restore_minimized_desktop_window(window_id)
+    );
+    let repeated = fixture.server.take_xwayland_backend_commands(2);
+    assert!(
+        repeated.iter().any(|command| matches!(
+            command, XwmCommand::SetState { window, state } if *window == handle && !state.hidden
+        )),
+        "state refresh must not re-hide a client whose restore is pending"
+    );
+    assert!(
+        repeated.iter().all(|command| !matches!(
+            command, XwmCommand::Map(window) if *window == handle
+        )),
+        "repeated restore must not start another map epoch"
+    );
+}
+
+#[test]
+fn dock_activation_waits_for_xwayland_content_with_a_live_surface() {
+    let mut fixture = stationary_pointer_xwayland_fixture();
+    let (window_id, handle, source) =
+        prepare_pending_xwayland_restore(&mut fixture, fake_snapshot().geometry);
+    let _ = fixture.server.take_xwayland_backend_commands(0);
+    assert!(
+        fixture
+            .server
+            .state
+            .surface_resource_by_id(fixture.popup_surface_id)
+            .is_some()
+    );
+
+    for attempt in 0..3 {
+        assert_eq!(
+            fixture
+                .server
+                .state
+                .activate_desktop_window_action(window_id),
+            crate::compositor::state::WindowActionOutcome::Changed,
+            "dock activation must retain intent while the live surface lacks matching content"
+        );
+        assert!(fixture.server.state.pending_x11_activation.is_some());
+        assert_eq!(fixture.server.state.focused_window_id, None);
+        assert!(
+            fixture
+                .server
+                .state
+                .window(window_id)
+                .unwrap()
+                .state
+                .is_minimized()
+        );
+        let commands = fixture.server.take_xwayland_backend_commands(attempt + 1);
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| matches!(
+                    command, XwmCommand::Map(window) if *window == handle
+                ))
+                .count(),
+            0,
+            "repeated activations must not start another map epoch"
+        );
+        assert!(
+            commands.iter().all(|command| !matches!(
+                command, XwmCommand::Focus { window: Some(window), .. } if *window == handle
+            )),
+            "focus must wait for valid content"
+        );
+    }
+
+    assert!(fixture.server.state.pending_x11_activation.is_some());
+    assert!(
+        fixture
+            .server
+            .state
+            .pending_xwayland_restores
+            .contains_key(&window_id)
+    );
+    commit_replacement_xwayland_content(&mut fixture, &source, 640, 480, 0, 0);
+    assert!(
+        fixture
+            .server
+            .state
+            .window(window_id)
+            .unwrap()
+            .state
+            .is_minimized()
+    );
+    assert_eq!(fixture.server.state.focused_window_id, None);
+    commit_replacement_xwayland_content(&mut fixture, &source, 800, 600, 0, 0);
+    assert!(fixture.server.state.pending_x11_activation.is_none());
+    assert!(
+        !fixture
+            .server
+            .state
+            .pending_xwayland_restores
+            .contains_key(&window_id)
+    );
+    assert!(
+        !fixture
+            .server
+            .state
+            .window(window_id)
+            .unwrap()
+            .state
+            .is_minimized()
+    );
+    assert_eq!(
+        fixture.server.state.window_id_for_x11_handle(handle),
+        Some(window_id)
+    );
+    assert_eq!(fixture.server.state.focused_window_id, Some(window_id));
+    let commands = fixture.server.take_xwayland_backend_commands(5);
+    assert_eq!(
+        commands
+            .iter()
+            .filter(|command| matches!(
+                command, XwmCommand::Focus { window: Some(window), .. } if *window == handle
+            ))
+            .count(),
+        1,
+        "completion must focus the restored window once"
+    );
+    assert_eq!(
+        fixture
+            .server
+            .state
+            .activate_desktop_window_action(window_id),
+        crate::compositor::state::WindowActionOutcome::NoChange
+    );
+    assert!(fixture.server.take_xwayland_backend_commands(6).is_empty());
+}
+
+#[test]
 fn pending_x11_activation_completes_on_the_same_window_replacement_surface() {
     let mut fixture = stationary_pointer_xwayland_fixture();
     let mut snapshot = fake_snapshot();

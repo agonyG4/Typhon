@@ -1962,7 +1962,8 @@ impl CompositorState {
                 crate::compositor::window_backend::WindowBackendCommand::PublishState {
                     window: window_id,
                     mode: window.state.mode(),
-                    minimized: window.state.is_minimized(),
+                    minimized: window.state.is_minimized()
+                        && !self.pending_xwayland_restores.contains_key(&window_id),
                     activated: self.focused_window_id == Some(window_id),
                 },
             );

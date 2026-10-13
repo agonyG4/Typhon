@@ -416,6 +416,17 @@ impl CompositorState {
         if was_minimized && !self.restore_minimized_desktop_window_contents(window_id, None) {
             return WindowActivationOutcome::Unavailable;
         }
+        if was_minimized
+            && self
+                .window(window_id)
+                .is_some_and(|window| window.state.is_minimized())
+        {
+            if let WindowBackend::X11(handle) = backend {
+                self.pending_x11_activation = Some(PendingX11Activation { window_id, handle });
+                return WindowActivationOutcome::Changed;
+            }
+            return WindowActivationOutcome::Unavailable;
+        }
         let root_surface_id = self
             .window(window_id)
             .map(|window| window.root_surface_id)
@@ -2214,11 +2225,21 @@ impl CompositorState {
     }
 
     fn queue_x11_mapping_transition(&mut self, window_id: WindowId, mapped: bool) {
-        if !self
-            .window(window_id)
-            .is_some_and(|window| matches!(window.backend, WindowBackend::X11(_)))
-        {
+        let Some(window) = self.window(window_id) else {
             return;
+        };
+        let WindowBackend::X11(_) = window.backend else {
+            return;
+        };
+        if mapped {
+            self.backend_commands.push(
+                crate::compositor::window_backend::WindowBackendCommand::PublishState {
+                    window: window_id,
+                    mode: window.state.mode(),
+                    minimized: false,
+                    activated: self.focused_window_id == Some(window_id),
+                },
+            );
         }
         self.backend_commands.push(
             crate::compositor::window_backend::WindowBackendCommand::SetMapped {
