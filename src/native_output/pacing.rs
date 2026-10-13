@@ -4009,8 +4009,12 @@ impl NativeFramePacing {
             || self.active_physical_identity != Some(expected_identity)
             || self.active_physical_key != Some(expected_key)
             || self.ready_worker_reservation_id == Some(reservation_id)
+            || self.ready.is_some()
+            || self.ready_physical_identity.is_some()
+            || self.ready_physical_key.is_some()
+            || self.ready_worker_reservation_id.is_some()
         {
-            return Err("ACTIVE pacing owner does not match re-plan ticket");
+            return Err("ACTIVE pacing owner or READY destination does not match re-plan ticket");
         }
         Ok(())
     }
