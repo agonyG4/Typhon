@@ -1745,15 +1745,44 @@ impl CompositorState {
                     local_y: interaction.start_placement.local_y + dy,
                     ..interaction.start_placement
                 };
-                let moved = self.set_surface_placement_with_cause(
-                    interaction.root_surface_id,
+                let geometry = WindowGeometry::new(
                     placement,
-                    RenderGenerationCause::WindowMove,
+                    interaction.start_width,
+                    interaction.start_height,
                 );
-                if moved
-                    && !interaction.first_move_geometry_logged
-                    && compositor_debug_surface_logging_enabled()
-                {
+                let compositor_managed_x11 =
+                    self.window(interaction.window_id).is_some_and(|window| {
+                        matches!(window.backend, WindowBackend::X11(_))
+                            && window.kind == DesktopWindowKind::Managed
+                            && window.is_normal_x11_role()
+                            && window.x11_placement_policy
+                                == Some(X11PlacementPolicy::CompositorManaged)
+                    });
+                let first_move_trace = !interaction.first_move_geometry_logged
+                    && compositor_debug_surface_logging_enabled();
+                let render_placement_before = first_move_trace
+                    .then(|| {
+                        self.renderable_surfaces
+                            .iter()
+                            .find(|surface| surface.surface_id == interaction.root_surface_id)
+                            .and_then(|surface| surface.render_placement)
+                    })
+                    .flatten();
+                let moved = if compositor_managed_x11 {
+                    self.set_x11_frame_geometry_and_surface_placement_with_cause(
+                        interaction.window_id,
+                        geometry,
+                        X11GeometryAuthoritySource::InteractiveMove,
+                        RenderGenerationCause::WindowMove,
+                    )
+                } else {
+                    self.set_surface_placement_with_cause(
+                        interaction.root_surface_id,
+                        placement,
+                        RenderGenerationCause::WindowMove,
+                    )
+                };
+                if moved && first_move_trace {
                     let committed_xdg_window_geometry = self
                         .effective_xdg_window_geometry(interaction.root_surface_id)
                         .map(|geometry| geometry.geometry);
@@ -1767,12 +1796,29 @@ impl CompositorState {
                         .iter()
                         .find(|surface| surface.surface_id == interaction.root_surface_id)
                         .map(|surface| surface.render_placement.unwrap_or(surface.placement));
+                    let render_placement_after = self
+                        .renderable_surfaces
+                        .iter()
+                        .find(|surface| surface.surface_id == interaction.root_surface_id)
+                        .map(|surface| surface.render_placement);
+                    let x11_materialized_client_rect = self
+                        .window(interaction.window_id)
+                        .and_then(|window| window.x11_materialized_client_rect);
+                    let visual_geometry_owner_present = self
+                        .toplevel_visual_geometries
+                        .contains_key(&interaction.root_surface_id)
+                        || self
+                            .toplevel_surfaces
+                            .contains_key(&interaction.root_surface_id);
+                    let active_resize_present = self
+                        .active_toplevel_resizes
+                        .contains_key(&interaction.root_surface_id);
                     let output_origins =
                         self.interaction_debug_surface_output_origins(interaction.root_surface_id);
                     let dx = (x - interaction.start_pointer_x).round() as i32;
                     let dy = (y - interaction.start_pointer_y).round() as i32;
                     eprintln!(
-                        "oblivion-one compositor: event=window_interaction_first_move root_surface_id={} start_placement={:?} start_pointer=({}, {}) current_pointer=({}, {}) delta=({}, {}) target_canonical_placement={:?} derived_root_render_placement={:?} resolved_root_render_placement={:?} resolved_root_output_origin={:?} resolved_child_output_origin={:?}",
+                        "oblivion-one compositor: event=window_interaction_first_move root_surface_id={} start_placement={:?} start_pointer=({}, {}) current_pointer=({}, {}) delta=({}, {}) target_canonical_placement={:?} x11_materialized_client_rect={:?} derived_root_render_placement={:?} render_placement_before={:?} render_placement_after={:?} resolved_root_render_placement={:?} resolved_root_output_origin={:?} resolved_child_output_origin={:?} visual_geometry_owner_present={} active_resize_present={}",
                         interaction.root_surface_id,
                         interaction.start_placement,
                         interaction.start_pointer_x,
@@ -1782,10 +1828,15 @@ impl CompositorState {
                         dx,
                         dy,
                         placement,
+                        x11_materialized_client_rect,
                         derived_root_render_placement,
+                        render_placement_before,
+                        render_placement_after,
                         actual_root_render_placement,
                         output_origins.root_output_origin,
                         output_origins.first_child_output_origin,
+                        visual_geometry_owner_present,
+                        active_resize_present,
                     );
                     interaction.first_move_geometry_logged = true;
                     self.window_interaction = Some(interaction);
@@ -1795,22 +1846,16 @@ impl CompositorState {
                         .window(interaction.window_id)
                         .is_some_and(|window| matches!(window.backend, WindowBackend::X11(_)))
                 {
-                    self.set_x11_frame_geometry_from_source(
-                        interaction.window_id,
-                        WindowGeometry::new(
-                            placement,
-                            interaction.start_width,
-                            interaction.start_height,
-                        ),
-                        X11GeometryAuthoritySource::InteractiveMove,
-                    );
+                    if !compositor_managed_x11 {
+                        self.set_x11_frame_geometry_from_source(
+                            interaction.window_id,
+                            geometry,
+                            X11GeometryAuthoritySource::InteractiveMove,
+                        );
+                    }
                     self.queue_backend_configure(
                         interaction.window_id,
-                        WindowGeometry::new(
-                            placement,
-                            interaction.start_width,
-                            interaction.start_height,
-                        ),
+                        geometry,
                         self.window(interaction.window_id)
                             .map(|window| window.state.mode())
                             .unwrap_or(ToplevelMode::Normal),

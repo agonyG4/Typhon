@@ -33,6 +33,47 @@ impl CompositorState {
         placement: SurfacePlacement,
         cause: RenderGenerationCause,
     ) -> bool {
+        self.set_surface_placement_with_cause_inner(surface_id, placement, cause, false)
+    }
+
+    pub(in crate::compositor) fn set_x11_frame_geometry_and_surface_placement_with_cause(
+        &mut self,
+        window_id: WindowId,
+        geometry: WindowGeometry,
+        source: X11GeometryAuthoritySource,
+        cause: RenderGenerationCause,
+    ) -> bool {
+        let Some(root_surface_id) = self.window(window_id).map(|window| window.root_surface_id)
+        else {
+            return false;
+        };
+        if self.window_id_for_surface(root_surface_id) != Some(window_id)
+            || self.surface_placement(root_surface_id) == geometry.placement
+            || !self
+                .renderable_surfaces
+                .iter()
+                .any(|surface| surface.surface_id == root_surface_id)
+        {
+            return false;
+        }
+        if !self.set_x11_frame_geometry_from_source(window_id, geometry, source) {
+            return false;
+        }
+        self.set_surface_placement_with_cause_inner(
+            root_surface_id,
+            geometry.placement,
+            cause,
+            true,
+        )
+    }
+
+    fn set_surface_placement_with_cause_inner(
+        &mut self,
+        surface_id: u32,
+        placement: SurfacePlacement,
+        cause: RenderGenerationCause,
+        derive_x11_materialized_render_placement: bool,
+    ) -> bool {
         if self.surface_placement(surface_id) == placement {
             return false;
         }
@@ -56,6 +97,16 @@ impl CompositorState {
             if refreshed_by_visual_assignment {
                 self.update_toplevel_visual_render_assignment(root_surface_id);
             } else {
+                if derive_x11_materialized_render_placement
+                    && let Some(render_placement) =
+                        self.derive_x11_materialized_root_render_placement(root_surface_id)
+                    && let Some(root) = self
+                        .renderable_surfaces
+                        .iter_mut()
+                        .find(|surface| surface.surface_id == root_surface_id)
+                {
+                    root.render_placement = Some(render_placement);
+                }
                 self.refresh_active_scene_surface_tree(root_surface_id);
             }
             if refreshed_by_visual_assignment {

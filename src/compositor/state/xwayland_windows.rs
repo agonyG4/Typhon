@@ -2,31 +2,48 @@ use super::*;
 use crate::xwayland::trace::{self, TraceFields};
 
 impl CompositorState {
-    pub(in crate::compositor) fn apply_x11_materialized_root_render_placement(
-        &mut self,
+    pub(in crate::compositor) fn derive_x11_materialized_root_render_placement(
+        &self,
         root_surface_id: u32,
-    ) -> bool {
-        let Some(window_id) = self.window_id_for_surface(root_surface_id) else {
-            return false;
-        };
-        let Some((rect, managed)) = self.window(window_id).map(|window| {
+    ) -> Option<SurfacePlacement> {
+        let window_id = self.window_id_for_surface(root_surface_id)?;
+        let (rect, managed_toplevel) = self.window(window_id).map(|window| {
             (
                 window.x11_materialized_client_rect,
-                window.kind == DesktopWindowKind::Managed && window.is_normal_x11_role(),
+                window.kind == DesktopWindowKind::Managed
+                    && window.is_normal_x11_role()
+                    && window.x11_placement_policy == Some(X11PlacementPolicy::CompositorManaged),
             )
-        }) else {
-            return false;
-        };
-        let Some(rect) = rect.filter(|_| managed) else {
-            return false;
-        };
+        })?;
+        let rect = rect.filter(|_| managed_toplevel)?;
         if self.active_toplevel_resizes.contains_key(&root_surface_id)
             || self
                 .toplevel_visual_geometries
                 .contains_key(&root_surface_id)
         {
-            return false;
+            return None;
         }
+        let root = self
+            .renderable_surfaces
+            .iter()
+            .find(|surface| surface.surface_id == root_surface_id)
+            .map(|surface| (surface.x, surface.y))?;
+        let x = rect.x().round() as i32;
+        let y = rect.y().round() as i32;
+        Some(SurfacePlacement::absolute_root_at(
+            x.saturating_sub(root.0),
+            y.saturating_sub(root.1),
+        ))
+    }
+
+    pub(in crate::compositor) fn apply_x11_materialized_root_render_placement(
+        &mut self,
+        root_surface_id: u32,
+    ) -> bool {
+        let Some(placement) = self.derive_x11_materialized_root_render_placement(root_surface_id)
+        else {
+            return false;
+        };
         let Some(root) = self
             .renderable_surfaces
             .iter_mut()
@@ -34,12 +51,7 @@ impl CompositorState {
         else {
             return false;
         };
-        let x = rect.x().round() as i32;
-        let y = rect.y().round() as i32;
-        root.render_placement = Some(SurfacePlacement::absolute_root_at(
-            x.saturating_sub(root.x),
-            y.saturating_sub(root.y),
-        ));
+        root.render_placement = Some(placement);
         self.refresh_active_scene_surface_tree(root_surface_id);
         true
     }

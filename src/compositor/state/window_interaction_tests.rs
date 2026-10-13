@@ -2577,6 +2577,9 @@ fn absolute_x11_move_preserves_root_placement_mode() {
     ));
 }
 
+#[path = "window_interaction_xwayland_tests.rs"]
+mod xwayland_materialized_placement_tests;
+
 #[test]
 fn absolute_xdg_move_updates_scene_without_queued_backend_position_command() {
     let surface_id = 42;
