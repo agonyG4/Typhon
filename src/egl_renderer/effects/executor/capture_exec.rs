@@ -315,10 +315,11 @@ pub(super) fn execute_capture(
             .gl
             .use_program(Some(renderer.runtime.capture_program));
         if let Some(location) = renderer.capture_uniform_location("u_capture_output_size") {
+            let output_size = renderer.output_target_space.output_size();
             renderer.gl.uniform_2_f32(
                 Some(&location),
-                renderer.scene.current_size.0.max(1) as f32,
-                renderer.scene.current_size.1.max(1) as f32,
+                output_size.0.max(1) as f32,
+                output_size.1.max(1) as f32,
             );
         }
         if let Some(location) = renderer.capture_uniform_location("u_capture_domain") {
@@ -380,6 +381,7 @@ pub(super) fn execute_capture(
             &scissors,
             target_plan.domain,
             (target_plan.width, target_plan.height),
+            framebuffer_origin,
             replay_host_timing_enabled,
         )
     };

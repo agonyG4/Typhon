@@ -838,9 +838,10 @@ impl LifecycleVisualStore {
                 error,
             )
         })?;
+        let output_size = context.target_space.output_size();
         let scratch_key = EffectTextureKey::new(
-            context.scene_state.current_size.0.max(1),
-            context.scene_state.current_size.1.max(1),
+            output_size.0.max(1),
+            output_size.1.max(1),
             EffectTextureFormat::Rgba8,
             EffectTextureFilter::Linear,
             EffectWorkingSpace::OutputEncodedSrgb,
@@ -912,13 +913,10 @@ impl LifecycleVisualStore {
             let draw_result = (|| {
                 let source_damage =
                     lifecycle_visual_effect_damage(lamp.visual_group.presented_source_visual_rect);
-                let output_bounds = EffectRect::new(
-                    0,
-                    0,
-                    context.scene_state.current_size.0.max(1),
-                    context.scene_state.current_size.1.max(1),
-                )
-                .expect("non-zero renderer dimensions must form valid effect bounds");
+                let output_size = context.target_space.output_size();
+                let output_bounds =
+                    EffectRect::new(0, 0, output_size.0.max(1), output_size.1.max(1))
+                        .expect("non-zero renderer dimensions must form valid effect bounds");
                 let plan = compile_frame_execution_plan(
                     &source.effect_scene,
                     &source_damage,
@@ -1330,7 +1328,7 @@ fn copy_framebuffer_region_to_texture(
     restore_target: EffectFramebufferTarget,
 ) -> RendererResult<()> {
     let Some(plan) = lifecycle_output_copy_region(
-        context.scene_state.current_size,
+        context.target_space.output_size(),
         rect,
         (target.key.width, target.key.height),
         f64::from(context.effect_runtime.effect_output_scale),

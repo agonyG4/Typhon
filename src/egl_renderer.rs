@@ -392,7 +392,17 @@ impl GlesSceneRenderer {
             ..
         } = self;
         let texture_sources = lifecycle.texture_sources(resources.texture_view());
-        EffectExecutionContext::new(gl, scene_state, effect_runtime, texture_sources)
+        let output_target_space = lifecycle::LifecycleRenderTargetSpace::output(
+            scene_state.current_size,
+            scene_state.current_framebuffer_origin,
+        );
+        EffectExecutionContext::new(
+            gl,
+            scene_state,
+            effect_runtime,
+            texture_sources,
+            output_target_space,
+        )
     }
 
     #[cfg(test)]
@@ -415,6 +425,10 @@ impl GlesSceneRenderer {
             effect_runtime,
             resources,
         } = self;
+        let output_target_space = lifecycle::LifecycleRenderTargetSpace::output(
+            scene_state.current_size,
+            framebuffer_origin,
+        );
         frame::FramePipeline::new(
             gl,
             cursor_image,
@@ -422,6 +436,7 @@ impl GlesSceneRenderer {
             lifecycle,
             effect_runtime,
             resources,
+            output_target_space,
         )
         .execute_effect_graph_with_overlays_config(
             graph,
@@ -794,6 +809,10 @@ impl GlesSceneRenderer {
             effect_runtime,
             resources,
         } = self;
+        let output_target_space = lifecycle::LifecycleRenderTargetSpace::output(
+            (request.width, request.height),
+            framebuffer_origin,
+        );
         frame::FramePipeline::new(
             gl,
             cursor_image,
@@ -801,6 +820,7 @@ impl GlesSceneRenderer {
             lifecycle,
             effect_runtime,
             resources,
+            output_target_space,
         )
         .render(egl, egl_display, request, buffer_age, framebuffer_origin)
     }

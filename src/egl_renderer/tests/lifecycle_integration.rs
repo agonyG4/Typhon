@@ -2683,11 +2683,16 @@ fn assert_lifecycle_resolved_visual_isolation_for_origin(
     let lamp = harness.renderer.lifecycle.samples()[0];
     {
         let renderer = &mut harness.renderer;
+        let target_space = crate::egl_renderer::lifecycle::LifecycleRenderTargetSpace::output(
+            renderer.scene_state.current_size,
+            framebuffer_origin,
+        );
         let mut context = LifecycleRenderContext::new(
             &harness.gl,
             &mut renderer.scene_state,
             &mut renderer.effect_runtime,
             renderer.resources.texture_view(),
+            target_space,
         );
         renderer
             .lifecycle
@@ -3284,6 +3289,357 @@ fn egl_decoration_commands_emit_titlebar_and_button_primitives() {
                 .iter()
                 .any(|command| matches!(command.layer, EglDrawLayer::DecorationAsset(_)))
         );
+    }
+}
+
+#[test]
+fn lifecycle_replay_capture_matches_full_output_crop_for_translated_domain() {
+    assert_lifecycle_replay_capture_matches_full_output_crop(LifecycleEffectKind::Lamp);
+}
+
+#[test]
+fn squash_replay_capture_matches_full_output_crop_for_translated_domain() {
+    assert_lifecycle_replay_capture_matches_full_output_crop(LifecycleEffectKind::Squash);
+}
+
+fn assert_lifecycle_replay_capture_matches_full_output_crop(effect: LifecycleEffectKind) {
+    let mode = std::env::var("TYPHON_SCENE_EXECUTION_MODE").unwrap_or_else(|_| "auto".into());
+    assert!(
+        matches!(mode.as_str(), "auto" | "region" | "legacy"),
+        "TYPHON_SCENE_EXECUTION_MODE must be auto, region, or legacy"
+    );
+
+    const OUTPUT_SIZE: (u32, u32) = (320, 200);
+    // Separate RGBA8 renders can differ by a few channel values from interpolation rounding.
+    const PIXEL_TOLERANCE: u8 = 3;
+    let capture_domain = EffectRect::new(73, 41, 131, 89).expect("translated capture domain");
+
+    let mut harness = GlesEffectTestHarness::new(OUTPUT_SIZE.0, OUTPUT_SIZE.1);
+    harness.install_texture_backed_output();
+
+    let mut buffer_ids = BufferIdAllocator::default();
+    let lower = lifecycle_test_surface(640, 0, 0, 320, 200, 0xff20_2010, &mut buffer_ids);
+    let retained = lifecycle_test_surface_with_row_colors(
+        641,
+        60,
+        40,
+        180,
+        110,
+        [0xffee_2211, 0xff12_ea14, 0xff12_22ee],
+        &mut buffer_ids,
+    );
+    let upper = lifecycle_test_surface(642, 170, 100, 30, 20, 0xffdd_22cc, &mut buffer_ids);
+    let lower_window = oblivion_one::compositor::WindowId::from_raw(1).expect("lower window");
+    let retained_window = oblivion_one::compositor::WindowId::from_raw(2).expect("retained window");
+    let upper_window = oblivion_one::compositor::WindowId::from_raw(3).expect("upper window");
+    let socket_name = format!("typhon-lifecycle-capture-space-egl-{}", std::process::id());
+    let mut server =
+        oblivion_one::compositor::OwnCompositorServer::bind_cpu_composition(&socket_name)
+            .expect("test compositor binds");
+    let windows = [
+        (lower.surface_id, lower_window),
+        (retained.surface_id, retained_window),
+        (upper.surface_id, upper_window),
+    ];
+    server.install_native_frame_test_scene(
+        vec![lower.clone(), retained.clone(), upper.clone()],
+        &windows,
+        None,
+    );
+    server.install_native_frame_test_scene(vec![lower.clone(), upper.clone()], &windows, None);
+
+    let mut resolved = crate::native_output::ResolvedNativeFrameScene::from_server_at(
+        &server,
+        AnimationTime::from_nanos(0),
+    );
+    resolved.surfaces = std::borrow::Cow::Owned(vec![lower, upper]);
+    resolved.lifecycle_surfaces = vec![retained.clone()];
+    resolved.lifecycle = lifecycle_effect_sample(
+        0.0,
+        LifecycleDirection::Minimize,
+        retained.surface_id,
+        1,
+        ResolvedEffectScene::default(),
+    );
+    resolved.lifecycle.samples[0].window_id = retained_window;
+    resolved.lifecycle.samples[0].visual_source.window_id = retained_window;
+    resolved.lifecycle.samples[0].visual_source.kind = LifecycleVisualSourceKind::NoOwnedEffects;
+    resolved.lifecycle.samples[0].effect = effect;
+    set_test_lifecycle_marker_insertions(&server, &mut resolved);
+    let identity = resolved.lifecycle.samples[0].presentation_identity;
+    resolved.lifecycle_snapshot =
+        oblivion_one::window_lifecycle_animation::LifecycleFrameSnapshot::from_sample(
+            &resolved.lifecycle,
+        );
+
+    let input_state = crate::native_output::NativeInputState::new(OUTPUT_SIZE.0, OUTPUT_SIZE.1);
+    let output_framebuffer = harness
+        .test_output_framebuffer
+        .expect("output has an FBO-backed render target");
+    let output_target = |framebuffer_origin| EglOutputRenderTarget {
+        framebuffer: output_framebuffer,
+        sampleable_texture: harness.test_output_texture,
+        width: OUTPUT_SIZE.0,
+        height: OUTPUT_SIZE.1,
+        buffer_age: BufferAge::Unsupported,
+        framebuffer_origin,
+    };
+
+    for framebuffer_origin in [
+        OutputFramebufferOrigin::BottomLeft,
+        OutputFramebufferOrigin::TopLeftScanout,
+    ] {
+        let mut frame_renderer = crate::native_output::NativeFrameRenderer::default();
+        let request = frame_renderer.egl_scene_draw_request(
+            OUTPUT_SIZE.0,
+            OUTPUT_SIZE.1,
+            &resolved,
+            &server,
+            &input_state,
+            crate::native_output::NativeCursorRenderMode::Hardware,
+            Some(OutputDamage::Full),
+        );
+        let outcome = harness
+            .renderer
+            .draw_scene_to_target(
+                &harness.egl,
+                harness.display,
+                output_target(framebuffer_origin),
+                request,
+            )
+            .expect("full-output lifecycle reference renders");
+        assert!(matches!(outcome, EglFrameOutcome::Rendered { .. }));
+
+        let commands = &harness.renderer.scene_state.commands;
+        let lower_index = commands
+            .iter()
+            .position(|command| command.layer == EglDrawLayer::Surface(640))
+            .expect("lower surface command");
+        let marker_index = commands
+            .iter()
+            .position(|command| command.layer == EglDrawLayer::LifecycleOverlay(identity))
+            .expect("lifecycle marker command");
+        let upper_index = commands
+            .iter()
+            .position(|command| command.layer == EglDrawLayer::Surface(642))
+            .expect("ordinary surface after the lifecycle marker");
+        assert!(lower_index < marker_index && marker_index < upper_index);
+        let capture_command_indices = (lower_index..=upper_index).collect::<Vec<_>>();
+        assert!(capture_command_indices.contains(&marker_index));
+        assert!(capture_command_indices.contains(&upper_index));
+
+        unsafe {
+            harness
+                .gl
+                .bind_framebuffer(glow::FRAMEBUFFER, Some(output_framebuffer));
+        }
+        let reference_pixels = read_effect_test_pixels(&harness.gl, OUTPUT_SIZE.0, OUTPUT_SIZE.1);
+
+        let capture_texture = unsafe {
+            harness
+                .gl
+                .create_texture()
+                .expect("capture texture creates")
+        };
+        let capture_framebuffer = unsafe {
+            harness
+                .gl
+                .create_framebuffer()
+                .expect("capture framebuffer creates")
+        };
+        unsafe {
+            harness
+                .gl
+                .bind_texture(glow::TEXTURE_2D, Some(capture_texture));
+            harness.gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_MIN_FILTER,
+                glow::NEAREST as i32,
+            );
+            harness.gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_MAG_FILTER,
+                glow::NEAREST as i32,
+            );
+            harness.gl.tex_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                glow::RGBA8 as i32,
+                capture_domain.width as i32,
+                capture_domain.height as i32,
+                0,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelUnpackData::Slice(None),
+            );
+            harness
+                .gl
+                .bind_framebuffer(glow::FRAMEBUFFER, Some(capture_framebuffer));
+            harness.gl.framebuffer_texture_2d(
+                glow::FRAMEBUFFER,
+                glow::COLOR_ATTACHMENT0,
+                glow::TEXTURE_2D,
+                Some(capture_texture),
+                0,
+            );
+            assert_eq!(
+                harness.gl.check_framebuffer_status(glow::FRAMEBUFFER),
+                glow::FRAMEBUFFER_COMPLETE,
+                "translated lifecycle capture target is complete"
+            );
+            harness.gl.viewport(
+                0,
+                0,
+                capture_domain.width as i32,
+                capture_domain.height as i32,
+            );
+            harness.gl.disable(glow::SCISSOR_TEST);
+            harness.gl.enable(glow::BLEND);
+            harness
+                .gl
+                .blend_equation_separate(glow::FUNC_ADD, glow::FUNC_ADD);
+            harness.gl.blend_func_separate(
+                glow::ONE,
+                glow::ONE_MINUS_SRC_ALPHA,
+                glow::ONE,
+                glow::ONE_MINUS_SRC_ALPHA,
+            );
+            harness.gl.clear_color(0.0, 0.0, 0.0, 0.0);
+            harness.gl.clear(glow::COLOR_BUFFER_BIT);
+        }
+
+        harness.renderer.scene_state.current_framebuffer_origin = framebuffer_origin;
+        harness.renderer.effect_runtime.capture_in_progress = true;
+        let capture_program = harness.renderer.effect_runtime.capture_program;
+        let capture_output_size = harness
+            .renderer
+            .effect_runtime
+            .capture_uniform_location(&harness.gl, "u_capture_output_size");
+        let capture_domain_uniform = harness
+            .renderer
+            .effect_runtime
+            .capture_uniform_location(&harness.gl, "u_capture_domain");
+        let capture_origin = harness
+            .renderer
+            .effect_runtime
+            .capture_uniform_location(&harness.gl, "u_capture_origin_bottom_left");
+        unsafe {
+            harness.gl.use_program(Some(capture_program));
+            if let Some(location) = capture_output_size.as_ref() {
+                harness.gl.uniform_2_f32(
+                    Some(location),
+                    OUTPUT_SIZE.0 as f32,
+                    OUTPUT_SIZE.1 as f32,
+                );
+            }
+            if let Some(location) = capture_domain_uniform.as_ref() {
+                harness.gl.uniform_4_f32(
+                    Some(location),
+                    capture_domain.x as f32,
+                    capture_domain.y as f32,
+                    capture_domain.width as f32,
+                    capture_domain.height as f32,
+                );
+            }
+            if let Some(location) = capture_origin.as_ref() {
+                harness.gl.uniform_1_i32(
+                    Some(location),
+                    i32::from(framebuffer_origin == OutputFramebufferOrigin::BottomLeft),
+                );
+            }
+        }
+
+        let renderer = &mut harness.renderer;
+        let (lifecycle_resources, lifecycle_dispatch) = renderer.lifecycle.replay_dispatch_parts();
+        let texture_sources = SceneTextureSources {
+            ordinary: renderer.resources.texture_view(),
+            lifecycle: lifecycle_resources,
+        };
+        let draw_result = {
+            let mut context = EffectExecutionContext::new_with_lifecycle_dispatch(
+                &harness.gl,
+                &mut renderer.scene_state,
+                &mut renderer.effect_runtime,
+                texture_sources,
+                crate::egl_renderer::lifecycle::LifecycleRenderTargetSpace::output(
+                    OUTPUT_SIZE,
+                    framebuffer_origin,
+                ),
+                Some(lifecycle_dispatch),
+            );
+            context.draw_capture_commands_for_regions(
+                &capture_command_indices,
+                &[OutputRect::new(
+                    capture_domain.x,
+                    capture_domain.y,
+                    capture_domain.width,
+                    capture_domain.height,
+                )],
+                capture_domain,
+                (capture_domain.width, capture_domain.height),
+                framebuffer_origin,
+                false,
+            )
+        };
+        harness.renderer.effect_runtime.capture_in_progress = false;
+        draw_result.expect("selected lifecycle command range replays into the capture target");
+
+        let replay_pixels =
+            read_effect_test_pixels(&harness.gl, capture_domain.width, capture_domain.height);
+        for capture_y in 0..capture_domain.height {
+            let local_y_from_top = capture_domain.height - 1 - capture_y;
+            let output_logical_y = capture_domain.y as u32 + local_y_from_top;
+            let reference_y = match framebuffer_origin {
+                OutputFramebufferOrigin::BottomLeft => OUTPUT_SIZE.1 - 1 - output_logical_y,
+                OutputFramebufferOrigin::TopLeftScanout => output_logical_y,
+            };
+            for capture_x in 0..capture_domain.width {
+                let reference = effect_test_pixel(
+                    &reference_pixels,
+                    OUTPUT_SIZE.0,
+                    capture_domain.x as u32 + capture_x,
+                    reference_y,
+                );
+                let replay =
+                    effect_test_pixel(&replay_pixels, capture_domain.width, capture_x, capture_y);
+                for channel in 0..4 {
+                    assert!(
+                        reference[channel].abs_diff(replay[channel]) <= PIXEL_TOLERANCE,
+                        "full output crop and translated replay differ for {effect:?} at output ({}, {}) / capture ({capture_x}, {capture_y}) for {framebuffer_origin:?}: reference={reference:?}, replay={replay:?}, mode={mode}",
+                        capture_domain.x as u32 + capture_x,
+                        output_logical_y,
+                    );
+                }
+            }
+        }
+
+        for (logical_y, dominant_channel) in [(45_u32, 0), (85_u32, 1), (125_u32, 2)] {
+            let local_y = logical_y - capture_domain.y as u32;
+            let capture_y = capture_domain.height - 1 - local_y;
+            let reference_y = match framebuffer_origin {
+                OutputFramebufferOrigin::BottomLeft => OUTPUT_SIZE.1 - 1 - logical_y,
+                OutputFramebufferOrigin::TopLeftScanout => logical_y,
+            };
+            let reference = effect_test_pixel(&reference_pixels, OUTPUT_SIZE.0, 90, reference_y);
+            let replay =
+                effect_test_pixel(&replay_pixels, capture_domain.width, 90 - 73, capture_y);
+            for (representation, pixel) in [("reference", reference), ("replay", replay)] {
+                for other_channel in 0..3 {
+                    if other_channel == dominant_channel {
+                        continue;
+                    }
+                    assert!(
+                        pixel[dominant_channel] > pixel[other_channel].saturating_mul(2),
+                        "logical row {logical_y} must preserve its red/green/blue band in the {representation} for {effect:?} / {framebuffer_origin:?}: {pixel:?}"
+                    );
+                }
+            }
+        }
+
+        unsafe {
+            harness.gl.delete_framebuffer(capture_framebuffer);
+            harness.gl.delete_texture(capture_texture);
+        }
     }
 }
 

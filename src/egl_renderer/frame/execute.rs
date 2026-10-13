@@ -653,6 +653,7 @@ impl FramePipeline<'_> {
             effects,
             resources,
             lifecycle,
+            output_target_space,
             ..
         } = self;
         let (lifecycle_resources, lifecycle_dispatch) = lifecycle.replay_dispatch_parts();
@@ -666,6 +667,7 @@ impl FramePipeline<'_> {
             scene,
             effects,
             texture_sources,
+            *output_target_space,
             lifecycle_dispatch,
         )
     }
@@ -918,9 +920,15 @@ impl FramePipeline<'_> {
             effects,
             resources,
             lifecycle,
+            output_target_space,
             ..
         } = self;
-        let mut context = LifecycleRenderContext::new(gl, scene, effects, resources.texture_view());
+        let target_space = super::super::lifecycle::LifecycleRenderTargetSpace::output(
+            output_target_space.output_size(),
+            framebuffer_origin,
+        );
+        let mut context =
+            LifecycleRenderContext::new(gl, scene, effects, resources.texture_view(), target_space);
         lifecycle.prepare_visual_sources(&mut context, plan, framebuffer_origin)
     }
 

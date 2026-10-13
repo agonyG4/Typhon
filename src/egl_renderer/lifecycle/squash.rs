@@ -324,8 +324,20 @@ impl SquashRenderState {
         let mut draw_calls = 0_usize;
         let mut texture_binds = 0_usize;
         let mut missing_required_decoration_resources = 0_usize;
+        let (program, opacity_location) = match context.target_space {
+            super::LifecycleRenderTargetSpace::Output { .. } => (
+                context.scene_state.program,
+                context.scene_state.presentation_opacity_location.clone(),
+            ),
+            super::LifecycleRenderTargetSpace::Capture { .. } => (
+                context.effect_runtime.capture_program,
+                context
+                    .effect_runtime
+                    .capture_uniform_location(&context.gl, "u_opacity"),
+            ),
+        };
         unsafe {
-            context.gl.use_program(Some(context.scene_state.program));
+            context.gl.use_program(Some(program));
             context.gl.bind_vertex_array(Some(self.vertex_array));
             context.gl.active_texture(glow::TEXTURE0);
             context.gl.enable(glow::BLEND);
@@ -395,7 +407,7 @@ impl SquashRenderState {
                         );
                         current_texture_sampling = Some(texture_sampling);
                     }
-                    if let Some(location) = &context.scene_state.presentation_opacity_location {
+                    if let Some(location) = &opacity_location {
                         context
                             .gl
                             .uniform_1_f32(Some(location), sample.effect_opacity as f32);
@@ -438,12 +450,6 @@ impl SquashRenderState {
             .frame_stats
             .missing_required_decoration_resources
             .saturating_add(missing_required_decoration_resources);
-        unsafe {
-            context.gl.use_program(Some(context.scene_state.program));
-            context
-                .gl
-                .bind_vertex_array(Some(context.scene_state.scene_vertex_array));
-        }
         Ok(())
     }
 }

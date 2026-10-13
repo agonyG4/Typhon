@@ -20,6 +20,8 @@ pub(super) struct LampUniformLocations {
     pub(super) translation_progress: Option<glow::UniformLocation>,
     pub(super) retreat_progress: Option<glow::UniformLocation>,
     pub(super) framebuffer_origin_bottom_left: Option<glow::UniformLocation>,
+    pub(super) capture_target: Option<glow::UniformLocation>,
+    pub(super) capture_domain: Option<glow::UniformLocation>,
     pub(super) texture: Option<glow::UniformLocation>,
 }
 
@@ -65,6 +67,8 @@ impl LampUniformLocations {
                 retreat_progress: gl.get_uniform_location(program, "u_retreat_progress"),
                 framebuffer_origin_bottom_left: gl
                     .get_uniform_location(program, "u_framebuffer_origin_bottom_left"),
+                capture_target: gl.get_uniform_location(program, "u_capture_target"),
+                capture_domain: gl.get_uniform_location(program, "u_capture_domain"),
                 texture: gl.get_uniform_location(program, "u_texture"),
             }
         }
@@ -584,7 +588,7 @@ impl LampRenderState {
         let (Some(program), Some(uniforms)) = (self.program, self.uniform_locations) else {
             let visible_samples = frame.visible_samples(
                 f64::from(context.effect_runtime.effect_output_scale),
-                context.scene_state.current_size,
+                context.target_space.output_size(),
             );
             for sample in visible_samples.into_iter().filter(|sample| {
                 sample.effect == LifecycleEffectKind::Lamp
@@ -662,19 +666,42 @@ impl LampRenderState {
                 context.gl.uniform_1_i32(Some(location), 0);
             }
             if let Some(location) = &uniforms.output_size {
+                let output_size = context.target_space.output_size();
                 context.gl.uniform_2_f32(
                     Some(location),
-                    context.scene_state.current_size.0 as f32,
-                    context.scene_state.current_size.1 as f32,
+                    output_size.0 as f32,
+                    output_size.1 as f32,
                 );
             }
             if let Some(location) = &uniforms.framebuffer_origin_bottom_left {
                 context.gl.uniform_1_i32(
                     Some(location),
                     i32::from(
-                        context.scene_state.current_framebuffer_origin
+                        context.target_space.framebuffer_origin()
                             == OutputFramebufferOrigin::BottomLeft,
                     ),
+                );
+            }
+            if let Some(location) = &uniforms.capture_target {
+                context.gl.uniform_1_i32(
+                    Some(location),
+                    i32::from(matches!(
+                        context.target_space,
+                        super::LifecycleRenderTargetSpace::Capture { .. }
+                    )),
+                );
+            }
+            if let (
+                Some(location),
+                super::LifecycleRenderTargetSpace::Capture { capture_domain, .. },
+            ) = (&uniforms.capture_domain, context.target_space)
+            {
+                context.gl.uniform_4_f32(
+                    Some(location),
+                    capture_domain.x as f32,
+                    capture_domain.y as f32,
+                    capture_domain.width.max(1) as f32,
+                    capture_domain.height.max(1) as f32,
                 );
             }
         }
@@ -809,12 +836,6 @@ impl LampRenderState {
             .frame_stats
             .missing_required_decoration_resources
             .saturating_add(missing_required_decoration_resources);
-        unsafe {
-            context.gl.use_program(Some(context.scene_state.program));
-            context
-                .gl
-                .bind_vertex_array(Some(context.scene_state.scene_vertex_array));
-        }
         Ok(())
     }
 }

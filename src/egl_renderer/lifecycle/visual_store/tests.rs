@@ -1,4 +1,5 @@
 use super::*;
+use crate::egl_renderer::lifecycle::LifecycleRenderTargetSpace;
 use crate::egl_renderer::tests::{
     GlesEffectTestHarness, lifecycle_test_lamp_sample as lamp_test_sample,
     lifecycle_transfer_assert_pixel as assert_effect_test_pixel,
@@ -17,11 +18,16 @@ use oblivion_one::window_lifecycle_animation::LifecycleVisualGroup;
 
 fn clear_test_target(harness: &mut GlesEffectTestHarness, target: &PooledEffectTexture) {
     let renderer = &mut harness.renderer;
+    let target_space = LifecycleRenderTargetSpace::output(
+        renderer.scene_state.current_size,
+        renderer.scene_state.current_framebuffer_origin,
+    );
     let mut context = LifecycleRenderContext::new(
         &harness.gl,
         &mut renderer.scene_state,
         &mut renderer.effect_runtime,
         renderer.resources.texture_view(),
+        target_space,
     );
     clear_effect_texture(&mut context, target).expect("lifecycle capture texture clears");
 }
@@ -34,11 +40,14 @@ fn copy_test_output_region(
 ) {
     let renderer = &mut harness.renderer;
     let output = EffectFramebufferTarget::new(renderer.scene_state.active_output_framebuffer);
+    let target_space =
+        LifecycleRenderTargetSpace::output(renderer.scene_state.current_size, framebuffer_origin);
     let mut context = LifecycleRenderContext::new(
         &harness.gl,
         &mut renderer.scene_state,
         &mut renderer.effect_runtime,
         renderer.resources.texture_view(),
+        target_space,
     );
     copy_framebuffer_region_to_texture(
         &mut context,
@@ -401,11 +410,16 @@ fn minimized_snapshot_survives_idle_frames_and_is_reused_by_restore_payload() {
 
         let mut frame = LifecycleFrameState::default();
         frame.begin(&restore);
+        let target_space = LifecycleRenderTargetSpace::output(
+            renderer.scene_state.current_size,
+            OutputFramebufferOrigin::BottomLeft,
+        );
         let mut context = LifecycleRenderContext::new(
             &harness.gl,
             &mut renderer.scene_state,
             &mut renderer.effect_runtime,
             renderer.resources.texture_view(),
+            target_space,
         );
         store
             .prepare_lifecycle_visual_sources(
@@ -488,11 +502,16 @@ fn missing_minimized_snapshot_skips_animation_source_without_recapture() {
     let renderer = &mut harness.renderer;
     let store = &mut renderer.lifecycle.visual_store;
     store.begin_frame(&restore);
+    let target_space = LifecycleRenderTargetSpace::output(
+        renderer.scene_state.current_size,
+        OutputFramebufferOrigin::BottomLeft,
+    );
     let mut context = LifecycleRenderContext::new(
         &harness.gl,
         &mut renderer.scene_state,
         &mut renderer.effect_runtime,
         renderer.resources.texture_view(),
+        target_space,
     );
     store
         .prepare_lifecycle_visual_sources(

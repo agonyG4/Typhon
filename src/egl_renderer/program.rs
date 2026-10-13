@@ -128,6 +128,8 @@ uniform float u_contraction_progress;
 uniform float u_translation_progress;
 uniform float u_retreat_progress;
 uniform int u_framebuffer_origin_bottom_left;
+uniform int u_capture_target;
+uniform vec4 u_capture_domain;
 
 // These are spatial constants. All temporal channels arrive from the CPU.
 const float LAMP_SHAPE_MIN = 0.20;
@@ -239,10 +241,16 @@ void main() {
             ? vec2(cross, axis)
             : vec2(axis, cross);
     }
-    vec2 clip = vec2(warped.x / u_output_size.x * 2.0 - 1.0,
-        u_framebuffer_origin_bottom_left != 0
-            ? 1.0 - warped.y / u_output_size.y * 2.0
-            : warped.y / u_output_size.y * 2.0 - 1.0);
+    vec2 clip;
+    if (u_capture_target != 0) {
+        vec2 local = (warped - u_capture_domain.xy) / u_capture_domain.zw;
+        clip = vec2(local.x * 2.0 - 1.0, 1.0 - local.y * 2.0);
+    } else {
+        clip = vec2(warped.x / u_output_size.x * 2.0 - 1.0,
+            u_framebuffer_origin_bottom_left != 0
+                ? 1.0 - warped.y / u_output_size.y * 2.0
+                : warped.y / u_output_size.y * 2.0 - 1.0);
+    }
     gl_Position = vec4(clip, 0.0, 1.0);
     v_uv = a_uv;
 }

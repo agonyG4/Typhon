@@ -21,6 +21,7 @@ pub(in crate::egl_renderer) struct EffectExecutionContext<'a> {
     pub(super) scene: &'a mut SceneRenderState,
     pub(super) runtime: &'a mut EffectRuntime,
     sources: SceneTextureSources<'a>,
+    pub(super) output_target_space: crate::egl_renderer::lifecycle::LifecycleRenderTargetSpace,
     lifecycle_dispatch: Option<crate::egl_renderer::lifecycle::LifecycleReplayDispatcher<'a>>,
 }
 
@@ -30,8 +31,9 @@ impl<'a> EffectExecutionContext<'a> {
         scene: &'a mut SceneRenderState,
         runtime: &'a mut EffectRuntime,
         sources: SceneTextureSources<'a>,
+        output_target_space: crate::egl_renderer::lifecycle::LifecycleRenderTargetSpace,
     ) -> Self {
-        Self::new_with_lifecycle_dispatch(gl, scene, runtime, sources, None)
+        Self::new_with_lifecycle_dispatch(gl, scene, runtime, sources, output_target_space, None)
     }
 
     pub(in crate::egl_renderer) fn new_with_lifecycle_dispatch(
@@ -39,6 +41,7 @@ impl<'a> EffectExecutionContext<'a> {
         scene: &'a mut SceneRenderState,
         runtime: &'a mut EffectRuntime,
         sources: SceneTextureSources<'a>,
+        output_target_space: crate::egl_renderer::lifecycle::LifecycleRenderTargetSpace,
         lifecycle_dispatch: Option<crate::egl_renderer::lifecycle::LifecycleReplayDispatcher<'a>>,
     ) -> Self {
         scene.ensure_capture_command_metadata();
@@ -47,6 +50,7 @@ impl<'a> EffectExecutionContext<'a> {
             scene,
             runtime,
             sources,
+            output_target_space,
             lifecycle_dispatch,
         }
     }
@@ -59,22 +63,41 @@ impl<'a> EffectExecutionContext<'a> {
         &mut self,
         identity: oblivion_one::presentation_animation::PresentationRetainedVisualIdentity,
         scissor: Option<OutputRect>,
+        target_space: crate::egl_renderer::lifecycle::LifecycleRenderTargetSpace,
     ) -> RendererResult<()> {
         let Some(dispatcher) = self.lifecycle_dispatch.as_mut() else {
             return Ok(());
         };
-        let mut lifecycle_context = crate::egl_renderer::lifecycle::LifecycleRenderContext::new(
-            self.gl,
-            self.scene,
-            self.runtime,
-            self.sources.ordinary,
-        );
-        let result = dispatcher.draw_marker(&mut lifecycle_context, identity, scissor);
+        let result = {
+            let mut lifecycle_context = crate::egl_renderer::lifecycle::LifecycleRenderContext::new(
+                self.gl,
+                self.scene,
+                self.runtime,
+                self.sources.ordinary,
+                target_space,
+            );
+            dispatcher.draw_marker(&mut lifecycle_context, identity, scissor)
+        };
+        let resume_program = match target_space {
+            crate::egl_renderer::lifecycle::LifecycleRenderTargetSpace::Output { .. } => {
+                self.scene.program
+            }
+            crate::egl_renderer::lifecycle::LifecycleRenderTargetSpace::Capture { .. } => {
+                self.runtime.capture_program
+            }
+        };
         unsafe {
-            self.gl.use_program(Some(self.scene.program));
+            self.gl.use_program(Some(resume_program));
             self.gl.active_texture(glow::TEXTURE0);
             self.gl
                 .bind_vertex_array(Some(self.scene.scene_vertex_array));
+            self.gl.enable(glow::BLEND);
+            self.gl.blend_func_separate(
+                glow::ONE,
+                glow::ONE_MINUS_SRC_ALPHA,
+                glow::ONE,
+                glow::ONE_MINUS_SRC_ALPHA,
+            );
         }
         result
     }
@@ -264,7 +287,7 @@ impl EffectExecutionContext<'_> {
     pub(in crate::egl_renderer) fn draw_scene_region_plan(&mut self) -> RendererResult<()> {
         self.draw_command_region_plan(
             false,
-            RegionPlanScissorMode::Framebuffer(self.scene.current_framebuffer_origin),
+            RegionPlanScissorMode::Framebuffer(self.output_target_space.framebuffer_origin()),
         )
     }
 
@@ -303,6 +326,29 @@ impl EffectExecutionContext<'_> {
                 framebuffer_origin: origin,
                 ..
             } => origin,
+        };
+        let target_space = match scissor_mode {
+            RegionPlanScissorMode::Framebuffer(origin) => {
+                crate::egl_renderer::lifecycle::LifecycleRenderTargetSpace::output(
+                    self.output_target_space.output_size(),
+                    origin,
+                )
+            }
+            RegionPlanScissorMode::CaptureTarget {
+                framebuffer_origin,
+                target_domain,
+                target_size,
+            } => crate::egl_renderer::lifecycle::LifecycleRenderTargetSpace::capture(
+                self.output_target_space.output_size(),
+                OutputRect::new(
+                    target_domain.x,
+                    target_domain.y,
+                    target_domain.width,
+                    target_domain.height,
+                ),
+                target_size,
+                framebuffer_origin,
+            ),
         };
         let plan_is_executable = if effect_plan {
             self.scene
@@ -536,7 +582,11 @@ impl EffectExecutionContext<'_> {
                         }
                     }
                     if command.bounds.intersects_output_rect(effective_scissor) {
-                        self.dispatch_lifecycle_overlay(identity, Some(effective_scissor))?;
+                        self.dispatch_lifecycle_overlay(
+                            identity,
+                            Some(effective_scissor),
+                            target_space,
+                        )?;
                     }
                 }
                 continue;
@@ -971,6 +1021,25 @@ impl EffectExecutionContext<'_> {
         command_range: Option<(usize, usize)>,
         use_visibility_plan: bool,
     ) -> RendererResult<()> {
+        self.draw_command_batch_with_visibility_and_range_in_target_space(
+            scene,
+            scissor,
+            plan_scene_visibility,
+            command_range,
+            use_visibility_plan,
+            self.output_target_space,
+        )
+    }
+
+    fn draw_command_batch_with_visibility_and_range_in_target_space(
+        &mut self,
+        scene: bool,
+        scissor: Option<OutputRect>,
+        plan_scene_visibility: bool,
+        command_range: Option<(usize, usize)>,
+        use_visibility_plan: bool,
+        target_space: crate::egl_renderer::lifecycle::LifecycleRenderTargetSpace,
+    ) -> RendererResult<()> {
         if scene && plan_scene_visibility {
             self.plan_scene_visibility(scissor);
         }
@@ -1112,7 +1181,7 @@ impl EffectExecutionContext<'_> {
                 }
             }
             if let EglDrawLayer::LifecycleOverlay(identity) = command.layer {
-                self.dispatch_lifecycle_overlay(identity, effective_scissor)?;
+                self.dispatch_lifecycle_overlay(identity, effective_scissor, target_space)?;
                 continue;
             }
             let Some(texture) = self.texture_for_layer(command.layer) else {
@@ -1224,6 +1293,7 @@ impl EffectExecutionContext<'_> {
         output_rect: OutputRect,
         target_domain: EffectRect,
         target_size: (u32, u32),
+        framebuffer_origin: OutputFramebufferOrigin,
         host_timing_enabled: bool,
     ) -> RendererResult<ReplayCaptureExecutionDetail> {
         let requested = EffectRect::new(
@@ -1270,7 +1340,25 @@ impl EffectExecutionContext<'_> {
         let commands_executed_before = self.scene.frame_stats.commands_executed;
         let draw_calls_before = self.scene.frame_stats.draw_calls;
         let draw_submit_start = host_timing_enabled.then(Instant::now);
-        let result = self.draw_command_batch_with_visibility(true, Some(output_rect), false);
+        let target_space = crate::egl_renderer::lifecycle::LifecycleRenderTargetSpace::capture(
+            self.output_target_space.output_size(),
+            OutputRect::new(
+                target_domain.x,
+                target_domain.y,
+                target_domain.width,
+                target_domain.height,
+            ),
+            target_size,
+            framebuffer_origin,
+        );
+        let result = self.draw_command_batch_with_visibility_and_range_in_target_space(
+            true,
+            Some(output_rect),
+            false,
+            None,
+            true,
+            target_space,
+        );
         let draw_submit_cpu_ns = monotonic_elapsed_ns(draw_submit_start);
         unsafe { self.gl.disable(glow::SCISSOR_TEST) };
         self.scene.frame_stats.planner_commands_visited = self
@@ -1304,12 +1392,13 @@ impl EffectExecutionContext<'_> {
         result.map(|()| detail)
     }
 
-    pub(super) fn draw_capture_commands_for_regions(
+    pub(in crate::egl_renderer) fn draw_capture_commands_for_regions(
         &mut self,
         command_indices: &[usize],
         output_rects: &[OutputRect],
         target_domain: EffectRect,
         target_size: (u32, u32),
+        framebuffer_origin: OutputFramebufferOrigin,
         host_timing_enabled: bool,
     ) -> RendererResult<ReplayCaptureExecutionDetail> {
         let layout = replay_capture_region_layout(output_rects);
@@ -1408,11 +1497,7 @@ impl EffectExecutionContext<'_> {
             let commands_executed_before = self.scene.frame_stats.commands_executed;
             let draw_calls_before = self.scene.frame_stats.draw_calls;
             let draw_submit_start = host_timing_enabled.then(Instant::now);
-            self.draw_capture_region_plan(
-                self.scene.current_framebuffer_origin,
-                target_domain,
-                target_size,
-            )?;
+            self.draw_capture_region_plan(framebuffer_origin, target_domain, target_size)?;
             detail.planner_commands_visited = actual_region_tests;
             detail.planner_commands_drawable = drawable_pairs;
             detail.commands_considered = self
@@ -1459,6 +1544,7 @@ impl EffectExecutionContext<'_> {
                 output_rect,
                 target_domain,
                 target_size,
+                framebuffer_origin,
                 host_timing_enabled,
             )?;
             detail.planner_commands_visited = detail

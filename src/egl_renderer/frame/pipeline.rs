@@ -1,7 +1,9 @@
 use khronos_egl as egl;
 
 use super::super::{
-    EglInstance, RendererResult, lifecycle::LifecycleRenderState, resources::RendererResourceState,
+    EglInstance, RendererResult,
+    lifecycle::{LifecycleRenderState, LifecycleRenderTargetSpace},
+    resources::RendererResourceState,
     scene_state::SceneRenderState,
 };
 use super::{planning::FramePlanOutcome, types::EglSceneDrawRequest};
@@ -16,6 +18,7 @@ pub(in crate::egl_renderer) struct FramePipeline<'a> {
     pub(super) lifecycle: &'a mut LifecycleRenderState,
     pub(super) effects: &'a mut super::super::effects::EffectRuntime,
     pub(super) resources: &'a mut RendererResourceState,
+    pub(super) output_target_space: LifecycleRenderTargetSpace,
 }
 
 impl<'a> FramePipeline<'a> {
@@ -26,6 +29,7 @@ impl<'a> FramePipeline<'a> {
         lifecycle: &'a mut LifecycleRenderState,
         effects: &'a mut super::super::effects::EffectRuntime,
         resources: &'a mut RendererResourceState,
+        output_target_space: LifecycleRenderTargetSpace,
     ) -> Self {
         Self {
             gl,
@@ -34,6 +38,7 @@ impl<'a> FramePipeline<'a> {
             lifecycle,
             effects,
             resources,
+            output_target_space,
         }
     }
 

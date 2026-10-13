@@ -94,11 +94,16 @@ pub(super) fn draw_lifecycle_markers_for_test(
 ) -> RendererResult<()> {
     let renderer = &mut harness.renderer;
     let (_, mut dispatcher) = renderer.lifecycle.replay_dispatch_parts();
+    let target_space = crate::egl_renderer::lifecycle::LifecycleRenderTargetSpace::output(
+        renderer.scene_state.current_size,
+        renderer.scene_state.current_framebuffer_origin,
+    );
     let mut context = LifecycleRenderContext::new(
         &harness.gl,
         &mut renderer.scene_state,
         &mut renderer.effect_runtime,
         renderer.resources.texture_view(),
+        target_space,
     );
     for identity in identities {
         dispatcher.draw_marker(&mut context, *identity, None)?;

@@ -15,6 +15,63 @@ pub(super) use frame_state::LifecycleCaptureSnapshot;
 use lamp::LampUniformLocations;
 pub(super) use visual_store::LifecycleResolvedVisualResource;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum LifecycleRenderTargetSpace {
+    Output {
+        output_size: (u32, u32),
+        framebuffer_origin: OutputFramebufferOrigin,
+    },
+    Capture {
+        output_size: (u32, u32),
+        capture_domain: OutputRect,
+        target_size: (u32, u32),
+        framebuffer_origin: OutputFramebufferOrigin,
+    },
+}
+
+impl LifecycleRenderTargetSpace {
+    pub(super) const fn output(
+        output_size: (u32, u32),
+        framebuffer_origin: OutputFramebufferOrigin,
+    ) -> Self {
+        Self::Output {
+            output_size,
+            framebuffer_origin,
+        }
+    }
+
+    pub(super) const fn capture(
+        output_size: (u32, u32),
+        capture_domain: OutputRect,
+        target_size: (u32, u32),
+        framebuffer_origin: OutputFramebufferOrigin,
+    ) -> Self {
+        Self::Capture {
+            output_size,
+            capture_domain,
+            target_size,
+            framebuffer_origin,
+        }
+    }
+
+    pub(super) const fn output_size(self) -> (u32, u32) {
+        match self {
+            Self::Output { output_size, .. } | Self::Capture { output_size, .. } => output_size,
+        }
+    }
+
+    pub(super) const fn framebuffer_origin(self) -> OutputFramebufferOrigin {
+        match self {
+            Self::Output {
+                framebuffer_origin, ..
+            }
+            | Self::Capture {
+                framebuffer_origin, ..
+            } => framebuffer_origin,
+        }
+    }
+}
+
 /// Renderer-side lifecycle execution owner. Semantic lifecycle identities and
 /// animation state remain owned by the compositor and presentation engine.
 pub(super) struct LifecycleRenderState {
@@ -393,6 +450,7 @@ pub(super) struct LifecycleRenderContext<'a> {
     pub(super) scene_state: &'a mut SceneRenderState,
     pub(super) effect_runtime: &'a mut EffectRuntime,
     pub(super) resources: ResourceTextureView<'a>,
+    pub(super) target_space: LifecycleRenderTargetSpace,
 }
 
 impl<'a> LifecycleRenderContext<'a> {
@@ -401,12 +459,14 @@ impl<'a> LifecycleRenderContext<'a> {
         scene_state: &'a mut SceneRenderState,
         effect_runtime: &'a mut EffectRuntime,
         resources: ResourceTextureView<'a>,
+        target_space: LifecycleRenderTargetSpace,
     ) -> Self {
         Self {
             gl,
             scene_state,
             effect_runtime,
             resources,
+            target_space,
         }
     }
 
@@ -425,6 +485,7 @@ impl<'a> LifecycleRenderContext<'a> {
                 ordinary: self.resources,
                 lifecycle: lifecycle_resources,
             },
+            self.target_space,
         )
     }
 
