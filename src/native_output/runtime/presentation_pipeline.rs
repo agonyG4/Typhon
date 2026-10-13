@@ -720,6 +720,7 @@ mod direct_tests;
 
 #[cfg(test)]
 mod tests {
+    use super::super::scene_history::{NativeFrameSceneSnapshot, NativeSceneHistory};
     use super::*;
     use std::num::NonZeroU64;
     use std::os::fd::{FromRawFd, OwnedFd};
@@ -768,6 +769,24 @@ mod tests {
             )
             .unwrap();
         swapchain
+    }
+
+    fn scene_snapshot_for_identity(
+        identity: OutputFrameIdentitySnapshot,
+    ) -> NativeFrameSceneSnapshot {
+        NativeFrameSceneSnapshot {
+            output_id: identity.output_id,
+            frame_id: identity.frame_id,
+            render_generation: identity.render_generation,
+            scene: super::super::output::NativeSceneSnapshot::default(),
+            cursor_damage: super::super::output::NativeCursorDamageBounds::default(),
+            presentation: oblivion_one::compositor::PresentationFrameSnapshot::empty_for_output(
+                identity.output_id,
+            ),
+            lifecycle: oblivion_one::window_lifecycle_animation::LifecycleFrameSnapshot::default(),
+            canonical_scene_evidence: None,
+            window_exit_evidence: Vec::new(),
+        }
     }
 
     fn frame_batch(frame_id: u64) -> oblivion_one::compositor::CompositorFrameBatchId {
@@ -1165,6 +1184,18 @@ mod tests {
             .expect("READY pacing reservation")
             .expect("worker pacing ticket");
 
+        let mut prior_identity = ready;
+        prior_identity.frame_id = ready.frame_id.saturating_sub(1);
+        prior_identity.render_generation = ready.render_generation.saturating_sub(1);
+        let prior_token = token(2050);
+        let mut scene_history =
+            NativeSceneHistory::new(scene_snapshot_for_identity(prior_identity));
+        assert!(scene_history.queue_submission(prior_token.get()));
+        assert!(scene_history.replace_ready(scene_snapshot_for_identity(ready)));
+        let mut frame_scheduler = NativeFrameScheduler::new(60, 0);
+        frame_scheduler.note_ready_frame(ready.reservation.fixed_target());
+        frame_scheduler.consume_ready_frame();
+
         let worker_token = token(2051);
         let queued_at = MonotonicTimestampNs::new(30);
         let (submission_fence, _) = swapchain
@@ -1182,6 +1213,12 @@ mod tests {
                 queued_at.get(),
             )
             .expect("Atomic worker ownership is reserved");
+        assert!(scene_history.queue_submission(worker_token.get()));
+        assert_eq!(
+            scene_history.submitted_frame_id(worker_token.get()),
+            Some(ready.frame_id)
+        );
+        assert!(!frame_scheduler.ready_frame_queued());
         assert_eq!(
             swapchain
                 .worker_queued_identity()
@@ -1208,22 +1245,47 @@ mod tests {
             crate::native_output::runtime::kms_worker::ValidationBaseInvalidationDisposition::Replan
         );
 
-        assert!(frame_pacing.cancel_worker_submission(Some(pacing_ticket)));
+        let output_epoch = oblivion_one::native::OutputEpochId::new(output_generation).unwrap();
+        let replan_request = super::super::cycle::ExplicitWorkerReplanRequest {
+            output_id: ready.output_id,
+            output_epoch,
+            crtc_id,
+            transaction_id: ready.transaction_id,
+            token: worker_token,
+            kind,
+            frame_id: ready.frame_id,
+            framebuffer_id: 42,
+            reservation: ready.reservation,
+            queued_at,
+            ready_submit: true,
+            pacing_ticket: Some(pacing_ticket),
+            submission_fence_available: true,
+        };
+        let validated = super::super::cycle::preflight_explicit_worker_replan(
+            &swapchain,
+            replan_request,
+            &scene_history,
+            &frame_pacing,
+            &frame_scheduler,
+            &arbiter,
+            &ledger,
+        )
+        .expect("all worker ownership views agree before mutation");
         let mut submission_fence = Some(submission_fence);
         let mut cursor_owner = None;
-        assert!(
-            swapchain
-                .return_worker_queued_for_replan(
-                    worker_token,
-                    &mut submission_fence,
-                    &mut cursor_owner,
-                )
-                .expect("physical frame returns to READY")
-        );
-        assert!(arbiter.reject_worker_queued(worker_token).is_some());
-        ledger
-            .rollback_queued(ready.transaction_id)
-            .expect("logical transaction returns to READY");
+        super::super::cycle::restore_explicit_worker_replan(
+            validated,
+            &mut swapchain,
+            &mut submission_fence,
+            &mut cursor_owner,
+            &mut scene_history,
+            &mut frame_pacing,
+            &mut frame_scheduler,
+            &mut arbiter,
+            &mut ledger,
+            queued_at.get(),
+        )
+        .expect("production worker rollback restores all READY ownership");
 
         assert_eq!(
             ledger.transaction(ready.transaction_id).unwrap().state(),
@@ -1233,8 +1295,45 @@ mod tests {
         assert_eq!(swapchain.worker_queued_identity(), None);
         assert_eq!(arbiter.worker_queued_token(), None);
         assert!(!frame_pacing.ready_worker_submission_reserved());
+        assert_eq!(
+            scene_history.ready_frame_identity(),
+            Some((ready.frame_id, ready.render_generation)),
+            "replanning must restore the exact submitted scene to READY"
+        );
+        assert_eq!(scene_history.submitted_frame_id(worker_token.get()), None);
+        assert_eq!(
+            scene_history.submitted_frame_id(prior_token.get()),
+            Some(prior_identity.frame_id),
+            "replanning the worker owner preserves the older kernel-submitted scene"
+        );
+        assert_eq!(
+            scene_history.latest_submitted_frame_id(),
+            Some(ready.frame_id),
+            "latest submitted frame remains historical diagnostic state"
+        );
+        assert_eq!(
+            frame_pacing.ready,
+            Some(pacing_ticket.frame_id()),
+            "replanning must preserve the READY-origin pacing owner"
+        );
+        assert_eq!(
+            frame_pacing.unsubmitted_physical_identity(),
+            Some(ready),
+            "replanning must preserve physical pacing identity"
+        );
         assert_eq!(ledger.counters().ready, 1);
         assert_eq!(ledger.counters().queued, 0);
+        assert!(frame_scheduler.ready_frame_queued());
+        assert_eq!(output_epoch.get(), output_generation);
+        super::super::cycle::validate_reconfiguration_frame_ownership_for_swapchain(
+            &swapchain,
+            output_epoch,
+            &scene_history,
+            &frame_pacing,
+            &frame_scheduler,
+            &ledger,
+        )
+        .expect("R1 READY ownership invariant accepts the restored frame");
 
         let snapshot = build_output_pipeline_snapshot_with_presented(
             output_generation,
@@ -1261,10 +1360,18 @@ mod tests {
 
         let retry_token = token(2052);
         let retry_queued_at = MonotonicTimestampNs::new(35);
+        let retry_pacing_ticket = frame_pacing
+            .reserve_worker_submission(true)
+            .expect("READY-origin pacing can reserve the same physical frame again")
+            .expect("replacement READY-origin pacing ticket");
         let (retry_fence, _) = swapchain
             .take_ready_for_worker(retry_token, retry_queued_at)
             .expect("the same READY frame can be queued again");
         drop(retry_fence);
+        scene_history
+            .queue_submission_or_error(retry_token.get())
+            .expect("same scene snapshot can be queued under token B");
+        frame_scheduler.consume_ready_frame();
         ledger
             .mark_queued(ready.transaction_id, output_generation, retry_queued_at)
             .expect("same transaction can be requeued");
@@ -1288,6 +1395,14 @@ mod tests {
         arbiter
             .mark_kernel_submitted(retry_token, submitted_at.get(), submit_returned_at.get())
             .expect("retry worker ownership is acknowledged");
+        frame_pacing
+            .note_worker_submit_exact(
+                Some(retry_pacing_ticket),
+                retry_token.get(),
+                submitted_at.get(),
+                NativeOutputPacingMode::PredictiveTriple,
+            )
+            .expect("same frame receives normal submitted pacing ownership");
 
         assert!(matches!(
             ledger.transaction(ready.transaction_id).unwrap().state(),
@@ -1296,6 +1411,15 @@ mod tests {
         assert_eq!(
             swapchain.pending_identity().map(|identity| identity.frame),
             Some(ready)
+        );
+        assert_eq!(
+            scene_history.submitted_frame_id(retry_token.get()),
+            Some(ready.frame_id)
+        );
+        assert_eq!(scene_history.submitted_frame_id(worker_token.get()), None);
+        assert_eq!(
+            scene_history.submitted_frame_id(prior_token.get()),
+            Some(prior_identity.frame_id)
         );
         build_output_pipeline_snapshot_with_presented(
             output_generation,
@@ -1311,6 +1435,132 @@ mod tests {
             PresentedPlaneSnapshot::legacy(None),
         )
         .expect("the re-planned frame continues through normal submission");
+    }
+
+    #[test]
+    fn validation_base_invalidated_replan_hands_active_pacing_owner_to_ready() {
+        let output_generation = 2;
+        let crtc_id = 205;
+        let mut swapchain = ready_swapchain();
+        let ready = swapchain.ready_identity().expect("physical READY frame");
+        let ready_at = MonotonicTimestampNs::new(17);
+        let mut ledger = OutputTransactionLedger::with_capacities(8, 16);
+        insert_composited_for_generation_at(
+            &mut ledger,
+            ready,
+            ready.slot,
+            42,
+            output_generation,
+            ready_at,
+        );
+        let kind = AtomicCommitKind::CompositedPrimary {
+            transaction_id: ready.transaction_id,
+            frame_id: ready.frame_id,
+            framebuffer_id: 42,
+        };
+        let mut arbiter = AtomicCommitArbiter::new();
+        let mut frame_pacing = NativeFramePacing::from_env();
+        frame_pacing.queue_visual(10, ready.render_generation);
+        frame_pacing
+            .note_render_started(NativeOutputPacingMode::ReactiveDouble, false)
+            .expect("ACTIVE-origin pacing render starts");
+        frame_pacing
+            .bind_physical_output_frame(ready)
+            .expect("ACTIVE pacing owner binds to the physical frame");
+        let pacing_ticket = frame_pacing
+            .reserve_worker_submission(false)
+            .expect("ACTIVE-origin worker reservation")
+            .expect("ACTIVE-origin worker ticket");
+        let mut scene_history = NativeSceneHistory::new(scene_snapshot_for_identity(ready));
+        assert!(scene_history.replace_ready(scene_snapshot_for_identity(ready)));
+        let mut frame_scheduler = NativeFrameScheduler::new(60, 0);
+        frame_scheduler.note_ready_frame(ready.reservation.fixed_target());
+        frame_scheduler.consume_ready_frame();
+
+        let worker_token = token(2061);
+        let queued_at = MonotonicTimestampNs::new(30);
+        let (submission_fence, _) = swapchain
+            .take_ready_for_worker(worker_token, queued_at)
+            .expect("physical READY moves to WORKER_QUEUED");
+        ledger
+            .mark_queued(ready.transaction_id, output_generation, queued_at)
+            .expect("transaction moves to Queued");
+        arbiter
+            .reserve_worker_queued(
+                worker_token,
+                output_generation,
+                crtc_id,
+                kind,
+                queued_at.get(),
+            )
+            .expect("Atomic arbiter owns the worker token");
+        scene_history
+            .queue_submission_or_error(worker_token.get())
+            .expect("scene moves to the worker token");
+
+        let output_epoch = oblivion_one::native::OutputEpochId::new(output_generation).unwrap();
+        let request = super::super::cycle::ExplicitWorkerReplanRequest {
+            output_id: ready.output_id,
+            output_epoch,
+            crtc_id,
+            transaction_id: ready.transaction_id,
+            token: worker_token,
+            kind,
+            frame_id: ready.frame_id,
+            framebuffer_id: 42,
+            reservation: ready.reservation,
+            queued_at,
+            ready_submit: false,
+            pacing_ticket: Some(pacing_ticket),
+            submission_fence_available: true,
+        };
+        let validated = super::super::cycle::preflight_explicit_worker_replan(
+            &swapchain,
+            request,
+            &scene_history,
+            &frame_pacing,
+            &frame_scheduler,
+            &arbiter,
+            &ledger,
+        )
+        .expect("ACTIVE-origin ownership preflight succeeds");
+        let mut submission_fence = Some(submission_fence);
+        let mut cursor_owner = None;
+        super::super::cycle::restore_explicit_worker_replan(
+            validated,
+            &mut swapchain,
+            &mut submission_fence,
+            &mut cursor_owner,
+            &mut scene_history,
+            &mut frame_pacing,
+            &mut frame_scheduler,
+            &mut arbiter,
+            &mut ledger,
+            queued_at.get(),
+        )
+        .expect("ACTIVE-origin frame returns through production rollback");
+
+        assert_eq!(swapchain.ready_identity(), Some(ready));
+        assert_eq!(frame_pacing.active, None);
+        assert_eq!(frame_pacing.active_physical_identity(), None);
+        assert_eq!(frame_pacing.ready, Some(pacing_ticket.frame_id()));
+        assert_eq!(frame_pacing.unsubmitted_physical_identity(), Some(ready));
+        assert!(!frame_pacing.worker_reservation_present());
+        assert!(!frame_pacing.ready_worker_submission_reserved());
+        assert!(frame_scheduler.ready_frame_queued());
+        assert_eq!(
+            scene_history.ready_frame_identity(),
+            Some((ready.frame_id, ready.render_generation))
+        );
+        assert_eq!(
+            ledger.transaction(ready.transaction_id).unwrap().state(),
+            OutputTransactionState::Ready { ready_at }
+        );
+        let retry = frame_pacing
+            .reserve_worker_submission(true)
+            .expect("returned frame accepts a READY-origin worker ticket")
+            .expect("replacement READY ticket");
+        assert_eq!(retry.physical_identity(), Some(ready));
     }
 
     #[test]
