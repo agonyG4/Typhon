@@ -525,7 +525,6 @@ fn journal_with_warm_paired_samples() -> AdaptiveRenderJournal {
             frame_id: sample,
             target,
             composite_started_at: MonotonicTimestampNs::new(base),
-            fence_exported_at: MonotonicTimestampNs::new(base + 1),
             fence_signaled_at: Some((
                 MonotonicTimestampNs::new(base + 1_000_000),
                 FenceTimestampQuality::ExactSyncFile,
@@ -588,7 +587,6 @@ fn advisory_dispatch_does_not_change_warm_paired_or_active_recovery() {
             frame_id: sample,
             target: reactive_test_target(),
             composite_started_at: MonotonicTimestampNs::new(base),
-            fence_exported_at: MonotonicTimestampNs::new(base + 1),
             fence_signaled_at: Some((
                 MonotonicTimestampNs::new(base + 1_000_000),
                 FenceTimestampQuality::ExactSyncFile,

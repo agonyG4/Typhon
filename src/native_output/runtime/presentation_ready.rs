@@ -780,7 +780,6 @@ mod tests {
                 surface_damage: SurfaceDamagePresentation::default(),
                 protocol_batch_id,
                 composite_started_at: frame_now,
-                fence_exported_at: frame_now,
                 rendered_at: frame_now,
                 client_commit_ns: None,
                 callback_reaction_ns: None,

@@ -565,7 +565,6 @@ mod tests {
             frame_id: 7,
             target,
             composite_started_at: MonotonicTimestampNs::new(0),
-            fence_exported_at: MonotonicTimestampNs::new(1),
             fence_signaled_at: Some((
                 MonotonicTimestampNs::new(5_000_000),
                 FenceTimestampQuality::ExactSyncFile,

@@ -2955,7 +2955,6 @@ impl AtomicEglGbmScanout {
             surface_damage,
             protocol_batch_id,
             composite_started_at,
-            fence_exported_at: rendered_at,
             rendered_at,
             client_commit_ns: callback_timing.map(|timing| timing.commit_ns),
             callback_reaction_ns: callback_timing.and_then(|timing| timing.reaction_ns),

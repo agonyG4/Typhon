@@ -203,7 +203,6 @@ pub struct FrameTimingObservation {
     pub frame_id: u64,
     pub target: PresentationTarget,
     pub composite_started_at: MonotonicTimestampNs,
-    pub fence_exported_at: MonotonicTimestampNs,
     pub fence_signaled_at: Option<(MonotonicTimestampNs, FenceTimestampQuality)>,
     pub submit_started_at: Option<MonotonicTimestampNs>,
     pub submit_returned_at: Option<MonotonicTimestampNs>,
@@ -220,14 +219,12 @@ fn exact_same_frame_critical_path_ns(observation: &FrameTimingObservation) -> Op
     let submit_started_at = observation.submit_started_at?;
     let submit_returned_at = observation.submit_returned_at?;
     let composite_started_ns = observation.composite_started_at.get();
-    let fence_exported_ns = observation.fence_exported_at.get();
     let fence_signaled_ns = fence_signaled_at.get();
     let submit_started_ns = submit_started_at.get();
     let submit_returned_ns = submit_returned_at.get();
 
-    if composite_started_ns > fence_exported_ns
-        || composite_started_ns > fence_signaled_ns
-        || fence_exported_ns > submit_started_ns
+    if composite_started_ns > fence_signaled_ns
+        || composite_started_ns > submit_started_ns
         || submit_started_ns > submit_returned_ns
     {
         return None;
@@ -1049,7 +1046,6 @@ mod tests {
             frame_id: 1,
             target: service_target(),
             composite_started_at: MonotonicTimestampNs::new(render_started_ns),
-            fence_exported_at: MonotonicTimestampNs::new(render_started_ns + 1),
             fence_signaled_at: Some((
                 MonotonicTimestampNs::new(render_signaled_ns),
                 FenceTimestampQuality::ExactSyncFile,
@@ -1094,7 +1090,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_critical_path_uses_gpu_branch_when_gpu_dominates() {
+    fn exact_critical_path_accepts_fence_after_submit_returns_and_gpu_dominates() {
         let mut journal = AdaptiveRenderJournal::default();
         journal.record_frame_service_observation(service_observation(
             0, 5_000_000, 1_000_000, 2_000_000,
@@ -1115,6 +1111,18 @@ mod tests {
         let prediction = journal.prediction(Duration::from_millis(10));
         assert_eq!(prediction.paired_service_samples, 1);
         assert_eq!(prediction.paired_service_p95_ns, 5_000_000);
+    }
+
+    #[test]
+    fn exact_critical_path_accepts_fence_signal_before_submit_starts() {
+        let mut journal = AdaptiveRenderJournal::default();
+        journal.record_frame_service_observation(service_observation(
+            0, 500_000, 1_000_000, 2_000_000,
+        ));
+
+        let prediction = journal.prediction(Duration::from_millis(10));
+        assert_eq!(prediction.paired_service_samples, 1);
+        assert_eq!(prediction.paired_service_p95_ns, 2_000_000);
     }
 
     #[test]
@@ -1141,6 +1149,9 @@ mod tests {
         ));
         journal.record_frame_service_observation(service_observation(
             5_000_000, 4_000_000, 6_000_000, 7_000_000,
+        ));
+        journal.record_frame_service_observation(service_observation(
+            5_000_000, 8_000_000, 4_000_000, 9_000_000,
         ));
 
         let prediction = journal.prediction(Duration::from_millis(10));
