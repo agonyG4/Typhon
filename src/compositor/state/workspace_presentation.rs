@@ -4,6 +4,19 @@ use crate::wm::{WorkspaceId, WorkspaceLocation, WorkspaceManager, WorkspaceSwitc
 use std::collections::HashMap;
 use std::num::NonZeroU64;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::compositor) enum WorkspacePresentationFallbackReason {
+    FullscreenTransition,
+}
+
+impl WorkspacePresentationFallbackReason {
+    const fn id(self) -> &'static str {
+        match self {
+            Self::FullscreenTransition => "fullscreen_transition",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct WorkspacePresentationTransitionId(NonZeroU64);
 
@@ -302,6 +315,21 @@ impl WorkspacePresentationState {
 }
 
 impl crate::compositor::CompositorState {
+    pub(in crate::compositor) fn settle_workspace_presentation_for_incompatible_transition(
+        &mut self,
+        reason: WorkspacePresentationFallbackReason,
+    ) -> bool {
+        if !self.workspace_presentation.clear() {
+            return false;
+        }
+        self.refresh_frame_work_visibility();
+        eprintln!(
+            "typhon.workspace_slide event=settled reason={}",
+            reason.id()
+        );
+        true
+    }
+
     pub(in crate::compositor) fn retire_workspace_presentation_if_rendered(
         &mut self,
         sample: &WorkspacePresentationSample,
@@ -608,6 +636,142 @@ mod tests {
     }
 
     #[test]
+    fn stationary_shell_surfaces_and_special_workspace_stay_outside_regular_slide_domain() {
+        let mut compositor = crate::compositor::CompositorState::default();
+        enable_workspace_slide(&mut compositor);
+        let target = workspace(2);
+        let outgoing_window = crate::compositor::WindowId::from_raw(811).unwrap();
+        let target_window = crate::compositor::WindowId::from_raw(812).unwrap();
+        let special_window = crate::compositor::WindowId::from_raw(813).unwrap();
+        compositor.install_native_frame_test_scene(
+            vec![
+                super::super::desktop_window_tests::x11_shm_surface(
+                    811,
+                    320,
+                    200,
+                    crate::compositor::SurfacePlacement::absolute_root_at(20, 30),
+                ),
+                super::super::desktop_window_tests::x11_shm_surface(
+                    812,
+                    320,
+                    200,
+                    crate::compositor::SurfacePlacement::absolute_root_at(40, 50),
+                ),
+                super::super::desktop_window_tests::x11_shm_surface(
+                    813,
+                    320,
+                    200,
+                    crate::compositor::SurfacePlacement::absolute_root_at(70, 80),
+                ),
+                super::super::desktop_window_tests::x11_shm_surface(
+                    814,
+                    320,
+                    200,
+                    crate::compositor::SurfacePlacement::absolute_root_at(0, 0),
+                ),
+                super::super::desktop_window_tests::x11_shm_surface(
+                    815,
+                    320,
+                    32,
+                    crate::compositor::SurfacePlacement::absolute_root_at(0, 0),
+                ),
+            ],
+            &[
+                (811, outgoing_window),
+                (812, target_window),
+                (813, special_window),
+            ],
+            None,
+        );
+        compositor
+            .desktop_windows
+            .get_mut(&outgoing_window)
+            .unwrap()
+            .management = Some(crate::wm::WindowManagementState::new(
+            WorkspaceLocation::Regular(workspace(1)),
+        ));
+        compositor
+            .desktop_windows
+            .get_mut(&target_window)
+            .unwrap()
+            .management = Some(crate::wm::WindowManagementState::new(
+            WorkspaceLocation::Regular(target),
+        ));
+        let special_id = crate::wm::SpecialWorkspaceId::DEFAULT;
+        compositor
+            .desktop_windows
+            .get_mut(&special_window)
+            .unwrap()
+            .management = Some(crate::wm::WindowManagementState::new(
+            WorkspaceLocation::Special(special_id),
+        ));
+        compositor
+            .workspace_manager
+            .toggle_special_workspace(special_id);
+        compositor.rebuild_active_scene_view();
+        assert!(matches!(
+            compositor.activate_workspace(target),
+            WorkspaceSwitchOutcome::Changed { current, .. } if current == target
+        ));
+
+        let transition = compositor.workspace_presentation.transition().unwrap();
+        let sampled_at =
+            AnimationTime::from_nanos(transition.started_at.as_nanos().saturating_add(50_000_000));
+        let frame_scene = compositor
+            .workspace_frame_presentation_scene_at(sampled_at)
+            .expect("active workspace slide creates a frame scene");
+        let special_root = compositor.presentation_owner_root_for_surface(813);
+        let target_root = compositor.presentation_owner_root_for_surface(812);
+
+        let target_participant = frame_scene
+            .workspace_sample
+            .participants
+            .iter()
+            .find(|participant| participant.workspace == target)
+            .expect("target workspace participates");
+        assert_ne!(target_participant.translation_x, 0.0);
+        assert_eq!(
+            frame_scene.workspace_by_owner_root.get(&target_root),
+            Some(&target)
+        );
+        assert!(
+            !frame_scene
+                .workspace_by_owner_root
+                .contains_key(&special_root)
+        );
+        assert!(compositor.window_is_visible_in_active_scene(special_window));
+        for stationary_id in [813, 814, 815] {
+            assert_eq!(
+                frame_scene
+                    .surfaces
+                    .iter()
+                    .filter(|surface| surface.surface_id == stationary_id)
+                    .count(),
+                1,
+                "stationary surface {stationary_id} is included exactly once"
+            );
+        }
+        let special_surface = frame_scene
+            .surfaces
+            .iter()
+            .find(|surface| surface.surface_id == 813)
+            .unwrap();
+        assert_eq!((special_surface.x, special_surface.y), (70, 80));
+        let background = frame_scene
+            .surfaces
+            .iter()
+            .find(|surface| surface.surface_id == 814)
+            .unwrap();
+        assert_eq!((background.x, background.y), (0, 0));
+        let panel = frame_scene
+            .surfaces
+            .iter()
+            .find(|surface| surface.surface_id == 815)
+            .unwrap();
+        assert_eq!((panel.x, panel.y), (0, 0));
+    }
+
+    #[test]
     fn frame_presentation_includes_outgoing_workspace_without_changing_semantic_scene() {
         let mut compositor = crate::compositor::CompositorState::default();
         enable_workspace_slide(&mut compositor);
@@ -875,6 +1039,40 @@ mod tests {
         assert!(presentation.retire_if_rendered(&settled_sample));
         assert!(presentation.transition().is_none());
         assert_eq!(start, workspace(1));
+    }
+
+    #[test]
+    fn settled_sample_from_fullscreen_retired_transition_cannot_retire_later_slide() {
+        let mut manager = WorkspaceManager::new(4).unwrap();
+        let mut presentation = WorkspacePresentationState::default();
+        let first_outcome = manager.activate(workspace(2));
+        presentation.activate_for_switch(
+            first_outcome,
+            &manager,
+            AnimationTime::from_nanos(0),
+            slide_curve(),
+        );
+        let old_settled_sample = presentation
+            .sample_at(
+                &manager,
+                AnimationTime::from_nanos(10_000_000_000),
+                1920.0,
+                1080.0,
+            )
+            .unwrap();
+        assert!(presentation.clear());
+
+        let later_outcome = manager.activate(workspace(3));
+        presentation.activate_for_switch(
+            later_outcome,
+            &manager,
+            AnimationTime::from_nanos(20_000_000),
+            slide_curve(),
+        );
+        let later_id = presentation.transition().unwrap().id;
+
+        assert!(!presentation.retire_if_rendered(&old_settled_sample));
+        assert_eq!(presentation.transition().unwrap().id, later_id);
     }
 
     #[test]

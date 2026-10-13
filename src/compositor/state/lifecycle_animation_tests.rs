@@ -2711,6 +2711,219 @@ fn successful_minimize_lamp_cancels_window_scale_geometry_track() {
     );
 }
 
+fn activate_workspace_slide_with_minimize_effect(
+    state: &mut CompositorState,
+    window_id: WindowId,
+    effect: crate::animation_control::AnimationEffect,
+) {
+    let target_workspace = crate::wm::WorkspaceId::new(2).expect("target workspace");
+    assert!(state.move_window_family_to_workspace(window_id, target_workspace));
+    let mut configuration = crate::animation_control::AnimationConfiguration {
+        enabled: true,
+        ..crate::animation_control::AnimationConfiguration::default()
+    };
+    configuration.overrides.insert(
+        crate::animation_control::AnimationSlot::WorkspaceSwitch,
+        crate::animation_control::AnimationEffect::WorkspaceSlide,
+    );
+    configuration.overrides.insert(
+        crate::animation_control::AnimationSlot::WindowMinimize,
+        effect,
+    );
+    state.lifecycle_animation_renderer_available = Some(true);
+    state.lifecycle_squash_renderer_available = Some(true);
+    state
+        .set_animation_configuration(configuration)
+        .expect("enable workspace slide and lifecycle effect");
+    state.activate_workspace(target_workspace);
+}
+
+#[test]
+fn minimizing_with_lamp_during_workspace_slide_skips_retained_lifecycle_capture() {
+    let (mut state, window_id) = ssd_test_state(416);
+    activate_workspace_slide_with_minimize_effect(
+        &mut state,
+        window_id,
+        crate::animation_control::AnimationEffect::MinimizeLamp,
+    );
+    let root_surface_id = state
+        .window(window_id)
+        .expect("test window")
+        .root_surface_id;
+    let scene_node_id = state
+        .scene_node_id_for_window_group(window_id)
+        .expect("window group node");
+    assert!(state.workspace_presentation.transition().is_some());
+
+    assert!(state.minimize_desktop_window(window_id));
+
+    assert!(
+        state
+            .window(window_id)
+            .expect("minimized window")
+            .state
+            .is_minimized()
+    );
+    assert!(state.workspace_presentation.transition().is_some());
+    assert_eq!(
+        state.presentation_animator.active_retained_visual(
+            scene_node_id,
+            PresentationRetainedVisualKind::WindowLifecycle,
+        ),
+        None
+    );
+    assert_eq!(state.window_lifecycle_animator.active_count(), 0);
+    assert!(
+        state
+            .retained_lifecycle_payloads
+            .windows_with_precapture()
+            .is_empty()
+    );
+    assert!(
+        state
+            .renderable_surfaces
+            .iter()
+            .all(|surface| surface.surface_id != root_surface_id)
+    );
+}
+
+#[test]
+fn minimizing_with_squash_during_workspace_slide_skips_retained_lifecycle_capture() {
+    let (mut state, window_id) = ssd_test_state(417);
+    activate_workspace_slide_with_minimize_effect(
+        &mut state,
+        window_id,
+        crate::animation_control::AnimationEffect::MinimizeSquash,
+    );
+    let scene_node_id = state
+        .scene_node_id_for_window_group(window_id)
+        .expect("window group node");
+    assert!(state.workspace_presentation.transition().is_some());
+
+    assert!(state.minimize_desktop_window(window_id));
+
+    assert!(
+        state
+            .window(window_id)
+            .expect("minimized window")
+            .state
+            .is_minimized()
+    );
+    assert!(state.workspace_presentation.transition().is_some());
+    assert_eq!(
+        state.presentation_animator.active_retained_visual(
+            scene_node_id,
+            PresentationRetainedVisualKind::WindowLifecycle,
+        ),
+        None
+    );
+    assert_eq!(state.window_lifecycle_animator.active_count(), 0);
+    assert!(
+        state
+            .retained_lifecycle_payloads
+            .windows_with_precapture()
+            .is_empty()
+    );
+}
+
+#[test]
+fn restoring_during_workspace_slide_skips_retained_restore_and_keeps_live_translation() {
+    let (mut state, window_id) = ssd_test_state(418);
+    let target_workspace = crate::wm::WorkspaceId::new(2).expect("target workspace");
+    assert!(state.move_window_family_to_workspace(window_id, target_workspace));
+
+    state
+        .set_animation_configuration(crate::animation_control::AnimationConfiguration {
+            enabled: false,
+            ..crate::animation_control::AnimationConfiguration::default()
+        })
+        .expect("disable lifecycle effects before minimizing fixture");
+    assert!(state.minimize_desktop_window(window_id));
+    assert!(
+        state
+            .window(window_id)
+            .expect("minimized window")
+            .state
+            .is_minimized()
+    );
+
+    let mut configuration = crate::animation_control::AnimationConfiguration {
+        enabled: true,
+        ..crate::animation_control::AnimationConfiguration::default()
+    };
+    configuration.overrides.insert(
+        crate::animation_control::AnimationSlot::WorkspaceSwitch,
+        crate::animation_control::AnimationEffect::WorkspaceSlide,
+    );
+    configuration.overrides.insert(
+        crate::animation_control::AnimationSlot::WindowRestore,
+        crate::animation_control::AnimationEffect::MinimizeLamp,
+    );
+    state.lifecycle_animation_renderer_available = Some(true);
+    state
+        .set_animation_configuration(configuration)
+        .expect("enable workspace slide and restore effect");
+    state.activate_workspace(target_workspace);
+    let scene_node_id = state
+        .scene_node_id_for_window_group(window_id)
+        .expect("window group node");
+    assert!(state.workspace_presentation.transition().is_some());
+
+    assert!(state.restore_minimized_desktop_window(window_id));
+
+    assert!(
+        !state
+            .window(window_id)
+            .expect("restored window")
+            .state
+            .is_minimized()
+    );
+    assert!(
+        state
+            .renderable_surfaces
+            .iter()
+            .any(|surface| surface.surface_id == 418)
+    );
+    assert!(state.workspace_presentation.transition().is_some());
+    assert_eq!(
+        state.presentation_animator.active_retained_visual(
+            scene_node_id,
+            PresentationRetainedVisualKind::WindowLifecycle,
+        ),
+        None
+    );
+    assert_eq!(state.window_lifecycle_animator.active_count(), 0);
+    assert!(
+        state
+            .retained_lifecycle_payloads
+            .windows_with_precapture()
+            .is_empty()
+    );
+
+    let sampled_at = AnimationTime::from_nanos(
+        AnimationTime::monotonic_now()
+            .expect("sample time")
+            .as_nanos()
+            .saturating_add(100_000_000),
+    );
+    let scene = state
+        .workspace_frame_presentation_scene_at(sampled_at)
+        .expect("active workspace slide scene");
+    assert!(
+        scene
+            .surfaces
+            .iter()
+            .any(|surface| surface.surface_id == 418)
+    );
+    let target_participant = scene
+        .workspace_sample
+        .participants
+        .iter()
+        .find(|participant| participant.workspace == target_workspace)
+        .expect("target workspace participant");
+    assert_ne!(target_participant.translation_x, 0.0);
+}
+
 #[test]
 fn failed_minimize_lamp_install_leaves_window_scale_geometry_active() {
     let root_surface_id = 410;

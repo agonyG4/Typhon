@@ -2770,3 +2770,71 @@ fn rapid_xdg_popup_cycles_leave_no_stale_popup_state() {
     queue.roundtrip(&mut state).unwrap();
     let _server = stop_controllable_test_server(commands, server_thread);
 }
+
+#[test]
+fn xdg_fullscreen_settles_active_workspace_slide_but_maximize_keeps_it_active() {
+    let socket_name = unique_socket_name();
+    let mut server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let mut animation_configuration = crate::animation_control::AnimationConfiguration {
+        enabled: true,
+        ..crate::animation_control::AnimationConfiguration::default()
+    };
+    animation_configuration.overrides.insert(
+        crate::animation_control::AnimationSlot::WorkspaceSwitch,
+        crate::animation_control::AnimationEffect::WorkspaceSlide,
+    );
+    server
+        .state
+        .set_animation_configuration(animation_configuration)
+        .expect("enable workspace slide");
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    let connection = Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let (surface, _xdg_surface, toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 380, 220).unwrap();
+    let surface_id = surface.id().protocol_id();
+    surface.commit();
+    connection.flush().unwrap();
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state).unwrap();
+
+    let internal_surface_id = resolve_internal_surface_id(&commands, surface_id);
+    let window_id = capture_window_id_for_surface(&commands, internal_surface_id)
+        .expect("mapped XDG window should have a window id");
+    let (reply, receiver) = std::sync::mpsc::channel();
+    commands
+        .send(ServerCommand::MoveWindowToWorkspace {
+            window_id,
+            workspace: 2,
+            reply,
+        })
+        .unwrap();
+    assert!(
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("server should move the window to workspace 2")
+    );
+    commands
+        .send(ServerCommand::ActivateWorkspace { workspace: 2 })
+        .unwrap();
+    assert!(capture_workspace_presentation_active(&commands));
+
+    toplevel.set_maximized();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    assert!(state.toplevel_has_state(client_xdg_toplevel::State::Maximized));
+    assert!(capture_workspace_presentation_active(&commands));
+
+    toplevel.set_fullscreen(None);
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    assert!(state.toplevel_has_state(client_xdg_toplevel::State::Fullscreen));
+    assert!(!capture_workspace_presentation_active(&commands));
+
+    stop_controllable_test_server(commands, server_thread);
+}

@@ -460,6 +460,42 @@ fn default_normal_xdg_window_is_admitted_with_sparse_default_properties() {
 }
 
 #[test]
+fn active_workspace_slide_declines_new_window_exit_preparation() {
+    let (mut state, root_surface_id, scene_node_id, window_id) =
+        admission_window(super::super::window_state::ToplevelMode::Normal, (500, 400));
+    let target_workspace = crate::wm::WorkspaceId::new(2).expect("target workspace");
+    assert!(state.move_window_family_to_workspace(window_id, target_workspace));
+    let mut configuration = crate::animation_control::AnimationConfiguration {
+        enabled: true,
+        ..crate::animation_control::AnimationConfiguration::default()
+    };
+    configuration.overrides.insert(
+        crate::animation_control::AnimationSlot::WorkspaceSwitch,
+        crate::animation_control::AnimationEffect::WorkspaceSlide,
+    );
+    configuration.overrides.insert(
+        crate::animation_control::AnimationSlot::WindowClose,
+        crate::animation_control::AnimationEffect::WindowScale,
+    );
+    state
+        .set_animation_configuration(configuration)
+        .expect("enable workspace slide and WindowExit effect");
+    state.activate_workspace(target_workspace);
+    publish_admission_evidence(&mut state, root_surface_id, scene_node_id, 3);
+    assert!(state.workspace_presentation.transition().is_some());
+
+    assert!(!state.prepare_window_exit(root_surface_id));
+
+    assert!(state.workspace_presentation.transition().is_some());
+    assert!(state.window_exit_payloads.can_prepare_root(root_surface_id));
+    assert!(state.active_window_exit_render_groups().is_empty());
+    assert!(state.remove_desktop_window(window_id).is_some());
+    assert!(state.window(window_id).is_none());
+    assert!(state.workspace_presentation.transition().is_some());
+    assert!(state.active_window_exit_render_groups().is_empty());
+}
+
+#[test]
 fn managed_xdg_window_exit_admission_respects_minimized_but_not_toplevel_mode() {
     use super::super::window_state::ToplevelMode;
 

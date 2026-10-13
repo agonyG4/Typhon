@@ -54,6 +54,11 @@ impl CompositorState {
         if !mode_changed && !minimized_changed {
             return false;
         }
+        if mode_changed && mode == ToplevelMode::Fullscreen {
+            self.settle_workspace_presentation_for_incompatible_transition(
+                crate::compositor::state::workspace_presentation::WorkspacePresentationFallbackReason::FullscreenTransition,
+            );
+        }
         if !mode_changed && minimized_changed && interaction_target.is_none() {
             if minimized {
                 if !self.minimize_desktop_window(window_id) {

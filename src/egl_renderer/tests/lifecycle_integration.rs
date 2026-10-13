@@ -325,6 +325,161 @@ fn egl_lifecycle_lamp_below_canonical_opaque_window_respects_painter_order() {
     );
 }
 
+#[test]
+fn workspace_slide_blur_reads_back_translated_lower_workspace_pixels() {
+    let mut harness = GlesEffectTestHarness::new(320, 200);
+    harness.install_texture_backed_output();
+
+    let mut buffer_ids = BufferIdAllocator::default();
+    let mut lower = lifecycle_test_surface(710, 0, 0, 320, 200, 0xffee_1010, &mut buffer_ids);
+    let lower_pixels = (0..320 * 200)
+        .map(|pixel| {
+            if pixel % 320 < 160 {
+                0xffee_1010
+            } else {
+                0xff10_10ee
+            }
+        })
+        .collect();
+    lower.buffer = CommittedSurfaceBuffer::shm_snapshot(
+        buffer_ids.allocate().expect("lower pixel buffer identity"),
+        BufferSize::new(320, 200).expect("lower pixel buffer size"),
+        lower_pixels,
+    );
+    let upper = lifecycle_test_surface(711, 0, 70, 120, 60, 0x4000_0000, &mut buffer_ids);
+    let lower_window = oblivion_one::compositor::WindowId::from_raw(1).expect("lower window");
+    let upper_window = oblivion_one::compositor::WindowId::from_raw(2).expect("upper window");
+    let socket_name = format!("typhon-workspace-slide-backdrop-egl-{}", std::process::id());
+    let mut server =
+        oblivion_one::compositor::OwnCompositorServer::bind_cpu_composition(&socket_name)
+            .expect("test compositor binds");
+    assert!(server.set_output_size(320, 200));
+    server.install_native_frame_test_scene(
+        vec![lower.clone(), upper.clone()],
+        &[
+            (lower.surface_id, lower_window),
+            (upper.surface_id, upper_window),
+        ],
+        None,
+    );
+    let target_workspace = oblivion_one::wm::WorkspaceId::new(2).expect("target workspace");
+    assert!(server.set_test_window_workspace(lower_window, target_workspace));
+    assert!(server.set_test_window_workspace(upper_window, target_workspace));
+    let mut animation_configuration = oblivion_one::animation_control::AnimationConfiguration {
+        enabled: true,
+        ..oblivion_one::animation_control::AnimationConfiguration::default()
+    };
+    animation_configuration.overrides.insert(
+        oblivion_one::animation_control::AnimationSlot::WorkspaceSwitch,
+        oblivion_one::animation_control::AnimationEffect::WorkspaceSlide,
+    );
+    server
+        .set_animation_configuration(animation_configuration)
+        .expect("enable WorkspaceSlide");
+    server.activate_workspace(target_workspace);
+    assert!(server.workspace_presentation_active());
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    let sampled_at = AnimationTime::monotonic_now().expect("monotonic frame time");
+    let mut resolved =
+        crate::native_output::ResolvedNativeFrameScene::from_server_at(&server, sampled_at);
+    let lower_frame = resolved
+        .surfaces
+        .iter()
+        .find(|surface| surface.surface_id == lower.surface_id)
+        .expect("translated lower workspace surface");
+    let upper_frame = resolved
+        .surfaces
+        .iter()
+        .find(|surface| surface.surface_id == upper.surface_id)
+        .expect("translated translucent window");
+    assert_ne!(lower_frame.x, lower.x);
+    assert_eq!(lower_frame.x, upper_frame.x);
+    let participant = resolved
+        .workspace_presentation_sample
+        .as_ref()
+        .expect("frame carries WorkspaceSlide sample")
+        .participants
+        .iter()
+        .find(|participant| participant.workspace == target_workspace)
+        .expect("target workspace participates in this frame");
+    let clip = participant.logical_cell_clip;
+    let left = upper_frame.x.max(clip.x.floor() as i32).max(0);
+    let top = upper_frame.y.max(clip.y.floor() as i32).max(0);
+    let right = (upper_frame.x + upper_frame.width as i32)
+        .min((clip.x + clip.width).ceil() as i32)
+        .min(320);
+    let bottom = (upper_frame.y + upper_frame.height as i32)
+        .min((clip.y + clip.height).ceil() as i32)
+        .min(200);
+    assert!(
+        right - left >= 16 && bottom - top >= 16,
+        "visible blur window: ({left}, {top})-({right}, {bottom})"
+    );
+
+    let blur_bounds = EffectRect::new(
+        u32::try_from(left).expect("visible blur x"),
+        u32::try_from(top).expect("visible blur y"),
+        u32::try_from(right - left).expect("visible blur width"),
+        u32::try_from(bottom - top).expect("visible blur height"),
+    )
+    .expect("visible blur region");
+    let (mut effects, registry) = moving_blur_scene_with_spec(blur_bounds, 24.0, 3, 1.0);
+    let upper_anchor = oblivion_one::compositor::EffectAnchor::BeforeSurface(upper.surface_id);
+    let backdrop = effects
+        .instances
+        .first_mut()
+        .expect("backdrop blur effect instance");
+    backdrop.anchor = upper_anchor;
+    backdrop.scene_order = oblivion_one::compositor::EffectSceneOrder::for_anchor(upper_anchor);
+    backdrop.backdrop_reuse = oblivion_one::compositor::EffectBackdropReuse::Exact;
+    harness.renderer.set_effect_registry(registry);
+    resolved.effects = effects;
+
+    let input_state = crate::native_output::NativeInputState::new(320, 200);
+    let mut frame_renderer = crate::native_output::NativeFrameRenderer::default();
+    let request = frame_renderer.egl_scene_draw_request(
+        320,
+        200,
+        &resolved,
+        &server,
+        &input_state,
+        crate::native_output::NativeCursorRenderMode::Hardware,
+        Some(OutputDamage::Full),
+    );
+    let target = EglOutputRenderTarget {
+        framebuffer: harness
+            .test_output_framebuffer
+            .expect("output has an FBO-backed render target"),
+        sampleable_texture: harness.test_output_texture,
+        width: 320,
+        height: 200,
+        buffer_age: BufferAge::Unsupported,
+        framebuffer_origin: OutputFramebufferOrigin::BottomLeft,
+    };
+    let outcome = harness
+        .renderer
+        .draw_scene_to_target(&harness.egl, harness.display, target, request)
+        .expect("WorkspaceSlide backdrop frame renders through GLES");
+    assert!(matches!(outcome, EglFrameOutcome::Rendered { .. }));
+
+    harness.renderer.bind_active_output_framebuffer();
+    let output_pixels = read_effect_test_pixels(&harness.gl, 320, 200);
+    let probe_x = left + (right - left) / 2;
+    let probe_y = top + (bottom - top) / 2;
+    let blurred_pixel = effect_test_pixel(
+        &output_pixels,
+        320,
+        probe_x as u32,
+        200 - 1 - probe_y as u32,
+    );
+    assert!(
+        blurred_pixel[0] > 60 && blurred_pixel[2] < 100,
+        "translucent window at translated x={} must blur the translated red lower workspace pixel, got {blurred_pixel:?}",
+        upper_frame.x,
+    );
+}
+
 fn render_lifecycle_overlap_pixel(
     effect: LifecycleEffectKind,
     retained_above: bool,

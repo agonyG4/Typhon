@@ -407,6 +407,7 @@ pub(in crate::compositor::tests) enum ServerCommand {
     CaptureKeyboardFocusSurfaceId(Sender<Option<u32>>),
     CaptureFocusedWindowId(Sender<Option<WindowId>>),
     CaptureFocusedToplevelMode(Sender<Option<ToplevelMode>>),
+    CaptureWorkspacePresentationActive(Sender<bool>),
     CaptureWindowIdForSurface {
         surface_id: u32,
         reply: Sender<Option<WindowId>>,
@@ -2224,6 +2225,9 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                             .map(|window| window.state.mode());
                         let _ = reply.send(mode);
                     }
+                    ServerCommand::CaptureWorkspacePresentationActive(reply) => {
+                        let _ = reply.send(server.workspace_presentation_active());
+                    }
                     ServerCommand::CaptureWindowIdForSurface { surface_id, reply } => {
                         let _ = reply.send(server.state.window_id_for_surface(surface_id));
                     }
@@ -3041,6 +3045,18 @@ pub(in crate::compositor::tests) fn capture_window_id_for_surface(
     receiver
         .recv_timeout(Duration::from_secs(1))
         .expect("server should report window for surface")
+}
+
+pub(in crate::compositor::tests) fn capture_workspace_presentation_active(
+    commands: &Sender<ServerCommand>,
+) -> bool {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureWorkspacePresentationActive(reply))
+        .unwrap();
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("server should report workspace presentation state")
 }
 
 pub(in crate::compositor::tests) fn apply_xwayland_association_event(

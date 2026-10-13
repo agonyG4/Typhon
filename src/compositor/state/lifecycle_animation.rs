@@ -44,6 +44,7 @@ impl LifecycleVisibleSurfaceGeometry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LifecycleAdmissionReason {
     EffectDisabled,
+    WorkspacePresentationActive,
     RendererUnavailable,
     NoSceneNode,
     ClockUnavailable,
@@ -64,6 +65,7 @@ impl LifecycleAdmissionReason {
     const fn id(self) -> &'static str {
         match self {
             Self::EffectDisabled => "effect_disabled",
+            Self::WorkspacePresentationActive => "workspace_presentation_active",
             Self::RendererUnavailable => "renderer_unavailable",
             Self::NoSceneNode => "no_scene_node",
             Self::ClockUnavailable => "clock_unavailable",
@@ -335,29 +337,39 @@ impl CompositorState {
         window_id: WindowId,
         direction: LifecycleDirection,
     ) -> Option<LifecycleEffectKind> {
-        let active_effect = self
-            .scene_node_id_for_window_group(window_id)
-            .and_then(|scene_node_id| {
-                self.presentation_animator.active_retained_visual(
-                    scene_node_id,
-                    PresentationRetainedVisualKind::WindowLifecycle,
-                )
-            })
-            .and_then(|identity| {
-                let now = AnimationTime::monotonic_now().unwrap_or(AnimationTime::from_nanos(0));
-                self.window_lifecycle_animator
-                    .sample(identity, now)
-                    .map(|sample| sample.effect)
+        let active_identity =
+            self.scene_node_id_for_window_group(window_id)
+                .and_then(|scene_node_id| {
+                    self.presentation_animator.active_retained_visual(
+                        scene_node_id,
+                        PresentationRetainedVisualKind::WindowLifecycle,
+                    )
+                });
+        let has_active_lifecycle = active_identity.is_some();
+        let active_effect = active_identity.and_then(|identity| {
+            let now = AnimationTime::monotonic_now().unwrap_or(AnimationTime::from_nanos(0));
+            self.window_lifecycle_animator
+                .sample(identity, now)
+                .map(|sample| sample.effect)
+        });
+        if has_active_lifecycle {
+            return active_effect.or_else(|| {
+                LifecycleEffectKind::from_animation_effect(self.lifecycle_effect(direction))
             });
-        active_effect.or_else(|| {
-            LifecycleEffectKind::from_animation_effect(self.lifecycle_effect(direction))
-        })
+        }
+        if self.workspace_presentation.transition().is_some() {
+            return None;
+        }
+        LifecycleEffectKind::from_animation_effect(self.lifecycle_effect(direction))
     }
 
     fn lifecycle_effect_skip_reason(
         &self,
         direction: LifecycleDirection,
     ) -> LifecycleAdmissionReason {
+        if self.workspace_presentation.transition().is_some() {
+            return LifecycleAdmissionReason::WorkspacePresentationActive;
+        }
         if !self.animation_control.enabled() {
             return LifecycleAdmissionReason::EffectDisabled;
         }

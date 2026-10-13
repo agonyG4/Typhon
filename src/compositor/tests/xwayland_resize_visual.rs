@@ -1275,6 +1275,35 @@ fn xwayland_fullscreen_request_installs_output_visual_and_configure() {
         .state
         .current_visual_root_window_geometry(fixture.surface_id)
         .expect("floating visual geometry");
+    let target_workspace = crate::wm::WorkspaceId::new(2).expect("target workspace");
+    assert!(
+        fixture
+            .server
+            .state
+            .move_window_family_to_workspace(window_id, target_workspace)
+    );
+    let mut animation_configuration = crate::animation_control::AnimationConfiguration {
+        enabled: true,
+        ..crate::animation_control::AnimationConfiguration::default()
+    };
+    animation_configuration.overrides.insert(
+        crate::animation_control::AnimationSlot::WorkspaceSwitch,
+        crate::animation_control::AnimationEffect::WorkspaceSlide,
+    );
+    fixture
+        .server
+        .state
+        .set_animation_configuration(animation_configuration)
+        .expect("enable workspace slide");
+    fixture.server.state.activate_workspace(target_workspace);
+    assert!(
+        fixture
+            .server
+            .state
+            .workspace_presentation
+            .transition()
+            .is_some()
+    );
 
     let commands = fixture
         .server
@@ -1323,6 +1352,14 @@ fn xwayland_fullscreen_request_installs_output_visual_and_configure() {
             .state
             .mode(),
         crate::compositor::ToplevelMode::Fullscreen
+    );
+    assert!(
+        fixture
+            .server
+            .state
+            .workspace_presentation
+            .transition()
+            .is_none()
     );
     assert_eq!(
         fixture

@@ -1628,6 +1628,12 @@ impl CompositorState {
         else {
             return false;
         };
+        if self
+            .window(window_id)
+            .is_some_and(|window| window.state.is_minimized())
+        {
+            return false;
+        }
         let lifecycle_scene_node_id = self.scene_node_id_for_window_group(window_id);
         let has_active_lifecycle = lifecycle_scene_node_id
             .and_then(|scene_node_id| {
@@ -1640,10 +1646,12 @@ impl CompositorState {
         let active_lifecycle_visual_group = lifecycle_scene_node_id
             .filter(|_| has_active_lifecycle)
             .and_then(|scene_node_id| self.lifecycle_visual_group_for_scene_node(scene_node_id));
+        let minimize_effect =
+            self.lifecycle_effect_kind_for_window(window_id, LifecycleDirection::Minimize);
         let (presented_source_client_rect, canonical_client_rect, lifecycle_effect_scene) =
             if has_active_lifecycle {
                 (None, None, ResolvedEffectScene::default())
-            } else {
+            } else if minimize_effect.is_some() {
                 let presented_source_client_rect =
                     self.lifecycle_minimize_source_rect(root_surface_id);
                 let canonical_client_rect = self.lifecycle_window_rect(root_surface_id);
@@ -1659,6 +1667,8 @@ impl CompositorState {
                     canonical_client_rect,
                     effect_scene,
                 )
+            } else {
+                (None, None, ResolvedEffectScene::default())
             };
         let scene_effect = self.window_is_visible_in_active_scene(window_id);
         let tiled_location = self
@@ -1666,15 +1676,7 @@ impl CompositorState {
             .and_then(|window| window.management)
             .filter(|management| management.layout() == LayoutMembership::Tiled)
             .map(|management| management.location());
-        if self
-            .window(window_id)
-            .is_some_and(|window| window.state.is_minimized())
-        {
-            return false;
-        }
         self.trace_x11_mapping_state(window_id, "minimize_requested");
-        let minimize_effect =
-            self.lifecycle_effect_kind_for_window(window_id, LifecycleDirection::Minimize);
         let lifecycle_visible_geometry = if !has_active_lifecycle && minimize_effect.is_some() {
             self.lifecycle_visible_surface_geometry_for_root(
                 root_surface_id,
@@ -2523,16 +2525,16 @@ impl CompositorState {
                 )
             })
             .is_some();
-        let settled_visual_snapshot = (!has_active_lifecycle)
+        let restore_effect =
+            self.lifecycle_effect_kind_for_window(window_id, LifecycleDirection::Restore);
+        let settled_visual_snapshot = (!has_active_lifecycle && restore_effect.is_some())
             .then_some(minimized_visual_snapshot)
             .flatten();
-        let lifecycle_effect_scene = if has_active_lifecycle {
+        let lifecycle_effect_scene = if has_active_lifecycle || restore_effect.is_none() {
             ResolvedEffectScene::default()
         } else {
             self.resolved_effect_scene_for_lifecycle_root(root_surface_id)
         };
-        let restore_effect =
-            self.lifecycle_effect_kind_for_window(window_id, LifecycleDirection::Restore);
         let lifecycle_decorations = if !has_active_lifecycle
             && restore_effect.is_some()
             && lifecycle_scene_node_id
@@ -2558,6 +2560,8 @@ impl CompositorState {
         let lifecycle_visual_group = if has_active_lifecycle {
             lifecycle_scene_node_id
                 .and_then(|scene_node_id| self.lifecycle_visual_group_for_scene_node(scene_node_id))
+        } else if restore_effect.is_none() {
+            None
         } else {
             xwayland_restore_source
                 .map(|source| source.canonical_client_rect)
@@ -2797,6 +2801,11 @@ impl CompositorState {
             .and_then(|window_id| self.window(window_id))
             .map(|window| window.state.mode())
             .unwrap_or(ToplevelMode::Normal);
+        if mode == ToplevelMode::Fullscreen && previous_mode != ToplevelMode::Fullscreen {
+            self.settle_workspace_presentation_for_incompatible_transition(
+                crate::compositor::state::workspace_presentation::WorkspacePresentationFallbackReason::FullscreenTransition,
+            );
+        }
         let source_geometry = self
             .current_visual_root_window_geometry(surface_id)
             .or_else(|| self.current_root_window_geometry(surface_id))

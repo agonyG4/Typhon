@@ -80,6 +80,13 @@ impl CompositorState {
     /// DMA-BUF release tokens move into the dedicated prepared store before
     /// canonical teardown starts.
     pub(in crate::compositor) fn prepare_window_exit(&mut self, root_surface_id: u32) -> bool {
+        if self.workspace_presentation.transition().is_some() {
+            eprintln!(
+                "typhon.window_exit_admission event=preparation_skipped root_surface_id={} reason=workspace_presentation_active",
+                root_surface_id,
+            );
+            return false;
+        }
         let effect = self.animation_control.effective_effect(
             AnimationSlot::WindowClose,
             self.animation_runtime_capabilities(),

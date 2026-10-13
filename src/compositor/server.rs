@@ -1804,6 +1804,25 @@ impl OwnCompositorServer {
         self.state.activate_workspace(workspace)
     }
 
+    #[cfg(test)]
+    pub fn set_test_window_workspace(
+        &mut self,
+        window_id: crate::compositor::WindowId,
+        workspace: WorkspaceId,
+    ) -> bool {
+        if !self.state.workspace_manager.contains(workspace) {
+            return false;
+        }
+        let Some(window) = self.state.window_mut(window_id) else {
+            return false;
+        };
+        window.management = Some(crate::wm::WindowManagementState::new(
+            crate::wm::WorkspaceLocation::Regular(workspace),
+        ));
+        self.state.rebuild_active_scene_view();
+        true
+    }
+
     pub fn move_focused_window_to_workspace(&mut self, workspace: WorkspaceId) -> bool {
         self.state.move_focused_window_to_workspace(workspace)
     }
