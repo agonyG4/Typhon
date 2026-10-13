@@ -1200,6 +1200,515 @@ fn nvidia_ready_pacing_divergence_is_terminalized_before_a_new_output_epoch() {
     assert!(new_frame_scheduler.visual_work_queued());
 }
 
+#[derive(Clone, Copy)]
+enum VariableRetryPacingLane {
+    Active,
+    Ready,
+}
+
+struct VariableRetryFixture {
+    output_epoch: oblivion_one::native::OutputEpochId,
+    owner: crate::native_output::scanout::OutputFrameIdentitySnapshot,
+    swapchain: crate::native_output::scanout::AtomicOutputSwapchain,
+    scene_history: crate::native_output::runtime::NativeSceneHistory,
+    frame_pacing: crate::native_output::pacing::NativeFramePacing,
+    frame_scheduler: crate::native_output::runtime::NativeFrameScheduler,
+    output_transactions: crate::native_output::presentation::ledger::OutputTransactionLedger,
+    server: OwnCompositorServer,
+}
+
+fn signaled_retry_render_fence() -> crate::egl_renderer::native_fence::NativeRenderFence {
+    use std::os::fd::{FromRawFd, OwnedFd};
+
+    let mut pipe = [-1; 2];
+    assert_eq!(
+        unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) },
+        0
+    );
+    unsafe { libc::close(pipe[1]) };
+    crate::egl_renderer::native_fence::NativeRenderFence::from_submission_fd(unsafe {
+        OwnedFd::from_raw_fd(pipe[0])
+    })
+}
+
+fn variable_retry_fixture(lane: VariableRetryPacingLane) -> VariableRetryFixture {
+    use crate::native_output::NativeCursorDamageBounds;
+    use crate::native_output::pacing::NativeFramePacing;
+    use crate::native_output::presentation::kms_timing::KmsPresentationTiming;
+    use crate::native_output::presentation::plane::{
+        FrozenCursorTestPolicy, FrozenPrimaryCursorPlan, FrozenPrimaryCursorPresentation,
+        PresentedCursorDelivery,
+    };
+    use crate::native_output::presentation::transaction::OutputTransaction;
+    use crate::native_output::runtime::scene_history::NativeFrameSceneSnapshot;
+    use crate::native_output::runtime::{NativeFrameScheduler, NativeSceneHistory};
+    use crate::native_output::scanout::{OutputSlotId, OutputSlotSet};
+    use oblivion_one::compositor::PresentationFrameSnapshot;
+    use oblivion_one::core::OutputId;
+    use oblivion_one::native::presentation_deadline::MonotonicTimestampNs;
+    use oblivion_one::native::scheduler::NativeOutputPacingMode;
+    use oblivion_one::window_lifecycle_animation::LifecycleFrameSnapshot;
+
+    static NEXT_SOCKET_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+    let output_id = OutputId::from_raw(1).expect("test output ID is nonzero");
+    let output_epoch = oblivion_one::native::OutputEpochId::initial();
+    let slots = OutputSlotSet::new([
+        OutputSlotId::new(0).unwrap(),
+        OutputSlotId::new(1).unwrap(),
+        OutputSlotId::new(2).unwrap(),
+    ])
+    .unwrap();
+    let mut swapchain = crate::native_output::scanout::AtomicOutputSwapchain::from_presented_slots(
+        slots,
+        OutputSlotId::new(0).unwrap(),
+        1,
+    )
+    .unwrap();
+    let slot = swapchain.acquire_render_slot().unwrap();
+    let cursor_plan = FrozenPrimaryCursorPlan {
+        delivery: PresentedCursorDelivery::Hidden,
+        primary_presentation: FrozenPrimaryCursorPresentation::Preserve,
+        cursor_test_policy: FrozenCursorTestPolicy::Required,
+    };
+    swapchain
+        .prepare_ready_for_test(slot, signaled_retry_render_fence(), cursor_plan, None)
+        .unwrap();
+
+    let anchor = MonotonicTimestampNs::new(1_000_000_000);
+    let earliest = MonotonicTimestampNs::new(anchor.get() + 6_060_606);
+    let reservation = variable_reservation(
+        oblivion_one::native::buffering::PresentationOpportunityId::new(1, 1),
+        anchor,
+        earliest,
+        None,
+    );
+    swapchain
+        .set_ready_variable_presentation_for_test(
+            reservation,
+            KmsPresentationTiming::variable(earliest.get()),
+        )
+        .unwrap();
+    let owner = swapchain.ready_identity().expect("physical READY exists");
+
+    let socket_id = NEXT_SOCKET_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let socket = format!(
+        "typhon-variable-retry-test-{}-{}-{}",
+        std::process::id(),
+        owner.frame_id,
+        socket_id
+    );
+    let mut server = OwnCompositorServer::bind(socket).expect("test Wayland socket");
+    let batch_id = server.take_frame_batch_for_render(owner.frame_id);
+    assert_eq!(batch_id, owner.protocol_batch_id);
+
+    let mut scene_history = NativeSceneHistory::new(NativeFrameSceneSnapshot {
+        output_id,
+        frame_id: 0,
+        render_generation: 0,
+        scene: NativeSceneSnapshot::from_surfaces_with_scene_nodes(&[], &[], Vec::new(), &[]),
+        cursor_damage: NativeCursorDamageBounds::default(),
+        presentation: PresentationFrameSnapshot::empty_for_output(output_id),
+        lifecycle: LifecycleFrameSnapshot::default(),
+        canonical_scene_evidence: None,
+        window_exit_evidence: Vec::new(),
+    });
+    assert!(scene_history.replace_ready(NativeFrameSceneSnapshot {
+        output_id,
+        frame_id: owner.frame_id,
+        render_generation: owner.render_generation,
+        scene: NativeSceneSnapshot::from_surfaces_with_scene_nodes(&[], &[], Vec::new(), &[]),
+        cursor_damage: NativeCursorDamageBounds::default(),
+        presentation: PresentationFrameSnapshot::empty_for_output(output_id),
+        lifecycle: LifecycleFrameSnapshot::default(),
+        canonical_scene_evidence: None,
+        window_exit_evidence: Vec::new(),
+    }));
+
+    let mut frame_pacing = NativeFramePacing::from_env();
+    frame_pacing.queue_visual(1, owner.render_generation);
+    frame_pacing
+        .note_render_started(NativeOutputPacingMode::ReactiveDouble, false)
+        .unwrap();
+    frame_pacing.bind_physical_output_frame(owner).unwrap();
+    let mut frame_scheduler = NativeFrameScheduler::new_with_refresh_interval_ns(10, 0);
+    if matches!(lane, VariableRetryPacingLane::Ready) {
+        server.note_frame_callbacks_deferred_ready(batch_id);
+        frame_pacing.note_ready_frame(2, true);
+        frame_scheduler.note_ready_frame(None);
+    }
+
+    let transaction = OutputTransaction::composited_variable_with_direct_equivalence(
+        output_id,
+        owner.transaction_id,
+        output_epoch.get(),
+        MonotonicTimestampNs::new(1),
+        reservation,
+        crate::native_output::DrmContentType::Graphics,
+        NativeOutputPacingMode::ReactiveDouble,
+        owner.frame_id,
+        owner.render_generation,
+        owner.pool_generation,
+        owner.slot,
+        owner.framebuffer_id.get(),
+        None,
+        batch_id,
+        None,
+    )
+    .unwrap();
+    let mut output_transactions =
+        crate::native_output::presentation::ledger::OutputTransactionLedger::new_for_output(
+            output_id,
+        );
+    output_transactions.insert(transaction).unwrap();
+    output_transactions
+        .mark_ready(owner.transaction_id, MonotonicTimestampNs::new(2))
+        .unwrap();
+
+    VariableRetryFixture {
+        output_epoch,
+        owner,
+        swapchain,
+        scene_history,
+        frame_pacing,
+        frame_scheduler,
+        output_transactions,
+        server,
+    }
+}
+
+fn assert_variable_retry_terminalizes(
+    lane: VariableRetryPacingLane,
+    rejection: crate::native_output::scanout::VariableRetryRejection,
+) {
+    use crate::native_output::presentation::ledger::{
+        OutputTransactionDropReason, OutputTransactionState, OutputTransactionTerminal,
+    };
+    use crate::native_output::presentation::plane::{
+        FrozenCursorTestPolicy, FrozenPrimaryCursorPlan, FrozenPrimaryCursorPresentation,
+        PresentedCursorDelivery,
+    };
+    use crate::native_output::scanout::OutputFrameIdentitySnapshot;
+    use oblivion_one::native::presentation_deadline::MonotonicTimestampNs;
+
+    let mut fixture = variable_retry_fixture(lane);
+    let owner = fixture.owner;
+    match rejection {
+        crate::native_output::scanout::VariableRetryRejection::TestOnly => {
+            assert!(fixture.swapchain.suspend_abandon_ready().unwrap());
+        }
+        crate::native_output::scanout::VariableRetryRejection::RealSubmit => {
+            let frame = fixture.swapchain.take_ready_for_submission().unwrap();
+            let mut no_completion_fence = None;
+            fixture
+                .swapchain
+                .suspend_failed_submission(frame, &mut no_completion_fence)
+                .unwrap();
+        }
+    }
+    assert_eq!(fixture.swapchain.ready_identity(), None);
+    assert!(fixture.swapchain.contains_suspended_frame(owner));
+    assert!(
+        !fixture
+            .swapchain
+            .contains_suspended_frame(OutputFrameIdentitySnapshot {
+                frame_id: owner.frame_id.saturating_add(100),
+                ..owner
+            })
+    );
+
+    let output_epoch_before = fixture.output_epoch;
+    super::terminalize_suspended_frame_for_variable_retry(
+        &mut fixture.swapchain,
+        owner,
+        fixture.output_epoch,
+        &mut fixture.scene_history,
+        &mut fixture.frame_pacing,
+        &mut fixture.frame_scheduler,
+        &mut fixture.server,
+        &mut fixture.output_transactions,
+        MonotonicTimestampNs::new(3),
+        rejection,
+        &crate::native_output::NativePerfLogger::from_env(),
+    )
+    .expect("runtime settles the exact suspended Variable frame");
+
+    assert_eq!(fixture.output_epoch, output_epoch_before);
+    assert_eq!(fixture.scene_history.ready_frame_identity(), None);
+    assert!(!fixture.frame_scheduler.ready_frame_queued());
+    assert_eq!(fixture.frame_pacing.active, None);
+    assert_eq!(fixture.frame_pacing.ready, None);
+    assert_eq!(fixture.frame_pacing.active_physical_identity(), None);
+    assert_eq!(fixture.frame_pacing.unsubmitted_physical_identity(), None);
+    assert_eq!(fixture.swapchain.ready_identity(), None);
+    assert!(fixture.swapchain.has_suspended_ownership());
+    assert!(fixture.swapchain.contains_suspended_frame(owner));
+    assert!(
+        fixture
+            .output_transactions
+            .active_transaction_ids()
+            .is_empty()
+    );
+    assert!(matches!(
+        fixture
+            .output_transactions
+            .transaction_including_terminal(owner.transaction_id)
+            .expect("rejected transaction remains in the terminal ledger")
+            .state(),
+        OutputTransactionState::Terminal(OutputTransactionTerminal::Dropped {
+            reason: OutputTransactionDropReason::SafeAbandonment,
+            ..
+        })
+    ));
+
+    let repeated = super::terminalize_suspended_frame_for_variable_retry(
+        &mut fixture.swapchain,
+        owner,
+        fixture.output_epoch,
+        &mut fixture.scene_history,
+        &mut fixture.frame_pacing,
+        &mut fixture.frame_scheduler,
+        &mut fixture.server,
+        &mut fixture.output_transactions,
+        MonotonicTimestampNs::new(4),
+        rejection,
+        &crate::native_output::NativePerfLogger::from_env(),
+    );
+    assert!(
+        repeated.is_err(),
+        "logical retirement cannot be applied twice"
+    );
+    assert!(
+        fixture
+            .output_transactions
+            .active_transaction_ids()
+            .is_empty()
+    );
+
+    assert!(fixture.swapchain.suspended_fences_signaled().unwrap());
+    while let Some(frame) = fixture.swapchain.take_suspended_frame() {
+        drop(frame);
+    }
+    fixture.swapchain.recover_suspended_slot(true).unwrap();
+
+    let successor_slot = fixture.swapchain.acquire_render_slot().unwrap();
+    fixture
+        .swapchain
+        .prepare_ready_for_test(
+            successor_slot,
+            signaled_retry_render_fence(),
+            FrozenPrimaryCursorPlan {
+                delivery: PresentedCursorDelivery::Hidden,
+                primary_presentation: FrozenPrimaryCursorPresentation::Preserve,
+                cursor_test_policy: FrozenCursorTestPolicy::Required,
+            },
+            None,
+        )
+        .unwrap();
+    let successor = fixture.swapchain.ready_identity().unwrap();
+    assert_ne!(successor.frame_id, owner.frame_id);
+    assert_ne!(successor.transaction_id, owner.transaction_id);
+    assert_eq!(successor.output_id, owner.output_id);
+    assert_eq!(fixture.output_epoch.get(), output_epoch_before.get());
+    fixture
+        .frame_pacing
+        .queue_visual(5, successor.render_generation);
+    fixture
+        .frame_pacing
+        .note_render_started(
+            oblivion_one::native::scheduler::NativeOutputPacingMode::ReactiveDouble,
+            false,
+        )
+        .unwrap();
+    fixture
+        .frame_pacing
+        .bind_physical_output_frame(successor)
+        .expect("the terminalized predecessor releases the active pacing owner");
+    assert_eq!(
+        fixture.frame_pacing.active_physical_identity(),
+        Some(successor)
+    );
+}
+
+#[test]
+fn variable_test_only_rejection_terminalizes_immediate_active_owner() {
+    assert_variable_retry_terminalizes(
+        VariableRetryPacingLane::Active,
+        crate::native_output::scanout::VariableRetryRejection::TestOnly,
+    );
+}
+
+#[test]
+fn variable_real_submit_rejection_terminalizes_immediate_active_owner() {
+    assert_variable_retry_terminalizes(
+        VariableRetryPacingLane::Active,
+        crate::native_output::scanout::VariableRetryRejection::RealSubmit,
+    );
+}
+
+#[test]
+fn variable_test_only_rejection_terminalizes_deferred_ready_owner() {
+    assert_variable_retry_terminalizes(
+        VariableRetryPacingLane::Ready,
+        crate::native_output::scanout::VariableRetryRejection::TestOnly,
+    );
+}
+
+#[test]
+fn variable_real_submit_rejection_terminalizes_deferred_ready_owner() {
+    assert_variable_retry_terminalizes(
+        VariableRetryPacingLane::Ready,
+        crate::native_output::scanout::VariableRetryRejection::RealSubmit,
+    );
+}
+
+#[test]
+fn worker_queue_full_preserves_deferred_ready_ownership() {
+    use crate::native_output::presentation::ledger::OutputTransactionState;
+
+    let mut fixture = variable_retry_fixture(VariableRetryPacingLane::Ready);
+    let owner = fixture.owner;
+    let pacing_ticket = fixture
+        .frame_pacing
+        .reserve_worker_submission(true)
+        .expect("READY pacing owner can reserve a worker attempt");
+    assert!(pacing_ticket.is_some());
+    let outcome =
+        crate::native_output::runtime::presentation_worker::defer_explicit_worker_submission(
+            &mut fixture.frame_pacing,
+            pacing_ticket,
+            crate::native_output::kms_worker::KmsWorkerAdmissionError::QueueFull,
+        )
+        .expect("queue-full worker admission defers the same READY frame");
+
+    assert!(matches!(
+        outcome,
+        crate::native_output::runtime::presentation_worker::ExplicitReadySubmissionOutcome::AdmissionDeferred {
+            reason: crate::native_output::kms_worker::KmsWorkerAdmissionError::QueueFull,
+        }
+    ));
+    assert_eq!(fixture.swapchain.ready_identity(), Some(owner));
+    assert_eq!(fixture.frame_pacing.active, None);
+    assert!(fixture.frame_pacing.ready.is_some());
+    assert_eq!(
+        fixture.frame_pacing.unsubmitted_physical_identity(),
+        Some(owner)
+    );
+    assert_eq!(
+        fixture.scene_history.ready_frame_identity(),
+        Some((owner.frame_id, owner.render_generation))
+    );
+    assert!(fixture.frame_scheduler.ready_frame_queued());
+    assert!(
+        fixture
+            .output_transactions
+            .active_transaction_ids()
+            .contains(&owner.transaction_id)
+    );
+    assert!(matches!(
+        fixture
+            .output_transactions
+            .transaction(owner.transaction_id)
+            .unwrap()
+            .state(),
+        OutputTransactionState::Ready { .. }
+    ));
+}
+
+#[test]
+fn queued_worker_variable_rejection_settles_its_ticket_once() {
+    use crate::native_output::presentation::ledger::{
+        OutputTransactionDropReason, OutputTransactionState, OutputTransactionTerminal,
+    };
+    use crate::native_output::runtime::presentation_transactions::settle_dropped_output_transaction;
+    use oblivion_one::native::presentation_deadline::MonotonicTimestampNs;
+
+    let mut fixture = variable_retry_fixture(VariableRetryPacingLane::Ready);
+    let owner = fixture.owner;
+    let token = PageFlipToken::new(900).expect("worker token is nonzero");
+    let pacing_ticket = fixture
+        .frame_pacing
+        .reserve_worker_submission(true)
+        .expect("worker reservation uses the READY pacing owner");
+    fixture
+        .output_transactions
+        .mark_queued(
+            owner.transaction_id,
+            fixture.output_epoch.get(),
+            MonotonicTimestampNs::new(3),
+        )
+        .unwrap();
+    let in_fence = fixture
+        .swapchain
+        .take_ready_for_worker(token, MonotonicTimestampNs::new(3))
+        .unwrap()
+        .0;
+    fixture
+        .scene_history
+        .queue_submission_or_error(token.get())
+        .unwrap();
+    fixture.frame_scheduler.consume_ready_frame();
+    let mut completion_fence = Some(in_fence);
+
+    // This is the existing asynchronous worker rejection order: submitted
+    // scene and pacing ticket are retired by the worker boundary, then the
+    // physical job is suspended and its transaction is safely abandoned.
+    fixture.scene_history.discard_submission(token.get());
+    assert!(fixture.frame_pacing.cancel_worker_submission(pacing_ticket));
+    fixture
+        .swapchain
+        .suspend_abandon_worker_queued_with_completion_fence(token, &mut completion_fence)
+        .unwrap();
+    settle_dropped_output_transaction(
+        &mut fixture.output_transactions,
+        owner.transaction_id,
+        OutputTransactionDropReason::SafeAbandonment,
+        MonotonicTimestampNs::new(4),
+        |obligations| {
+            crate::native_output::runtime::presentation_transactions::restore_presentation_feedback_obligation(
+                &mut fixture.server,
+                obligations,
+            );
+            let batch_id = obligations
+                .frame_batch_id()
+                .expect("worker Variable transaction retains its frame batch");
+            fixture.server.restore_frame_batch_after_render_failure(batch_id);
+            Ok(())
+        },
+    )
+    .unwrap();
+    fixture
+        .frame_pacing
+        .queue_visual(6, owner.render_generation + 1);
+    fixture.frame_scheduler.queue_visual_work();
+
+    assert_eq!(fixture.frame_pacing.unsubmitted_physical_identity(), None);
+    assert_eq!(fixture.scene_history.submitted_frame_id(token.get()), None);
+    assert!(!fixture.frame_scheduler.ready_frame_queued());
+    assert!(fixture.swapchain.contains_suspended_frame(owner));
+    assert!(
+        fixture
+            .output_transactions
+            .active_transaction_ids()
+            .is_empty()
+    );
+    assert!(matches!(
+        fixture
+            .output_transactions
+            .transaction_including_terminal(owner.transaction_id)
+            .unwrap()
+            .state(),
+        OutputTransactionState::Terminal(OutputTransactionTerminal::Dropped {
+            reason: OutputTransactionDropReason::SafeAbandonment,
+            ..
+        })
+    ));
+    assert!(
+        !fixture.frame_pacing.cancel_worker_submission(pacing_ticket),
+        "the worker pacing ticket is already settled and cannot be consumed twice"
+    );
+}
+
 fn worker_composited_job() -> (KmsCommitJob, AtomicOutputSwapchain) {
     let transaction_id = OutputTransactionId::new(NonZeroU64::new(41).unwrap());
     let token = PageFlipToken::new(41).unwrap();
