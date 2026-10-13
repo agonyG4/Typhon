@@ -1,5 +1,11 @@
 use super::*;
 
+#[derive(Debug, Clone, Copy)]
+struct PointerButtonPressState {
+    button: u32,
+    delivery: Option<NativePointerButtonDelivery>,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct NativeInputState {
     pub(crate) output_width: u32,
@@ -23,7 +29,7 @@ pub(crate) struct NativeInputState {
     keyboard_repeat: KeyboardRepeatState,
     #[cfg(test)]
     pub(crate) source_removal_modifier_release_routes: Vec<(u16, ModifierMask)>,
-    pressed_pointer_buttons: Vec<u32>,
+    pressed_pointer_buttons: Vec<PointerButtonPressState>,
 }
 
 impl NativeInputState {
@@ -828,6 +834,7 @@ impl NativeInputState {
         pressed: bool,
     ) -> NativeInputEffect {
         let mut effect = NativeInputEffect::default();
+        let sequence_owner_before = self.pointer_button_delivery(button);
         self.set_pointer_button_pressed(button, pressed);
 
         let modifiers = self.active_modifier_mask();
@@ -835,37 +842,65 @@ impl NativeInputState {
         let binding_match = self
             .binding_manager
             .handle_pointer_button(modifiers, button, pressed, inhibited);
-        input_trace_log(|| match &binding_match {
-            AstreaBindingMatch::Consumed { action, .. } => format!(
-                "event=pointer_binding button={button} button_name={} pressed={pressed} modifiers={modifiers:?} shortcut_inhibited={inhibited} binding_result=consumed binding_action={action:?} cursor_x={} cursor_y={}",
-                linux_pointer_button_name(button),
-                self.cursor_x,
-                self.cursor_y,
-            ),
-            AstreaBindingMatch::Pass => format!(
-                "event=pointer_binding button={button} button_name={} pressed={pressed} modifiers={modifiers:?} shortcut_inhibited={inhibited} binding_result=pass binding_action=none cursor_x={} cursor_y={}",
-                linux_pointer_button_name(button),
-                self.cursor_x,
-                self.cursor_y,
-            ),
-        });
-        resize_debug_log(|| {
+        let binding_consumed = matches!(binding_match, AstreaBindingMatch::Consumed { .. });
+        let (delivery, route_event) = if pressed {
+            let delivery = sequence_owner_before.unwrap_or_else(|| {
+                let delivery = if binding_consumed {
+                    NativePointerButtonDelivery::Compositor
+                } else {
+                    NativePointerButtonDelivery::Client
+                };
+                self.pin_pointer_button_delivery(button, delivery);
+                delivery
+            });
+            (delivery, delivery == NativePointerButtonDelivery::Client)
+        } else {
+            match sequence_owner_before {
+                Some(delivery) => (delivery, true),
+                None if !binding_consumed => (NativePointerButtonDelivery::Client, true),
+                None => (NativePointerButtonDelivery::Client, false),
+            }
+        };
+        let sequence_owner_after = self.pointer_button_delivery(button);
+        let binding_result = if binding_consumed { "consumed" } else { "pass" };
+        let delivery_name = delivery.as_str();
+        let delivery_owner_name = if pressed {
+            delivery_name
+        } else {
+            sequence_owner_before.map_or("unknown", NativePointerButtonDelivery::as_str)
+        };
+        let event_delivery_name = if route_event { delivery_name } else { "none" };
+        input_trace_log(|| {
             format!(
-                "event=hardware_button button={} pressed={} modifiers={:?} binding_result={} binding_action={}",
-                button,
-                pressed,
-                modifiers,
-                match &binding_match {
-                    AstreaBindingMatch::Consumed { .. } => "consumed",
-                    AstreaBindingMatch::Pass => "pass",
-                },
+                "event=pointer_binding button={button} button_name={} pressed={pressed} modifiers={modifiers:?} shortcut_inhibited={inhibited} binding_result={binding_result} binding_action={} sequence_owner_before={} sequence_owner_after={} delivery_owner={delivery_owner_name} press_owner={} release_binding_result={} release_delivery={event_delivery_name} cursor_x={} cursor_y={}",
+                linux_pointer_button_name(button),
                 match &binding_match {
                     AstreaBindingMatch::Consumed { action, .. } => format!("{action:?}"),
                     AstreaBindingMatch::Pass => "none".to_string(),
                 },
+                sequence_owner_before.map_or("unknown", NativePointerButtonDelivery::as_str),
+                sequence_owner_after.map_or("unknown", NativePointerButtonDelivery::as_str),
+                sequence_owner_before.map_or("unknown", NativePointerButtonDelivery::as_str),
+                binding_result,
+                self.cursor_x,
+                self.cursor_y,
             )
         });
-        let binding_consumed = matches!(binding_match, AstreaBindingMatch::Consumed { .. });
+        resize_debug_log(|| {
+            format!(
+                "event=hardware_button button={} pressed={} modifiers={:?} binding_result={} binding_action={} delivery_owner={} event_routed={}",
+                button,
+                pressed,
+                modifiers,
+                binding_result,
+                match &binding_match {
+                    AstreaBindingMatch::Consumed { action, .. } => format!("{action:?}"),
+                    AstreaBindingMatch::Pass => "none".to_string(),
+                },
+                delivery_owner_name,
+                route_event,
+            )
+        });
         match binding_match {
             AstreaBindingMatch::Consumed { action, phase, .. } => {
                 self.apply_binding_action(action, phase, Some(button), &mut effect);
@@ -873,23 +908,24 @@ impl NativeInputState {
             AstreaBindingMatch::Pass => {}
         }
 
-        if !binding_consumed {
+        if route_event {
             effect
                 .pointer_buttons
-                .push(NativePointerButtonEvent::new_at(
+                .push(NativePointerButtonEvent::new_at_with_delivery(
                     button,
                     pressed,
                     self.cursor_x,
                     self.cursor_y,
                     self.output_width,
                     self.output_height,
+                    delivery,
                 ));
             effect.request_redraw();
         }
         resize_debug_log(|| {
             format!(
-                "event=effect_button button={} pressed={} forwarded_to_apply={} window_actions={:?}",
-                button, pressed, !binding_consumed, effect.window_actions,
+                "event=effect_button button={} pressed={} delivery_owner={} event_routed={} window_actions={:?}",
+                button, pressed, delivery_owner_name, route_event, effect.window_actions,
             )
         });
         trace_native_input_effect_actions(&effect);
@@ -898,21 +934,51 @@ impl NativeInputState {
 
     fn set_pointer_button_pressed(&mut self, button: u32, pressed: bool) {
         if pressed {
-            if !self.pressed_pointer_buttons.contains(&button) {
-                self.pressed_pointer_buttons.push(button);
+            if !self
+                .pressed_pointer_buttons
+                .iter()
+                .any(|state| state.button == button)
+            {
+                self.pressed_pointer_buttons.push(PointerButtonPressState {
+                    button,
+                    delivery: None,
+                });
             }
         } else {
             self.pressed_pointer_buttons
-                .retain(|pressed_button| *pressed_button != button);
+                .retain(|state| state.button != button);
+        }
+    }
+
+    fn pointer_button_delivery(&self, button: u32) -> Option<NativePointerButtonDelivery> {
+        self.pressed_pointer_buttons
+            .iter()
+            .find(|state| state.button == button)
+            .and_then(|state| state.delivery)
+    }
+
+    fn pin_pointer_button_delivery(&mut self, button: u32, delivery: NativePointerButtonDelivery) {
+        if let Some(state) = self
+            .pressed_pointer_buttons
+            .iter_mut()
+            .find(|state| state.button == button)
+            && state.delivery.is_none()
+        {
+            state.delivery = Some(delivery);
         }
     }
 
     pub(crate) fn is_pointer_button_pressed(&self, button: u32) -> bool {
-        self.pressed_pointer_buttons.contains(&button)
+        self.pressed_pointer_buttons
+            .iter()
+            .any(|state| state.button == button)
     }
 
     pub(crate) fn pressed_pointer_buttons_snapshot(&self) -> Vec<u32> {
-        self.pressed_pointer_buttons.clone()
+        self.pressed_pointer_buttons
+            .iter()
+            .map(|state| state.button)
+            .collect()
     }
 
     pub(crate) fn clear_pressed_pointer_buttons(&mut self) {

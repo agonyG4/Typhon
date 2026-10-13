@@ -2366,13 +2366,14 @@ fn native_input_super_mouse_buttons_start_window_interactions() {
     assert!(move_end.window_actions.is_empty());
     assert_eq!(
         move_end.pointer_buttons,
-        vec![NativePointerButtonEvent::new_at(
+        vec![NativePointerButtonEvent::new_at_with_delivery(
             u32::from(BTN_LEFT),
             false,
             184.0,
             112.0,
             320,
             200,
+            NativePointerButtonDelivery::Compositor,
         )]
     );
 
@@ -2388,6 +2389,20 @@ fn native_input_super_mouse_buttons_start_window_interactions() {
         }]
     );
     assert!(resize_start.pointer_buttons.is_empty());
+    resize_input.handle_key_event(KEY_LEFTMETA, 0);
+    let resize_end = resize_input.handle_pointer_button(u32::from(BTN_RIGHT), false);
+    assert_eq!(
+        resize_end.pointer_buttons,
+        vec![NativePointerButtonEvent::new_at_with_delivery(
+            u32::from(BTN_RIGHT),
+            false,
+            160.0,
+            100.0,
+            320,
+            200,
+            NativePointerButtonDelivery::Compositor,
+        )]
+    );
 }
 
 #[test]
@@ -4340,6 +4355,17 @@ pub(super) fn spawn_native_input_resize_client(
                     queue.roundtrip(&mut state).unwrap();
                     events_sender.send(ClientEvent::MoveRequested).unwrap();
                 }
+                ClientCommand::BeginXdgResize => {
+                    queue.roundtrip(&mut state).unwrap();
+                    toplevel.resize(
+                        &seat,
+                        state.last_button_press_serial.unwrap(),
+                        client_xdg_toplevel::ResizeEdge::BottomRight,
+                    );
+                    connection.flush().unwrap();
+                    queue.roundtrip(&mut state).unwrap();
+                    events_sender.send(ClientEvent::ResizeRequested).unwrap();
+                }
                 ClientCommand::CaptureButtons => {
                     queue.roundtrip(&mut state).unwrap();
                     events_sender
@@ -4454,6 +4480,7 @@ pub(super) fn spawn_native_input_keyboard_client(
                 | ClientCommand::CaptureCursorState
                 | ClientCommand::CaptureActive
                 | ClientCommand::BeginXdgMove
+                | ClientCommand::BeginXdgResize
                 | ClientCommand::CaptureButtons => {
                     panic!("unexpected keyboard test client command")
                 }

@@ -1660,17 +1660,44 @@ pub(crate) fn apply_native_input_effect(
         } else {
             oblivion_one::compositor::WindowInteractionButtonRelease::NotInteractionTrigger
         };
-        let compositor_release_consumed = matches!(
-            release_outcome,
+        let interaction_release_delivery = match &release_outcome {
             oblivion_one::compositor::WindowInteractionButtonRelease::Ended {
-                delivery: oblivion_one::compositor::TriggerReleaseDelivery::CompositorOwned,
-                ..
-            }
-        );
-        let client_dispatch = !compositor_release_consumed;
+                delivery, ..
+            } => Some(*delivery),
+            oblivion_one::compositor::WindowInteractionButtonRelease::NotInteractionTrigger => None,
+        };
+        let compositor_release_consumed = interaction_release_delivery
+            == Some(oblivion_one::compositor::TriggerReleaseDelivery::CompositorOwned);
+        let client_dispatch = match interaction_release_delivery {
+            Some(oblivion_one::compositor::TriggerReleaseDelivery::ClientOwned) => true,
+            Some(oblivion_one::compositor::TriggerReleaseDelivery::CompositorOwned) => false,
+            None => event.delivery == NativePointerButtonDelivery::Client,
+        };
+        if let Some(delivery) = interaction_release_delivery {
+            let expected_event_delivery = match delivery {
+                oblivion_one::compositor::TriggerReleaseDelivery::ClientOwned => {
+                    NativePointerButtonDelivery::Client
+                }
+                oblivion_one::compositor::TriggerReleaseDelivery::CompositorOwned => {
+                    NativePointerButtonDelivery::Compositor
+                }
+            };
+            debug_assert_eq!(
+                event.delivery, expected_event_delivery,
+                "pointer sequence delivery disagrees with its active window interaction"
+            );
+        }
+        input_trace_log(|| {
+            format!(
+                "event=pointer_route button={} pressed={} event_delivery={} release_outcome={release_outcome:?} client_dispatch={client_dispatch}",
+                event.button,
+                event.pressed,
+                event.delivery.as_str(),
+            )
+        });
         resize_debug_log(|| {
             format!(
-                "event=apply_button button={} pressed={} active_interaction_id={} active_trigger_button={} end_attempt={} release_outcome={release_outcome:?} client_dispatch={client_dispatch}",
+                "event=apply_button button={} pressed={} active_interaction_id={} active_trigger_button={} end_attempt={} event_delivery={} release_outcome={release_outcome:?} client_dispatch={client_dispatch}",
                 event.button,
                 event.pressed,
                 active.map_or_else(
@@ -1681,6 +1708,7 @@ pub(crate) fn apply_native_input_effect(
                     .and_then(|snapshot| snapshot.trigger_button)
                     .map_or_else(|| "none".to_string(), |button| button.to_string()),
                 end_attempt,
+                event.delivery.as_str(),
             )
         });
         if let oblivion_one::compositor::WindowInteractionButtonRelease::Ended {
@@ -1688,6 +1716,7 @@ pub(crate) fn apply_native_input_effect(
             context: release_context,
         } = release_outcome
         {
+            debug_assert_eq!(event.delivery, NativePointerButtonDelivery::Client);
             let _ = context
                 .server
                 .send_client_owned_trigger_release(release_context);
@@ -1700,6 +1729,7 @@ pub(crate) fn apply_native_input_effect(
             continue;
         }
         if compositor_release_consumed {
+            debug_assert_eq!(event.delivery, NativePointerButtonDelivery::Compositor);
             context.resize_perf.observe_action(
                 NativeWindowAction::EndInteraction,
                 true,
@@ -1708,9 +1738,11 @@ pub(crate) fn apply_native_input_effect(
             application.redraw_requested = true;
             continue;
         }
-        context
-            .server
-            .send_pointer_button_without_publication(event.button, event.pressed);
+        if client_dispatch {
+            context
+                .server
+                .send_pointer_button_without_publication(event.button, event.pressed);
+        }
     }
     if let Some(frame) = effect.pointer_axis {
         context.server.send_pointer_axis_frame(frame);

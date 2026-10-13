@@ -2,6 +2,7 @@
 pub(super) enum ClientEvent {
     ReadyForPointer,
     MoveRequested,
+    ResizeRequested,
     Buttons {
         pressed_count: usize,
         released_count: usize,
@@ -53,6 +54,7 @@ pub(super) enum ClientCommand {
     CaptureCursorState,
     CaptureActive,
     BeginXdgMove,
+    BeginXdgResize,
     CaptureButtons,
     CaptureKeyboard,
     CaptureKeyboardState,

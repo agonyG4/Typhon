@@ -72,6 +72,21 @@ impl NativeKeyboardEvent {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NativePointerButtonDelivery {
+    Client,
+    Compositor,
+}
+
+impl NativePointerButtonDelivery {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Client => "client",
+            Self::Compositor => "compositor",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct NativePointerButtonEvent {
     pub(crate) button: u32,
@@ -80,6 +95,7 @@ pub(crate) struct NativePointerButtonEvent {
     pub(crate) y: f64,
     pub(crate) output_width: u32,
     pub(crate) output_height: u32,
+    pub(crate) delivery: NativePointerButtonDelivery,
 }
 
 impl NativePointerButtonEvent {
@@ -91,6 +107,26 @@ impl NativePointerButtonEvent {
         output_width: u32,
         output_height: u32,
     ) -> Self {
+        Self::new_at_with_delivery(
+            button,
+            pressed,
+            x,
+            y,
+            output_width,
+            output_height,
+            NativePointerButtonDelivery::Client,
+        )
+    }
+
+    pub(crate) const fn new_at_with_delivery(
+        button: u32,
+        pressed: bool,
+        x: f64,
+        y: f64,
+        output_width: u32,
+        output_height: u32,
+        delivery: NativePointerButtonDelivery,
+    ) -> Self {
         Self {
             button,
             pressed,
@@ -98,6 +134,7 @@ impl NativePointerButtonEvent {
             y,
             output_width,
             output_height,
+            delivery,
         }
     }
 }

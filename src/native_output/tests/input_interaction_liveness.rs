@@ -39,13 +39,14 @@ fn physical_pointer_button_state_updates_before_binding_consumption() {
     assert!(!input.is_pointer_button_pressed(u32::from(BTN_RIGHT)));
     assert_eq!(
         release.pointer_buttons,
-        vec![NativePointerButtonEvent::new_at(
+        vec![NativePointerButtonEvent::new_at_with_delivery(
             u32::from(BTN_RIGHT),
             false,
             160.0,
             100.0,
             320,
             200,
+            NativePointerButtonDelivery::Compositor,
         )]
     );
 }
@@ -65,7 +66,534 @@ fn physical_pointer_button_state_deduplicates_repeated_transitions() {
 }
 
 #[test]
-fn consumed_trigger_release_is_detected_by_reconciliation() {
+fn pointer_delivery_owner_survives_modifier_and_inhibition_changes() {
+    let button = u32::from(BTN_RIGHT);
+    let mut compositor_owned = NativeInputState::new(320, 200);
+    compositor_owned.handle_key_event(KEY_LEFTMETA, 1);
+    let press = compositor_owned.handle_pointer_button(button, true);
+    assert!(press.pointer_buttons.is_empty());
+
+    compositor_owned.handle_key_event(KEY_LEFTMETA, 0);
+    compositor_owned
+        .reconcile_keyboard_shortcut_inhibition(KeyboardShortcutInhibitionSnapshot::new(true, 1));
+    let release = compositor_owned.handle_pointer_button(button, false);
+    assert_eq!(release.pointer_buttons.len(), 1);
+    assert_eq!(
+        release.pointer_buttons[0].delivery,
+        NativePointerButtonDelivery::Compositor
+    );
+
+    let mut client_owned = NativeInputState::new(320, 200);
+    client_owned
+        .reconcile_keyboard_shortcut_inhibition(KeyboardShortcutInhibitionSnapshot::new(true, 1));
+    client_owned.handle_key_event(KEY_LEFTMETA, 1);
+    let press = client_owned.handle_pointer_button(button, true);
+    assert_eq!(press.pointer_buttons.len(), 1);
+    assert_eq!(
+        press.pointer_buttons[0].delivery,
+        NativePointerButtonDelivery::Client
+    );
+
+    client_owned
+        .reconcile_keyboard_shortcut_inhibition(KeyboardShortcutInhibitionSnapshot::new(false, 2));
+    client_owned.handle_key_event(KEY_LEFTMETA, 0);
+    let release = client_owned.handle_pointer_button(button, false);
+    assert_eq!(release.pointer_buttons.len(), 1);
+    assert_eq!(
+        release.pointer_buttons[0].delivery,
+        NativePointerButtonDelivery::Client
+    );
+}
+
+#[test]
+fn pointer_delivery_owners_are_independent_and_duplicate_press_does_not_retag() {
+    let left = u32::from(BTN_LEFT);
+    let middle = u32::from(BTN_MIDDLE);
+    let mut input = NativeInputState::new(320, 200);
+    input.handle_key_event(KEY_LEFTMETA, 1);
+
+    let left_press = input.handle_pointer_button(left, true);
+    assert!(left_press.pointer_buttons.is_empty());
+    let middle_press = input.handle_pointer_button(middle, true);
+    assert_eq!(middle_press.pointer_buttons.len(), 1);
+    assert_eq!(
+        middle_press.pointer_buttons[0].delivery,
+        NativePointerButtonDelivery::Client
+    );
+
+    input.binding_manager = AstreaBindingManager::with_specs(vec![BindingSpec {
+        modifiers: ModifierMask::SUPER,
+        trigger: BindingTrigger::PointerPress,
+        input: BindingInput::PointerButton(middle),
+        action: BindingActionDefinition::EmitShortcut {
+            namespace: "test".to_string(),
+            name: "duplicate_middle_press".to_string(),
+        },
+        repeat: RepeatPolicy::Disabled,
+        inhibition: InhibitionPolicy::Respect,
+        reserved: false,
+    }]);
+    let duplicate_middle_press = input.handle_pointer_button(middle, true);
+    assert_eq!(duplicate_middle_press.binding_action_invocations.len(), 1);
+    assert_eq!(duplicate_middle_press.pointer_buttons.len(), 1);
+    assert_eq!(
+        duplicate_middle_press.pointer_buttons[0].delivery,
+        NativePointerButtonDelivery::Client
+    );
+
+    input.handle_key_event(KEY_LEFTMETA, 0);
+    let left_release = input.handle_pointer_button(left, false);
+    let middle_release = input.handle_pointer_button(middle, false);
+    assert_eq!(
+        left_release.pointer_buttons[0].delivery,
+        NativePointerButtonDelivery::Compositor
+    );
+    assert_eq!(
+        middle_release.pointer_buttons[0].delivery,
+        NativePointerButtonDelivery::Client
+    );
+    assert!(input.pressed_pointer_buttons_snapshot().is_empty());
+}
+
+#[test]
+fn session_clear_retires_client_and_compositor_pointer_sequence_owners() {
+    let left = u32::from(BTN_LEFT);
+    let middle = u32::from(BTN_MIDDLE);
+    let mut input = NativeInputState::new(320, 200);
+    input.handle_key_event(KEY_LEFTMETA, 1);
+    assert!(
+        input
+            .handle_pointer_button(left, true)
+            .pointer_buttons
+            .is_empty()
+    );
+    assert_eq!(
+        input
+            .handle_pointer_button(middle, true)
+            .pointer_buttons
+            .len(),
+        1
+    );
+
+    input.clear_pressed_state_for_session_switch();
+    assert!(!input.is_pointer_button_pressed(left));
+    assert!(!input.is_pointer_button_pressed(middle));
+    assert!(input.pressed_pointer_buttons_snapshot().is_empty());
+
+    let new_left_press = input.handle_pointer_button(left, true);
+    assert_eq!(new_left_press.pointer_buttons.len(), 1);
+    assert_eq!(
+        new_left_press.pointer_buttons[0].delivery,
+        NativePointerButtonDelivery::Client
+    );
+    let new_left_release = input.handle_pointer_button(left, false);
+    assert_eq!(new_left_release.pointer_buttons.len(), 1);
+    assert_eq!(
+        new_left_release.pointer_buttons[0].delivery,
+        NativePointerButtonDelivery::Client
+    );
+
+    input.binding_manager = AstreaBindingManager::with_specs(vec![BindingSpec {
+        modifiers: ModifierMask::EMPTY,
+        trigger: BindingTrigger::PointerPress,
+        input: BindingInput::PointerButton(middle),
+        action: BindingActionDefinition::EmitShortcut {
+            namespace: "test".to_string(),
+            name: "new_middle_press".to_string(),
+        },
+        repeat: RepeatPolicy::Disabled,
+        inhibition: InhibitionPolicy::Respect,
+        reserved: false,
+    }]);
+    let new_middle_press = input.handle_pointer_button(middle, true);
+    assert!(new_middle_press.pointer_buttons.is_empty());
+    let middle_release = input.handle_pointer_button(middle, false);
+    assert_eq!(middle_release.pointer_buttons.len(), 1);
+    assert_eq!(
+        middle_release.pointer_buttons[0].delivery,
+        NativePointerButtonDelivery::Compositor
+    );
+}
+
+#[test]
+fn pointer_release_binding_does_not_steal_client_owned_release() {
+    let socket_name = format!("typhon-native-input-release-binding-{}", std::process::id());
+    let socket_path =
+        PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap()).join(&socket_name);
+    let mut server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let (client_commands, client_events) = spawn_native_input_resize_client(socket_path);
+
+    assert!(matches!(
+        pump_native_input_server_until(&mut server, &client_events),
+        ClientEvent::ReadyForPointer
+    ));
+    server.send_pointer_motion(92.0, 86.0);
+    client_commands.send(ClientCommand::SetCursor).unwrap();
+    assert!(matches!(
+        pump_native_input_server_until(&mut server, &client_events),
+        ClientEvent::CursorReady { .. }
+    ));
+
+    let button = u32::from(BTN_LEFT);
+    let mut input = NativeInputState::new(320, 200);
+    input.handle_pointer_motion_delta(-68.0, -14.0);
+    let press = input.handle_pointer_button(button, true);
+    assert_eq!(
+        press.pointer_buttons,
+        vec![NativePointerButtonEvent::new_at(
+            button, true, 92.0, 86.0, 320, 200,
+        )]
+    );
+    let mut resize_perf = NativeResizePerfState::default();
+    let mut process_supervisor = ChildSupervisor::new();
+    apply_native_input_effect(
+        press,
+        NativeInputApplyContext {
+            binding_action_catalog: &BindingActionCatalog::empty(),
+            server: &mut server,
+            perf: NativePerfLogger::from_env(),
+            resize_perf: &mut resize_perf,
+            cursor_mode: NativeCursorRenderMode::Software,
+            app_gpu_policy: EffectiveCompositorAppGpuPolicy::CpuOnly,
+            process_supervisor: &mut process_supervisor,
+            xwayland: None,
+        },
+    )
+    .unwrap();
+
+    input.binding_manager = AstreaBindingManager::with_specs(vec![BindingSpec {
+        modifiers: ModifierMask::EMPTY,
+        trigger: BindingTrigger::PointerRelease,
+        input: BindingInput::PointerButton(button),
+        action: BindingActionDefinition::EmitShortcut {
+            namespace: "test".to_string(),
+            name: "client_owned_release".to_string(),
+        },
+        repeat: RepeatPolicy::Disabled,
+        inhibition: InhibitionPolicy::Respect,
+        reserved: false,
+    }]);
+
+    let release = input.handle_pointer_button(button, false);
+
+    assert_eq!(release.binding_action_invocations.len(), 1);
+    assert_eq!(
+        release.pointer_buttons,
+        vec![NativePointerButtonEvent::new_at(
+            button, false, 92.0, 86.0, 320, 200,
+        )]
+    );
+    apply_native_input_effect(
+        release,
+        NativeInputApplyContext {
+            binding_action_catalog: input.binding_manager.action_catalog(),
+            server: &mut server,
+            perf: NativePerfLogger::from_env(),
+            resize_perf: &mut resize_perf,
+            cursor_mode: NativeCursorRenderMode::Software,
+            app_gpu_policy: EffectiveCompositorAppGpuPolicy::CpuOnly,
+            process_supervisor: &mut process_supervisor,
+            xwayland: None,
+        },
+    )
+    .unwrap();
+
+    client_commands.send(ClientCommand::CaptureButtons).unwrap();
+    assert_eq!(
+        pump_native_input_server_until(&mut server, &client_events),
+        ClientEvent::Buttons {
+            pressed_count: 1,
+            released_count: 1,
+        }
+    );
+    client_commands.send(ClientCommand::Finish).unwrap();
+    assert!(matches!(
+        pump_native_input_server_until(&mut server, &client_events),
+        ClientEvent::Finished { .. }
+    ));
+}
+
+#[test]
+fn compositor_owned_pointer_release_binding_keeps_release_in_effect() {
+    let socket_name = format!(
+        "typhon-native-input-compositor-release-binding-{}",
+        std::process::id()
+    );
+    let socket_path =
+        PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap()).join(&socket_name);
+    let mut server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let (client_commands, client_events) = spawn_native_input_resize_client(socket_path);
+    assert!(matches!(
+        pump_native_input_server_until(&mut server, &client_events),
+        ClientEvent::ReadyForPointer
+    ));
+    server.send_pointer_motion(92.0, 86.0);
+    client_commands.send(ClientCommand::SetCursor).unwrap();
+    assert!(matches!(
+        pump_native_input_server_until(&mut server, &client_events),
+        ClientEvent::CursorReady { .. }
+    ));
+
+    let button = u32::from(BTN_LEFT);
+    let mut input = NativeInputState::new(320, 200);
+    input.binding_manager = AstreaBindingManager::with_specs(vec![
+        BindingSpec {
+            modifiers: ModifierMask::EMPTY,
+            trigger: BindingTrigger::PointerPress,
+            input: BindingInput::PointerButton(button),
+            action: BindingActionDefinition::EmitShortcut {
+                namespace: "test".to_string(),
+                name: "compositor_press".to_string(),
+            },
+            repeat: RepeatPolicy::Disabled,
+            inhibition: InhibitionPolicy::Respect,
+            reserved: false,
+        },
+        BindingSpec {
+            modifiers: ModifierMask::EMPTY,
+            trigger: BindingTrigger::PointerRelease,
+            input: BindingInput::PointerButton(button),
+            action: BindingActionDefinition::EmitShortcut {
+                namespace: "test".to_string(),
+                name: "compositor_release".to_string(),
+            },
+            repeat: RepeatPolicy::Disabled,
+            inhibition: InhibitionPolicy::Respect,
+            reserved: false,
+        },
+    ]);
+
+    let press = input.handle_pointer_button(button, true);
+    assert!(press.pointer_buttons.is_empty());
+    assert_eq!(press.binding_action_invocations.len(), 1);
+    let mut resize_perf = NativeResizePerfState::default();
+    let mut process_supervisor = ChildSupervisor::new();
+    apply_native_input_effect(
+        press,
+        NativeInputApplyContext {
+            binding_action_catalog: input.binding_manager.action_catalog(),
+            server: &mut server,
+            perf: NativePerfLogger::from_env(),
+            resize_perf: &mut resize_perf,
+            cursor_mode: NativeCursorRenderMode::Software,
+            app_gpu_policy: EffectiveCompositorAppGpuPolicy::CpuOnly,
+            process_supervisor: &mut process_supervisor,
+            xwayland: None,
+        },
+    )
+    .unwrap();
+
+    let release = input.handle_pointer_button(button, false);
+    assert_eq!(release.binding_action_invocations.len(), 1);
+    assert_eq!(release.pointer_buttons.len(), 1);
+    assert_eq!(
+        release.pointer_buttons[0].delivery,
+        NativePointerButtonDelivery::Compositor
+    );
+    apply_native_input_effect(
+        release,
+        NativeInputApplyContext {
+            binding_action_catalog: input.binding_manager.action_catalog(),
+            server: &mut server,
+            perf: NativePerfLogger::from_env(),
+            resize_perf: &mut resize_perf,
+            cursor_mode: NativeCursorRenderMode::Software,
+            app_gpu_policy: EffectiveCompositorAppGpuPolicy::CpuOnly,
+            process_supervisor: &mut process_supervisor,
+            xwayland: None,
+        },
+    )
+    .unwrap();
+
+    client_commands.send(ClientCommand::CaptureButtons).unwrap();
+    assert_eq!(
+        pump_native_input_server_until(&mut server, &client_events),
+        ClientEvent::Buttons {
+            pressed_count: 0,
+            released_count: 0,
+        }
+    );
+    client_commands.send(ClientCommand::Finish).unwrap();
+    assert!(matches!(
+        pump_native_input_server_until(&mut server, &client_events),
+        ClientEvent::Finished { .. }
+    ));
+}
+
+#[test]
+fn rejected_native_binding_begin_resize_keeps_button_sequence_compositor_owned() {
+    let socket_name = format!("typhon-native-input-rejected-resize-{}", std::process::id());
+    let socket_path =
+        PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap()).join(&socket_name);
+    let mut server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let (client_commands, client_events) = spawn_native_input_resize_client(socket_path);
+
+    assert!(matches!(
+        pump_native_input_server_until(&mut server, &client_events),
+        ClientEvent::ReadyForPointer
+    ));
+    server.send_pointer_motion(92.0, 86.0);
+    client_commands.send(ClientCommand::SetCursor).unwrap();
+    assert!(matches!(
+        pump_native_input_server_until(&mut server, &client_events),
+        ClientEvent::CursorReady { .. }
+    ));
+    assert!(server.toggle_maximize_focused_window());
+    client_commands.send(ClientCommand::CaptureActive).unwrap();
+    assert!(matches!(
+        pump_native_input_server_until(&mut server, &client_events),
+        ClientEvent::Active { .. }
+    ));
+    server.send_pointer_motion(92.0, 86.0);
+    client_commands.send(ClientCommand::CaptureActive).unwrap();
+    let active = pump_native_input_server_until(&mut server, &client_events);
+    let ClientEvent::Active {
+        pointer_enter_count,
+        ..
+    } = active
+    else {
+        panic!("expected active pointer state, got {active:?}");
+    };
+    assert!(pointer_enter_count > 0);
+
+    server.send_pointer_button(u32::from(BTN_LEFT), true);
+    server.send_pointer_button(u32::from(BTN_LEFT), false);
+    client_commands.send(ClientCommand::CaptureButtons).unwrap();
+    assert_eq!(
+        pump_native_input_server_until(&mut server, &client_events),
+        ClientEvent::Buttons {
+            pressed_count: 1,
+            released_count: 1,
+        }
+    );
+
+    let button = u32::from(BTN_RIGHT);
+    let mut input = NativeInputState::new(320, 200);
+    input.handle_key_event(KEY_LEFTMETA, 1);
+    input.handle_pointer_motion_delta(-68.0, -14.0);
+    let press = input.handle_pointer_button(button, true);
+    assert!(press.pointer_buttons.is_empty());
+    assert_eq!(
+        press.window_actions,
+        vec![NativeWindowAction::BeginResize {
+            x: 92.0,
+            y: 86.0,
+            trigger_button: Some(button),
+        }]
+    );
+
+    let mut resize_perf = NativeResizePerfState::default();
+    let mut process_supervisor = ChildSupervisor::new();
+    apply_native_input_effect(
+        press,
+        NativeInputApplyContext {
+            binding_action_catalog: &BindingActionCatalog::empty(),
+            server: &mut server,
+            perf: NativePerfLogger::from_env(),
+            resize_perf: &mut resize_perf,
+            cursor_mode: NativeCursorRenderMode::Software,
+            app_gpu_policy: EffectiveCompositorAppGpuPolicy::CpuOnly,
+            process_supervisor: &mut process_supervisor,
+            xwayland: None,
+        },
+    )
+    .unwrap();
+    assert!(!server.window_interaction_active());
+
+    input.handle_key_event(KEY_LEFTMETA, 0);
+    let release = input.handle_pointer_button(button, false);
+    assert!(!input.is_pointer_button_pressed(button));
+    assert!(input.pressed_pointer_buttons_snapshot().is_empty());
+    assert_eq!(release.pointer_buttons.len(), 1);
+    assert_eq!(
+        release.pointer_buttons[0].delivery,
+        NativePointerButtonDelivery::Compositor
+    );
+    apply_native_input_effect(
+        release,
+        NativeInputApplyContext {
+            binding_action_catalog: &BindingActionCatalog::empty(),
+            server: &mut server,
+            perf: NativePerfLogger::from_env(),
+            resize_perf: &mut resize_perf,
+            cursor_mode: NativeCursorRenderMode::Software,
+            app_gpu_policy: EffectiveCompositorAppGpuPolicy::CpuOnly,
+            process_supervisor: &mut process_supervisor,
+            xwayland: None,
+        },
+    )
+    .unwrap();
+    assert!(!server.window_interaction_active());
+
+    assert!(server.toggle_fullscreen_focused_window());
+    let move_button = u32::from(BTN_LEFT);
+    input.handle_key_event(KEY_LEFTMETA, 1);
+    let move_press = input.handle_pointer_button(move_button, true);
+    assert!(move_press.pointer_buttons.is_empty());
+    assert_eq!(
+        move_press.window_actions,
+        vec![NativeWindowAction::BeginMove {
+            x: 92.0,
+            y: 86.0,
+            trigger_button: Some(move_button),
+        }]
+    );
+    apply_native_input_effect(
+        move_press,
+        NativeInputApplyContext {
+            binding_action_catalog: input.binding_manager.action_catalog(),
+            server: &mut server,
+            perf: NativePerfLogger::from_env(),
+            resize_perf: &mut resize_perf,
+            cursor_mode: NativeCursorRenderMode::Software,
+            app_gpu_policy: EffectiveCompositorAppGpuPolicy::CpuOnly,
+            process_supervisor: &mut process_supervisor,
+            xwayland: None,
+        },
+    )
+    .unwrap();
+    assert!(!server.window_interaction_active());
+
+    input.handle_key_event(KEY_LEFTMETA, 0);
+    let move_release = input.handle_pointer_button(move_button, false);
+    assert_eq!(move_release.pointer_buttons.len(), 1);
+    assert_eq!(
+        move_release.pointer_buttons[0].delivery,
+        NativePointerButtonDelivery::Compositor
+    );
+    apply_native_input_effect(
+        move_release,
+        NativeInputApplyContext {
+            binding_action_catalog: input.binding_manager.action_catalog(),
+            server: &mut server,
+            perf: NativePerfLogger::from_env(),
+            resize_perf: &mut resize_perf,
+            cursor_mode: NativeCursorRenderMode::Software,
+            app_gpu_policy: EffectiveCompositorAppGpuPolicy::CpuOnly,
+            process_supervisor: &mut process_supervisor,
+            xwayland: None,
+        },
+    )
+    .unwrap();
+    assert!(!server.window_interaction_active());
+
+    client_commands.send(ClientCommand::CaptureButtons).unwrap();
+    assert_eq!(
+        pump_native_input_server_until(&mut server, &client_events),
+        ClientEvent::Buttons {
+            pressed_count: 1,
+            released_count: 1,
+        }
+    );
+    client_commands.send(ClientCommand::Finish).unwrap();
+    assert!(matches!(
+        pump_native_input_server_until(&mut server, &client_events),
+        ClientEvent::Finished { .. }
+    ));
+}
+
+#[test]
+fn compositor_owned_trigger_release_ends_before_reconciliation_fallback() {
     let socket_name = format!(
         "typhon-native-input-consumed-release-{}",
         std::process::id()
@@ -81,7 +609,6 @@ fn consumed_trigger_release_is_detected_by_reconciliation() {
     ));
 
     let button = u32::from(BTN_RIGHT);
-    assert!(server.begin_window_resize_at_with_trigger(92.0, 86.0, button));
     server.send_pointer_motion(92.0, 86.0);
     client_commands.send(ClientCommand::SetCursor).unwrap();
     assert!(matches!(
@@ -90,6 +617,32 @@ fn consumed_trigger_release_is_detected_by_reconciliation() {
     ));
 
     let mut input = NativeInputState::new(320, 200);
+    input.handle_key_event(KEY_LEFTMETA, 1);
+    input.handle_pointer_motion_delta(-68.0, -14.0);
+    let press = input.handle_pointer_button(button, true);
+    assert!(press.pointer_buttons.is_empty());
+    assert!(matches!(
+        press.window_actions.as_slice(),
+        [NativeWindowAction::BeginResize { trigger_button: Some(trigger), .. }] if *trigger == button
+    ));
+    let mut resize_perf = NativeResizePerfState::default();
+    let mut process_supervisor = ChildSupervisor::new();
+    apply_native_input_effect(
+        press,
+        NativeInputApplyContext {
+            binding_action_catalog: input.binding_manager.action_catalog(),
+            server: &mut server,
+            perf: NativePerfLogger::from_env(),
+            resize_perf: &mut resize_perf,
+            cursor_mode: NativeCursorRenderMode::Software,
+            app_gpu_policy: EffectiveCompositorAppGpuPolicy::CpuOnly,
+            process_supervisor: &mut process_supervisor,
+            xwayland: None,
+        },
+    )
+    .unwrap();
+    assert!(server.window_interaction_active());
+
     input.binding_manager = AstreaBindingManager::with_specs(vec![BindingSpec {
         modifiers: ModifierMask::EMPTY,
         trigger: BindingTrigger::PointerRelease,
@@ -102,14 +655,17 @@ fn consumed_trigger_release_is_detected_by_reconciliation() {
         inhibition: InhibitionPolicy::Respect,
         reserved: false,
     }]);
-    input.handle_pointer_button(button, true);
+    input.handle_key_event(KEY_LEFTMETA, 0);
 
     let release = input.handle_pointer_button(button, false);
 
     assert!(!input.is_pointer_button_pressed(button));
-    assert!(release.pointer_buttons.is_empty());
-    let mut resize_perf = NativeResizePerfState::default();
-    let mut process_supervisor = ChildSupervisor::new();
+    assert_eq!(release.binding_action_invocations.len(), 1);
+    assert_eq!(release.pointer_buttons.len(), 1);
+    assert_eq!(
+        release.pointer_buttons[0].delivery,
+        NativePointerButtonDelivery::Compositor
+    );
     apply_native_input_effect(
         release,
         NativeInputApplyContext {
@@ -124,9 +680,20 @@ fn consumed_trigger_release_is_detected_by_reconciliation() {
         },
     )
     .unwrap();
-    assert!(server.window_interaction_active());
-    assert!(server.reconcile_window_interaction_trigger(false));
     assert!(!server.window_interaction_active());
+    assert!(!server.reconcile_window_interaction_trigger(false));
+    let metrics = server.window_interaction_release_metrics();
+    assert_eq!(metrics.window_interaction_trigger_releases, 1);
+    assert_eq!(metrics.window_interaction_compositor_releases_consumed, 1);
+    assert_eq!(metrics.window_interaction_client_releases_forwarded, 0);
+    client_commands.send(ClientCommand::CaptureButtons).unwrap();
+    assert_eq!(
+        pump_native_input_server_until(&mut server, &client_events),
+        ClientEvent::Buttons {
+            pressed_count: 0,
+            released_count: 0,
+        }
+    );
 
     client_commands.send(ClientCommand::Finish).unwrap();
     assert!(matches!(
@@ -205,6 +772,88 @@ fn client_owned_xdg_move_release_uses_production_native_routing() {
     let metrics = server.window_interaction_release_metrics();
     assert_eq!(metrics.window_interaction_trigger_releases, 100);
     assert_eq!(metrics.window_interaction_client_releases_forwarded, 100);
+    assert_eq!(metrics.window_interaction_release_target_missing, 0);
+    client_commands.send(ClientCommand::Finish).unwrap();
+    assert!(matches!(
+        pump_native_input_server_until(&mut server, &client_events),
+        ClientEvent::Finished { .. }
+    ));
+}
+
+#[test]
+fn client_owned_xdg_resize_release_uses_production_native_routing() {
+    let socket_name = format!(
+        "typhon-native-input-xdg-resize-release-{}",
+        std::process::id()
+    );
+    let socket_path =
+        PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap()).join(&socket_name);
+    let mut server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let (client_commands, client_events) = spawn_native_input_resize_client(socket_path);
+
+    assert!(matches!(
+        pump_native_input_server_until(&mut server, &client_events),
+        ClientEvent::ReadyForPointer
+    ));
+    server.send_pointer_motion(92.0, 86.0);
+    client_commands.send(ClientCommand::SetCursor).unwrap();
+    assert!(matches!(
+        pump_native_input_server_until(&mut server, &client_events),
+        ClientEvent::CursorReady { .. }
+    ));
+
+    let mut resize_perf = NativeResizePerfState::default();
+    let mut process_supervisor = ChildSupervisor::new();
+    for cycle in 0..3 {
+        server.send_pointer_button(u32::from(BTN_LEFT), true);
+        client_commands.send(ClientCommand::BeginXdgResize).unwrap();
+        assert!(matches!(
+            pump_native_input_server_until(&mut server, &client_events),
+            ClientEvent::ResizeRequested
+        ));
+        assert!(server.window_interaction_active(), "cycle {cycle}");
+
+        apply_native_input_effect(
+            NativeInputEffect {
+                pointer_buttons: vec![NativePointerButtonEvent::new_at(
+                    u32::from(BTN_LEFT),
+                    false,
+                    92.0,
+                    86.0,
+                    320,
+                    200,
+                )],
+                ..NativeInputEffect::default()
+            },
+            NativeInputApplyContext {
+                binding_action_catalog: &BindingActionCatalog::empty(),
+                server: &mut server,
+                perf: NativePerfLogger::from_env(),
+                resize_perf: &mut resize_perf,
+                cursor_mode: NativeCursorRenderMode::Software,
+                app_gpu_policy: EffectiveCompositorAppGpuPolicy::CpuOnly,
+                process_supervisor: &mut process_supervisor,
+                xwayland: None,
+            },
+        )
+        .unwrap();
+
+        assert!(!server.window_interaction_active(), "cycle {cycle}");
+        assert!(server.pointer_ownership_is_clear(), "cycle {cycle}");
+        server.send_pointer_button(u32::from(BTN_LEFT), false);
+        client_commands.send(ClientCommand::CaptureButtons).unwrap();
+        assert_eq!(
+            pump_native_input_server_until(&mut server, &client_events),
+            ClientEvent::Buttons {
+                pressed_count: cycle + 1,
+                released_count: cycle + 1,
+            }
+        );
+    }
+
+    let metrics = server.window_interaction_release_metrics();
+    assert_eq!(metrics.window_interaction_trigger_releases, 3);
+    assert_eq!(metrics.window_interaction_client_releases_forwarded, 3);
     assert_eq!(metrics.window_interaction_release_target_missing, 0);
     client_commands.send(ClientCommand::Finish).unwrap();
     assert!(matches!(
@@ -595,22 +1244,40 @@ fn compositor_owned_native_binding_release_is_consumed_by_production_routing() {
         pump_native_input_server_until(&mut server, &client_events),
         ClientEvent::CursorReady { .. }
     ));
-    assert!(server.begin_window_resize_at_with_trigger(92.0, 86.0, u32::from(BTN_RIGHT)));
 
+    let button = u32::from(BTN_RIGHT);
+    let mut input = NativeInputState::new(320, 200);
+    input.handle_key_event(KEY_LEFTMETA, 1);
+    input.handle_pointer_motion_delta(-68.0, -14.0);
+    let press = input.handle_pointer_button(button, true);
+    assert!(press.pointer_buttons.is_empty());
     let mut resize_perf = NativeResizePerfState::default();
     let mut process_supervisor = ChildSupervisor::new();
     apply_native_input_effect(
-        NativeInputEffect {
-            pointer_buttons: vec![NativePointerButtonEvent::new_at(
-                u32::from(BTN_RIGHT),
-                false,
-                92.0,
-                86.0,
-                320,
-                200,
-            )],
-            ..NativeInputEffect::default()
+        press,
+        NativeInputApplyContext {
+            binding_action_catalog: &BindingActionCatalog::empty(),
+            server: &mut server,
+            perf: NativePerfLogger::from_env(),
+            resize_perf: &mut resize_perf,
+            cursor_mode: NativeCursorRenderMode::Software,
+            app_gpu_policy: EffectiveCompositorAppGpuPolicy::CpuOnly,
+            process_supervisor: &mut process_supervisor,
+            xwayland: None,
         },
+    )
+    .unwrap();
+    assert!(server.window_interaction_active());
+
+    input.handle_key_event(KEY_LEFTMETA, 0);
+    let release = input.handle_pointer_button(button, false);
+    assert_eq!(release.pointer_buttons.len(), 1);
+    assert_eq!(
+        release.pointer_buttons[0].delivery,
+        NativePointerButtonDelivery::Compositor
+    );
+    apply_native_input_effect(
+        release,
         NativeInputApplyContext {
             binding_action_catalog: &BindingActionCatalog::empty(),
             server: &mut server,
@@ -625,6 +1292,70 @@ fn compositor_owned_native_binding_release_is_consumed_by_production_routing() {
     .unwrap();
 
     assert!(!server.window_interaction_active());
+    assert!(!server.reconcile_window_interaction_trigger(false));
+    assert!(!input.is_pointer_button_pressed(button));
+    assert!(input.pressed_pointer_buttons_snapshot().is_empty());
+
+    let first_release_metrics = server.window_interaction_release_metrics();
+    assert_eq!(first_release_metrics.window_interaction_trigger_releases, 1);
+    assert_eq!(
+        first_release_metrics.window_interaction_compositor_releases_consumed,
+        1
+    );
+
+    let move_button = u32::from(BTN_LEFT);
+    input.handle_key_event(KEY_LEFTMETA, 1);
+    let move_press = input.handle_pointer_button(move_button, true);
+    assert!(move_press.pointer_buttons.is_empty());
+    assert!(matches!(
+        move_press.window_actions.as_slice(),
+        [NativeWindowAction::BeginMove {
+            trigger_button: Some(trigger),
+            ..
+        }] if *trigger == move_button
+    ));
+    apply_native_input_effect(
+        move_press,
+        NativeInputApplyContext {
+            binding_action_catalog: &BindingActionCatalog::empty(),
+            server: &mut server,
+            perf: NativePerfLogger::from_env(),
+            resize_perf: &mut resize_perf,
+            cursor_mode: NativeCursorRenderMode::Software,
+            app_gpu_policy: EffectiveCompositorAppGpuPolicy::CpuOnly,
+            process_supervisor: &mut process_supervisor,
+            xwayland: None,
+        },
+    )
+    .unwrap();
+    assert!(server.window_interaction_active());
+
+    input.handle_key_event(KEY_LEFTMETA, 0);
+    let move_release = input.handle_pointer_button(move_button, false);
+    assert_eq!(move_release.pointer_buttons.len(), 1);
+    assert_eq!(
+        move_release.pointer_buttons[0].delivery,
+        NativePointerButtonDelivery::Compositor
+    );
+    apply_native_input_effect(
+        move_release,
+        NativeInputApplyContext {
+            binding_action_catalog: &BindingActionCatalog::empty(),
+            server: &mut server,
+            perf: NativePerfLogger::from_env(),
+            resize_perf: &mut resize_perf,
+            cursor_mode: NativeCursorRenderMode::Software,
+            app_gpu_policy: EffectiveCompositorAppGpuPolicy::CpuOnly,
+            process_supervisor: &mut process_supervisor,
+            xwayland: None,
+        },
+    )
+    .unwrap();
+    assert!(!server.window_interaction_active());
+    assert!(!server.reconcile_window_interaction_trigger(false));
+    assert!(!input.is_pointer_button_pressed(move_button));
+    assert!(input.pressed_pointer_buttons_snapshot().is_empty());
+
     client_commands.send(ClientCommand::CaptureButtons).unwrap();
     assert_eq!(
         pump_native_input_server_until(&mut server, &client_events),
@@ -634,8 +1365,8 @@ fn compositor_owned_native_binding_release_is_consumed_by_production_routing() {
         }
     );
     let metrics = server.window_interaction_release_metrics();
-    assert_eq!(metrics.window_interaction_trigger_releases, 1);
-    assert_eq!(metrics.window_interaction_compositor_releases_consumed, 1);
+    assert_eq!(metrics.window_interaction_trigger_releases, 2);
+    assert_eq!(metrics.window_interaction_compositor_releases_consumed, 2);
     assert_eq!(metrics.window_interaction_client_releases_forwarded, 0);
     client_commands.send(ClientCommand::Finish).unwrap();
     assert!(matches!(
