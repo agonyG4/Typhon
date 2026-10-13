@@ -1994,6 +1994,151 @@ fn unchanged_presented_geometry_keeps_hit_validity_and_changed_geometry_remaps_i
 }
 
 #[test]
+fn nonauthoritative_presented_geometry_does_not_remap_input() {
+    let surface_id = 3_914;
+    let mut state = xdg_state(
+        test_surface(surface_id),
+        DecorationPreference::ClientSide,
+        ToplevelMode::Normal,
+    );
+    let canonical = state
+        .current_presentation_rect_for_root(surface_id)
+        .expect("canonical presentation rectangle");
+    let screen_point = (canonical.x() + 130.0, canonical.y() + 80.0);
+    let initial_mapping = state
+        .presentation_input_point_for_root(surface_id, screen_point.0, screen_point.1)
+        .expect("initial input mapping");
+    let moved_physical_rect = crate::presentation_animation::PresentationRect::new(
+        canonical.x() + 100.0,
+        canonical.y() + 40.0,
+        canonical.width(),
+        canonical.height(),
+    )
+    .expect("moved physical rectangle");
+    let pointer_generation = state.pointer_hit_generation;
+    let topology_generation = state.interaction_topology_generation;
+
+    state.publish_presented_window_geometry(
+        0,
+        PresentedWindowGeometry::new(surface_id, moved_physical_rect),
+    );
+
+    assert_eq!(state.pointer_hit_generation, pointer_generation);
+    assert_eq!(state.interaction_topology_generation, topology_generation);
+    assert_eq!(
+        state
+            .presentation_input_point_for_root(surface_id, screen_point.0, screen_point.1)
+            .expect("non-authoritative geometry falls back to canonical input mapping"),
+        initial_mapping
+    );
+}
+
+#[test]
+fn cancel_presented_root_invalidates_exact_pointer_hit_without_changing_topology() {
+    let surface_id = 1;
+    let mut state = xdg_state(
+        test_surface(surface_id),
+        DecorationPreference::ClientSide,
+        ToplevelMode::Normal,
+    );
+    state.set_test_effective_xdg_window_geometry(
+        surface_id,
+        XdgWindowGeometry::new(0, 0, SURFACE_WIDTH as i32, SURFACE_HEIGHT as i32),
+    );
+    let (_display, _client) = install_test_toplevel_role(&mut state, surface_id);
+    let expected_target_surface = state
+        .surface_resource_by_id(surface_id)
+        .expect("test pointer target has a registered surface resource");
+    let output_id = state.native_output_id().expect("test output id");
+    let window_id = state
+        .window_id_for_surface(surface_id)
+        .expect("test window");
+    let scene_node_id = state
+        .scene_node_id_for_window_group(window_id)
+        .expect("test scene node");
+    let canonical_rect = state
+        .current_presentation_rect_for_root(surface_id)
+        .expect("canonical presentation rectangle");
+    let shift_x = 500.0;
+    let shift_y = 400.0;
+    let presented_rect = crate::presentation_animation::PresentationRect::new(
+        canonical_rect.x() + shift_x,
+        canonical_rect.y() + shift_y,
+        canonical_rect.width(),
+        canonical_rect.height(),
+    )
+    .expect("shifted physical rectangle");
+    let sample = crate::presentation_animation::PresentationSceneSample::empty_for_output(
+        output_id,
+        AnimationTime::from_nanos(1),
+        PresentationSampleTimeSource::MonotonicFallback,
+    );
+    let presentation =
+        crate::presentation_animation::PresentationFrameSnapshot::from_sample_with_presented_windows(
+            &sample,
+            vec![PresentedWindowGeometry::with_scene_node(
+                scene_node_id,
+                surface_id,
+                presented_rect,
+            )],
+        );
+    let topology_generation = state.interaction_topology_generation;
+    state.publish_presented_presentation(1, &presentation);
+    let pointer_generation = state.pointer_hit_generation;
+    assert_eq!(state.interaction_topology_generation, topology_generation);
+
+    let origin = state.active_scene_surface_origins()[0];
+    let point = (
+        f64::from(origin.0) + shift_x + 50.0,
+        f64::from(origin.1) + shift_y + 50.0,
+    );
+    let hit = state.pointer_scene_hit_at(point.0, point.1);
+    assert!(
+        matches!(
+            hit,
+            PointerSceneHit::Client { ref target }
+                if target.surface.id() == expected_target_surface.id()
+        ),
+        "expected a client hit at the physically mapped point, got {hit:?}"
+    );
+    assert_eq!(
+        state
+            .pointer_scene_hit_cache
+            .as_ref()
+            .expect("the exact point hit is cached")
+            .pointer_hit_generation(),
+        pointer_generation
+    );
+
+    state.cancel_presentation_for_root(surface_id);
+
+    assert_eq!(state.pointer_hit_generation, pointer_generation + 1);
+    assert_eq!(state.interaction_topology_generation, topology_generation);
+    assert!(state.presented_window_geometry(surface_id).is_none());
+    assert!(
+        state
+            .presented_presentation
+            .as_ref()
+            .expect("presentation snapshot remains authoritative")
+            .presented_window_geometry(surface_id)
+            .is_none(),
+        "root removal updates the mirrored snapshot projection too"
+    );
+    assert!(matches!(
+        state.pointer_scene_hit_at(point.0, point.1),
+        PointerSceneHit::None
+    ));
+
+    let pointer_generation_after_cancel = state.pointer_hit_generation;
+    state.cancel_presentation_for_root(surface_id + 1);
+    assert_eq!(
+        state.pointer_hit_generation,
+        pointer_generation_after_cancel
+    );
+    assert_eq!(state.interaction_topology_generation, topology_generation);
+}
+
+#[test]
 fn stacking_change_advances_topology_and_rebuilds_visual_stack_groups() {
     let first_surface_id = 3_912;
     let second_surface_id = 3_913;

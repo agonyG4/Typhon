@@ -224,8 +224,8 @@ mod tests {
         PresentationClipRect, PresentationEngine, PresentationFrameSnapshot,
         PresentationGeometryMutation, PresentationOpacity, PresentationOpacityMutation,
         PresentationRetainedVisualIdentity, PresentationRetainedVisualKind, PresentationRevisionId,
-        PresentationSampleTimeSource, PresentationTransactionId, PresentationTransactionRequest,
-        PresentationWindowTarget, PresentedWindowGeometry,
+        PresentationSampleTimeSource, PresentationSceneSample, PresentationTransactionId,
+        PresentationTransactionRequest, PresentationWindowTarget, PresentedWindowGeometry,
     };
     use crate::window_lifecycle_animation::{
         LifecycleDirection, LifecycleFrameSample, LifecycleFrameSnapshot, LifecycleMotionRequest,
@@ -238,6 +238,27 @@ mod tests {
 
     fn rect(x: f64, y: f64, width: f64, height: f64) -> PresentationRect {
         PresentationRect::new(x, y, width, height).expect("valid test rectangle")
+    }
+
+    fn physical_presentation_snapshot(
+        output_id: OutputId,
+        sampled_at: AnimationTime,
+        presented_windows: Vec<PresentedWindowGeometry>,
+    ) -> PresentationFrameSnapshot {
+        let sample = PresentationSceneSample::empty_for_output(
+            output_id,
+            sampled_at,
+            PresentationSampleTimeSource::MonotonicFallback,
+        );
+        PresentationFrameSnapshot::from_sample_with_presented_windows(&sample, presented_windows)
+    }
+
+    fn input_projection(presentation: &PresentationFrameSnapshot) -> Vec<(u32, PresentationRect)> {
+        presentation
+            .presented_windows
+            .iter()
+            .map(|window| (window.root_surface_id(), window.presented_rect()))
+            .collect()
     }
 
     fn clip_rect(x: f64, y: f64, width: f64, height: f64) -> PresentationClipRect {
@@ -452,20 +473,31 @@ mod tests {
         let pointer_generation_before_authority = state.pointer_hit_generation;
         let scene_node_id = SceneNodeId::from_raw(PRESENTATION_NODE).expect("scene node");
         let presented_rect = rect(20.0, 30.0, 180.0, 120.0);
-        let mut presentation = PresentationFrameSnapshot::empty_for_output(output_id);
-        presentation.presented_windows = vec![
-            PresentedWindowGeometry::with_scene_node(
-                scene_node_id,
-                root_surface_id,
-                presented_rect,
-            ),
-            PresentedWindowGeometry::with_scene_node(
-                SceneNodeId::from_raw(PRESENTATION_NODE + 1).expect("second scene node"),
-                root_surface_id + 1,
-                rect(230.0, 30.0, 100.0, 80.0),
-            ),
-        ];
-        presentation.signature = 1;
+        let second_window = PresentedWindowGeometry::with_scene_node(
+            SceneNodeId::from_raw(PRESENTATION_NODE + 1).expect("second scene node"),
+            root_surface_id + 1,
+            rect(230.0, 30.0, 100.0, 80.0),
+        );
+        let first_window = PresentedWindowGeometry::with_scene_node(
+            scene_node_id,
+            root_surface_id,
+            presented_rect,
+        );
+        let presentation = physical_presentation_snapshot(
+            output_id,
+            AnimationTime::from_nanos(1_000_000),
+            vec![second_window, first_window],
+        );
+        let reordered_presentation = physical_presentation_snapshot(
+            output_id,
+            AnimationTime::from_nanos(1_000_000),
+            vec![first_window, second_window],
+        );
+        assert_eq!(
+            input_projection(&presentation),
+            input_projection(&reordered_presentation),
+            "the canonical constructor makes producer input order irrelevant"
+        );
 
         state.publish_presented_presentation(1, &presentation);
         let after_authority = state.pointer_hit_generation;
@@ -479,18 +511,31 @@ mod tests {
         let metrics_before_repeats = state.pointer_input_metrics_snapshot();
 
         for frame_id in 2..=4 {
-            let mut repeated = presentation.clone();
-            repeated.sampled_at = AnimationTime::from_nanos(frame_id * 1_000_000);
-            repeated.signature = frame_id;
+            let mut repeated_windows = vec![
+                PresentedWindowGeometry::with_scene_node(
+                    scene_node_id,
+                    root_surface_id,
+                    presented_rect,
+                ),
+                second_window,
+            ];
             if frame_id == 3 {
-                repeated.presented_windows[0] = PresentedWindowGeometry::with_scene_node(
+                repeated_windows[0] = PresentedWindowGeometry::with_scene_node(
                     SceneNodeId::from_raw(PRESENTATION_NODE + 3).expect("replacement node"),
                     root_surface_id,
                     presented_rect,
                 );
-            } else if frame_id == 4 {
-                repeated.presented_windows.reverse();
             }
+            if frame_id == 4 {
+                repeated_windows.reverse();
+            }
+            let mut repeated = physical_presentation_snapshot(
+                output_id,
+                AnimationTime::from_nanos(frame_id * 1_000_000),
+                repeated_windows,
+            );
+            repeated.signature = frame_id;
+            assert_eq!(input_projection(&presentation), input_projection(&repeated));
             state.publish_presented_frame(PresentedFramePublication {
                 frame_id,
                 presentation: &repeated,
@@ -522,6 +567,92 @@ mod tests {
             metrics_after_repeats.visual_stack_groups_cache_rebuilds,
             metrics_before_repeats.visual_stack_groups_cache_rebuilds
         );
+    }
+
+    #[test]
+    fn physical_projection_changes_invalidate_pointer_hits_without_changing_topology() {
+        let mut state = CompositorState::new(None);
+        let output_id = state.native_output_id().expect("test output id");
+        let first_root = 71;
+        let second_root = 72;
+        let added_root = 73;
+        let first_node = SceneNodeId::from_raw(PRESENTATION_NODE).expect("first scene node");
+        let second_node = SceneNodeId::from_raw(PRESENTATION_NODE + 1).expect("second scene node");
+        let first_rect = rect(20.0, 30.0, 180.0, 120.0);
+        let second_rect = rect(230.0, 30.0, 100.0, 80.0);
+        let topology_generation = state.interaction_topology_generation;
+
+        let initial = physical_presentation_snapshot(
+            output_id,
+            AnimationTime::from_nanos(1_000_000),
+            vec![
+                PresentedWindowGeometry::with_scene_node(second_node, second_root, second_rect),
+                PresentedWindowGeometry::with_scene_node(first_node, first_root, first_rect),
+            ],
+        );
+        state.publish_presented_presentation(1, &initial);
+        let mut pointer_generation = state.pointer_hit_generation;
+        assert_eq!(state.interaction_topology_generation, topology_generation);
+
+        let identical_projection = physical_presentation_snapshot(
+            output_id,
+            AnimationTime::from_nanos(2_000_000),
+            vec![
+                PresentedWindowGeometry::with_scene_node(
+                    SceneNodeId::from_raw(PRESENTATION_NODE + 4).expect("replacement node"),
+                    first_root,
+                    first_rect,
+                ),
+                PresentedWindowGeometry::with_scene_node(second_node, second_root, second_rect),
+            ],
+        );
+        state.publish_presented_presentation(2, &identical_projection);
+        assert_eq!(state.pointer_hit_generation, pointer_generation);
+        assert_eq!(state.interaction_topology_generation, topology_generation);
+
+        let changed_rect = rect(240.0, 35.0, 100.0, 80.0);
+        let rect_changed = physical_presentation_snapshot(
+            output_id,
+            AnimationTime::from_nanos(3_000_000),
+            vec![
+                PresentedWindowGeometry::with_scene_node(first_node, first_root, first_rect),
+                PresentedWindowGeometry::with_scene_node(second_node, second_root, changed_rect),
+            ],
+        );
+        state.publish_presented_presentation(3, &rect_changed);
+        assert_eq!(state.pointer_hit_generation, pointer_generation + 1);
+        pointer_generation = state.pointer_hit_generation;
+        assert_eq!(state.interaction_topology_generation, topology_generation);
+
+        let root_added = physical_presentation_snapshot(
+            output_id,
+            AnimationTime::from_nanos(4_000_000),
+            vec![
+                PresentedWindowGeometry::with_scene_node(
+                    SceneNodeId::from_raw(PRESENTATION_NODE + 2).expect("added scene node"),
+                    added_root,
+                    rect(350.0, 30.0, 90.0, 70.0),
+                ),
+                PresentedWindowGeometry::with_scene_node(first_node, first_root, first_rect),
+                PresentedWindowGeometry::with_scene_node(second_node, second_root, changed_rect),
+            ],
+        );
+        state.publish_presented_presentation(4, &root_added);
+        assert_eq!(state.pointer_hit_generation, pointer_generation + 1);
+        pointer_generation = state.pointer_hit_generation;
+        assert_eq!(state.interaction_topology_generation, topology_generation);
+
+        let root_removed = physical_presentation_snapshot(
+            output_id,
+            AnimationTime::from_nanos(5_000_000),
+            vec![
+                PresentedWindowGeometry::with_scene_node(first_node, first_root, first_rect),
+                PresentedWindowGeometry::with_scene_node(second_node, second_root, changed_rect),
+            ],
+        );
+        state.publish_presented_presentation(5, &root_removed);
+        assert_eq!(state.pointer_hit_generation, pointer_generation + 1);
+        assert_eq!(state.interaction_topology_generation, topology_generation);
     }
 
     #[test]

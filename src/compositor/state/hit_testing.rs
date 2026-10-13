@@ -401,7 +401,8 @@ impl CompositorState {
             return Some((x, y, origin));
         }
 
-        if let Some(presented_window) = self.presented_window_geometry(presentation_owner)
+        if self.presented_presentation_frame_id != 0
+            && let Some(presented_window) = self.presented_window_geometry(presentation_owner)
             && let Some(canonical_rect) =
                 self.current_presentation_rect_for_root(presentation_owner)
         {

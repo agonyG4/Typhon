@@ -167,25 +167,11 @@ fn presented_window_input_projection_changed(
     previous: &[PresentedWindowGeometry],
     next: &[PresentedWindowGeometry],
 ) -> bool {
+    // Published vectors are ordered by root ID; snapshot construction sorts them.
     previous.len() != next.len()
-        || previous.iter().any(|window| {
-            let same_projection_count = |windows: &[PresentedWindowGeometry]| {
-                windows
-                    .iter()
-                    .filter(|candidate| {
-                        candidate.root_surface_id() == window.root_surface_id()
-                            && candidate.presented_rect() == window.presented_rect()
-                    })
-                    .count()
-            };
-            let first_rect_for_root = |windows: &[PresentedWindowGeometry]| {
-                windows
-                    .iter()
-                    .find(|candidate| candidate.root_surface_id() == window.root_surface_id())
-                    .map(|candidate| candidate.presented_rect())
-            };
-            same_projection_count(previous) != same_projection_count(next)
-                || first_rect_for_root(previous) != first_rect_for_root(next)
+        || previous.iter().zip(next).any(|(previous, next)| {
+            previous.root_surface_id() != next.root_surface_id()
+                || previous.presented_rect() != next.presented_rect()
         })
 }
 
@@ -1049,6 +1035,8 @@ impl CompositorState {
         {
             self.presentation_animator.cancel_all(scene_node_id);
         }
+        let input_projection_changed = self.presented_presentation_frame_id != 0
+            && self.presented_window_geometry(root_surface_id).is_some();
         if let Some(presentation) = self.presented_presentation.as_mut() {
             presentation
                 .transforms
@@ -1059,10 +1047,16 @@ impl CompositorState {
             presentation
                 .clips
                 .retain(|clip| clip.root_surface_id != root_surface_id);
+            presentation
+                .presented_windows
+                .retain(|window| window.root_surface_id() != root_surface_id);
             presentation.refresh_signature();
         }
         self.presented_window_geometries
             .retain(|window| window.root_surface_id() != root_surface_id);
+        if input_projection_changed {
+            self.advance_pointer_hit_generation();
+        }
     }
 
     pub(in crate::compositor) fn cancel_presentation_geometry_for_root(
