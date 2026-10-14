@@ -70,7 +70,7 @@ pub(super) fn build_render_begin_fields(
         ),
         PacingField::u64(
             "prediction_worker_submit_wake_ns",
-            prediction.p95_wake_lateness_ns,
+            prediction.p95_worker_submit_wake_lateness_ns,
         ),
         PacingField::u64(
             "prediction_worker_pre_submit_ns",
@@ -167,6 +167,7 @@ pub(super) fn build_buffering_performance_snapshot(
         predicted_parallel_service_ns: prediction.parallel_service_ns,
         predicted_parallel_samples: prediction.parallel_samples as u64,
         predicted_main_event_loop_wake_guard_ns: prediction.main_event_loop_wake_guard_ns,
+        predicted_worker_submit_wake_lateness_ns: prediction.p95_worker_submit_wake_lateness_ns,
         predicted_kms_dispatch_budget_ns: prediction.kms_dispatch_budget_ns,
         predicted_kms_apply_guard_ns: prediction.kms_apply_guard_ns,
         predicted_independent_p90_floor_ns: prediction.independent_p90_floor_ns,
@@ -419,7 +420,7 @@ pub(super) fn log_output_pipeline_snapshot(
 
 #[cfg(test)]
 mod tests {
-    use super::build_buffering_performance_snapshot;
+    use super::{build_buffering_performance_snapshot, build_render_begin_fields};
     use crate::native_output::pacing::NativeBufferingMetrics;
     use oblivion_one::native::adaptive_buffering::{
         AdaptiveBufferingController, AdaptiveRenderJournal, AdaptiveTripleBufferPolicy,
@@ -543,8 +544,45 @@ mod tests {
     }
 
     #[test]
+    fn worker_submit_wake_telemetry_uses_worker_history() {
+        let mut journal = AdaptiveRenderJournal::default();
+        journal.record_wake_lateness(700_000);
+        journal.record_fixed_timed_wake(25_000);
+        let prediction = journal.prediction(Duration::from_millis(10));
+        let buffering = AdaptiveBufferingController::new(AdaptiveTripleBufferPolicy::Auto);
+        let fields = build_render_begin_fields(
+            None,
+            None,
+            0,
+            0,
+            false,
+            &buffering,
+            0,
+            0,
+            &prediction,
+            Duration::from_millis(10),
+            super::NativeScanoutBufferSnapshot {
+                backend: super::NativeScanoutKind::Unavailable,
+                capacity: None,
+                current: None,
+                pending: None,
+                ready: None,
+                free_count: None,
+                gbm_surface_has_free_buffers: None,
+            },
+        );
+        let line = crate::native_output::pacing::pacing_line("render_begin", &fields);
+
+        assert!(
+            line.contains("prediction_worker_submit_wake_ns=25000"),
+            "{line}"
+        );
+    }
+
+    #[test]
     fn buffering_snapshot_exposes_cold_and_exact_parallel_evidence() {
         let mut journal = AdaptiveRenderJournal::default();
+        journal.record_fixed_timed_wake(42_000);
         let target_time = MonotonicTimestampNs::new(10_000_000);
         let target = PresentationTarget {
             sequence: 1,
@@ -596,6 +634,7 @@ mod tests {
         assert_eq!(value["predictedKmsDispatchBudgetNs"], 250_000);
         assert_eq!(value["predictedKmsApplyGuardNs"], 100_000);
         assert_eq!(value["predictedMainEventLoopWakeGuardNs"], 1_000_000);
+        assert_eq!(value["predictedWorkerSubmitWakeLatenessNs"], 42_000);
         assert_eq!(value["desiredFuturePrimaryCredit"], 1);
         assert_eq!(value["futurePrimaryCredit"], 1);
         assert_eq!(value["creditReleaseCleanOpportunities"], 0);

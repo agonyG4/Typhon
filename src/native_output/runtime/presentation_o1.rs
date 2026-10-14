@@ -144,6 +144,7 @@ mod tests {
             p90_recent_render_ns: 1_000_000,
             render_risk_ns: 10_000_000,
             p95_wake_lateness_ns: 1_000_000,
+            p95_worker_submit_wake_lateness_ns: 1_000_000,
             p95_atomic_submit_ns: 1_000_000,
             p95_worker_queue_residency_ns: 0,
             p95_worker_pre_submit_ns: 0,

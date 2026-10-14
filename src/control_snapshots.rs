@@ -803,6 +803,8 @@ pub struct BufferingPerformanceSnapshot {
     #[serde(default)]
     pub predicted_main_event_loop_wake_guard_ns: u64,
     #[serde(default)]
+    pub predicted_worker_submit_wake_lateness_ns: u64,
+    #[serde(default)]
     pub predicted_kms_dispatch_budget_ns: u64,
     #[serde(default)]
     pub predicted_kms_apply_guard_ns: u64,
@@ -1284,6 +1286,7 @@ mod tests {
         buffering["predictedParallelServiceNs"] = serde_json::json!(3500000);
         buffering["predictedParallelSamples"] = serde_json::json!(20);
         buffering["predictedMainEventLoopWakeGuardNs"] = serde_json::json!(200000);
+        buffering["predictedWorkerSubmitWakeLatenessNs"] = serde_json::json!(25000);
         buffering["predictedKmsDispatchBudgetNs"] = serde_json::json!(500000);
         buffering["predictedKmsApplyGuardNs"] = serde_json::json!(300000);
         let mut value = serde_json::json!({
@@ -1450,6 +1453,7 @@ mod tests {
         assert!(human.contains(
             "Exact parallel samples/render/queue/service: 20/3000000/1000000/3500000 ns"
         ));
+        assert!(human.contains("KMS worker-submit wake p95: 25000 ns"));
         assert!(human.contains("O1 desired/effective credit: 2/2"));
         assert!(human.contains("Credit release clean/horizon: 9/10"));
         assert_eq!(serde_json::to_value(&snapshot).unwrap(), value);

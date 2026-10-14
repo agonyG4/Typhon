@@ -19,7 +19,7 @@ pub fn human(result: &AstreactlResult) -> String {
             snapshot.minimized_window_count
         ),
         AstreactlResult::Performance(snapshot) => format!(
-            "CPU render p50/p95/p99: {}/{}/{} us\nRepaint skip/partial/full: {}/{}/{}\nTriple render-ahead attempts/ready: {}/{}\nO1 estimator/cold wake guard: {}/{}\nExact parallel samples/render/queue/service: {}/{}/{}/{} ns\nO1 wake/dispatch/apply/selected total: {}/{}/{}/{} ns\nMiss recovery remaining: {}\nO1 desired/effective credit: {}/{}\nCredit release clean/horizon: {}/{}",
+            "CPU render p50/p95/p99: {}/{}/{} us\nRepaint skip/partial/full: {}/{}/{}\nTriple render-ahead attempts/ready: {}/{}\nO1 estimator/cold wake guard: {}/{}\nExact parallel samples/render/queue/service: {}/{}/{}/{} ns\nO1 wake/dispatch/apply/selected total: {}/{}/{}/{} ns\nKMS worker-submit wake p95: {} ns\nMiss recovery remaining: {}\nO1 desired/effective credit: {}/{}\nCredit release clean/horizon: {}/{}",
             snapshot.compositor_cpu_render.p50_us,
             snapshot.compositor_cpu_render.p95_us,
             snapshot.compositor_cpu_render.p99_us,
@@ -38,6 +38,7 @@ pub fn human(result: &AstreactlResult) -> String {
             snapshot.buffering.predicted_kms_dispatch_budget_ns,
             snapshot.buffering.predicted_kms_apply_guard_ns,
             snapshot.buffering.predicted_total_service_ns,
+            snapshot.buffering.predicted_worker_submit_wake_lateness_ns,
             snapshot.buffering.predicted_miss_recovery_remaining,
             snapshot.buffering.desired_future_primary_credit,
             snapshot.buffering.future_primary_credit,

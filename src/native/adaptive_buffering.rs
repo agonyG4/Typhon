@@ -247,6 +247,7 @@ pub struct RenderPrediction {
     pub p90_recent_render_ns: u64,
     pub render_risk_ns: u64,
     pub p95_wake_lateness_ns: u64,
+    pub p95_worker_submit_wake_lateness_ns: u64,
     pub p95_atomic_submit_ns: u64,
     pub p95_worker_queue_residency_ns: u64,
     pub p95_worker_pre_submit_ns: u64,
@@ -578,6 +579,7 @@ impl AdaptiveRenderJournal {
                 render_risk.max(self.render_samples_ns.iter().copied().max().unwrap_or(0));
         }
         let p95_wake = nearest_rank(&self.wake_lateness_samples_ns, 95);
+        let p95_worker_submit_wake = nearest_rank(&self.worker_submit_wake_lateness_samples_ns, 95);
         let p95_ioctl = nearest_rank(&self.atomic_submit_samples_ns, 95);
         let p95_worker_pre_submit = nearest_rank(&self.worker_pre_submit_samples_ns, 95);
         let p95_worker_dispatch = nearest_rank(&self.worker_dispatch_samples_ns, 95);
@@ -639,6 +641,7 @@ impl AdaptiveRenderJournal {
             p90_recent_render_ns: p90,
             render_risk_ns: render_risk,
             p95_wake_lateness_ns: p95_wake,
+            p95_worker_submit_wake_lateness_ns: p95_worker_submit_wake,
             p95_atomic_submit_ns: p95_ioctl,
             p95_worker_queue_residency_ns: p95_queue_residency,
             p95_worker_pre_submit_ns: p95_worker_pre_submit,
@@ -2255,11 +2258,56 @@ mod tests {
         let prediction = journal.prediction(Duration::from_millis(10));
         assert_eq!(prediction.p90_recent_render_ns, 109);
         assert_eq!(prediction.p95_wake_lateness_ns, 1_115);
+        assert_eq!(prediction.p95_worker_submit_wake_lateness_ns, 3_115);
         assert_eq!(prediction.p95_worker_queue_residency_ns, 2_115);
-        assert_eq!(prediction.p95_wake_lateness_ns, 1_115);
         assert_eq!(prediction.p95_atomic_ioctl_ns, 4_115);
         assert_eq!(prediction.kms_dispatch_budget_ns, 5_121);
         assert_eq!(prediction.p95_target_slip_ns, 6_115);
+    }
+
+    #[test]
+    fn main_and_worker_wake_lateness_diagnostics_remain_independent() {
+        let mut journal = AdaptiveRenderJournal::default();
+        journal.record_wake_lateness(25_000);
+
+        let main_wake_only = journal.prediction(Duration::from_millis(10));
+        assert_eq!(main_wake_only.p95_wake_lateness_ns, 25_000);
+        assert_eq!(main_wake_only.p95_worker_submit_wake_lateness_ns, 0);
+
+        journal.record_fixed_timed_wake(40_000);
+        let both_domains = journal.prediction(Duration::from_millis(10));
+        assert_eq!(both_domains.p95_wake_lateness_ns, 25_000);
+        assert_eq!(both_domains.p95_worker_submit_wake_lateness_ns, 40_000);
+        assert_eq!(both_domains.total_cost_ns, main_wake_only.total_cost_ns);
+
+        let mut warm_journal = AdaptiveRenderJournal::default();
+        record_uniform_prediction_inputs(
+            &mut warm_journal,
+            3_000_000,
+            5_000_000,
+            1_000_000,
+            25_000,
+            100_000,
+            500_000,
+        );
+        let warm_before = warm_journal.prediction(Duration::from_millis(10));
+        assert_eq!(
+            warm_before.estimator_mode,
+            PredictionEstimatorMode::WarmParallel
+        );
+
+        warm_journal.record_fixed_timed_wake(7_000_000);
+        let warm_after = warm_journal.prediction(Duration::from_millis(10));
+        assert_eq!(
+            warm_after.p95_wake_lateness_ns,
+            warm_before.p95_wake_lateness_ns
+        );
+        assert_eq!(warm_after.p95_worker_submit_wake_lateness_ns, 7_000_000);
+        assert_eq!(
+            warm_after.kms_dispatch_budget_ns,
+            warm_before.kms_dispatch_budget_ns
+        );
+        assert_eq!(warm_after.total_cost_ns, warm_before.total_cost_ns);
     }
 
     #[test]

@@ -64,6 +64,7 @@ fn only_composited_primary_timing_enters_primary_render_prediction() {
     assert_eq!(prediction.p95_worker_pre_submit_ns, 0);
     assert_eq!(prediction.p95_worker_dispatch_ns, 0);
     assert_eq!(prediction.p95_wake_lateness_ns, 0);
+    assert_eq!(prediction.p95_worker_submit_wake_lateness_ns, 0);
     assert_eq!(prediction.kms_dispatch_budget_ns, 250_000);
 
     let primary_sample = WorkerTimingJournalSample {
@@ -88,7 +89,11 @@ fn only_composited_primary_timing_enters_primary_render_prediction() {
     assert_eq!(primary_prediction.p95_worker_queue_residency_ns, 200_000);
     assert_eq!(primary_prediction.p95_worker_pre_submit_ns, 50_000);
     assert_eq!(primary_prediction.p95_worker_dispatch_ns, 200_000);
-    assert_eq!(primary_prediction.p95_wake_lateness_ns, 25_000);
+    assert_eq!(primary_prediction.p95_wake_lateness_ns, 0);
+    assert_eq!(
+        primary_prediction.p95_worker_submit_wake_lateness_ns,
+        25_000
+    );
     assert_eq!(primary_prediction.kms_dispatch_budget_ns, 500_000);
 
     record_composited_primary_worker_timing(
@@ -122,6 +127,10 @@ fn only_composited_primary_timing_enters_primary_render_prediction() {
     assert_eq!(
         after_direct.p95_wake_lateness_ns,
         primary_prediction.p95_wake_lateness_ns
+    );
+    assert_eq!(
+        after_direct.p95_worker_submit_wake_lateness_ns,
+        primary_prediction.p95_worker_submit_wake_lateness_ns
     );
     assert_eq!(after_direct.kms_dispatch_budget_ns, 500_000);
 }
