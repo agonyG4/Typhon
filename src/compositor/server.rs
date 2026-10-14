@@ -135,6 +135,15 @@ pub struct PointerInputMetricsSnapshot {
     pub pointer_hit_generation_invalidations: u64,
     pub interaction_topology_invalidations: u64,
     pub visual_stack_groups_cache_rebuilds: u64,
+    pub pointer_focus_transitions: u64,
+    pub pointer_enter_reconciliations: u64,
+    pub pointer_enter_same_surface_skips: u64,
+    pub pointer_enter_resource_iterations: u64,
+    pub pointer_enter_temporary_vectors: u64,
+    pub desktop_focus_pipeline_invocations: u64,
+    pub desktop_focus_same_window_noops: u64,
+    pub desktop_focus_fast_noops: u64,
+    pub pointer_constraint_reconciliations: u64,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct XwaylandClientIdentity {
@@ -196,6 +205,15 @@ impl OwnCompositorServer {
             pointer_hit_generation_invalidations: metrics.pointer_hit_generation_invalidations,
             interaction_topology_invalidations: metrics.interaction_topology_invalidations,
             visual_stack_groups_cache_rebuilds: metrics.visual_stack_groups_cache_rebuilds,
+            pointer_focus_transitions: metrics.pointer_focus_transitions,
+            pointer_enter_reconciliations: metrics.pointer_enter_reconciliations,
+            pointer_enter_same_surface_skips: metrics.pointer_enter_same_surface_skips,
+            pointer_enter_resource_iterations: metrics.pointer_enter_resource_iterations,
+            pointer_enter_temporary_vectors: metrics.pointer_enter_temporary_vectors,
+            desktop_focus_pipeline_invocations: metrics.desktop_focus_pipeline_invocations,
+            desktop_focus_same_window_noops: metrics.desktop_focus_same_window_noops,
+            desktop_focus_fast_noops: metrics.desktop_focus_fast_noops,
+            pointer_constraint_reconciliations: metrics.pointer_constraint_reconciliations,
         }
     }
 

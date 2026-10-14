@@ -230,6 +230,97 @@ pub(in crate::compositor::tests) fn create_focused_toplevel_and_receive_pointer_
     Ok(state)
 }
 
+pub(in crate::compositor::tests) fn create_focused_toplevel_registers_pointer_without_motion(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
+    let stream = UnixStream::connect(socket_path)?;
+    let connection = Connection::from_socket(stream)?;
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
+    let qh = queue.handle();
+
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
+    let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ())?;
+    let _first_pointer = seat.get_pointer(&qh, ());
+    let surface = compositor.create_surface(&qh, ());
+    let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
+    let _toplevel = xdg_surface.get_toplevel(&qh, ());
+    surface.commit();
+    connection.flush()?;
+
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state)?;
+    commit_test_buffered_surface(&surface, &shm, &qh, 32, 32)?;
+    connection.flush()?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    commands.send(ServerCommand::PointerMotion {
+        x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 20.0,
+        y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 14.0,
+    })?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+
+    set_pointer_hit_instrumentation_enabled(commands, true);
+    let metrics_before_registration = capture_pointer_input_metrics(commands);
+    let _second_pointer = seat.get_pointer(&qh, ());
+    connection.flush()?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    let metrics_after_registration = capture_pointer_input_metrics(commands);
+
+    commands.send(ServerCommand::PointerMotion {
+        x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 20.0,
+        y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 14.0,
+    })?;
+    wait_for_server_commands(commands);
+    queue.roundtrip(&mut state)?;
+    let metrics_after_stable_motion = capture_pointer_input_metrics(commands);
+
+    assert_eq!(
+        metrics_after_registration.pointer_enter_reconciliations,
+        metrics_before_registration.pointer_enter_reconciliations,
+        "register_pointer should synchronize the new resource directly"
+    );
+    assert_eq!(
+        metrics_after_stable_motion.pointer_enter_reconciliations,
+        metrics_after_registration.pointer_enter_reconciliations
+    );
+    assert_eq!(
+        metrics_after_stable_motion.pointer_focus_transitions,
+        metrics_after_registration.pointer_focus_transitions
+    );
+    assert_eq!(
+        metrics_after_stable_motion.pointer_enter_same_surface_skips
+            - metrics_after_registration.pointer_enter_same_surface_skips,
+        1
+    );
+    assert_eq!(
+        metrics_after_stable_motion.pointer_enter_resource_iterations,
+        metrics_after_registration.pointer_enter_resource_iterations
+    );
+    assert_eq!(
+        metrics_after_stable_motion.pointer_enter_temporary_vectors,
+        metrics_after_registration.pointer_enter_temporary_vectors
+    );
+    assert_eq!(
+        metrics_after_stable_motion.desktop_focus_pipeline_invocations,
+        metrics_after_registration.desktop_focus_pipeline_invocations
+    );
+    assert_eq!(
+        metrics_after_stable_motion.desktop_focus_fast_noops
+            - metrics_after_registration.desktop_focus_fast_noops,
+        1
+    );
+    assert_eq!(
+        metrics_after_stable_motion.pointer_constraint_reconciliations,
+        metrics_after_registration.pointer_constraint_reconciliations
+    );
+    Ok(state)
+}
+
 pub(in crate::compositor::tests) fn create_focused_toplevel_and_receive_relative_pointer_motion(
     socket_path: &PathBuf,
     commands: &Sender<ServerCommand>,

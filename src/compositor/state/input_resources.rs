@@ -1,3 +1,4 @@
+use super::hit_testing::PointerFocusUpdate;
 use super::*;
 use crate::control_snapshots::{
     KeyboardConfigurationPersistence, KeyboardConfigurationSnapshot, KeyboardConfigurationSource,
@@ -905,10 +906,29 @@ impl CompositorState {
             self.clear_pointer_focus();
             return;
         };
-        self.focus_desktop_window_at_pointer_target(&target);
+        self.focus_desktop_window_for_pointer_motion_target(&target);
         let time = wayland_event_time();
-        self.ensure_pointer_focus(&target.surface);
-        self.send_pointer_enter_if_needed(&target);
+        let focus_is_unchanged = self
+            .pointer_surface
+            .as_ref()
+            .is_some_and(|current| same_surface_resource(current, &target.surface));
+        let focus_update = if focus_is_unchanged {
+            PointerFocusUpdate::Unchanged
+        } else {
+            self.ensure_pointer_focus(&target.surface)
+        };
+        match focus_update {
+            PointerFocusUpdate::Unchanged => {
+                if self.pointer_hit_instrumentation_enabled {
+                    self.pointer_hit_metrics.pointer_enter_same_surface_skips = self
+                        .pointer_hit_metrics
+                        .pointer_enter_same_surface_skips
+                        .saturating_add(1);
+                }
+            }
+            PointerFocusUpdate::Changed => self.send_pointer_enter_if_needed(&target),
+            PointerFocusUpdate::Suppressed => {}
+        }
 
         for pointer in self
             .pointer_resources

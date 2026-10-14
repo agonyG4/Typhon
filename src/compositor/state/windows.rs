@@ -463,6 +463,31 @@ impl CompositorState {
         })
     }
 
+    pub(in crate::compositor) fn focus_desktop_window_for_pointer_motion_target(
+        &mut self,
+        target: &PointerTarget,
+    ) {
+        let target_root = self.root_surface_id_for_surface(compositor_surface_id(&target.surface));
+        let target_window = self.window_id_for_surface(target_root);
+        let already_focused_window = target_window.is_some_and(|window_id| {
+            self.focused_window_id == Some(window_id)
+                && self.focused_surface.as_ref().is_some_and(|surface| {
+                    let root = self.root_surface_id_for_surface(compositor_surface_id(surface));
+                    self.window_id_for_surface(root) == Some(window_id)
+                })
+        });
+        if already_focused_window {
+            if self.pointer_hit_instrumentation_enabled {
+                self.pointer_hit_metrics.desktop_focus_fast_noops = self
+                    .pointer_hit_metrics
+                    .desktop_focus_fast_noops
+                    .saturating_add(1);
+            }
+            return;
+        }
+        self.focus_desktop_window_at_pointer_target(target);
+    }
+
     pub(in crate::compositor) fn focus_desktop_window_at_pointer_scene_hit(
         &mut self,
         hit: &PointerSceneHit,

@@ -36,6 +36,15 @@ pub(crate) struct CursorHitTestCounters {
     pub(crate) pointer_hit_generation_invalidations: u64,
     pub(crate) interaction_topology_invalidations: u64,
     pub(crate) visual_stack_groups_cache_rebuilds: u64,
+    pub(crate) pointer_focus_transitions: u64,
+    pub(crate) pointer_enter_reconciliations: u64,
+    pub(crate) pointer_enter_same_surface_skips: u64,
+    pub(crate) pointer_enter_resource_iterations: u64,
+    pub(crate) pointer_enter_temporary_vectors: u64,
+    pub(crate) desktop_focus_pipeline_invocations: u64,
+    pub(crate) desktop_focus_same_window_noops: u64,
+    pub(crate) desktop_focus_fast_noops: u64,
+    pub(crate) pointer_constraint_reconciliations: u64,
 }
 
 impl CursorHitTestCounters {
@@ -78,6 +87,33 @@ impl CursorHitTestCounters {
             visual_stack_groups_cache_rebuilds: self
                 .visual_stack_groups_cache_rebuilds
                 .saturating_sub(before.visual_stack_groups_cache_rebuilds),
+            pointer_focus_transitions: self
+                .pointer_focus_transitions
+                .saturating_sub(before.pointer_focus_transitions),
+            pointer_enter_reconciliations: self
+                .pointer_enter_reconciliations
+                .saturating_sub(before.pointer_enter_reconciliations),
+            pointer_enter_same_surface_skips: self
+                .pointer_enter_same_surface_skips
+                .saturating_sub(before.pointer_enter_same_surface_skips),
+            pointer_enter_resource_iterations: self
+                .pointer_enter_resource_iterations
+                .saturating_sub(before.pointer_enter_resource_iterations),
+            pointer_enter_temporary_vectors: self
+                .pointer_enter_temporary_vectors
+                .saturating_sub(before.pointer_enter_temporary_vectors),
+            desktop_focus_pipeline_invocations: self
+                .desktop_focus_pipeline_invocations
+                .saturating_sub(before.desktop_focus_pipeline_invocations),
+            desktop_focus_same_window_noops: self
+                .desktop_focus_same_window_noops
+                .saturating_sub(before.desktop_focus_same_window_noops),
+            desktop_focus_fast_noops: self
+                .desktop_focus_fast_noops
+                .saturating_sub(before.desktop_focus_fast_noops),
+            pointer_constraint_reconciliations: self
+                .pointer_constraint_reconciliations
+                .saturating_sub(before.pointer_constraint_reconciliations),
         }
     }
 }
@@ -100,6 +136,15 @@ impl From<PointerInputMetricsSnapshot> for CursorHitTestCounters {
             pointer_hit_generation_invalidations: snapshot.pointer_hit_generation_invalidations,
             interaction_topology_invalidations: snapshot.interaction_topology_invalidations,
             visual_stack_groups_cache_rebuilds: snapshot.visual_stack_groups_cache_rebuilds,
+            pointer_focus_transitions: snapshot.pointer_focus_transitions,
+            pointer_enter_reconciliations: snapshot.pointer_enter_reconciliations,
+            pointer_enter_same_surface_skips: snapshot.pointer_enter_same_surface_skips,
+            pointer_enter_resource_iterations: snapshot.pointer_enter_resource_iterations,
+            pointer_enter_temporary_vectors: snapshot.pointer_enter_temporary_vectors,
+            desktop_focus_pipeline_invocations: snapshot.desktop_focus_pipeline_invocations,
+            desktop_focus_same_window_noops: snapshot.desktop_focus_same_window_noops,
+            desktop_focus_fast_noops: snapshot.desktop_focus_fast_noops,
+            pointer_constraint_reconciliations: snapshot.pointer_constraint_reconciliations,
         }
     }
 }
@@ -764,7 +809,7 @@ impl NativeCursorResponsivenessTrace {
         );
         let _ = writeln!(
             output,
-            "{{\"type\":\"cumulative_counter_deltas\",\"hit_test_calls\":{},\"hit_test_cache_hits\":{},\"hit_test_cache_misses\":{},\"hit_test_full_scene_scans\":{},\"hit_test_owner_locality_fast_hits\":{},\"hit_test_certificate_hits\":{},\"hit_test_certificate_misses\":{},\"hit_test_certificate_builds\":{},\"hit_test_certificate_rejections\":{},\"hit_test_groups_inspected\":{},\"hit_test_surfaces_inspected\":{},\"hit_test_cpu_ns\":{},\"hit_test_generation_invalidations\":{},\"hit_test_topology_invalidations\":{},\"hit_test_visual_stack_groups_cache_rebuilds\":{},\"arbitration_response_windows_opened\":{},\"arbitration_changes_coalesced\":{},\"arbitration_plane_delta_plans\":{},\"arbitration_plane_delta_submissions\":{},\"arbitration_deferred_for_primary\":{},\"arbitration_piggybacked\":{},\"arbitration_idle_hardware_updates\":{},\"arbitration_idle_software_updates\":{},\"ready_primary_piggybacks\":{},\"unready_primary_bypass_decisions\":{},\"kms_busy_retries\":{},\"cursor_service_target_misses\":{}}}",
+            "{{\"type\":\"cumulative_counter_deltas\",\"hit_test_calls\":{},\"hit_test_cache_hits\":{},\"hit_test_cache_misses\":{},\"hit_test_full_scene_scans\":{},\"hit_test_owner_locality_fast_hits\":{},\"hit_test_certificate_hits\":{},\"hit_test_certificate_misses\":{},\"hit_test_certificate_builds\":{},\"hit_test_certificate_rejections\":{},\"hit_test_groups_inspected\":{},\"hit_test_surfaces_inspected\":{},\"hit_test_cpu_ns\":{},\"hit_test_generation_invalidations\":{},\"hit_test_topology_invalidations\":{},\"hit_test_visual_stack_groups_cache_rebuilds\":{},\"pointer_focus_transitions\":{},\"pointer_enter_reconciliations\":{},\"pointer_enter_same_surface_skips\":{},\"pointer_enter_resource_iterations\":{},\"pointer_enter_temporary_vectors\":{},\"desktop_focus_pipeline_invocations\":{},\"desktop_focus_same_window_noops\":{},\"desktop_focus_fast_noops\":{},\"pointer_constraint_reconciliations\":{},\"arbitration_response_windows_opened\":{},\"arbitration_changes_coalesced\":{},\"arbitration_plane_delta_plans\":{},\"arbitration_plane_delta_submissions\":{},\"arbitration_deferred_for_primary\":{},\"arbitration_piggybacked\":{},\"arbitration_idle_hardware_updates\":{},\"arbitration_idle_software_updates\":{},\"ready_primary_piggybacks\":{},\"unready_primary_bypass_decisions\":{},\"kms_busy_retries\":{},\"cursor_service_target_misses\":{}}}",
             hit_test_delta.calls,
             hit_test_delta.cache_hits,
             hit_test_delta.cache_misses,
@@ -780,6 +825,15 @@ impl NativeCursorResponsivenessTrace {
             hit_test_delta.pointer_hit_generation_invalidations,
             hit_test_delta.interaction_topology_invalidations,
             hit_test_delta.visual_stack_groups_cache_rebuilds,
+            hit_test_delta.pointer_focus_transitions,
+            hit_test_delta.pointer_enter_reconciliations,
+            hit_test_delta.pointer_enter_same_surface_skips,
+            hit_test_delta.pointer_enter_resource_iterations,
+            hit_test_delta.pointer_enter_temporary_vectors,
+            hit_test_delta.desktop_focus_pipeline_invocations,
+            hit_test_delta.desktop_focus_same_window_noops,
+            hit_test_delta.desktop_focus_fast_noops,
+            hit_test_delta.pointer_constraint_reconciliations,
             arbitration_delta.response_windows_opened,
             arbitration_delta.changes_coalesced,
             arbitration_delta.plane_delta_plans,
@@ -1385,6 +1439,15 @@ mod tests {
                 certificate_misses: 6,
                 certificate_builds: 7,
                 certificate_rejections: 8,
+                pointer_focus_transitions: 9,
+                pointer_enter_reconciliations: 10,
+                pointer_enter_same_surface_skips: 11,
+                pointer_enter_resource_iterations: 12,
+                pointer_enter_temporary_vectors: 13,
+                desktop_focus_pipeline_invocations: 14,
+                desktop_focus_same_window_noops: 15,
+                desktop_focus_fast_noops: 16,
+                pointer_constraint_reconciliations: 17,
                 ..CursorHitTestCounters::default()
             },
         );
@@ -1396,6 +1459,15 @@ mod tests {
             certificate_misses: 6,
             certificate_builds: 7,
             certificate_rejections: 8,
+            pointer_focus_transitions: 9,
+            pointer_enter_reconciliations: 10,
+            pointer_enter_same_surface_skips: 11,
+            pointer_enter_resource_iterations: 12,
+            pointer_enter_temporary_vectors: 13,
+            desktop_focus_pipeline_invocations: 14,
+            desktop_focus_same_window_noops: 15,
+            desktop_focus_fast_noops: 16,
+            pointer_constraint_reconciliations: 17,
             ..PointerInputMetricsSnapshot::default()
         };
         let output = trace.format_dump(
@@ -1411,6 +1483,15 @@ mod tests {
         assert!(output.contains("\"hit_test_certificate_misses\":6"));
         assert!(output.contains("\"hit_test_certificate_builds\":7"));
         assert!(output.contains("\"hit_test_certificate_rejections\":8"));
+        assert!(output.contains("\"pointer_focus_transitions\":9"));
+        assert!(output.contains("\"pointer_enter_reconciliations\":10"));
+        assert!(output.contains("\"pointer_enter_same_surface_skips\":11"));
+        assert!(output.contains("\"pointer_enter_resource_iterations\":12"));
+        assert!(output.contains("\"pointer_enter_temporary_vectors\":13"));
+        assert!(output.contains("\"desktop_focus_pipeline_invocations\":14"));
+        assert!(output.contains("\"desktop_focus_same_window_noops\":15"));
+        assert!(output.contains("\"desktop_focus_fast_noops\":16"));
+        assert!(output.contains("\"pointer_constraint_reconciliations\":17"));
     }
 
     #[test]

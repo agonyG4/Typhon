@@ -3290,6 +3290,70 @@ fn pointer_hit_certificate_reuses_stable_client_mapping_without_locality_scan() 
 }
 
 #[test]
+fn pointer_motion_rechecks_desktop_focus_after_keyboard_focus_moves_elsewhere() {
+    let mut state = CompositorState::new(None);
+    let client = pointer_test_wayland_client();
+    let (surface_a_id, window_a_id) = append_pointer_test_toplevel(
+        &mut state,
+        &client,
+        SurfacePlacement::absolute_root_at(100, 100),
+        None,
+    );
+    let (surface_b_id, window_b_id) = append_pointer_test_toplevel(
+        &mut state,
+        &client,
+        SurfacePlacement::absolute_root_at(500, 100),
+        None,
+    );
+    for surface_id in [surface_a_id, surface_b_id] {
+        state
+            .xdg_surface_lifecycles
+            .get_mut(&surface_id)
+            .expect("test toplevel lifecycle")
+            .currently_mapped = true;
+    }
+    state.window_stacking = vec![window_a_id, window_b_id];
+    state.rebuild_active_scene_view();
+    state.pointer_hit_instrumentation_enabled = true;
+    let surface_a = state
+        .surface_resource_by_id(surface_a_id)
+        .expect("window A surface resource");
+    let surface_b = state
+        .surface_resource_by_id(surface_b_id)
+        .expect("window B surface resource");
+    state.set_desktop_focus(surface_a.clone(), "test_initial_focus");
+    state.ensure_pointer_focus(&surface_a);
+    let surface_a_index = state
+        .active_scene_surface_index(surface_a_id)
+        .expect("window A is in the active scene");
+    let target = state.active_scene_surface_render_assignments()[surface_a_index].target;
+    let x = f64::from(target.x() + 20);
+    let y = f64::from(target.y() + 20);
+    assert!(matches!(
+        state.pointer_scene_hit_at(x, y),
+        PointerSceneHit::Client { ref target }
+            if compositor_surface_id(&target.surface) == surface_a_id
+    ));
+
+    state.set_desktop_focus(surface_b, "test_external_keyboard_focus");
+    assert_eq!(state.focused_window_id, Some(window_b_id));
+    let before_motion = state.pointer_input_metrics_snapshot();
+    state.send_pointer_motion(x, y);
+    let after_motion = state.pointer_input_metrics_snapshot();
+
+    assert_eq!(state.focused_window_id, Some(window_a_id));
+    assert_eq!(
+        after_motion.desktop_focus_pipeline_invocations
+            - before_motion.desktop_focus_pipeline_invocations,
+        1
+    );
+    assert_eq!(
+        after_motion.desktop_focus_fast_noops,
+        before_motion.desktop_focus_fast_noops
+    );
+}
+
+#[test]
 fn pointer_hit_certificate_is_not_reused_after_interaction_generation_changes() {
     let mut state = CompositorState::new(None);
     let client = pointer_test_wayland_client();

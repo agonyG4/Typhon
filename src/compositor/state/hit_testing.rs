@@ -15,6 +15,13 @@ pub(in crate::compositor) enum PointerSceneHit {
     None,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::compositor) enum PointerFocusUpdate {
+    Unchanged,
+    Changed,
+    Suppressed,
+}
+
 #[derive(Debug, Clone)]
 pub(in crate::compositor) struct PointerSceneHitCache {
     x: f64,
@@ -265,9 +272,14 @@ pub(in crate::compositor) struct PointerInputMetrics {
     pub(in crate::compositor) interaction_pointer_local_updates: u64,
     pub(in crate::compositor) interaction_generic_hover_hit_tests_avoided: u64,
     pub(in crate::compositor) pointer_focus_transitions: u64,
+    pub(in crate::compositor) pointer_enter_reconciliations: u64,
+    pub(in crate::compositor) pointer_enter_same_surface_skips: u64,
+    pub(in crate::compositor) pointer_enter_resource_iterations: u64,
+    pub(in crate::compositor) pointer_enter_temporary_vectors: u64,
     pub(in crate::compositor) pointer_scene_hit_cpu_nanos: u64,
     pub(in crate::compositor) desktop_focus_pipeline_invocations: u64,
     pub(in crate::compositor) desktop_focus_same_window_noops: u64,
+    pub(in crate::compositor) desktop_focus_fast_noops: u64,
     pub(in crate::compositor) keyboard_focus_reconciliations: u64,
     pub(in crate::compositor) pointer_constraint_reconciliations: u64,
 }
@@ -1646,7 +1658,10 @@ impl CompositorState {
         self.surface_resources.get(&surface_id).cloned()
     }
 
-    pub(in crate::compositor) fn ensure_pointer_focus(&mut self, surface: &wl_surface::WlSurface) {
+    pub(in crate::compositor) fn ensure_pointer_focus(
+        &mut self,
+        surface: &wl_surface::WlSurface,
+    ) -> PointerFocusUpdate {
         if let Some(active) = self.active_locked_pointer_binding()
             && !same_surface_resource(&active.surface, surface)
         {
@@ -1657,20 +1672,20 @@ impl CompositorState {
                 compositor_surface_id(surface)
             ));
             self.pin_locked_pointer_focus(&active);
-            return;
+            return PointerFocusUpdate::Suppressed;
         }
         if let Some(active) = self.active_confined_pointer_binding()
             && !same_surface_resource(&active.surface, surface)
         {
             self.pin_confined_pointer_focus(&active);
-            return;
+            return PointerFocusUpdate::Suppressed;
         }
         if self
             .pointer_surface
             .as_ref()
             .is_some_and(|current| same_surface_resource(current, surface))
         {
-            return;
+            return PointerFocusUpdate::Unchanged;
         }
 
         self.pointer_hit_metrics.pointer_focus_transitions = self
@@ -1681,6 +1696,7 @@ impl CompositorState {
             self.clear_pointer_focus();
         }
         self.pointer_surface = Some(surface.clone());
+        PointerFocusUpdate::Changed
     }
 
     pub(in crate::compositor) fn pointer_resource_entered_surface(
@@ -1895,13 +1911,37 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn send_pointer_enter_if_needed(&mut self, target: &PointerTarget) {
+        if self.pointer_hit_instrumentation_enabled {
+            self.pointer_hit_metrics.pointer_enter_reconciliations = self
+                .pointer_hit_metrics
+                .pointer_enter_reconciliations
+                .saturating_add(1);
+        }
+        let resources_before_retain = self.pointer_resources.len();
         self.pointer_resources.retain(Resource::is_alive);
+        let resources_after_retain = self.pointer_resources.len();
         let pointers = self
             .pointer_resources
             .iter()
             .filter(|pointer| resource_belongs_to_surface_client(*pointer, &target.surface))
             .cloned()
             .collect::<Vec<_>>();
+        if self.pointer_hit_instrumentation_enabled {
+            self.pointer_hit_metrics.pointer_enter_resource_iterations = self
+                .pointer_hit_metrics
+                .pointer_enter_resource_iterations
+                .saturating_add(
+                    u64::try_from(resources_before_retain)
+                        .unwrap_or(u64::MAX)
+                        .saturating_add(u64::try_from(resources_after_retain).unwrap_or(u64::MAX)),
+                );
+            if !pointers.is_empty() {
+                self.pointer_hit_metrics.pointer_enter_temporary_vectors = self
+                    .pointer_hit_metrics
+                    .pointer_enter_temporary_vectors
+                    .saturating_add(1);
+            }
+        }
 
         for pointer in pointers {
             self.send_pointer_enter_to_resource(&pointer, target);

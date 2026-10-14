@@ -921,6 +921,160 @@ fn wayland_client_receives_pointer_motion_from_native_input_bridge() {
 }
 
 #[test]
+fn stable_certified_pointer_motion_keeps_motion_dispatch_without_focus_reconciliation() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let stream = UnixStream::connect(&socket_path).unwrap();
+    let connection = Connection::from_socket(stream).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ()).unwrap();
+    let _pointer = seat.get_pointer(&qh, ());
+    let surface = compositor.create_surface(&qh, ());
+    let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
+    let _toplevel = xdg_surface.get_toplevel(&qh, ());
+    surface.commit();
+    connection.flush().unwrap();
+
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state).unwrap();
+    commit_test_buffered_surface(&surface, &shm, &qh, 32, 32).unwrap();
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    set_pointer_hit_instrumentation_enabled(&commands, true);
+
+    let offset = render::FIRST_SURFACE_OFFSET;
+    commands
+        .send(ServerCommand::PointerMotion {
+            x: f64::from(offset.0) + 20.0,
+            y: f64::from(offset.1) + 14.0,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    assert_eq!(state.pointer_enter_count, 1);
+    assert_eq!(state.pointer_motion_count, 1);
+
+    let before = capture_pointer_input_metrics(&commands);
+    for batch_start in (0..2_000).step_by(32) {
+        for step in batch_start..(batch_start + 32).min(2_000) {
+            commands
+                .send(ServerCommand::PointerMotion {
+                    x: f64::from(offset.0) + 3.0 + f64::from(step) * 0.001,
+                    y: f64::from(offset.1) + 15.0 + f64::from(step % 17) * 0.01,
+                })
+                .unwrap();
+        }
+        wait_for_server_commands(&commands);
+        queue.roundtrip(&mut state).unwrap();
+    }
+    let after = capture_pointer_input_metrics(&commands);
+    let motion_count = state.pointer_motion_count;
+    let enter_count = state.pointer_enter_count;
+    let leave_count = state.pointer_leave_count;
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    assert_eq!(
+        after.pointer_hit_certificate_hits - before.pointer_hit_certificate_hits,
+        2_000
+    );
+    assert_eq!(after.full_scene_hit_scans, before.full_scene_hit_scans);
+    assert_eq!(
+        after.owner_locality_fast_hits,
+        before.owner_locality_fast_hits
+    );
+    assert_eq!(
+        after.visual_stack_groups_cache_rebuilds,
+        before.visual_stack_groups_cache_rebuilds
+    );
+    assert_eq!(
+        after.pointer_focus_transitions,
+        before.pointer_focus_transitions
+    );
+    assert_eq!(
+        after.pointer_enter_reconciliations - before.pointer_enter_reconciliations,
+        0
+    );
+    assert_eq!(
+        after.pointer_enter_same_surface_skips - before.pointer_enter_same_surface_skips,
+        2_000
+    );
+    assert_eq!(
+        after.pointer_enter_resource_iterations,
+        before.pointer_enter_resource_iterations
+    );
+    assert_eq!(
+        after.pointer_enter_temporary_vectors,
+        before.pointer_enter_temporary_vectors
+    );
+    assert_eq!(
+        after.desktop_focus_pipeline_invocations, before.desktop_focus_pipeline_invocations,
+        "stable motion should bypass the full desktop focus policy"
+    );
+    assert_eq!(
+        after.desktop_focus_same_window_noops,
+        before.desktop_focus_same_window_noops
+    );
+    assert_eq!(
+        after.desktop_focus_fast_noops - before.desktop_focus_fast_noops,
+        2_000
+    );
+    assert_eq!(
+        after.pointer_constraint_reconciliations,
+        before.pointer_constraint_reconciliations
+    );
+    assert_eq!(
+        motion_count, 2_001,
+        "every pointer sample must dispatch Motion"
+    );
+    assert_eq!(
+        enter_count, 1,
+        "stable motion must not send extra Enter events"
+    );
+    assert_eq!(leave_count, 0, "stable motion must not send Leave events");
+}
+
+#[test]
+fn pointer_registered_during_stable_focus_gets_enter_without_another_motion() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let state = create_focused_toplevel_registers_pointer_without_motion(&socket_path, &commands);
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    let state = state.unwrap();
+    assert_eq!(state.pointer_enter_count, 2);
+    assert_eq!(state.pointer_leave_count, 0);
+    assert_eq!(state.pointer_motion_count, 3);
+    let mut entered_resources = state
+        .pointer_enter_serials
+        .iter()
+        .map(|(resource_id, _)| *resource_id)
+        .collect::<Vec<_>>();
+    entered_resources.sort_unstable();
+    entered_resources.dedup();
+    assert_eq!(entered_resources.len(), 2);
+    let mut motion_resources = state.pointer_motion_resource_ids.clone();
+    motion_resources.sort_unstable();
+    motion_resources.dedup();
+    assert_eq!(motion_resources.len(), 2);
+    assert!(
+        state
+            .pointer_event_log
+            .ends_with(&["motion", "frame", "motion", "frame"])
+    );
+}
+
+#[test]
 fn wayland_client_receives_pointer_axis_from_native_input_bridge() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();
@@ -2013,6 +2167,24 @@ fn subsurface_place_above_changes_pointer_target_after_parent_commit() {
     assert!(state.second_child_surface_id.is_some());
     assert!(state.pointer_leave_count >= 1);
     assert!(state.pointer_enter_count >= 2);
+    let first_enter = state
+        .pointer_event_log
+        .iter()
+        .position(|event| *event == "enter")
+        .expect("initial surface receives Enter");
+    let leave = state
+        .pointer_event_log
+        .iter()
+        .position(|event| *event == "leave")
+        .expect("surface crossing sends Leave");
+    let crossing_enter = state
+        .pointer_event_log
+        .iter()
+        .enumerate()
+        .skip(leave + 1)
+        .find_map(|(index, event)| (*event == "enter").then_some(index))
+        .expect("crossing surface receives Enter after Leave");
+    assert!(first_enter < leave && leave < crossing_enter);
 }
 
 #[test]

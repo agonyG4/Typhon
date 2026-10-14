@@ -237,6 +237,10 @@ fn default_locked_constraint_region_activates_at_current_pointer() {
         .unwrap();
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
+    set_pointer_hit_instrumentation_enabled(&commands, true);
+    let pointer_enters_before_commit = state.pointer_enter_count;
+    let pointer_motions_before_commit = state.pointer_motion_count;
+    let metrics_before_commit = capture_pointer_input_metrics(&commands);
 
     let _lock = constraints.lock_pointer(
         &surface,
@@ -254,12 +258,23 @@ fn default_locked_constraint_region_activates_at_current_pointer() {
         .unwrap();
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
+    let metrics_after_commit = capture_pointer_input_metrics(&commands);
     let active_anchor = capture_active_locked_pointer_anchor(&commands);
     commands.send(ServerCommand::Stop).unwrap();
     server_thread.join().unwrap();
 
     assert_eq!(state.locked_count, 1);
     assert_eq!(active_anchor, Some(pointer_position));
+    assert_eq!(state.pointer_enter_count, pointer_enters_before_commit);
+    assert_eq!(state.pointer_motion_count, pointer_motions_before_commit);
+    assert_eq!(
+        metrics_after_commit.pointer_enter_reconciliations,
+        metrics_before_commit.pointer_enter_reconciliations
+    );
+    assert!(
+        metrics_after_commit.pointer_constraint_reconciliations
+            > metrics_before_commit.pointer_constraint_reconciliations
+    );
 }
 
 #[test]
