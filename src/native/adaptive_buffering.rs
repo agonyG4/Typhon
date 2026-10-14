@@ -582,11 +582,13 @@ impl AdaptiveRenderJournal {
         let p95_worker_pre_submit = nearest_rank(&self.worker_pre_submit_samples_ns, 95);
         let p95_worker_dispatch = nearest_rank(&self.worker_dispatch_samples_ns, 95);
         let p95_queue_residency = nearest_rank(&self.worker_queue_residency_samples_ns, 95);
-        let exported_submission_budget = nearest_rank(&self.fixed_submission_budget_samples_ns, 95);
         let kms_dispatch_budget = if self.fixed_submission_budget_samples_ns.is_empty() {
             250_000
         } else {
-            exported_submission_budget
+            self.fixed_submission_budget_samples_ns
+                .back()
+                .copied()
+                .unwrap_or(250_000)
         };
         let ceiling = 2_000_000_u64.min(refresh_ns / 4).max(500_000);
         let dynamic_margin = p95_wake.saturating_add(250_000).clamp(500_000, ceiling);
@@ -1216,6 +1218,79 @@ mod tests {
                 base_ns + exact_queue_ready_ns + 1_000_000,
             ));
         }
+    }
+
+    fn warm_parallel_journal_with_budget_history(budget_ns: u64) -> AdaptiveRenderJournal {
+        let mut journal = AdaptiveRenderJournal::default();
+        record_uniform_prediction_inputs(
+            &mut journal,
+            2_000_000,
+            2_000_000,
+            4_000_000,
+            0,
+            0,
+            budget_ns,
+        );
+        for _ in WARM_PARALLEL_MIN_SAMPLES..SAMPLE_CAPACITY {
+            journal.record_fixed_submission_budget(budget_ns);
+        }
+        assert_eq!(
+            journal.prediction_estimator_mode(),
+            PredictionEstimatorMode::WarmParallel
+        );
+        journal
+    }
+
+    #[test]
+    fn one_new_authoritative_kms_budget_immediately_changes_warm_prediction() {
+        let mut journal = warm_parallel_journal_with_budget_history(500_000);
+        let before = journal.prediction_with_kms_guard(Duration::from_millis(10), 300_000);
+        assert_eq!(before.kms_dispatch_budget_ns, 500_000);
+        assert_eq!(before.parallel_service_ns, 4_500_000);
+
+        journal.record_fixed_submission_budget(1_500_000);
+
+        let after = journal.prediction_with_kms_guard(Duration::from_millis(10), 300_000);
+        assert_eq!(after.kms_dispatch_budget_ns, 1_500_000);
+        assert_eq!(after.parallel_service_ns, 5_500_000);
+        assert_eq!(after.total_cost_ns, before.total_cost_ns + 1_000_000);
+    }
+
+    #[test]
+    fn kms_dispatch_tail_increase_and_decay_reach_the_next_prediction() {
+        use crate::native::kms_worker_dispatch_timing::KmsWorkerDispatchModel;
+
+        let mut kms = KmsWorkerDispatchModel::default();
+        for _ in 0..SAMPLE_CAPACITY {
+            kms.record_fixed_timed_wake(0);
+            kms.record_worker_service(0, 0, 450_000);
+        }
+        assert_eq!(kms.budget().dispatch_budget_ns, 500_000);
+
+        let mut journal =
+            warm_parallel_journal_with_budget_history(kms.budget().dispatch_budget_ns);
+        let before = journal.prediction_with_kms_guard(Duration::from_millis(10), 300_000);
+
+        let miss = kms.observe_submission_deadline(1_000_000, 1_100_000, true, true);
+        assert!(miss.increased);
+        let raised_budget_ns = kms.budget().dispatch_budget_ns;
+        assert_eq!(raised_budget_ns, 650_000);
+        journal.record_fixed_submission_budget(raised_budget_ns);
+
+        let after_increase = journal.prediction_with_kms_guard(Duration::from_millis(10), 300_000);
+        assert_eq!(after_increase.kms_dispatch_budget_ns, raised_budget_ns);
+        assert_eq!(after_increase.total_cost_ns, before.total_cost_ns + 150_000);
+
+        for _ in 0..32 {
+            kms.observe_submission_deadline(2_000_000, 2_000_000, true, true);
+        }
+        let decayed_budget_ns = kms.budget().dispatch_budget_ns;
+        assert_eq!(decayed_budget_ns, 600_000);
+        journal.record_fixed_submission_budget(decayed_budget_ns);
+
+        let after_decay = journal.prediction_with_kms_guard(Duration::from_millis(10), 300_000);
+        assert_eq!(after_decay.kms_dispatch_budget_ns, decayed_budget_ns);
+        assert_eq!(after_decay.total_cost_ns, before.total_cost_ns + 100_000);
     }
 
     #[test]
@@ -2183,7 +2258,7 @@ mod tests {
         assert_eq!(prediction.p95_worker_queue_residency_ns, 2_115);
         assert_eq!(prediction.p95_wake_lateness_ns, 1_115);
         assert_eq!(prediction.p95_atomic_ioctl_ns, 4_115);
-        assert_eq!(prediction.kms_dispatch_budget_ns, 5_115);
+        assert_eq!(prediction.kms_dispatch_budget_ns, 5_121);
         assert_eq!(prediction.p95_target_slip_ns, 6_115);
     }
 

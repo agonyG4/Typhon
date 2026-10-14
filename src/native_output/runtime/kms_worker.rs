@@ -34,12 +34,12 @@ pub(super) struct WorkerTimingJournalSample {
     pub(super) submission_budget_ns: Option<u64>,
 }
 
-pub(super) fn record_primary_worker_timing(
+pub(super) fn record_composited_primary_worker_timing(
     journal: &mut AdaptiveRenderJournal,
     kind: AtomicCommitKind,
     sample: WorkerTimingJournalSample,
 ) {
-    if matches!(kind, AtomicCommitKind::PlaneDelta { .. }) {
+    if !matches!(kind, AtomicCommitKind::CompositedPrimary { .. }) {
         return;
     }
     journal.record_worker_queue_residency(sample.queue_residency_ns);
@@ -1176,7 +1176,7 @@ impl NativeRuntime {
                 let queued_at = ownership.job.queued_at.get();
                 let submit_started_at = ownership.submit_started_at.get();
                 let submit_returned_at = ownership.submit_returned_at.get();
-                record_primary_worker_timing(
+                record_composited_primary_worker_timing(
                     &mut self.render_journal,
                     kind,
                     WorkerTimingJournalSample {

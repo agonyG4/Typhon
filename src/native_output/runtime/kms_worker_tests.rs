@@ -4,7 +4,7 @@ use super::kms_worker::{
     retain_complete_submitted_ownership, retain_uncertain_job_with_suspension,
     retire_stale_submitted_completion,
 };
-use super::kms_worker::{WorkerTimingJournalSample, record_primary_worker_timing};
+use super::kms_worker::{WorkerTimingJournalSample, record_composited_primary_worker_timing};
 use super::kms_worker_teardown::SubmittedWorkerPacingState;
 use super::plane_cycle::plane_delta_reservation_outcome;
 use crate::native_output::kms_worker::{
@@ -36,10 +36,10 @@ use std::os::fd::{FromRawFd, OwnedFd};
 use std::time::Duration;
 
 #[test]
-fn cursor_plane_delta_timing_does_not_enter_primary_render_prediction() {
+fn only_composited_primary_timing_enters_primary_render_prediction() {
     let transaction_id = OutputTransactionId::new(NonZeroU64::new(1).expect("transaction ID"));
     let mut journal = AdaptiveRenderJournal::default();
-    let sample = WorkerTimingJournalSample {
+    let plane_delta_sample = WorkerTimingJournalSample {
         queue_residency_ns: 40_000_000,
         ioctl_duration_ns: 30_000_000,
         pre_submit_duration_ns: 20_000_000,
@@ -48,14 +48,14 @@ fn cursor_plane_delta_timing_does_not_enter_primary_render_prediction() {
         submission_budget_ns: Some(80_000_000),
     };
 
-    record_primary_worker_timing(
+    record_composited_primary_worker_timing(
         &mut journal,
         AtomicCommitKind::PlaneDelta {
             transaction_id,
             cursor_epoch: 1,
             framebuffer_id: Some(1),
         },
-        sample,
+        plane_delta_sample,
     );
 
     let prediction = journal.prediction(Duration::from_millis(16));
@@ -66,22 +66,168 @@ fn cursor_plane_delta_timing_does_not_enter_primary_render_prediction() {
     assert_eq!(prediction.p95_wake_lateness_ns, 0);
     assert_eq!(prediction.kms_dispatch_budget_ns, 250_000);
 
-    record_primary_worker_timing(
+    let primary_sample = WorkerTimingJournalSample {
+        queue_residency_ns: 200_000,
+        ioctl_duration_ns: 100_000,
+        pre_submit_duration_ns: 50_000,
+        dispatch_duration_ns: 200_000,
+        submit_wake_lateness_ns: Some(25_000),
+        submission_budget_ns: Some(500_000),
+    };
+    record_composited_primary_worker_timing(
         &mut journal,
         AtomicCommitKind::CompositedPrimary {
             transaction_id,
             frame_id: 1,
             framebuffer_id: 1,
         },
-        sample,
+        primary_sample,
     );
     let primary_prediction = journal.prediction(Duration::from_millis(16));
-    assert_eq!(primary_prediction.p95_atomic_submit_ns, 30_000_000);
-    assert_eq!(primary_prediction.p95_worker_queue_residency_ns, 40_000_000);
-    assert_eq!(primary_prediction.p95_worker_pre_submit_ns, 20_000_000);
-    assert_eq!(primary_prediction.p95_worker_dispatch_ns, 50_000_000);
-    assert_eq!(primary_prediction.p95_wake_lateness_ns, 0);
-    assert_eq!(primary_prediction.kms_dispatch_budget_ns, 80_000_000);
+    assert_eq!(primary_prediction.p95_atomic_submit_ns, 100_000);
+    assert_eq!(primary_prediction.p95_worker_queue_residency_ns, 200_000);
+    assert_eq!(primary_prediction.p95_worker_pre_submit_ns, 50_000);
+    assert_eq!(primary_prediction.p95_worker_dispatch_ns, 200_000);
+    assert_eq!(primary_prediction.p95_wake_lateness_ns, 25_000);
+    assert_eq!(primary_prediction.kms_dispatch_budget_ns, 500_000);
+
+    record_composited_primary_worker_timing(
+        &mut journal,
+        AtomicCommitKind::DirectPrimary {
+            transaction_id,
+            direct_token: oblivion_one::native::kms::PageFlipToken::new(2)
+                .expect("direct pageflip token"),
+            framebuffer_id: 2,
+        },
+        plane_delta_sample,
+    );
+
+    let after_direct = journal.prediction(Duration::from_millis(16));
+    assert_eq!(
+        after_direct.p95_atomic_submit_ns,
+        primary_prediction.p95_atomic_submit_ns
+    );
+    assert_eq!(
+        after_direct.p95_worker_queue_residency_ns,
+        primary_prediction.p95_worker_queue_residency_ns
+    );
+    assert_eq!(
+        after_direct.p95_worker_pre_submit_ns,
+        primary_prediction.p95_worker_pre_submit_ns
+    );
+    assert_eq!(
+        after_direct.p95_worker_dispatch_ns,
+        primary_prediction.p95_worker_dispatch_ns
+    );
+    assert_eq!(
+        after_direct.p95_wake_lateness_ns,
+        primary_prediction.p95_wake_lateness_ns
+    );
+    assert_eq!(after_direct.kms_dispatch_budget_ns, 500_000);
+}
+
+#[test]
+fn direct_primary_does_not_advance_composited_warm_budget_maturity() {
+    let transaction_id = OutputTransactionId::new(NonZeroU64::new(1).expect("transaction ID"));
+    let primary_sample = WorkerTimingJournalSample {
+        queue_residency_ns: 200_000,
+        ioctl_duration_ns: 100_000,
+        pre_submit_duration_ns: 50_000,
+        dispatch_duration_ns: 200_000,
+        submit_wake_lateness_ns: Some(25_000),
+        submission_budget_ns: Some(500_000),
+    };
+    let direct_sample = WorkerTimingJournalSample {
+        queue_residency_ns: 40_000_000,
+        ioctl_duration_ns: 30_000_000,
+        pre_submit_duration_ns: 20_000_000,
+        dispatch_duration_ns: 50_000_000,
+        submit_wake_lateness_ns: Some(10_000_000),
+        submission_budget_ns: Some(80_000_000),
+    };
+    let mut journal = AdaptiveRenderJournal::default();
+    let frame_target = worker_timing_test_target();
+
+    for sample in 0..20_u64 {
+        let base_ns = 100_000_000 + sample * 10_000_000;
+        journal.record_frame_service_observation(
+            oblivion_one::native::adaptive_buffering::FrameTimingObservation {
+                frame_id: sample,
+                target: frame_target,
+                composite_started_at: MonotonicTimestampNs::new(base_ns),
+                worker_queued_at: Some(MonotonicTimestampNs::new(base_ns + 4_000_000)),
+                fence_signaled_at: Some((
+                    MonotonicTimestampNs::new(base_ns + 2_000_000),
+                    oblivion_one::native::adaptive_buffering::FenceTimestampQuality::ExactSyncFile,
+                )),
+            },
+        );
+        if sample < 19 {
+            record_composited_primary_worker_timing(
+                &mut journal,
+                AtomicCommitKind::CompositedPrimary {
+                    transaction_id,
+                    frame_id: sample,
+                    framebuffer_id: 1,
+                },
+                primary_sample,
+            );
+        }
+    }
+    assert_eq!(
+        journal.prediction_estimator_mode(),
+        oblivion_one::native::adaptive_buffering::PredictionEstimatorMode::ColdStart
+    );
+
+    record_composited_primary_worker_timing(
+        &mut journal,
+        AtomicCommitKind::DirectPrimary {
+            transaction_id,
+            direct_token: oblivion_one::native::kms::PageFlipToken::new(2)
+                .expect("direct pageflip token"),
+            framebuffer_id: 2,
+        },
+        direct_sample,
+    );
+    assert_eq!(
+        journal.prediction_estimator_mode(),
+        oblivion_one::native::adaptive_buffering::PredictionEstimatorMode::ColdStart
+    );
+
+    record_composited_primary_worker_timing(
+        &mut journal,
+        AtomicCommitKind::CompositedPrimary {
+            transaction_id,
+            frame_id: 19,
+            framebuffer_id: 1,
+        },
+        primary_sample,
+    );
+    assert_eq!(
+        journal.prediction_estimator_mode(),
+        oblivion_one::native::adaptive_buffering::PredictionEstimatorMode::WarmParallel
+    );
+}
+
+fn worker_timing_test_target() -> PresentationTarget {
+    let timestamp = MonotonicTimestampNs::new(10_000_000);
+    PresentationTarget {
+        sequence: 1,
+        presentation_time: timestamp,
+        submit_not_before: timestamp,
+        render_start_deadline: timestamp,
+        refresh_interval: Duration::from_millis(10),
+        reason: PresentationTargetReason::Normal,
+        clock_generation: 1,
+        estimated: false,
+        predicted_unreachable: false,
+        physical_claim: oblivion_one::native::presentation_deadline::PrimaryRefreshClaim {
+            sequence: 1,
+            presentation_time: timestamp,
+            clock_generation: 1,
+        },
+        selection_evidence: Default::default(),
+    }
 }
 
 struct RecordingFatalJobHandler {
