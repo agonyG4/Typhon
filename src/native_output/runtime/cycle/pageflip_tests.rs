@@ -21,7 +21,112 @@ use oblivion_one::native::presentation_deadline::{
 };
 use oblivion_one::native::presentation_timing::PresentationTiming;
 use std::num::NonZeroU64;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::Arc;
+
+struct SwapchainSuspendedRecovery<'a> {
+    swapchain: &'a mut AtomicOutputSwapchain,
+}
+
+impl SuspendedOutputRecoveryBackend for SwapchainSuspendedRecovery<'_> {
+    fn has_suspended_output_ownership(&self) -> NativeResult<bool> {
+        Ok(self.swapchain.has_suspended_ownership())
+    }
+
+    fn recover_suspended_ready_if_signaled(&mut self) -> NativeResult<bool> {
+        Ok(self.swapchain.recover_suspended_frames_if_signaled(drop)?)
+    }
+
+    fn suspended_fence_fd(&self) -> NativeResult<Option<std::os::fd::RawFd>> {
+        Ok(self.swapchain.suspended_fence_fd()?)
+    }
+}
+
+impl DirectEntryOwnershipBackend for SwapchainSuspendedRecovery<'_> {
+    fn swapchain_mut(&mut self) -> std::io::Result<&mut AtomicOutputSwapchain> {
+        Ok(self.swapchain)
+    }
+}
+
+struct SuspendedWithoutReadinessFd;
+
+impl SuspendedOutputRecoveryBackend for SuspendedWithoutReadinessFd {
+    fn has_suspended_output_ownership(&self) -> NativeResult<bool> {
+        Ok(true)
+    }
+
+    fn recover_suspended_ready_if_signaled(&mut self) -> NativeResult<bool> {
+        Ok(false)
+    }
+
+    fn suspended_fence_fd(&self) -> NativeResult<Option<std::os::fd::RawFd>> {
+        Ok(None)
+    }
+}
+
+fn pageflip_test_controllable_render_fence() -> (
+    crate::egl_renderer::native_fence::NativeRenderFence,
+    OwnedFd,
+) {
+    let event = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+    assert!(event >= 0);
+    let signal = unsafe { OwnedFd::from_raw_fd(event) };
+    let submission = unsafe { libc::fcntl(signal.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+    assert!(submission >= 0);
+    (
+        crate::egl_renderer::native_fence::NativeRenderFence::from_submission_fd(unsafe {
+            OwnedFd::from_raw_fd(submission)
+        }),
+        signal,
+    )
+}
+
+fn signal_pageflip_test_fence(signal: &OwnedFd) {
+    let value = 1u64.to_ne_bytes();
+    assert_eq!(
+        unsafe { libc::write(signal.as_raw_fd(), value.as_ptr().cast(), value.len()) },
+        value.len() as isize
+    );
+}
+
+#[test]
+fn suspended_output_recovery_requires_a_wake_owner_and_preserves_an_existing_token() {
+    let mut event_loop = NativeEventLoop::new().unwrap();
+    let mut output_render_fence_token = None;
+    let error = recover_or_arm_suspended_output_ownership(
+        &mut SuspendedWithoutReadinessFd,
+        &mut event_loop,
+        &mut output_render_fence_token,
+    )
+    .expect_err("suspended ownership with no fence and no token is invalid");
+    assert!(
+        error
+            .to_string()
+            .contains("suspended output ownership has no readiness fence to wait for")
+    );
+
+    let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+    assert!(fd >= 0);
+    let owned_fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    let existing = event_loop
+        .register(fd, NativeEventSource::OutputRenderFence)
+        .unwrap();
+    output_render_fence_token = Some(existing);
+    let waiting = recover_or_arm_suspended_output_ownership(
+        &mut SuspendedWithoutReadinessFd,
+        &mut event_loop,
+        &mut output_render_fence_token,
+    )
+    .unwrap();
+    assert_eq!(waiting, SuspendedOutputRecovery::Waiting);
+    assert_eq!(output_render_fence_token, Some(existing));
+    assert_eq!(
+        event_loop.source_for_token(existing),
+        Some(NativeEventSource::OutputRenderFence)
+    );
+    event_loop.unregister(existing).unwrap();
+    drop(owned_fd);
+}
 
 fn pageflip_timestamp(
     presented_at: MonotonicTimestampNs,
@@ -1229,6 +1334,13 @@ fn signaled_retry_render_fence() -> crate::egl_renderer::native_fence::NativeRen
 }
 
 fn variable_retry_fixture(lane: VariableRetryPacingLane) -> VariableRetryFixture {
+    variable_retry_fixture_with_render_fence(lane, signaled_retry_render_fence())
+}
+
+fn variable_retry_fixture_with_render_fence(
+    lane: VariableRetryPacingLane,
+    render_fence: crate::egl_renderer::native_fence::NativeRenderFence,
+) -> VariableRetryFixture {
     use crate::native_output::NativeCursorDamageBounds;
     use crate::native_output::pacing::NativeFramePacing;
     use crate::native_output::presentation::kms_timing::KmsPresentationTiming;
@@ -1269,7 +1381,7 @@ fn variable_retry_fixture(lane: VariableRetryPacingLane) -> VariableRetryFixture
         cursor_test_policy: FrozenCursorTestPolicy::Required,
     };
     swapchain
-        .prepare_ready_for_test(slot, signaled_retry_render_fence(), cursor_plan, None)
+        .prepare_ready_for_test(slot, render_fence, cursor_plan, None)
         .unwrap();
 
     let anchor = MonotonicTimestampNs::new(1_000_000_000);
@@ -2028,6 +2140,20 @@ fn append_ready_successor(
     opportunity_sequence: u64,
     anchor_ns: u64,
 ) -> OutputFrameIdentitySnapshot {
+    append_ready_successor_with_render_fence(
+        fixture,
+        opportunity_sequence,
+        anchor_ns,
+        signaled_retry_render_fence(),
+    )
+}
+
+fn append_ready_successor_with_render_fence(
+    fixture: &mut VariableRetryFixture,
+    opportunity_sequence: u64,
+    anchor_ns: u64,
+    render_fence: crate::egl_renderer::native_fence::NativeRenderFence,
+) -> OutputFrameIdentitySnapshot {
     use crate::native_output::NativeCursorDamageBounds;
     use crate::native_output::presentation::kms_timing::KmsPresentationTiming;
     use crate::native_output::presentation::plane::{
@@ -2046,7 +2172,7 @@ fn append_ready_successor(
         .swapchain
         .prepare_ready_for_test(
             slot,
-            signaled_retry_render_fence(),
+            render_fence,
             FrozenPrimaryCursorPlan {
                 delivery: PresentedCursorDelivery::Hidden,
                 primary_presentation: FrozenPrimaryCursorPresentation::Preserve,
@@ -2235,8 +2361,14 @@ fn direct_entry_retires_worker_and_ready_successors_before_invalidating_scene_ba
     let mut cursor_output_arbitration = NativeCursorOutputArbitration::default();
     let mut emergency_worker_jobs = Vec::new();
     let mut queued_redraw_requested = false;
+    let mut event_loop = NativeEventLoop::new().unwrap();
+    let mut output_render_fence_token = None;
     let retirement = retire_direct_entry_future_composited_owners(
-        &mut fixture.swapchain,
+        &mut SwapchainSuspendedRecovery {
+            swapchain: &mut fixture.swapchain,
+        },
+        &mut event_loop,
+        &mut output_render_fence_token,
         Some(&worker),
         crtc_id,
         output_epoch,
@@ -2255,13 +2387,19 @@ fn direct_entry_retires_worker_and_ready_successors_before_invalidating_scene_ba
         NativePerfLogger::from_env(),
     )
     .unwrap();
+    fixture
+        .scene_history
+        .invalidate_presented_composited_baseline();
+    assert_eq!(fixture.scene_history.presented_frame_id(), None);
 
     assert_eq!(retirement.worker_frame_id, Some(fixture.owner.frame_id));
     assert_eq!(retirement.ready_frame_id, Some(ready_owner.frame_id));
     assert_eq!(fixture.swapchain.worker_queued_identity(), None);
     assert_eq!(fixture.swapchain.ready_identity(), None);
-    assert!(fixture.swapchain.contains_suspended_frame(fixture.owner));
-    assert!(fixture.swapchain.contains_suspended_frame(ready_owner));
+    assert!(!fixture.swapchain.contains_suspended_frame(fixture.owner));
+    assert!(!fixture.swapchain.contains_suspended_frame(ready_owner));
+    assert!(!fixture.swapchain.has_suspended_ownership());
+    assert!(output_render_fence_token.is_none());
     assert_eq!(
         fixture.scene_history.submitted_frame_id(worker_token.get()),
         None
@@ -2301,10 +2439,8 @@ fn direct_entry_retires_worker_and_ready_successors_before_invalidating_scene_ba
     );
     assert_eq!(fixture.output_epoch, output_epoch);
 
-    fixture
-        .scene_history
-        .invalidate_presented_composited_baseline();
-    assert_eq!(fixture.scene_history.presented_frame_id(), None);
+    assert!(fixture.swapchain.render_target_available_for_limit(2));
+
     validate_reconfiguration_frame_ownership_for_swapchain(
         &fixture.swapchain,
         output_epoch,
@@ -2315,21 +2451,6 @@ fn direct_entry_retires_worker_and_ready_successors_before_invalidating_scene_ba
     )
     .unwrap();
     assert!(fixture.frame_scheduler.visual_work_queued());
-
-    drop(
-        fixture
-            .swapchain
-            .take_suspended_frame()
-            .expect("retired worker frame remains releasable after its fence signals"),
-    );
-    drop(
-        fixture
-            .swapchain
-            .take_suspended_frame()
-            .expect("retired READY frame remains releasable after its fence signals"),
-    );
-    assert!(fixture.swapchain.take_suspended_frame().is_none());
-    fixture.swapchain.recover_suspended_slot(true).unwrap();
 
     let fresh_owner = append_ready_successor(&mut fixture, 3, 3_000_000_000);
     assert_eq!(fixture.scene_history.presented_frame_id(), None);
@@ -2415,4 +2536,293 @@ fn direct_entry_retires_worker_and_ready_successors_before_invalidating_scene_ba
     assert_eq!(atomic_commit_arbiter.worker_queued_kind(), Some(fresh_kind));
     assert!(!fixture.frame_scheduler.ready_frame_queued());
     assert_eq!(fixture.output_epoch, output_epoch);
+}
+
+#[test]
+fn direct_entry_waits_for_each_suspended_successor_fence_before_reconfiguration() {
+    use crate::native_output::presentation::ledger::{
+        OutputTransactionDropReason, OutputTransactionState, OutputTransactionTerminal,
+    };
+
+    let (worker_fence, worker_signal) = pageflip_test_controllable_render_fence();
+    let mut fixture =
+        variable_retry_fixture_with_render_fence(VariableRetryPacingLane::Ready, worker_fence);
+    let output_epoch = fixture.output_epoch;
+    let crtc_id = 7;
+    let direct_token = PageFlipToken::new(750).unwrap();
+    let direct_transaction_id = OutputTransactionId::new(NonZeroU64::new(750).unwrap());
+    let direct_kind = AtomicCommitKind::DirectPrimary {
+        transaction_id: direct_transaction_id,
+        direct_token,
+        framebuffer_id: 95,
+    };
+    let mut atomic_commit_arbiter = AtomicCommitArbiter::new();
+    atomic_commit_arbiter
+        .reserve_worker_queued(direct_token, output_epoch.get(), crtc_id, direct_kind, 1)
+        .unwrap();
+    atomic_commit_arbiter
+        .mark_kernel_submitted(direct_token, 2, 3)
+        .unwrap();
+
+    let worker_token = PageFlipToken::new(751).unwrap();
+    let (worker, worker_pacing_ticket) = queue_fixture_ready_as_worker(
+        &mut fixture,
+        &mut atomic_commit_arbiter,
+        worker_token,
+        crtc_id,
+    );
+    let (ready_fence, ready_signal) = pageflip_test_controllable_render_fence();
+    let ready_owner =
+        append_ready_successor_with_render_fence(&mut fixture, 2, 2_000_000_000, ready_fence);
+    let direct_completion =
+        atomic_commit_arbiter.complete(direct_token, output_epoch.get(), crtc_id);
+    assert!(matches!(
+        direct_completion,
+        AtomicCommitCompletion::Completed { kind, .. } if kind == direct_kind
+    ));
+
+    let mut atomic_cursor = None;
+    let mut cursor_output_arbitration = NativeCursorOutputArbitration::default();
+    let mut emergency_worker_jobs = Vec::new();
+    let mut queued_redraw_requested = false;
+    let mut event_loop = NativeEventLoop::new().unwrap();
+    let mut output_render_fence_token = None;
+    let retirement = retire_direct_entry_future_composited_owners(
+        &mut SwapchainSuspendedRecovery {
+            swapchain: &mut fixture.swapchain,
+        },
+        &mut event_loop,
+        &mut output_render_fence_token,
+        Some(&worker),
+        crtc_id,
+        output_epoch,
+        &mut fixture.scene_history,
+        &mut fixture.frame_pacing,
+        &mut fixture.frame_scheduler,
+        &mut atomic_cursor,
+        &mut cursor_output_arbitration,
+        &mut atomic_commit_arbiter,
+        &mut fixture.server,
+        &mut fixture.output_transactions,
+        &mut emergency_worker_jobs,
+        &mut queued_redraw_requested,
+        direct_transaction_id,
+        direct_token,
+        NativePerfLogger::from_env(),
+    )
+    .unwrap();
+    fixture
+        .scene_history
+        .invalidate_presented_composited_baseline();
+    assert_eq!(fixture.scene_history.presented_frame_id(), None);
+
+    assert_eq!(retirement.worker_frame_id, Some(fixture.owner.frame_id));
+    assert_eq!(retirement.ready_frame_id, Some(ready_owner.frame_id));
+    assert!(fixture.swapchain.has_suspended_ownership());
+    assert!(output_render_fence_token.is_some());
+    assert!(!fixture.swapchain.render_target_available_for_limit(2));
+    assert!(fixture.swapchain.acquire_render_slot().is_err());
+    assert_eq!(fixture.swapchain.worker_queued_identity(), None);
+    assert_eq!(fixture.swapchain.ready_identity(), None);
+    assert_eq!(
+        fixture.scene_history.submitted_frame_id(worker_token.get()),
+        None
+    );
+    assert_eq!(fixture.scene_history.ready_frame_identity(), None);
+    assert_eq!(fixture.frame_pacing.ready, None);
+    assert_eq!(fixture.frame_pacing.unsubmitted_physical_identity(), None);
+    assert!(!fixture.frame_pacing.active_worker_owned());
+    assert!(!fixture.frame_scheduler.ready_frame_queued());
+    assert!(fixture.frame_scheduler.visual_work_queued());
+    assert!(queued_redraw_requested);
+    assert!(emergency_worker_jobs.is_empty());
+    assert!(atomic_commit_arbiter.worker_queued_kind().is_none());
+    assert!(
+        fixture
+            .output_transactions
+            .active_transaction_ids()
+            .is_empty()
+    );
+    for owner in [fixture.owner, ready_owner] {
+        assert!(matches!(
+            fixture
+                .output_transactions
+                .transaction_including_terminal(owner.transaction_id)
+                .unwrap()
+                .state(),
+            OutputTransactionState::Terminal(OutputTransactionTerminal::Dropped {
+                reason: OutputTransactionDropReason::SafeAbandonment,
+                ..
+            })
+        ));
+    }
+    assert!(
+        !fixture
+            .frame_pacing
+            .cancel_worker_submission(Some(worker_pacing_ticket))
+    );
+
+    let first_token = output_render_fence_token.unwrap();
+    signal_pageflip_test_fence(&worker_signal);
+    let first_wakeup = event_loop.wait().unwrap();
+    assert!(first_wakeup.reasons.output_render_fence());
+    let first_progress = settle_suspended_output_fence_wake(
+        &mut SwapchainSuspendedRecovery {
+            swapchain: &mut fixture.swapchain,
+        },
+        &mut event_loop,
+        &mut output_render_fence_token,
+    )
+    .unwrap();
+    assert_eq!(first_progress, SuspendedOutputRecovery::Waiting);
+    let second_token = output_render_fence_token.expect("READY successor fence is re-armed");
+    assert_ne!(first_token, second_token);
+    assert!(fixture.swapchain.has_suspended_ownership());
+    assert!(!fixture.swapchain.render_target_available_for_limit(2));
+
+    signal_pageflip_test_fence(&ready_signal);
+    let second_wakeup = event_loop.wait().unwrap();
+    assert!(second_wakeup.reasons.output_render_fence());
+    let recovered = settle_suspended_output_fence_wake(
+        &mut SwapchainSuspendedRecovery {
+            swapchain: &mut fixture.swapchain,
+        },
+        &mut event_loop,
+        &mut output_render_fence_token,
+    )
+    .unwrap();
+    assert_eq!(recovered, SuspendedOutputRecovery::Recovered);
+    assert!(output_render_fence_token.is_none());
+    assert!(!fixture.swapchain.has_suspended_ownership());
+    assert!(fixture.swapchain.render_target_available_for_limit(2));
+    assert_eq!(fixture.swapchain.worker_queued_identity(), None);
+    assert_eq!(fixture.swapchain.ready_identity(), None);
+    assert_eq!(
+        fixture.scene_history.submitted_frame_id(worker_token.get()),
+        None
+    );
+    assert_eq!(fixture.scene_history.ready_frame_identity(), None);
+    assert_eq!(fixture.frame_pacing.ready, None);
+    assert_eq!(fixture.frame_pacing.unsubmitted_physical_identity(), None);
+    assert!(!fixture.frame_pacing.active_worker_owned());
+    assert!(!fixture.frame_scheduler.ready_frame_queued());
+    assert!(
+        fixture
+            .output_transactions
+            .active_transaction_ids()
+            .is_empty()
+    );
+    assert_eq!(fixture.output_epoch, output_epoch);
+    validate_reconfiguration_frame_ownership_for_swapchain(
+        &fixture.swapchain,
+        output_epoch,
+        &fixture.scene_history,
+        &fixture.frame_pacing,
+        &fixture.frame_scheduler,
+        &fixture.output_transactions,
+    )
+    .unwrap();
+
+    let fresh_owner = append_ready_successor(&mut fixture, 3, 3_000_000_000);
+    assert_eq!(fixture.scene_history.presented_frame_id(), None);
+    assert_eq!(fixture.swapchain.ready_identity(), Some(fresh_owner));
+    assert_eq!(
+        fixture.scene_history.ready_frame_identity(),
+        Some((fresh_owner.frame_id, fresh_owner.render_generation))
+    );
+    assert!(fixture.frame_scheduler.ready_frame_queued());
+    assert!(
+        fixture
+            .output_transactions
+            .active_transaction_ids()
+            .contains(&fresh_owner.transaction_id)
+    );
+    validate_reconfiguration_frame_ownership_for_swapchain(
+        &fixture.swapchain,
+        output_epoch,
+        &fixture.scene_history,
+        &fixture.frame_pacing,
+        &fixture.frame_scheduler,
+        &fixture.output_transactions,
+    )
+    .unwrap();
+}
+
+#[test]
+fn suspended_output_recovery_advances_one_fence_at_a_time() {
+    let mut swapchain = AtomicOutputSwapchain::from_presented_slots(
+        explicit_slot_set(),
+        OutputSlotId::new(0).unwrap(),
+        74,
+    )
+    .unwrap();
+    let worker_slot = swapchain.acquire_render_slot().unwrap();
+    let (worker_fence, worker_signal) = pageflip_test_controllable_render_fence();
+    swapchain
+        .finish_render(worker_slot, 1, worker_fence)
+        .unwrap();
+    let worker_token = PageFlipToken::new(740).unwrap();
+    let (submission_fence, _) = swapchain
+        .take_ready_for_worker(worker_token, MonotonicTimestampNs::new(10))
+        .unwrap();
+    drop(submission_fence);
+
+    let ready_slot = swapchain.acquire_render_slot().unwrap();
+    let (ready_fence, ready_signal) = pageflip_test_controllable_render_fence();
+    swapchain.finish_render(ready_slot, 1, ready_fence).unwrap();
+    swapchain.suspend_abandon_future_frames().unwrap();
+    assert!(swapchain.has_suspended_ownership());
+
+    let mut event_loop = NativeEventLoop::new().unwrap();
+    let mut output_render_fence_token = None;
+    let first_wait = recover_or_arm_suspended_output_ownership(
+        &mut SwapchainSuspendedRecovery {
+            swapchain: &mut swapchain,
+        },
+        &mut event_loop,
+        &mut output_render_fence_token,
+    )
+    .unwrap();
+    assert_eq!(first_wait, SuspendedOutputRecovery::Waiting);
+    let first_token = output_render_fence_token.expect("first suspended fence is armed");
+    assert_eq!(
+        event_loop.source_for_token(first_token),
+        Some(NativeEventSource::OutputRenderFence)
+    );
+    assert!(!swapchain.render_target_available_for_limit(2));
+    assert!(swapchain.acquire_render_slot().is_err());
+
+    signal_pageflip_test_fence(&worker_signal);
+    let first_wakeup = event_loop.wait().unwrap();
+    assert!(first_wakeup.reasons.output_render_fence());
+    let progressed = settle_suspended_output_fence_wake(
+        &mut SwapchainSuspendedRecovery {
+            swapchain: &mut swapchain,
+        },
+        &mut event_loop,
+        &mut output_render_fence_token,
+    )
+    .unwrap();
+    assert_eq!(progressed, SuspendedOutputRecovery::Waiting);
+    let second_token = output_render_fence_token.expect("remaining fence is re-armed");
+    assert_ne!(first_token, second_token);
+    assert!(!swapchain.render_target_available_for_limit(2));
+
+    signal_pageflip_test_fence(&ready_signal);
+    let second_wakeup = event_loop.wait().unwrap();
+    assert!(second_wakeup.reasons.output_render_fence());
+    let recovered = settle_suspended_output_fence_wake(
+        &mut SwapchainSuspendedRecovery {
+            swapchain: &mut swapchain,
+        },
+        &mut event_loop,
+        &mut output_render_fence_token,
+    )
+    .unwrap();
+    assert_eq!(recovered, SuspendedOutputRecovery::Recovered);
+    assert!(output_render_fence_token.is_none());
+    assert!(!swapchain.has_suspended_ownership());
+    assert!(swapchain.render_target_available_for_limit(2));
+    assert!(swapchain.acquire_render_slot().is_ok());
+    swapchain.validate_invariants().unwrap();
 }
