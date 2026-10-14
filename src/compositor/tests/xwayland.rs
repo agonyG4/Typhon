@@ -1448,6 +1448,53 @@ fn activating_associationless_iconic_x11_window_requests_remap_and_cancels_on_re
 }
 
 #[test]
+fn xwayland_minimize_publishes_hidden_before_unmapping() {
+    let mut fixture = stationary_pointer_xwayland_fixture();
+    let mut snapshot = fake_snapshot();
+    snapshot.surface_id = fixture.parent_surface_id;
+    snapshot.state.maximized = true;
+    let handle = snapshot.handle;
+    fixture
+        .server
+        .apply_xwayland_window_event(XwmEvent::WindowReady(snapshot));
+    let window_id = fixture
+        .server
+        .state
+        .window_id_for_x11_handle(handle)
+        .unwrap();
+    let _ = fixture.server.take_xwayland_backend_commands(0);
+    fixture
+        .server
+        .set_lifecycle_animation_renderer_available(false);
+
+    assert!(fixture.server.state.minimize_desktop_window(window_id));
+    let commands = fixture.server.take_xwayland_backend_commands(1);
+    let hidden_state = commands
+        .iter()
+        .position(|command| {
+            matches!(
+                command, XwmCommand::SetState { window, state }
+                    if *window == handle && state.hidden && state.maximized && !state.activated
+            )
+        })
+        .expect("minimize must publish hidden, maximized, inactive state");
+    let unmap = commands
+        .iter()
+        .position(|command| matches!(command, XwmCommand::Unmap(window) if *window == handle))
+        .expect("minimize must unmap the X11 window");
+
+    assert!(hidden_state < unmap, "hidden state must precede Unmap");
+    assert_eq!(
+        commands
+            .iter()
+            .filter(|command| matches!(command, XwmCommand::Unmap(window) if *window == handle))
+            .count(),
+        1,
+        "minimize must issue one effective Unmap"
+    );
+}
+
+#[test]
 fn deferred_xwayland_restore_clears_hidden_before_mapping() {
     let mut fixture = stationary_pointer_xwayland_fixture();
     let mut snapshot = fake_snapshot();

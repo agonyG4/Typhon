@@ -2258,16 +2258,15 @@ impl CompositorState {
         let WindowBackend::X11(_) = window.backend else {
             return;
         };
-        if mapped {
-            self.backend_commands.push(
-                crate::compositor::window_backend::WindowBackendCommand::PublishState {
-                    window: window_id,
-                    mode: window.state.mode(),
-                    minimized: false,
-                    activated: self.focused_window_id == Some(window_id),
-                },
-            );
-        }
+        let mode = window.state.mode();
+        self.backend_commands.push(
+            crate::compositor::window_backend::WindowBackendCommand::PublishState {
+                window: window_id,
+                mode,
+                minimized: !mapped,
+                activated: mapped && self.focused_window_id == Some(window_id),
+            },
+        );
         self.backend_commands.push(
             crate::compositor::window_backend::WindowBackendCommand::SetMapped {
                 window: window_id,

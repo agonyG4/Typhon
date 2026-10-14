@@ -499,6 +499,7 @@ pub(crate) fn execute(xwm: &mut Xwm, command: XwmCommand) -> Result<XwmCommandOu
         }
         XwmCommand::SetState { window, state } => {
             publish_state(xwm, window, state)?;
+            trace_x11_state_publication(window, state);
         }
         XwmCommand::SyncClientLists {
             client_list,
@@ -1355,6 +1356,24 @@ fn publish_frame_extents(
 
 fn set_lifecycle_map_commanded(xwm: &mut Xwm, handle: super::X11WindowHandle) {
     let _ = xwm.windows.mark_map_commanded(handle);
+}
+
+fn trace_x11_state_publication(handle: super::X11WindowHandle, state: X11PublishedState) {
+    if !matches!(
+        std::env::var("ASTREA_LIFECYCLE_DIAGNOSTICS").as_deref(),
+        Ok("1" | "true" | "on")
+    ) {
+        return;
+    }
+    eprintln!(
+        "typhon.x11_mapping event=wm_state_published xid={} generation={} fullscreen={} maximized={} hidden={} activated={}",
+        handle.xid(),
+        handle.generation().get(),
+        state.fullscreen,
+        state.maximized,
+        state.hidden,
+        state.activated,
+    );
 }
 
 fn trace_x11_mapping_command(
