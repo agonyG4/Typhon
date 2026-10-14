@@ -295,6 +295,8 @@ pub(super) fn execute_capture(
         .runtime
         .effect_resources
         .bind_render_target(renderer.gl, target)?;
+    #[cfg(test)]
+    let _dither_restore = super::pass_exec::establish_test_offscreen_dither_state(renderer.gl);
     unsafe {
         renderer
             .gl
@@ -944,6 +946,8 @@ pub(super) fn capture_output_rects_to_graph_texture_shader_copy_with_targets(
     .ok_or_else(|| io::Error::other("direct capture domain is outside the output"))?;
     let result = (|| {
         let draw_framebuffer = runtime.effect_resources.bind_draw_target(gl, target)?;
+        #[cfg(test)]
+        let _dither_restore = super::pass_exec::establish_test_offscreen_dither_state(gl);
         // This is a hard guard against sampling from the image attached to the
         // current draw framebuffer. The output framebuffer is never bound as
         // DRAW for this path; only the pooled graph target is.

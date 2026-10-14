@@ -13,11 +13,17 @@ mod shader_cache;
 mod trace;
 
 #[cfg(test)]
-pub(crate) use blur::{DUAL_KAWASE_DOWNSAMPLE_LINEAR_SHADER, DUAL_KAWASE_VERTEX_SHADER};
+pub(crate) use blur::{
+    DUAL_KAWASE_DOWNSAMPLE_LINEAR_SHADER, DUAL_KAWASE_UPSAMPLE_SHADER, DUAL_KAWASE_VERTEX_SHADER,
+};
+#[cfg(test)]
+pub(crate) use executor::FRAGMENT_STAGE_FRAGMENT_SHADER;
+#[cfg(test)]
+pub(crate) use executor::with_test_offscreen_dither_policy;
 #[cfg(test)]
 pub(crate) use executor::{
     BLEND_STAGE_FRAGMENT_SHADER, EffectPassBlendMode, MASK_STAGE_FRAGMENT_SHADER,
-    NORMALIZE_FRAGMENT_SHADER, establish_effect_pass_blend_state,
+    NORMALIZE_FRAGMENT_SHADER, TEST_MANUAL_BINARY16_GLSL, establish_effect_pass_blend_state,
 };
 #[cfg(test)]
 pub(crate) const COPY_FRAGMENT_SHADER: &str = executor::COPY_FRAGMENT_SHADER;

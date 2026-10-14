@@ -1,5 +1,70 @@
 use super::*;
 
+#[cfg(test)]
+std::thread_local! {
+    static TEST_OFFSCREEN_DITHER_POLICY: std::cell::Cell<Option<bool>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+#[cfg(test)]
+pub(crate) fn with_test_offscreen_dither_policy<T>(
+    policy: Option<bool>,
+    run: impl FnOnce() -> T,
+) -> T {
+    let previous = TEST_OFFSCREEN_DITHER_POLICY.with(|current| current.replace(policy));
+    let _restore = TestOffscreenDitherPolicyRestore(previous);
+    run()
+}
+
+#[cfg(test)]
+struct TestOffscreenDitherPolicyRestore(Option<bool>);
+
+#[cfg(test)]
+impl Drop for TestOffscreenDitherPolicyRestore {
+    fn drop(&mut self) {
+        TEST_OFFSCREEN_DITHER_POLICY.with(|current| current.set(self.0));
+    }
+}
+
+#[cfg(test)]
+pub(super) struct TestOffscreenDitherStateRestore<'a> {
+    gl: &'a glow::Context,
+    previous: bool,
+}
+
+#[cfg(test)]
+impl Drop for TestOffscreenDitherStateRestore<'_> {
+    fn drop(&mut self) {
+        unsafe {
+            if self.previous {
+                self.gl.enable(glow::DITHER);
+            } else {
+                self.gl.disable(glow::DITHER);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+pub(super) fn establish_test_offscreen_dither_state(
+    gl: &glow::Context,
+) -> Option<TestOffscreenDitherStateRestore<'_>> {
+    TEST_OFFSCREEN_DITHER_POLICY.with(|policy| {
+        policy.get().map(|enabled| {
+            let previous = unsafe { gl.is_enabled(glow::DITHER) };
+            unsafe {
+                if enabled {
+                    gl.enable(glow::DITHER);
+                } else {
+                    gl.disable(glow::DITHER);
+                }
+            }
+            TestOffscreenDitherStateRestore { gl, previous }
+        })
+    })
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum EffectPassBlendMode {
     Replace,
@@ -209,6 +274,8 @@ pub(super) fn execute_kawase_texture_stage(
         .runtime
         .effect_resources
         .bind_render_target(renderer.gl, output_texture)?;
+    #[cfg(test)]
+    let _dither_restore = establish_test_offscreen_dither_state(renderer.gl);
     establish_effect_pass_blend_state(renderer.gl, EffectPassBlendMode::Replace);
     let target_flip_y = effect_target_requires_logical_y_flip(false, framebuffer_origin);
     let input_flip_y = effect_input_requires_sample_y_flip(input_layout.origin);
@@ -511,6 +578,8 @@ pub(super) fn execute_fullscreen_stage(
         .runtime
         .effect_resources
         .bind_render_target(renderer.gl, output_texture)?;
+    #[cfg(test)]
+    let _dither_restore = establish_test_offscreen_dither_state(renderer.gl);
     let module = ShaderModuleId::new(module)
         .ok_or_else(|| io::Error::other("effect stage shader id is zero"))?;
     let shader_key = ShaderProgramKey::new(
@@ -1348,6 +1417,9 @@ fn execute_fullscreen_pass_impl(
                 .ok_or_else(|| io::Error::other("effect output texture is not allocated"))?,
         )
     };
+    #[cfg(test)]
+    let _dither_restore =
+        output_texture.and_then(|_| establish_test_offscreen_dither_state(renderer.gl));
     if output_is_framebuffer {
         renderer.establish_effect_composition_state(targets.composition_draw);
     }

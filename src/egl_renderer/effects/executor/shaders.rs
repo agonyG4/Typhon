@@ -701,10 +701,60 @@ void main() {
 "#;
 
 #[cfg(test)]
+pub(crate) const TEST_MANUAL_BINARY16_GLSL: &str = r#"precision highp int;
+uint typhon_float_to_binary16_rtz(float value) {
+    uint bits = floatBitsToUint(value);
+    uint sign = (bits >> 16u) & 0x8000u;
+    uint exponent = (bits >> 23u) & 0xffu;
+    uint fraction = bits & 0x007fffffu;
+    if (exponent == 0xffu) {
+        if (fraction == 0u) return sign | 0x7c00u;
+        return sign | 0x7c00u | max(fraction >> 13u, 1u);
+    }
+    int unbiased = int(exponent) - 127;
+    if (unbiased > 15) return sign | 0x7bffu;
+    if (unbiased >= -14) {
+        uint half_exponent = uint(unbiased + 15);
+        return sign | (half_exponent << 10u) | (fraction >> 13u);
+    }
+    if (unbiased < -24) return sign;
+    uint significand = 0x800000u | fraction;
+    uint shift = uint(-unbiased - 1);
+    return sign | (significand >> shift);
+}
+
+float typhon_binary16_to_float(uint half_bits) {
+    uint sign = (half_bits & 0x8000u) << 16u;
+    uint exponent = (half_bits >> 10u) & 0x1fu;
+    uint fraction = half_bits & 0x03ffu;
+    if (exponent == 0u) {
+        if (fraction == 0u) return uintBitsToFloat(sign);
+        int unbiased = -14;
+        while ((fraction & 0x0400u) == 0u) {
+            fraction <<= 1u;
+            unbiased -= 1;
+        }
+        fraction &= 0x03ffu;
+        return uintBitsToFloat(
+            sign | (uint(unbiased + 127) << 23u) | (fraction << 13u)
+        );
+    }
+    if (exponent == 0x1fu) {
+        return uintBitsToFloat(sign | 0x7f800000u | (fraction << 13u));
+    }
+    return uintBitsToFloat(
+        sign | ((exponent + 112u) << 23u) | (fraction << 13u)
+    );
+}
+"#;
+
+#[cfg(test)]
 const DIAGNOSTIC_VIRTUAL_RGBA16F_BOUNDARY: &str = r#"vec4 typhon_virtual_rgba16f_boundary(vec4 value) {
     return vec4(
-        unpackHalf2x16(packHalf2x16(value.rg)),
-        unpackHalf2x16(packHalf2x16(value.ba))
+        typhon_binary16_to_float(typhon_float_to_binary16_rtz(value.r)),
+        typhon_binary16_to_float(typhon_float_to_binary16_rtz(value.g)),
+        typhon_binary16_to_float(typhon_float_to_binary16_rtz(value.b)),
+        typhon_binary16_to_float(typhon_float_to_binary16_rtz(value.a))
     );
 }"#;
 
@@ -730,7 +780,9 @@ pub(crate) fn diagnostic_kawase_only_channel_bits_shader(
 ) -> String {
     let mut source = DIAGNOSTIC_KAWASE_ONLY_FRAGMENT_SHADER.to_owned();
     if q1 {
-        let main = format!("{DIAGNOSTIC_VIRTUAL_RGBA16F_BOUNDARY}\n\nvoid main() {{");
+        let main = format!(
+            "{TEST_MANUAL_BINARY16_GLSL}\n{DIAGNOSTIC_VIRTUAL_RGBA16F_BOUNDARY}\n\nvoid main() {{"
+        );
         replace_diagnostic_shader_once(&mut source, "void main() {", &main);
         replace_diagnostic_shader_once(
             &mut source,
@@ -767,7 +819,9 @@ pub(crate) fn diagnostic_legacy_up2_canonical_shader() -> String {
 #[cfg(test)]
 pub(crate) fn diagnostic_fragment_stage_q2_shader() -> String {
     let mut source = FRAGMENT_STAGE_FRAGMENT_SHADER.to_owned();
-    let main = format!("{DIAGNOSTIC_VIRTUAL_RGBA16F_BOUNDARY}\n\nvoid main() {{");
+    let main = format!(
+        "{TEST_MANUAL_BINARY16_GLSL}\n{DIAGNOSTIC_VIRTUAL_RGBA16F_BOUNDARY}\n\nvoid main() {{"
+    );
     replace_diagnostic_shader_once(&mut source, "void main() {", &main);
     replace_diagnostic_shader_once(
         &mut source,
@@ -781,7 +835,9 @@ pub(crate) fn diagnostic_fragment_stage_q2_shader() -> String {
 pub(crate) fn diagnostic_fragment_stage_boundary_probe_shader(q2: bool, channel: &str) -> String {
     let mut source = FRAGMENT_STAGE_FRAGMENT_SHADER.to_owned();
     if q2 {
-        let main = format!("{DIAGNOSTIC_VIRTUAL_RGBA16F_BOUNDARY}\n\nvoid main() {{");
+        let main = format!(
+            "{TEST_MANUAL_BINARY16_GLSL}\n{DIAGNOSTIC_VIRTUAL_RGBA16F_BOUNDARY}\n\nvoid main() {{"
+        );
         replace_diagnostic_shader_once(&mut source, "void main() {", &main);
         replace_diagnostic_shader_once(
             &mut source,
@@ -816,7 +872,9 @@ pub(crate) fn diagnostic_terminal_shader_with_virtual_boundaries(q1: bool, q2: b
         "vec2 sample_uv = typhon_effect_sample_uv(canonical_effect_local_uv);",
     );
     if q1 || q2 {
-        let main = format!("{DIAGNOSTIC_VIRTUAL_RGBA16F_BOUNDARY}\n\nvoid main() {{");
+        let main = format!(
+            "{TEST_MANUAL_BINARY16_GLSL}\n{DIAGNOSTIC_VIRTUAL_RGBA16F_BOUNDARY}\n\nvoid main() {{"
+        );
         replace_diagnostic_shader_once(&mut source, "void main() {", &main);
     }
     if q1 {

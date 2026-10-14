@@ -1,4 +1,220 @@
 use super::*;
+use glow::HasContext;
+
+fn compare_mrt_store_with_capture(
+    label: &str,
+    capture: &effects::DiagnosticTextureCapture,
+    probe: &super::rgba16f_store::MrtProbeReadback,
+) {
+    assert_eq!((capture.width, capture.height), (probe.width, probe.height));
+    let mut differing_texels = 0;
+    let mut differing_channels = 0;
+    let mut max_delta = 0.0_f32;
+    for (expected, actual) in capture.pixels.iter().zip(&probe.stored) {
+        let mut texel_differs = false;
+        for channel in 0..4 {
+            let delta = (expected[channel] - actual[channel]).abs();
+            max_delta = max_delta.max(delta);
+            if expected[channel].to_bits() != actual[channel].to_bits() {
+                differing_channels += 1;
+                texel_differs = true;
+            }
+        }
+        differing_texels += usize::from(texel_differs);
+    }
+    println!(
+        "{label} vs MRT store texels={} channels={} max_delta={max_delta}",
+        differing_texels, differing_channels
+    );
+    let classification = super::rgba16f_store::classify_mrt(probe);
+    println!("{label} MRT classification={classification:?}");
+    super::rgba16f_store::report_mrt_samples(label, probe, 4);
+}
+
+fn diagnostic_saturation_matrix(saturation: f32) -> [f32; 16] {
+    let desaturation = 1.0 - saturation;
+    let red = 0.2126 * desaturation;
+    let green = 0.7152 * desaturation;
+    let blue = 0.0722 * desaturation;
+    [
+        red + saturation,
+        red,
+        red,
+        0.0,
+        green,
+        green + saturation,
+        green,
+        0.0,
+        blue,
+        blue,
+        blue + saturation,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+    ]
+}
+
+fn set_mrt_i32(gl: &glow::Context, program: glow::Program, name: &str, value: i32) {
+    unsafe {
+        if let Some(location) = gl.get_uniform_location(program, name) {
+            gl.uniform_1_i32(Some(&location), value);
+        }
+    }
+}
+
+fn set_mrt_f32(gl: &glow::Context, program: glow::Program, name: &str, value: f32) {
+    unsafe {
+        if let Some(location) = gl.get_uniform_location(program, name) {
+            gl.uniform_1_f32(Some(&location), value);
+        }
+    }
+}
+
+fn set_mrt_vec2(gl: &glow::Context, program: glow::Program, name: &str, value: [f32; 2]) {
+    unsafe {
+        if let Some(location) = gl.get_uniform_location(program, name) {
+            gl.uniform_2_f32(Some(&location), value[0], value[1]);
+        }
+    }
+}
+
+fn run_same_invocation_boundary_probes(
+    harness: &GlesEffectTestHarness,
+    replay: &effects::TerminalBoundaryReplayExecution,
+    up2_input_pass: oblivion_one::effects::GraphPassId,
+    up2_pass: &CompiledRenderPass,
+    up2_id: oblivion_one::effects::GraphPassId,
+    fragment_id: oblivion_one::effects::GraphPassId,
+    saturation: f32,
+    dither: bool,
+    case_name: &str,
+    origin: OutputFramebufferOrigin,
+) {
+    let up2_input = replay
+        .captures
+        .get(&up2_input_pass)
+        .expect("legacy replay captures the stored Up2 input");
+    let a0 = replay
+        .captures
+        .get(&up2_id)
+        .expect("legacy replay captures A0");
+    let b0 = replay
+        .captures
+        .get(&fragment_id)
+        .expect("legacy replay captures B0");
+    let gl = &harness.gl;
+    let up2_input_texture = super::rgba16f_store::upload_rgba16f_texture(
+        gl,
+        up2_input.width,
+        up2_input.height,
+        &up2_input.pixels,
+        true,
+    );
+    let up2_probe_shader = super::rgba16f_store::instrument_mrt_fragment_shader(
+        effects::DUAL_KAWASE_UPSAMPLE_SHADER,
+        "    out_color = result;",
+    );
+    let up2_probe = super::rgba16f_store::run_mrt_probe(
+        gl,
+        a0.width,
+        a0.height,
+        effects::DUAL_KAWASE_VERTEX_SHADER,
+        &up2_probe_shader,
+        Some(up2_input_texture),
+        dither,
+        |gl, program| {
+            set_mrt_i32(
+                gl,
+                program,
+                "u_effect_input_flip_y",
+                i32::from(
+                    up2_input.origin == oblivion_one::effects::GraphTextureOrigin::BottomLeft,
+                ),
+            );
+            set_mrt_vec2(
+                gl,
+                program,
+                "u_effect_texel_size",
+                [
+                    1.0 / up2_input.width.max(1) as f32,
+                    1.0 / up2_input.height.max(1) as f32,
+                ],
+            );
+            set_mrt_f32(
+                gl,
+                program,
+                "u_effect_blur_radius",
+                up2_pass.blur_radius.unwrap_or(1.0),
+            );
+        },
+    );
+    unsafe { gl.delete_texture(up2_input_texture) };
+    assert_eq!((up2_probe.width, up2_probe.height), (a0.width, a0.height));
+    let up2_label = format!("A0_vs_M0 case={case_name} origin={origin:?} dither={dither}");
+    compare_mrt_store_with_capture(&up2_label, a0, &up2_probe);
+
+    let a0_texture =
+        super::rgba16f_store::upload_rgba16f_texture(gl, a0.width, a0.height, &a0.pixels, true);
+    let fragment_probe_shader = super::rgba16f_store::instrument_mrt_fragment_shader(
+        effects::FRAGMENT_STAGE_FRAGMENT_SHADER,
+        "    out_color = typhon_sanitize_premultiplied(result);",
+    );
+    let matrix = diagnostic_saturation_matrix(saturation);
+    let fragment_probe = super::rgba16f_store::run_mrt_probe(
+        gl,
+        b0.width,
+        b0.height,
+        effects::DUAL_KAWASE_VERTEX_SHADER,
+        &fragment_probe_shader,
+        Some(a0_texture),
+        dither,
+        |gl, program| unsafe {
+            set_mrt_i32(
+                gl,
+                program,
+                "u_effect_input_flip_y",
+                i32::from(a0.origin == oblivion_one::effects::GraphTextureOrigin::BottomLeft),
+            );
+            set_mrt_i32(gl, program, "u_effect_decode_srgb", 0);
+            set_mrt_i32(gl, program, "u_effect_encode_srgb", 0);
+            if let Some(location) = gl.get_uniform_location(program, "u_effect_color_matrix") {
+                gl.uniform_matrix_4_f32_slice(Some(&location), false, &matrix);
+            }
+            if let Some(location) = gl.get_uniform_location(program, "u_effect_color_bias") {
+                gl.uniform_4_f32(Some(&location), 0.0, 0.0, 0.0, 0.0);
+            }
+            if let Some(location) = gl.get_uniform_location(program, "u_effect_tint_color") {
+                gl.uniform_4_f32(Some(&location), 1.0, 1.0, 1.0, 1.0);
+            }
+            set_mrt_f32(gl, program, "u_effect_tint_amount", 0.0);
+            set_mrt_f32(gl, program, "u_effect_noise_amount", 0.0);
+        },
+    );
+    unsafe { gl.delete_texture(a0_texture) };
+    assert_eq!(
+        (fragment_probe.width, fragment_probe.height),
+        (b0.width, b0.height)
+    );
+    let fragment_label = format!(
+        "B0_vs_MB0 case={case_name} saturation={saturation} origin={origin:?} dither={dither}"
+    );
+    compare_mrt_store_with_capture(&fragment_label, b0, &fragment_probe);
+
+    for probe in [&up2_probe, &fragment_probe] {
+        for (index, raw_bits) in probe.raw_bits.iter().enumerate() {
+            for channel in 0..4 {
+                let raw = f32::from_bits(raw_bits[channel]);
+                let expected = super::rgba16f_store::binary16_toward_zero_for_test(raw);
+                assert_eq!(
+                    probe.manual_half_bits[index][channel] as u16, expected,
+                    "manual converter differs from CPU RTZ reference at channel={channel}"
+                );
+            }
+        }
+    }
+}
 
 fn terminal_builtin_blur_scene(
     rect: EffectRect,
@@ -3471,4 +3687,188 @@ fn effect_trace_bounds_checkpoint_scene_advancement() {
     assert!(events[replay_begin].contains("scene_cursor_start=1"));
     assert!(events[replay_begin].contains("scene_cursor_end=2"));
     assert!(events[replay_begin].contains("command_count=1"));
+}
+
+#[test]
+fn same_invocation_mrt_reports_real_up2_and_fragment_store_provenance() {
+    let even_bounds = (160, 120);
+    let odd_bounds = (161, 121);
+    let even_rect = EffectRect::new(18, 14, 96, 72).expect("even blur domain");
+    let odd_rect = EffectRect::new(19, 13, 101, 75).expect("odd blur domain");
+    let cases = [
+        ("even_sat_1", even_bounds, even_rect, 1.0, 81_u32),
+        ("even_sat_031", even_bounds, even_rect, 0.31, 82_u32),
+        ("odd_sat_031", odd_bounds, odd_rect, 0.31, 83_u32),
+    ];
+
+    for origin in [
+        OutputFramebufferOrigin::BottomLeft,
+        OutputFramebufferOrigin::TopLeftScanout,
+    ] {
+        for (case_name, output_size, rect, saturation, group_id) in cases {
+            for dither in [true, false] {
+                let visual_group = VisualGroupId::new(group_id).expect("visual group");
+                let material = oblivion_one::material::EffectiveMaterial {
+                    blur: 0.37,
+                    saturation,
+                    noise: 0.0,
+                };
+                let (scene, registry) =
+                    terminal_builtin_blur_scene(rect, visual_group, material, None);
+                let bounds =
+                    EffectRect::new(0, 0, output_size.0, output_size.1).expect("output bounds");
+                let graph = terminal_graph_variant(&scene, &registry, bounds, false);
+                let tails = terminal_tail_capture_ids(&graph);
+                assert_eq!(tails.len(), 1, "the provenance graph has one tail");
+                let tail = tails[0];
+                let up2_pass = graph
+                    .passes
+                    .iter()
+                    .find(|pass| pass.id == tail.upsample)
+                    .expect("legacy Up2 pass exists");
+                let up2_input_id = up2_pass.inputs[0];
+                let up2_input_pass = graph
+                    .passes
+                    .iter()
+                    .find(|pass| pass.output == Some(up2_input_id))
+                    .expect("legacy Up2 input has a producing pass");
+                let capture_passes = [up2_input_pass.id, tail.upsample, tail.fragment];
+                let mut harness = GlesEffectTestHarness::new(output_size.0, output_size.1);
+                install_diagnostic_scene(&mut harness, rect, visual_group);
+                let plan = diagnostic_repaint_plan_for_repairs_in_size(&[], true, output_size);
+                let region = EffectRegion::from_rect(bounds);
+                let config = effects::EffectDebugConfig::new(
+                    effects::EffectDebugCaptureMode::Replay,
+                    effects::EffectDebugKawaseMode::Partial,
+                );
+                let replay = effects::with_test_offscreen_dither_policy(Some(dither), || {
+                    execute_diagnostic_frame_with_terminal_replay(
+                        &mut harness,
+                        &graph,
+                        &plan,
+                        region,
+                        true,
+                        config,
+                        origin,
+                        effects::TerminalBoundaryReplay::Legacy,
+                        capture_passes,
+                        [],
+                    )
+                });
+                println!(
+                    "STORE_PROVENANCE case={case_name} origin={origin:?} dither={dither} up2_input_filter=LINEAR"
+                );
+                run_same_invocation_boundary_probes(
+                    &harness,
+                    &replay,
+                    up2_input_pass.id,
+                    up2_pass,
+                    tail.upsample,
+                    tail.fragment,
+                    saturation,
+                    dither,
+                    case_name,
+                    origin,
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn noise_free_terminal_matrix_reports_explicit_offscreen_dither_policies() {
+    let odd_bounds = (161, 121);
+    let odd_rect = EffectRect::new(19, 13, 101, 75).expect("odd translated blur");
+    let even_rect = EffectRect::new(18, 14, 96, 72).expect("even blur");
+    let rounded_triangle = oblivion_one::effects::EffectCoverage {
+        rounded_rect: Some(oblivion_one::effects::EffectCoverageRoundedRect {
+            x: odd_rect.x as f64,
+            y: odd_rect.y as f64,
+            width: odd_rect.width as f64,
+            height: odd_rect.height as f64,
+            radius: 13.5,
+        }),
+        triangle: Some(oblivion_one::effects::EffectCoverageTriangle {
+            a: [27.0, 23.0],
+            b: [108.0, 20.0],
+            c: [78.0, 79.0],
+        }),
+    };
+
+    for dither in [true, false] {
+        let all_failures = effects::with_test_offscreen_dither_policy(Some(dither), || {
+            let mut failures = Vec::new();
+            for origin in [
+                OutputFramebufferOrigin::BottomLeft,
+                OutputFramebufferOrigin::TopLeftScanout,
+            ] {
+                for (name, size, rect, group, blur, saturation, coverage) in [
+                    (
+                        "single_sat_1_noise_0",
+                        (160, 120),
+                        even_rect,
+                        91,
+                        0.37,
+                        1.0,
+                        None,
+                    ),
+                    (
+                        "single_sat_031_noise_0",
+                        (160, 120),
+                        even_rect,
+                        92,
+                        0.37,
+                        0.31,
+                        None,
+                    ),
+                    (
+                        "odd_translated_sat_031_noise_0",
+                        odd_bounds,
+                        odd_rect,
+                        93,
+                        0.42,
+                        0.31,
+                        None,
+                    ),
+                    (
+                        "even_translated_sat_1_noise_0",
+                        (160, 120),
+                        even_rect,
+                        94,
+                        0.37,
+                        1.0,
+                        None,
+                    ),
+                    (
+                        "rounded_triangle_coverage_noise_0",
+                        odd_bounds,
+                        odd_rect,
+                        95,
+                        0.42,
+                        0.31,
+                        Some(rounded_triangle.clone()),
+                    ),
+                ] {
+                    failures.extend(run_terminal_builtin_diagnostic_case(
+                        name,
+                        size,
+                        rect,
+                        VisualGroupId::new(group).expect("visual group"),
+                        blur,
+                        saturation,
+                        0.0,
+                        coverage,
+                        origin,
+                    ));
+                }
+                failures.extend(run_terminal_causal_diagnostic_case(0.0, origin));
+            }
+            failures
+        });
+        println!(
+            "OFFSCREEN_DITHER policy={} matrix_exactness_failures={} failures={all_failures:?}",
+            if dither { "enabled" } else { "disabled" },
+            all_failures.len()
+        );
+    }
 }
