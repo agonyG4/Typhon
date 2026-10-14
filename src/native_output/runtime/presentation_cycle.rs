@@ -2200,16 +2200,11 @@ impl NativeRuntime {
                                                 owner: _,
                                                 rejection: _,
                                             } => {
-                                                if output_render_fence_token.is_none()
-                                                    && let Some(fd) = explicit.suspended_fence_fd()?
-                                                {
-                                                    *output_render_fence_token = Some(
-                                                        event_loop.register(
-                                                            fd,
-                                                            NativeEventSource::OutputRenderFence,
-                                                        )?,
-                                                    );
-                                                }
+                                                super::cycle::recover_or_arm_suspended_output_ownership(
+                                                    explicit,
+                                                    event_loop,
+                                                    output_render_fence_token,
+                                                )?;
                                                 *queued_redraw_requested = true;
                                                 return Ok(());
                                             }

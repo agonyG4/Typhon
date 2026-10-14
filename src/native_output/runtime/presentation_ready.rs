@@ -349,12 +349,11 @@ pub(super) fn submit_ready_frame(
                     owner: _,
                     rejection: _,
                 } => {
-                    if output_render_fence_token.is_none()
-                        && let Some(fd) = explicit.suspended_fence_fd()?
-                    {
-                        *output_render_fence_token =
-                            Some(event_loop.register(fd, NativeEventSource::OutputRenderFence)?);
-                    }
+                    super::cycle::recover_or_arm_suspended_output_ownership(
+                        explicit,
+                        event_loop,
+                        output_render_fence_token,
+                    )?;
                     return Ok(ReadySubmissionResult::VariableRetryRequired);
                 }
             };

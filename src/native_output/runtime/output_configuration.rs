@@ -2062,22 +2062,11 @@ impl NativeRuntime {
                 &mut self.output_transactions,
                 MonotonicTimestampNs::new(monotonic_now_ns()?),
             )?;
-            if explicit.has_suspended_output_ownership()? {
-                if explicit.recover_suspended_ready_if_signaled()? {
-                    return Ok(());
-                }
-                super::cycle::register_suspended_fence_if_needed(
-                    explicit,
-                    &mut self.event_loop,
-                    &mut self.output_render_fence_token,
-                )?;
-                if self.output_render_fence_token.is_none() {
-                    return Err(io::Error::other(
-                        "suspended output ownership has no readiness fence to wait for",
-                    )
-                    .into());
-                }
-            }
+            super::cycle::recover_or_arm_suspended_output_ownership(
+                explicit,
+                &mut self.event_loop,
+                &mut self.output_render_fence_token,
+            )?;
             return Ok(());
         }
         if !self.scanout.ready_frame_queued() {

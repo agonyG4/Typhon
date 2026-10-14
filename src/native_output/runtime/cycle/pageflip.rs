@@ -22,12 +22,13 @@ use crate::native_output::presentation::plane::{
     CursorCoupling, CursorRevision, PresentedCursorState,
 };
 use crate::native_output::scanout::{
-    AtomicOutputSwapchain, FrozenCursorPlaneOwner, OutputFrameIdentitySnapshot,
+    AtomicEglGbmScanout, AtomicOutputSwapchain, FrozenCursorPlaneOwner, OutputFrameIdentitySnapshot,
 };
 use oblivion_one::native::adaptive_buffering::{
     AdaptiveRenderJournal, EstimatorRecoveryDisposition, FenceTimestampQuality, ProvenDeadlineMiss,
 };
 use oblivion_one::native::presentation_deadline::PresentationTarget;
+use std::os::fd::RawFd;
 
 fn is_non_primary_atomic_completion(completion: AtomicCommitCompletion) -> bool {
     matches!(
@@ -1633,7 +1634,9 @@ impl DirectEntryFutureRetirement {
 
 #[allow(clippy::too_many_arguments)]
 fn retire_direct_entry_future_composited_owners(
-    swapchain: &mut AtomicOutputSwapchain,
+    ownership: &mut impl DirectEntryOwnershipBackend,
+    event_loop: &mut NativeEventLoop,
+    output_render_fence_token: &mut Option<ReactorToken>,
     worker: Option<&KmsCommitWorkerHandle>,
     crtc_id: u32,
     output_epoch: OutputEpochId,
@@ -1652,7 +1655,8 @@ fn retire_direct_entry_future_composited_owners(
     perf: NativePerfLogger,
 ) -> NativeResult<DirectEntryFutureRetirement> {
     let mut retirement = DirectEntryFutureRetirement::default();
-    let worker_owner = swapchain.worker_queued_identity();
+    let worker_owner = ownership.swapchain_mut()?.worker_queued_identity();
+    let mut worker_recovery_established = false;
     match atomic_commit_arbiter.worker_queued_kind() {
         Some(AtomicCommitKind::CompositedPrimary {
             transaction_id,
@@ -1678,21 +1682,32 @@ fn retire_direct_entry_future_composited_owners(
             let worker = worker.ok_or_else(|| {
                 io::Error::other("Direct entry worker successor has no KMS worker handle")
             })?;
-            let telemetry = abandon_overtaken_worker_queued(
-                worker,
-                owner,
-                crtc_id,
-                swapchain,
-                scene_history,
-                frame_pacing,
-                frame_scheduler,
-                atomic_cursor,
-                cursor_output_arbitration,
-                atomic_commit_arbiter,
-                server,
-                output_transactions,
-                emergency_worker_jobs,
-            )?;
+            let cancellation = {
+                let swapchain = ownership.swapchain_mut()?;
+                abandon_overtaken_worker_queued(
+                    worker,
+                    owner,
+                    crtc_id,
+                    swapchain,
+                    scene_history,
+                    frame_pacing,
+                    frame_scheduler,
+                    atomic_cursor,
+                    cursor_output_arbitration,
+                    atomic_commit_arbiter,
+                    server,
+                    output_transactions,
+                    emergency_worker_jobs,
+                )
+            };
+            let suspended_recovery = recover_or_arm_suspended_output_ownership(
+                ownership,
+                event_loop,
+                output_render_fence_token,
+            );
+            worker_recovery_established = true;
+            suspended_recovery?;
+            let telemetry = cancellation?;
             if telemetry.direct_test_only_duration_ns.is_some()
                 || telemetry.direct_callback_owner_leaks.is_some()
             {
@@ -1714,19 +1729,37 @@ fn retire_direct_entry_future_composited_owners(
         }
     }
 
-    let retired_at = MonotonicTimestampNs::new(monotonic_now_ns()?);
-    if let Some(owner) = swapchain.ready_identity() {
-        abandon_overtaken_ready_on_swapchain(
-            swapchain,
-            owner,
-            output_epoch,
-            scene_history,
-            frame_pacing,
-            frame_scheduler,
-            server,
-            output_transactions,
-            retired_at,
+    if !worker_recovery_established {
+        recover_or_arm_suspended_output_ownership(
+            ownership,
+            event_loop,
+            output_render_fence_token,
         )?;
+    }
+
+    let retired_at = MonotonicTimestampNs::new(monotonic_now_ns()?);
+    if let Some(owner) = ownership.swapchain_mut()?.ready_identity() {
+        let ready_retirement = {
+            let swapchain = ownership.swapchain_mut()?;
+            abandon_overtaken_ready_on_swapchain(
+                swapchain,
+                owner,
+                output_epoch,
+                scene_history,
+                frame_pacing,
+                frame_scheduler,
+                server,
+                output_transactions,
+                retired_at,
+            )
+        };
+        let suspended_recovery = recover_or_arm_suspended_output_ownership(
+            ownership,
+            event_loop,
+            output_render_fence_token,
+        );
+        suspended_recovery?;
+        ready_retirement?;
         retirement.ready_frame_id = Some(owner.frame_id);
     }
 
@@ -1758,7 +1791,7 @@ fn retire_direct_entry_future_composited_owners(
     }
 
     validate_reconfiguration_frame_ownership_for_swapchain(
-        swapchain,
+        ownership.swapchain_mut()?,
         output_epoch,
         scene_history,
         frame_pacing,
@@ -1768,18 +1801,125 @@ fn retire_direct_entry_future_composited_owners(
     Ok(retirement)
 }
 
-pub(crate) fn register_suspended_fence_if_needed(
-    explicit: &AtomicEglGbmScanout,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SuspendedOutputRecovery {
+    None,
+    Recovered,
+    Waiting,
+}
+
+pub(crate) trait SuspendedOutputRecoveryBackend {
+    fn has_suspended_output_ownership(&self) -> NativeResult<bool>;
+    fn recover_suspended_ready_if_signaled(&mut self) -> NativeResult<bool>;
+    fn suspended_fence_fd(&self) -> NativeResult<Option<RawFd>>;
+}
+
+impl SuspendedOutputRecoveryBackend for AtomicEglGbmScanout {
+    fn has_suspended_output_ownership(&self) -> NativeResult<bool> {
+        Ok(AtomicEglGbmScanout::has_suspended_output_ownership(self)?)
+    }
+
+    fn recover_suspended_ready_if_signaled(&mut self) -> NativeResult<bool> {
+        Ok(AtomicEglGbmScanout::recover_suspended_ready_if_signaled(
+            self,
+        )?)
+    }
+
+    fn suspended_fence_fd(&self) -> NativeResult<Option<RawFd>> {
+        Ok(AtomicEglGbmScanout::suspended_fence_fd(self)?)
+    }
+}
+
+trait DirectEntryOwnershipBackend: SuspendedOutputRecoveryBackend {
+    fn swapchain_mut(&mut self) -> io::Result<&mut AtomicOutputSwapchain>;
+}
+
+impl DirectEntryOwnershipBackend for AtomicEglGbmScanout {
+    fn swapchain_mut(&mut self) -> io::Result<&mut AtomicOutputSwapchain> {
+        AtomicEglGbmScanout::swapchain_mut(self)
+    }
+}
+
+impl SuspendedOutputRecoveryBackend for Box<AtomicEglGbmScanout> {
+    fn has_suspended_output_ownership(&self) -> NativeResult<bool> {
+        Ok((**self).has_suspended_output_ownership()?)
+    }
+
+    fn recover_suspended_ready_if_signaled(&mut self) -> NativeResult<bool> {
+        Ok((**self).recover_suspended_ready_if_signaled()?)
+    }
+
+    fn suspended_fence_fd(&self) -> NativeResult<Option<RawFd>> {
+        Ok((**self).suspended_fence_fd()?)
+    }
+}
+
+impl DirectEntryOwnershipBackend for Box<AtomicEglGbmScanout> {
+    fn swapchain_mut(&mut self) -> io::Result<&mut AtomicOutputSwapchain> {
+        (**self).swapchain_mut()
+    }
+}
+
+pub(crate) fn recover_or_arm_suspended_output_ownership(
+    explicit: &mut impl SuspendedOutputRecoveryBackend,
     event_loop: &mut NativeEventLoop,
     output_render_fence_token: &mut Option<ReactorToken>,
-) -> NativeResult<()> {
-    if output_render_fence_token.is_none()
-        && let Some(fd) = explicit.suspended_fence_fd()?
-    {
-        *output_render_fence_token =
-            Some(event_loop.register(fd, NativeEventSource::OutputRenderFence)?);
+) -> NativeResult<SuspendedOutputRecovery> {
+    if !explicit.has_suspended_output_ownership()? {
+        return Ok(SuspendedOutputRecovery::None);
     }
-    Ok(())
+
+    let recovered = explicit.recover_suspended_ready_if_signaled()?;
+    let suspended_remains = explicit.has_suspended_output_ownership()?;
+    if recovered && suspended_remains {
+        return Err(
+            io::Error::other("suspended output recovery left physical ownership behind").into(),
+        );
+    }
+    if !suspended_remains {
+        return Ok(SuspendedOutputRecovery::Recovered);
+    }
+
+    if output_render_fence_token.is_none() {
+        if let Some(fd) = explicit.suspended_fence_fd()? {
+            *output_render_fence_token =
+                Some(event_loop.register(fd, NativeEventSource::OutputRenderFence)?);
+        } else {
+            // The fence may have signaled between the first recovery check and
+            // readiness-FD selection. Close that race before declaring that
+            // suspended ownership has no wake source.
+            let recovered = explicit.recover_suspended_ready_if_signaled()?;
+            let suspended_remains = explicit.has_suspended_output_ownership()?;
+            if recovered && suspended_remains {
+                return Err(io::Error::other(
+                    "suspended output recovery left physical ownership behind",
+                )
+                .into());
+            }
+            if !suspended_remains {
+                return Ok(SuspendedOutputRecovery::Recovered);
+            }
+        }
+    }
+    if output_render_fence_token.is_none() {
+        return Err(io::Error::other(
+            "suspended output ownership has no readiness fence to wait for",
+        )
+        .into());
+    }
+
+    Ok(SuspendedOutputRecovery::Waiting)
+}
+
+pub(crate) fn settle_suspended_output_fence_wake(
+    explicit: &mut impl SuspendedOutputRecoveryBackend,
+    event_loop: &mut NativeEventLoop,
+    output_render_fence_token: &mut Option<ReactorToken>,
+) -> NativeResult<SuspendedOutputRecovery> {
+    if let Some(token) = output_render_fence_token.take() {
+        event_loop.unregister(token)?;
+    }
+    recover_or_arm_suspended_output_ownership(explicit, event_loop, output_render_fence_token)
 }
 
 fn should_continue_resuming_recovery(
@@ -1966,18 +2106,17 @@ impl NativeRuntime {
                     event_loop.unregister(token)?;
                 }
             } else {
-                if let Some(token) = output_render_fence_token.take() {
-                    event_loop.unregister(token)?;
-                }
                 if let NativeScanoutBackend::AtomicEglGbm(explicit) = &mut **scanout {
-                    if explicit.recover_suspended_ready_if_signaled()? {
-                        *queued_redraw_requested = true;
-                    }
-                    register_suspended_fence_if_needed(
+                    if settle_suspended_output_fence_wake(
                         explicit,
                         event_loop,
                         output_render_fence_token,
-                    )?;
+                    )? == SuspendedOutputRecovery::Recovered
+                    {
+                        *queued_redraw_requested = true;
+                    }
+                } else if let Some(token) = output_render_fence_token.take() {
+                    event_loop.unregister(token)?;
                 }
                 if let NativeScanoutBackend::AtomicEglGbm(explicit) = &mut **scanout
                     && let Some(timing) = explicit
@@ -2637,9 +2776,10 @@ impl NativeRuntime {
                             )
                             .into());
                         };
-                        let swapchain = explicit.swapchain_mut()?;
                         retire_direct_entry_future_composited_owners(
-                            swapchain,
+                            explicit,
+                            event_loop,
+                            output_render_fence_token,
                             kms_commit_worker.as_ref(),
                             target.crtc_id,
                             *output_epoch,
@@ -2869,7 +3009,7 @@ impl NativeRuntime {
                             PhysicalPrimaryClaimRevalidation::Valid => break,
                             PhysicalPrimaryClaimRevalidation::OvertakesReady { owner } => {
                                 frame_pacing.note_physical_claim_overtake_ready();
-                                let recovered = abandon_overtaken_ready(
+                                let abandonment = abandon_overtaken_ready(
                                     explicit,
                                     owner,
                                     *output_epoch,
@@ -2879,21 +3019,23 @@ impl NativeRuntime {
                                     server,
                                     output_transactions,
                                     presented_at,
-                                )
-                                .is_ok();
+                                );
+                                let suspended_recovery = recover_or_arm_suspended_output_ownership(
+                                    explicit,
+                                    event_loop,
+                                    output_render_fence_token,
+                                );
+                                let recovered = abandonment.is_ok();
                                 frame_pacing.note_physical_claim_overtake_recovery(recovered);
                                 if !recovered {
+                                    suspended_recovery?;
                                     return Err(io::Error::other(
                                         "failed to recover an overtaken READY primary",
                                     )
                                     .into());
                                 }
                                 *queued_redraw_requested = true;
-                                register_suspended_fence_if_needed(
-                                    explicit,
-                                    event_loop,
-                                    output_render_fence_token,
-                                )?;
+                                suspended_recovery?;
                             }
                             PhysicalPrimaryClaimRevalidation::OvertakesWorkerQueued { owner } => {
                                 frame_pacing.note_physical_claim_overtake_worker_queued();
@@ -2920,17 +3062,24 @@ impl NativeRuntime {
                                         emergency_quarantined_worker_jobs,
                                     )
                                 };
+                                let suspended_recovery = recover_or_arm_suspended_output_ownership(
+                                    explicit,
+                                    event_loop,
+                                    output_render_fence_token,
+                                );
                                 let recovered = cancellation.is_ok();
                                 frame_pacing.note_physical_claim_overtake_recovery(recovered);
                                 let telemetry = match cancellation {
                                     Ok(telemetry) => telemetry,
                                     Err(_) => {
+                                        suspended_recovery?;
                                         return Err(io::Error::other(
                                             "failed to recover an overtaken queued primary",
                                         )
                                         .into());
                                     }
                                 };
+                                suspended_recovery?;
                                 if let Some(duration_ns) = telemetry.direct_test_only_duration_ns {
                                     explicit.note_direct_test_only(duration_ns, false);
                                 }
@@ -2940,11 +3089,6 @@ impl NativeRuntime {
                                     explicit.note_direct_callback_owner_leaks(callback_owner_leaks);
                                 }
                                 *queued_redraw_requested = true;
-                                register_suspended_fence_if_needed(
-                                    explicit,
-                                    event_loop,
-                                    output_render_fence_token,
-                                )?;
                             }
                             PhysicalPrimaryClaimRevalidation::Fatal(violation) => {
                                 frame_pacing.note_physical_claim_fatal_violation();

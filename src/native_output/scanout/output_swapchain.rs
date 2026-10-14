@@ -1407,6 +1407,20 @@ impl AtomicOutputSwapchain {
             })
     }
 
+    pub(crate) fn recover_suspended_frames_if_signaled(
+        &mut self,
+        mut retire_frame: impl FnMut(RenderedOutputFrame),
+    ) -> io::Result<bool> {
+        if !self.has_suspended_ownership() || !self.suspended_fences_signaled()? {
+            return Ok(false);
+        }
+        while let Some(frame) = self.take_suspended_frame() {
+            retire_frame(frame);
+        }
+        self.recover_suspended_slot(true)?;
+        Ok(true)
+    }
+
     pub(crate) fn pending_fence_signaled(&self) -> io::Result<bool> {
         let Some(pending) = self.pending.as_ref() else {
             return Ok(true);

@@ -869,14 +869,12 @@ impl NativeRuntime {
                 self.server.scene_render_generation(),
                 NativeVisualWorkQueueReason::QueuedRedrawRetry,
             )?;
-            if self.output_render_fence_token.is_none()
-                && let NativeScanoutBackend::AtomicEglGbm(explicit) = &*self.scanout
-                && let Some(fd) = explicit.suspended_fence_fd()?
-            {
-                self.output_render_fence_token = Some(
-                    self.event_loop
-                        .register(fd, NativeEventSource::OutputRenderFence)?,
-                );
+            if let NativeScanoutBackend::AtomicEglGbm(explicit) = &mut *self.scanout {
+                super::super::cycle::recover_or_arm_suspended_output_ownership(
+                    explicit,
+                    &mut self.event_loop,
+                    &mut self.output_render_fence_token,
+                )?;
             }
             self.perf.log("native.kms_commit_worker", || {
                 vec![

@@ -63,6 +63,38 @@ fn elapsed_nanos(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
+fn queue_render_control_parts(
+    render_transport: &mut AtomicRenderTransport,
+    pending_render_controls: &mut Vec<SequencedRenderControl>,
+    render_control_epoch: &mut u64,
+    render_control_overflowed: &mut bool,
+    control: AtomicRenderControl,
+) -> io::Result<()> {
+    match render_transport {
+        AtomicRenderTransport::Synchronous(domain) => apply_render_control(domain, control),
+        AtomicRenderTransport::Worker(worker) => {
+            if pending_render_controls.len() >= MAX_PENDING_RENDER_CONTROLS {
+                *render_control_overflowed = true;
+                worker.fail_control_lane();
+                return Err(io::Error::other(
+                    "bounded renderer-control lane is full; refusing to drop renderer state",
+                ));
+            }
+            let Some(next_epoch) = render_control_epoch.checked_add(1) else {
+                *render_control_overflowed = true;
+                worker.fail_control_lane();
+                return Err(io::Error::other("renderer control epoch exhausted"));
+            };
+            *render_control_epoch = next_epoch;
+            pending_render_controls.push(SequencedRenderControl {
+                epoch: *render_control_epoch,
+                control,
+            });
+            Ok(())
+        }
+    }
+}
+
 fn teardown_render_before_physical(
     destroy_render_domain: impl FnOnce(),
     release_physical_pool: impl FnOnce(),
@@ -711,29 +743,13 @@ fn create_worker_render_setup(
 
 impl AtomicEglGbmScanout {
     fn queue_render_control(&mut self, control: AtomicRenderControl) -> io::Result<()> {
-        match &mut self.render_transport {
-            AtomicRenderTransport::Synchronous(domain) => apply_render_control(domain, control),
-            AtomicRenderTransport::Worker(worker) => {
-                if self.pending_render_controls.len() >= MAX_PENDING_RENDER_CONTROLS {
-                    self.render_control_overflowed = true;
-                    worker.fail_control_lane();
-                    return Err(io::Error::other(
-                        "bounded renderer-control lane is full; refusing to drop renderer state",
-                    ));
-                }
-                let Some(next_epoch) = self.render_control_epoch.checked_add(1) else {
-                    self.render_control_overflowed = true;
-                    worker.fail_control_lane();
-                    return Err(io::Error::other("renderer control epoch exhausted"));
-                };
-                self.render_control_epoch = next_epoch;
-                self.pending_render_controls.push(SequencedRenderControl {
-                    epoch: self.render_control_epoch,
-                    control,
-                });
-                Ok(())
-            }
-        }
+        queue_render_control_parts(
+            &mut self.render_transport,
+            &mut self.pending_render_controls,
+            &mut self.render_control_epoch,
+            &mut self.render_control_overflowed,
+            control,
+        )
     }
 
     fn take_render_controls_for_job(&mut self) -> io::Result<(Vec<SequencedRenderControl>, u64)> {
@@ -3287,22 +3303,32 @@ impl AtomicEglGbmScanout {
     }
 
     pub(crate) fn recover_suspended_ready_if_signaled(&mut self) -> io::Result<bool> {
-        if !self.swapchain()?.has_suspended_ownership() {
+        if !self.has_suspended_output_ownership()? {
             return Ok(false);
         }
-        if !self.swapchain()?.suspended_fences_signaled()? {
-            return Ok(false);
-        }
-        let mut recovered = false;
-        while let Some(frame) = self.swapchain_mut()?.take_suspended_frame() {
-            recovered = true;
-            let _ = self.queue_render_control(AtomicRenderControl::DiscardRendered {
-                frame: frame.scene_commit,
-            });
+        let AtomicEglGbmScanout {
+            swapchain,
+            render_transport,
+            pending_render_controls,
+            render_control_epoch,
+            render_control_overflowed,
+            ..
+        } = self;
+        let swapchain = swapchain
+            .as_mut()
+            .ok_or_else(|| io::Error::other("explicit output swapchain is not presented"))?;
+        swapchain.recover_suspended_frames_if_signaled(|frame| {
+            let _ = queue_render_control_parts(
+                render_transport,
+                pending_render_controls,
+                render_control_epoch,
+                render_control_overflowed,
+                AtomicRenderControl::DiscardRendered {
+                    frame: frame.scene_commit,
+                },
+            );
             drop(frame.surface_damage);
-        }
-        self.swapchain_mut()?.recover_suspended_slot(true)?;
-        Ok(recovered)
+        })
     }
 
     pub(crate) fn note_physical_primary_presentation(

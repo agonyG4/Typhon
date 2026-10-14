@@ -12,7 +12,7 @@ pub(super) mod direct_fallback;
 #[path = "cycle/pageflip.rs"]
 mod pageflip;
 pub(super) use pageflip::abandon_overtaken_ready;
-pub(crate) use pageflip::register_suspended_fence_if_needed;
+pub(crate) use pageflip::recover_or_arm_suspended_output_ownership;
 pub(super) use pageflip::terminalize_suspended_frame_for_variable_retry;
 pub(super) use pageflip::terminalize_unsubmitted_frame_for_reconfiguration;
 pub(super) use pageflip::validate_reconfiguration_frame_ownership;
