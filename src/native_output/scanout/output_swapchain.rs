@@ -311,6 +311,7 @@ pub(crate) struct FrozenCursorPlaneOwner {
 pub(crate) struct SubmittedOutputFrame {
     pub(crate) frame: RenderedOutputFrame,
     pub(crate) token: PageFlipToken,
+    pub(crate) worker_queued_at: Option<MonotonicTimestampNs>,
     pub(crate) submit_started_at: MonotonicTimestampNs,
     pub(crate) submit_returned_at: MonotonicTimestampNs,
     pub(crate) out_fence: Option<OwnedFd>,
@@ -462,6 +463,7 @@ pub(crate) enum DeferredO1BindingReadiness {
 #[derive(Debug)]
 pub(crate) struct CompletedOutputFrame {
     pub(crate) frame: RenderedOutputFrame,
+    pub(crate) worker_queued_at: Option<MonotonicTimestampNs>,
     pub(crate) submit_started_at: MonotonicTimestampNs,
     pub(crate) submit_returned_at: MonotonicTimestampNs,
     pub(crate) old_current: OutputSlotId,
@@ -1034,6 +1036,7 @@ impl AtomicOutputSwapchain {
         self.pending = Some(SubmittedOutputFrame {
             frame: queued.frame,
             token,
+            worker_queued_at: Some(queued.queued_at),
             submit_started_at,
             submit_returned_at,
             out_fence,
@@ -1193,6 +1196,7 @@ impl AtomicOutputSwapchain {
         self.pending = Some(SubmittedOutputFrame {
             frame,
             token,
+            worker_queued_at: None,
             submit_started_at,
             submit_returned_at,
             out_fence,
@@ -1568,6 +1572,7 @@ impl AtomicOutputSwapchain {
             submit_started_at: pending.submit_started_at,
             submit_returned_at: pending.submit_returned_at,
             frame: pending.frame,
+            worker_queued_at: pending.worker_queued_at,
             old_current,
             new_current: self.current,
             presentation_serial: self.presentation_serial,
@@ -2739,6 +2744,10 @@ mod tests {
             .expect("matching Variable pageflip completes");
         assert_eq!(completed.frame.reservation, reservation);
         assert_eq!(completed.frame.presentation_timing, timing);
+        assert_eq!(
+            completed.worker_queued_at,
+            Some(MonotonicTimestampNs::new(4))
+        );
     }
 
     #[test]
@@ -2801,6 +2810,7 @@ mod tests {
             completed.frame.presentation_timing,
             KmsPresentationTiming::variable(2)
         );
+        assert_eq!(completed.worker_queued_at, None);
     }
 
     #[test]

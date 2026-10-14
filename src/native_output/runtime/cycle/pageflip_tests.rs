@@ -516,21 +516,21 @@ fn fallback_render_readiness() -> RenderReadinessObservation {
     RenderReadinessObservation::from_frame(None, MonotonicTimestampNs::new(81))
 }
 
-fn journal_with_warm_paired_samples() -> AdaptiveRenderJournal {
+fn journal_with_warm_parallel_samples() -> AdaptiveRenderJournal {
     let mut journal = AdaptiveRenderJournal::default();
     let target = reactive_test_target();
     for sample in 0..20 {
         let base = sample * 2_000_000;
+        journal.record_fixed_submission_budget(500_000);
         journal.record_frame_service_observation(FrameTimingObservation {
             frame_id: sample,
             target,
             composite_started_at: MonotonicTimestampNs::new(base),
+            worker_queued_at: Some(MonotonicTimestampNs::new(base + 1_000_000)),
             fence_signaled_at: Some((
                 MonotonicTimestampNs::new(base + 1_000_000),
                 FenceTimestampQuality::ExactSyncFile,
             )),
-            submit_started_at: Some(MonotonicTimestampNs::new(base + 1_000_000)),
-            submit_returned_at: Some(MonotonicTimestampNs::new(base + 1_001_000)),
         });
     }
     journal
@@ -549,12 +549,12 @@ fn reactive_dispatch_slip_is_advisory_not_proven_recovery_evidence() {
 }
 
 #[test]
-fn advisory_dispatch_does_not_change_warm_paired_or_active_recovery() {
-    let mut warm = journal_with_warm_paired_samples();
+fn advisory_dispatch_does_not_change_warm_parallel_or_active_recovery() {
+    let mut warm = journal_with_warm_parallel_samples();
     let refresh = std::time::Duration::from_millis(10);
     assert_eq!(
         warm.prediction(refresh).estimator_mode,
-        oblivion_one::native::adaptive_buffering::PredictionEstimatorMode::WarmPaired
+        oblivion_one::native::adaptive_buffering::PredictionEstimatorMode::WarmParallel
     );
     let before_warm = warm.prediction(refresh).miss_recovery_remaining;
     apply_deadline_assessment(
@@ -570,7 +570,7 @@ fn advisory_dispatch_does_not_change_warm_paired_or_active_recovery() {
     );
     assert_eq!(
         warm.prediction(refresh).estimator_mode,
-        oblivion_one::native::adaptive_buffering::PredictionEstimatorMode::WarmPaired
+        oblivion_one::native::adaptive_buffering::PredictionEstimatorMode::WarmParallel
     );
 
     let mut recovering = AdaptiveRenderJournal::default();
@@ -587,12 +587,11 @@ fn advisory_dispatch_does_not_change_warm_paired_or_active_recovery() {
             frame_id: sample,
             target: reactive_test_target(),
             composite_started_at: MonotonicTimestampNs::new(base),
+            worker_queued_at: Some(MonotonicTimestampNs::new(base + 1_000_000)),
             fence_signaled_at: Some((
                 MonotonicTimestampNs::new(base + 1_000_000),
                 FenceTimestampQuality::ExactSyncFile,
             )),
-            submit_started_at: Some(MonotonicTimestampNs::new(base + 1_000_000)),
-            submit_returned_at: Some(MonotonicTimestampNs::new(base + 1_001_000)),
         });
     }
     let before_recovery = recovering.prediction(refresh).miss_recovery_remaining;

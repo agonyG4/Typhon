@@ -12,6 +12,7 @@ pub struct SimulatedO1Config {
     pub dispatch_service_ns: u64,
     pub apply_guard_ns: u64,
     pub apply_delay_ns: u64,
+    pub render_start_advance_ns: u64,
     pub frames: u32,
     pub worker_enabled: bool,
 }
@@ -51,6 +52,7 @@ struct SimulatedFrame {
     service_ns: u64,
     render_started_ns: Option<i64>,
     render_ready_ns: Option<i64>,
+    worker_queued_at_ns: Option<i64>,
     submit_returned_ns: Option<i64>,
     admitted: bool,
     render_ahead: bool,
@@ -167,7 +169,9 @@ impl SimulatedO1EventModel {
                 .saturating_add(self.config.dispatch_service_ns)
                 .saturating_add(self.config.apply_guard_ns);
             let ahead_start = target_ns.saturating_sub(total as i64);
-            let arrival = predecessor_ns.min(ahead_start);
+            let earlier_render_start =
+                predecessor_ns.saturating_sub(self.config.render_start_advance_ns as i64);
+            let arrival = earlier_render_start.min(ahead_start);
             let estimate = PipelineServiceEstimate::new(
                 0,
                 service,
@@ -191,6 +195,7 @@ impl SimulatedO1EventModel {
                 service_ns: service,
                 render_started_ns: None,
                 render_ready_ns: None,
+                worker_queued_at_ns: None,
                 submit_returned_ns: None,
                 admitted: false,
                 render_ahead: false,
@@ -378,6 +383,14 @@ impl SimulatedO1EventModel {
                 }
                 SimulatedO1EventKind::FenceReady => {
                     if state.prepared == Some(event.frame) {
+                        if self.config.worker_enabled && state.worker_queued.is_none() {
+                            state.prepared = None;
+                            state.worker_queued = Some(event.frame);
+                            frames[event.frame as usize]
+                                .as_mut()
+                                .expect("worker queue frame exists")
+                                .worker_queued_at_ns = Some(event.at_ns);
+                        }
                         queue_transport_progress(
                             &mut queue,
                             &mut order,
@@ -394,25 +407,33 @@ impl SimulatedO1EventModel {
                     }
                 }
                 SimulatedO1EventKind::WorkerWake => {
-                    if let Some(frame) = frames[event.frame as usize].as_mut() {
-                        frame.transport_scheduled = false;
-                    }
-                    if state.prepared == Some(event.frame) && state.worker_queued.is_none() {
-                        state.prepared = None;
-                        state.worker_queued = Some(event.frame);
-                        queue_transport_progress(
-                            &mut queue,
-                            &mut order,
-                            &mut frames,
-                            &state,
-                            event.frame,
-                            TransportProgressContext {
-                                generation: event.generation,
-                                at_ns: event.at_ns,
-                                worker_enabled: self.config.worker_enabled,
-                                dispatch_service_ns: self.config.dispatch_service_ns,
-                            },
-                        );
+                    if state.worker_queued == Some(event.frame) {
+                        if let Some(frame) = frames[event.frame as usize].as_mut() {
+                            frame.transport_scheduled = false;
+                        }
+                        if state.kernel_submitted.is_none() {
+                            if let Some(frame) = frames[event.frame as usize].as_mut() {
+                                frame.transport_scheduled = true;
+                                if let Some(queued_at_ns) = frame.worker_queued_at_ns {
+                                    result.intentional_queue_latency_ns =
+                                        result.intentional_queue_latency_ns.saturating_add(
+                                            u64::try_from(event.at_ns.saturating_sub(queued_at_ns))
+                                                .unwrap_or(0),
+                                        );
+                                }
+                            }
+                            push_event(
+                                &mut queue,
+                                &mut order,
+                                SimulatedO1Event {
+                                    at_ns: event.at_ns,
+                                    order: 0,
+                                    frame: event.frame,
+                                    generation: event.generation,
+                                    kind: SimulatedO1EventKind::SubmitStarted,
+                                },
+                            );
+                        }
                     }
                 }
                 SimulatedO1EventKind::SubmitStarted => {
@@ -432,11 +453,9 @@ impl SimulatedO1EventModel {
                             &mut queue,
                             &mut order,
                             SimulatedO1Event {
-                                at_ns: event.at_ns.saturating_add(if self.config.worker_enabled {
-                                    0
-                                } else {
-                                    self.config.dispatch_service_ns as i64
-                                }),
+                                at_ns: event
+                                    .at_ns
+                                    .saturating_add(self.config.dispatch_service_ns as i64),
                                 order: 0,
                                 frame: event.frame,
                                 generation: event.generation,
@@ -560,6 +579,17 @@ impl SimulatedO1EventModel {
                         frame.terminalized = true;
                         result.terminalized_submitted_frames =
                             result.terminalized_submitted_frames.saturating_add(1);
+                    }
+                    if self.config.worker_enabled
+                        && state.worker_queued.is_none()
+                        && let Some(prepared_frame) = state.prepared
+                    {
+                        state.prepared = None;
+                        state.worker_queued = Some(prepared_frame);
+                        frames[prepared_frame as usize]
+                            .as_mut()
+                            .expect("prepared worker frame exists")
+                            .worker_queued_at_ns = Some(event.at_ns);
                     }
                     if let Some(next_frame) = state.worker_queued.or(state.prepared) {
                         queue_transport_progress(
@@ -717,13 +747,12 @@ fn queue_transport_progress(
     }
     let (kind, scheduled_at) = if context.worker_enabled {
         if state.worker_queued == Some(frame_id) {
-            (SimulatedO1EventKind::SubmitStarted, context.at_ns)
-        } else if state.prepared == Some(frame_id) && state.worker_queued.is_none() {
+            let planned_wake_ns = frame
+                .deadline_ns
+                .saturating_sub(context.dispatch_service_ns as i64);
             (
                 SimulatedO1EventKind::WorkerWake,
-                context
-                    .at_ns
-                    .saturating_add(context.dispatch_service_ns as i64),
+                context.at_ns.max(planned_wake_ns),
             )
         } else {
             return;
@@ -883,6 +912,15 @@ mod tests {
         SimulatedO1Config, SimulatedO1Event, SimulatedO1EventKind, SimulatedO1EventModel,
         simulate_o1, simulate_o1_with_render_services,
     };
+    use crate::native::adaptive_buffering::{
+        AdaptiveRenderJournal, FenceTimestampQuality, FrameTimingObservation,
+        PredictionEstimatorMode, RenderPrediction,
+    };
+    use crate::native::kms_worker_dispatch_timing::KmsWorkerDispatchModel;
+    use crate::native::presentation_deadline::{
+        MonotonicTimestampNs, PresentationTarget, PresentationTargetReason, PrimaryRefreshClaim,
+    };
+    use std::time::Duration;
 
     fn config(render_service_ns: u64) -> SimulatedO1Config {
         SimulatedO1Config {
@@ -891,9 +929,58 @@ mod tests {
             dispatch_service_ns: 300_000,
             apply_guard_ns: 500_000,
             apply_delay_ns: 500_000,
+            render_start_advance_ns: 0,
             frames: 120,
             worker_enabled: true,
         }
+    }
+
+    fn exact_parallel_prediction(
+        render_ready_ns: u64,
+        queue_ready_ns: u64,
+        kms_dispatch_budget_ns: u64,
+        composite_start_ns: u64,
+    ) -> RenderPrediction {
+        let mut journal = AdaptiveRenderJournal::default();
+        for sample in 0..20_u64 {
+            let composite_ns = composite_start_ns + sample * 10_000_000;
+            let target_time = MonotonicTimestampNs::new(composite_ns + 20_000_000);
+            let sequence = sample + 1;
+            let target = PresentationTarget {
+                sequence,
+                presentation_time: target_time,
+                submit_not_before: target_time,
+                render_start_deadline: target_time,
+                refresh_interval: Duration::from_nanos(6_060_606),
+                reason: PresentationTargetReason::Normal,
+                clock_generation: 1,
+                estimated: false,
+                predicted_unreachable: false,
+                physical_claim: PrimaryRefreshClaim {
+                    sequence,
+                    presentation_time: target_time,
+                    clock_generation: 1,
+                },
+                selection_evidence: Default::default(),
+            };
+            journal.record_fixed_submission_budget(kms_dispatch_budget_ns);
+            journal.record_frame_service_observation(FrameTimingObservation {
+                frame_id: sequence,
+                target,
+                composite_started_at: MonotonicTimestampNs::new(composite_ns),
+                worker_queued_at: Some(MonotonicTimestampNs::new(composite_ns + queue_ready_ns)),
+                fence_signaled_at: Some((
+                    MonotonicTimestampNs::new(composite_ns + render_ready_ns),
+                    FenceTimestampQuality::ExactSyncFile,
+                )),
+            });
+        }
+        let prediction = journal.prediction(Duration::from_nanos(6_060_606));
+        assert_eq!(
+            prediction.estimator_mode,
+            PredictionEstimatorMode::WarmParallel
+        );
+        prediction
     }
 
     #[test]
@@ -908,6 +995,142 @@ mod tests {
             assert_eq!(result.max_future_primary_depth, 1);
             assert_eq!(result.target_hits, test_config.frames);
         }
+    }
+
+    #[test]
+    fn simulator_165_hz_stable_animation_is_physically_schedulable() {
+        let mut test_config = config(3_000_000);
+        test_config.refresh_interval_ns = 6_060_606;
+        test_config.dispatch_service_ns = 500_000;
+        test_config.apply_guard_ns = 300_000;
+        test_config.apply_delay_ns = 300_000;
+        test_config.frames = 96;
+
+        let result = simulate_o1(test_config);
+
+        assert_eq!(result.render_readiness_misses, 0);
+        assert_eq!(result.dispatch_misses, 0);
+        assert_eq!(result.apply_guard_misses, 0);
+        assert_eq!(result.target_hits, test_config.frames);
+        assert!(result.max_future_primary_depth <= 2);
+        assert_eq!(result.target_mutations, 0);
+    }
+
+    #[test]
+    fn simulator_early_render_adds_only_intentional_wait() {
+        let mut baseline_config = config(3_000_000);
+        baseline_config.refresh_interval_ns = 6_060_606;
+        baseline_config.dispatch_service_ns = 500_000;
+        baseline_config.apply_guard_ns = 300_000;
+        baseline_config.apply_delay_ns = 300_000;
+        baseline_config.frames = 48;
+        let mut early_config = baseline_config;
+        early_config.render_start_advance_ns = 1_000_000;
+
+        let baseline = simulate_o1(baseline_config);
+        let early = simulate_o1(early_config);
+        let baseline_prediction =
+            exact_parallel_prediction(3_000_000, 3_000_000, 500_000, 100_000_000);
+        let early_prediction = exact_parallel_prediction(3_000_000, 3_000_000, 500_000, 99_000_000);
+
+        assert!(early.intentional_queue_latency_ns > baseline.intentional_queue_latency_ns);
+        assert_eq!(
+            baseline_prediction.total_cost_ns,
+            early_prediction.total_cost_ns
+        );
+        assert_eq!(
+            baseline_prediction.parallel_service_ns,
+            early_prediction.parallel_service_ns
+        );
+        assert_eq!(baseline.target_hits, early.target_hits);
+        assert_eq!(
+            baseline.render_readiness_misses,
+            early.render_readiness_misses
+        );
+        assert_eq!(baseline.dispatch_misses, early.dispatch_misses);
+        assert_eq!(baseline.apply_guard_misses, early.apply_guard_misses);
+        assert_eq!(baseline.credit_grants, early.credit_grants);
+        assert_eq!(baseline.credit_revokes, early.credit_revokes);
+        assert_eq!(
+            baseline.desired_credit_one_observations,
+            early.desired_credit_one_observations
+        );
+        assert_eq!(
+            baseline.desired_credit_two_observations,
+            early.desired_credit_two_observations
+        );
+        assert!(early.max_future_primary_depth <= 2);
+        assert_eq!(early.target_mutations, 0);
+    }
+
+    #[test]
+    fn simulator_transient_gpu_spike_gets_early_lead_without_repeated_misses() {
+        let mut test_config = config(3_000_000);
+        test_config.refresh_interval_ns = 6_060_606;
+        test_config.dispatch_service_ns = 500_000;
+        test_config.apply_guard_ns = 300_000;
+        test_config.apply_delay_ns = 300_000;
+        test_config.render_start_advance_ns = 3_000_000;
+        test_config.frames = 48;
+        let mut services = vec![3_000_000; test_config.frames as usize];
+        services[0] = 8_000_000;
+
+        let result = simulate_o1_with_render_services(test_config, &services);
+
+        assert_eq!(result.render_readiness_misses, 0);
+        assert_eq!(result.dispatch_misses, 0);
+        assert_eq!(result.apply_guard_misses, 0);
+        assert_eq!(result.target_hits, test_config.frames);
+        assert!(result.max_future_primary_depth <= 2);
+        assert_eq!(result.target_mutations, 0);
+    }
+
+    #[test]
+    fn simulator_kms_dispatch_spike_uses_exported_budget_once() {
+        let mut kms = KmsWorkerDispatchModel::default();
+        for _ in 0..20 {
+            kms.record_worker_service(0, 500_000, 500_000);
+        }
+        let initial_budget = kms.budget().dispatch_budget_ns;
+        let initial_prediction =
+            exact_parallel_prediction(2_000_000, 4_000_000, initial_budget, 100_000_000);
+
+        let tail = kms.observe_submission_deadline(20_000_000, 21_000_000, true, true);
+        assert!(tail.increased);
+        let raised_budget = kms.budget().dispatch_budget_ns;
+        let raised_prediction =
+            exact_parallel_prediction(2_000_000, 4_000_000, raised_budget, 100_000_000);
+
+        assert!(raised_budget > initial_budget);
+        assert_eq!(
+            raised_prediction.exact_render_ready_risk_ns,
+            initial_prediction.exact_render_ready_risk_ns
+        );
+        assert_eq!(
+            raised_prediction.exact_queue_ready_risk_ns,
+            initial_prediction.exact_queue_ready_risk_ns
+        );
+        assert_eq!(
+            raised_prediction.parallel_service_ns - initial_prediction.parallel_service_ns,
+            raised_budget - initial_budget
+        );
+        assert_eq!(
+            raised_prediction.warm_parallel_total_cost_ns
+                - initial_prediction.warm_parallel_total_cost_ns,
+            raised_budget - initial_budget
+        );
+
+        let mut test_config = config(2_000_000);
+        test_config.refresh_interval_ns = 6_060_606;
+        test_config.dispatch_service_ns = raised_budget;
+        test_config.apply_guard_ns = 300_000;
+        test_config.apply_delay_ns = 300_000;
+        test_config.frames = 48;
+        let result = simulate_o1(test_config);
+        assert_eq!(result.render_readiness_misses, 0);
+        assert_eq!(result.dispatch_misses, 0);
+        assert_eq!(result.apply_guard_misses, 0);
+        assert!(result.max_future_primary_depth <= 2);
     }
 
     #[test]
@@ -979,11 +1202,13 @@ mod tests {
     fn kms_only_misses_do_not_grant_render_credit() {
         let mut test_config = config(500_000);
         test_config.apply_delay_ns = 1_500_000;
+        test_config.frames = 1;
         let result = simulate_o1(test_config);
 
         assert_eq!(result.credit_grants, 0);
+        assert_eq!(result.render_readiness_misses, 0);
         assert_eq!(result.kms_dispatch_misses, 0);
-        assert_eq!(result.kms_apply_misses, test_config.frames);
+        assert_eq!(result.kms_apply_misses, 1);
     }
 
     #[test]
@@ -1128,7 +1353,7 @@ mod tests {
         let mut test_config = config(500_000);
         test_config.frames = 4;
         let generation_change = SimulatedO1Event {
-            at_ns: 7_000_000,
+            at_ns: 11_700_000,
             order: 0,
             frame: 0,
             generation: 1,

@@ -785,17 +785,27 @@ pub struct BufferingPerformanceSnapshot {
     pub predicted_independent_kms_lead_ns: u64,
     #[serde(default)]
     pub predicted_independent_total_service_ns: u64,
-    /// Warm exact same-frame critical-path estimate; GPU and KMS branches may overlap.
+    /// Selected total from the exact parallel branch model when warm.
     #[serde(default)]
-    pub predicted_warm_paired_total_service_ns: u64,
+    pub predicted_warm_parallel_total_service_ns: u64,
     #[serde(default)]
     pub predicted_cold_wake_guard: bool,
     #[serde(default)]
     pub predicted_estimator_mode: String,
     #[serde(default)]
-    pub predicted_paired_critical_path_p95_ns: u64,
+    pub predicted_exact_render_ready_risk_ns: u64,
     #[serde(default)]
-    pub predicted_paired_critical_path_samples: u64,
+    pub predicted_exact_queue_ready_risk_ns: u64,
+    #[serde(default)]
+    pub predicted_parallel_service_ns: u64,
+    #[serde(default)]
+    pub predicted_parallel_samples: u64,
+    #[serde(default)]
+    pub predicted_main_event_loop_wake_guard_ns: u64,
+    #[serde(default)]
+    pub predicted_kms_dispatch_budget_ns: u64,
+    #[serde(default)]
+    pub predicted_kms_apply_guard_ns: u64,
     #[serde(default)]
     pub predicted_independent_p90_floor_ns: u64,
     #[serde(default)]
@@ -1229,6 +1239,51 @@ mod tests {
             "minUs": 0,
             "maxUs": 0,
         });
+        let mut buffering = serde_json::json!({
+            "reactiveDoubleFrames": 0,
+            "predictiveTripleFrames": 0,
+            "futurePrimaryCredit": 2,
+            "extraCreditGrants": 0,
+            "extraCreditRevokes": 0,
+            "o1Credit2UsefulHits": 0,
+            "o1Credit2UnnecessaryHits": 0,
+            "o1Credit2IneffectiveMisses": 0,
+            "o1Credit2GrantedNotConsumed": 0,
+            "o1Credit2DrainEvents": 0,
+            "o1Credit2RefillSuppressedWhileDraining": 0,
+            "preRenderAbandoned": 0,
+            "predictedIndependentRenderReadyServiceNs": 0,
+            "predictedIndependentKmsLeadNs": 0,
+            "predictedColdWakeGuard": true,
+            "predictedEstimatorMode": "warm_parallel",
+            "desiredFuturePrimaryCredit": 2,
+            "creditReleaseCleanOpportunities": 9,
+            "creditReleaseHorizon": 10,
+            "predictedIndependentTotalServiceNs": 0,
+            "predictedWarmParallelTotalServiceNs": 0,
+            "predictedIndependentP90FloorNs": 0,
+            "predictedWorkerNonIoctlLeadNs": 0,
+            "predictedMissRecoveryRemaining": 0,
+            "predictedTotalServiceNs": 0,
+            "lastOverlapRequiredNs": 0,
+            "positiveOverlapObservations": 0,
+            "nonpositiveOverlapObservations": 0,
+            "renderAheadAttempts": 0,
+            "renderAheadReady": 0,
+            "readySubmits": 0,
+            "tripleEntriesPredicted": 0,
+            "tripleEntriesRenderMiss": 0,
+            "tripleEntriesSubmitMiss": 0,
+            "tripleEntriesPresentationMiss": 0,
+            "tripleExits": 0,
+        });
+        buffering["predictedExactRenderReadyRiskNs"] = serde_json::json!(3000000);
+        buffering["predictedExactQueueReadyRiskNs"] = serde_json::json!(1000000);
+        buffering["predictedParallelServiceNs"] = serde_json::json!(3500000);
+        buffering["predictedParallelSamples"] = serde_json::json!(20);
+        buffering["predictedMainEventLoopWakeGuardNs"] = serde_json::json!(200000);
+        buffering["predictedKmsDispatchBudgetNs"] = serde_json::json!(500000);
+        buffering["predictedKmsApplyGuardNs"] = serde_json::json!(300000);
         let mut value = serde_json::json!({
             "compositorCpuRender": timing,
             "repaint": {
@@ -1240,46 +1295,7 @@ mod tests {
                 "fullOutputPixels": 0,
                 "fullRepaintReasons": {},
             },
-            "buffering": {
-                "reactiveDoubleFrames": 0,
-                "predictiveTripleFrames": 0,
-                "futurePrimaryCredit": 2,
-                "extraCreditGrants": 0,
-                "extraCreditRevokes": 0,
-                "o1Credit2UsefulHits": 0,
-                "o1Credit2UnnecessaryHits": 0,
-                "o1Credit2IneffectiveMisses": 0,
-                "o1Credit2GrantedNotConsumed": 0,
-                "o1Credit2DrainEvents": 0,
-                "o1Credit2RefillSuppressedWhileDraining": 0,
-                "preRenderAbandoned": 0,
-                "predictedIndependentRenderReadyServiceNs": 0,
-                "predictedIndependentKmsLeadNs": 0,
-                "predictedColdWakeGuard": true,
-                "predictedEstimatorMode": "warm_paired",
-                "predictedPairedCriticalPathP95Ns": 3000000,
-                "predictedPairedCriticalPathSamples": 20,
-                "desiredFuturePrimaryCredit": 2,
-                "creditReleaseCleanOpportunities": 9,
-                "creditReleaseHorizon": 10,
-                "predictedIndependentTotalServiceNs": 0,
-                "predictedWarmPairedTotalServiceNs": 0,
-                "predictedIndependentP90FloorNs": 0,
-                "predictedWorkerNonIoctlLeadNs": 0,
-                "predictedMissRecoveryRemaining": 0,
-                "predictedTotalServiceNs": 0,
-                "lastOverlapRequiredNs": 0,
-                "positiveOverlapObservations": 0,
-                "nonpositiveOverlapObservations": 0,
-                "renderAheadAttempts": 0,
-                "renderAheadReady": 0,
-                "readySubmits": 0,
-                "tripleEntriesPredicted": 0,
-                "tripleEntriesRenderMiss": 0,
-                "tripleEntriesSubmitMiss": 0,
-                "tripleEntriesPresentationMiss": 0,
-                "tripleExits": 0,
-            },
+            "buffering": buffering,
             "kms": {
                 "modeRefreshIntervalNs": 0,
                 "modeBlankingIntervalNs": null,
@@ -1388,6 +1404,26 @@ mod tests {
         ] {
             value["kms"]["workerTiming"][key] = serde_json::Value::from(0);
         }
+        for key in [
+            "primaryDispatchBudgetUs",
+            "primaryDispatchTailGuardUs",
+            "primaryApplyGuardUs",
+            "cursorPrepareBudgetUs",
+            "cursorDispatchBudgetUs",
+            "cursorDispatchTailGuardUs",
+            "cursorApplyGuardUs",
+            "cursorTotalLeadUs",
+            "cursorTargetHits",
+            "cursorDispatchMisses",
+            "cursorApplyMisses",
+            "cursorUnreachableTargets",
+            "cursorRecoveryCleanHits",
+            "cursorGuardIncreases",
+            "cursorGuardDecays",
+            "cursorGuardAgeMs",
+        ] {
+            value["kms"][key] = serde_json::Value::from(0);
+        }
 
         let snapshot = serde_json::from_value::<PerformanceSnapshot>(value.clone()).unwrap();
         assert_eq!(
@@ -1397,8 +1433,10 @@ mod tests {
         let human = crate::astreactl::output::human(&AstreactlResult::Performance(Box::new(
             snapshot.clone(),
         )));
-        assert!(human.contains("O1 estimator/cold wake guard: warm_paired/true"));
-        assert!(human.contains("Exact critical path p95/samples: 3000000 ns/20"));
+        assert!(human.contains("O1 estimator/cold wake guard: warm_parallel/true"));
+        assert!(human.contains(
+            "Exact parallel samples/render/queue/service: 20/3000000/1000000/3500000 ns"
+        ));
         assert!(human.contains("O1 desired/effective credit: 2/2"));
         assert!(human.contains("Credit release clean/horizon: 9/10"));
         assert_eq!(serde_json::to_value(&snapshot).unwrap(), value);

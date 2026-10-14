@@ -5,9 +5,13 @@ use std::cell::Cell;
 use std::hint::black_box;
 use std::time::Duration;
 
-use oblivion_one::native::adaptive_buffering::AdaptiveRenderJournal;
+use oblivion_one::native::adaptive_buffering::{
+    AdaptiveRenderJournal, FenceTimestampQuality, FrameTimingObservation,
+};
 use oblivion_one::native::kms_worker_dispatch_timing::KmsWorkerDispatchModel;
-use oblivion_one::native::presentation_deadline::MonotonicTimestampNs;
+use oblivion_one::native::presentation_deadline::{
+    MonotonicTimestampNs, PresentationTarget, PresentationTargetReason, PrimaryRefreshClaim,
+};
 
 thread_local! {
     static ALLOCATIONS: Cell<Option<usize>> = const { Cell::new(None) };
@@ -65,6 +69,24 @@ fn allocations_during(f: impl FnOnce()) -> usize {
 #[test]
 fn populated_render_prediction_does_not_allocate() {
     let mut journal = AdaptiveRenderJournal::default();
+    let target_time = MonotonicTimestampNs::new(1_000_000_000);
+    let target = PresentationTarget {
+        sequence: 1,
+        presentation_time: target_time,
+        submit_not_before: target_time,
+        render_start_deadline: target_time,
+        refresh_interval: Duration::from_millis(6),
+        reason: PresentationTargetReason::Normal,
+        clock_generation: 1,
+        estimated: false,
+        predicted_unreachable: false,
+        physical_claim: PrimaryRefreshClaim {
+            sequence: 1,
+            presentation_time: target_time,
+            clock_generation: 1,
+        },
+        selection_evidence: Default::default(),
+    };
     for value in 1..=241 {
         journal.record_render_sample(value, MonotonicTimestampNs::new(value));
         journal.record_wake_lateness(value);
@@ -74,6 +96,16 @@ fn populated_render_prediction_does_not_allocate() {
         journal.record_worker_service(value, value);
         journal.record_fixed_submission_budget(value);
         journal.record_target_slip(value);
+        journal.record_frame_service_observation(FrameTimingObservation {
+            frame_id: value,
+            target,
+            composite_started_at: MonotonicTimestampNs::new(value),
+            worker_queued_at: Some(MonotonicTimestampNs::new(value + 1)),
+            fence_signaled_at: Some((
+                MonotonicTimestampNs::new(value + 2),
+                FenceTimestampQuality::ExactSyncFile,
+            )),
+        });
     }
     let allocations = allocations_during(|| {
         black_box(black_box(&journal).prediction(Duration::from_millis(6)));

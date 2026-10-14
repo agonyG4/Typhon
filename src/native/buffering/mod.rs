@@ -284,7 +284,7 @@ mod tests {
     use super::{
         ElasticFuturePrimaryCredit, OpportunityLease, OpportunityLeaseReason,
         PipelineServiceEstimate, PresentationOpportunity, PresentationOpportunityFrontier,
-        PresentationOpportunityId, SimulatedO1Config, simulate_o1,
+        PresentationOpportunityId, SimulatedO1Config, SimulatedO1Result, simulate_o1,
         simulate_o1_with_render_services,
     };
     use crate::native::presentation_deadline::MonotonicTimestampNs;
@@ -419,9 +419,15 @@ mod tests {
             dispatch_service_ns: 300_000,
             apply_guard_ns: 500_000,
             apply_delay_ns: 500_000,
+            render_start_advance_ns: 0,
             frames: 120,
             worker_enabled: true,
         }
+    }
+
+    fn without_intentional_queue_latency(mut result: SimulatedO1Result) -> SimulatedO1Result {
+        result.intentional_queue_latency_ns = 0;
+        result
     }
 
     #[test]
@@ -437,7 +443,11 @@ mod tests {
         let mut worker_without_transport_lane = worker;
         worker_without_transport_lane.max_worker_queued_owners =
             synchronous.max_worker_queued_owners;
-        assert_eq!(worker_without_transport_lane, synchronous);
+        assert!(worker.intentional_queue_latency_ns > 0);
+        assert_eq!(
+            without_intentional_queue_latency(worker_without_transport_lane),
+            without_intentional_queue_latency(synchronous)
+        );
     }
 
     #[test]
@@ -454,12 +464,20 @@ mod tests {
 
     #[test]
     fn simulator_separates_apply_failure_from_dispatch_failure() {
-        let mut config = config(500_000);
-        config.apply_delay_ns = 1_500_000;
-        let result = simulate_o1(config);
+        let mut isolated_config = config(500_000);
+        isolated_config.apply_delay_ns = 1_500_000;
+        isolated_config.frames = 1;
+        let isolated = simulate_o1(isolated_config);
 
-        assert_eq!(result.dispatch_misses, 0);
-        assert_eq!(result.apply_guard_misses, 120);
+        assert_eq!(isolated.dispatch_misses, 0);
+        assert_eq!(isolated.apply_guard_misses, 1);
+
+        let mut sustained_config = config(500_000);
+        sustained_config.apply_delay_ns = 1_500_000;
+        let sustained = simulate_o1(sustained_config);
+        assert_eq!(sustained.apply_guard_misses, sustained_config.frames);
+        assert!(sustained.dispatch_misses > 0);
+        assert_eq!(sustained.dispatch_misses, sustained.kms_dispatch_misses);
     }
 
     #[test]
@@ -502,7 +520,11 @@ mod tests {
         let mut worker_without_transport_lane = worker;
         worker_without_transport_lane.max_worker_queued_owners =
             synchronous.max_worker_queued_owners;
-        assert_eq!(worker_without_transport_lane, synchronous);
+        assert!(worker.intentional_queue_latency_ns > 0);
+        assert_eq!(
+            without_intentional_queue_latency(worker_without_transport_lane),
+            without_intentional_queue_latency(synchronous)
+        );
         assert_eq!(worker.target_hits, 60);
         assert_eq!(worker.credit_two_observations, 0);
     }

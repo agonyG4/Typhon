@@ -49,8 +49,8 @@ pub(super) fn build_render_begin_fields(
             prediction.independent_total_cost_ns,
         ),
         PacingField::u64(
-            "prediction_warm_paired_total_cost_ns",
-            prediction.warm_paired_total_cost_ns,
+            "prediction_warm_parallel_total_cost_ns",
+            prediction.warm_parallel_total_cost_ns,
         ),
         PacingField::u64(
             "prediction_independent_p90_floor_ns",
@@ -91,13 +91,18 @@ pub(super) fn build_render_begin_fields(
         ),
         PacingField::u64("prediction_kms_total_lead_ns", prediction.kms_total_lead_ns),
         PacingField::u64(
-            "prediction_paired_service_p95_ns",
-            prediction.paired_service_p95_ns,
+            "prediction_exact_render_ready_risk_ns",
+            prediction.exact_render_ready_risk_ns,
         ),
-        PacingField::usize(
-            "prediction_paired_service_samples",
-            prediction.paired_service_samples,
+        PacingField::u64(
+            "prediction_exact_queue_ready_risk_ns",
+            prediction.exact_queue_ready_risk_ns,
         ),
+        PacingField::u64(
+            "prediction_parallel_service_ns",
+            prediction.parallel_service_ns,
+        ),
+        PacingField::usize("prediction_parallel_samples", prediction.parallel_samples),
         PacingField::str(
             "prediction_estimator_mode",
             prediction.estimator_mode.as_str(),
@@ -120,14 +125,6 @@ pub(super) fn build_render_begin_fields(
         PacingField::u64(
             "o1_credit_release_horizon",
             u64::from(buffering.clean_release_horizon()),
-        ),
-        PacingField::u64(
-            "prediction_exact_critical_path_p95_ns",
-            prediction.paired_service_p95_ns,
-        ),
-        PacingField::usize(
-            "prediction_exact_critical_path_samples",
-            prediction.paired_service_samples,
         ),
     ];
     fields.extend(snapshot_fields(buffer_snapshot));
@@ -162,11 +159,16 @@ pub(super) fn build_buffering_performance_snapshot(
             .saturating_add(prediction.render_risk_ns),
         predicted_independent_kms_lead_ns: prediction.kms_total_lead_ns,
         predicted_independent_total_service_ns: prediction.independent_total_cost_ns,
-        predicted_warm_paired_total_service_ns: prediction.warm_paired_total_cost_ns,
+        predicted_warm_parallel_total_service_ns: prediction.warm_parallel_total_cost_ns,
         predicted_cold_wake_guard: prediction.cold_wake_guard,
         predicted_estimator_mode: prediction.estimator_mode.as_str().to_string(),
-        predicted_paired_critical_path_p95_ns: prediction.paired_service_p95_ns,
-        predicted_paired_critical_path_samples: prediction.paired_service_samples as u64,
+        predicted_exact_render_ready_risk_ns: prediction.exact_render_ready_risk_ns,
+        predicted_exact_queue_ready_risk_ns: prediction.exact_queue_ready_risk_ns,
+        predicted_parallel_service_ns: prediction.parallel_service_ns,
+        predicted_parallel_samples: prediction.parallel_samples as u64,
+        predicted_main_event_loop_wake_guard_ns: prediction.main_event_loop_wake_guard_ns,
+        predicted_kms_dispatch_budget_ns: prediction.kms_dispatch_budget_ns,
+        predicted_kms_apply_guard_ns: prediction.kms_apply_guard_ns,
         predicted_independent_p90_floor_ns: prediction.independent_p90_floor_ns,
         predicted_worker_non_ioctl_lead_ns: prediction.worker_non_ioctl_lead_ns,
         predicted_miss_recovery_remaining: prediction.miss_recovery_remaining as u64,
@@ -493,8 +495,8 @@ mod tests {
             prediction.independent_total_cost_ns
         );
         assert_eq!(
-            snapshot.predicted_warm_paired_total_service_ns,
-            prediction.warm_paired_total_cost_ns
+            snapshot.predicted_warm_parallel_total_service_ns,
+            prediction.warm_parallel_total_cost_ns
         );
         assert_eq!(
             snapshot.predicted_independent_p90_floor_ns,
@@ -541,7 +543,7 @@ mod tests {
     }
 
     #[test]
-    fn buffering_snapshot_exposes_cold_and_exact_critical_path_evidence() {
+    fn buffering_snapshot_exposes_cold_and_exact_parallel_evidence() {
         let mut journal = AdaptiveRenderJournal::default();
         let target_time = MonotonicTimestampNs::new(10_000_000);
         let target = PresentationTarget {
@@ -565,12 +567,11 @@ mod tests {
             frame_id: 7,
             target,
             composite_started_at: MonotonicTimestampNs::new(0),
+            worker_queued_at: Some(MonotonicTimestampNs::new(1_000_000)),
             fence_signaled_at: Some((
                 MonotonicTimestampNs::new(5_000_000),
                 FenceTimestampQuality::ExactSyncFile,
             )),
-            submit_started_at: Some(MonotonicTimestampNs::new(1_000_000)),
-            submit_returned_at: Some(MonotonicTimestampNs::new(2_000_000)),
         });
         let prediction = journal.prediction_at_with_kms_guard(
             MonotonicTimestampNs::new(50_000_000_000),
@@ -588,8 +589,13 @@ mod tests {
 
         assert!(value["predictedColdWakeGuard"].as_bool().unwrap());
         assert_eq!(value["predictedEstimatorMode"], "cold_start");
-        assert_eq!(value["predictedPairedCriticalPathP95Ns"], 5_000_000);
-        assert_eq!(value["predictedPairedCriticalPathSamples"], 1);
+        assert_eq!(value["predictedExactRenderReadyRiskNs"], 5_000_000);
+        assert_eq!(value["predictedExactQueueReadyRiskNs"], 1_000_000);
+        assert_eq!(value["predictedParallelServiceNs"], 5_000_000);
+        assert_eq!(value["predictedParallelSamples"], 1);
+        assert_eq!(value["predictedKmsDispatchBudgetNs"], 250_000);
+        assert_eq!(value["predictedKmsApplyGuardNs"], 100_000);
+        assert_eq!(value["predictedMainEventLoopWakeGuardNs"], 1_000_000);
         assert_eq!(value["desiredFuturePrimaryCredit"], 1);
         assert_eq!(value["futurePrimaryCredit"], 1);
         assert_eq!(value["creditReleaseCleanOpportunities"], 0);

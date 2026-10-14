@@ -10,15 +10,15 @@ use std::collections::VecDeque;
 use std::time::Duration;
 
 const SAMPLE_CAPACITY: usize = 120;
-const WARM_PAIRED_MIN_SAMPLES: usize = 20;
-const MISS_RECOVERY_PAIRED_SUCCESSES: usize = 20;
+const WARM_PARALLEL_MIN_SAMPLES: usize = 20;
+const MISS_RECOVERY_EXACT_SUCCESSES: usize = 20;
 const COLD_WAKE_REFRESH_INTERVALS: u64 = 100;
 
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PredictionEstimatorMode {
     ColdStart,
-    WarmPaired,
+    WarmParallel,
     MissRecovery,
 }
 
@@ -26,7 +26,7 @@ impl PredictionEstimatorMode {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::ColdStart => "cold_start",
-            Self::WarmPaired => "warm_paired",
+            Self::WarmParallel => "warm_parallel",
             Self::MissRecovery => "miss_recovery",
         }
     }
@@ -203,34 +203,31 @@ pub struct FrameTimingObservation {
     pub frame_id: u64,
     pub target: PresentationTarget,
     pub composite_started_at: MonotonicTimestampNs,
+    pub worker_queued_at: Option<MonotonicTimestampNs>,
     pub fence_signaled_at: Option<(MonotonicTimestampNs, FenceTimestampQuality)>,
-    pub submit_started_at: Option<MonotonicTimestampNs>,
-    pub submit_returned_at: Option<MonotonicTimestampNs>,
 }
 
-/// Return the exact same-frame critical path when all timestamps are complete
-/// and monotonic. GPU completion and KMS submission can overlap, so service is
-/// measured to the later readiness point rather than by summing both branches.
-fn exact_same_frame_critical_path_ns(observation: &FrameTimingObservation) -> Option<u64> {
+/// Exact worker and GPU branch samples from one frame. These branches may
+/// become ready in either order; only each branch's relation to composite
+/// start must be monotonic.
+fn exact_parallel_branch_samples_ns(observation: &FrameTimingObservation) -> Option<(u64, u64)> {
     let (fence_signaled_at, FenceTimestampQuality::ExactSyncFile) = observation.fence_signaled_at?
     else {
         return None;
     };
-    let submit_started_at = observation.submit_started_at?;
-    let submit_returned_at = observation.submit_returned_at?;
+    let worker_queued_at = observation.worker_queued_at?;
     let composite_started_ns = observation.composite_started_at.get();
     let fence_signaled_ns = fence_signaled_at.get();
-    let submit_started_ns = submit_started_at.get();
-    let submit_returned_ns = submit_returned_at.get();
+    let worker_queued_ns = worker_queued_at.get();
 
-    if composite_started_ns > fence_signaled_ns
-        || composite_started_ns > submit_started_ns
-        || submit_started_ns > submit_returned_ns
-    {
+    if composite_started_ns > fence_signaled_ns || composite_started_ns > worker_queued_ns {
         return None;
     }
 
-    Some(fence_signaled_ns.max(submit_returned_ns) - composite_started_ns)
+    Some((
+        fence_signaled_ns - composite_started_ns,
+        worker_queued_ns - composite_started_ns,
+    ))
 }
 
 pub fn render_sample_duration_ns(
@@ -260,18 +257,112 @@ pub struct RenderPrediction {
     pub kms_apply_guard_ns: u64,
     pub kms_total_lead_ns: u64,
     pub p95_target_slip_ns: u64,
-    /// Exact same-frame critical-path p95: max(GPU fence, KMS submit return)
-    /// minus compositor start. The branches may overlap.
-    pub paired_service_p95_ns: u64,
-    pub paired_service_samples: usize,
+    pub exact_render_ready_risk_ns: u64,
+    pub exact_queue_ready_risk_ns: u64,
+    pub parallel_service_ns: u64,
+    pub parallel_samples: usize,
     pub estimator_mode: PredictionEstimatorMode,
     pub independent_total_cost_ns: u64,
-    pub warm_paired_total_cost_ns: u64,
+    pub warm_parallel_total_cost_ns: u64,
     pub independent_p90_floor_ns: u64,
     pub worker_non_ioctl_lead_ns: u64,
     pub miss_recovery_remaining: usize,
     pub total_cost_ns: u64,
     pub cold_wake_guard: bool,
+}
+
+#[derive(Debug)]
+struct BranchRiskHistory {
+    samples_ns: VecDeque<u64>,
+    ewma_ns: u64,
+    upper_positive_deviation_ns: u64,
+    last_sample_at: Option<MonotonicTimestampNs>,
+}
+
+impl Default for BranchRiskHistory {
+    fn default() -> Self {
+        Self {
+            samples_ns: VecDeque::with_capacity(SAMPLE_CAPACITY),
+            ewma_ns: 0,
+            upper_positive_deviation_ns: 0,
+            last_sample_at: None,
+        }
+    }
+}
+
+impl BranchRiskHistory {
+    fn record(&mut self, sample_ns: u64, at: MonotonicTimestampNs) {
+        if let Some(previous_at) = self.last_sample_at {
+            let dt_ns = at.get().saturating_sub(previous_at.get());
+            let positive_error = sample_ns.saturating_sub(self.ewma_ns);
+            let (deviation_num, deviation_den) = deviation_alpha(dt_ns);
+            self.upper_positive_deviation_ns = mix_rounded(
+                positive_error,
+                self.upper_positive_deviation_ns,
+                deviation_num,
+                deviation_den,
+            )
+            .max(positive_error);
+            let (mean_num, mean_den) = mean_alpha(dt_ns);
+            self.ewma_ns = mix_rounded(sample_ns, self.ewma_ns, mean_num, mean_den);
+        } else {
+            self.ewma_ns = sample_ns;
+            self.upper_positive_deviation_ns = 0;
+        }
+        push_bounded(&mut self.samples_ns, sample_ns);
+        self.last_sample_at = Some(at);
+    }
+
+    fn risk_ns(&self) -> u64 {
+        nearest_rank(&self.samples_ns, 95).max(
+            self.ewma_ns
+                .saturating_add(self.upper_positive_deviation_ns.saturating_mul(2)),
+        )
+    }
+}
+
+#[derive(Debug, Default)]
+struct ExactParallelRiskJournal {
+    render_ready: BranchRiskHistory,
+    queue_ready: BranchRiskHistory,
+}
+
+impl ExactParallelRiskJournal {
+    fn record(&mut self, render_ready_ns: u64, queue_ready_ns: u64, at: MonotonicTimestampNs) {
+        self.render_ready.record(render_ready_ns, at);
+        self.queue_ready.record(queue_ready_ns, at);
+    }
+
+    fn samples(&self) -> usize {
+        self.render_ready
+            .samples_ns
+            .len()
+            .min(self.queue_ready.samples_ns.len())
+    }
+}
+
+fn parallel_service_ns(
+    render_ready_risk_ns: u64,
+    queue_ready_risk_ns: u64,
+    kms_budget_ns: u64,
+) -> u64 {
+    render_ready_risk_ns.max(queue_ready_risk_ns.saturating_add(kms_budget_ns))
+}
+
+fn warm_parallel_total_cost_ns(
+    main_wake_guard_ns: u64,
+    kms_apply_guard_ns: u64,
+    render_ready_risk_ns: u64,
+    queue_ready_risk_ns: u64,
+    kms_dispatch_budget_ns: u64,
+) -> u64 {
+    main_wake_guard_ns
+        .saturating_add(kms_apply_guard_ns)
+        .saturating_add(parallel_service_ns(
+            render_ready_risk_ns,
+            queue_ready_risk_ns,
+            kms_dispatch_budget_ns,
+        ))
 }
 
 #[doc(hidden)]
@@ -286,8 +377,7 @@ pub struct AdaptiveRenderJournal {
     worker_dispatch_samples_ns: VecDeque<u64>,
     fixed_submission_budget_samples_ns: VecDeque<u64>,
     target_slip_samples_ns: VecDeque<u64>,
-    /// Exact paired same-frame critical-path service samples.
-    paired_service_samples_ns: VecDeque<u64>,
+    exact_parallel: ExactParallelRiskJournal,
     ewma_render_ns: u64,
     upper_render_deviation_ns: u64,
     last_sample_at: Option<MonotonicTimestampNs>,
@@ -307,7 +397,7 @@ impl Default for AdaptiveRenderJournal {
             worker_dispatch_samples_ns: VecDeque::with_capacity(SAMPLE_CAPACITY),
             fixed_submission_budget_samples_ns: VecDeque::with_capacity(SAMPLE_CAPACITY),
             target_slip_samples_ns: VecDeque::with_capacity(SAMPLE_CAPACITY),
-            paired_service_samples_ns: VecDeque::with_capacity(SAMPLE_CAPACITY),
+            exact_parallel: ExactParallelRiskJournal::default(),
             ewma_render_ns: 0,
             upper_render_deviation_ns: 0,
             last_sample_at: None,
@@ -364,7 +454,9 @@ impl AdaptiveRenderJournal {
     }
 
     pub fn record_fixed_submission_budget(&mut self, sample_ns: u64) {
-        push_bounded(&mut self.fixed_submission_budget_samples_ns, sample_ns);
+        if sample_ns > 0 {
+            push_bounded(&mut self.fixed_submission_budget_samples_ns, sample_ns);
+        }
     }
 
     pub fn record_target_slip(&mut self, sample_ns: u64) {
@@ -372,25 +464,33 @@ impl AdaptiveRenderJournal {
     }
 
     pub fn record_frame_service_observation(&mut self, observation: FrameTimingObservation) {
-        let Some(critical_path_ns) = exact_same_frame_critical_path_ns(&observation) else {
+        let Some((render_ready_ns, queue_ready_ns)) =
+            exact_parallel_branch_samples_ns(&observation)
+        else {
             return;
         };
-        push_bounded(&mut self.paired_service_samples_ns, critical_path_ns);
+        self.exact_parallel.record(
+            render_ready_ns,
+            queue_ready_ns,
+            observation.composite_started_at,
+        );
         self.miss_recovery_remaining = self.miss_recovery_remaining.saturating_sub(1);
     }
 
     pub fn note_proven_deadline_miss(&mut self, disposition: EstimatorRecoveryDisposition) {
         self.missed_deadlines = self.missed_deadlines.saturating_add(1);
         if disposition == EstimatorRecoveryDisposition::ResetIndependentHorizon {
-            self.miss_recovery_remaining = MISS_RECOVERY_PAIRED_SUCCESSES;
+            self.miss_recovery_remaining = MISS_RECOVERY_EXACT_SUCCESSES;
         }
     }
 
     pub fn prediction_estimator_mode(&self) -> PredictionEstimatorMode {
         if self.miss_recovery_remaining > 0 {
             PredictionEstimatorMode::MissRecovery
-        } else if self.paired_service_samples_ns.len() >= WARM_PAIRED_MIN_SAMPLES {
-            PredictionEstimatorMode::WarmPaired
+        } else if self.exact_parallel.samples() >= WARM_PARALLEL_MIN_SAMPLES
+            && self.fixed_submission_budget_samples_ns.len() >= WARM_PARALLEL_MIN_SAMPLES
+        {
+            PredictionEstimatorMode::WarmParallel
         } else {
             PredictionEstimatorMode::ColdStart
         }
@@ -473,46 +573,50 @@ impl AdaptiveRenderJournal {
         } else {
             central_risk.max(p90)
         };
-        if (1..WARM_PAIRED_MIN_SAMPLES).contains(&self.render_samples_ns.len()) {
+        if (1..WARM_PARALLEL_MIN_SAMPLES).contains(&self.render_samples_ns.len()) {
             render_risk =
                 render_risk.max(self.render_samples_ns.iter().copied().max().unwrap_or(0));
         }
         let p95_wake = nearest_rank(&self.wake_lateness_samples_ns, 95);
         let p95_ioctl = nearest_rank(&self.atomic_submit_samples_ns, 95);
-        let p95_worker_wake = nearest_rank(&self.worker_submit_wake_lateness_samples_ns, 95);
         let p95_worker_pre_submit = nearest_rank(&self.worker_pre_submit_samples_ns, 95);
         let p95_worker_dispatch = nearest_rank(&self.worker_dispatch_samples_ns, 95);
         let p95_queue_residency = nearest_rank(&self.worker_queue_residency_samples_ns, 95);
-        let measured_dispatch_budget = p95_worker_wake
-            .saturating_add(p95_worker_dispatch.max(p95_ioctl))
-            .saturating_add(50_000);
         let exported_submission_budget = nearest_rank(&self.fixed_submission_budget_samples_ns, 95);
-        let kms_dispatch_budget = if exported_submission_budget != 0 {
-            exported_submission_budget
-        } else if self.fixed_submission_budget_samples_ns.len() < WARM_PAIRED_MIN_SAMPLES {
-            measured_dispatch_budget.max(250_000)
+        let kms_dispatch_budget = if self.fixed_submission_budget_samples_ns.is_empty() {
+            250_000
         } else {
-            measured_dispatch_budget
+            exported_submission_budget
         };
         let ceiling = 2_000_000_u64.min(refresh_ns / 4).max(500_000);
         let dynamic_margin = p95_wake.saturating_add(250_000).clamp(500_000, ceiling);
         let main_event_loop_wake_guard = if self.wake_lateness_samples_ns.len()
-            < WARM_PAIRED_MIN_SAMPLES
-            || self.fixed_submission_budget_samples_ns.len() < WARM_PAIRED_MIN_SAMPLES
+            < WARM_PARALLEL_MIN_SAMPLES
+            || self.fixed_submission_budget_samples_ns.len() < WARM_PARALLEL_MIN_SAMPLES
         {
             dynamic_margin.max(1_000_000)
         } else {
             dynamic_margin
         };
         let kms_total_lead = kms_dispatch_budget.saturating_add(kms_apply_guard_ns);
-        let paired_service_p95_ns = nearest_rank(&self.paired_service_samples_ns, 95);
+        let exact_render_ready_risk_ns = self.exact_parallel.render_ready.risk_ns();
+        let exact_queue_ready_risk_ns = self.exact_parallel.queue_ready.risk_ns();
+        let parallel_service_ns = parallel_service_ns(
+            exact_render_ready_risk_ns,
+            exact_queue_ready_risk_ns,
+            kms_dispatch_budget,
+        );
         let independent_total_cost_ns = render_risk
             .saturating_add(main_event_loop_wake_guard)
             .saturating_add(kms_total_lead);
         let worker_non_ioctl_lead_ns = kms_dispatch_budget.saturating_sub(p95_ioctl);
-        let warm_paired_total_cost_ns = paired_service_p95_ns
-            .saturating_add(main_event_loop_wake_guard)
-            .saturating_add(kms_apply_guard_ns);
+        let warm_parallel_total_cost_ns = warm_parallel_total_cost_ns(
+            main_event_loop_wake_guard,
+            kms_apply_guard_ns,
+            exact_render_ready_risk_ns,
+            exact_queue_ready_risk_ns,
+            kms_dispatch_budget,
+        );
         let independent_p90_floor_ns = p90
             .saturating_add(main_event_loop_wake_guard)
             .saturating_add(kms_dispatch_budget)
@@ -522,9 +626,7 @@ impl AdaptiveRenderJournal {
             PredictionEstimatorMode::ColdStart | PredictionEstimatorMode::MissRecovery => {
                 independent_total_cost_ns
             }
-            PredictionEstimatorMode::WarmPaired => {
-                warm_paired_total_cost_ns.max(independent_p90_floor_ns)
-            }
+            PredictionEstimatorMode::WarmParallel => warm_parallel_total_cost_ns,
         };
         if cold_wake {
             total = total.max(refresh_ns.saturating_sub(100_000));
@@ -545,11 +647,13 @@ impl AdaptiveRenderJournal {
             kms_apply_guard_ns,
             kms_total_lead_ns: kms_total_lead,
             p95_target_slip_ns: nearest_rank(&self.target_slip_samples_ns, 95),
-            paired_service_p95_ns,
-            paired_service_samples: self.paired_service_samples_ns.len(),
+            exact_render_ready_risk_ns,
+            exact_queue_ready_risk_ns,
+            parallel_service_ns,
+            parallel_samples: self.exact_parallel.samples(),
             estimator_mode,
             independent_total_cost_ns,
-            warm_paired_total_cost_ns,
+            warm_parallel_total_cost_ns,
             independent_p90_floor_ns,
             worker_non_ioctl_lead_ns,
             miss_recovery_remaining: self.miss_recovery_remaining,
@@ -1039,32 +1143,67 @@ mod tests {
     fn service_observation(
         render_started_ns: u64,
         render_signaled_ns: u64,
-        submit_started_ns: u64,
-        submit_returned_ns: u64,
+        worker_queued_ns: u64,
+        _submit_returned_ns: u64,
     ) -> FrameTimingObservation {
         FrameTimingObservation {
             frame_id: 1,
             target: service_target(),
             composite_started_at: MonotonicTimestampNs::new(render_started_ns),
+            worker_queued_at: Some(MonotonicTimestampNs::new(worker_queued_ns)),
             fence_signaled_at: Some((
                 MonotonicTimestampNs::new(render_signaled_ns),
                 FenceTimestampQuality::ExactSyncFile,
             )),
-            submit_started_at: Some(MonotonicTimestampNs::new(submit_started_ns)),
-            submit_returned_at: Some(MonotonicTimestampNs::new(submit_returned_ns)),
         }
+    }
+
+    #[test]
+    fn intentional_worker_wait_does_not_change_warm_prediction() {
+        fn journal_with_worker_wait(wait_ns: u64) -> AdaptiveRenderJournal {
+            let mut journal = AdaptiveRenderJournal::default();
+            for sample in 0..WARM_PARALLEL_MIN_SAMPLES {
+                let composite_ns = 100_000_000 + sample as u64 * 50_000_000;
+                let observation = service_observation(
+                    composite_ns,
+                    composite_ns + 3_000_000,
+                    composite_ns + 1_000_000,
+                    composite_ns + 1_100_000 + wait_ns,
+                );
+                journal.record_render_sample(
+                    3_000_000,
+                    MonotonicTimestampNs::new(composite_ns + 3_000_000),
+                );
+                journal.record_fixed_submission_budget(500_000);
+                journal.record_frame_service_observation(observation);
+            }
+            journal
+        }
+
+        let little_wait = journal_with_worker_wait(1_000_000).prediction(Duration::from_millis(10));
+        let intentional_wait =
+            journal_with_worker_wait(30_000_000).prediction(Duration::from_millis(10));
+
+        assert_eq!(
+            little_wait.estimator_mode,
+            PredictionEstimatorMode::WarmParallel
+        );
+        assert_eq!(
+            little_wait.total_cost_ns, intentional_wait.total_cost_ns,
+            "scheduled worker wait must not train compositor service risk"
+        );
     }
 
     fn record_uniform_prediction_inputs(
         journal: &mut AdaptiveRenderJournal,
         render_sample_ns: u64,
-        paired_render_service_ns: u64,
-        submit_service_ns: u64,
+        exact_render_ready_ns: u64,
+        exact_queue_ready_ns: u64,
         wake_lateness_ns: u64,
         ioctl_ns: u64,
         kms_dispatch_budget_ns: u64,
     ) {
-        for sample in 0..WARM_PAIRED_MIN_SAMPLES {
+        for sample in 0..WARM_PARALLEL_MIN_SAMPLES {
             let base_ns = 100_000_000 + sample as u64 * 10_000_000;
             journal.record_render_sample(render_sample_ns, MonotonicTimestampNs::new(base_ns));
             journal.record_wake_lateness(wake_lateness_ns);
@@ -1072,61 +1211,78 @@ mod tests {
             journal.record_fixed_submission_budget(kms_dispatch_budget_ns);
             journal.record_frame_service_observation(service_observation(
                 base_ns,
-                base_ns + paired_render_service_ns,
-                base_ns + paired_render_service_ns + 1_000_000,
-                base_ns + paired_render_service_ns + 1_000_000 + submit_service_ns,
+                base_ns + exact_render_ready_ns,
+                base_ns + exact_queue_ready_ns,
+                base_ns + exact_queue_ready_ns + 1_000_000,
             ));
         }
     }
 
     #[test]
-    fn paired_critical_path_includes_worker_delay_without_recounting_it() {
+    fn exact_parallel_history_records_compositor_to_queue_ready_branch() {
         let mut journal = AdaptiveRenderJournal::default();
         journal.record_frame_service_observation(service_observation(100, 1_100, 9_000, 9_300));
 
         let prediction = journal.prediction(Duration::from_millis(10));
-        assert_eq!(prediction.paired_service_samples, 1);
-        assert_eq!(prediction.paired_service_p95_ns, 9_200);
+        assert_eq!(prediction.parallel_samples, 1);
+        assert_eq!(prediction.exact_render_ready_risk_ns, 1_000);
+        assert_eq!(prediction.exact_queue_ready_risk_ns, 8_900);
     }
 
     #[test]
-    fn exact_critical_path_accepts_fence_after_submit_returns_and_gpu_dominates() {
+    fn exact_parallel_gpu_branch_can_dominate() {
         let mut journal = AdaptiveRenderJournal::default();
         journal.record_frame_service_observation(service_observation(
             0, 5_000_000, 1_000_000, 2_000_000,
         ));
 
         let prediction = journal.prediction(Duration::from_millis(10));
-        assert_eq!(prediction.paired_service_samples, 1);
-        assert_eq!(prediction.paired_service_p95_ns, 5_000_000);
+        assert_eq!(prediction.parallel_samples, 1);
+        assert_eq!(prediction.exact_render_ready_risk_ns, 5_000_000);
+        assert_eq!(prediction.exact_queue_ready_risk_ns, 1_000_000);
     }
 
     #[test]
-    fn exact_critical_path_uses_submit_branch_when_kms_dominates() {
+    fn exact_parallel_queue_branch_can_dominate_without_waiting_for_fence() {
         let mut journal = AdaptiveRenderJournal::default();
         journal.record_frame_service_observation(service_observation(
-            0, 2_000_000, 1_000_000, 5_000_000,
+            0, 2_000_000, 4_000_000, 5_000_000,
         ));
 
         let prediction = journal.prediction(Duration::from_millis(10));
-        assert_eq!(prediction.paired_service_samples, 1);
-        assert_eq!(prediction.paired_service_p95_ns, 5_000_000);
+        assert_eq!(prediction.parallel_samples, 1);
+        assert_eq!(prediction.exact_render_ready_risk_ns, 2_000_000);
+        assert_eq!(prediction.exact_queue_ready_risk_ns, 4_000_000);
     }
 
     #[test]
-    fn exact_critical_path_accepts_fence_signal_before_submit_starts() {
+    fn exact_parallel_accepts_fence_signal_before_worker_queue() {
         let mut journal = AdaptiveRenderJournal::default();
         journal.record_frame_service_observation(service_observation(
             0, 500_000, 1_000_000, 2_000_000,
         ));
 
         let prediction = journal.prediction(Duration::from_millis(10));
-        assert_eq!(prediction.paired_service_samples, 1);
-        assert_eq!(prediction.paired_service_p95_ns, 2_000_000);
+        assert_eq!(prediction.parallel_samples, 1);
+        assert_eq!(prediction.exact_render_ready_risk_ns, 500_000);
+        assert_eq!(prediction.exact_queue_ready_risk_ns, 1_000_000);
     }
 
     #[test]
-    fn approximate_fence_timestamps_do_not_enter_exact_critical_path_history() {
+    fn exact_parallel_accepts_worker_queue_before_fence_signal() {
+        let mut journal = AdaptiveRenderJournal::default();
+        journal.record_frame_service_observation(service_observation(
+            0, 4_000_000, 800_000, 4_100_000,
+        ));
+
+        let prediction = journal.prediction(Duration::from_millis(10));
+        assert_eq!(prediction.parallel_samples, 1);
+        assert_eq!(prediction.exact_render_ready_risk_ns, 4_000_000);
+        assert_eq!(prediction.exact_queue_ready_risk_ns, 800_000);
+    }
+
+    #[test]
+    fn approximate_fence_timestamps_do_not_enter_exact_parallel_history() {
         let mut journal = AdaptiveRenderJournal::default();
         let mut observation = service_observation(0, 5_000_000, 1_000_000, 2_000_000);
         observation.fence_signaled_at = Some((
@@ -1137,41 +1293,44 @@ mod tests {
         journal.record_frame_service_observation(observation);
 
         let prediction = journal.prediction(Duration::from_millis(10));
-        assert_eq!(prediction.paired_service_samples, 0);
-        assert_eq!(prediction.paired_service_p95_ns, 0);
+        assert_eq!(prediction.parallel_samples, 0);
+        assert_eq!(prediction.exact_render_ready_risk_ns, 0);
+        assert_eq!(prediction.exact_queue_ready_risk_ns, 0);
     }
 
     #[test]
-    fn non_monotonic_frame_service_observations_are_ignored() {
+    fn invalid_queue_or_fence_timestamps_do_not_train_exact_parallel_history() {
         let mut journal = AdaptiveRenderJournal::default();
         journal.record_frame_service_observation(service_observation(
-            0, 5_000_000, 2_000_000, 1_000_000,
+            5_000_000, 8_000_000, 4_000_000, 9_000_000,
         ));
         journal.record_frame_service_observation(service_observation(
             5_000_000, 4_000_000, 6_000_000, 7_000_000,
         ));
-        journal.record_frame_service_observation(service_observation(
-            5_000_000, 8_000_000, 4_000_000, 9_000_000,
-        ));
 
         let prediction = journal.prediction(Duration::from_millis(10));
-        assert_eq!(prediction.paired_service_samples, 0);
+        assert_eq!(prediction.parallel_samples, 0);
         assert_eq!(prediction.miss_recovery_remaining, 0);
     }
 
     #[test]
-    fn warm_mode_selects_paired_service_instead_of_independent_deviation() {
-        fn journal_with_paired_service(paired_service_ns: u64) -> AdaptiveRenderJournal {
+    fn warm_parallel_selects_exact_branches_instead_of_independent_deviation() {
+        fn journal_with_exact_render_ready(exact_render_ready_ns: u64) -> AdaptiveRenderJournal {
             let mut journal = AdaptiveRenderJournal::default();
-            for sample in 0..20 {
-                let base_ns = 10_000_000 + sample * 10_000_000;
+            for sample in 0..WARM_PARALLEL_MIN_SAMPLES {
+                let base_ns = 10_000_000 + sample as u64 * 10_000_000;
                 journal.record_render_sample(
-                    if sample == 19 { 10_000_000 } else { 1_000_000 },
+                    if sample == WARM_PARALLEL_MIN_SAMPLES - 1 {
+                        10_000_000
+                    } else {
+                        1_000_000
+                    },
                     MonotonicTimestampNs::new(base_ns),
                 );
+                journal.record_fixed_submission_budget(500_000);
                 journal.record_frame_service_observation(service_observation(
                     base_ns,
-                    base_ns + paired_service_ns,
+                    base_ns + exact_render_ready_ns,
                     base_ns + 500_000,
                     base_ns + 1_000_000,
                 ));
@@ -1179,140 +1338,201 @@ mod tests {
             journal
         }
 
-        let low_paired =
-            journal_with_paired_service(2_000_000).prediction(Duration::from_millis(10));
-        let high_paired =
-            journal_with_paired_service(8_000_000).prediction(Duration::from_millis(10));
+        let low_parallel =
+            journal_with_exact_render_ready(2_000_000).prediction(Duration::from_millis(10));
+        let high_parallel =
+            journal_with_exact_render_ready(8_000_000).prediction(Duration::from_millis(10));
 
         assert_eq!(
-            low_paired.estimator_mode,
-            PredictionEstimatorMode::WarmPaired
+            low_parallel.estimator_mode,
+            PredictionEstimatorMode::WarmParallel
         );
         assert_eq!(
-            high_paired.estimator_mode,
-            PredictionEstimatorMode::WarmPaired
+            high_parallel.estimator_mode,
+            PredictionEstimatorMode::WarmParallel
         );
         assert_eq!(
-            low_paired.render_risk_ns, high_paired.render_risk_ns,
+            low_parallel.render_risk_ns, high_parallel.render_risk_ns,
             "independent render risk remains shared diagnostic state"
         );
         assert!(
-            high_paired.upper_render_deviation_ns >= 8_000_000,
+            high_parallel.upper_render_deviation_ns >= 8_000_000,
             "the regression must include a large independent render tail"
         );
-        assert!(low_paired.render_risk_ns >= 10_000_000);
+        assert!(low_parallel.render_risk_ns >= 10_000_000);
         assert!(
-            low_paired.total_cost_ns < high_paired.total_cost_ns,
-            "WarmPaired must select paired service cost instead of sticky independent risk"
+            low_parallel.total_cost_ns < high_parallel.total_cost_ns,
+            "WarmParallel must select exact branches instead of sticky independent risk"
         );
     }
 
     #[test]
-    fn paired_critical_path_includes_same_frame_worker_delay_but_not_unrelated_tails() {
+    fn exact_parallel_branch_histories_use_queue_and_gpu_risks() {
         let mut journal = AdaptiveRenderJournal::default();
-        for sample in 0..20 {
-            journal.record_render_sample(1_000_000, MonotonicTimestampNs::new(sample + 1));
+        for sample in 0..WARM_PARALLEL_MIN_SAMPLES {
+            let base_ns = 10_000_000 + sample as u64 * 10_000_000;
+            journal.record_render_sample(1_000_000, MonotonicTimestampNs::new(base_ns));
             journal.record_wake_lateness(4_000_000);
+            journal.record_fixed_submission_budget(2_000_000);
             journal.record_worker_service(3_000_000, 2_000_000);
             journal.record_frame_service_observation(service_observation(
-                10_000_000 + sample * 10_000_000,
-                14_000_000 + sample * 10_000_000,
-                20_000_000 + sample * 10_000_000,
-                23_000_000 + sample * 10_000_000,
+                base_ns,
+                base_ns + 4_000_000,
+                base_ns + 10_000_000,
+                base_ns + 13_000_000,
             ));
         }
 
         let prediction = journal.prediction(Duration::from_millis(10));
-        assert_eq!(prediction.paired_service_p95_ns, 13_000_000);
-        assert_eq!(prediction.paired_service_samples, 20);
+        assert_eq!(prediction.exact_render_ready_risk_ns, 4_000_000);
+        assert_eq!(prediction.exact_queue_ready_risk_ns, 10_000_000);
+        assert_eq!(prediction.parallel_service_ns, 12_000_000);
+        assert_eq!(prediction.parallel_samples, WARM_PARALLEL_MIN_SAMPLES);
         assert_eq!(
             prediction.estimator_mode,
-            PredictionEstimatorMode::WarmPaired
+            PredictionEstimatorMode::WarmParallel
         );
-        assert_eq!(prediction.worker_non_ioctl_lead_ns, 2_050_000);
-        assert_eq!(prediction.independent_total_cost_ns, 5_050_000);
         assert_eq!(
-            prediction.warm_paired_total_cost_ns,
-            prediction
-                .paired_service_p95_ns
-                .saturating_add(prediction.main_event_loop_wake_guard_ns)
-                .saturating_add(prediction.kms_apply_guard_ns),
-            "same-frame critical path already includes queue and submit delay"
+            prediction.warm_parallel_total_cost_ns,
+            prediction.main_event_loop_wake_guard_ns + 12_000_000,
+            "parallel branch maximum is counted once, followed by main and apply guards"
         );
-        assert_eq!(prediction.warm_paired_total_cost_ns, 15_000_000);
-        assert_eq!(prediction.independent_p90_floor_ns, 5_050_000);
-        assert_eq!(prediction.total_cost_ns, 15_000_000);
+        assert_eq!(
+            prediction.total_cost_ns,
+            prediction.warm_parallel_total_cost_ns
+        );
     }
 
     #[test]
-    fn warm_estimator_does_not_add_worker_residual_to_absolute_critical_path() {
-        for (kms_budget_ns, ioctl_ns, expected_residual_ns) in [
-            (700_000, 400_000, 300_000),
-            (400_000, 400_000, 0),
-            (300_000, 400_000, 0),
-        ] {
-            let mut journal = AdaptiveRenderJournal::default();
-            record_uniform_prediction_inputs(
-                &mut journal,
-                1_000_000,
-                6_000_000,
-                1_000_000,
-                0,
-                ioctl_ns,
-                kms_budget_ns,
-            );
-            let prediction = journal.prediction_with_kms_guard(Duration::from_millis(10), 100_000);
-            let expected_warm_ns = 8_000_000 + 1_000_000 / 2 + 100_000;
-            let expected_floor_ns = 1_000_000 + 1_000_000 / 2 + kms_budget_ns + 100_000;
+    fn parallel_formula_uses_max_and_counts_each_guard_once() {
+        assert_eq!(
+            warm_parallel_total_cost_ns(200_000, 300_000, 5_000_000, 1_000_000, 500_000),
+            5_500_000,
+            "GPU branch dominates without serially adding KMS dispatch"
+        );
+        assert_eq!(
+            warm_parallel_total_cost_ns(200_000, 300_000, 2_000_000, 4_000_000, 1_000_000),
+            5_500_000,
+            "queue-ready plus active KMS service dominates"
+        );
+    }
 
-            assert_eq!(prediction.worker_non_ioctl_lead_ns, expected_residual_ns);
-            assert_eq!(prediction.warm_paired_total_cost_ns, expected_warm_ns);
-            assert_eq!(prediction.independent_p90_floor_ns, expected_floor_ns);
-            assert_eq!(
-                prediction.total_cost_ns,
-                expected_warm_ns.max(expected_floor_ns)
-            );
+    #[test]
+    fn exact_parallel_branch_risk_attacks_fast_decays_slowly_and_recovers() {
+        let mut journal = AdaptiveRenderJournal::default();
+        for sample in 0..WARM_PARALLEL_MIN_SAMPLES {
+            let composite_ns = 100_000_000 + sample as u64 * 6_000_000;
+            journal.record_frame_service_observation(service_observation(
+                composite_ns,
+                composite_ns + 1_000_000,
+                composite_ns + 500_000,
+                composite_ns + 2_000_000,
+            ));
         }
+        let stable_risk = journal
+            .prediction(Duration::from_millis(10))
+            .exact_render_ready_risk_ns;
+        let stable_queue_risk = journal
+            .prediction(Duration::from_millis(10))
+            .exact_queue_ready_risk_ns;
+        assert_eq!(stable_risk, 1_000_000);
+        assert_eq!(stable_queue_risk, 500_000);
+
+        let spike_at = 100_000_000 + WARM_PARALLEL_MIN_SAMPLES as u64 * 6_000_000;
+        journal.record_frame_service_observation(service_observation(
+            spike_at,
+            spike_at + 8_000_000,
+            spike_at + 6_000_000,
+            spike_at + 9_000_000,
+        ));
+        let spike_risk = journal
+            .prediction(Duration::from_millis(10))
+            .exact_render_ready_risk_ns;
+        let queue_spike_risk = journal
+            .prediction(Duration::from_millis(10))
+            .exact_queue_ready_risk_ns;
+        assert!(
+            spike_risk > stable_risk * 2,
+            "a slow exact sample attacks risk immediately"
+        );
+        assert!(queue_spike_risk > stable_queue_risk * 2);
+
+        for sample in 1..=5 {
+            let composite_ns = spike_at + sample * 6_000_000;
+            journal.record_frame_service_observation(service_observation(
+                composite_ns,
+                composite_ns + 1_000_000,
+                composite_ns + 500_000,
+                composite_ns + 2_000_000,
+            ));
+        }
+        let short_recovery_risk = journal
+            .prediction(Duration::from_millis(10))
+            .exact_render_ready_risk_ns;
+        let short_queue_recovery_risk = journal
+            .prediction(Duration::from_millis(10))
+            .exact_queue_ready_risk_ns;
+        assert!(
+            short_recovery_risk > stable_risk * 2,
+            "a few fast samples must not erase learned positive tail risk"
+        );
+        assert!(short_queue_recovery_risk > stable_queue_risk * 2);
+
+        let mut composite_ns = spike_at + 6 * 6_000_000;
+        for _ in 0..100 {
+            composite_ns += 600_000_000;
+            journal.record_frame_service_observation(service_observation(
+                composite_ns,
+                composite_ns + 1_000_000,
+                composite_ns + 500_000,
+                composite_ns + 2_000_000,
+            ));
+        }
+        let recovered_risk = journal
+            .prediction(Duration::from_millis(10))
+            .exact_render_ready_risk_ns;
+        let recovered_queue_risk = journal
+            .prediction(Duration::from_millis(10))
+            .exact_queue_ready_risk_ns;
+        assert!(recovered_risk < spike_risk);
+        assert!(recovered_risk <= 1_100_000);
+        assert!(recovered_queue_risk < queue_spike_risk);
+        assert!(recovered_queue_risk <= 550_000);
     }
 
     #[test]
-    fn warm_paired_service_counts_submit_ioctl_exactly_once() {
+    fn warm_parallel_counts_kms_dispatch_exactly_once_on_queue_branch() {
         let mut journal = AdaptiveRenderJournal::default();
         record_uniform_prediction_inputs(
             &mut journal,
             1_000_000,
-            3_000_000,
-            500_000,
+            2_000_000,
+            4_000_000,
             250_000,
             500_000,
-            1_200_000,
+            1_000_000,
         );
 
         let prediction = journal.prediction_with_kms_guard(Duration::from_millis(10), 100_000);
 
-        assert_eq!(prediction.paired_service_p95_ns, 4_500_000);
         assert_eq!(prediction.p95_atomic_ioctl_ns, 500_000);
-        assert_eq!(prediction.kms_dispatch_budget_ns, 1_200_000);
-        assert_eq!(prediction.worker_non_ioctl_lead_ns, 700_000);
+        assert_eq!(prediction.kms_dispatch_budget_ns, 1_000_000);
+        assert_eq!(prediction.exact_render_ready_risk_ns, 2_000_000);
+        assert_eq!(prediction.exact_queue_ready_risk_ns, 4_000_000);
+        assert_eq!(prediction.parallel_service_ns, 5_000_000);
         assert_eq!(
-            prediction.warm_paired_total_cost_ns,
-            prediction
-                .paired_service_p95_ns
-                .saturating_add(prediction.main_event_loop_wake_guard_ns)
-                .saturating_add(prediction.kms_apply_guard_ns),
-            "absolute same-frame submit completion already includes worker and ioctl delay"
+            prediction.total_cost_ns,
+            prediction.main_event_loop_wake_guard_ns + 100_000 + 5_000_000
         );
-        assert_eq!(prediction.warm_paired_total_cost_ns, 5_100_000);
-        assert_eq!(prediction.total_cost_ns, 5_100_000);
     }
 
     #[test]
-    fn warm_estimator_never_undercuts_independent_p90_floor() {
+    fn warm_parallel_does_not_apply_independent_floor_after_selection() {
         let mut journal = AdaptiveRenderJournal::default();
         record_uniform_prediction_inputs(
             &mut journal,
             10_000_000,
-            500_000,
+            100_000,
             100_000,
             0,
             100_000,
@@ -1321,16 +1541,20 @@ mod tests {
 
         let prediction = journal.prediction_with_kms_guard(Duration::from_millis(20), 100_000);
 
-        assert_eq!(prediction.warm_paired_total_cost_ns, 2_200_000);
+        assert_eq!(prediction.warm_parallel_total_cost_ns, 1_200_000);
         assert_eq!(prediction.independent_p90_floor_ns, 11_100_000);
-        assert_eq!(prediction.total_cost_ns, 11_100_000);
+        assert_eq!(
+            prediction.total_cost_ns,
+            prediction.warm_parallel_total_cost_ns
+        );
     }
 
     #[test]
     fn fewer_than_warm_samples_keep_cold_independent_selection() {
         let mut journal = AdaptiveRenderJournal::default();
-        for sample in 0..WARM_PAIRED_MIN_SAMPLES - 1 {
+        for sample in 0..WARM_PARALLEL_MIN_SAMPLES - 1 {
             let base_ns = 100_000_000 + sample as u64 * 10_000_000;
+            journal.record_fixed_submission_budget(500_000);
             journal.record_frame_service_observation(service_observation(
                 base_ns,
                 base_ns + 8_000_000,
@@ -1338,6 +1562,7 @@ mod tests {
                 base_ns + 10_000_000,
             ));
         }
+        journal.record_fixed_submission_budget(500_000);
 
         let prediction = journal.prediction(Duration::from_millis(10));
 
@@ -1349,15 +1574,62 @@ mod tests {
             prediction.total_cost_ns,
             prediction.independent_total_cost_ns
         );
+
+        journal.record_frame_service_observation(service_observation(
+            300_000_000,
+            308_000_000,
+            309_000_000,
+            310_000_000,
+        ));
+        assert_eq!(
+            journal.prediction_estimator_mode(),
+            PredictionEstimatorMode::WarmParallel
+        );
+    }
+
+    #[test]
+    fn warm_parallel_requires_twenty_valid_kms_budget_samples() {
+        let mut journal = AdaptiveRenderJournal::default();
+        for sample in 0..WARM_PARALLEL_MIN_SAMPLES {
+            let base_ns = 100_000_000 + sample as u64 * 10_000_000;
+            if sample + 1 < WARM_PARALLEL_MIN_SAMPLES {
+                journal.record_fixed_submission_budget(500_000);
+            }
+            journal.record_frame_service_observation(service_observation(
+                base_ns,
+                base_ns + 2_000_000,
+                base_ns + 1_000_000,
+                base_ns + 3_000_000,
+            ));
+        }
+        assert_eq!(journal.exact_parallel.samples(), WARM_PARALLEL_MIN_SAMPLES);
+        assert_eq!(
+            journal.prediction_estimator_mode(),
+            PredictionEstimatorMode::ColdStart
+        );
+
+        journal.record_fixed_submission_budget(500_000);
+        assert_eq!(
+            journal.prediction_estimator_mode(),
+            PredictionEstimatorMode::WarmParallel
+        );
     }
 
     #[test]
     fn miss_recovery_requires_clean_exact_horizon_and_resets_on_miss() {
         let mut journal = AdaptiveRenderJournal::default();
-        record_uniform_prediction_inputs(&mut journal, 1_000_000, 1_000_000, 1_000_000, 0, 0, 0);
+        record_uniform_prediction_inputs(
+            &mut journal,
+            1_000_000,
+            1_000_000,
+            1_000_000,
+            0,
+            0,
+            500_000,
+        );
         assert_eq!(
             journal.prediction_estimator_mode(),
-            PredictionEstimatorMode::WarmPaired
+            PredictionEstimatorMode::WarmParallel
         );
 
         journal.note_proven_deadline_miss(EstimatorRecoveryDisposition::ResetIndependentHorizon);
@@ -1365,7 +1637,7 @@ mod tests {
         assert_eq!(journal.missed_deadlines, 1);
         assert_eq!(
             recovering.miss_recovery_remaining,
-            MISS_RECOVERY_PAIRED_SUCCESSES
+            MISS_RECOVERY_EXACT_SUCCESSES
         );
         assert_eq!(
             recovering.estimator_mode,
@@ -1376,7 +1648,7 @@ mod tests {
             recovering.independent_total_cost_ns
         );
 
-        for sample in 0..MISS_RECOVERY_PAIRED_SUCCESSES - 1 {
+        for sample in 0..MISS_RECOVERY_EXACT_SUCCESSES - 1 {
             let offset_ns = sample as u64 * 10_000;
             journal.record_frame_service_observation(service_observation(
                 1_000_000 + offset_ns,
@@ -1403,7 +1675,7 @@ mod tests {
         ));
         journal.record_frame_service_observation(approximate);
         let mut incomplete = service_observation(3_000_000, 3_001_000, 3_002_000, 3_003_000);
-        incomplete.submit_returned_at = None;
+        incomplete.worker_queued_at = None;
         journal.record_frame_service_observation(incomplete);
         assert_eq!(
             journal
@@ -1417,11 +1689,11 @@ mod tests {
         ));
         assert_eq!(
             journal.prediction_estimator_mode(),
-            PredictionEstimatorMode::WarmPaired
+            PredictionEstimatorMode::WarmParallel
         );
 
         journal.note_proven_deadline_miss(EstimatorRecoveryDisposition::ResetIndependentHorizon);
-        for sample in 0..MISS_RECOVERY_PAIRED_SUCCESSES / 2 {
+        for sample in 0..MISS_RECOVERY_EXACT_SUCCESSES / 2 {
             let offset_ns = sample as u64 * 10_000;
             journal.record_frame_service_observation(service_observation(
                 5_000_000 + offset_ns,
@@ -1434,16 +1706,16 @@ mod tests {
             journal
                 .prediction(Duration::from_millis(10))
                 .miss_recovery_remaining,
-            MISS_RECOVERY_PAIRED_SUCCESSES / 2
+            MISS_RECOVERY_EXACT_SUCCESSES / 2
         );
         journal.note_proven_deadline_miss(EstimatorRecoveryDisposition::ResetIndependentHorizon);
         assert_eq!(
             journal
                 .prediction(Duration::from_millis(10))
                 .miss_recovery_remaining,
-            MISS_RECOVERY_PAIRED_SUCCESSES
+            MISS_RECOVERY_EXACT_SUCCESSES
         );
-        for sample in 0..MISS_RECOVERY_PAIRED_SUCCESSES - 1 {
+        for sample in 0..MISS_RECOVERY_EXACT_SUCCESSES - 1 {
             let offset_ns = sample as u64 * 10_000;
             journal.record_frame_service_observation(service_observation(
                 6_000_000 + offset_ns,
@@ -1461,24 +1733,32 @@ mod tests {
         ));
         assert_eq!(
             journal.prediction_estimator_mode(),
-            PredictionEstimatorMode::WarmPaired
+            PredictionEstimatorMode::WarmParallel
         );
     }
 
     #[test]
     fn cause_specific_recovery_preserves_warm_state_and_active_recovery() {
         let mut journal = AdaptiveRenderJournal::default();
-        record_uniform_prediction_inputs(&mut journal, 1_000_000, 1_000_000, 1_000_000, 0, 0, 0);
+        record_uniform_prediction_inputs(
+            &mut journal,
+            1_000_000,
+            1_000_000,
+            1_000_000,
+            0,
+            0,
+            500_000,
+        );
         assert_eq!(
             journal.prediction_estimator_mode(),
-            PredictionEstimatorMode::WarmPaired
+            PredictionEstimatorMode::WarmParallel
         );
 
         journal.note_proven_deadline_miss(EstimatorRecoveryDisposition::PreserveEstimatorState);
         assert_eq!(journal.missed_deadlines, 1);
         assert_eq!(
             journal.prediction_estimator_mode(),
-            PredictionEstimatorMode::WarmPaired
+            PredictionEstimatorMode::WarmParallel
         );
         assert_eq!(
             journal
@@ -1831,13 +2111,39 @@ mod tests {
     }
 
     #[test]
-    fn queue_residency_is_observable_but_never_part_of_predicted_cost() {
+    fn queue_residency_is_observable_but_never_part_of_warm_prediction() {
         let mut journal = AdaptiveRenderJournal::default();
-        journal.record_worker_queue_residency(500_000_000);
+        record_uniform_prediction_inputs(
+            &mut journal,
+            1_000_000,
+            3_000_000,
+            1_000_000,
+            0,
+            250_000,
+            500_000,
+        );
         let baseline = journal.prediction(Duration::from_millis(10));
+        journal.record_worker_queue_residency(u64::MAX);
+        let delayed_queue = journal.prediction(Duration::from_millis(10));
 
-        assert_eq!(baseline.p95_worker_queue_residency_ns, 500_000_000);
-        assert!(baseline.total_cost_ns < 10_000_000);
+        assert_eq!(
+            baseline.estimator_mode,
+            PredictionEstimatorMode::WarmParallel
+        );
+        assert_eq!(delayed_queue.p95_worker_queue_residency_ns, u64::MAX);
+        assert_eq!(
+            baseline.exact_render_ready_risk_ns,
+            delayed_queue.exact_render_ready_risk_ns
+        );
+        assert_eq!(
+            baseline.exact_queue_ready_risk_ns,
+            delayed_queue.exact_queue_ready_risk_ns
+        );
+        assert_eq!(
+            baseline.kms_dispatch_budget_ns,
+            delayed_queue.kms_dispatch_budget_ns
+        );
+        assert_eq!(baseline.total_cost_ns, delayed_queue.total_cost_ns);
     }
 
     #[test]

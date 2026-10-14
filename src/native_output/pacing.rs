@@ -1479,11 +1479,13 @@ mod tests {
         let summary = pacing.content_summary_line();
         for field in [
             "prediction_independent_total_cost_ns=5350000",
-            "prediction_warm_paired_total_cost_ns=1100000",
+            "prediction_warm_parallel_total_cost_ns=1350000",
             "prediction_independent_p90_floor_ns=1350000",
             "prediction_worker_non_ioctl_lead_ns=250000",
-            "prediction_exact_critical_path_p95_ns=0",
-            "prediction_exact_critical_path_samples=0",
+            "prediction_exact_render_ready_risk_ns=0",
+            "prediction_exact_queue_ready_risk_ns=0",
+            "prediction_parallel_service_ns=250000",
+            "prediction_parallel_samples=0",
             "prediction_cold_wake_guard=false",
             "prediction_miss_recovery_remaining=0",
             "prediction_estimator_mode=cold_start",
@@ -5255,8 +5257,8 @@ impl NativeFramePacing {
                     prediction.map_or(0, |value| value.independent_total_cost_ns),
                 ),
                 PacingField::u64(
-                    "prediction_warm_paired_total_cost_ns",
-                    prediction.map_or(0, |value| value.warm_paired_total_cost_ns),
+                    "prediction_warm_parallel_total_cost_ns",
+                    prediction.map_or(0, |value| value.warm_parallel_total_cost_ns),
                 ),
                 PacingField::u64(
                     "prediction_independent_p90_floor_ns",
@@ -5299,20 +5301,20 @@ impl NativeFramePacing {
                     prediction.map_or(0, |value| value.p95_target_slip_ns),
                 ),
                 PacingField::u64(
-                    "prediction_paired_service_p95_ns",
-                    prediction.map_or(0, |value| value.paired_service_p95_ns),
+                    "prediction_exact_render_ready_risk_ns",
+                    prediction.map_or(0, |value| value.exact_render_ready_risk_ns),
                 ),
                 PacingField::u64(
-                    "prediction_paired_service_samples",
-                    prediction.map_or(0, |value| value.paired_service_samples as u64),
+                    "prediction_exact_queue_ready_risk_ns",
+                    prediction.map_or(0, |value| value.exact_queue_ready_risk_ns),
                 ),
                 PacingField::u64(
-                    "prediction_exact_critical_path_p95_ns",
-                    prediction.map_or(0, |value| value.paired_service_p95_ns),
+                    "prediction_parallel_service_ns",
+                    prediction.map_or(0, |value| value.parallel_service_ns),
                 ),
                 PacingField::u64(
-                    "prediction_exact_critical_path_samples",
-                    prediction.map_or(0, |value| value.paired_service_samples as u64),
+                    "prediction_parallel_samples",
+                    prediction.map_or(0, |value| value.parallel_samples as u64),
                 ),
                 PacingField::str(
                     "prediction_estimator_mode",

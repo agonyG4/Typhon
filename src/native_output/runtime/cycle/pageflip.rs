@@ -3087,9 +3087,8 @@ impl NativeRuntime {
                         frame_id: frame.frame_id,
                         target: target,
                         composite_started_at: frame.composite_started_at,
+                        worker_queued_at: frame.worker_queued_at,
                         fence_signaled_at: frame.fence_signal,
-                        submit_started_at: Some(frame.submit_started_at),
-                        submit_returned_at: Some(frame.submit_returned_at),
                     });
                     let recovery_remaining_before = render_journal
                         .prediction(target.refresh_interval)
