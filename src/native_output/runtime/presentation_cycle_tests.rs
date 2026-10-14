@@ -57,6 +57,11 @@ fn direct_primary_in_flight_suppresses_render_and_render_ahead_until_pageflip() 
             assert!(frame_scheduler.visual_work_queued());
         }
 
+        if phase == DirectPrimaryPendingPhase::WorkerQueued {
+            arbiter
+                .mark_kernel_submitted(token, 11, 12)
+                .expect("queued DirectPrimary reaches the kernel before its pageflip");
+        }
         assert!(matches!(
             arbiter.complete(token, 1, 8),
             AtomicCommitCompletion::Completed { kind: completed, .. } if completed == kind
