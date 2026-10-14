@@ -18,7 +18,8 @@ use super::presentation_cursor::*;
 use super::presentation_direct::{
     CompositedPrimaryAdmission, DirectPresentationInputs, composited_primary_admission,
     inspect_direct_presentation, interactive_visual_render_admission_allowed,
-    log_prepared_primary_arbitration, suppress_direct_render_ahead,
+    log_prepared_primary_arbitration, suppress_composited_render_while_direct_pending,
+    suppress_direct_render_ahead,
 };
 use super::presentation_metrics::{
     PipelineSchedulingDiagnostics, build_render_begin_fields, finish_no_primary_work,
@@ -1010,6 +1011,30 @@ impl NativeRuntime {
             scheduler_decision = SchedulerDecision::Idle;
         }
         suppress_direct_render_ahead(presentation_path, &mut scheduler_decision, scanout, perf);
+        if let Some((direct_phase, suppressed_decision)) =
+            suppress_composited_render_while_direct_pending(
+                atomic_commit_arbiter,
+                &mut scheduler_decision,
+                queued_redraw_requested,
+            )
+        {
+            scanout.note_direct_composited_render_ahead_suppressed();
+            let decision_name = match suppressed_decision {
+                SchedulerDecision::Render => "render",
+                SchedulerDecision::RenderAhead => "render_ahead",
+                _ => unreachable!("only render decisions are suppressed here"),
+            };
+            perf.log("direct_scanout", || {
+                vec![
+                    NativePerfField::str(
+                        "event",
+                        "suppressed_composited_render_while_direct_pending",
+                    ),
+                    NativePerfField::str("direct_phase", direct_phase.as_str()),
+                    NativePerfField::str("decision", decision_name),
+                ]
+            });
+        }
         if presentation_path == NativePresentationPath::PlaneDelta
             && let Some(cursor) = atomic_cursor.as_mut()
             && (!atomic_commit_arbiter.atomic_commit_pending() || can_queue_worker_cursor)

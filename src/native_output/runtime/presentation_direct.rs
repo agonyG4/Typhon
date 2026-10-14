@@ -5,6 +5,58 @@ use super::planner::NativePresentationPath;
 use super::*;
 use oblivion_one::native::kms::KmsBackendKind;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DirectPrimaryPendingPhase {
+    WorkerQueued,
+    KernelSubmitted,
+}
+
+impl DirectPrimaryPendingPhase {
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::WorkerQueued => "worker_queued",
+            Self::KernelSubmitted => "kernel_submitted",
+        }
+    }
+}
+
+pub(super) fn direct_primary_in_flight_phase(
+    arbiter: &AtomicCommitArbiter,
+) -> Option<DirectPrimaryPendingPhase> {
+    if matches!(
+        arbiter.worker_queued_kind(),
+        Some(AtomicCommitKind::DirectPrimary { .. })
+    ) {
+        Some(DirectPrimaryPendingPhase::WorkerQueued)
+    } else if matches!(
+        arbiter.kernel_submitted_kind(),
+        Some(AtomicCommitKind::DirectPrimary { .. })
+    ) {
+        Some(DirectPrimaryPendingPhase::KernelSubmitted)
+    } else {
+        None
+    }
+}
+
+pub(super) fn suppress_composited_render_while_direct_pending(
+    arbiter: &AtomicCommitArbiter,
+    scheduler_decision: &mut SchedulerDecision,
+    queued_redraw_requested: &mut bool,
+) -> Option<(DirectPrimaryPendingPhase, SchedulerDecision)> {
+    let phase = direct_primary_in_flight_phase(arbiter)?;
+    if !matches!(
+        *scheduler_decision,
+        SchedulerDecision::Render | SchedulerDecision::RenderAhead
+    ) {
+        return None;
+    }
+
+    let suppressed_decision = *scheduler_decision;
+    *scheduler_decision = SchedulerDecision::WaitForPageFlip;
+    *queued_redraw_requested = true;
+    Some((phase, suppressed_decision))
+}
+
 fn should_inspect_direct_scanout(
     preference: NativeDirectScanoutPreference,
     direct_active: bool,

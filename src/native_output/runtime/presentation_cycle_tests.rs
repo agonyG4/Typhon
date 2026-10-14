@@ -2,6 +2,10 @@ use super::presentation_cycle::complete_compatibility_no_visual_change;
 use super::presentation_cycle::cursor_work_requires_primary_repaint;
 use super::presentation_cycle::primary_render_admission_blocked;
 use super::presentation_cycle::render_worker_received_visual_demand;
+use super::presentation_direct::{
+    DirectPrimaryPendingPhase, direct_primary_in_flight_phase,
+    suppress_composited_render_while_direct_pending,
+};
 use super::*;
 use crate::native_output::runtime::commit_timing::logical_scene_changed;
 use crate::native_output::scanout::{NativePaintOutcome, NativePaintStats, NativeScanoutKind};
@@ -9,6 +13,69 @@ use oblivion_one::compositor::{DesktopFrameCopyKind, DesktopSceneRebuildKind};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_COMPATIBILITY_SKIP_SOCKET: AtomicU64 = AtomicU64::new(0);
+
+#[test]
+fn direct_primary_in_flight_suppresses_render_and_render_ahead_until_pageflip() {
+    let transaction_id =
+        OutputTransactionId::new(std::num::NonZeroU64::new(500).expect("non-zero transaction ID"));
+    let token = oblivion_one::native::kms::PageFlipToken::new(500).expect("non-zero token");
+    let kind = AtomicCommitKind::DirectPrimary {
+        transaction_id,
+        direct_token: token,
+        framebuffer_id: 42,
+    };
+
+    for phase in [
+        DirectPrimaryPendingPhase::WorkerQueued,
+        DirectPrimaryPendingPhase::KernelSubmitted,
+    ] {
+        let mut arbiter = AtomicCommitArbiter::new();
+        match phase {
+            DirectPrimaryPendingPhase::WorkerQueued => arbiter
+                .reserve_worker_queued(token, 1, 8, kind, 10)
+                .expect("queue DirectPrimary in the Atomic worker"),
+            DirectPrimaryPendingPhase::KernelSubmitted => arbiter
+                .reserve(token, 1, 8, kind, 10)
+                .expect("submit DirectPrimary to the kernel"),
+        }
+        assert_eq!(direct_primary_in_flight_phase(&arbiter), Some(phase));
+
+        let mut frame_scheduler = NativeFrameScheduler::new(60, 0);
+        frame_scheduler.queue_visual_work();
+        for original_decision in [SchedulerDecision::Render, SchedulerDecision::RenderAhead] {
+            let mut decision = original_decision;
+            let mut queued_redraw_requested = false;
+            let suppressed = suppress_composited_render_while_direct_pending(
+                &arbiter,
+                &mut decision,
+                &mut queued_redraw_requested,
+            );
+
+            assert_eq!(suppressed, Some((phase, original_decision)));
+            assert_eq!(decision, SchedulerDecision::WaitForPageFlip);
+            assert!(queued_redraw_requested);
+            assert!(frame_scheduler.visual_work_queued());
+        }
+
+        assert!(matches!(
+            arbiter.complete(token, 1, 8),
+            AtomicCommitCompletion::Completed { kind: completed, .. } if completed == kind
+        ));
+        assert_eq!(direct_primary_in_flight_phase(&arbiter), None);
+        let mut fresh_decision = SchedulerDecision::Render;
+        let mut queued_redraw_requested = true;
+        assert_eq!(
+            suppress_composited_render_while_direct_pending(
+                &arbiter,
+                &mut fresh_decision,
+                &mut queued_redraw_requested,
+            ),
+            None
+        );
+        assert_eq!(fresh_decision, SchedulerDecision::Render);
+        assert!(frame_scheduler.visual_work_queued());
+    }
+}
 
 #[test]
 fn render_worker_admission_gate_only_blocks_new_primary_render_work() {
