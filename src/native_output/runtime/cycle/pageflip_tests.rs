@@ -2023,7 +2023,11 @@ fn queue_fixture_ready_as_worker(
     )
 }
 
-fn append_ready_successor(fixture: &mut VariableRetryFixture) -> OutputFrameIdentitySnapshot {
+fn append_ready_successor(
+    fixture: &mut VariableRetryFixture,
+    opportunity_sequence: u64,
+    anchor_ns: u64,
+) -> OutputFrameIdentitySnapshot {
     use crate::native_output::NativeCursorDamageBounds;
     use crate::native_output::presentation::kms_timing::KmsPresentationTiming;
     use crate::native_output::presentation::plane::{
@@ -2051,10 +2055,14 @@ fn append_ready_successor(fixture: &mut VariableRetryFixture) -> OutputFrameIden
             None,
         )
         .unwrap();
-    let anchor = MonotonicTimestampNs::new(2_000_000_000);
+    let anchor = MonotonicTimestampNs::new(anchor_ns);
     let earliest = MonotonicTimestampNs::new(anchor.get() + 6_060_606);
-    let reservation =
-        variable_reservation(PresentationOpportunityId::new(2, 1), anchor, earliest, None);
+    let reservation = variable_reservation(
+        PresentationOpportunityId::new(1, opportunity_sequence),
+        anchor,
+        earliest,
+        None,
+    );
     fixture
         .swapchain
         .set_ready_variable_presentation_for_test(
@@ -2134,6 +2142,8 @@ fn direct_entry_retires_worker_and_ready_successors_before_invalidating_scene_ba
     use crate::native_output::presentation::ledger::{
         OutputTransactionDropReason, OutputTransactionState, OutputTransactionTerminal,
     };
+    use oblivion_one::native::presentation_deadline::MonotonicTimestampNs;
+
     let mut mismatch = variable_retry_fixture(VariableRetryPacingLane::Ready);
     assert!(
         mismatch
@@ -2180,7 +2190,7 @@ fn direct_entry_retires_worker_and_ready_successors_before_invalidating_scene_ba
         worker_token,
         crtc_id,
     );
-    let ready_owner = append_ready_successor(&mut fixture);
+    let ready_owner = append_ready_successor(&mut fixture, 2, 2_000_000_000);
     assert_eq!(
         fixture
             .swapchain
@@ -2305,4 +2315,104 @@ fn direct_entry_retires_worker_and_ready_successors_before_invalidating_scene_ba
     )
     .unwrap();
     assert!(fixture.frame_scheduler.visual_work_queued());
+
+    drop(
+        fixture
+            .swapchain
+            .take_suspended_frame()
+            .expect("retired worker frame remains releasable after its fence signals"),
+    );
+    drop(
+        fixture
+            .swapchain
+            .take_suspended_frame()
+            .expect("retired READY frame remains releasable after its fence signals"),
+    );
+    assert!(fixture.swapchain.take_suspended_frame().is_none());
+    fixture.swapchain.recover_suspended_slot(true).unwrap();
+
+    let fresh_owner = append_ready_successor(&mut fixture, 3, 3_000_000_000);
+    assert_eq!(fixture.scene_history.presented_frame_id(), None);
+    assert_eq!(fixture.swapchain.ready_identity(), Some(fresh_owner));
+    assert_eq!(
+        fixture.scene_history.ready_frame_identity(),
+        Some((fresh_owner.frame_id, fresh_owner.render_generation))
+    );
+    assert_eq!(
+        fixture.frame_pacing.unsubmitted_physical_identity(),
+        Some(fresh_owner)
+    );
+    assert!(fixture.frame_scheduler.ready_frame_queued());
+    assert!(
+        fixture
+            .output_transactions
+            .active_transaction_ids()
+            .contains(&fresh_owner.transaction_id)
+    );
+    validate_reconfiguration_frame_ownership_for_swapchain(
+        &fixture.swapchain,
+        output_epoch,
+        &fixture.scene_history,
+        &fixture.frame_pacing,
+        &fixture.frame_scheduler,
+        &fixture.output_transactions,
+    )
+    .unwrap();
+
+    let fresh_token = PageFlipToken::new(702).unwrap();
+    let submitted_at = MonotonicTimestampNs::new(9);
+    let _fresh_pacing_ticket = fixture
+        .frame_pacing
+        .reserve_worker_submission(true)
+        .expect("fresh READY frame reserves a worker submit")
+        .expect("pacing is enabled in the fixture");
+    fixture
+        .output_transactions
+        .mark_queued(fresh_owner.transaction_id, output_epoch.get(), submitted_at)
+        .unwrap();
+    fixture
+        .swapchain
+        .take_ready_for_worker(fresh_token, submitted_at)
+        .unwrap();
+    fixture
+        .scene_history
+        .queue_submission_or_error(fresh_token.get())
+        .unwrap();
+    fixture.frame_scheduler.consume_ready_frame();
+    let fresh_kind = AtomicCommitKind::CompositedPrimary {
+        transaction_id: fresh_owner.transaction_id,
+        frame_id: fresh_owner.frame_id,
+        framebuffer_id: fresh_owner.framebuffer_id.get(),
+    };
+    atomic_commit_arbiter
+        .reserve_worker_queued(
+            fresh_token,
+            output_epoch.get(),
+            crtc_id,
+            fresh_kind,
+            submitted_at.get(),
+        )
+        .unwrap();
+    assert_eq!(
+        fixture
+            .swapchain
+            .worker_queued_identity()
+            .map(|identity| identity.frame),
+        Some(fresh_owner)
+    );
+    assert_eq!(
+        fixture.scene_history.submitted_frame_id(fresh_token.get()),
+        Some(fresh_owner.frame_id)
+    );
+    assert!(matches!(
+        fixture
+            .output_transactions
+            .transaction(fresh_owner.transaction_id)
+            .unwrap()
+            .state(),
+        OutputTransactionState::Queued { .. }
+    ));
+    assert_eq!(atomic_commit_arbiter.worker_queued_kind(), Some(fresh_kind));
+    assert!(!fixture.frame_scheduler.ready_frame_queued());
+    assert_eq!(fixture.output_epoch, output_epoch);
 }
