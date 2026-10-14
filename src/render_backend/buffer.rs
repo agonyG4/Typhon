@@ -250,6 +250,19 @@ impl DmabufImageKey {
         }
     }
 
+    /// Return a packed logical payload estimate only for formats whose
+    /// compositor representation is known to be 32 bits per pixel.
+    pub fn logical_payload_bytes(&self) -> Option<u64> {
+        match DrmFormat::from_fourcc(self.format) {
+            DrmFormat::Argb8888 | DrmFormat::Xrgb8888 | DrmFormat::Xbgr8888 => {
+                u64::from(self.width)
+                    .checked_mul(u64::from(self.height))?
+                    .checked_mul(4)
+            }
+            DrmFormat::Other(_) => None,
+        }
+    }
+
     pub const fn buffer_id(&self) -> BufferId {
         self.buffer_id
     }
@@ -537,5 +550,33 @@ mod identity_tests {
         assert!(DrmFormat::Xbgr8888.is_opaque_rgb8888());
         assert!(!DrmFormat::Argb8888.is_opaque_rgb8888());
         assert!(!DrmFormat::Other(xbgr).is_opaque_rgb8888());
+    }
+
+    #[test]
+    fn dmabuf_logical_payload_bytes_only_counts_known_32_bit_formats() {
+        let key = |format| DmabufImageKey {
+            buffer_id: BufferId::for_tests(1),
+            width: 12,
+            height: 8,
+            format,
+            planes: Vec::new(),
+        };
+
+        assert_eq!(
+            key(DrmFormat::Argb8888.as_fourcc()).logical_payload_bytes(),
+            Some(12 * 8 * 4)
+        );
+        assert_eq!(
+            key(DrmFormat::Xrgb8888.as_fourcc()).logical_payload_bytes(),
+            Some(12 * 8 * 4)
+        );
+        assert_eq!(
+            key(DrmFormat::Xbgr8888.as_fourcc()).logical_payload_bytes(),
+            Some(12 * 8 * 4)
+        );
+        assert_eq!(
+            key(u32::from_le_bytes(*b"NV12")).logical_payload_bytes(),
+            None
+        );
     }
 }

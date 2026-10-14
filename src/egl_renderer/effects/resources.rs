@@ -311,6 +311,9 @@ impl std::fmt::Display for EffectResourceError {
 
 impl std::error::Error for EffectResourceError {}
 
+static NEXT_EFFECT_POOL_GENERATION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PooledEffectTexture {
     pub id: u64,
@@ -318,6 +321,17 @@ pub struct PooledEffectTexture {
     pub bytes: u64,
     last_used: u64,
     checked_out: bool,
+    purpose: EffectTexturePurpose,
+    identity: crate::gpu_residency::GpuResourceIdentity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum EffectTexturePurpose {
+    #[default]
+    Scratch,
+    Checkpoint,
+    LifecycleRetained,
+    Capture,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -453,6 +467,8 @@ pub struct EffectResourcePool {
     eviction_count: usize,
     allocation_count: usize,
     reuse_count: usize,
+    retirement_count: usize,
+    event_counters: crate::gpu_residency::GenerationEventCounters,
 }
 
 impl EffectResourcePool {
@@ -465,6 +481,9 @@ impl EffectResourcePool {
         if budget_bytes == 0 {
             return Err(EffectResourceError::InvalidBudget);
         }
+        let generation = NEXT_EFFECT_POOL_GENERATION
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .max(1);
         Ok(Self {
             textures: HashMap::new(),
             current_bytes: 0,
@@ -476,6 +495,8 @@ impl EffectResourcePool {
             eviction_count: 0,
             allocation_count: 0,
             reuse_count: 0,
+            retirement_count: 0,
+            event_counters: crate::gpu_residency::GenerationEventCounters::new(generation),
         })
     }
 
@@ -492,6 +513,7 @@ impl EffectResourcePool {
         {
             texture.checked_out = true;
             texture.last_used = self.clock;
+            texture.purpose = EffectTexturePurpose::Scratch;
             self.reuse_count = self.reuse_count.saturating_add(1);
             return Ok(texture.clone());
         }
@@ -519,11 +541,17 @@ impl EffectResourcePool {
             bytes,
             last_used: self.clock,
             checked_out: true,
+            purpose: EffectTexturePurpose::Scratch,
+            identity: crate::gpu_residency::GpuResourceIdentity::new(
+                self.event_counters.generation(),
+                id,
+            ),
         };
         self.textures.entry(key).or_default().push(texture.clone());
         self.current_bytes = new_current;
         self.peak_bytes = self.peak_bytes.max(new_current);
         self.allocation_count = self.allocation_count.saturating_add(1);
+        self.event_counters.record_allocation(texture.identity);
         Ok(texture)
     }
 
@@ -531,6 +559,12 @@ impl EffectResourcePool {
         &mut self,
         texture: PooledEffectTexture,
     ) -> Result<(), EffectResourceError> {
+        if texture.identity.generation() != self.event_counters.generation()
+            || texture.identity.local_id() != texture.id
+        {
+            self.event_counters.record_retirement(texture.identity);
+            return Err(EffectResourceError::UnknownTexture(texture.id));
+        }
         let Some(cached) = self
             .textures
             .get_mut(&texture.key)
@@ -543,7 +577,23 @@ impl EffectResourcePool {
         }
         cached.checked_out = false;
         cached.last_used = self.clock;
+        cached.purpose = EffectTexturePurpose::Scratch;
         Ok(())
+    }
+
+    fn set_purpose(&mut self, texture: &PooledEffectTexture, purpose: EffectTexturePurpose) {
+        if texture.identity.generation() != self.event_counters.generation()
+            || texture.identity.local_id() != texture.id
+        {
+            return;
+        }
+        if let Some(cached) = self
+            .textures
+            .get_mut(&texture.key)
+            .and_then(|textures| textures.iter_mut().find(|cached| cached.id == texture.id))
+        {
+            cached.purpose = purpose;
+        }
     }
 
     #[allow(dead_code)]
@@ -560,6 +610,14 @@ impl EffectResourcePool {
             });
             !textures.is_empty()
         });
+        self.retirement_count = self.retirement_count.saturating_add(removed.len());
+        for id in &removed {
+            self.event_counters
+                .record_retirement(crate::gpu_residency::GpuResourceIdentity::new(
+                    self.event_counters.generation(),
+                    *id,
+                ));
+        }
         self.recalculate_current_bytes();
         removed
     }
@@ -610,14 +668,47 @@ impl EffectResourcePool {
     }
 
     pub(crate) fn metrics(&self) -> EffectResourceMetrics {
-        let cached_texture_count = self.textures.values().map(Vec::len).sum();
-        let checked_out_texture_count = self
-            .textures
-            .values()
-            .flatten()
-            .filter(|texture| texture.checked_out)
-            .count();
+        let mut cached_texture_count = 0;
+        let mut checked_out_texture_count = 0;
+        let mut active_scratch_count = 0;
+        let mut active_scratch_bytes = 0_u64;
+        let mut reusable_scratch_count = 0;
+        let mut reusable_scratch_bytes = 0_u64;
+        let mut checkpoint_count = 0;
+        let mut checkpoint_bytes = 0_u64;
+        let mut lifecycle_retained_count = 0;
+        let mut lifecycle_retained_bytes = 0_u64;
+        let mut capture_count = 0;
+        let mut capture_bytes = 0_u64;
+        for texture in self.textures.values().flatten() {
+            cached_texture_count += 1;
+            checked_out_texture_count += usize::from(texture.checked_out);
+            match texture.purpose {
+                EffectTexturePurpose::Scratch if texture.checked_out => {
+                    active_scratch_count += 1;
+                    active_scratch_bytes = active_scratch_bytes.saturating_add(texture.bytes);
+                }
+                EffectTexturePurpose::Scratch => {
+                    reusable_scratch_count += 1;
+                    reusable_scratch_bytes = reusable_scratch_bytes.saturating_add(texture.bytes);
+                }
+                EffectTexturePurpose::Checkpoint => {
+                    checkpoint_count += 1;
+                    checkpoint_bytes = checkpoint_bytes.saturating_add(texture.bytes);
+                }
+                EffectTexturePurpose::LifecycleRetained => {
+                    lifecycle_retained_count += 1;
+                    lifecycle_retained_bytes =
+                        lifecycle_retained_bytes.saturating_add(texture.bytes);
+                }
+                EffectTexturePurpose::Capture => {
+                    capture_count += 1;
+                    capture_bytes = capture_bytes.saturating_add(texture.bytes);
+                }
+            }
+        }
         EffectResourceMetrics {
+            generation: self.event_counters.generation(),
             current_bytes: self.current_bytes,
             peak_bytes: self.peak_bytes,
             budget_bytes: self.budget_bytes,
@@ -627,6 +718,17 @@ impl EffectResourcePool {
             eviction_count: self.eviction_count,
             allocation_count: self.allocation_count,
             reuse_count: self.reuse_count,
+            retirement_count: self.retirement_count,
+            active_scratch_count,
+            active_scratch_bytes,
+            reusable_scratch_count,
+            reusable_scratch_bytes,
+            checkpoint_count,
+            checkpoint_bytes,
+            lifecycle_retained_count,
+            lifecycle_retained_bytes,
+            capture_count,
+            capture_bytes,
         }
     }
 
@@ -661,6 +763,12 @@ impl EffectResourcePool {
             !textures.is_empty()
         });
         if removed {
+            self.retirement_count = self.retirement_count.saturating_add(1);
+            self.event_counters
+                .record_retirement(crate::gpu_residency::GpuResourceIdentity::new(
+                    self.event_counters.generation(),
+                    id,
+                ));
             self.recalculate_current_bytes();
         }
         removed
@@ -1065,7 +1173,7 @@ impl EffectGlResourceCache {
                         continue;
                     }
                 };
-                self.checkpoint_captures.insert(
+                self.insert_checkpoint_capture(
                     key.clone(),
                     CachedCheckpointCapture {
                         texture,
@@ -1372,6 +1480,40 @@ impl EffectGlResourceCache {
         texture: PooledEffectTexture,
     ) -> Result<(), EffectResourceError> {
         self.pool.return_texture(texture)
+    }
+
+    pub(crate) fn acquire_lifecycle(
+        &mut self,
+        gl: &glow::Context,
+        key: EffectTextureKey,
+    ) -> Result<PooledEffectTexture, Box<dyn std::error::Error>> {
+        let mut texture = self.acquire(gl, key)?;
+        self.pool
+            .set_purpose(&texture, EffectTexturePurpose::LifecycleRetained);
+        texture.purpose = EffectTexturePurpose::LifecycleRetained;
+        Ok(texture)
+    }
+
+    pub(crate) fn acquire_capture(
+        &mut self,
+        gl: &glow::Context,
+        key: EffectTextureKey,
+    ) -> Result<PooledEffectTexture, Box<dyn std::error::Error>> {
+        let mut texture = self.acquire(gl, key)?;
+        self.pool
+            .set_purpose(&texture, EffectTexturePurpose::Capture);
+        texture.purpose = EffectTexturePurpose::Capture;
+        Ok(texture)
+    }
+
+    fn insert_checkpoint_capture(
+        &mut self,
+        key: CheckpointCaptureCacheKey,
+        capture: CachedCheckpointCapture,
+    ) {
+        self.pool
+            .set_purpose(&capture.texture, EffectTexturePurpose::Checkpoint);
+        self.checkpoint_captures.insert(key, capture);
     }
 
     pub(crate) fn metrics(&self) -> EffectResourceMetrics {
@@ -1835,7 +1977,7 @@ mod tests {
     ) -> EffectGlResourceCache {
         let mut cache = EffectGlResourceCache::with_budget(1024 * 1024).unwrap();
         let texture = cache.pool.checkout(key(8, 8)).unwrap();
-        cache.checkpoint_captures.insert(
+        cache.insert_checkpoint_capture(
             cache_key,
             CachedCheckpointCapture {
                 texture,
@@ -2803,7 +2945,7 @@ mod tests {
             EffectGlResourceCache::with_budgets(candidate_bytes * 2, candidate_bytes).unwrap();
         let lease = cache.pool.checkout(texture_key(&plan)).unwrap();
         let lease_id = lease.id;
-        cache.checkpoint_captures.insert(
+        cache.insert_checkpoint_capture(
             resident_key.clone(),
             CachedCheckpointCapture {
                 texture: lease,
@@ -2974,7 +3116,7 @@ mod tests {
 
         let mut cache = EffectGlResourceCache::with_budget(budget).unwrap();
         let lease = cache.pool.checkout(texture_key(&plan)).unwrap();
-        cache.checkpoint_captures.insert(
+        cache.insert_checkpoint_capture(
             cache_key.clone(),
             CachedCheckpointCapture {
                 texture: lease.clone(),
@@ -3057,7 +3199,7 @@ mod tests {
         };
         let mut cache = EffectGlResourceCache::with_budget(budget).unwrap();
         let checkpoint_lease = cache.pool.checkout(key(8, 8)).unwrap();
-        cache.checkpoint_captures.insert(
+        cache.insert_checkpoint_capture(
             cache_key.clone(),
             CachedCheckpointCapture {
                 texture: checkpoint_lease.clone(),
@@ -3228,7 +3370,7 @@ mod tests {
         let mut cache = EffectGlResourceCache::with_budget(graph_peak + checkpoint_bytes).unwrap();
         let lease = cache.pool.checkout(texture_key(&plan)).unwrap();
         let lease_id = lease.id;
-        cache.checkpoint_captures.insert(
+        cache.insert_checkpoint_capture(
             cache_key.clone(),
             CachedCheckpointCapture {
                 texture: lease,
@@ -4080,13 +4222,95 @@ mod tests {
         assert_eq!(live_metrics.cached_key_count, 1);
         assert_eq!(live_metrics.cached_texture_count, 1);
         assert_eq!(live_metrics.checked_out_texture_count, 1);
+        assert_eq!(live_metrics.active_scratch_count, 1);
+        assert_eq!(
+            live_metrics.active_scratch_bytes,
+            live_metrics.current_bytes
+        );
+        assert_eq!(live_metrics.reusable_scratch_count, 0);
         pool.return_texture(texture).unwrap();
+        let warm_metrics = pool.metrics();
+        assert_eq!(warm_metrics.active_scratch_count, 0);
+        assert_eq!(warm_metrics.reusable_scratch_count, 1);
+        assert_eq!(
+            warm_metrics.reusable_scratch_bytes,
+            warm_metrics.current_bytes
+        );
         let reused = pool.checkout(key(16, 16)).unwrap();
         let reused_metrics = pool.metrics();
         assert_eq!(reused_metrics.allocation_count, 1);
         assert_eq!(reused_metrics.reuse_count, 1);
         assert_eq!(reused_metrics.current_bytes, live_metrics.current_bytes);
         assert_eq!(reused_metrics.peak_bytes, live_metrics.peak_bytes);
+        pool.return_texture(reused).unwrap();
+        assert_eq!(pool.cleanup_size_history().len(), 1);
+        let torn_down_metrics = pool.metrics();
+        assert_eq!(torn_down_metrics.allocation_count, 1);
+        assert_eq!(torn_down_metrics.retirement_count, 1);
+        assert_eq!(torn_down_metrics.current_bytes, 0);
+        assert_eq!(pool.event_counters.live_count(), 0);
+        assert_eq!(
+            pool.event_counters.allocation_count(),
+            pool.event_counters.retirement_count()
+        );
+    }
+
+    #[test]
+    fn checkpoint_and_lifecycle_leases_have_distinct_accounting_domains() {
+        let mut pool = EffectResourcePool::new();
+        let checkpoint = pool.checkout(key(16, 16)).unwrap();
+        pool.set_purpose(&checkpoint, EffectTexturePurpose::Checkpoint);
+        let lifecycle = pool.checkout(key(8, 8)).unwrap();
+        pool.set_purpose(&lifecycle, EffectTexturePurpose::LifecycleRetained);
+
+        let retained_metrics = pool.metrics();
+        assert_eq!(retained_metrics.checkpoint_count, 1);
+        assert_eq!(retained_metrics.checkpoint_bytes, 16 * 16 * 4);
+        assert_eq!(retained_metrics.lifecycle_retained_count, 1);
+        assert_eq!(retained_metrics.lifecycle_retained_bytes, 8 * 8 * 4);
+        assert_eq!(retained_metrics.active_scratch_count, 0);
+
+        pool.return_texture(checkpoint).unwrap();
+        pool.return_texture(lifecycle).unwrap();
+        let returned_metrics = pool.metrics();
+        assert_eq!(returned_metrics.checkpoint_count, 0);
+        assert_eq!(returned_metrics.lifecycle_retained_count, 0);
+        assert_eq!(returned_metrics.reusable_scratch_count, 2);
+    }
+
+    #[test]
+    fn stale_pool_lease_cannot_return_over_a_reused_local_id() {
+        let mut old_pool = EffectResourcePool::new();
+        let stale = old_pool.checkout(key(16, 16)).unwrap();
+        let mut current_pool = EffectResourcePool::new();
+        let current = current_pool.checkout(key(16, 16)).unwrap();
+        assert_eq!(stale.id, current.id);
+        assert_ne!(stale.identity.generation(), current.identity.generation());
+
+        assert!(current_pool.return_texture(stale).is_err());
+        assert!(current_pool.is_checked_out(current.id));
+        assert_eq!(current_pool.event_counters.live_count(), 1);
+        assert_eq!(current_pool.event_counters.stale_event_count(), 1);
+        current_pool.return_texture(current).unwrap();
+        current_pool.cleanup_size_history();
+        assert_eq!(current_pool.event_counters.live_count(), 0);
+    }
+
+    #[test]
+    fn disabled_accounting_does_not_change_effect_texture_reuse_or_lifetime() {
+        let mut pool = EffectResourcePool::new();
+        pool.event_counters = crate::gpu_residency::GenerationEventCounters::disabled(
+            pool.event_counters.generation(),
+        );
+        let lease = pool.checkout(key(16, 16)).unwrap();
+        assert_eq!(pool.event_counters.allocation_count(), 0);
+        pool.return_texture(lease.clone()).unwrap();
+        let reused = pool.checkout(key(16, 16)).unwrap();
+
+        assert_eq!(reused.id, lease.id);
+        assert_eq!(pool.metrics().allocation_count, 1);
+        assert_eq!(pool.metrics().reuse_count, 1);
+        assert!(pool.is_checked_out(reused.id));
         pool.return_texture(reused).unwrap();
     }
 

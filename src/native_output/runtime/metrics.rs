@@ -30,6 +30,7 @@ pub(super) struct NativeRenderTelemetry {
     partial_repair_pixels: u64,
     full_output_pixels: u64,
     full_repaint_reasons: [u64; RENDER_REPAINT_REASON_COUNT],
+    gpu_residency: crate::gpu_residency::GpuResidencyRendererSummary,
     pub(super) resource_efficiency: ResourceEfficiencyMetrics,
 }
 
@@ -63,6 +64,7 @@ impl NativeRenderTelemetry {
         output_width: u32,
         output_height: u32,
     ) {
+        self.gpu_residency = stats.gpu_residency;
         self.record_render_us(render_us);
         self.record_repaint(
             stats.repaint_mode,
@@ -296,6 +298,11 @@ impl NativeRuntime {
         );
         let compositor_cpu_render =
             timing_summary_snapshot(self.render_telemetry.snapshot().compositor_cpu_render);
+        let mut gpu_residency = crate::gpu_residency::GpuResidencySnapshot::from_renderer(
+            self.render_telemetry.gpu_residency,
+        );
+        gpu_residency.set_domain(self.scanout.gpu_residency_domain_snapshot());
+        gpu_residency.recompute_totals();
         let mut timing_scopes = BTreeMap::new();
         for (name, summary) in &self.timing_scopes {
             timing_scopes.insert((*name).to_string(), timing_summary_snapshot(*summary));
@@ -368,6 +375,7 @@ impl NativeRuntime {
                 missed_refresh_3x_or_more: pacing.missed_refresh_3x_or_more,
             },
             resource_efficiency: self.resource_efficiency().snapshot(),
+            gpu_residency,
             timing_scopes,
         }
     }

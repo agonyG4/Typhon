@@ -2483,6 +2483,19 @@ impl AtomicOutputSwapchain {
             && self.quarantine_slot_id() != Some(slot)
             && self.suspended_slot_id(slot).is_none()
     }
+
+    pub(crate) fn residency_protection(
+        &self,
+        slot: OutputSlotId,
+    ) -> crate::gpu_residency::OutputSlotProtection {
+        if slot == self.current {
+            crate::gpu_residency::OutputSlotProtection::ScanoutPinned
+        } else if self.slot_is_free(slot) {
+            crate::gpu_residency::OutputSlotProtection::FixedPoolReusable
+        } else {
+            crate::gpu_residency::OutputSlotProtection::SynchronizationPinned
+        }
+    }
 }
 
 fn poll_completion_fd(fd: RawFd, error_message: &str) -> io::Result<bool> {
@@ -4335,5 +4348,35 @@ mod tests {
 
     const fn now(value: u64) -> MonotonicTimestampNs {
         MonotonicTimestampNs::new(value)
+    }
+
+    #[test]
+    fn residency_summary_protects_the_current_scanout_slot() {
+        let slots = OutputSlotSet::new([
+            OutputSlotId::new(0).expect("slot 0"),
+            OutputSlotId::new(1).expect("slot 1"),
+            OutputSlotId::new(2).expect("slot 2"),
+        ])
+        .expect("test slots");
+        let swapchain = AtomicOutputSwapchain::from_presented_slots(
+            slots,
+            OutputSlotId::new(0).expect("current slot"),
+            9,
+        )
+        .expect("test swapchain");
+        let states = [
+            OutputSlotId::new(0).expect("slot 0"),
+            OutputSlotId::new(1).expect("slot 1"),
+            OutputSlotId::new(2).expect("slot 2"),
+        ]
+        .map(|slot| swapchain.residency_protection(slot));
+        let summary = crate::gpu_residency::output_pool_domain_snapshot(9, 10, 10, states);
+
+        assert_eq!(summary.resource_count, 3);
+        assert_eq!(summary.pinned_count, 1);
+        assert_eq!(summary.active_count, 1);
+        assert_eq!(summary.fixed_pool_reusable_count, 2);
+        assert_eq!(summary.reusable_count, 0);
+        assert_eq!(summary.compositor_owned_estimated_bytes, 3 * 10 * 10 * 4);
     }
 }

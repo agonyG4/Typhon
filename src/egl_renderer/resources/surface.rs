@@ -247,13 +247,29 @@ impl RendererResourceState {
             }
         }
 
-        let stale_ids = self
-            .surfaces
-            .resources
-            .keys()
-            .copied()
-            .filter(|id| self.surfaces.active_surface_ids.binary_search(id).is_err())
-            .collect::<Vec<_>>();
+        let mut active_dmabuf_count = 0;
+        let mut active_dmabuf_known_bytes = 0_u64;
+        let mut active_dmabuf_unknown_size_count = 0;
+        let mut stale_ids = Vec::new();
+        for (&surface_id, resource) in &self.surfaces.resources {
+            if self
+                .surfaces
+                .active_surface_ids
+                .binary_search(&surface_id)
+                .is_err()
+            {
+                stale_ids.push(surface_id);
+                continue;
+            }
+            if let Some(key) = &resource.dmabuf_key {
+                active_dmabuf_count += 1;
+                if let Some(bytes) = key.logical_payload_bytes() {
+                    active_dmabuf_known_bytes = active_dmabuf_known_bytes.saturating_add(bytes);
+                } else {
+                    active_dmabuf_unknown_size_count += 1;
+                }
+            }
+        }
         for surface_id in stale_ids {
             if let Some(resource) = self.surfaces.resources.remove(&surface_id) {
                 destroy_surface_resource(gl, egl, egl_display, resource);
@@ -263,6 +279,11 @@ impl RendererResourceState {
             self.dmabuf.failed_surface_generations.remove(&surface_id);
         }
 
+        self.dmabuf.publish_active_metrics(
+            active_dmabuf_count,
+            active_dmabuf_known_bytes,
+            active_dmabuf_unknown_size_count,
+        );
         self.dmabuf.publish_metrics(telemetry);
         Ok(())
     }

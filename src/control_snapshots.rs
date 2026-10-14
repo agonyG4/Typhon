@@ -992,6 +992,8 @@ pub struct PerformanceSnapshot {
     pub buffering: BufferingPerformanceSnapshot,
     pub kms: KmsPerformanceSnapshot,
     pub resource_efficiency: ResourceEfficiencyPerformanceSnapshot,
+    #[serde(default)]
+    pub gpu_residency: crate::gpu_residency::GpuResidencySnapshot,
     pub timing_scopes: std::collections::BTreeMap<String, TimingSummarySnapshot>,
 }
 
@@ -1382,6 +1384,7 @@ mod tests {
                 "presentationPlanningRuns": 0,
                 "presentationPlanningSkips": 0,
             },
+            "gpuResidency": crate::gpu_residency::GpuResidencySnapshot::default(),
             "timingScopes": {},
         });
 
@@ -1426,6 +1429,16 @@ mod tests {
         }
 
         let snapshot = serde_json::from_value::<PerformanceSnapshot>(value.clone()).unwrap();
+        let mut legacy_value = value.clone();
+        legacy_value
+            .as_object_mut()
+            .expect("snapshot is an object")
+            .remove("gpuResidency");
+        let legacy_snapshot = serde_json::from_value::<PerformanceSnapshot>(legacy_value).unwrap();
+        assert_eq!(
+            legacy_snapshot.gpu_residency,
+            crate::gpu_residency::GpuResidencySnapshot::default()
+        );
         assert_eq!(
             serde_json::to_value(&snapshot.buffering).unwrap(),
             value["buffering"]

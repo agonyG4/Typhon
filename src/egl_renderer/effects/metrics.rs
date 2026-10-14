@@ -1,5 +1,6 @@
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct EffectResourceMetrics {
+    pub generation: u64,
     pub current_bytes: u64,
     pub peak_bytes: u64,
     pub budget_bytes: u64,
@@ -9,6 +10,17 @@ pub(crate) struct EffectResourceMetrics {
     pub eviction_count: usize,
     pub allocation_count: usize,
     pub reuse_count: usize,
+    pub retirement_count: usize,
+    pub active_scratch_count: usize,
+    pub active_scratch_bytes: u64,
+    pub reusable_scratch_count: usize,
+    pub reusable_scratch_bytes: u64,
+    pub checkpoint_count: usize,
+    pub checkpoint_bytes: u64,
+    pub lifecycle_retained_count: usize,
+    pub lifecycle_retained_bytes: u64,
+    pub capture_count: usize,
+    pub capture_bytes: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

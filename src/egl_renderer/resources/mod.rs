@@ -431,4 +431,11 @@ impl<'a> ResourceTelemetry<'a> {
         self.frame_stats.dmabuf_cache_peak_entries = peak_entries;
         self.frame_stats.dmabuf_cache_max_entries_for_one_surface = max_entries_for_one_surface;
     }
+
+    pub(super) fn publish_client_import_residency(
+        &mut self,
+        summary: crate::gpu_residency::GpuResidencyDomainSnapshot,
+    ) {
+        self.frame_stats.gpu_residency.client_import = summary;
+    }
 }

@@ -5,6 +5,8 @@ use oblivion_one::{
     },
 };
 
+use crate::gpu_residency::GpuResidencyRendererSummary;
+
 use super::super::{
     EglSceneCacheKey, OutputFramebufferOrigin,
     damage::{
@@ -128,6 +130,7 @@ pub(crate) struct GlesSceneFrameStats {
     pub effect_gpu_cached_keys: usize,
     pub effect_gpu_cached_textures: usize,
     pub effect_gpu_checked_out_textures: usize,
+    pub gpu_residency: GpuResidencyRendererSummary,
     pub effect_resource_allocations_total: usize,
     pub effect_resource_reuses_total: usize,
     pub effect_resource_evictions_total: usize,

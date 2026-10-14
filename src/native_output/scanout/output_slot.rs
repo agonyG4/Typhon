@@ -281,6 +281,10 @@ impl AtomicPhysicalOutputPool {
         self.pool_generation
     }
 
+    pub(crate) const fn slots(&self) -> &[AtomicOutputSlotBacking; EXPLICIT_OUTPUT_SLOT_CAPACITY] {
+        &self.slots
+    }
+
     pub(crate) fn plane_count(&self) -> io::Result<u32> {
         self.slots
             .first()

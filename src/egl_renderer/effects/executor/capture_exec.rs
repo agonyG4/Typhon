@@ -581,7 +581,7 @@ pub(super) fn capture_scene_work_preservation_context(
     let texture = renderer
         .runtime
         .effect_resources
-        .acquire(renderer.gl, key)?;
+        .acquire_capture(renderer.gl, key)?;
     let result = (|| {
         let output_framebuffer = renderer.scene.active_output_framebuffer;
         renderer.bind_active_output_framebuffer();

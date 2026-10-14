@@ -505,7 +505,7 @@ impl LifecycleVisualStore {
             let texture = match context
                 .effect_runtime
                 .effect_resources
-                .acquire(&context.gl, texture_key)
+                .acquire_lifecycle(&context.gl, texture_key)
             {
                 Ok(texture) => texture,
                 Err(error) => {

@@ -74,6 +74,52 @@ pub(super) fn record_effect_resource_metrics(
     scene.frame_stats.effect_gpu_cached_keys = metrics.cached_key_count;
     scene.frame_stats.effect_gpu_cached_textures = metrics.cached_texture_count;
     scene.frame_stats.effect_gpu_checked_out_textures = metrics.checked_out_texture_count;
+    let defaults = crate::gpu_residency::GpuResidencyRendererSummary::default();
+    let mut residency = scene.frame_stats.gpu_residency;
+    residency.effects_scratch = defaults.effects_scratch;
+    residency.effects_checkpoint = defaults.effects_checkpoint;
+    residency.lifecycle_retained_visual = defaults.lifecycle_retained_visual;
+    residency.capture = defaults.capture;
+    residency.effects_scratch.owner_generation = metrics.generation;
+    residency.effects_checkpoint.owner_generation = metrics.generation;
+    residency.lifecycle_retained_visual.owner_generation = metrics.generation;
+    residency.capture.owner_generation = metrics.generation;
+    residency.effects_scratch.record_resources(
+        crate::gpu_residency::ResourceResidency::Active,
+        metrics.active_scratch_count as u64,
+        Some(metrics.active_scratch_bytes),
+        false,
+        false,
+    );
+    residency.effects_scratch.record_resources(
+        crate::gpu_residency::ResourceResidency::WarmReusable,
+        metrics.reusable_scratch_count as u64,
+        Some(metrics.reusable_scratch_bytes),
+        false,
+        false,
+    );
+    residency.effects_checkpoint.record_resources(
+        crate::gpu_residency::ResourceResidency::Active,
+        metrics.checkpoint_count as u64,
+        Some(metrics.checkpoint_bytes),
+        false,
+        false,
+    );
+    residency.lifecycle_retained_visual.record_resources(
+        crate::gpu_residency::ResourceResidency::Active,
+        metrics.lifecycle_retained_count as u64,
+        Some(metrics.lifecycle_retained_bytes),
+        false,
+        false,
+    );
+    residency.capture.record_resources(
+        crate::gpu_residency::ResourceResidency::Active,
+        metrics.capture_count as u64,
+        Some(metrics.capture_bytes),
+        false,
+        false,
+    );
+    scene.frame_stats.gpu_residency = residency;
     let shader_metrics = runtime.effect_shaders.metrics();
     scene.frame_stats.shader_cache_capacity = shader_metrics.capacity;
     scene.frame_stats.shader_cache_entries = shader_metrics.resident_entries;

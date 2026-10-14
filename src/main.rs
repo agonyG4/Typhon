@@ -23,7 +23,7 @@ use oblivion_one::{
         OwnCompositorServer, RendererProtocolCapabilities, SelectionProtocolCapabilities,
         client_protocols_for_capabilities_with_frame_pacing,
     },
-    default_state_dir, discover_tools,
+    default_state_dir, discover_tools, gpu_residency,
     portal::PortalRuntime,
     session::NativeSessionProbe,
 };

@@ -1108,6 +1108,38 @@ impl AtomicEglGbmScanout {
             .map(AtomicPhysicalOutputPool::pool_generation)
     }
 
+    pub(crate) fn gpu_residency_domain_snapshot(
+        &self,
+    ) -> crate::gpu_residency::GpuResidencyDomainSnapshot {
+        let Some(pool) = self.physical_pool.as_ref() else {
+            return crate::gpu_residency::GpuResidencyDomainSnapshot::new(
+                crate::gpu_residency::GpuResidencyOwner::NativeOutput,
+                crate::gpu_residency::ResourceDomain::OutputScanout,
+                crate::gpu_residency::ResourceOwnership::CompositorOwned,
+                crate::gpu_residency::ResourceCoverage::Uninstrumented,
+            );
+        };
+        let generation = pool.pool_generation();
+        let (states, coverage) = match self.swapchain.as_ref() {
+            Some(swapchain) if swapchain.pool_generation() == generation => (
+                std::array::from_fn(|index| swapchain.residency_protection(pool.slots()[index].id)),
+                crate::gpu_residency::ResourceCoverage::Instrumented,
+            ),
+            _ => (
+                [crate::gpu_residency::OutputSlotProtection::Unknown; 3],
+                crate::gpu_residency::ResourceCoverage::PartiallyInstrumented,
+            ),
+        };
+        let mut summary = crate::gpu_residency::output_pool_domain_snapshot(
+            generation,
+            self.width,
+            self.height,
+            states,
+        );
+        summary.coverage = coverage;
+        summary
+    }
+
     pub(crate) fn next_pool_generation(&self) -> io::Result<u64> {
         self.swapchain()?
             .pool_generation()

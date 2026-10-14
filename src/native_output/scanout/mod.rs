@@ -897,6 +897,22 @@ impl NativeScanoutBackend {
         }
     }
 
+    pub(crate) fn gpu_residency_domain_snapshot(
+        &self,
+    ) -> crate::gpu_residency::GpuResidencyDomainSnapshot {
+        match self {
+            Self::AtomicEglGbm(scanout) => scanout.gpu_residency_domain_snapshot(),
+            Self::NativeEglGbm(_) | Self::Gbm(_) | Self::Dumb(_) => {
+                crate::gpu_residency::GpuResidencyDomainSnapshot::new(
+                    crate::gpu_residency::GpuResidencyOwner::NativeOutput,
+                    crate::gpu_residency::ResourceDomain::OutputScanout,
+                    crate::gpu_residency::ResourceOwnership::CompositorOwned,
+                    crate::gpu_residency::ResourceCoverage::Uninstrumented,
+                )
+            }
+        }
+    }
+
     pub(crate) fn invalidate_direct_validation_cache(&mut self) {
         if let Self::AtomicEglGbm(scanout) = self {
             scanout.invalidate_direct_validation_cache();
