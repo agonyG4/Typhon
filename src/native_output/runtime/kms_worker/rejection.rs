@@ -3,13 +3,13 @@ use crate::native_output::kms_worker::{KmsCommitJob, KmsCursorUpdate, KmsPrimary
 use oblivion_one::native::kms::AtomicKmsError;
 
 use super::super::presentation_transactions::{
-    DirectTerminalCallbackDisposition, direct_terminal_callback_owner_leaks,
-    discard_presentation_feedback_obligation, restore_presentation_feedback_obligation,
-    settle_dropped_output_transaction, settle_failed_output_transaction,
-    settle_superseded_output_transaction,
+    DirectCallbackLeakMetrics, DirectTerminalCallbackDisposition,
+    direct_terminal_callback_owner_leaks, discard_presentation_feedback_obligation,
+    restore_presentation_feedback_obligation, settle_dropped_output_transaction,
+    settle_failed_output_transaction, settle_superseded_output_transaction,
 };
 use super::direct_rejection::WorkerRejectionKind;
-use crate::native_output::scanout::{AtomicEglGbmScanout, FrozenCursorPlaneOwner};
+use crate::native_output::scanout::{AtomicOutputSwapchain, FrozenCursorPlaneOwner};
 #[cfg(test)]
 use std::os::fd::OwnedFd;
 
@@ -22,11 +22,18 @@ fn take_primary_submission_fence(job: &mut KmsCommitJob) -> Option<OwnedFd> {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[derive(Debug, Clone, Copy, Default)]
+pub(in crate::native_output::runtime) struct DroppedQueuedWorkerJobTelemetry {
+    pub(in crate::native_output::runtime) direct_test_only_duration_ns: Option<u64>,
+    pub(in crate::native_output::runtime) direct_callback_owner_leaks:
+        Option<DirectCallbackLeakMetrics>,
+}
+
 pub(in crate::native_output::runtime) fn drop_queued_worker_job_with_reason_parts(
     mut job: KmsCommitJob,
     drop_reason: OutputTransactionDropReason,
     scene_history: &mut NativeSceneHistory,
-    scanout: &mut AtomicEglGbmScanout,
+    swapchain: &mut AtomicOutputSwapchain,
     frame_pacing: &mut NativeFramePacing,
     frame_scheduler: &mut NativeFrameScheduler,
     atomic_cursor: &mut Option<NativeAtomicCursor>,
@@ -36,18 +43,15 @@ pub(in crate::native_output::runtime) fn drop_queued_worker_job_with_reason_part
     output_transactions: &mut OutputTransactionLedger,
     kms_commit_worker: Option<&crate::native_output::kms_worker::KmsCommitWorkerHandle>,
     emergency_worker_jobs: &mut Vec<KmsCommitJob>,
-) -> NativeResult<()> {
-    scene_history.discard_submission(job.token.get());
+) -> NativeResult<DroppedQueuedWorkerJobTelemetry> {
     let sidecar_transaction_id = job
         .owners
         .cursor()
         .filter(|owner| owner.sidecar_id.is_some())
         .map(|owner| owner.transaction.id());
-    if matches!(job.kind, AtomicCommitKind::DirectPrimary { .. })
-        && let Some(duration_ns) = job.test_only_duration_ns
-    {
-        scanout.note_direct_test_only(duration_ns, false);
-    }
+    let direct_test_only_duration_ns = matches!(job.kind, AtomicCommitKind::DirectPrimary { .. })
+        .then_some(job.test_only_duration_ns)
+        .flatten();
     let compatibility_primary = matches!(job.kind, AtomicCommitKind::CompositedPrimary { .. })
         && output_transactions
             .transaction(job.transaction_id)
@@ -111,14 +115,21 @@ pub(in crate::native_output::runtime) fn drop_queued_worker_job_with_reason_part
             .into());
         } else {
             let transfer = match &mut job.primary {
-                KmsPrimaryUpdate::Framebuffer { in_fence, .. } => {
-                    scanout.suspend_abandon_worker_submission(job.token, in_fence)
-                }
+                KmsPrimaryUpdate::Framebuffer { in_fence, .. } => swapchain
+                    .suspend_abandon_worker_queued_with_completion_fence(job.token, in_fence),
                 KmsPrimaryUpdate::Unchanged => {
                     let mut no_completion_fence = None;
-                    scanout.suspend_abandon_worker_submission(job.token, &mut no_completion_fence)
+                    swapchain.suspend_abandon_worker_queued_with_completion_fence(
+                        job.token,
+                        &mut no_completion_fence,
+                    )
                 }
-            };
+            }
+            .and_then(|suspended| {
+                suspended
+                    .then_some(())
+                    .ok_or_else(|| io::Error::other("queued worker frame was not suspended"))
+            });
             if let Err(error) = transfer {
                 eprintln!(
                     "native KMS worker: queued output suspension failed; retaining emergency ownership: {error}"
@@ -177,15 +188,23 @@ pub(in crate::native_output::runtime) fn drop_queued_worker_job_with_reason_part
             },
         )?;
     }
-    if let Some(callback_owner_leaks) = direct_callback_owner_leaks {
-        scanout.note_direct_callback_owner_leaks(callback_owner_leaks);
+    if matches!(job.kind, AtomicCommitKind::CompositedPrimary { .. })
+        && !scene_history.discard_submission(job.token.get())
+    {
+        return Err(io::Error::other(
+            "safely abandoned composited worker has no matching scene submission",
+        )
+        .into());
     }
     if drop_reason == OutputTransactionDropReason::SafeAbandonment
         && let Some(worker) = kms_commit_worker
     {
         worker.record_shutdown_queued_job_settled();
     }
-    Ok(())
+    Ok(DroppedQueuedWorkerJobTelemetry {
+        direct_test_only_duration_ns,
+        direct_callback_owner_leaks,
+    })
 }
 
 fn take_embedded_cursor_owner(

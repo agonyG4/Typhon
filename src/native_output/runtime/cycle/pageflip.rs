@@ -1,5 +1,7 @@
 use super::super::cursor_cycle::{complete_plane_delta_pageflip, complete_primary_cursor_pageflip};
-use super::super::kms_worker::drop_queued_worker_job_with_reason_parts;
+use super::super::kms_worker::{
+    DroppedQueuedWorkerJobTelemetry, drop_queued_worker_job_with_reason_parts,
+};
 use super::super::presentation_cursor::trace_presented_cursor;
 use super::super::presentation_transactions::{
     commit_prepared_presented_output_transaction, complete_presentation_feedback_obligation,
@@ -1308,6 +1310,30 @@ pub(crate) fn abandon_overtaken_ready(
     presented_at: MonotonicTimestampNs,
 ) -> NativeResult<()> {
     let swapchain = explicit.swapchain_mut()?;
+    abandon_overtaken_ready_on_swapchain(
+        swapchain,
+        owner,
+        output_epoch,
+        scene_history,
+        frame_pacing,
+        frame_scheduler,
+        server,
+        output_transactions,
+        presented_at,
+    )
+}
+
+fn abandon_overtaken_ready_on_swapchain(
+    swapchain: &mut AtomicOutputSwapchain,
+    owner: OutputFrameIdentitySnapshot,
+    output_epoch: OutputEpochId,
+    scene_history: &mut NativeSceneHistory,
+    frame_pacing: &mut NativeFramePacing,
+    frame_scheduler: &mut NativeFrameScheduler,
+    server: &mut OwnCompositorServer,
+    output_transactions: &mut OutputTransactionLedger,
+    presented_at: MonotonicTimestampNs,
+) -> NativeResult<()> {
     terminalize_unsubmitted_ready_frame(
         swapchain,
         owner,
@@ -1535,7 +1561,7 @@ fn abandon_overtaken_worker_queued(
     worker: &KmsCommitWorkerHandle,
     owner: QueuedOutputFrameIdentitySnapshot,
     crtc_id: u32,
-    explicit: &mut AtomicEglGbmScanout,
+    swapchain: &mut AtomicOutputSwapchain,
     scene_history: &mut NativeSceneHistory,
     frame_pacing: &mut NativeFramePacing,
     frame_scheduler: &mut NativeFrameScheduler,
@@ -1545,7 +1571,7 @@ fn abandon_overtaken_worker_queued(
     server: &mut OwnCompositorServer,
     output_transactions: &mut OutputTransactionLedger,
     emergency_worker_jobs: &mut Vec<KmsCommitJob>,
-) -> NativeResult<()> {
+) -> NativeResult<DroppedQueuedWorkerJobTelemetry> {
     match worker.cancel_queued_primary(
         owner.token,
         owner.frame.transaction_id,
@@ -1570,7 +1596,7 @@ fn abandon_overtaken_worker_queued(
                 *job,
                 OutputTransactionDropReason::SafeAbandonment,
                 scene_history,
-                explicit,
+                swapchain,
                 frame_pacing,
                 frame_scheduler,
                 atomic_cursor,
@@ -1591,6 +1617,155 @@ fn abandon_overtaken_worker_queued(
         )
         .into()),
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct DirectEntryFutureRetirement {
+    worker_frame_id: Option<u64>,
+    ready_frame_id: Option<u64>,
+}
+
+impl DirectEntryFutureRetirement {
+    const fn retired_any(self) -> bool {
+        self.worker_frame_id.is_some() || self.ready_frame_id.is_some()
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn retire_direct_entry_future_composited_owners(
+    swapchain: &mut AtomicOutputSwapchain,
+    worker: Option<&KmsCommitWorkerHandle>,
+    crtc_id: u32,
+    output_epoch: OutputEpochId,
+    scene_history: &mut NativeSceneHistory,
+    frame_pacing: &mut NativeFramePacing,
+    frame_scheduler: &mut NativeFrameScheduler,
+    atomic_cursor: &mut Option<NativeAtomicCursor>,
+    cursor_output_arbitration: &mut NativeCursorOutputArbitration,
+    atomic_commit_arbiter: &mut AtomicCommitArbiter,
+    server: &mut OwnCompositorServer,
+    output_transactions: &mut OutputTransactionLedger,
+    emergency_worker_jobs: &mut Vec<KmsCommitJob>,
+    queued_redraw_requested: &mut bool,
+    direct_transaction_id: OutputTransactionId,
+    direct_token: PageFlipToken,
+    perf: NativePerfLogger,
+) -> NativeResult<DirectEntryFutureRetirement> {
+    let mut retirement = DirectEntryFutureRetirement::default();
+    let worker_owner = swapchain.worker_queued_identity();
+    match atomic_commit_arbiter.worker_queued_kind() {
+        Some(AtomicCommitKind::CompositedPrimary {
+            transaction_id,
+            frame_id,
+            framebuffer_id,
+        }) => {
+            let owner = worker_owner.ok_or_else(|| {
+                io::Error::other("Atomic worker queued successor has no physical frame owner")
+            })?;
+            if owner.token
+                != atomic_commit_arbiter.worker_queued_token().ok_or_else(|| {
+                    io::Error::other("Atomic worker queued successor has no arbiter token")
+                })?
+                || owner.frame.transaction_id != transaction_id
+                || owner.frame.frame_id != frame_id
+                || owner.frame.framebuffer_id.get() != framebuffer_id
+            {
+                return Err(io::Error::other(
+                    "Direct entry worker successor identity does not match Atomic ownership",
+                )
+                .into());
+            }
+            let worker = worker.ok_or_else(|| {
+                io::Error::other("Direct entry worker successor has no KMS worker handle")
+            })?;
+            let telemetry = abandon_overtaken_worker_queued(
+                worker,
+                owner,
+                crtc_id,
+                swapchain,
+                scene_history,
+                frame_pacing,
+                frame_scheduler,
+                atomic_cursor,
+                cursor_output_arbitration,
+                atomic_commit_arbiter,
+                server,
+                output_transactions,
+                emergency_worker_jobs,
+            )?;
+            if telemetry.direct_test_only_duration_ns.is_some()
+                || telemetry.direct_callback_owner_leaks.is_some()
+            {
+                return Err(io::Error::other(
+                    "composited Direct entry successor returned Direct-only worker telemetry",
+                )
+                .into());
+            }
+            retirement.worker_frame_id = Some(frame_id);
+        }
+        Some(AtomicCommitKind::DirectPrimary { .. } | AtomicCommitKind::PlaneDelta { .. })
+        | None => {
+            if worker_owner.is_some() {
+                return Err(io::Error::other(
+                    "physical worker queued frame has no matching composited Atomic owner",
+                )
+                .into());
+            }
+        }
+    }
+
+    let retired_at = MonotonicTimestampNs::new(monotonic_now_ns()?);
+    if let Some(owner) = swapchain.ready_identity() {
+        abandon_overtaken_ready_on_swapchain(
+            swapchain,
+            owner,
+            output_epoch,
+            scene_history,
+            frame_pacing,
+            frame_scheduler,
+            server,
+            output_transactions,
+            retired_at,
+        )?;
+        retirement.ready_frame_id = Some(owner.frame_id);
+    }
+
+    if retirement.retired_any() {
+        *queued_redraw_requested = true;
+        if !frame_scheduler.visual_work_queued() {
+            super::super::queue_visual_work(
+                frame_pacing,
+                frame_scheduler,
+                retired_at.get(),
+                server.scene_render_generation(),
+                NativeVisualWorkQueueReason::WorkerRequeue,
+            )?;
+        }
+        perf.log("direct_scanout", || {
+            vec![
+                NativePerfField::str("event", "direct_entry_future_composited_retired"),
+                NativePerfField::bool(
+                    "worker_queued_retired",
+                    retirement.worker_frame_id.is_some(),
+                ),
+                NativePerfField::bool("ready_retired", retirement.ready_frame_id.is_some()),
+                NativePerfField::u64("direct_transaction_id", direct_transaction_id.get()),
+                NativePerfField::u64("direct_token", direct_token.get()),
+                NativePerfField::u64("worker_frame_id", retirement.worker_frame_id.unwrap_or(0)),
+                NativePerfField::u64("ready_frame_id", retirement.ready_frame_id.unwrap_or(0)),
+            ]
+        });
+    }
+
+    validate_reconfiguration_frame_ownership_for_swapchain(
+        swapchain,
+        output_epoch,
+        scene_history,
+        frame_pacing,
+        frame_scheduler,
+        output_transactions,
+    )?;
+    Ok(retirement)
 }
 
 pub(crate) fn register_suspended_fence_if_needed(
@@ -2446,6 +2621,43 @@ impl NativeRuntime {
                         *output_epoch,
                         target.crtc_id,
                     );
+                    if scanout.output_render_in_progress() {
+                        return Err(io::Error::other(
+                            "DirectPrimary pageflip crossed an active composited render",
+                        )
+                        .into());
+                    }
+                    if !presented_planes
+                        .primary
+                        .is_some_and(|assignment| assignment.is_direct())
+                    {
+                        let NativeScanoutBackend::AtomicEglGbm(explicit) = &mut **scanout else {
+                            return Err(io::Error::other(
+                                "DirectPrimary pageflip has no explicit output swapchain",
+                            )
+                            .into());
+                        };
+                        let swapchain = explicit.swapchain_mut()?;
+                        retire_direct_entry_future_composited_owners(
+                            swapchain,
+                            kms_commit_worker.as_ref(),
+                            target.crtc_id,
+                            *output_epoch,
+                            scene_history,
+                            frame_pacing,
+                            frame_scheduler,
+                            atomic_cursor,
+                            cursor_output_arbitration,
+                            atomic_commit_arbiter,
+                            server,
+                            output_transactions,
+                            emergency_quarantined_worker_jobs,
+                            queued_redraw_requested,
+                            transaction_id,
+                            pageflip_token,
+                            perf,
+                        )?;
+                    }
                     cycle_direct::settle_direct_pageflip(
                         scanout,
                         scene_history,
@@ -2690,28 +2902,42 @@ impl NativeRuntime {
                                         "overtaken worker primary has no worker handle",
                                     )
                                 })?;
-                                let recovered = abandon_overtaken_worker_queued(
-                                    worker,
-                                    owner,
-                                    target.crtc_id,
-                                    explicit,
-                                    scene_history,
-                                    frame_pacing,
-                                    frame_scheduler,
-                                    atomic_cursor,
-                                    cursor_output_arbitration,
-                                    atomic_commit_arbiter,
-                                    server,
-                                    output_transactions,
-                                    emergency_quarantined_worker_jobs,
-                                )
-                                .is_ok();
-                                frame_pacing.note_physical_claim_overtake_recovery(recovered);
-                                if !recovered {
-                                    return Err(io::Error::other(
-                                        "failed to recover an overtaken queued primary",
+                                let cancellation = {
+                                    let swapchain = explicit.swapchain_mut()?;
+                                    abandon_overtaken_worker_queued(
+                                        worker,
+                                        owner,
+                                        target.crtc_id,
+                                        swapchain,
+                                        scene_history,
+                                        frame_pacing,
+                                        frame_scheduler,
+                                        atomic_cursor,
+                                        cursor_output_arbitration,
+                                        atomic_commit_arbiter,
+                                        server,
+                                        output_transactions,
+                                        emergency_quarantined_worker_jobs,
                                     )
-                                    .into());
+                                };
+                                let recovered = cancellation.is_ok();
+                                frame_pacing.note_physical_claim_overtake_recovery(recovered);
+                                let telemetry = match cancellation {
+                                    Ok(telemetry) => telemetry,
+                                    Err(_) => {
+                                        return Err(io::Error::other(
+                                            "failed to recover an overtaken queued primary",
+                                        )
+                                        .into());
+                                    }
+                                };
+                                if let Some(duration_ns) = telemetry.direct_test_only_duration_ns {
+                                    explicit.note_direct_test_only(duration_ns, false);
+                                }
+                                if let Some(callback_owner_leaks) =
+                                    telemetry.direct_callback_owner_leaks
+                                {
+                                    explicit.note_direct_callback_owner_leaks(callback_owner_leaks);
                                 }
                                 *queued_redraw_requested = true;
                                 register_suspended_fence_if_needed(

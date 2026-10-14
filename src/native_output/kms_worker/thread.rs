@@ -184,6 +184,21 @@ impl KmsWorkerQuiesceHandle {
 
 impl KmsCommitWorkerHandle {
     #[cfg(test)]
+    pub(crate) fn with_queued_job_for_test(job: KmsCommitJob) -> Self {
+        let result_fd = create_eventfd().expect("test KMS worker eventfd");
+        let shared = Arc::new(WorkerShared::new(result_fd));
+        shared
+            .try_reserve()
+            .expect("test KMS worker admission")
+            .enqueue(job)
+            .unwrap_or_else(|error| panic!("test KMS job was rejected: {error:?}"));
+        Self {
+            shared,
+            join: Mutex::new(None),
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn notify_work_for_test(&self) {
         self.shared.work_wakeup.notify_all();
     }

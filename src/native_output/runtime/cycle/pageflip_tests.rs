@@ -1,8 +1,8 @@
 use super::*;
 use crate::native_output::kms_worker::{
-    KmsBundleOwners, KmsCommitJob, KmsCommitTestPolicy, KmsPrimaryCursorPresentation,
-    KmsPrimaryUpdate, KmsTestOnlyPolicy, KmsValidationBase, KmsWorkerDispatchModel,
-    KmsWorkerDispatchTailObservation,
+    KmsBundleOwners, KmsCommitJob, KmsCommitTestPolicy, KmsCommitWorkerHandle,
+    KmsPrimaryCursorPresentation, KmsPrimaryUpdate, KmsTestOnlyPolicy, KmsValidationBase,
+    KmsWorkerDispatchModel, KmsWorkerDispatchTailObservation,
 };
 use crate::native_output::pacing::{ContentCadenceAttribution, classify_content_frame};
 use crate::native_output::presentation::kms_timing::KmsPresentationOutcome;
@@ -1904,4 +1904,405 @@ fn software_primary_metadata_freezes_revision_before_desired_advances() {
     assert_eq!(frozen.output_position.x, 11);
     assert_eq!(frozen.output_position.y, 22);
     assert_eq!(frozen.delivery, PresentedCursorDelivery::Software);
+}
+
+fn queue_fixture_ready_as_worker(
+    fixture: &mut VariableRetryFixture,
+    atomic_commit_arbiter: &mut AtomicCommitArbiter,
+    token: PageFlipToken,
+    crtc_id: u32,
+) -> (
+    KmsCommitWorkerHandle,
+    crate::native_output::pacing::WorkerPacingTicket,
+) {
+    use crate::native_output::kms_worker::{KmsCursorUpdate, KmsPrimaryUpdate};
+    use crate::native_output::presentation::kms_timing::KmsPresentationTiming;
+    use crate::native_output::presentation::plane::{KmsCommitBundleId, PresentedPlaneSnapshot};
+    use crate::native_output::presentation::transaction::OutputTransaction;
+    use oblivion_one::native::kms::FramebufferId;
+    use oblivion_one::native::presentation_deadline::MonotonicTimestampNs;
+
+    let owner = fixture.owner;
+    let now = MonotonicTimestampNs::new(3);
+    let pacing_ticket = fixture
+        .frame_pacing
+        .reserve_worker_submission(true)
+        .expect("READY pacing owner reserves a worker attempt")
+        .expect("pacing is enabled in the fixture");
+    fixture
+        .output_transactions
+        .mark_queued(owner.transaction_id, fixture.output_epoch.get(), now)
+        .unwrap();
+    let in_fence = fixture
+        .swapchain
+        .take_ready_for_worker(token, now)
+        .unwrap()
+        .0;
+    fixture
+        .scene_history
+        .queue_submission_or_error(token.get())
+        .unwrap();
+    fixture.frame_scheduler.consume_ready_frame();
+
+    let kind = AtomicCommitKind::CompositedPrimary {
+        transaction_id: owner.transaction_id,
+        frame_id: owner.frame_id,
+        framebuffer_id: owner.framebuffer_id.get(),
+    };
+    atomic_commit_arbiter
+        .reserve_worker_queued(token, fixture.output_epoch.get(), crtc_id, kind, now.get())
+        .unwrap();
+    let worker_transaction = Arc::new(
+        OutputTransaction::composited_variable_with_direct_equivalence(
+            owner.output_id,
+            owner.transaction_id,
+            fixture.output_epoch.get(),
+            now,
+            match owner.reservation {
+                crate::native_output::presentation::transaction::FramePresentationReservation::Variable(
+                    reservation,
+                ) => reservation,
+                crate::native_output::presentation::transaction::FramePresentationReservation::Fixed(
+                    _,
+                ) => panic!("worker fixture must use a variable reservation"),
+                crate::native_output::presentation::transaction::FramePresentationReservation::DeferredO1(
+                    _,
+                ) => panic!("worker fixture must not use a deferred O1 reservation"),
+            },
+            crate::native_output::DrmContentType::Graphics,
+            oblivion_one::native::scheduler::NativeOutputPacingMode::ReactiveDouble,
+            owner.frame_id,
+            owner.render_generation,
+            owner.pool_generation,
+            owner.slot,
+            owner.framebuffer_id.get(),
+            None,
+            owner.protocol_batch_id,
+            None,
+        )
+        .unwrap(),
+    );
+    let owners = KmsBundleOwners::for_transaction(kind, worker_transaction, None, None).unwrap();
+    let earliest = MonotonicTimestampNs::new(1_006_060_606);
+    let job = KmsCommitJob {
+        bundle_id: KmsCommitBundleId::from_pageflip_token(token),
+        owners,
+        output_id: owner.output_id,
+        transaction_id: owner.transaction_id,
+        token,
+        output_epoch: fixture.output_epoch,
+        crtc_id,
+        kind,
+        reservation: owner.reservation,
+        presentation_timing: KmsPresentationTiming::variable(earliest.get()),
+        validation_base: KmsValidationBase::Presented {
+            output_id: owner.output_id,
+            snapshot: PresentedPlaneSnapshot::legacy(None),
+            output_generation: fixture.output_epoch.get(),
+            crtc_id,
+        },
+        queued_at: now,
+        primary: KmsPrimaryUpdate::Framebuffer {
+            framebuffer: FramebufferId::new(owner.framebuffer_id.get()).unwrap(),
+            in_fence: Some(in_fence),
+            request_out_fence: false,
+        },
+        cursor: KmsCursorUpdate::Unchanged,
+        cursor_delivery: PresentedCursorDelivery::Hidden,
+        primary_cursor_presentation: KmsPrimaryCursorPresentation::Preserve,
+        cursor_pin: None,
+        direct_primary_lease: None,
+        test_only_duration_ns: None,
+        pacing_ticket: Some(pacing_ticket),
+        test_policy: KmsCommitTestPolicy::from_primary(KmsTestOnlyPolicy::Skip),
+        ready_submit: true,
+    };
+    (
+        KmsCommitWorkerHandle::with_queued_job_for_test(job),
+        pacing_ticket,
+    )
+}
+
+fn append_ready_successor(fixture: &mut VariableRetryFixture) -> OutputFrameIdentitySnapshot {
+    use crate::native_output::NativeCursorDamageBounds;
+    use crate::native_output::presentation::kms_timing::KmsPresentationTiming;
+    use crate::native_output::presentation::plane::{
+        FrozenCursorTestPolicy, FrozenPrimaryCursorPlan, FrozenPrimaryCursorPresentation,
+    };
+    use crate::native_output::presentation::transaction::OutputTransaction;
+    use crate::native_output::runtime::scene_history::NativeFrameSceneSnapshot;
+    use oblivion_one::compositor::PresentationFrameSnapshot;
+    use oblivion_one::native::buffering::PresentationOpportunityId;
+    use oblivion_one::native::presentation_deadline::MonotonicTimestampNs;
+    use oblivion_one::native::scheduler::NativeOutputPacingMode;
+    use oblivion_one::window_lifecycle_animation::LifecycleFrameSnapshot;
+
+    let slot = fixture.swapchain.acquire_render_slot().unwrap();
+    fixture
+        .swapchain
+        .prepare_ready_for_test(
+            slot,
+            signaled_retry_render_fence(),
+            FrozenPrimaryCursorPlan {
+                delivery: PresentedCursorDelivery::Hidden,
+                primary_presentation: FrozenPrimaryCursorPresentation::Preserve,
+                cursor_test_policy: FrozenCursorTestPolicy::Required,
+            },
+            None,
+        )
+        .unwrap();
+    let anchor = MonotonicTimestampNs::new(2_000_000_000);
+    let earliest = MonotonicTimestampNs::new(anchor.get() + 6_060_606);
+    let reservation =
+        variable_reservation(PresentationOpportunityId::new(2, 1), anchor, earliest, None);
+    fixture
+        .swapchain
+        .set_ready_variable_presentation_for_test(
+            reservation,
+            KmsPresentationTiming::variable(earliest.get()),
+        )
+        .unwrap();
+    let owner = fixture.swapchain.ready_identity().unwrap();
+    let batch_id = fixture.server.take_frame_batch_for_render(owner.frame_id);
+    assert_eq!(batch_id, owner.protocol_batch_id);
+    fixture.server.note_frame_callbacks_deferred_ready(batch_id);
+
+    fixture
+        .frame_pacing
+        .queue_visual(5, owner.render_generation);
+    fixture
+        .frame_pacing
+        .note_render_started(NativeOutputPacingMode::ReactiveDouble, false)
+        .unwrap();
+    fixture
+        .frame_pacing
+        .bind_physical_output_frame(owner)
+        .unwrap();
+    fixture.frame_pacing.note_ready_frame(6, true);
+    fixture.frame_scheduler.queue_visual_work();
+    fixture.frame_scheduler.consume_visual_work();
+    fixture.frame_scheduler.note_ready_frame(None);
+
+    assert!(
+        fixture
+            .scene_history
+            .replace_ready(NativeFrameSceneSnapshot {
+                output_id: owner.output_id,
+                frame_id: owner.frame_id,
+                render_generation: owner.render_generation,
+                scene: NativeSceneSnapshot::from_surfaces_with_scene_nodes(
+                    &[],
+                    &[],
+                    Vec::new(),
+                    &[]
+                ),
+                cursor_damage: NativeCursorDamageBounds::default(),
+                presentation: PresentationFrameSnapshot::empty_for_output(owner.output_id),
+                lifecycle: LifecycleFrameSnapshot::default(),
+                canonical_scene_evidence: None,
+                window_exit_evidence: Vec::new(),
+            })
+    );
+    let transaction = OutputTransaction::composited_variable_with_direct_equivalence(
+        owner.output_id,
+        owner.transaction_id,
+        fixture.output_epoch.get(),
+        MonotonicTimestampNs::new(7),
+        reservation,
+        crate::native_output::DrmContentType::Graphics,
+        NativeOutputPacingMode::ReactiveDouble,
+        owner.frame_id,
+        owner.render_generation,
+        owner.pool_generation,
+        owner.slot,
+        owner.framebuffer_id.get(),
+        None,
+        batch_id,
+        None,
+    )
+    .unwrap();
+    fixture.output_transactions.insert(transaction).unwrap();
+    fixture
+        .output_transactions
+        .mark_ready(owner.transaction_id, MonotonicTimestampNs::new(8))
+        .unwrap();
+    owner
+}
+
+#[test]
+fn direct_entry_retires_worker_and_ready_successors_before_invalidating_scene_baseline() {
+    use crate::native_output::presentation::ledger::{
+        OutputTransactionDropReason, OutputTransactionState, OutputTransactionTerminal,
+    };
+    let mut mismatch = variable_retry_fixture(VariableRetryPacingLane::Ready);
+    assert!(
+        mismatch
+            .scene_history
+            .discard_ready_if_identity(mismatch.owner.frame_id, mismatch.owner.render_generation)
+    );
+    let mismatch_error = validate_reconfiguration_frame_ownership_for_swapchain(
+        &mismatch.swapchain,
+        mismatch.output_epoch,
+        &mismatch.scene_history,
+        &mismatch.frame_pacing,
+        &mismatch.frame_scheduler,
+        &mismatch.output_transactions,
+    )
+    .expect_err("the strict validator rejects physical READY without scene READY");
+    assert!(
+        mismatch_error
+            .to_string()
+            .contains("unsubmitted READY has no matching scene-history READY owner")
+    );
+
+    let mut fixture = variable_retry_fixture(VariableRetryPacingLane::Ready);
+    let output_epoch = fixture.output_epoch;
+    let crtc_id = 7;
+    let direct_token = PageFlipToken::new(700).unwrap();
+    let direct_transaction_id = OutputTransactionId::new(NonZeroU64::new(700).unwrap());
+    let direct_kind = AtomicCommitKind::DirectPrimary {
+        transaction_id: direct_transaction_id,
+        direct_token,
+        framebuffer_id: 90,
+    };
+    let mut atomic_commit_arbiter = AtomicCommitArbiter::new();
+    atomic_commit_arbiter
+        .reserve_worker_queued(direct_token, output_epoch.get(), crtc_id, direct_kind, 1)
+        .unwrap();
+    atomic_commit_arbiter
+        .mark_kernel_submitted(direct_token, 2, 3)
+        .unwrap();
+
+    let worker_token = PageFlipToken::new(701).unwrap();
+    let (worker, worker_pacing_ticket) = queue_fixture_ready_as_worker(
+        &mut fixture,
+        &mut atomic_commit_arbiter,
+        worker_token,
+        crtc_id,
+    );
+    let ready_owner = append_ready_successor(&mut fixture);
+    assert_eq!(
+        fixture
+            .swapchain
+            .worker_queued_identity()
+            .map(|identity| identity.frame),
+        Some(fixture.owner)
+    );
+    assert_eq!(fixture.swapchain.ready_identity(), Some(ready_owner));
+    assert_eq!(
+        fixture.scene_history.submitted_frame_id(worker_token.get()),
+        Some(fixture.owner.frame_id)
+    );
+    assert_eq!(
+        fixture.scene_history.ready_frame_identity(),
+        Some((ready_owner.frame_id, ready_owner.render_generation))
+    );
+    assert_eq!(
+        fixture.frame_pacing.unsubmitted_physical_identity(),
+        Some(ready_owner)
+    );
+    assert!(fixture.frame_scheduler.ready_frame_queued());
+    assert!(
+        fixture
+            .output_transactions
+            .active_transaction_ids()
+            .contains(&fixture.owner.transaction_id)
+    );
+    assert!(
+        fixture
+            .output_transactions
+            .active_transaction_ids()
+            .contains(&ready_owner.transaction_id)
+    );
+    let direct_completion =
+        atomic_commit_arbiter.complete(direct_token, output_epoch.get(), crtc_id);
+    assert!(matches!(
+        direct_completion,
+        AtomicCommitCompletion::Completed { kind, .. } if kind == direct_kind
+    ));
+
+    let mut atomic_cursor = None;
+    let mut cursor_output_arbitration = NativeCursorOutputArbitration::default();
+    let mut emergency_worker_jobs = Vec::new();
+    let mut queued_redraw_requested = false;
+    let retirement = retire_direct_entry_future_composited_owners(
+        &mut fixture.swapchain,
+        Some(&worker),
+        crtc_id,
+        output_epoch,
+        &mut fixture.scene_history,
+        &mut fixture.frame_pacing,
+        &mut fixture.frame_scheduler,
+        &mut atomic_cursor,
+        &mut cursor_output_arbitration,
+        &mut atomic_commit_arbiter,
+        &mut fixture.server,
+        &mut fixture.output_transactions,
+        &mut emergency_worker_jobs,
+        &mut queued_redraw_requested,
+        direct_transaction_id,
+        direct_token,
+        NativePerfLogger::from_env(),
+    )
+    .unwrap();
+
+    assert_eq!(retirement.worker_frame_id, Some(fixture.owner.frame_id));
+    assert_eq!(retirement.ready_frame_id, Some(ready_owner.frame_id));
+    assert_eq!(fixture.swapchain.worker_queued_identity(), None);
+    assert_eq!(fixture.swapchain.ready_identity(), None);
+    assert!(fixture.swapchain.contains_suspended_frame(fixture.owner));
+    assert!(fixture.swapchain.contains_suspended_frame(ready_owner));
+    assert_eq!(
+        fixture.scene_history.submitted_frame_id(worker_token.get()),
+        None
+    );
+    assert_eq!(fixture.scene_history.ready_frame_identity(), None);
+    assert_eq!(fixture.frame_pacing.ready, None);
+    assert_eq!(fixture.frame_pacing.unsubmitted_physical_identity(), None);
+    assert!(!fixture.frame_pacing.active_worker_owned());
+    assert!(!fixture.frame_scheduler.ready_frame_queued());
+    assert!(fixture.frame_scheduler.visual_work_queued());
+    assert!(queued_redraw_requested);
+    assert!(emergency_worker_jobs.is_empty());
+    assert!(atomic_commit_arbiter.worker_queued_kind().is_none());
+    assert!(
+        fixture
+            .output_transactions
+            .active_transaction_ids()
+            .is_empty()
+    );
+    for owner in [fixture.owner, ready_owner] {
+        assert!(matches!(
+            fixture
+                .output_transactions
+                .transaction_including_terminal(owner.transaction_id)
+                .unwrap()
+                .state(),
+            OutputTransactionState::Terminal(OutputTransactionTerminal::Dropped {
+                reason: OutputTransactionDropReason::SafeAbandonment,
+                ..
+            })
+        ));
+    }
+    assert!(
+        !fixture
+            .frame_pacing
+            .cancel_worker_submission(Some(worker_pacing_ticket))
+    );
+    assert_eq!(fixture.output_epoch, output_epoch);
+
+    fixture
+        .scene_history
+        .invalidate_presented_composited_baseline();
+    assert_eq!(fixture.scene_history.presented_frame_id(), None);
+    validate_reconfiguration_frame_ownership_for_swapchain(
+        &fixture.swapchain,
+        output_epoch,
+        &fixture.scene_history,
+        &fixture.frame_pacing,
+        &fixture.frame_scheduler,
+        &fixture.output_transactions,
+    )
+    .unwrap();
+    assert!(fixture.frame_scheduler.visual_work_queued());
 }
