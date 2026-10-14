@@ -759,6 +759,34 @@ const DIAGNOSTIC_VIRTUAL_RGBA16F_BOUNDARY: &str = r#"vec4 typhon_virtual_rgba16f
 }"#;
 
 #[cfg(test)]
+const DIAGNOSTIC_VIRTUAL_RGBA16F_RTZ_ALIAS: &str = r#"vec4 typhon_virtual_rgba16f_rtz(vec4 value) {
+    return typhon_virtual_rgba16f_boundary(value);
+}"#;
+
+#[cfg(test)]
+const DIAGNOSTIC_CANONICAL_EFFECT_COORDINATES: &str = r#"vec2 typhon_canonical_effect_local_pixel() {
+    ivec2 storage_pixel = ivec2(floor(gl_FragCoord.xy));
+    int logical_y = u_effect_target_flip_y != 0
+        ? storage_pixel.y
+        : int(u_effect_output_size.y) - 1 - storage_pixel.y;
+    vec2 logical_pixel = vec2(float(storage_pixel.x), float(logical_y)) +
+        u_effect_output_domain.xy;
+    return logical_pixel - u_effect_input_domain.xy;
+}
+
+vec2 typhon_canonical_effect_local_uv() {
+    return (typhon_canonical_effect_local_pixel() + vec2(0.5)) /
+        u_effect_input_domain.zw;
+}
+
+float typhon_canonical_effect_noise() {
+    vec2 canonical_noise_uv = typhon_canonical_effect_local_uv();
+    return fract(
+        sin(dot(canonical_noise_uv, vec2(12.9898, 78.233))) * 43758.5453
+    ) - 0.5;
+}"#;
+
+#[cfg(test)]
 fn replace_diagnostic_shader_once(source: &mut String, before: &str, after: &str) {
     assert_eq!(
         source.matches(before).count(),
@@ -832,6 +860,34 @@ pub(crate) fn diagnostic_fragment_stage_q2_shader() -> String {
 }
 
 #[cfg(test)]
+pub(crate) fn diagnostic_canonical_material_shader() -> String {
+    let mut source = FRAGMENT_STAGE_FRAGMENT_SHADER.to_owned();
+    replace_diagnostic_shader_once(
+        &mut source,
+        "uniform int u_effect_input_flip_y;",
+        "uniform int u_effect_input_flip_y;\nuniform highp int u_effect_target_flip_y;\nuniform vec2 u_effect_output_size;\nuniform vec4 u_effect_input_domain;\nuniform vec4 u_effect_output_domain;",
+    );
+    replace_diagnostic_shader_once(
+        &mut source,
+        "void main() {",
+        &format!("{DIAGNOSTIC_CANONICAL_EFFECT_COORDINATES}\n\nvoid main() {{"),
+    );
+    replace_diagnostic_shader_once(
+        &mut source,
+        "    float noise = fract(sin(dot(v_uv, vec2(12.9898, 78.233))) * 43758.5453) - 0.5;",
+        "    float noise = typhon_canonical_effect_noise();",
+    );
+    source
+}
+
+#[cfg(test)]
+pub(crate) fn diagnostic_canonical_noise_field_shader() -> String {
+    format!(
+        "#version 300 es\nprecision highp float;\nprecision highp int;\nuniform vec2 u_effect_output_size;\nuniform vec4 u_effect_input_domain;\nuniform vec4 u_effect_output_domain;\nuniform highp int u_effect_target_flip_y;\nout highp vec4 out_color;\n\n{DIAGNOSTIC_CANONICAL_EFFECT_COORDINATES}\n\nvoid main() {{\n    float noise = typhon_canonical_effect_noise();\n    uint bits = floatBitsToUint(noise);\n    out_color = vec4(\n        float(bits & 255u),\n        float((bits >> 8u) & 255u),\n        float((bits >> 16u) & 255u),\n        float((bits >> 24u) & 255u)\n    );\n}}\n"
+    )
+}
+
+#[cfg(test)]
 pub(crate) fn diagnostic_fragment_stage_boundary_probe_shader(q2: bool, channel: &str) -> String {
     let mut source = FRAGMENT_STAGE_FRAGMENT_SHADER.to_owned();
     if q2 {
@@ -859,7 +915,7 @@ pub(crate) fn diagnostic_terminal_shader_with_virtual_boundaries(q1: bool, q2: b
     replace_diagnostic_shader_once(
         &mut source,
         "uniform vec2 u_effect_output_size;",
-        "uniform vec2 u_effect_output_size;\nuniform highp int u_effect_target_flip_y;",
+        "uniform vec2 u_effect_output_size;\nuniform highp int u_effect_target_flip_y;\nuniform vec4 u_effect_output_domain;",
     );
     replace_diagnostic_shader_once(
         &mut source,
@@ -873,7 +929,7 @@ pub(crate) fn diagnostic_terminal_shader_with_virtual_boundaries(q1: bool, q2: b
     );
     if q1 || q2 {
         let main = format!(
-            "{TEST_MANUAL_BINARY16_GLSL}\n{DIAGNOSTIC_VIRTUAL_RGBA16F_BOUNDARY}\n\nvoid main() {{"
+            "{TEST_MANUAL_BINARY16_GLSL}\n{DIAGNOSTIC_VIRTUAL_RGBA16F_BOUNDARY}\n{DIAGNOSTIC_VIRTUAL_RGBA16F_RTZ_ALIAS}\n\nvoid main() {{"
         );
         replace_diagnostic_shader_once(&mut source, "void main() {", &main);
     }
@@ -881,16 +937,64 @@ pub(crate) fn diagnostic_terminal_shader_with_virtual_boundaries(q1: bool, q2: b
         replace_diagnostic_shader_once(
             &mut source,
             "    result = u_effect_color_matrix * result + u_effect_color_bias;",
-            "    result = typhon_virtual_rgba16f_boundary(result);\n    result = u_effect_color_matrix * result + u_effect_color_bias;",
+            "    result = typhon_virtual_rgba16f_rtz(result);\n    result = u_effect_color_matrix * result + u_effect_color_bias;",
         );
     }
     if q2 {
         replace_diagnostic_shader_once(
             &mut source,
             "    result = typhon_sanitize_premultiplied(result);\n    if (u_effect_encode_srgb != 0)",
-            "    result = typhon_sanitize_premultiplied(result);\n    result = typhon_virtual_rgba16f_boundary(result);\n    if (u_effect_encode_srgb != 0)",
+            "    result = typhon_sanitize_premultiplied(result);\n    result = typhon_virtual_rgba16f_rtz(result);\n    if (u_effect_encode_srgb != 0)",
         );
     }
+    source
+}
+
+#[cfg(test)]
+pub(crate) fn diagnostic_canonical_terminal_shader_with_virtual_boundaries(
+    q1: bool,
+    q2: bool,
+) -> String {
+    let mut source = diagnostic_terminal_shader_with_virtual_boundaries(q1, q2);
+    replace_diagnostic_shader_once(
+        &mut source,
+        "vec2 typhon_effect_sample_uv(vec2 logical_uv) {",
+        &format!(
+            "{DIAGNOSTIC_CANONICAL_EFFECT_COORDINATES}\n\nvec2 typhon_effect_sample_uv(vec2 logical_uv) {{"
+        ),
+    );
+    replace_diagnostic_shader_once(
+        &mut source,
+        "vec2 logical_output_pixel = vec2(float(storage_pixel.x), float(logical_y));\n    vec2 canonical_local_pixel = logical_output_pixel - u_effect_input_domain.xy;",
+        "vec2 canonical_local_pixel = typhon_canonical_effect_local_pixel();",
+    );
+    replace_diagnostic_shader_once(
+        &mut source,
+        "    float noise = fract(sin(dot(effect_local_uv, vec2(12.9898, 78.233))) * 43758.5453) - 0.5;",
+        "    float noise = typhon_canonical_effect_noise();",
+    );
+    source
+}
+
+#[cfg(test)]
+pub(crate) fn diagnostic_canonical_terminal_q1_capture_shader() -> String {
+    let mut source = diagnostic_canonical_terminal_shader_with_virtual_boundaries(true, true);
+    replace_diagnostic_shader_once(
+        &mut source,
+        "    result = u_effect_color_matrix * result + u_effect_color_bias;",
+        "    out_color = result;\n    return;\n    result = u_effect_color_matrix * result + u_effect_color_bias;",
+    );
+    source
+}
+
+#[cfg(test)]
+pub(crate) fn diagnostic_canonical_terminal_q2_capture_shader() -> String {
+    let mut source = diagnostic_canonical_terminal_shader_with_virtual_boundaries(true, true);
+    replace_diagnostic_shader_once(
+        &mut source,
+        "    if (u_effect_encode_srgb != 0) result = typhon_encode_premultiplied_srgb(result);",
+        "    out_color = result;\n    return;\n    if (u_effect_encode_srgb != 0) result = typhon_encode_premultiplied_srgb(result);",
+    );
     source
 }
 

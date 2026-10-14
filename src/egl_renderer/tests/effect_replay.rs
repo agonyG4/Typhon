@@ -247,6 +247,43 @@ fn terminal_builtin_blur_scene(
     (ResolvedEffectScene::new(1, vec![instance]), registry)
 }
 
+fn terminal_builtin_blur_scene_with_tint(
+    rect: EffectRect,
+    visual_group: VisualGroupId,
+    material: oblivion_one::material::EffectiveMaterial,
+    tint: oblivion_one::effects::TintSpec,
+) -> (ResolvedEffectScene, oblivion_one::effects::EffectRegistry) {
+    let (scene, _) = terminal_builtin_blur_scene(rect, visual_group, material, None);
+    let mut program = oblivion_one::effects::builtin_background_material_program(material).program;
+    let matrix_id = program
+        .nodes
+        .iter()
+        .find(|node| {
+            matches!(
+                node.kind,
+                oblivion_one::effects::EffectNodeKind::ColorMatrix(_)
+            )
+        })
+        .map(|node| node.id)
+        .expect("builtin material has a ColorMatrix");
+    let noise_index = program
+        .nodes
+        .iter()
+        .position(|node| matches!(node.kind, oblivion_one::effects::EffectNodeKind::Noise(_)))
+        .expect("builtin material has a Noise stage");
+    let tint_id = oblivion_one::effects::EffectNodeId::new(5).expect("Tint node id");
+    program.nodes[noise_index].inputs = vec![tint_id];
+    program.nodes.insert(
+        noise_index,
+        oblivion_one::effects::EffectNode::tint(tint_id, matrix_id, tint),
+    );
+    let program = oblivion_one::effects::validate_effect_program(program)
+        .expect("synthetic Tint material validates");
+    let mut registry = oblivion_one::effects::EffectRegistry::empty();
+    registry.insert(program).expect("Tint material inserts");
+    (scene, registry)
+}
+
 fn terminal_graph_variant(
     scene: &ResolvedEffectScene,
     registry: &oblivion_one::effects::EffectRegistry,
@@ -713,6 +750,306 @@ fn render_terminal_replay_mode(
     (replay, read_diagnostic_pixels(&harness))
 }
 
+fn render_canonical_single_tail_pair(
+    staged_graph: &CompiledFrameGraph,
+    fused_graph: &CompiledFrameGraph,
+    output_size: (u32, u32),
+    origin: OutputFramebufferOrigin,
+    install_scene: impl Fn(&mut GlesEffectTestHarness),
+    case_name: &str,
+) -> (Vec<u8>, Vec<u8>) {
+    let staged_tails = terminal_tail_capture_ids(staged_graph);
+    assert_eq!(staged_tails.len(), 1, "{case_name} staged graph tail count");
+    let staged_tail = staged_tails[0];
+    let fused_terminal = fused_graph
+        .passes
+        .iter()
+        .find(|pass| pass.terminal_kawase.is_some())
+        .expect("fused graph retains one terminal Composite");
+    assert_eq!(fused_terminal.instance, staged_tail.instance);
+
+    let (staged_replay, staged_pixels) =
+        effects::with_test_offscreen_dither_policy(Some(false), || {
+            render_terminal_replay_mode(
+                staged_graph,
+                output_size,
+                origin,
+                |harness| install_scene(harness),
+                effects::TerminalBoundaryReplay::CanonicalStaged,
+                [staged_tail.upsample, staged_tail.fragment],
+                [staged_tail.fragment],
+            )
+        });
+    let (fused_replay, fused_pixels) =
+        effects::with_test_offscreen_dither_policy(Some(false), || {
+            render_terminal_replay_mode(
+                fused_graph,
+                output_size,
+                origin,
+                |harness| install_scene(harness),
+                effects::TerminalBoundaryReplay::CanonicalTerminalQ1Q2,
+                [],
+                [fused_terminal.id],
+            )
+        });
+
+    let staged_a = &staged_replay.captures[&staged_tail.upsample].pixels;
+    let fused_a = &fused_replay.stage_probes
+        [&(fused_terminal.id, effects::TerminalDiagnosticStage::Up2)]
+        .pixels;
+    assert_eq!(
+        staged_a, fused_a,
+        "{case_name} canonical A differs for {origin:?}"
+    );
+    let staged_b = &staged_replay.captures[&staged_tail.fragment].pixels;
+    let fused_b = &fused_replay.stage_probes[&(
+        fused_terminal.id,
+        effects::TerminalDiagnosticStage::Fragment,
+    )]
+        .pixels;
+    assert_eq!(
+        staged_b, fused_b,
+        "{case_name} canonical B differs for {origin:?}"
+    );
+    assert_eq!(
+        staged_replay.stage_probes[&(
+            staged_tail.fragment,
+            effects::TerminalDiagnosticStage::CanonicalNoiseBits
+        )]
+            .pixels,
+        fused_replay.stage_probes[&(
+            fused_terminal.id,
+            effects::TerminalDiagnosticStage::CanonicalNoiseBits
+        )]
+            .pixels,
+        "{case_name} canonical Noise bits differ for {origin:?}"
+    );
+    assert_eq!(
+        staged_pixels, fused_pixels,
+        "canonical staged and fused C differ for {case_name} at {origin:?}"
+    );
+    let summary = summarize_rgba8_difference(
+        &staged_pixels,
+        &fused_pixels,
+        output_size.0,
+        output_size.1,
+        origin,
+    );
+    assert_eq!(summary.changed_pixels, 0, "{case_name} C changed pixels");
+    assert_eq!(summary.alpha_changed_pixels, 0, "{case_name} alpha changed");
+    (staged_pixels, fused_pixels)
+}
+
+fn render_canonical_multi_tail_pair(
+    staged_graph: &CompiledFrameGraph,
+    fused_graph: &CompiledFrameGraph,
+    output_size: (u32, u32),
+    origin: OutputFramebufferOrigin,
+    install_scene: impl Fn(&mut GlesEffectTestHarness),
+    case_name: &str,
+) -> (Vec<u8>, Vec<u8>) {
+    let staged_tails = terminal_tail_capture_ids(staged_graph);
+    let fused_terminals = fused_graph
+        .passes
+        .iter()
+        .filter(|pass| pass.terminal_kawase.is_some())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        staged_tails.len(),
+        fused_terminals.len(),
+        "{case_name} staged/fused terminal tail count"
+    );
+    let capture_passes = staged_tails
+        .iter()
+        .flat_map(|tail| [tail.upsample, tail.fragment])
+        .collect::<Vec<_>>();
+    let probe_passes = fused_terminals
+        .iter()
+        .map(|pass| pass.id)
+        .collect::<Vec<_>>();
+    let (staged_replay, staged_pixels) =
+        effects::with_test_offscreen_dither_policy(Some(false), || {
+            render_terminal_replay_mode(
+                staged_graph,
+                output_size,
+                origin,
+                |harness| install_scene(harness),
+                effects::TerminalBoundaryReplay::CanonicalStaged,
+                capture_passes,
+                staged_tails.iter().map(|tail| tail.fragment),
+            )
+        });
+    let (fused_replay, fused_pixels) =
+        effects::with_test_offscreen_dither_policy(Some(false), || {
+            render_terminal_replay_mode(
+                fused_graph,
+                output_size,
+                origin,
+                |harness| install_scene(harness),
+                effects::TerminalBoundaryReplay::CanonicalTerminalQ1Q2,
+                [],
+                probe_passes,
+            )
+        });
+
+    for tail in &staged_tails {
+        let fused_terminal = fused_terminals
+            .iter()
+            .find(|pass| pass.instance == tail.instance)
+            .expect("matching fused tail exists");
+        assert_eq!(
+            staged_replay.captures[&tail.upsample].pixels,
+            fused_replay.stage_probes[&(fused_terminal.id, effects::TerminalDiagnosticStage::Up2)]
+                .pixels,
+            "{case_name} A differs at instance {} for {origin:?}",
+            tail.instance.get()
+        );
+        assert_eq!(
+            staged_replay.captures[&tail.fragment].pixels,
+            fused_replay.stage_probes[&(
+                fused_terminal.id,
+                effects::TerminalDiagnosticStage::Fragment
+            )]
+                .pixels,
+            "{case_name} B differs at instance {} for {origin:?}",
+            tail.instance.get()
+        );
+        assert_eq!(
+            staged_replay.stage_probes[&(
+                tail.fragment,
+                effects::TerminalDiagnosticStage::CanonicalNoiseBits
+            )]
+                .pixels,
+            fused_replay.stage_probes[&(
+                fused_terminal.id,
+                effects::TerminalDiagnosticStage::CanonicalNoiseBits
+            )]
+                .pixels,
+            "{case_name} Noise bits differ at instance {} for {origin:?}",
+            tail.instance.get()
+        );
+    }
+    assert_eq!(staged_pixels, fused_pixels, "{case_name} final C differs");
+    let summary = summarize_rgba8_difference(
+        &staged_pixels,
+        &fused_pixels,
+        output_size.0,
+        output_size.1,
+        origin,
+    );
+    assert_eq!(summary.changed_pixels, 0, "{case_name} changed pixels");
+    assert_eq!(summary.alpha_changed_pixels, 0, "{case_name} alpha changed");
+    (staged_pixels, fused_pixels)
+}
+
+fn render_terminal_replay_after_partial_repair(
+    graph: &CompiledFrameGraph,
+    output_size: (u32, u32),
+    origin: OutputFramebufferOrigin,
+    install_scene: impl Fn(&mut GlesEffectTestHarness),
+    repair: OutputRect,
+    mode: effects::TerminalBoundaryReplay,
+) -> (Vec<u8>, Vec<u8>) {
+    let mut harness = GlesEffectTestHarness::new(output_size.0, output_size.1);
+    install_scene(&mut harness);
+    let bounds = EffectRect::new(0, 0, output_size.0, output_size.1).expect("output bounds");
+    let config = effects::EffectDebugConfig::new(
+        effects::EffectDebugCaptureMode::Replay,
+        effects::EffectDebugKawaseMode::Partial,
+    );
+    execute_diagnostic_frame_with_terminal_replay(
+        &mut harness,
+        graph,
+        &diagnostic_repaint_plan_for_repairs_in_size(&[], true, output_size),
+        EffectRegion::from_rect(bounds),
+        true,
+        config,
+        origin,
+        mode,
+        [],
+        [],
+    );
+    update_diagnostic_background_for_surface(&harness, 7, repair, [207, 43, 89, 255]);
+    execute_diagnostic_frame_with_terminal_replay(
+        &mut harness,
+        graph,
+        &diagnostic_repaint_plan_for_repairs_in_size(&[repair], false, output_size),
+        diagnostic_region(repair),
+        false,
+        config,
+        origin,
+        mode,
+        [],
+        [],
+    );
+    let partial_pixels = read_diagnostic_pixels(&harness);
+    execute_diagnostic_frame_with_terminal_replay(
+        &mut harness,
+        graph,
+        &diagnostic_repaint_plan_for_repairs_in_size(&[], true, output_size),
+        EffectRegion::from_rect(bounds),
+        true,
+        config,
+        origin,
+        mode,
+        [],
+        [],
+    );
+    let full_pixels = read_diagnostic_pixels(&harness);
+    (partial_pixels, full_pixels)
+}
+
+fn capture_canonical_staged_noise_field(
+    graph: &CompiledFrameGraph,
+    output_size: (u32, u32),
+    origin: OutputFramebufferOrigin,
+    fragment_pass: oblivion_one::effects::GraphPassId,
+    install_scene: impl FnOnce(&mut GlesEffectTestHarness),
+) -> effects::DiagnosticTextureCapture {
+    let mut harness = GlesEffectTestHarness::new(output_size.0, output_size.1);
+    install_scene(&mut harness);
+    let bounds = EffectRect::new(0, 0, output_size.0, output_size.1).expect("output bounds");
+    let replay = effects::with_test_offscreen_dither_policy(Some(false), || {
+        execute_diagnostic_frame_with_terminal_replay(
+            &mut harness,
+            graph,
+            &diagnostic_repaint_plan_for_repairs_in_size(&[], true, output_size),
+            EffectRegion::from_rect(bounds),
+            true,
+            effects::EffectDebugConfig::new(
+                effects::EffectDebugCaptureMode::Replay,
+                effects::EffectDebugKawaseMode::Partial,
+            ),
+            origin,
+            effects::TerminalBoundaryReplay::CanonicalStaged,
+            [],
+            [fragment_pass],
+        )
+    });
+    replay.stage_probes[&(
+        fragment_pass,
+        effects::TerminalDiagnosticStage::CanonicalNoiseBits,
+    )]
+        .clone()
+}
+
+fn canonical_noise_bits_at_local_pixel(
+    capture: &effects::DiagnosticTextureCapture,
+    domain: EffectRect,
+    local_x: u32,
+    local_y: u32,
+) -> u32 {
+    assert!(local_x < domain.width && local_y < domain.height);
+    let logical_x = u32::try_from(domain.x).expect("non-negative effect domain") + local_x;
+    let logical_y = u32::try_from(domain.y).expect("non-negative effect domain") + local_y;
+    let storage_y = match capture.origin {
+        oblivion_one::effects::GraphTextureOrigin::BottomLeft => capture.height - 1 - logical_y,
+    };
+    let index = storage_y as usize * capture.width as usize + logical_x as usize;
+    let encoded = capture.pixels[index].map(|byte| byte.round() as u32);
+    encoded[0] | (encoded[1] << 8) | (encoded[2] << 16) | (encoded[3] << 24)
+}
+
 fn report_rgba16f_comparison(
     label: &str,
     legacy: &effects::DiagnosticTextureCapture,
@@ -857,7 +1194,7 @@ fn run_terminal_builtin_diagnostic_case(
     let terminal_graph = terminal_graph_variant(&scene, &registry, bounds, true);
     let tails = terminal_tail_capture_ids(&legacy_graph);
     assert_eq!(tails.len(), 1, "single blur has one canonical tail");
-    let tail = tails[0];
+    let tail = &tails[0];
     let fused_composite = terminal_graph
         .passes
         .iter()
@@ -3871,4 +4208,537 @@ fn noise_free_terminal_matrix_reports_explicit_offscreen_dither_policies() {
             all_failures.len()
         );
     }
+}
+
+#[test]
+fn canonical_staged_blur_matches_canonical_terminal_fusion_exactly() {
+    let output_size = (64, 48);
+    let bounds = EffectRect::new(0, 0, output_size.0, output_size.1).expect("output bounds");
+    let rect = bounds;
+    let visual_group = VisualGroupId::new(126).expect("visual group");
+    let (scene, registry) = terminal_builtin_blur_scene(
+        rect,
+        visual_group,
+        oblivion_one::material::EffectiveMaterial {
+            blur: 0.5,
+            saturation: 1.0,
+            noise: 0.0,
+        },
+        None,
+    );
+    let staged_graph = terminal_graph_variant(&scene, &registry, bounds, false);
+    let fused_graph = terminal_graph_variant(&scene, &registry, bounds, true);
+    let tails = terminal_tail_capture_ids(&staged_graph);
+    assert_eq!(
+        tails.len(),
+        1,
+        "canonical staged graph has one terminal tail"
+    );
+    let tail = tails[0];
+    let fused_composite = fused_graph
+        .passes
+        .iter()
+        .find(|pass| pass.terminal_kawase.is_some())
+        .expect("canonical fused graph retains its terminal Composite");
+
+    for origin in [
+        OutputFramebufferOrigin::BottomLeft,
+        OutputFramebufferOrigin::TopLeftScanout,
+    ] {
+        let (staged, canonical_staged) =
+            effects::with_test_offscreen_dither_policy(Some(false), || {
+                render_terminal_replay_mode(
+                    &staged_graph,
+                    output_size,
+                    origin,
+                    |harness| install_diagnostic_scene(harness, rect, visual_group),
+                    effects::TerminalBoundaryReplay::CanonicalStaged,
+                    [tail.upsample, tail.fragment],
+                    [],
+                )
+            });
+        let (fused, canonical_fused) =
+            effects::with_test_offscreen_dither_policy(Some(false), || {
+                render_terminal_replay_mode(
+                    &fused_graph,
+                    output_size,
+                    origin,
+                    |harness| install_diagnostic_scene(harness, rect, visual_group),
+                    effects::TerminalBoundaryReplay::CanonicalTerminalQ1Q2,
+                    [],
+                    [fused_composite.id],
+                )
+            });
+
+        assert_eq!(
+            staged.captures[&tail.upsample].pixels,
+            fused.stage_probes[&(fused_composite.id, effects::TerminalDiagnosticStage::Up2)].pixels,
+            "canonical A differs for {origin:?}"
+        );
+        assert_eq!(
+            staged.captures[&tail.fragment].pixels,
+            fused.stage_probes[&(
+                fused_composite.id,
+                effects::TerminalDiagnosticStage::Fragment
+            )]
+                .pixels,
+            "canonical B differs for {origin:?}"
+        );
+        assert_eq!(
+            canonical_staged, canonical_fused,
+            "canonical C differs for {origin:?}"
+        );
+    }
+}
+
+#[test]
+fn canonical_staged_blur_exact_matrix_and_legacy_impact() {
+    let odd_size = (161, 121);
+    let odd_rect = EffectRect::new(19, 13, 101, 75).expect("odd translated blur");
+    let even_size = (160, 120);
+    let even_rect = EffectRect::new(18, 14, 96, 72).expect("even blur");
+    let rounded = oblivion_one::effects::EffectCoverage {
+        rounded_rect: Some(oblivion_one::effects::EffectCoverageRoundedRect {
+            x: odd_rect.x as f64,
+            y: odd_rect.y as f64,
+            width: odd_rect.width as f64,
+            height: odd_rect.height as f64,
+            radius: 13.5,
+        }),
+        triangle: None,
+    };
+    let triangle = oblivion_one::effects::EffectCoverage {
+        rounded_rect: None,
+        triangle: Some(oblivion_one::effects::EffectCoverageTriangle {
+            a: [27.0, 23.0],
+            b: [108.0, 20.0],
+            c: [78.0, 79.0],
+        }),
+    };
+    let default_material = oblivion_one::material::MaterialConfiguration::default()
+        .effective()
+        .expect("production default material resolves");
+    let cases = [
+        (
+            "even_sat1_noise0",
+            even_size,
+            even_rect,
+            oblivion_one::material::EffectiveMaterial {
+                blur: 0.37,
+                saturation: 1.0,
+                noise: 0.0,
+            },
+            None,
+            false,
+        ),
+        (
+            "even_sat031_noise0",
+            even_size,
+            even_rect,
+            oblivion_one::material::EffectiveMaterial {
+                blur: 0.37,
+                saturation: 0.31,
+                noise: 0.0,
+            },
+            None,
+            true,
+        ),
+        (
+            "odd_translated_sat031_noise0",
+            odd_size,
+            odd_rect,
+            oblivion_one::material::EffectiveMaterial {
+                blur: 0.42,
+                saturation: 0.31,
+                noise: 0.0,
+            },
+            None,
+            true,
+        ),
+        (
+            "odd_translated_canonical_noise",
+            odd_size,
+            odd_rect,
+            oblivion_one::material::EffectiveMaterial {
+                blur: 0.42,
+                saturation: 0.31,
+                noise: 0.3,
+            },
+            None,
+            true,
+        ),
+        (
+            "even_canonical_noise",
+            even_size,
+            even_rect,
+            oblivion_one::material::EffectiveMaterial {
+                blur: 0.37,
+                saturation: 0.52,
+                noise: 0.3,
+            },
+            None,
+            true,
+        ),
+        (
+            "rounded_coverage",
+            odd_size,
+            odd_rect,
+            oblivion_one::material::EffectiveMaterial {
+                blur: 0.42,
+                saturation: 0.52,
+                noise: 0.0,
+            },
+            Some(rounded),
+            false,
+        ),
+        (
+            "triangle_coverage",
+            odd_size,
+            odd_rect,
+            oblivion_one::material::EffectiveMaterial {
+                blur: 0.42,
+                saturation: 0.52,
+                noise: 0.0,
+            },
+            Some(triangle),
+            false,
+        ),
+        (
+            "default_material",
+            even_size,
+            even_rect,
+            default_material,
+            None,
+            true,
+        ),
+        (
+            "high_noise_stress",
+            even_size,
+            even_rect,
+            oblivion_one::material::EffectiveMaterial {
+                blur: 0.37,
+                saturation: 0.52,
+                noise: 0.3,
+            },
+            None,
+            true,
+        ),
+    ];
+
+    for (case_index, (case_name, output_size, rect, material, coverage, report_legacy)) in
+        cases.into_iter().enumerate()
+    {
+        let bounds = EffectRect::new(0, 0, output_size.0, output_size.1).expect("output bounds");
+        let visual_group = VisualGroupId::new(140 + case_index as u32).expect("visual group");
+        let (scene, registry) = terminal_builtin_blur_scene(rect, visual_group, material, coverage);
+        let staged_graph = terminal_graph_variant(&scene, &registry, bounds, false);
+        let fused_graph = terminal_graph_variant(&scene, &registry, bounds, true);
+        assert_eq!(staged_graph.stats.terminal_blur_fusions, 0);
+        assert_eq!(fused_graph.stats.terminal_blur_fusions, 1);
+
+        for origin in [
+            OutputFramebufferOrigin::BottomLeft,
+            OutputFramebufferOrigin::TopLeftScanout,
+        ] {
+            let (canonical_staged, _) = render_canonical_single_tail_pair(
+                &staged_graph,
+                &fused_graph,
+                output_size,
+                origin,
+                |harness| install_diagnostic_scene(harness, rect, visual_group),
+                case_name,
+            );
+
+            if case_name == "even_sat1_noise0" && origin == OutputFramebufferOrigin::BottomLeft {
+                let (_, dither_on_pixels) =
+                    effects::with_test_offscreen_dither_policy(Some(true), || {
+                        render_terminal_replay_mode(
+                            &staged_graph,
+                            output_size,
+                            origin,
+                            |harness| install_diagnostic_scene(harness, rect, visual_group),
+                            effects::TerminalBoundaryReplay::CanonicalStaged,
+                            [],
+                            [],
+                        )
+                    });
+                assert_eq!(
+                    canonical_staged, dither_on_pixels,
+                    "explicit offscreen DITHER-on changed canonical C0"
+                );
+            }
+
+            if report_legacy {
+                let (_, old_pixels) = render_terminal_replay_mode(
+                    &staged_graph,
+                    output_size,
+                    origin,
+                    |harness| install_diagnostic_scene(harness, rect, visual_group),
+                    effects::TerminalBoundaryReplay::Legacy,
+                    [],
+                    [],
+                );
+                let impact = report_rgba8_comparison(
+                    &format!("old-vs-canonical {case_name} origin={origin:?}"),
+                    &old_pixels,
+                    &canonical_staged,
+                    output_size.0,
+                    output_size.1,
+                    origin,
+                );
+                println!("    compatibility impact: {impact:?}");
+            }
+        }
+    }
+
+    let tint_size = even_size;
+    let tint_rect = even_rect;
+    let tint_group = VisualGroupId::new(160).expect("Tint visual group");
+    let tint_material = oblivion_one::material::EffectiveMaterial {
+        blur: 0.37,
+        saturation: 0.31,
+        noise: 0.0,
+    };
+    let tint = oblivion_one::effects::TintSpec::new([0.96, 0.82, 1.0, 1.0], 0.35)
+        .expect("synthetic Tint validates");
+    let (tint_scene, tint_registry) =
+        terminal_builtin_blur_scene_with_tint(tint_rect, tint_group, tint_material, tint);
+    let tint_bounds = EffectRect::new(0, 0, tint_size.0, tint_size.1).expect("Tint bounds");
+    let tint_staged = terminal_graph_variant(&tint_scene, &tint_registry, tint_bounds, false);
+    let tint_fused = terminal_graph_variant(&tint_scene, &tint_registry, tint_bounds, true);
+    assert_eq!(tint_fused.stats.terminal_blur_fusions, 1);
+    for origin in [
+        OutputFramebufferOrigin::BottomLeft,
+        OutputFramebufferOrigin::TopLeftScanout,
+    ] {
+        render_canonical_single_tail_pair(
+            &tint_staged,
+            &tint_fused,
+            tint_size,
+            origin,
+            |harness| install_diagnostic_scene(harness, tint_rect, tint_group),
+            "synthetic_tint",
+        );
+    }
+}
+
+#[test]
+fn canonical_causal_abc_noise_free_and_noise_are_exact() {
+    let fixture = native_three_checkpoint_fixture();
+    for (case_name, noise) in [("causal_abc_noise0", 0.0), ("causal_abc_noise", 0.3)] {
+        let (mut scene, _) = native_three_checkpoint_backdrop_scene(fixture);
+        let program = oblivion_one::effects::builtin_background_material_program(
+            oblivion_one::material::EffectiveMaterial {
+                blur: 0.4,
+                saturation: 0.52,
+                noise,
+            },
+        );
+        let program_id = program.program.id;
+        for instance in &mut scene.instances {
+            instance.program = program_id;
+        }
+        let mut registry = oblivion_one::effects::EffectRegistry::empty();
+        registry.insert(program).expect("causal material inserts");
+        let staged_graph = terminal_graph_variant(&scene, &registry, fixture.output_bounds, false);
+        let fused_graph = terminal_graph_variant(&scene, &registry, fixture.output_bounds, true);
+        assert_eq!(staged_graph.stats.terminal_blur_fusions, 0);
+        assert_eq!(
+            fused_graph.stats.terminal_blur_fusions, 3,
+            "causal A/B/C should retain three independent tails"
+        );
+
+        for origin in [
+            OutputFramebufferOrigin::BottomLeft,
+            OutputFramebufferOrigin::TopLeftScanout,
+        ] {
+            let (canonical_staged, _) = render_canonical_multi_tail_pair(
+                &staged_graph,
+                &fused_graph,
+                fixture.output_size,
+                origin,
+                |harness| {
+                    install_native_three_checkpoint_diagnostic_scene(harness, fixture.scene);
+                },
+                case_name,
+            );
+            if noise == 0.0 && origin == OutputFramebufferOrigin::BottomLeft {
+                let (_, old_pixels) = render_terminal_replay_mode(
+                    &staged_graph,
+                    fixture.output_size,
+                    origin,
+                    |harness| {
+                        install_native_three_checkpoint_diagnostic_scene(harness, fixture.scene);
+                    },
+                    effects::TerminalBoundaryReplay::Legacy,
+                    [],
+                    [],
+                );
+                let impact = report_rgba8_comparison(
+                    "old-vs-canonical causal A/B/C",
+                    &old_pixels,
+                    &canonical_staged,
+                    fixture.output_size.0,
+                    fixture.output_size.1,
+                    origin,
+                );
+                println!("    compatibility impact causal A/B/C: {impact:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn canonical_partial_repair_matches_full_render_for_staged_and_fused_paths() {
+    let output_size = (161, 121);
+    let bounds = EffectRect::new(0, 0, output_size.0, output_size.1).expect("output bounds");
+    let rect = EffectRect::new(19, 13, 101, 75).expect("translated blur");
+    let visual_group = VisualGroupId::new(170).expect("repair visual group");
+    let (scene, registry) = terminal_builtin_blur_scene(
+        rect,
+        visual_group,
+        oblivion_one::material::EffectiveMaterial {
+            blur: 0.42,
+            saturation: 0.31,
+            noise: 0.3,
+        },
+        None,
+    );
+    let staged_graph = terminal_graph_variant(&scene, &registry, bounds, false);
+    let fused_graph = terminal_graph_variant(&scene, &registry, bounds, true);
+    let tails = terminal_tail_capture_ids(&staged_graph);
+    assert_eq!(tails.len(), 1);
+    let fused_terminal = fused_graph
+        .passes
+        .iter()
+        .find(|pass| pass.terminal_kawase.is_some())
+        .expect("fused terminal pass");
+    let repair = OutputRect::new(20, 14, 3, 2);
+
+    for origin in [
+        OutputFramebufferOrigin::BottomLeft,
+        OutputFramebufferOrigin::TopLeftScanout,
+    ] {
+        let (staged_partial, staged_full) =
+            effects::with_test_offscreen_dither_policy(Some(false), || {
+                render_terminal_replay_after_partial_repair(
+                    &staged_graph,
+                    output_size,
+                    origin,
+                    |harness| install_diagnostic_scene(harness, rect, visual_group),
+                    repair,
+                    effects::TerminalBoundaryReplay::CanonicalStaged,
+                )
+            });
+        let staged_repair_summary = summarize_rgba8_difference(
+            &staged_full,
+            &staged_partial,
+            output_size.0,
+            output_size.1,
+            origin,
+        );
+        println!("canonical partial C0 {origin:?}: {staged_repair_summary:?}");
+        assert_eq!(
+            staged_partial, staged_full,
+            "canonical C0 repair differs from full"
+        );
+
+        let (fused_partial, fused_full) =
+            effects::with_test_offscreen_dither_policy(Some(false), || {
+                render_terminal_replay_after_partial_repair(
+                    &fused_graph,
+                    output_size,
+                    origin,
+                    |harness| install_diagnostic_scene(harness, rect, visual_group),
+                    repair,
+                    effects::TerminalBoundaryReplay::CanonicalTerminalQ1Q2,
+                )
+            });
+        let fused_repair_summary = summarize_rgba8_difference(
+            &fused_full,
+            &fused_partial,
+            output_size.0,
+            output_size.1,
+            origin,
+        );
+        println!("canonical partial C1 {origin:?}: {fused_repair_summary:?}");
+        assert_eq!(
+            fused_partial, fused_full,
+            "canonical C1 repair differs from full"
+        );
+        assert_eq!(staged_full, fused_full, "canonical full C0/C1 differs");
+        assert_eq!(
+            staged_partial, fused_partial,
+            "canonical partial C0/C1 differs"
+        );
+        assert!(fused_terminal.terminal_kawase.is_some());
+    }
+}
+
+#[test]
+fn canonical_noise_seed_fields_are_origin_and_translation_independent() {
+    let output_size = (161, 121);
+    let first_rect = EffectRect::new(19, 13, 101, 75).expect("first translated domain");
+    let translated_rect = EffectRect::new(31, 22, 101, 75).expect("translated domain");
+    let material = oblivion_one::material::EffectiveMaterial {
+        blur: 0.42,
+        saturation: 0.31,
+        noise: 0.3,
+    };
+    let first_group = VisualGroupId::new(180).expect("first noise group");
+    let translated_group = VisualGroupId::new(181).expect("translated noise group");
+    let (first_scene, first_registry) =
+        terminal_builtin_blur_scene(first_rect, first_group, material, None);
+    let (translated_scene, translated_registry) =
+        terminal_builtin_blur_scene(translated_rect, translated_group, material, None);
+    let bounds = EffectRect::new(0, 0, output_size.0, output_size.1).expect("output bounds");
+    let first_graph = terminal_graph_variant(&first_scene, &first_registry, bounds, false);
+    let translated_graph =
+        terminal_graph_variant(&translated_scene, &translated_registry, bounds, false);
+    let first_tail = terminal_tail_capture_ids(&first_graph)[0];
+    let translated_tail = terminal_tail_capture_ids(&translated_graph)[0];
+
+    let first_bottom = capture_canonical_staged_noise_field(
+        &first_graph,
+        output_size,
+        OutputFramebufferOrigin::BottomLeft,
+        first_tail.fragment,
+        |harness| install_diagnostic_scene(harness, first_rect, first_group),
+    );
+    let first_top = capture_canonical_staged_noise_field(
+        &first_graph,
+        output_size,
+        OutputFramebufferOrigin::TopLeftScanout,
+        first_tail.fragment,
+        |harness| install_diagnostic_scene(harness, first_rect, first_group),
+    );
+    assert_eq!(
+        first_bottom.pixels, first_top.pixels,
+        "canonical offscreen Noise field changed with framebuffer origin"
+    );
+    let translated = capture_canonical_staged_noise_field(
+        &translated_graph,
+        output_size,
+        OutputFramebufferOrigin::TopLeftScanout,
+        translated_tail.fragment,
+        |harness| install_diagnostic_scene(harness, translated_rect, translated_group),
+    );
+    let mut distinct_noise_values = std::collections::HashSet::new();
+    for local_y in 0..first_rect.height {
+        for local_x in 0..first_rect.width {
+            let first_bits =
+                canonical_noise_bits_at_local_pixel(&first_top, first_rect, local_x, local_y);
+            let translated_bits =
+                canonical_noise_bits_at_local_pixel(&translated, translated_rect, local_x, local_y);
+            assert_eq!(
+                first_bits, translated_bits,
+                "Noise changed at local [{local_x},{local_y}]"
+            );
+            distinct_noise_values.insert(first_bits);
+        }
+    }
+    assert!(
+        distinct_noise_values.len() > 1,
+        "canonical Noise test field should contain varying seeds"
+    );
 }

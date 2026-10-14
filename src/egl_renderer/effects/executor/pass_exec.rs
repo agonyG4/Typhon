@@ -83,6 +83,7 @@ pub(super) enum DiagnosticFullscreenShader {
     TerminalKawaseQ1RedBits,
     TerminalKawaseQ1GreenBits,
     LegacyCanonicalUp2,
+    CanonicalMaterial,
     LegacyUp2AndFragment,
     TerminalUp2AndFragment,
     MaterialOnly,
@@ -97,6 +98,10 @@ pub(super) enum DiagnosticFullscreenShader {
     TerminalQ1Only,
     TerminalQ2Only,
     TerminalQ1Q2,
+    CanonicalTerminalQ1Q2,
+    CanonicalTerminalQ1Capture,
+    CanonicalTerminalQ2Capture,
+    CanonicalNoiseField,
 }
 
 #[cfg(test)]
@@ -126,6 +131,11 @@ impl DiagnosticFullscreenShader {
             Self::TerminalQ1Only => 0xD10B,
             Self::TerminalQ2Only => 0xD10C,
             Self::TerminalQ1Q2 => 0xD10D,
+            Self::CanonicalMaterial => 0xD118,
+            Self::CanonicalTerminalQ1Capture => 0xD119,
+            Self::CanonicalTerminalQ2Capture => 0xD11A,
+            Self::CanonicalNoiseField => 0xD11B,
+            Self::CanonicalTerminalQ1Q2 => 0xD11C,
         }
     }
 
@@ -148,6 +158,7 @@ impl DiagnosticFullscreenShader {
                 diagnostic_kawase_only_channel_bits_shader(true, Some("g"))
             }
             Self::LegacyCanonicalUp2 => diagnostic_legacy_up2_canonical_shader(),
+            Self::CanonicalMaterial => super::shaders::diagnostic_canonical_material_shader(),
             Self::LegacyUp2AndFragment => DIAGNOSTIC_LEGACY_UP2_FRAGMENT_SHADER.to_owned(),
             Self::TerminalUp2AndFragment => {
                 DIAGNOSTIC_TERMINAL_UP2_FRAGMENT_STAGE_SHADER.to_owned()
@@ -168,6 +179,18 @@ impl DiagnosticFullscreenShader {
             Self::TerminalQ1Only => diagnostic_terminal_shader_with_virtual_boundaries(true, false),
             Self::TerminalQ2Only => diagnostic_terminal_shader_with_virtual_boundaries(false, true),
             Self::TerminalQ1Q2 => diagnostic_terminal_shader_with_virtual_boundaries(true, true),
+            Self::CanonicalTerminalQ1Q2 => {
+                super::shaders::diagnostic_canonical_terminal_shader_with_virtual_boundaries(
+                    true, true,
+                )
+            }
+            Self::CanonicalTerminalQ1Capture => {
+                super::shaders::diagnostic_canonical_terminal_q1_capture_shader()
+            }
+            Self::CanonicalTerminalQ2Capture => {
+                super::shaders::diagnostic_canonical_terminal_q2_capture_shader()
+            }
+            Self::CanonicalNoiseField => super::shaders::diagnostic_canonical_noise_field_shader(),
         }
     }
 
@@ -1889,6 +1912,21 @@ fn execute_fullscreen_pass_impl(
                     input_plan.domain.y as f32,
                     input_plan.domain.width.max(1) as f32,
                     input_plan.domain.height.max(1) as f32,
+                );
+            }
+            if let Some(location) = uniform_location(
+                &mut renderer.runtime.effect_shaders,
+                renderer.gl,
+                shader_key,
+                program,
+                "u_effect_output_domain",
+            ) {
+                renderer.gl.uniform_4_f32(
+                    Some(&location),
+                    output_plan.domain.x as f32,
+                    output_plan.domain.y as f32,
+                    output_plan.domain.width.max(1) as f32,
+                    output_plan.domain.height.max(1) as f32,
                 );
             }
         }

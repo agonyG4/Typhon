@@ -5,11 +5,13 @@ use super::*;
 pub(crate) enum TerminalBoundaryReplay {
     Legacy,
     CanonicalLegacyUp2,
+    CanonicalStaged,
     FuseUp2AndFragment,
     FuseFragmentAndComposite,
     TerminalQ1Only,
     TerminalQ2Only,
     TerminalQ1Q2,
+    CanonicalTerminalQ1Q2,
     KawaseOnlyProbe,
     MaterialOnlyProbe,
     FragmentBoundaryProbe,
@@ -76,6 +78,7 @@ pub(crate) enum TerminalDiagnosticStage {
     FragmentQ2RedBits,
     FragmentQ2GreenBits,
     Fragment,
+    CanonicalNoiseBits,
 }
 
 #[cfg(test)]
@@ -397,6 +400,7 @@ pub(super) fn execute_graph_passes_inner(
             Some(
                 TerminalBoundaryReplay::FuseUp2AndFragment
                     | TerminalBoundaryReplay::CanonicalLegacyUp2
+                    | TerminalBoundaryReplay::CanonicalStaged
                     | TerminalBoundaryReplay::FuseFragmentAndComposite
                     | TerminalBoundaryReplay::KawaseOnlyProbe
                     | TerminalBoundaryReplay::MaterialOnlyProbe
@@ -955,6 +959,46 @@ pub(super) fn execute_graph_passes_inner(
                     )
                     .map(|()| None)
                 }
+                (Some(TerminalBoundaryReplay::CanonicalStaged), Some(tail))
+                    if tail.upsample.id == pass.id =>
+                {
+                    super::pass_exec::execute_fullscreen_pass_diagnostic(
+                        renderer,
+                        graph,
+                        textures,
+                        physical_pass,
+                        targets,
+                        super::pass_exec::DiagnosticFullscreenShader::LegacyCanonicalUp2,
+                        None,
+                        None,
+                        framebuffer_origin,
+                        true,
+                        &execution_damage.region,
+                    )
+                    .map(|()| None)
+                }
+                (Some(TerminalBoundaryReplay::CanonicalStaged), Some(tail))
+                    if tail.fragment.id == pass.id =>
+                {
+                    let stage = physical_pass
+                        .stage
+                        .as_ref()
+                        .expect("canonical Fragment retains its material stage");
+                    super::pass_exec::execute_fullscreen_pass_diagnostic(
+                        renderer,
+                        graph,
+                        textures,
+                        physical_pass,
+                        targets,
+                        super::pass_exec::DiagnosticFullscreenShader::CanonicalMaterial,
+                        Some((stage, &physical_pass.fused_stages)),
+                        None,
+                        framebuffer_origin,
+                        false,
+                        &execution_damage.region,
+                    )
+                    .map(|()| None)
+                }
                 (Some(TerminalBoundaryReplay::FuseUp2AndFragment), Some(tail))
                     if tail.fragment.id == pass.id =>
                 {
@@ -1029,6 +1073,27 @@ pub(super) fn execute_graph_passes_inner(
                         physical_pass,
                         targets,
                         super::pass_exec::DiagnosticFullscreenShader::TerminalQ1Q2,
+                        None,
+                        None,
+                        framebuffer_origin,
+                        true,
+                        &execution_damage.region,
+                    )
+                    .map(|()| {
+                        stats.composites = stats.composites.saturating_add(1);
+                        None
+                    })
+                }
+                (Some(TerminalBoundaryReplay::CanonicalTerminalQ1Q2), _)
+                    if pass.terminal_kawase.is_some() =>
+                {
+                    super::pass_exec::execute_fullscreen_pass_diagnostic(
+                        renderer,
+                        graph,
+                        textures,
+                        physical_pass,
+                        targets,
+                        super::pass_exec::DiagnosticFullscreenShader::CanonicalTerminalQ1Q2,
                         None,
                         None,
                         framebuffer_origin,
@@ -1310,6 +1375,70 @@ pub(super) fn execute_graph_passes_inner(
                         replay.stage_probes.insert(
                             (pass.id, TerminalDiagnosticStage::Fragment),
                             fragment_capture,
+                        );
+                    }
+                    TerminalBoundaryReplay::CanonicalTerminalQ1Q2
+                        if replay.probe_passes.contains(&pass.id)
+                            && pass.terminal_kawase.is_some() =>
+                    {
+                        let q1_capture = capture_terminal_stage_probe(
+                            renderer,
+                            graph,
+                            textures,
+                            pass,
+                            targets,
+                            framebuffer_origin,
+                            super::pass_exec::DiagnosticFullscreenShader::CanonicalTerminalQ1Capture,
+                            None,
+                        )?;
+                        let q2_capture = capture_terminal_stage_probe(
+                            renderer,
+                            graph,
+                            textures,
+                            pass,
+                            targets,
+                            framebuffer_origin,
+                            super::pass_exec::DiagnosticFullscreenShader::CanonicalTerminalQ2Capture,
+                            None,
+                        )?;
+                        let noise_capture = capture_terminal_stage_probe(
+                            renderer,
+                            graph,
+                            textures,
+                            pass,
+                            targets,
+                            framebuffer_origin,
+                            super::pass_exec::DiagnosticFullscreenShader::CanonicalNoiseField,
+                            None,
+                        )?;
+                        replay
+                            .stage_probes
+                            .insert((pass.id, TerminalDiagnosticStage::Up2), q1_capture);
+                        replay
+                            .stage_probes
+                            .insert((pass.id, TerminalDiagnosticStage::Fragment), q2_capture);
+                        replay.stage_probes.insert(
+                            (pass.id, TerminalDiagnosticStage::CanonicalNoiseBits),
+                            noise_capture,
+                        );
+                    }
+                    TerminalBoundaryReplay::CanonicalStaged
+                        if replay.probe_passes.contains(&pass.id)
+                            && pass.kind == RenderPassKind::Fragment =>
+                    {
+                        let noise_capture = capture_terminal_stage_probe(
+                            renderer,
+                            graph,
+                            textures,
+                            pass,
+                            targets,
+                            framebuffer_origin,
+                            super::pass_exec::DiagnosticFullscreenShader::CanonicalNoiseField,
+                            None,
+                        )?;
+                        replay.stage_probes.insert(
+                            (pass.id, TerminalDiagnosticStage::CanonicalNoiseBits),
+                            noise_capture,
                         );
                     }
                     _ => {}
