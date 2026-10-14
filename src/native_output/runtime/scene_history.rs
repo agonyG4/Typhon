@@ -286,10 +286,16 @@ impl NativeSceneHistory {
         }
     }
 
-    pub(crate) fn invalidate_presented_damage_history(&mut self) {
+    pub(crate) fn invalidate_presented_composited_baseline(&mut self) {
+        self.presented = None;
+    }
+
+    /// Drop all scene history after the old output epoch has been proven quiescent.
+    pub(crate) fn reset_composited_history_for_output_epoch(&mut self) {
         self.presented = None;
         self.ready = None;
         self.submitted.clear();
+        self.latest_submitted_frame_id = None;
     }
 
     pub(crate) fn replace_ready(&mut self, snapshot: NativeFrameSceneSnapshot) -> bool {
@@ -1403,7 +1409,7 @@ mod tests {
         assert!(history.promote_pageflip(20));
         assert_eq!(history.presented_frame_id(), Some(2));
         assert_eq!(history.latest_submitted_frame_id(), Some(3));
-        history.invalidate_presented_damage_history();
+        history.invalidate_presented_composited_baseline();
         assert_eq!(history.latest_submitted_frame_id(), Some(3));
     }
 
@@ -1434,27 +1440,44 @@ mod tests {
     }
 
     #[test]
-    fn direct_primary_boundary_has_no_composited_scene_until_return() {
+    fn direct_primary_boundary_invalidates_only_presented_composited_baseline() {
         let mut history = NativeSceneHistory::new(snapshot(1));
         history.replace_ready(snapshot(2));
         assert!(history.queue_submission(20));
+        history.replace_ready(snapshot(3));
 
-        history.invalidate_presented_damage_history();
+        history.invalidate_presented_composited_baseline();
 
         assert!(history.presented_scene_if_any().is_none());
-        assert!(history.ready.is_none());
-        assert!(history.submitted.is_empty());
+        assert_eq!(history.ready.as_ref().map(|frame| frame.frame_id), Some(3));
+        assert_eq!(history.submitted.len(), 1);
+        assert_eq!(
+            history
+                .submitted
+                .front()
+                .map(|(token, frame)| (*token, frame.frame_id)),
+            Some((20, 2))
+        );
+        assert_eq!(history.latest_submitted_frame_id(), Some(2));
         assert_eq!(
             history.cursor_damage((None, None)),
             NativeCursorDamageBounds::default()
         );
+    }
 
+    #[test]
+    fn output_epoch_reset_clears_all_composited_scene_owners() {
+        let mut history = NativeSceneHistory::new(snapshot(1));
+        history.replace_ready(snapshot(2));
+        assert!(history.queue_submission(20));
         history.replace_ready(snapshot(3));
-        assert!(history.queue_submission(30));
-        assert!(history.promote_pageflip(30));
-        assert_eq!(
-            history.presented.as_ref().map(|frame| frame.frame_id),
-            Some(3)
-        );
+
+        history.reset_composited_history_for_output_epoch();
+
+        assert!(history.presented_scene_if_any().is_none());
+        assert!(history.ready_frame_identity().is_none());
+        assert_eq!(history.submitted_frame_id(20), None);
+        assert!(history.submitted.is_empty());
+        assert_eq!(history.latest_submitted_frame_id(), None);
     }
 }

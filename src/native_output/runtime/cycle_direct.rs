@@ -116,7 +116,7 @@ pub(super) fn settle_direct_pageflip(
     } else {
         scanout.note_direct_entry();
         scanout.invalidate_presented_damage_history();
-        scene_history.invalidate_presented_damage_history();
+        scene_history.invalidate_presented_composited_baseline();
     }
     *presented_primary = Some(PresentedPrimaryAssignment::Direct {
         transaction_id,

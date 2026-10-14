@@ -2417,7 +2417,7 @@ impl NativeRuntime {
         // before allowing direct promotion on the next ordinary frame.
         self.scanout.invalidate_direct_validation_cache();
         self.last_direct_candidate_key = None;
-        self.scene_history.invalidate_presented_damage_history();
+        self.scene_history.reset_composited_history_for_output_epoch();
         self.last_client_cursor_damage = None;
         self.last_software_cursor_damage = None;
         self.last_client_cursor_path = None;
