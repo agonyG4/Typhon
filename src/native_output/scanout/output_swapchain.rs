@@ -4027,29 +4027,6 @@ mod tests {
         );
         assert_eq!(frame_pacing.predictive_o1_active_entries_for_test(), 1);
 
-        let ticket = frame_pacing
-            .reserve_worker_submission(true)
-            .expect("worker pacing reservation succeeds")
-            .expect("worker ticket for READY B");
-        assert!(ticket.ready_submit());
-        assert_eq!(ticket.physical_key(), Some(key));
-        assert_eq!(
-            ticket.physical_identity(),
-            Some(after),
-            "worker ticket must carry the Fixed snapshot created by late binding"
-        );
-        assert_eq!(
-            ticket.physical_key(),
-            Some(OutputFrameKey::from(&before)),
-            "ticket keeps the stable key across the reservation metadata change"
-        );
-        assert!(
-            frame_pacing
-                .validate_worker_queued_physical_owner(ticket, before)
-                .is_err(),
-            "matching stable key does not excuse stale DeferredO1 ticket metadata"
-        );
-
         // Continue the exact late-bound frame through the production worker
         // queue transitions and validate the same role at reconfiguration.
         use crate::native_output::runtime::{
@@ -4109,6 +4086,28 @@ mod tests {
             panic!("late binding produces a Fixed target");
         };
         assert_eq!(frame_scheduler.ready_target(), Some(target));
+        let ticket = frame_pacing
+            .reserve_worker_submission(true)
+            .expect("worker pacing reservation succeeds")
+            .expect("worker ticket for READY B");
+        assert!(ticket.ready_submit());
+        assert_eq!(ticket.physical_key(), Some(key));
+        assert_eq!(
+            ticket.physical_identity(),
+            Some(after),
+            "worker ticket must carry the Fixed snapshot created by late binding"
+        );
+        assert_eq!(
+            ticket.physical_key(),
+            Some(OutputFrameKey::from(&before)),
+            "ticket keeps the stable key across the reservation metadata change"
+        );
+        assert!(
+            frame_pacing
+                .validate_worker_queued_physical_owner(ticket, before)
+                .is_err(),
+            "matching stable key does not excuse stale DeferredO1 ticket metadata"
+        );
 
         let token = PageFlipToken::new(903).expect("worker token");
         let queued_at = now(12_300_000);
