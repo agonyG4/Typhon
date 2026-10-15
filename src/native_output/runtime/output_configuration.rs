@@ -1287,6 +1287,61 @@ impl NativeRuntime {
         Ok(())
     }
 
+    fn validate_output_configuration_ready_ownership(
+        &self,
+        explicit: &crate::native_output::scanout::AtomicEglGbmScanout,
+    ) -> NativeResult<()> {
+        if let Err(error) = super::cycle::validate_reconfiguration_frame_ownership(
+            explicit,
+            self.output_epoch,
+            &self.scene_history,
+            &self.frame_pacing,
+            &self.frame_scheduler,
+            &self.output_transactions,
+        ) {
+            let swapchain = explicit.swapchain()?;
+            let physical_ready = swapchain.ready_identity();
+            let transaction = physical_ready.and_then(|owner| {
+                self.output_transactions
+                    .transaction(owner.transaction_id)
+                    .map(|record| (owner.transaction_id, record.state().kind()))
+            });
+            let pacing_lane = physical_ready
+                .and_then(|owner| self.frame_pacing.unsubmitted_physical_frame_lane(owner));
+            let worker_snapshot = self.kms_commit_worker.as_ref().map(|worker| {
+                (
+                    worker.queue_depth(),
+                    worker.inflight(),
+                    worker.fatal_reason_name(),
+                )
+            });
+            let arbiter_snapshot = (
+                self.atomic_commit_arbiter.worker_queued_token(),
+                self.atomic_commit_arbiter.worker_queued_kind(),
+                self.atomic_commit_arbiter.kernel_submitted_token(),
+                self.atomic_commit_arbiter.kernel_submitted_kind(),
+            );
+            return Err(io::Error::other(format!(
+                "{error}; READY ownership diagnostic: output_epoch={} latest_submitted_frame_id={:?} latest_presented_frame_id={:?} physical_ready={physical_ready:?} scene_ready={:?} transaction={transaction:?} pacing_identity={:?} pacing_lane={pacing_lane:?} scheduler_ready={} scheduler_target={:?} worker_queued={:?} swapchain_submitted={:?} arbiter_queued=(token={:?},kind={:?}) arbiter_submitted=(token={:?},kind={:?}) kms_worker={worker_snapshot:?}",
+                self.output_epoch.get(),
+                self.scene_history.latest_submitted_frame_id(),
+                self.scene_history.presented_frame_id(),
+                self.scene_history.ready_frame_identity(),
+                self.frame_pacing.unsubmitted_physical_identity(),
+                self.frame_scheduler.ready_frame_queued(),
+                self.frame_scheduler.ready_target(),
+                swapchain.worker_queued_identity(),
+                swapchain.pending_identity(),
+                arbiter_snapshot.0,
+                arbiter_snapshot.1,
+                arbiter_snapshot.2,
+                arbiter_snapshot.3,
+            ))
+            .into());
+        }
+        Ok(())
+    }
+
     pub(crate) fn advance_output_configuration(
         &mut self,
         now_ns: u64,
@@ -1335,28 +1390,14 @@ impl NativeRuntime {
         };
         let candidate_render_fence_owned = pending.waiting_on_render_fence();
         if let NativeScanoutBackend::AtomicEglGbm(explicit) = &*self.scanout {
-            super::cycle::validate_reconfiguration_frame_ownership(
-                explicit,
-                self.output_epoch,
-                &self.scene_history,
-                &self.frame_pacing,
-                &self.frame_scheduler,
-                &self.output_transactions,
-            )?;
+            self.validate_output_configuration_ready_ownership(explicit)?;
         }
         let boundary = self.native_output_reconfiguration_boundary();
         if boundary.is_safe_to_retire_unsubmitted_ready_frame() {
             self.abandon_unsubmitted_output_frame()?;
         }
         if let NativeScanoutBackend::AtomicEglGbm(explicit) = &*self.scanout {
-            super::cycle::validate_reconfiguration_frame_ownership(
-                explicit,
-                self.output_epoch,
-                &self.scene_history,
-                &self.frame_pacing,
-                &self.frame_scheduler,
-                &self.output_transactions,
-            )?;
+            self.validate_output_configuration_ready_ownership(explicit)?;
         }
         if !self
             .native_output_reconfiguration_boundary()

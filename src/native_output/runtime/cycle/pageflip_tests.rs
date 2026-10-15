@@ -1302,6 +1302,272 @@ fn nvidia_ready_pacing_divergence_is_terminalized_before_a_new_output_epoch() {
     assert!(new_frame_scheduler.visual_work_queued());
 }
 
+#[test]
+fn atomic_ready_scene_publication_uses_physical_generation_after_cursor_change() {
+    use crate::native_output::NativeSceneSnapshot;
+    use crate::native_output::presentation::ledger::OutputTransactionStateKind;
+    use oblivion_one::compositor::PresentationFrameSnapshot;
+    use oblivion_one::window_lifecycle_animation::LifecycleFrameSnapshot;
+
+    let mut fixture = variable_retry_fixture(VariableRetryPacingLane::Ready);
+    let owner = fixture.owner;
+    // A cursor-only compositor generation can move ahead while the frozen
+    // scene generation stays at its previous value.
+    let frozen_scene_generation = owner.render_generation.saturating_add(1);
+    assert_ne!(frozen_scene_generation, owner.render_generation);
+
+    fixture.scene_history.discard_ready();
+    super::super::presentation_worker::replace_atomic_ready_scene(
+        &mut fixture.scene_history,
+        NativeSceneSnapshot::from_surfaces_with_scene_nodes(&[], &[], Vec::new(), &[]),
+        owner,
+        PresentationFrameSnapshot::empty_for_output(owner.output_id),
+        LifecycleFrameSnapshot::default(),
+        (None, None),
+    );
+
+    assert_eq!(
+        fixture.scene_history.ready_frame_identity(),
+        Some((owner.frame_id, owner.render_generation)),
+        "the READY scene identity must use the same render generation as its physical frame"
+    );
+    assert_eq!(fixture.swapchain.ready_identity(), Some(owner));
+    let transaction = fixture
+        .output_transactions
+        .transaction(owner.transaction_id)
+        .expect("READY transaction owner");
+    assert_eq!(
+        transaction.state().kind(),
+        OutputTransactionStateKind::Ready
+    );
+    assert_eq!(
+        transaction.descriptor().composited_frame_identity(),
+        Some((
+            owner.frame_id,
+            owner.render_generation,
+            owner.pool_generation
+        ))
+    );
+    assert_eq!(
+        fixture.frame_pacing.unsubmitted_physical_identity(),
+        Some(owner)
+    );
+    assert!(fixture.frame_scheduler.ready_frame_queued());
+    validate_reconfiguration_frame_ownership_for_swapchain(
+        &fixture.swapchain,
+        fixture.output_epoch,
+        &fixture.scene_history,
+        &fixture.frame_pacing,
+        &fixture.frame_scheduler,
+        &fixture.output_transactions,
+    )
+    .expect("strict reconfiguration validation accepts the complete READY ownership bundle");
+}
+
+#[test]
+fn invalidated_worker_replan_reaches_output_configuration_with_coherent_ready_owners() {
+    use crate::native_output::NativeOutputReconfigurationBoundary;
+    use crate::native_output::kms_worker::ValidationBaseInvalidationReason;
+    use crate::native_output::presentation::ledger::{
+        OutputTransactionDropReason, OutputTransactionStateKind, OutputTransactionTerminal,
+    };
+    use crate::native_output::presentation::transaction::OutputProtocolObligations;
+    use crate::native_output::runtime::kms_worker::{
+        ValidationBaseInvalidationDisposition, validation_base_invalidation_disposition,
+    };
+    use oblivion_one::native::presentation_deadline::MonotonicTimestampNs;
+
+    let mut fixture = variable_retry_fixture(VariableRetryPacingLane::Ready);
+    let owner = fixture.owner;
+    let output_epoch = fixture.output_epoch;
+    let crtc_id = 7;
+    let worker_token = PageFlipToken::new(701).unwrap();
+    let queued_at = MonotonicTimestampNs::new(30);
+    let kind = AtomicCommitKind::CompositedPrimary {
+        transaction_id: owner.transaction_id,
+        frame_id: owner.frame_id,
+        framebuffer_id: owner.framebuffer_id.get(),
+    };
+    let pacing_ticket = fixture
+        .frame_pacing
+        .reserve_worker_submission(true)
+        .expect("READY pacing reservation")
+        .expect("worker pacing ticket");
+    let (submission_fence, _) = fixture
+        .swapchain
+        .take_ready_for_worker(worker_token, queued_at)
+        .expect("physical READY moves to WORKER_QUEUED");
+    fixture
+        .output_transactions
+        .mark_queued(owner.transaction_id, output_epoch.get(), queued_at)
+        .expect("logical READY moves to Queued");
+    let mut arbiter = AtomicCommitArbiter::new();
+    arbiter
+        .reserve_worker_queued(
+            worker_token,
+            output_epoch.get(),
+            crtc_id,
+            kind,
+            queued_at.get(),
+        )
+        .expect("worker owns the Atomic commit lane");
+    assert!(fixture.scene_history.queue_submission(worker_token.get()));
+    fixture.frame_scheduler.consume_ready_frame();
+
+    assert_eq!(
+        validation_base_invalidation_disposition(
+            true,
+            false,
+            output_epoch.get(),
+            output_epoch.get(),
+            ValidationBaseInvalidationReason::PresentedRevisionChanged,
+        ),
+        ValidationBaseInvalidationDisposition::Replan
+    );
+    let request = ExplicitWorkerReplanRequest {
+        output_id: owner.output_id,
+        output_epoch,
+        crtc_id,
+        transaction_id: owner.transaction_id,
+        token: worker_token,
+        kind,
+        frame_id: owner.frame_id,
+        framebuffer_id: owner.framebuffer_id.get(),
+        reservation: owner.reservation,
+        queued_at,
+        ready_submit: true,
+        pacing_ticket: Some(pacing_ticket),
+        submission_fence_available: true,
+    };
+    let validated = preflight_explicit_worker_replan(
+        &fixture.swapchain,
+        request,
+        &fixture.scene_history,
+        &fixture.frame_pacing,
+        &fixture.frame_scheduler,
+        &arbiter,
+        &fixture.output_transactions,
+    )
+    .expect("the validation-base replan begins from one exact submitted owner");
+    let mut submission_fence = Some(submission_fence);
+    let mut cursor_owner = None;
+    restore_explicit_worker_replan(
+        validated,
+        &mut fixture.swapchain,
+        &mut submission_fence,
+        &mut cursor_owner,
+        &mut fixture.scene_history,
+        &mut fixture.frame_pacing,
+        &mut fixture.frame_scheduler,
+        &mut arbiter,
+        &mut fixture.output_transactions,
+        queued_at.get(),
+    )
+    .expect("production replan restores the exact frozen READY ownership");
+    drop(submission_fence);
+
+    assert_eq!(fixture.swapchain.ready_identity(), Some(owner));
+    assert_eq!(
+        fixture.scene_history.ready_frame_identity(),
+        Some((owner.frame_id, owner.render_generation))
+    );
+    assert_eq!(
+        fixture.frame_pacing.unsubmitted_physical_identity(),
+        Some(owner)
+    );
+    assert!(fixture.frame_scheduler.ready_frame_queued());
+    assert_eq!(
+        fixture
+            .output_transactions
+            .transaction(owner.transaction_id)
+            .unwrap()
+            .state()
+            .kind(),
+        OutputTransactionStateKind::Ready
+    );
+    validate_reconfiguration_frame_ownership_for_swapchain(
+        &fixture.swapchain,
+        output_epoch,
+        &fixture.scene_history,
+        &fixture.frame_pacing,
+        &fixture.frame_scheduler,
+        &fixture.output_transactions,
+    )
+    .expect("the output-configuration validation gate accepts the restored bundle");
+
+    let boundary = NativeOutputReconfigurationBoundary {
+        presentation_transaction_owned: true,
+        ..NativeOutputReconfigurationBoundary::default()
+    };
+    assert!(boundary.is_safe_to_retire_unsubmitted_ready_frame());
+    terminalize_unsubmitted_ready_frame(
+        &mut fixture.swapchain,
+        owner,
+        output_epoch,
+        &mut fixture.scene_history,
+        &mut fixture.frame_pacing,
+        &mut fixture.frame_scheduler,
+        &mut fixture.output_transactions,
+        MonotonicTimestampNs::new(40),
+        |obligations: OutputProtocolObligations| {
+            assert_eq!(obligations.frame_batch_id(), Some(owner.protocol_batch_id));
+            Ok(())
+        },
+    )
+    .expect("the output-configuration boundary retires the complete READY bundle");
+
+    assert_eq!(fixture.swapchain.ready_identity(), None);
+    assert!(!fixture.scene_history.has_ready_frame());
+    assert!(!fixture.frame_pacing.has_unsettled_output_frame_ownership());
+    assert!(!fixture.frame_scheduler.ready_frame_queued());
+    assert!(fixture.swapchain.has_suspended_ownership());
+    assert!(matches!(
+        fixture
+            .output_transactions
+            .transaction_including_terminal(owner.transaction_id)
+            .unwrap()
+            .state(),
+        OutputTransactionState::Terminal(OutputTransactionTerminal::Dropped {
+            reason: OutputTransactionDropReason::SafeAbandonment,
+            ..
+        })
+    ));
+    validate_reconfiguration_frame_ownership_for_swapchain(
+        &fixture.swapchain,
+        output_epoch,
+        &fixture.scene_history,
+        &fixture.frame_pacing,
+        &fixture.frame_scheduler,
+        &fixture.output_transactions,
+    )
+    .expect("no READY owner remains fragmented after retirement");
+
+    let mut event_loop = NativeEventLoop::new().unwrap();
+    let mut output_render_fence_token = None;
+    let recovery = recover_or_arm_suspended_output_ownership(
+        &mut SwapchainSuspendedRecovery {
+            swapchain: &mut fixture.swapchain,
+        },
+        &mut event_loop,
+        &mut output_render_fence_token,
+    )
+    .expect("output configuration either recovers or waits on the real render fence");
+    match recovery {
+        SuspendedOutputRecovery::Recovered => {
+            assert!(!fixture.swapchain.has_suspended_ownership());
+            assert!(output_render_fence_token.is_none());
+        }
+        SuspendedOutputRecovery::Waiting => {
+            let token = output_render_fence_token.expect("registered render-fence wake owner");
+            assert_eq!(
+                event_loop.source_for_token(token),
+                Some(NativeEventSource::OutputRenderFence)
+            );
+        }
+        SuspendedOutputRecovery::None => panic!("suspended READY retirement has a real owner"),
+    }
+}
+
 #[derive(Clone, Copy)]
 enum VariableRetryPacingLane {
     Active,
