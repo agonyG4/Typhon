@@ -2594,6 +2594,65 @@ fn x11_fullscreen_uses_output_geometry_and_maximize_publishes_both_axes() {
 }
 
 #[test]
+fn x11_state_request_normalizes_maximize_axes_to_full_maximize() {
+    let mut state = CompositorState::new(None);
+    let generation = XwaylandGeneration::new(NonZeroU64::new(1).unwrap());
+    let snapshot = x11_snapshot(generation, 116, 67);
+    let id = state.allocate_window_id().expect("window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_x11(id, snapshot.clone()))
+        .expect("insert X11 window");
+
+    let horizontal_only = state
+        .apply_x11_state_request(
+            snapshot.handle,
+            crate::xwayland::xwm::X11StateRequest {
+                action: crate::xwayland::xwm::X11StateAction::Add,
+                first: Some(crate::xwayland::xwm::X11StateAtom::MaximizedHorizontal),
+                second: None,
+            },
+        )
+        .expect("horizontal-only maximize state");
+    assert!(!horizontal_only.maximized);
+    assert_eq!(
+        state.window(id).expect("window").state.mode(),
+        ToplevelMode::Normal
+    );
+
+    let maximized = state
+        .apply_x11_state_request(
+            snapshot.handle,
+            crate::xwayland::xwm::X11StateRequest {
+                action: crate::xwayland::xwm::X11StateAction::Add,
+                first: Some(crate::xwayland::xwm::X11StateAtom::MaximizedHorizontal),
+                second: Some(crate::xwayland::xwm::X11StateAtom::MaximizedVertical),
+            },
+        )
+        .expect("fully maximized state");
+    assert!(maximized.maximized);
+    assert_eq!(
+        state.window(id).expect("window").state.mode(),
+        ToplevelMode::Maximized
+    );
+
+    let partial_after_remove = state
+        .apply_x11_state_request(
+            snapshot.handle,
+            crate::xwayland::xwm::X11StateRequest {
+                action: crate::xwayland::xwm::X11StateAction::Remove,
+                first: Some(crate::xwayland::xwm::X11StateAtom::MaximizedHorizontal),
+                second: None,
+            },
+        )
+        .expect("partially removed maximize state");
+    assert!(!partial_after_remove.maximized);
+    assert_eq!(
+        state.window(id).expect("window").state.mode(),
+        ToplevelMode::Normal
+    );
+}
+
+#[test]
 fn pre_map_fullscreen_snapshot_enters_fullscreen_on_admission() {
     let mut state = CompositorState::new(None);
     super::window_open_animation_tests::set_window_open_preset(

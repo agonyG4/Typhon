@@ -1242,10 +1242,12 @@ fn parse_protocols(reply: &xproto::GetPropertyReply, xwm: &Xwm) -> Option<Parsed
 
 fn parse_state(reply: &xproto::GetPropertyReply, xwm: &Xwm) -> Option<ParsedProperty> {
     let values = parse_u32s(reply)?;
+    let maximized_horizontal =
+        values.contains(&xwm.atoms.get(XwmAtomName::NetWmStateMaximizedHorz));
+    let maximized_vertical = values.contains(&xwm.atoms.get(XwmAtomName::NetWmStateMaximizedVert));
     Some(ParsedProperty::State(X11PublishedState {
         fullscreen: values.contains(&xwm.atoms.get(XwmAtomName::NetWmStateFullscreen)),
-        maximized: values.contains(&xwm.atoms.get(XwmAtomName::NetWmStateMaximizedVert))
-            || values.contains(&xwm.atoms.get(XwmAtomName::NetWmStateMaximizedHorz)),
+        maximized: super::ewmh::aggregate_maximize(maximized_horizontal, maximized_vertical),
         hidden: values.contains(&xwm.atoms.get(XwmAtomName::NetWmStateHidden)),
         activated: false,
     }))
@@ -1318,6 +1320,51 @@ mod tests {
         assert_eq!(parse_text("títle".as_bytes()), Some("títle".to_owned()));
         assert_eq!(parse_app_id(b"instance\0QtApp\0"), Some("QtApp".to_owned()));
         assert!(parse_text(&vec![b'x'; MAX_TEXT_PROPERTY_BYTES + 1]).is_none());
+    }
+
+    #[test]
+    fn net_wm_state_parser_requires_both_maximize_axes() {
+        let generation = XwaylandGeneration::new(NonZeroU64::new(1).expect("nonzero"));
+        let (xwm, _peer) = crate::xwayland::xwm::events::tests::test_fixture(generation);
+        let maximized_horz = xwm.atoms.get(XwmAtomName::NetWmStateMaximizedHorz);
+        let maximized_vert = xwm.atoms.get(XwmAtomName::NetWmStateMaximizedVert);
+
+        for (horizontal, vertical, expected_maximized) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (true, true, true),
+        ] {
+            let values = [
+                horizontal.then_some(maximized_horz),
+                vertical.then_some(maximized_vert),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+            let reply = xproto::GetPropertyReply {
+                format: 32,
+                sequence: 0,
+                length: values.len() as u32,
+                type_: u32::from(xproto::AtomEnum::ATOM),
+                bytes_after: 0,
+                value_len: values.len() as u32,
+                value: values
+                    .iter()
+                    .flat_map(|value| value.to_ne_bytes())
+                    .collect(),
+            };
+
+            let ParsedProperty::State(state) =
+                parse(PropertyKind::NetWmState, &reply, &xwm).expect("valid _NET_WM_STATE")
+            else {
+                panic!("expected parsed X11 state")
+            };
+            assert_eq!(
+                state.maximized, expected_maximized,
+                "horizontal={horizontal}, vertical={vertical}"
+            );
+        }
     }
 
     #[test]

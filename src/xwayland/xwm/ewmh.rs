@@ -58,7 +58,9 @@ mod tests {
 
     #[test]
     fn full_maximize_requires_both_axes() {
+        assert!(!aggregate_maximize(false, false));
         assert!(!aggregate_maximize(true, false));
+        assert!(!aggregate_maximize(false, true));
         assert!(aggregate_maximize(true, true));
     }
 }
