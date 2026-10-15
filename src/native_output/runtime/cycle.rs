@@ -5,6 +5,36 @@ use crate::native_output::screen_capture::{
 
 const MAX_SCREEN_CAPTURES_FAILED_PER_TURN: usize = 16;
 
+pub(super) const fn screen_capture_delivery_is_allowed(
+    shutdown_running: bool,
+    session_permits_output: bool,
+) -> bool {
+    shutdown_running && session_permits_output
+}
+
+pub(super) const fn screen_capture_waits_for_render_worker(
+    render_worker_active: bool,
+    render_worker_busy: bool,
+) -> bool {
+    render_worker_active && render_worker_busy
+}
+
+pub(super) const fn screen_capture_backlog_needs_immediate_continuation(
+    capture_pending: bool,
+    render_worker_active: bool,
+    render_worker_busy: bool,
+) -> bool {
+    capture_pending
+        && !screen_capture_waits_for_render_worker(render_worker_active, render_worker_busy)
+}
+
+pub(super) const fn process_launch_backlog_needs_immediate_continuation(
+    process_launch_backlog_pending: bool,
+    shutdown_running: bool,
+) -> bool {
+    process_launch_backlog_pending && shutdown_running
+}
+
 #[path = "cycle_direct.rs"]
 mod cycle_direct;
 #[path = "cycle/fallback.rs"]
@@ -43,6 +73,101 @@ mod dmem_shutdown_tests {
         assert!(NativeRuntime::foreground_dmem_is_eligible(true, true));
         assert!(!NativeRuntime::foreground_dmem_is_eligible(true, false));
         assert!(!NativeRuntime::foreground_dmem_is_eligible(false, true));
+    }
+}
+
+#[cfg(test)]
+mod screen_capture_lifecycle_tests {
+    use super::super::{session::NativeSessionState, shutdown::NativeShutdownLifecycle};
+    use super::*;
+
+    #[test]
+    fn screen_capture_delivery_requires_running_shutdown_and_active_session() {
+        let shutdown = NativeShutdownLifecycle::new();
+
+        assert!(screen_capture_delivery_is_allowed(
+            shutdown.is_running(),
+            NativeSessionState::Active.permits_output(),
+        ));
+        for session in [
+            NativeSessionState::Suspending,
+            NativeSessionState::Suspended,
+            NativeSessionState::Resuming,
+            NativeSessionState::Failed,
+        ] {
+            assert!(!screen_capture_delivery_is_allowed(
+                shutdown.is_running(),
+                session.permits_output(),
+            ));
+        }
+    }
+
+    #[test]
+    fn shutdown_request_rejects_and_terminalizes_pending_capture_before_progress() {
+        let mut shutdown = NativeShutdownLifecycle::new();
+        shutdown.request_shutdown(1, None).unwrap();
+        let mut pending_captures = MAX_SCREEN_CAPTURES_FAILED_PER_TURN + 1;
+        let mut terminal_captures = 0;
+        let mut backlog_continuations = 0;
+
+        assert!(!screen_capture_delivery_is_allowed(
+            shutdown.is_running(),
+            NativeSessionState::Active.permits_output(),
+        ));
+        assert!(!process_launch_backlog_needs_immediate_continuation(
+            true,
+            shutdown.is_running(),
+        ));
+        while pending_captures > 0 {
+            let failed_this_turn = pending_captures.min(MAX_SCREEN_CAPTURES_FAILED_PER_TURN);
+            pending_captures -= failed_this_turn;
+            terminal_captures += failed_this_turn;
+            backlog_continuations += usize::from(pending_captures > 0);
+        }
+
+        assert_eq!(terminal_captures, MAX_SCREEN_CAPTURES_FAILED_PER_TURN + 1);
+        assert_eq!(backlog_continuations, 1);
+        assert_eq!(
+            shutdown.advance_requested().unwrap().to,
+            ShutdownState::StoppingChildren
+        );
+    }
+
+    #[test]
+    fn busy_render_worker_keeps_capture_pending_without_immediate_continuation() {
+        let render_worker_busy = screen_capture_waits_for_render_worker(true, true);
+
+        assert!(render_worker_busy);
+        assert!(!screen_capture_backlog_needs_immediate_continuation(
+            true, true, true,
+        ));
+        assert!(screen_capture_backlog_needs_immediate_continuation(
+            true, true, false,
+        ));
+        assert!(!screen_capture_backlog_needs_immediate_continuation(
+            false, false, false,
+        ));
+    }
+
+    #[test]
+    fn repeated_capture_backlog_advances_one_request_per_turn() {
+        let mut pending_captures = 128usize;
+        let mut serviced_requests = 0;
+        let mut continuations = 0;
+
+        while pending_captures > 0 {
+            pending_captures -= 1;
+            serviced_requests += 1;
+            continuations += usize::from(screen_capture_backlog_needs_immediate_continuation(
+                pending_captures > 0,
+                false,
+                false,
+            ));
+        }
+
+        assert_eq!(serviced_requests, 128);
+        assert_eq!(continuations, 127);
+        assert_eq!(pending_captures, 0);
     }
 }
 
@@ -508,8 +633,10 @@ impl NativeRuntime {
                 );
             }
         }
-        if (self.shutdown.is_running() || !self.session.permits_output())
-            && self.server.has_pending_astrea_screen_capture()
+        if !screen_capture_delivery_is_allowed(
+            self.shutdown.is_running(),
+            self.session.permits_output(),
+        ) && self.server.has_pending_astrea_screen_capture()
         {
             self.fail_pending_screen_captures("session_inactive");
             if self.server.has_pending_astrea_screen_capture() {
@@ -780,18 +907,14 @@ impl NativeRuntime {
                     Some(self.cursor_manager.desired_configuration()),
                 )
             };
-            if launch_backlog_pending && !self.shutdown.is_running() {
+            if process_launch_backlog_needs_immediate_continuation(
+                launch_backlog_pending,
+                self.shutdown.is_running(),
+            ) {
                 self.event_loop.request_continuation(
                     oblivion_one::native::event_loop::NativeContinuationReason::ProcessLaunchBacklog,
                 )?;
             }
-        }
-        if self.shutdown.is_running()
-            && (self.server.has_pending_process_launches()
-                || self.server.has_pending_astrea_screen_capture())
-        {
-            self.finish_slow_cycle(&cycle, render_attempted)?;
-            return Ok(());
         }
         let commit_timing_planning_generation_before_prepare =
             self.server.commit_timing_planning_generation();
@@ -863,17 +986,20 @@ impl NativeRuntime {
             self.finish_slow_cycle(&cycle, render_attempted)?;
             return Ok(());
         }
-        if prepare_operation_plan.service_screen_capture {
-            if self.server.has_pending_astrea_screen_capture() {
-                self.service_pending_screen_capture()?;
-                if self.server.has_pending_astrea_screen_capture()
-                    && !self.scanout.render_worker_busy()
-                {
-                    self.event_loop.request_continuation(
-                        oblivion_one::native::event_loop::NativeContinuationReason::ScreenCaptureBacklog,
-                    )?;
-                }
-            }
+        let capture_service_attempted = prepare_operation_plan.service_screen_capture_if_pending(
+            self.server.has_pending_astrea_screen_capture(),
+            || self.service_pending_screen_capture(),
+        )?;
+        if capture_service_attempted
+            && screen_capture_backlog_needs_immediate_continuation(
+                self.server.has_pending_astrea_screen_capture(),
+                self.scanout.render_worker_active(),
+                self.scanout.render_worker_busy(),
+            )
+        {
+            self.event_loop.request_continuation(
+                oblivion_one::native::event_loop::NativeContinuationReason::ScreenCaptureBacklog,
+            )?;
         }
         let presentation_operation_plan = NativeWorkDomains::classify(
             &cycle.wakeup,
@@ -1059,22 +1185,6 @@ impl NativeRuntime {
         &mut self,
         cycle: &NativeCycleState,
     ) -> NativeResult<()> {
-        if self.shutdown.is_running()
-            && (self.server.has_pending_process_launches()
-                || self.server.has_pending_astrea_screen_capture())
-        {
-            if self.server.has_pending_process_launches() {
-                self.event_loop.request_continuation(
-                    oblivion_one::native::event_loop::NativeContinuationReason::ProcessLaunchBacklog,
-                )?;
-            }
-            if self.server.has_pending_astrea_screen_capture() {
-                self.event_loop.request_continuation(
-                    oblivion_one::native::event_loop::NativeContinuationReason::ScreenCaptureBacklog,
-                )?;
-            }
-            return Ok(());
-        }
         loop {
             match self.shutdown.state() {
                 ShutdownState::Running | ShutdownState::Complete => return Ok(()),
@@ -1543,7 +1653,17 @@ impl NativeRuntime {
     }
 
     fn service_pending_screen_capture(&mut self) -> NativeResult<()> {
-        if self.scanout.render_worker_active() && self.scanout.render_worker_busy() {
+        if !screen_capture_delivery_is_allowed(
+            self.shutdown.is_running(),
+            self.session.permits_output(),
+        ) {
+            self.fail_pending_screen_captures("session_inactive");
+            return Ok(());
+        }
+        if screen_capture_waits_for_render_worker(
+            self.scanout.render_worker_active(),
+            self.scanout.render_worker_busy(),
+        ) {
             // Keep the protocol request in the compositor backlog until the
             // serialized renderer command slot is available. The completion
             // fd will wake the reactor; no capture job is prepared here.
@@ -1552,10 +1672,6 @@ impl NativeRuntime {
         let Some(pending) = self.server.take_pending_astrea_screen_capture() else {
             return Ok(());
         };
-        if !self.session.permits_output() {
-            pending.capture.failed("session_inactive".to_owned());
-            return Ok(());
-        }
         if !self
             .server
             .astrea_screen_capture_output_is_current(pending.output_id)

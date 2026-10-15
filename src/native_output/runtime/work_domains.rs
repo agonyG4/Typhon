@@ -79,6 +79,18 @@ impl NativeCycleOperationPlan {
             || frame_completed
             || visual_work_created
     }
+
+    pub(super) fn service_screen_capture_if_pending<E>(
+        self,
+        capture_pending: bool,
+        service: impl FnOnce() -> Result<(), E>,
+    ) -> Result<bool, E> {
+        if !self.service_screen_capture || !capture_pending {
+            return Ok(false);
+        }
+        service()?;
+        Ok(true)
+    }
 }
 
 impl NativeWorkDomains {
@@ -697,6 +709,77 @@ mod tests {
     }
 
     #[test]
+    fn running_active_session_services_capture_without_a_redraw() {
+        use super::super::{
+            cycle::screen_capture_delivery_is_allowed, session::NativeSessionState,
+            shutdown::NativeShutdownLifecycle,
+        };
+
+        let shutdown = NativeShutdownLifecycle::new();
+        let session = NativeSessionState::Active;
+        let plan = NativeWorkDomains::classify(
+            &wakeup(0),
+            &NativeRuntimeState {
+                screen_capture_pending: true,
+                ..state()
+            },
+        )
+        .operation_plan();
+        let mut serviced = false;
+
+        assert!(screen_capture_delivery_is_allowed(
+            shutdown.is_running(),
+            session.permits_output(),
+        ));
+        assert!(
+            plan.service_screen_capture_if_pending(true, || {
+                serviced = true;
+                Ok::<_, ()>(())
+            })
+            .unwrap()
+        );
+        assert!(serviced);
+        assert!(!plan.presentation_admitted(false, false, false));
+    }
+
+    #[test]
+    fn suspended_session_terminalizes_capture_without_delivering_pixels() {
+        use super::super::{
+            cycle::screen_capture_delivery_is_allowed, session::NativeSessionState,
+            shutdown::NativeShutdownLifecycle,
+        };
+
+        let shutdown = NativeShutdownLifecycle::new();
+        let session = NativeSessionState::Suspended;
+        let plan = NativeWorkDomains::classify(
+            &wakeup(0),
+            &NativeRuntimeState {
+                screen_capture_pending: true,
+                ..state()
+            },
+        )
+        .operation_plan();
+        let mut pending_request = Some(());
+        let mut service_calls = 0;
+        let mut failures = 0;
+
+        if !screen_capture_delivery_is_allowed(shutdown.is_running(), session.permits_output()) {
+            pending_request.take();
+            failures += 1;
+        } else {
+            plan.service_screen_capture_if_pending(pending_request.is_some(), || {
+                service_calls += 1;
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+        }
+
+        assert_eq!(failures, 1);
+        assert_eq!(service_calls, 0);
+        assert!(pending_request.is_none());
+    }
+
+    #[test]
     fn pending_capture_is_protocol_only_work() {
         let decision = NativeWorkDomains::from_wakeup(
             &wakeup(0),
@@ -708,6 +791,167 @@ mod tests {
 
         assert_eq!(decision.work_class, NativeWorkClass::ProtocolOnly);
         assert!(!decision.service_primary_scene);
+    }
+
+    #[test]
+    fn capture_and_presentation_stages_run_after_a_bounded_launch_batch() {
+        use super::super::{
+            cycle::process_launch_backlog_needs_immediate_continuation,
+            shutdown::NativeShutdownLifecycle,
+        };
+
+        let plan = NativeWorkDomains::classify(
+            &wakeup(0),
+            &NativeRuntimeState {
+                visual_scene_debt: true,
+                screen_capture_pending: true,
+                ..state()
+            },
+        )
+        .operation_plan();
+        let process_launch_backlog_remains = true;
+        let shutdown_running = NativeShutdownLifecycle::new().is_running();
+        let mut stages = Vec::new();
+
+        if process_launch_backlog_needs_immediate_continuation(
+            process_launch_backlog_remains,
+            shutdown_running,
+        ) {
+            stages.push("process_launch_continuation");
+        }
+        if plan.service_acquire_and_prepare {
+            stages.push("acquire_prepare");
+        }
+        let capture_serviced = plan
+            .service_screen_capture_if_pending(true, || {
+                stages.push("screen_capture");
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+        if plan.presentation_admitted(false, false, false) {
+            stages.push("presentation");
+        }
+
+        assert!(capture_serviced);
+        assert_eq!(
+            stages,
+            [
+                "process_launch_continuation",
+                "acquire_prepare",
+                "screen_capture",
+                "presentation"
+            ]
+        );
+    }
+
+    #[test]
+    fn capture_only_cycle_reaches_capture_service_without_presentation() {
+        let plan = NativeWorkDomains::classify(
+            &wakeup(0),
+            &NativeRuntimeState {
+                screen_capture_pending: true,
+                ..state()
+            },
+        )
+        .operation_plan();
+        let mut capture_services = 0;
+
+        let capture_serviced = plan
+            .service_screen_capture_if_pending(true, || {
+                capture_services += 1;
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+
+        assert!(capture_serviced);
+        assert_eq!(capture_services, 1);
+        assert!(!plan.presentation_admitted(false, false, false));
+    }
+
+    #[test]
+    fn worker_busy_capture_stays_queued_until_completion() {
+        use super::super::cycle::{
+            screen_capture_backlog_needs_immediate_continuation,
+            screen_capture_waits_for_render_worker,
+        };
+
+        let plan = NativeWorkDomains::classify(
+            &wakeup(0),
+            &NativeRuntimeState {
+                screen_capture_pending: true,
+                ..state()
+            },
+        )
+        .operation_plan();
+        let mut pending_request = Some(());
+        let worker_active = true;
+        let mut worker_busy = true;
+        let mut capture_service_calls = 0;
+
+        plan.service_screen_capture_if_pending(pending_request.is_some(), || {
+            capture_service_calls += 1;
+            if !screen_capture_waits_for_render_worker(worker_active, worker_busy) {
+                pending_request.take();
+            }
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+        assert!(pending_request.is_some());
+        assert!(!screen_capture_backlog_needs_immediate_continuation(
+            pending_request.is_some(),
+            worker_active,
+            worker_busy,
+        ));
+
+        worker_busy = false;
+        plan.service_screen_capture_if_pending(pending_request.is_some(), || {
+            capture_service_calls += 1;
+            if !screen_capture_waits_for_render_worker(worker_active, worker_busy) {
+                pending_request.take();
+            }
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+
+        assert_eq!(capture_service_calls, 2);
+        assert!(pending_request.is_none());
+    }
+
+    #[test]
+    fn repeated_capture_backlog_services_one_request_per_turn() {
+        use super::super::cycle::screen_capture_backlog_needs_immediate_continuation;
+
+        let plan = NativeWorkDomains::classify(
+            &wakeup(0),
+            &NativeRuntimeState {
+                screen_capture_pending: true,
+                ..state()
+            },
+        )
+        .operation_plan();
+        let mut pending_requests = 128usize;
+        let mut services = 0;
+        let mut continuations = 0;
+
+        while pending_requests > 0 {
+            assert!(
+                plan.service_screen_capture_if_pending(true, || {
+                    pending_requests -= 1;
+                    services += 1;
+                    Ok::<_, ()>(())
+                })
+                .unwrap()
+            );
+            continuations += usize::from(screen_capture_backlog_needs_immediate_continuation(
+                pending_requests > 0,
+                false,
+                false,
+            ));
+        }
+
+        assert_eq!(services, 128);
+        assert_eq!(continuations, 127);
+        assert_eq!(pending_requests, 0);
     }
 
     #[test]
