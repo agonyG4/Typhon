@@ -1,7 +1,7 @@
 use super::*;
 use crate::native_output::pacing::NativeBufferingMetrics;
 use oblivion_one::compositor::SurfaceDamagePresentation;
-use oblivion_one::control_snapshots::BufferingPerformanceSnapshot;
+use oblivion_one::control_snapshots::{BufferingPerformanceSnapshot, ExactParallelDiagnostics};
 use oblivion_one::native::adaptive_buffering::{AdaptiveBufferingController, RenderPrediction};
 
 #[allow(clippy::too_many_arguments)]
@@ -136,6 +136,7 @@ pub(super) fn build_buffering_performance_snapshot(
     adaptive_buffering: &AdaptiveBufferingController,
     pre_render_abandoned: u64,
     prediction: &RenderPrediction,
+    exact_parallel_diagnostics: ExactParallelDiagnostics,
 ) -> BufferingPerformanceSnapshot {
     BufferingPerformanceSnapshot {
         reactive_double_frames: buffering.reactive_double_frames,
@@ -166,6 +167,7 @@ pub(super) fn build_buffering_performance_snapshot(
         predicted_exact_queue_ready_risk_ns: prediction.exact_queue_ready_risk_ns,
         predicted_parallel_service_ns: prediction.parallel_service_ns,
         predicted_parallel_samples: prediction.parallel_samples as u64,
+        exact_parallel_diagnostics,
         predicted_main_event_loop_wake_guard_ns: prediction.main_event_loop_wake_guard_ns,
         predicted_worker_submit_wake_lateness_ns: prediction.p95_worker_submit_wake_lateness_ns,
         predicted_kms_dispatch_budget_ns: prediction.kms_dispatch_budget_ns,
@@ -422,6 +424,7 @@ pub(super) fn log_output_pipeline_snapshot(
 mod tests {
     use super::{build_buffering_performance_snapshot, build_render_begin_fields};
     use crate::native_output::pacing::NativeBufferingMetrics;
+    use oblivion_one::control_snapshots::ExactParallelDiagnostics;
     use oblivion_one::native::adaptive_buffering::{
         AdaptiveBufferingController, AdaptiveRenderJournal, AdaptiveTripleBufferPolicy,
         FenceTimestampQuality, FrameTimingObservation,
@@ -461,7 +464,13 @@ mod tests {
         let prediction = AdaptiveRenderJournal::default()
             .prediction_with_kms_guard(Duration::from_millis(10), 100_000);
 
-        let snapshot = build_buffering_performance_snapshot(buffering, &adaptive, 23, &prediction);
+        let snapshot = build_buffering_performance_snapshot(
+            buffering,
+            &adaptive,
+            23,
+            &prediction,
+            ExactParallelDiagnostics::default(),
+        );
 
         assert_eq!(snapshot.reactive_double_frames, 1);
         assert_eq!(snapshot.predictive_triple_frames, 2);
@@ -622,6 +631,7 @@ mod tests {
             &adaptive,
             0,
             &prediction,
+            ExactParallelDiagnostics::default(),
         );
         let value = serde_json::to_value(snapshot).unwrap();
 

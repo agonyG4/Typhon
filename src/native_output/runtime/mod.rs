@@ -9,6 +9,8 @@ use termination::{
     NativeTerminationJournal, RuntimePhase, TerminationRecordStatus, TerminationSnapshot,
 };
 
+mod o1_branch_tail;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NativeVisualWorkQueueReason {
     SceneRepaint,

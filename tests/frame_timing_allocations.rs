@@ -123,6 +123,66 @@ fn populated_render_prediction_does_not_allocate() {
 }
 
 #[test]
+fn exact_frame_recording_with_decomposition_does_not_allocate() {
+    let mut journal = AdaptiveRenderJournal::default();
+    let target_time = MonotonicTimestampNs::new(1_000_000_000);
+    let target = PresentationTarget {
+        sequence: 1,
+        presentation_time: target_time,
+        submit_not_before: target_time,
+        render_start_deadline: target_time,
+        refresh_interval: Duration::from_millis(6),
+        reason: PresentationTargetReason::Normal,
+        clock_generation: 1,
+        estimated: false,
+        predicted_unreachable: false,
+        physical_claim: PrimaryRefreshClaim {
+            sequence: 1,
+            presentation_time: target_time,
+            clock_generation: 1,
+        },
+        selection_evidence: Default::default(),
+    };
+
+    for value in 1..=241 {
+        let composite_ns = value * 10_000_000;
+        journal.record_frame_service_observation_with_rendered(
+            FrameTimingObservation {
+                frame_id: value,
+                target,
+                composite_started_at: MonotonicTimestampNs::new(composite_ns),
+                worker_queued_at: Some(MonotonicTimestampNs::new(composite_ns + 3_000)),
+                fence_signaled_at: Some((
+                    MonotonicTimestampNs::new(composite_ns + 5_000),
+                    FenceTimestampQuality::ExactSyncFile,
+                )),
+            },
+            Some(MonotonicTimestampNs::new(composite_ns + 2_000)),
+        );
+    }
+
+    let allocations = allocations_during(|| {
+        for value in 242..=246 {
+            let composite_ns = value * 10_000_000;
+            black_box(journal.record_frame_service_observation_with_rendered(
+                FrameTimingObservation {
+                    frame_id: value,
+                    target,
+                    composite_started_at: MonotonicTimestampNs::new(composite_ns),
+                    worker_queued_at: Some(MonotonicTimestampNs::new(composite_ns + 3_000)),
+                    fence_signaled_at: Some((
+                        MonotonicTimestampNs::new(composite_ns + 5_000),
+                        FenceTimestampQuality::ExactSyncFile,
+                    )),
+                },
+                Some(MonotonicTimestampNs::new(composite_ns + 2_000)),
+            ));
+        }
+    });
+    assert_eq!(allocations, 0);
+}
+
+#[test]
 fn populated_worker_dispatch_budget_does_not_allocate() {
     let mut model = KmsWorkerDispatchModel::default();
     for value in 1..=241 {

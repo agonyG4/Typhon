@@ -296,6 +296,9 @@ impl NativeRuntime {
             Duration::from_nanos(presentation_timing.mode().refresh_interval_ns()),
             presentation_timing.apply_guard_ns(),
         );
+        let exact_parallel_diagnostics = self
+            .render_journal
+            .exact_parallel_diagnostics(presentation_timing.mode().refresh_interval_ns());
         let compositor_cpu_render =
             timing_summary_snapshot(self.render_telemetry.snapshot().compositor_cpu_render);
         let mut gpu_residency = crate::gpu_residency::GpuResidencySnapshot::from_renderer(
@@ -315,6 +318,7 @@ impl NativeRuntime {
                 &self.adaptive_buffering,
                 self.presentation_deadline.pre_render_abandoned(),
                 &service_prediction,
+                exact_parallel_diagnostics,
             ),
             kms: KmsPerformanceSnapshot {
                 mode_refresh_interval_ns: presentation_timing.mode().refresh_interval_ns(),

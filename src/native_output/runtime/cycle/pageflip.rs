@@ -2,6 +2,7 @@ use super::super::cursor_cycle::{complete_plane_delta_pageflip, complete_primary
 use super::super::kms_worker::{
     DroppedQueuedWorkerJobTelemetry, drop_queued_worker_job_with_reason_parts,
 };
+use super::super::o1_branch_tail::{O1BranchTailEvent, O1BranchTailInput};
 use super::super::presentation_cursor::trace_presented_cursor;
 use super::super::presentation_transactions::{
     commit_prepared_presented_output_transaction, complete_presentation_feedback_obligation,
@@ -3453,16 +3454,62 @@ impl NativeRuntime {
                         outcome,
                         readiness,
                     );
-                    render_journal.record_frame_service_observation(FrameTimingObservation {
-                        frame_id: frame.frame_id,
-                        target: target,
-                        composite_started_at: frame.composite_started_at,
-                        worker_queued_at: frame.worker_queued_at,
-                        fence_signaled_at: frame.fence_signal,
-                    });
-                    let recovery_remaining_before = render_journal
-                        .prediction(target.refresh_interval)
-                        .miss_recovery_remaining;
+                    let exact_branch_sample =
+                        render_journal.record_frame_service_observation_with_rendered(
+                            FrameTimingObservation {
+                                frame_id: frame.frame_id,
+                                target,
+                                composite_started_at: frame.composite_started_at,
+                                worker_queued_at: frame.worker_queued_at,
+                                fence_signaled_at: frame.fence_signal,
+                            },
+                            Some(frame.rendered_at),
+                        );
+                    let post_record_prediction = render_journal.prediction(target.refresh_interval);
+                    let recovery_remaining_before =
+                        post_record_prediction.miss_recovery_remaining;
+                    if let Some((raw_render_ready_ns, raw_queue_ready_ns)) = exact_branch_sample {
+                        let refresh_ns = u64::try_from(target.refresh_interval.as_nanos())
+                            .unwrap_or(u64::MAX)
+                            .max(1);
+                        if raw_render_ready_ns > refresh_ns || raw_queue_ready_ns > refresh_ns {
+                            let fence_timestamp_quality = frame.fence_signal.map_or(
+                                "unavailable",
+                                |(_, quality)| match quality {
+                                    FenceTimestampQuality::ExactSyncFile => "exact_sync_file",
+                                    FenceTimestampQuality::ObservedApproximate => {
+                                        "observed_approximate"
+                                    }
+                                },
+                            );
+                            if let Some(event) = O1BranchTailEvent::new(O1BranchTailInput {
+                                frame_id: frame.frame_id,
+                                transaction_id: frame.transaction_id.get(),
+                                target_sequence: target.sequence,
+                                target_presentation_ns: target.presentation_time.get(),
+                                target_reason: target_reason_name(target.reason),
+                                target_binding: target.is_binding(),
+                                target_predicted_unreachable: target.predicted_unreachable,
+                                actual_sequence: actual_logical_sequence,
+                                presented_at_ns,
+                                refresh_ns,
+                                composite_started_ns: frame.composite_started_at.get(),
+                                rendered_observed_ns: Some(frame.rendered_at.get()),
+                                worker_handoff_begin_ns: frame.worker_queued_at.map(|at| at.get()),
+                                fence_signal_ns: frame.fence_signal.map(|(at, _)| at.get()),
+                                fence_timestamp_quality,
+                                raw_render_ready_ns,
+                                raw_queue_ready_ns,
+                                selected_render_ready_risk_ns: post_record_prediction
+                                    .exact_render_ready_risk_ns,
+                                selected_queue_ready_risk_ns: post_record_prediction
+                                    .exact_queue_ready_risk_ns,
+                                estimator_mode: post_record_prediction.estimator_mode.as_str(),
+                            }) {
+                                perf.log("native.o1_branch_tail", || event.fields());
+                            }
+                        }
+                    }
                     let recovery = apply_deadline_assessment(
                         assessment,
                         render_journal,

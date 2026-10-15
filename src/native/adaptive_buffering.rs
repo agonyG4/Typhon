@@ -1,6 +1,9 @@
 //! Deadline risk prediction and bounded adaptive-buffering policy.
 #![allow(dead_code)] // Wired into the native runtime in Task 12.
 
+use crate::control_snapshots::{
+    BranchRiskDiagnostics, BranchRiskSource, ExactParallelDiagnostics, SampleWindowDiagnostics,
+};
 use crate::native::buffering::{
     O1CreditDemandController, O1CreditDemandReason, PresentationOpportunityId,
 };
@@ -320,12 +323,65 @@ impl BranchRiskHistory {
                 .saturating_add(self.upper_positive_deviation_ns.saturating_mul(2)),
         )
     }
+
+    fn diagnostics(&self, refresh_interval_ns: u64) -> BranchRiskDiagnostics {
+        let window = sample_window_diagnostics(&self.samples_ns, refresh_interval_ns);
+        let central_risk_ns = self
+            .ewma_ns
+            .saturating_add(self.upper_positive_deviation_ns.saturating_mul(2));
+        let selected_risk_ns = window.p95_ns.max(central_risk_ns);
+        let selected_source = if self.samples_ns.is_empty() {
+            BranchRiskSource::None
+        } else if window.p95_ns >= central_risk_ns {
+            // Ties intentionally report the recent p95 floor.
+            BranchRiskSource::RecentP95
+        } else {
+            BranchRiskSource::PositiveDeviation
+        };
+
+        BranchRiskDiagnostics {
+            window,
+            ewma_ns: self.ewma_ns,
+            upper_positive_deviation_ns: self.upper_positive_deviation_ns,
+            central_risk_ns,
+            selected_risk_ns,
+            selected_source,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct DiagnosticSampleHistory {
+    samples_ns: VecDeque<u64>,
+}
+
+impl Default for DiagnosticSampleHistory {
+    fn default() -> Self {
+        Self {
+            samples_ns: VecDeque::with_capacity(SAMPLE_CAPACITY),
+        }
+    }
+}
+
+impl DiagnosticSampleHistory {
+    fn record(&mut self, sample_ns: u64) {
+        push_bounded(&mut self.samples_ns, sample_ns);
+    }
+
+    fn diagnostics(&self, refresh_interval_ns: u64) -> SampleWindowDiagnostics {
+        sample_window_diagnostics(&self.samples_ns, refresh_interval_ns)
+    }
 }
 
 #[derive(Debug, Default)]
 struct ExactParallelRiskJournal {
     render_ready: BranchRiskHistory,
     queue_ready: BranchRiskHistory,
+    composite_to_rendered_observed: DiagnosticSampleHistory,
+    post_render_handoff: DiagnosticSampleHistory,
+    fence_after_rendered_observed: DiagnosticSampleHistory,
+    rendered_observed_after_fence: DiagnosticSampleHistory,
+    decomposition_invalid_samples: u64,
 }
 
 impl ExactParallelRiskJournal {
@@ -339,6 +395,134 @@ impl ExactParallelRiskJournal {
             .samples_ns
             .len()
             .min(self.queue_ready.samples_ns.len())
+    }
+
+    fn record_decomposition(
+        &mut self,
+        observation: &FrameTimingObservation,
+        rendered_observed_at: Option<MonotonicTimestampNs>,
+    ) {
+        let Some(rendered_observed_at) = rendered_observed_at else {
+            return;
+        };
+        let Some(worker_handoff_begin) = observation.worker_queued_at else {
+            return;
+        };
+        let Some((fence_signal, FenceTimestampQuality::ExactSyncFile)) =
+            observation.fence_signaled_at
+        else {
+            return;
+        };
+
+        let composite_ns = observation.composite_started_at.get();
+        let rendered_ns = rendered_observed_at.get();
+        let worker_handoff_ns = worker_handoff_begin.get();
+        let fence_ns = fence_signal.get();
+
+        if rendered_ns < composite_ns {
+            self.decomposition_invalid_samples =
+                self.decomposition_invalid_samples.saturating_add(1);
+            return;
+        }
+        self.composite_to_rendered_observed
+            .record(rendered_ns - composite_ns);
+
+        if worker_handoff_ns < rendered_ns {
+            self.decomposition_invalid_samples =
+                self.decomposition_invalid_samples.saturating_add(1);
+        } else {
+            self.post_render_handoff
+                .record(worker_handoff_ns - rendered_ns);
+        }
+
+        if fence_ns > rendered_ns {
+            self.fence_after_rendered_observed
+                .record(fence_ns - rendered_ns);
+        } else if rendered_ns > fence_ns {
+            self.rendered_observed_after_fence
+                .record(rendered_ns - fence_ns);
+        }
+    }
+
+    fn diagnostics(&self, refresh_interval_ns: u64) -> ExactParallelDiagnostics {
+        let mut queue_before_fence_samples = 0;
+        let mut fence_before_queue_samples = 0;
+        let mut equal_samples = 0;
+        for (render_ready_ns, queue_ready_ns) in self
+            .render_ready
+            .samples_ns
+            .iter()
+            .zip(self.queue_ready.samples_ns.iter())
+        {
+            if queue_ready_ns < render_ready_ns {
+                queue_before_fence_samples += 1;
+            } else if render_ready_ns < queue_ready_ns {
+                fence_before_queue_samples += 1;
+            } else {
+                equal_samples += 1;
+            }
+        }
+
+        ExactParallelDiagnostics {
+            render_ready: self.render_ready.diagnostics(refresh_interval_ns),
+            queue_ready: self.queue_ready.diagnostics(refresh_interval_ns),
+            composite_to_rendered_observed: self
+                .composite_to_rendered_observed
+                .diagnostics(refresh_interval_ns),
+            post_render_handoff: self.post_render_handoff.diagnostics(refresh_interval_ns),
+            fence_after_rendered_observed: self
+                .fence_after_rendered_observed
+                .diagnostics(refresh_interval_ns),
+            rendered_observed_after_fence: self
+                .rendered_observed_after_fence
+                .diagnostics(refresh_interval_ns),
+            queue_before_fence_samples,
+            fence_before_queue_samples,
+            equal_samples,
+            decomposition_invalid_samples: self.decomposition_invalid_samples,
+        }
+    }
+}
+
+fn sample_window_diagnostics(
+    samples_ns: &VecDeque<u64>,
+    refresh_interval_ns: u64,
+) -> SampleWindowDiagnostics {
+    if samples_ns.is_empty() {
+        return SampleWindowDiagnostics::default();
+    }
+
+    let count = samples_ns.len().min(SAMPLE_CAPACITY);
+    let mut scratch = [0_u64; SAMPLE_CAPACITY];
+    let values = &mut scratch[..count];
+    let (front, back) = samples_ns.as_slices();
+    let front_len = front.len().min(count);
+    values[..front_len].copy_from_slice(&front[..front_len]);
+    let back_len = count - front_len;
+    values[front_len..].copy_from_slice(&back[..back_len]);
+    values.sort_unstable();
+
+    let percentile = |percent: usize| {
+        let rank = (percent * count).div_ceil(100).max(1);
+        values[rank - 1]
+    };
+
+    SampleWindowDiagnostics {
+        count,
+        latest_ns: samples_ns.back().copied().unwrap_or(0),
+        p50_ns: percentile(50),
+        p90_ns: percentile(90),
+        p95_ns: percentile(95),
+        p99_ns: percentile(99),
+        max_ns: values[count - 1],
+        over_refresh_samples: samples_ns
+            .iter()
+            .filter(|sample| **sample > refresh_interval_ns)
+            .count(),
+        over_two_refresh_samples: samples_ns
+            .iter()
+            .filter(|sample| **sample > refresh_interval_ns.saturating_mul(2))
+            .count(),
     }
 }
 
@@ -465,17 +649,34 @@ impl AdaptiveRenderJournal {
     }
 
     pub fn record_frame_service_observation(&mut self, observation: FrameTimingObservation) {
-        let Some((render_ready_ns, queue_ready_ns)) =
-            exact_parallel_branch_samples_ns(&observation)
-        else {
-            return;
-        };
+        let _ = self.record_frame_service_observation_with_rendered(observation, None);
+    }
+
+    /// Records the same authoritative exact R/Q evidence as
+    /// `record_frame_service_observation` and, when supplied, adds diagnostic
+    /// decomposition from the compositor's render-observation timestamp.
+    pub fn record_frame_service_observation_with_rendered(
+        &mut self,
+        observation: FrameTimingObservation,
+        rendered_observed_at: Option<MonotonicTimestampNs>,
+    ) -> Option<(u64, u64)> {
+        let (render_ready_ns, queue_ready_ns) = exact_parallel_branch_samples_ns(&observation)?;
         self.exact_parallel.record(
             render_ready_ns,
             queue_ready_ns,
             observation.composite_started_at,
         );
+        self.exact_parallel
+            .record_decomposition(&observation, rendered_observed_at);
         self.miss_recovery_remaining = self.miss_recovery_remaining.saturating_sub(1);
+        Some((render_ready_ns, queue_ready_ns))
+    }
+
+    /// Computes raw exact-branch distributions only for explicit performance
+    /// snapshots. Prediction and per-frame recording use their existing bounded
+    /// percentile work and never call this method.
+    pub fn exact_parallel_diagnostics(&self, refresh_interval_ns: u64) -> ExactParallelDiagnostics {
+        self.exact_parallel.diagnostics(refresh_interval_ns.max(1))
     }
 
     pub fn note_proven_deadline_miss(&mut self, disposition: EstimatorRecoveryDisposition) {
@@ -1124,7 +1325,7 @@ mod tests {
         assert_eq!(prediction.kms_dispatch_budget_ns, 250_000);
     }
 
-    fn service_target() -> PresentationTarget {
+    pub(super) fn service_target() -> PresentationTarget {
         let timestamp = MonotonicTimestampNs::new(10_000_000);
         PresentationTarget {
             sequence: 1,
@@ -1145,7 +1346,7 @@ mod tests {
         }
     }
 
-    fn service_observation(
+    pub(super) fn service_observation(
         render_started_ns: u64,
         render_signaled_ns: u64,
         worker_queued_ns: u64,
@@ -2359,6 +2560,263 @@ mod tests {
         assert_eq!(controller.mode(), AdaptiveBufferingMode::Triple);
         controller.observe_overlap_required(0);
         assert_eq!(controller.mode(), AdaptiveBufferingMode::Double);
+    }
+}
+
+#[cfg(test)]
+mod exact_parallel_diagnostics_tests {
+    use super::*;
+
+    const REFRESH_NS: u64 = 6_060_606;
+
+    fn observation(composite_ns: u64, fence_ns: u64, handoff_ns: u64) -> FrameTimingObservation {
+        super::tests::service_observation(composite_ns, fence_ns, handoff_ns, handoff_ns)
+    }
+
+    fn rendered(journal: &mut AdaptiveRenderJournal, observation: FrameTimingObservation, at: u64) {
+        journal.record_frame_service_observation_with_rendered(
+            observation,
+            Some(MonotonicTimestampNs::new(at)),
+        );
+    }
+
+    #[test]
+    fn raw_branch_window_exposes_a_rare_spike_and_selected_source() {
+        let mut journal = AdaptiveRenderJournal::default();
+        for sample in 0..SAMPLE_CAPACITY {
+            let composite_ns = 100_000_000 + sample as u64 * 10_000_000;
+            let render_ready_ns = if sample + 1 == SAMPLE_CAPACITY {
+                8_000_000
+            } else {
+                1_000_000
+            };
+            rendered(
+                &mut journal,
+                observation(
+                    composite_ns,
+                    composite_ns + render_ready_ns,
+                    composite_ns + 1_000_000,
+                ),
+                composite_ns + 500_000,
+            );
+        }
+
+        let diagnostics = journal.exact_parallel_diagnostics(REFRESH_NS);
+        let render = diagnostics.render_ready;
+        assert_eq!(render.window.count, 120);
+        assert_eq!(render.window.latest_ns, 8_000_000);
+        assert_eq!(render.window.p50_ns, 1_000_000);
+        assert_eq!(render.window.p90_ns, 1_000_000);
+        assert_eq!(render.window.p95_ns, 1_000_000);
+        assert_eq!(render.window.p99_ns, 1_000_000);
+        assert_eq!(render.window.max_ns, 8_000_000);
+        assert_eq!(render.window.over_refresh_samples, 1);
+        assert_eq!(render.window.over_two_refresh_samples, 0);
+        assert!(render.central_risk_ns > render.window.p95_ns);
+        assert_eq!(
+            render.selected_risk_ns,
+            render.window.p95_ns.max(render.central_risk_ns)
+        );
+        assert_eq!(
+            render.selected_source,
+            if render.central_risk_ns > render.window.p95_ns {
+                BranchRiskSource::PositiveDeviation
+            } else {
+                BranchRiskSource::RecentP95
+            }
+        );
+        assert_eq!(render.selected_source, BranchRiskSource::PositiveDeviation);
+    }
+
+    #[test]
+    fn diagnostic_snapshots_do_not_change_prediction() {
+        let mut journal = AdaptiveRenderJournal::default();
+        for sample in 0..WARM_PARALLEL_MIN_SAMPLES {
+            let composite_ns = 200_000_000 + sample as u64 * 10_000_000;
+            journal.record_fixed_submission_budget(500_000);
+            rendered(
+                &mut journal,
+                observation(
+                    composite_ns,
+                    composite_ns + 3_000_000,
+                    composite_ns + 4_000_000,
+                ),
+                composite_ns + 2_000_000,
+            );
+        }
+        let before = journal.prediction_with_kms_guard(Duration::from_millis(10), 300_000);
+        for _ in 0..4 {
+            let _ = journal.exact_parallel_diagnostics(10_000_000);
+        }
+        let after = journal.prediction_with_kms_guard(Duration::from_millis(10), 300_000);
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn decomposition_tracks_render_observation_handoff_and_gpu_tail() {
+        let mut journal = AdaptiveRenderJournal::default();
+        rendered(
+            &mut journal,
+            observation(0, 5_000_000, 4_000_000),
+            3_000_000,
+        );
+
+        let diagnostics = journal.exact_parallel_diagnostics(REFRESH_NS);
+        assert_eq!(diagnostics.render_ready.window.latest_ns, 5_000_000);
+        assert_eq!(diagnostics.queue_ready.window.latest_ns, 4_000_000);
+        assert_eq!(
+            diagnostics.composite_to_rendered_observed.latest_ns,
+            3_000_000
+        );
+        assert_eq!(diagnostics.post_render_handoff.latest_ns, 1_000_000);
+        assert_eq!(
+            diagnostics.fence_after_rendered_observed.latest_ns,
+            2_000_000
+        );
+        assert_eq!(diagnostics.rendered_observed_after_fence.count, 0);
+        assert_eq!(diagnostics.queue_before_fence_samples, 1);
+        assert_eq!(diagnostics.fence_before_queue_samples, 0);
+        assert_eq!(diagnostics.equal_samples, 0);
+        assert_eq!(diagnostics.decomposition_invalid_samples, 0);
+    }
+
+    #[test]
+    fn rendered_observation_after_fence_is_counted_separately() {
+        let mut journal = AdaptiveRenderJournal::default();
+        rendered(
+            &mut journal,
+            observation(0, 2_000_000, 6_000_000),
+            5_000_000,
+        );
+
+        let diagnostics = journal.exact_parallel_diagnostics(REFRESH_NS);
+        assert_eq!(diagnostics.render_ready.window.latest_ns, 2_000_000);
+        assert_eq!(diagnostics.queue_ready.window.latest_ns, 6_000_000);
+        assert_eq!(
+            diagnostics.composite_to_rendered_observed.latest_ns,
+            5_000_000
+        );
+        assert_eq!(diagnostics.post_render_handoff.latest_ns, 1_000_000);
+        assert_eq!(diagnostics.fence_after_rendered_observed.count, 0);
+        assert_eq!(
+            diagnostics.rendered_observed_after_fence.latest_ns,
+            3_000_000
+        );
+        assert_eq!(diagnostics.queue_before_fence_samples, 0);
+        assert_eq!(diagnostics.fence_before_queue_samples, 1);
+    }
+
+    #[test]
+    fn equal_branch_readiness_has_its_own_order_count() {
+        let mut journal = AdaptiveRenderJournal::default();
+        rendered(
+            &mut journal,
+            observation(0, 5_000_000, 5_000_000),
+            3_000_000,
+        );
+        let diagnostics = journal.exact_parallel_diagnostics(REFRESH_NS);
+        assert_eq!(diagnostics.equal_samples, 1);
+        assert_eq!(diagnostics.queue_before_fence_samples, 0);
+        assert_eq!(diagnostics.fence_before_queue_samples, 0);
+    }
+
+    #[test]
+    fn malformed_rendered_timestamp_does_not_reject_exact_branch_training() {
+        let malformed = observation(100, 5_100, 4_100);
+        let mut journal = AdaptiveRenderJournal::default();
+        let mut control = AdaptiveRenderJournal::default();
+        rendered(&mut journal, malformed, 99);
+        control.record_frame_service_observation(malformed);
+
+        assert_eq!(
+            journal.prediction(Duration::from_millis(10)),
+            control.prediction(Duration::from_millis(10))
+        );
+        let diagnostics = journal.exact_parallel_diagnostics(REFRESH_NS);
+        assert_eq!(diagnostics.render_ready.window.count, 1);
+        assert_eq!(diagnostics.queue_ready.window.count, 1);
+        assert_eq!(diagnostics.composite_to_rendered_observed.count, 0);
+        assert_eq!(diagnostics.post_render_handoff.count, 0);
+        assert_eq!(diagnostics.fence_after_rendered_observed.count, 0);
+        assert_eq!(diagnostics.rendered_observed_after_fence.count, 0);
+        assert_eq!(diagnostics.decomposition_invalid_samples, 1);
+    }
+
+    #[test]
+    fn malformed_handoff_rejects_only_handoff_decomposition() {
+        let mut journal = AdaptiveRenderJournal::default();
+        rendered(&mut journal, observation(0, 5_000, 3_000), 4_000);
+
+        let diagnostics = journal.exact_parallel_diagnostics(REFRESH_NS);
+        assert_eq!(diagnostics.render_ready.window.latest_ns, 5_000);
+        assert_eq!(diagnostics.queue_ready.window.latest_ns, 3_000);
+        assert_eq!(diagnostics.composite_to_rendered_observed.latest_ns, 4_000);
+        assert_eq!(diagnostics.post_render_handoff.count, 0);
+        assert_eq!(diagnostics.fence_after_rendered_observed.latest_ns, 1_000);
+        assert_eq!(diagnostics.decomposition_invalid_samples, 1);
+        assert_eq!(
+            journal
+                .prediction(Duration::from_millis(10))
+                .parallel_samples,
+            1
+        );
+    }
+
+    #[test]
+    fn approximate_fence_stays_out_of_scheduling_and_diagnostic_histories() {
+        let mut observation = observation(0, 5_000_000, 1_000_000);
+        observation.fence_signaled_at = Some((
+            MonotonicTimestampNs::new(5_000_000),
+            FenceTimestampQuality::ObservedApproximate,
+        ));
+        let mut journal = AdaptiveRenderJournal::default();
+        let accepted = journal.record_frame_service_observation_with_rendered(
+            observation,
+            Some(MonotonicTimestampNs::new(500_000)),
+        );
+
+        assert_eq!(accepted, None);
+        assert_eq!(
+            journal
+                .prediction(Duration::from_millis(10))
+                .parallel_samples,
+            0
+        );
+        let diagnostics = journal.exact_parallel_diagnostics(REFRESH_NS);
+        assert_eq!(diagnostics.render_ready.window.count, 0);
+        assert_eq!(diagnostics.queue_ready.window.count, 0);
+        assert_eq!(diagnostics.decomposition_invalid_samples, 0);
+    }
+
+    #[test]
+    fn exact_parallel_diagnostic_histories_remain_bounded() {
+        let mut journal = AdaptiveRenderJournal::default();
+        for sample in 0..=SAMPLE_CAPACITY {
+            let composite_ns = sample as u64 * 10_000_000;
+            rendered(
+                &mut journal,
+                observation(
+                    composite_ns,
+                    composite_ns + 2_000_000,
+                    composite_ns + 2_000_000,
+                ),
+                composite_ns + 1_000_000,
+            );
+        }
+
+        let diagnostics = journal.exact_parallel_diagnostics(REFRESH_NS);
+        assert_eq!(diagnostics.render_ready.window.count, SAMPLE_CAPACITY);
+        assert_eq!(diagnostics.queue_ready.window.count, SAMPLE_CAPACITY);
+        assert_eq!(
+            diagnostics.composite_to_rendered_observed.count,
+            SAMPLE_CAPACITY
+        );
+        assert_eq!(diagnostics.post_render_handoff.count, SAMPLE_CAPACITY);
+        assert_eq!(
+            diagnostics.fence_after_rendered_observed.count,
+            SAMPLE_CAPACITY
+        );
+        assert_eq!(diagnostics.rendered_observed_after_fence.count, 0);
     }
 }
 

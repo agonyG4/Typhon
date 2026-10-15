@@ -1,7 +1,50 @@
 use crate::control_snapshots::{
-    AstreactlResult, CursorSnapshot, DoctorCheck, KeyboardConfigurationSnapshot,
-    KeyboardLayoutSnapshot, WindowSnapshot,
+    AstreactlResult, CursorSnapshot, DoctorCheck, ExactParallelDiagnostics,
+    KeyboardConfigurationSnapshot, KeyboardLayoutSnapshot, WindowSnapshot,
 };
+
+fn format_exact_parallel_diagnostics(diagnostics: &ExactParallelDiagnostics) -> String {
+    let render = diagnostics.render_ready;
+    let queue = diagnostics.queue_ready;
+    format!(
+        "Exact R raw p50/p95/p99/max: {}/{}/{}/{} ns\n\
+Exact Q raw p50/p95/p99/max: {}/{}/{}/{} ns\n\
+Exact R model ewma/dev/central/selected: {}/{}/{}/{} ns ({})\n\
+Exact Q model ewma/dev/central/selected: {}/{}/{}/{} ns ({})\n\
+Pipeline p95 C/H/GPU-tail/observed-after-fence: {}/{}/{}/{} ns\n\
+R/Q over 1R/2R: {}/{}, {}/{}\n\
+Fence-before-queue / queue-before-fence: {}/{} (equal {})",
+        render.window.p50_ns,
+        render.window.p95_ns,
+        render.window.p99_ns,
+        render.window.max_ns,
+        queue.window.p50_ns,
+        queue.window.p95_ns,
+        queue.window.p99_ns,
+        queue.window.max_ns,
+        render.ewma_ns,
+        render.upper_positive_deviation_ns,
+        render.central_risk_ns,
+        render.selected_risk_ns,
+        render.selected_source.as_str(),
+        queue.ewma_ns,
+        queue.upper_positive_deviation_ns,
+        queue.central_risk_ns,
+        queue.selected_risk_ns,
+        queue.selected_source.as_str(),
+        diagnostics.composite_to_rendered_observed.p95_ns,
+        diagnostics.post_render_handoff.p95_ns,
+        diagnostics.fence_after_rendered_observed.p95_ns,
+        diagnostics.rendered_observed_after_fence.p95_ns,
+        render.window.over_refresh_samples,
+        render.window.over_two_refresh_samples,
+        queue.window.over_refresh_samples,
+        queue.window.over_two_refresh_samples,
+        diagnostics.fence_before_queue_samples,
+        diagnostics.queue_before_fence_samples,
+        diagnostics.equal_samples,
+    )
+}
 
 pub fn human(result: &AstreactlResult) -> String {
     match result {
@@ -19,7 +62,7 @@ pub fn human(result: &AstreactlResult) -> String {
             snapshot.minimized_window_count
         ),
         AstreactlResult::Performance(snapshot) => format!(
-            "CPU render p50/p95/p99: {}/{}/{} us\nRepaint skip/partial/full: {}/{}/{}\nTriple render-ahead attempts/ready: {}/{}\nO1 estimator/cold wake guard: {}/{}\nExact parallel samples/render/queue/service: {}/{}/{}/{} ns\nO1 wake/dispatch/apply/selected total: {}/{}/{}/{} ns\nKMS worker-submit wake p95: {} ns\nMiss recovery remaining: {}\nO1 desired/effective credit: {}/{}\nCredit release clean/horizon: {}/{}",
+            "CPU render p50/p95/p99: {}/{}/{} us\nRepaint skip/partial/full: {}/{}/{}\nTriple render-ahead attempts/ready: {}/{}\nO1 estimator/cold wake guard: {}/{}\nExact parallel samples/render/queue/service: {}/{}/{}/{} ns\nO1 wake/dispatch/apply/selected total: {}/{}/{}/{} ns\nKMS worker-submit wake p95: {} ns\nMiss recovery remaining: {}\nO1 desired/effective credit: {}/{}\nCredit release clean/horizon: {}/{}\n{}",
             snapshot.compositor_cpu_render.p50_us,
             snapshot.compositor_cpu_render.p95_us,
             snapshot.compositor_cpu_render.p99_us,
@@ -44,6 +87,7 @@ pub fn human(result: &AstreactlResult) -> String {
             snapshot.buffering.future_primary_credit,
             snapshot.buffering.credit_release_clean_opportunities,
             snapshot.buffering.credit_release_horizon,
+            format_exact_parallel_diagnostics(&snapshot.buffering.exact_parallel_diagnostics),
         ),
         AstreactlResult::Doctor(snapshot) => snapshot
             .checks
@@ -327,7 +371,7 @@ pub fn sanitize_terminal_text(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::human;
+    use super::{format_exact_parallel_diagnostics, human};
     use crate::animation_control::{
         AnimationCatalogSnapshot, AnimationConfiguration, AnimationConfigurationSnapshot,
         AnimationControlSnapshot, AnimationEffect, AnimationPreset, AnimationSlot,
@@ -599,5 +643,83 @@ mod tests {
         assert!(human(&value).contains("Animate maximized window open: false"));
         assert_eq!(configuration.preset, AnimationPreset::Astrea);
         assert_eq!(effect, AnimationEffect::WindowScale);
+    }
+
+    #[test]
+    fn exact_parallel_performance_output_is_compact_and_includes_branch_decomposition() {
+        use crate::control_snapshots::{
+            BranchRiskDiagnostics, BranchRiskSource, ExactParallelDiagnostics,
+            SampleWindowDiagnostics,
+        };
+
+        let window = SampleWindowDiagnostics {
+            count: 120,
+            latest_ns: 8_000_000,
+            p50_ns: 1_000_000,
+            p90_ns: 1_000_000,
+            p95_ns: 1_000_000,
+            p99_ns: 1_000_000,
+            max_ns: 8_000_000,
+            over_refresh_samples: 1,
+            over_two_refresh_samples: 1,
+        };
+        let diagnostics = ExactParallelDiagnostics {
+            render_ready: BranchRiskDiagnostics {
+                window,
+                ewma_ns: 2_000_000,
+                upper_positive_deviation_ns: 4_000_000,
+                central_risk_ns: 10_000_000,
+                selected_risk_ns: 10_000_000,
+                selected_source: BranchRiskSource::PositiveDeviation,
+            },
+            queue_ready: BranchRiskDiagnostics {
+                window: SampleWindowDiagnostics {
+                    latest_ns: 4_000_000,
+                    p50_ns: 1_000_000,
+                    p90_ns: 2_000_000,
+                    p95_ns: 3_000_000,
+                    p99_ns: 4_000_000,
+                    max_ns: 4_000_000,
+                    ..window
+                },
+                ewma_ns: 2_000_000,
+                upper_positive_deviation_ns: 500_000,
+                central_risk_ns: 3_000_000,
+                selected_risk_ns: 3_000_000,
+                selected_source: BranchRiskSource::RecentP95,
+            },
+            composite_to_rendered_observed: SampleWindowDiagnostics {
+                p95_ns: 5_000_000,
+                ..SampleWindowDiagnostics::default()
+            },
+            post_render_handoff: SampleWindowDiagnostics {
+                p95_ns: 1_000_000,
+                ..SampleWindowDiagnostics::default()
+            },
+            fence_after_rendered_observed: SampleWindowDiagnostics {
+                p95_ns: 2_000_000,
+                ..SampleWindowDiagnostics::default()
+            },
+            rendered_observed_after_fence: SampleWindowDiagnostics {
+                p95_ns: 3_000_000,
+                ..SampleWindowDiagnostics::default()
+            },
+            queue_before_fence_samples: 7,
+            fence_before_queue_samples: 8,
+            equal_samples: 9,
+            ..ExactParallelDiagnostics::default()
+        };
+
+        let output = format_exact_parallel_diagnostics(&diagnostics);
+
+        assert!(output.contains("Exact R raw p50/p95/p99/max: 1000000/1000000/1000000/8000000 ns"));
+        assert!(output.contains("Exact Q raw p50/p95/p99/max: 1000000/3000000/4000000/4000000 ns"));
+        assert!(output.contains("Exact R model ewma/dev/central/selected: 2000000/4000000/10000000/10000000 ns (positive_deviation)"));
+        assert!(output.contains("Exact Q model ewma/dev/central/selected: 2000000/500000/3000000/3000000 ns (recent_p95)"));
+        assert!(output.contains(
+            "Pipeline p95 C/H/GPU-tail/observed-after-fence: 5000000/1000000/2000000/3000000 ns"
+        ));
+        assert!(output.contains("R/Q over 1R/2R: 1/1, 1/1"));
+        assert!(output.contains("Fence-before-queue / queue-before-fence: 8/7 (equal 9)"));
     }
 }

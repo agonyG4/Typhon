@@ -757,6 +757,69 @@ pub struct RepaintPerformanceSnapshot {
     pub full_repaint_reasons: std::collections::BTreeMap<String, u64>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(default, deny_unknown_fields)]
+pub struct SampleWindowDiagnostics {
+    pub count: usize,
+    pub latest_ns: u64,
+    pub p50_ns: u64,
+    pub p90_ns: u64,
+    pub p95_ns: u64,
+    pub p99_ns: u64,
+    pub max_ns: u64,
+    pub over_refresh_samples: usize,
+    pub over_two_refresh_samples: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
+pub enum BranchRiskSource {
+    #[default]
+    None,
+    RecentP95,
+    PositiveDeviation,
+}
+
+impl BranchRiskSource {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::RecentP95 => "recent_p95",
+            Self::PositiveDeviation => "positive_deviation",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(default, deny_unknown_fields)]
+pub struct BranchRiskDiagnostics {
+    pub window: SampleWindowDiagnostics,
+    pub ewma_ns: u64,
+    pub upper_positive_deviation_ns: u64,
+    pub central_risk_ns: u64,
+    pub selected_risk_ns: u64,
+    pub selected_source: BranchRiskSource,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(default, deny_unknown_fields)]
+pub struct ExactParallelDiagnostics {
+    pub render_ready: BranchRiskDiagnostics,
+    pub queue_ready: BranchRiskDiagnostics,
+    pub composite_to_rendered_observed: SampleWindowDiagnostics,
+    pub post_render_handoff: SampleWindowDiagnostics,
+    pub fence_after_rendered_observed: SampleWindowDiagnostics,
+    pub rendered_observed_after_fence: SampleWindowDiagnostics,
+    pub queue_before_fence_samples: usize,
+    pub fence_before_queue_samples: usize,
+    pub equal_samples: usize,
+    pub decomposition_invalid_samples: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
@@ -800,6 +863,8 @@ pub struct BufferingPerformanceSnapshot {
     pub predicted_parallel_service_ns: u64,
     #[serde(default)]
     pub predicted_parallel_samples: u64,
+    #[serde(default)]
+    pub exact_parallel_diagnostics: ExactParallelDiagnostics,
     #[serde(default)]
     pub predicted_main_event_loop_wake_guard_ns: u64,
     #[serde(default)]
@@ -1432,6 +1497,31 @@ mod tests {
         }
 
         let snapshot = serde_json::from_value::<PerformanceSnapshot>(value.clone()).unwrap();
+        assert_eq!(
+            snapshot.buffering.exact_parallel_diagnostics,
+            ExactParallelDiagnostics::default()
+        );
+        let diagnostic_value =
+            serde_json::to_value(snapshot.buffering.exact_parallel_diagnostics).unwrap();
+        assert!(diagnostic_value.get("renderReady").is_some());
+        assert!(diagnostic_value.get("queueReady").is_some());
+        assert!(
+            diagnostic_value["renderReady"]["window"]
+                .get("p50Ns")
+                .is_some()
+        );
+        let mut legacy_buffering = value["buffering"].clone();
+        legacy_buffering
+            .as_object_mut()
+            .expect("buffering is an object")
+            .remove("exactParallelDiagnostics");
+        let legacy_buffering_snapshot =
+            serde_json::from_value::<BufferingPerformanceSnapshot>(legacy_buffering).unwrap();
+        assert_eq!(
+            legacy_buffering_snapshot.exact_parallel_diagnostics,
+            ExactParallelDiagnostics::default()
+        );
+        value["buffering"]["exactParallelDiagnostics"] = diagnostic_value;
         let mut legacy_value = value.clone();
         legacy_value
             .as_object_mut()
