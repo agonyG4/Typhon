@@ -249,6 +249,48 @@ pub(super) fn reactive_or_commit_timing_target(
         })
 }
 
+/// Admit a fresh fixed-vsync composited ReactiveDouble target using only the
+/// recent exact-render readiness floor. Existing physical predecessors keep
+/// the generic ordered-successor behavior, and any admission deferral is
+/// limited to one physical refresh.
+pub(super) fn fresh_composited_reactive_target(
+    planner: &PresentationDeadlinePlanner,
+    lower_bound: Option<PresentationTarget>,
+    now: MonotonicTimestampNs,
+    predicted_total_cost: Duration,
+    recent_render_floor_ns: u64,
+    apply_guard_ns: u64,
+) -> Option<PresentationTarget> {
+    if let Some(lower_bound) = lower_bound {
+        return reactive_or_commit_timing_target(
+            planner,
+            None,
+            Some(lower_bound),
+            now,
+            predicted_total_cost,
+        );
+    }
+
+    let candidate = planner.reactive_target(now, predicted_total_cost)?;
+    if candidate.reason != PresentationTargetReason::ReactiveDouble
+        || candidate.estimated
+        || recent_render_floor_ns == 0
+    {
+        return Some(candidate);
+    }
+
+    let commit_complete_deadline_ns = candidate
+        .presentation_time
+        .get()
+        .saturating_sub(apply_guard_ns);
+    let expected_ready_at_ns = now.get().saturating_add(recent_render_floor_ns);
+    if expected_ready_at_ns <= commit_complete_deadline_ns {
+        Some(candidate)
+    } else {
+        planner.reactive_target_after(now, predicted_total_cost, candidate)
+    }
+}
+
 #[cfg(test)]
 pub(super) fn plan_scheduled_target_for_mode(
     planner: &mut PresentationDeadlinePlanner,

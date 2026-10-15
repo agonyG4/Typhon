@@ -1,7 +1,7 @@
 use super::super::planner::{
-    plan_scheduled_target_for_budget, plan_scheduled_target_for_mode,
-    plan_visual_target_for_budget, reactive_or_commit_timing_target,
-    visual_target_deadline_for_mode,
+    fresh_composited_reactive_target, plan_scheduled_target_for_budget,
+    plan_scheduled_target_for_mode, plan_visual_target_for_budget,
+    reactive_or_commit_timing_target, visual_target_deadline_for_mode,
 };
 use super::kms_worker::{
     ValidationBaseInvalidationDisposition, WorkerRejectionKind, direct_rejection_policy,
@@ -130,6 +130,229 @@ fn reactive_advisory_pending_target_does_not_reserve_a_false_o1_frontier() {
             .get()
             .saturating_add(refresh.as_nanos() as u64 * 2)
     );
+}
+
+const FRESH_REACTIVE_REFRESH_NS: u64 = 6_060_606;
+const FRESH_REACTIVE_ANCHOR_NS: u64 = 1_000_000_000;
+const FRESH_REACTIVE_APPLY_GUARD_NS: u64 = 200_000;
+
+fn fresh_reactive_planner() -> PresentationDeadlinePlanner {
+    let mut planner =
+        PresentationDeadlinePlanner::new(Duration::from_nanos(FRESH_REACTIVE_REFRESH_NS));
+    assert_eq!(
+        planner.note_presented(MonotonicTimestampNs::new(FRESH_REACTIVE_ANCHOR_NS)),
+        1
+    );
+    planner
+}
+
+fn admit_fresh_reactive_with_lead(
+    planner: &PresentationDeadlinePlanner,
+    lead_ns: u64,
+    recent_render_floor_ns: u64,
+    predicted_total_cost: Duration,
+) -> PresentationTarget {
+    let commit_complete_deadline = FRESH_REACTIVE_ANCHOR_NS
+        .saturating_add(FRESH_REACTIVE_REFRESH_NS)
+        .saturating_sub(FRESH_REACTIVE_APPLY_GUARD_NS);
+    let now = MonotonicTimestampNs::new(commit_complete_deadline.saturating_sub(lead_ns));
+    fresh_composited_reactive_target(
+        planner,
+        None,
+        now,
+        predicted_total_cost,
+        recent_render_floor_ns,
+        FRESH_REACTIVE_APPLY_GUARD_NS,
+    )
+    .expect("fresh reactive target")
+}
+
+#[test]
+fn fresh_composited_reactive_gate_keeps_feasible_n_plus_one() {
+    let planner = fresh_reactive_planner();
+    let target =
+        admit_fresh_reactive_with_lead(&planner, 5_000_000, 3_000_000, Duration::from_millis(20));
+
+    assert_eq!(target.sequence, 2);
+    assert_eq!(target.reason, PresentationTargetReason::ReactiveDouble);
+    assert_eq!(target.authority(), PresentationTargetAuthority::Advisory);
+}
+
+#[test]
+fn fresh_composited_reactive_gate_defers_infeasible_n_plus_one_once() {
+    let planner = fresh_reactive_planner();
+    let target =
+        admit_fresh_reactive_with_lead(&planner, 200_000, 4_000_000, Duration::from_millis(20));
+
+    assert_eq!(target.sequence, 3);
+    assert_eq!(target.reason, PresentationTargetReason::ReactiveDouble);
+    assert_eq!(target.authority(), PresentationTargetAuthority::Advisory);
+}
+
+#[test]
+fn fresh_composited_reactive_gate_keeps_exact_deadline_boundary() {
+    let planner = fresh_reactive_planner();
+    let target =
+        admit_fresh_reactive_with_lead(&planner, 3_000_000, 3_000_000, Duration::from_millis(20));
+
+    assert_eq!(target.sequence, 2);
+}
+
+#[test]
+fn fresh_composited_reactive_gate_ignores_sticky_full_prediction_risk() {
+    let planner = fresh_reactive_planner();
+    let target =
+        admit_fresh_reactive_with_lead(&planner, 4_000_000, 2_000_000, Duration::from_millis(50));
+
+    assert_eq!(target.sequence, 2);
+    assert!(target.predicted_unreachable);
+}
+
+#[test]
+fn fresh_composited_reactive_gate_defers_at_most_one_refresh() {
+    let planner = fresh_reactive_planner();
+    let original = planner
+        .reactive_target(
+            MonotonicTimestampNs::new(
+                FRESH_REACTIVE_ANCHOR_NS + FRESH_REACTIVE_REFRESH_NS
+                    - FRESH_REACTIVE_APPLY_GUARD_NS
+                    - 200_000,
+            ),
+            Duration::from_millis(100),
+        )
+        .expect("original N+1 candidate");
+    let target =
+        admit_fresh_reactive_with_lead(&planner, 200_000, 10_000_000, Duration::from_millis(100));
+
+    assert_eq!(target.sequence, original.sequence + 1);
+    assert!(target.selection_evidence.earliest_feasible_sequence > target.sequence);
+}
+
+#[test]
+fn fresh_composited_reactive_gate_leaves_lower_bound_ordering_unchanged() {
+    let planner = fresh_reactive_planner();
+    let lower_bound = planner
+        .reactive_target(
+            MonotonicTimestampNs::new(FRESH_REACTIVE_ANCHOR_NS + 500_000),
+            Duration::from_millis(17),
+        )
+        .expect("pending physical target");
+    let commit_complete_deadline = FRESH_REACTIVE_ANCHOR_NS
+        .saturating_add(FRESH_REACTIVE_REFRESH_NS)
+        .saturating_sub(FRESH_REACTIVE_APPLY_GUARD_NS);
+    let now = MonotonicTimestampNs::new(commit_complete_deadline.saturating_sub(200_000));
+    let expected = reactive_or_commit_timing_target(
+        &planner,
+        None,
+        Some(lower_bound),
+        now,
+        Duration::from_millis(100),
+    )
+    .expect("generic ordered successor");
+    let actual = fresh_composited_reactive_target(
+        &planner,
+        Some(lower_bound),
+        now,
+        Duration::from_millis(100),
+        100_000_000,
+        FRESH_REACTIVE_APPLY_GUARD_NS,
+    )
+    .expect("lower-bound target");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn direct_scanout_generic_target_keeps_next_refresh_under_sticky_risk() {
+    let planner = fresh_reactive_planner();
+    let commit_complete_deadline = FRESH_REACTIVE_ANCHOR_NS
+        .saturating_add(FRESH_REACTIVE_REFRESH_NS)
+        .saturating_sub(FRESH_REACTIVE_APPLY_GUARD_NS);
+    let now = MonotonicTimestampNs::new(commit_complete_deadline.saturating_sub(200_000));
+    let target =
+        reactive_or_commit_timing_target(&planner, None, None, now, Duration::from_millis(100))
+            .expect("generic direct target");
+
+    assert_eq!(target.sequence, 2);
+    assert!(target.predicted_unreachable);
+}
+
+#[test]
+fn fresh_composited_reactive_gate_preserves_bootstrap_estimated_target() {
+    let planner = PresentationDeadlinePlanner::new(Duration::from_nanos(FRESH_REACTIVE_REFRESH_NS));
+    let now = MonotonicTimestampNs::new(FRESH_REACTIVE_ANCHOR_NS);
+    let expected =
+        reactive_or_commit_timing_target(&planner, None, None, now, Duration::from_millis(20))
+            .expect("bootstrap target");
+    let actual = fresh_composited_reactive_target(
+        &planner,
+        None,
+        now,
+        Duration::from_millis(20),
+        100_000_000,
+        FRESH_REACTIVE_APPLY_GUARD_NS,
+    )
+    .expect("estimated target");
+
+    assert!(actual.estimated);
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn fresh_composited_reactive_gate_preserves_zero_render_history_behavior() {
+    let planner = fresh_reactive_planner();
+    let target = admit_fresh_reactive_with_lead(&planner, 200_000, 0, Duration::from_millis(20));
+
+    assert_eq!(target.sequence, 2);
+}
+
+#[test]
+fn scheduled_commit_timing_target_remains_exact_with_render_history() {
+    let planner = fresh_reactive_planner();
+    let now = MonotonicTimestampNs::new(FRESH_REACTIVE_ANCHOR_NS + 1_000_000);
+    let reactive = planner
+        .reactive_target(now, Duration::ZERO)
+        .expect("scheduled target fixture");
+    let scheduled = PresentationTarget {
+        reason: PresentationTargetReason::CommitTiming,
+        ..reactive
+    };
+    let actual = reactive_or_commit_timing_target(
+        &planner,
+        Some(scheduled),
+        None,
+        now,
+        Duration::from_millis(100),
+    )
+    .expect("scheduled commit timing target");
+
+    assert_eq!(actual, scheduled);
+}
+
+#[test]
+fn fresh_reactive_165hz_admission_is_phase_sensitive() {
+    let mut planner = fresh_reactive_planner();
+    let late =
+        admit_fresh_reactive_with_lead(&planner, 200_000, 4_000_000, Duration::from_millis(20));
+    assert_eq!(late.sequence, 3);
+
+    let next_physical_present = FRESH_REACTIVE_ANCHOR_NS + FRESH_REACTIVE_REFRESH_NS;
+    assert_eq!(
+        planner.note_presented(MonotonicTimestampNs::new(next_physical_present)),
+        2
+    );
+    let later_demand_now = MonotonicTimestampNs::new(next_physical_present + 500_000);
+    let later = fresh_composited_reactive_target(
+        &planner,
+        None,
+        later_demand_now,
+        Duration::from_millis(20),
+        3_000_000,
+        FRESH_REACTIVE_APPLY_GUARD_NS,
+    )
+    .expect("later demand with sufficient lead");
+
+    assert_eq!(later.sequence, 3);
 }
 
 #[test]

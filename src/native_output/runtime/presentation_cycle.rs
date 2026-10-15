@@ -10,7 +10,7 @@ use super::frame::{
 };
 use super::planner::{
     NativePresentationPath, NativePresentationPlanInput, cursor_primary_ordering_target,
-    pacing_mode_for_target, pending_fixed_target_for_scanout,
+    fresh_composited_reactive_target, pacing_mode_for_target, pending_fixed_target_for_scanout,
     plan_cursor_service_opportunity_with_current, plan_native_presentation_path,
     plan_visual_target_for_budget, prepare_presentation_target, reactive_or_commit_timing_target,
 };
@@ -1270,13 +1270,25 @@ impl NativeRuntime {
                 let frame_target = scheduled_presentation_target
                     .take()
                     .or_else(|| {
-                        reactive_or_commit_timing_target(
-                            presentation_deadline,
-                            None,
-                            pending_target,
-                            MonotonicTimestampNs::new(monotonic_now_ns().ok()?),
-                            predicted_total_cost,
-                        )
+                        let now = MonotonicTimestampNs::new(monotonic_now_ns().ok()?);
+                        if reactive_presentation_candidate {
+                            reactive_or_commit_timing_target(
+                                presentation_deadline,
+                                None,
+                                pending_target,
+                                now,
+                                predicted_total_cost,
+                            )
+                        } else {
+                            fresh_composited_reactive_target(
+                                presentation_deadline,
+                                pending_target,
+                                now,
+                                predicted_total_cost,
+                                prediction.p90_recent_render_ns,
+                                presentation_timing.apply_guard_ns(),
+                            )
+                        }
                     })
                     .ok_or_else(|| {
                         frame_pacing.cancel_unsubmitted_render();
@@ -1727,13 +1739,25 @@ impl NativeRuntime {
                                     let frame_target = scheduled_presentation_target
                                     .take()
                                     .or_else(|| {
-                                        reactive_or_commit_timing_target(
-                                            presentation_deadline,
-                                            None,
-                                            pending_target,
-                                            MonotonicTimestampNs::new(monotonic_now_ns().ok()?),
-                                            predicted_total_cost,
-                                        )
+                                        let now = MonotonicTimestampNs::new(monotonic_now_ns().ok()?);
+                                        if reactive_presentation_candidate {
+                                            reactive_or_commit_timing_target(
+                                                presentation_deadline,
+                                                None,
+                                                pending_target,
+                                                now,
+                                                predicted_total_cost,
+                                            )
+                                        } else {
+                                            fresh_composited_reactive_target(
+                                                presentation_deadline,
+                                                pending_target,
+                                                now,
+                                                predicted_total_cost,
+                                                prediction.p90_recent_render_ns,
+                                                presentation_timing.apply_guard_ns(),
+                                            )
+                                        }
                                     })
                                     .ok_or_else(|| {
                                         frame_pacing.cancel_unsubmitted_render();
