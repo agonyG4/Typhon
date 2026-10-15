@@ -58,27 +58,44 @@ pub(super) fn record_composited_scene_identity(
 pub(super) fn replace_atomic_ready_scene(
     scene_history: &mut NativeSceneHistory,
     resolved_snapshot: NativeSceneSnapshot,
-    frame_id: u64,
-    render_generation: u64,
+    physical_owner: crate::native_output::scanout::OutputFrameIdentitySnapshot,
     presentation: oblivion_one::compositor::PresentationFrameSnapshot,
     lifecycle: oblivion_one::window_lifecycle_animation::LifecycleFrameSnapshot,
     cursor: (
         Option<NativeClientCursorDamageState>,
         Option<NativeDamageRect>,
     ),
-) {
+) -> NativeResult<()> {
+    if scene_history.output_id() != physical_owner.output_id {
+        return Err(io::Error::other(format!(
+            "Atomic READY scene output mismatch: scene_history={:?} physical_ready={:?}",
+            scene_history.output_id(),
+            physical_owner,
+        ))
+        .into());
+    }
     let cursor_damage = scene_history.cursor_damage(cursor);
-    scene_history.replace_ready(NativeFrameSceneSnapshot {
-        output_id: scene_history.output_id(),
-        frame_id,
-        render_generation,
+    let scene_owner = (physical_owner.frame_id, physical_owner.render_generation);
+    if !scene_history.replace_ready(NativeFrameSceneSnapshot {
+        output_id: physical_owner.output_id,
+        frame_id: physical_owner.frame_id,
+        render_generation: physical_owner.render_generation,
         scene: resolved_snapshot,
         cursor_damage,
         presentation,
         lifecycle,
         canonical_scene_evidence: None,
         window_exit_evidence: Vec::new(),
-    });
+    }) || scene_history.ready_frame_identity() != Some(scene_owner)
+    {
+        return Err(io::Error::other(format!(
+            "Atomic READY scene publication did not retain its physical owner: physical_ready={:?} scene_ready={:?}",
+            physical_owner,
+            scene_history.ready_frame_identity(),
+        ))
+        .into());
+    }
+    Ok(())
 }
 
 #[expect(
@@ -88,9 +105,7 @@ pub(super) fn replace_atomic_ready_scene(
 pub(super) fn record_atomic_rendered_scene(
     scene_history: &mut NativeSceneHistory,
     presentation_trace: &mut PresentationTransactionTraceRing,
-    frame_id: u64,
-    transaction_id: OutputTransactionId,
-    resolved_render_generation: u64,
+    physical_owner: crate::native_output::scanout::OutputFrameIdentitySnapshot,
     resolved_snapshot: NativeSceneSnapshot,
     presentation: oblivion_one::compositor::PresentationFrameSnapshot,
     lifecycle: oblivion_one::window_lifecycle_animation::LifecycleFrameSnapshot,
@@ -108,17 +123,16 @@ pub(super) fn record_atomic_rendered_scene(
     replace_atomic_ready_scene(
         scene_history,
         resolved_snapshot,
-        frame_id,
-        resolved_render_generation,
+        physical_owner,
         presentation,
         lifecycle,
         cursor,
-    );
+    )?;
     record_composited_scene_identity(
         presentation_trace,
-        transaction_id,
-        frame_id,
-        resolved_render_generation,
+        physical_owner.transaction_id,
+        physical_owner.frame_id,
+        physical_owner.render_generation,
         resolved_scene_signature,
         render_damage_signature,
         repair_damage_signature,
@@ -171,7 +185,6 @@ pub(super) fn settle_atomic_rendered_outcome(
         resolved_scene_signature,
         render_damage_signature,
         repair_damage_signature,
-        resolved_render_generation,
         framebuffer_slot,
         deferred_o1_binding_advanced_intervals,
         deferred_o1_binding_failure,
@@ -202,6 +215,25 @@ pub(super) fn settle_atomic_rendered_outcome(
             return Err(Box::new(error));
         }
     };
+    if physical_identity.frame_id != frame_id
+        || physical_identity.transaction_id != transaction_id
+        || physical_identity.protocol_batch_id != protocol_batch_id
+    {
+        if context.finish_render_work_on_failure {
+            context.explicit.finish_render_work();
+        }
+        context
+            .server
+            .cancel_lifecycle_precapture_after_render_failure();
+        context.frame_pacing.note_predictive_o1_failed();
+        context.frame_pacing.cancel_unsubmitted_render();
+        return Err(io::Error::other(format!(
+            "rendered Atomic outcome disagrees with physical READY owner: physical_ready={physical_identity:?} outcome_frame={frame_id} outcome_transaction={} outcome_protocol_batch={}",
+            transaction_id.get(),
+            protocol_batch_id.get(),
+        ))
+        .into());
+    }
     if let Err(error) = context
         .frame_pacing
         .bind_physical_output_frame(physical_identity)
@@ -257,9 +289,7 @@ pub(super) fn settle_atomic_rendered_outcome(
     record_atomic_rendered_scene(
         context.scene_history,
         context.presentation_trace,
-        frame_id,
-        transaction_id,
-        resolved_render_generation,
+        physical_identity,
         resolved_snapshot,
         presentation,
         lifecycle_snapshot,

@@ -2010,7 +2010,7 @@ impl NativeRuntime {
                                 )?;
                             }
                             #[rustfmt::skip]
-                            AtomicFrameRenderOutcome::Rendered { frame_id, transaction_id, protocol_batch_id, render_us, repaint_stats, lifecycle_snapshot, resolved_snapshot, resolved_scene_signature, render_damage_signature, repair_damage_signature, resolved_render_generation, framebuffer_slot, deferred_o1_binding_advanced_intervals, deferred_o1_binding_failure } => {
+                            AtomicFrameRenderOutcome::Rendered { frame_id, transaction_id, protocol_batch_id, render_us, repaint_stats, lifecycle_snapshot, resolved_snapshot, resolved_scene_signature, render_damage_signature, repair_damage_signature, framebuffer_slot, deferred_o1_binding_advanced_intervals, deferred_o1_binding_failure } => {
                                 if slow_cycle_enabled {
                                     slow_cycle_trace.note_compositor_render_us(render_us);
                                 }
@@ -2052,7 +2052,6 @@ impl NativeRuntime {
                                         resolved_scene_signature,
                                         render_damage_signature,
                                         repair_damage_signature,
-                                        resolved_render_generation,
                                         framebuffer_slot,
                                         deferred_o1_binding_advanced_intervals,
                                         deferred_o1_binding_failure,
