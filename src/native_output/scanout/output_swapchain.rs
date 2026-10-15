@@ -433,6 +433,14 @@ pub(crate) struct PreparedDeferredO1SwapchainBinding {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PreparedReadyTargetSwapchainReplacement {
+    expected_identity: OutputFrameIdentitySnapshot,
+    expected_target: PresentationTarget,
+    replacement_target: PresentationTarget,
+    submit_window: KmsSubmitWindow,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PhysicalPrimaryClaimViolation {
     GenerationMismatch,
     Regression,
@@ -1848,19 +1856,76 @@ impl AtomicOutputSwapchain {
         replacement: PresentationTarget,
         submit_window: KmsSubmitWindow,
     ) -> io::Result<()> {
-        self.validate_ready_target_replacement(transaction_id, expected, replacement)?;
+        let expected_identity = self
+            .ready_identity()
+            .ok_or_else(|| io::Error::other("ready target replacement has no ready frame"))?;
+        if expected_identity.transaction_id != transaction_id {
+            return Err(io::Error::other(
+                "ready target replacement identity does not match the ready frame",
+            ));
+        }
+        let prepared = self.prepare_ready_target_replacement(
+            expected_identity,
+            expected,
+            replacement,
+            submit_window,
+        )?;
+        self.commit_prepared_ready_target_replacement(prepared);
+        Ok(())
+    }
+
+    pub(crate) fn prepare_ready_target_replacement(
+        &self,
+        expected_identity: OutputFrameIdentitySnapshot,
+        expected: PresentationTarget,
+        replacement: PresentationTarget,
+        submit_window: KmsSubmitWindow,
+    ) -> io::Result<PreparedReadyTargetSwapchainReplacement> {
+        if self.ready_identity() != Some(expected_identity) {
+            return Err(io::Error::other(
+                "ready physical identity changed before target replacement",
+            ));
+        }
+        self.validate_ready_target_replacement(
+            expected_identity.transaction_id,
+            expected,
+            replacement,
+        )?;
         if submit_window.target_presentation_ns() != replacement.presentation_time.get() {
             return Err(io::Error::other(
                 "ready target replacement submit window belongs to another target",
             ));
         }
+        Ok(PreparedReadyTargetSwapchainReplacement {
+            expected_identity,
+            expected_target: expected,
+            replacement_target: replacement,
+            submit_window,
+        })
+    }
+
+    pub(crate) fn commit_prepared_ready_target_replacement(
+        &mut self,
+        prepared: PreparedReadyTargetSwapchainReplacement,
+    ) {
         let ready = self
             .ready
             .as_mut()
-            .ok_or_else(|| io::Error::other("ready target replacement has no ready frame"))?;
-        ready.reservation = FramePresentationReservation::Fixed(replacement);
-        ready.presentation_timing = KmsPresentationTiming::Fixed(submit_window);
-        Ok(())
+            .expect("preflighted READY target frame remains ready");
+        debug_assert_eq!(
+            OutputFrameIdentitySnapshot::from(&*ready),
+            prepared.expected_identity
+        );
+        debug_assert_eq!(
+            ready.transaction_id,
+            prepared.expected_identity.transaction_id
+        );
+        debug_assert_eq!(
+            ready.reservation,
+            FramePresentationReservation::Fixed(prepared.expected_target)
+        );
+        ready.reservation = FramePresentationReservation::Fixed(prepared.replacement_target);
+        ready.presentation_timing = KmsPresentationTiming::Fixed(prepared.submit_window);
     }
 
     pub(crate) fn deferred_o1_binding_failure(
@@ -3711,12 +3776,14 @@ mod tests {
 
     #[test]
     fn late_deferred_o1_binding_rebases_pacing_before_worker_reservation() {
+        use crate::native_output::DeferredO1BindingResult;
         use crate::native_output::pacing::NativeFramePacing;
         use crate::native_output::presentation::ledger::{
             OutputTransactionLedger, OutputTransactionStateKind,
         };
         use crate::native_output::presentation::transaction::OutputTransaction;
-        use oblivion_one::native::scheduler::NativeOutputPacingMode;
+        use crate::native_output::scanout::AtomicEglGbmScanout;
+        use oblivion_one::native::scheduler::{NativeFrameScheduler, NativeOutputPacingMode};
 
         let predecessor_target = predictive_test_target(1, 6_060_606);
         let (mut swapchain, predecessor_token) =
@@ -3801,6 +3868,10 @@ mod tests {
             "the lifecycle keeps the current DeferredO1 metadata before binding"
         );
         assert_eq!(frame_pacing.worker_reservation_ticket(), None);
+        let mut frame_scheduler = NativeFrameScheduler::new_with_refresh_interval_ns(6_060_606, 0);
+        frame_scheduler.note_ready_frame(None);
+        assert!(frame_scheduler.ready_frame_queued());
+        assert_eq!(frame_scheduler.ready_target(), None);
 
         complete_physical_predecessor(
             &mut swapchain,
@@ -3811,21 +3882,58 @@ mod tests {
                 clock_generation: 1,
             },
         );
-        let (transaction_id, target, submit_window, advanced_intervals) = swapchain
-            .deferred_o1_binding_candidate(1, now(12_200_000))
-            .expect("late binding candidate lookup")
-            .expect("successor B binds after predecessor A pageflip");
-        output_transactions
-            .bind_deferred_o1(transaction_id, target)
-            .expect("transaction B binds to the exact Fixed target");
-        swapchain
-            .commit_deferred_o1_binding(transaction_id, target, submit_window)
-            .expect("swapchain READY B binds to the exact Fixed target");
+        let mut missing_scheduler =
+            NativeFrameScheduler::new_with_refresh_interval_ns(6_060_606, 0);
+        assert!(
+            AtomicEglGbmScanout::bind_ready_deferred_o1_on_swapchain(
+                &mut swapchain,
+                &mut output_transactions,
+                &mut frame_pacing,
+                &mut missing_scheduler,
+                1,
+                now(12_200_000),
+            )
+            .is_err(),
+            "late bind requires the existing scheduler READY owner"
+        );
+        assert_eq!(swapchain.ready_identity(), Some(before));
+        assert_eq!(frame_pacing.unsubmitted_physical_identity(), Some(before));
+        assert_eq!(
+            output_transactions
+                .transaction(before.transaction_id)
+                .unwrap()
+                .state()
+                .kind(),
+            OutputTransactionStateKind::ReadyUnbound
+        );
+        assert!(!missing_scheduler.ready_frame_queued());
+        assert_eq!(missing_scheduler.ready_target(), None);
+        let advanced_intervals = match AtomicEglGbmScanout::bind_ready_deferred_o1_on_swapchain(
+            &mut swapchain,
+            &mut output_transactions,
+            &mut frame_pacing,
+            &mut frame_scheduler,
+            1,
+            now(12_200_000),
+        )
+        .expect("production late-bind entry point succeeds after predecessor pageflip")
+        {
+            DeferredO1BindingResult::Bound { advanced_intervals } => advanced_intervals,
+            result => panic!("expected production late bind, got {result:?}"),
+        };
         let after = swapchain.ready_identity().expect("fixed READY B");
         assert!(matches!(
             after.reservation,
             FramePresentationReservation::Fixed(_)
         ));
+        let FramePresentationReservation::Fixed(bound_target) = after.reservation else {
+            unreachable!();
+        };
+        assert_eq!(
+            frame_scheduler.ready_target(),
+            Some(bound_target),
+            "the scheduler READY owner follows the production target bind"
+        );
         assert_eq!(
             output_transactions
                 .transaction(after.transaction_id)
@@ -3836,8 +3944,8 @@ mod tests {
         );
         assert_eq!(
             frame_pacing.unsubmitted_physical_identity(),
-            Some(before),
-            "the regression fixture captures the former late-binding divergence"
+            Some(after),
+            "pacing metadata follows the production late bind"
         );
         assert_eq!(OutputFrameKey::from(&before), OutputFrameKey::from(&after));
         let mut wrong_key = after;
@@ -3890,9 +3998,6 @@ mod tests {
                 .is_err(),
             "pacing ownership of another physical frame cannot be rebased"
         );
-        frame_pacing
-            .rebase_unsubmitted_physical_metadata(before, after, advanced_intervals)
-            .expect("pacing READY B rebases to the same Fixed physical frame");
         let key = OutputFrameKey::from(&before);
         assert_eq!(key, OutputFrameKey::from(&after));
         assert_eq!(before.frame_id, after.frame_id);
@@ -3949,12 +4054,12 @@ mod tests {
         // queue transitions and validate the same role at reconfiguration.
         use crate::native_output::runtime::{
             AtomicCommitArbiter, AtomicCommitKind, NativeFrameSceneSnapshot, NativeSceneHistory,
+            validate_reconfiguration_frame_ownership_for_swapchain,
             validate_reconfiguration_frame_ownership_for_swapchain_with_arbiter,
         };
         use crate::native_output::{NativeCursorDamageBounds, NativeSceneSnapshot};
         use oblivion_one::compositor::PresentationFrameSnapshot;
         use oblivion_one::native::OutputEpochId;
-        use oblivion_one::native::scheduler::NativeFrameScheduler;
         use oblivion_one::window_lifecycle_animation::LifecycleFrameSnapshot;
 
         let output_id = after.output_id;
@@ -3971,15 +4076,39 @@ mod tests {
         };
         let mut scene_history = NativeSceneHistory::new(make_scene(0, 0));
         assert!(scene_history.replace_ready(make_scene(after.frame_id, after.render_generation)));
+        let mut pre_r17_scheduler =
+            NativeFrameScheduler::new_with_refresh_interval_ns(6_060_606, 0);
+        pre_r17_scheduler.note_ready_frame(None);
+        let pre_r17_error = validate_reconfiguration_frame_ownership_for_swapchain(
+            &swapchain,
+            OutputEpochId::initial(),
+            &scene_history,
+            &frame_pacing,
+            &pre_r17_scheduler,
+            &output_transactions,
+        )
+        .expect_err("the pre-R1.7 scheduler metadata is stale after physical late binding");
+        assert_eq!(
+            pre_r17_error.to_string(),
+            "unsubmitted READY disagrees with scheduler READY ownership"
+        );
+        validate_reconfiguration_frame_ownership_for_swapchain(
+            &swapchain,
+            OutputEpochId::initial(),
+            &scene_history,
+            &frame_pacing,
+            &frame_scheduler,
+            &output_transactions,
+        )
+        .expect("strict READY validation accepts the atomic late-bound owners");
         let frozen_scene = scene_history
             .ready_snapshot_for_test()
             .expect("scene is frozen before worker admission")
             .clone();
-        let mut frame_scheduler = NativeFrameScheduler::new_with_refresh_interval_ns(6_060_606, 0);
         let FramePresentationReservation::Fixed(target) = after.reservation else {
             panic!("late binding produces a Fixed target");
         };
-        frame_scheduler.note_ready_frame(Some(target));
+        assert_eq!(frame_scheduler.ready_target(), Some(target));
 
         let token = PageFlipToken::new(903).expect("worker token");
         let queued_at = now(12_300_000);
@@ -4040,7 +4169,7 @@ mod tests {
         // frame and frozen scene from WORKER_QUEUED to READY.
         use crate::native_output::runtime::{
             ExplicitWorkerReplanRequest, preflight_explicit_worker_replan,
-            restore_explicit_worker_replan, validate_reconfiguration_frame_ownership_for_swapchain,
+            restore_explicit_worker_replan,
         };
         let mut submission_fence = Some(worker_fence);
         let replan = preflight_explicit_worker_replan(

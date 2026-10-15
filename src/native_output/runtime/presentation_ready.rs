@@ -33,6 +33,7 @@ pub(super) fn pull_ready_frame_into_reachable_opportunity(
     presentation_deadline: &PresentationDeadlinePlanner,
     presentation_timing: &KmsPresentationTimingModel,
     frame_pacing: &mut NativeFramePacing,
+    frame_scheduler: &mut NativeFrameScheduler,
     now: MonotonicTimestampNs,
     output_generation: u64,
     dispatch_budget_ns: u64,
@@ -43,6 +44,7 @@ pub(super) fn pull_ready_frame_into_reachable_opportunity(
         presentation_deadline,
         presentation_timing,
         frame_pacing,
+        frame_scheduler,
         now,
         output_generation,
         dispatch_budget_ns,
@@ -56,6 +58,7 @@ pub(super) fn pull_ready_frame_into_reachable_opportunity_on_swapchain(
     presentation_deadline: &PresentationDeadlinePlanner,
     presentation_timing: &KmsPresentationTimingModel,
     frame_pacing: &mut NativeFramePacing,
+    frame_scheduler: &mut NativeFrameScheduler,
     now: MonotonicTimestampNs,
     output_generation: u64,
     dispatch_budget_ns: u64,
@@ -127,30 +130,53 @@ pub(super) fn pull_ready_frame_into_reachable_opportunity_on_swapchain(
         Err(_) => return Ok(ReadyPullInResult::RejectedTooLate),
     };
 
-    if swapchain
-        .validate_ready_target_replacement(ready_identity.transaction_id, old_target, new_target)
-        .is_err()
-    {
-        return Ok(ReadyPullInResult::RejectedOwned);
-    }
-    if output_transactions
-        .replace_ready_target(ready_identity.transaction_id, old_target, new_target)
-        .is_err()
-    {
-        return Ok(ReadyPullInResult::RejectedIdentity);
-    }
-    if let Err(error) = swapchain.replace_ready_target(
+    let mut replacement_identity = ready_identity;
+    replacement_identity.reservation =
+        crate::native_output::presentation::transaction::FramePresentationReservation::Fixed(
+            new_target,
+        );
+    let transaction_replacement = match output_transactions.prepare_ready_target_replacement(
         ready_identity.transaction_id,
+        old_target,
+        new_target,
+    ) {
+        Ok(prepared) => prepared,
+        Err(_) => return Ok(ReadyPullInResult::RejectedIdentity),
+    };
+    let swapchain_replacement = match swapchain.prepare_ready_target_replacement(
+        ready_identity,
         old_target,
         new_target,
         submit_window,
     ) {
-        let _ = output_transactions.replace_ready_target(
-            ready_identity.transaction_id,
-            new_target,
-            old_target,
-        );
-        return Err(error.into());
+        Ok(prepared) => prepared,
+        Err(_) => return Ok(ReadyPullInResult::RejectedOwned),
+    };
+    let pacing_replacement = match frame_pacing
+        .prepare_fixed_target_physical_metadata_rebase(ready_identity, replacement_identity)
+    {
+        Ok(prepared) => prepared,
+        Err(_) => return Ok(ReadyPullInResult::RejectedIdentity),
+    };
+    let scheduler_replacement = if frame_scheduler.ready_frame_queued() {
+        match frame_scheduler
+            .prepare_ready_target_metadata_rebase(Some(old_target), Some(new_target))
+        {
+            Ok(prepared) => Some(prepared),
+            Err(_) => return Ok(ReadyPullInResult::RejectedIdentity),
+        }
+    } else {
+        if frame_scheduler.ready_target().is_some() {
+            return Ok(ReadyPullInResult::RejectedIdentity);
+        }
+        None
+    };
+
+    output_transactions.commit_prepared_ready_target_replacement(transaction_replacement);
+    swapchain.commit_prepared_ready_target_replacement(swapchain_replacement);
+    frame_pacing.commit_fixed_target_physical_metadata_rebase(pacing_replacement);
+    if let Some(scheduler_replacement) = scheduler_replacement {
+        frame_scheduler.commit_ready_target_metadata_rebase(scheduler_replacement);
     }
     frame_pacing.note_ready_pull_in_success(old_target, new_target);
     Ok(ReadyPullInResult::PulledIn)
@@ -666,8 +692,19 @@ mod tests {
         FrozenCursorTestPolicy, FrozenPrimaryCursorPlan, FrozenPrimaryCursorPresentation,
         PresentedCursorDelivery,
     };
+    use crate::native_output::runtime::{
+        NativeFrameSceneSnapshot, NativeSceneHistory,
+        validate_reconfiguration_frame_ownership_for_swapchain,
+    };
+    use crate::native_output::scanout::OutputFrameKey;
+    use crate::native_output::{NativeCursorDamageBounds, NativeSceneSnapshot};
     use drm_sys::drm_mode_modeinfo;
-    use oblivion_one::compositor::{CompositorFrameBatchId, SurfaceDamagePresentation};
+    use oblivion_one::compositor::{
+        CompositorFrameBatchId, PresentationFrameSnapshot, SurfaceDamagePresentation,
+    };
+    use oblivion_one::native::OutputEpochId;
+    use oblivion_one::native::scheduler::NativeFrameScheduler;
+    use oblivion_one::window_lifecycle_animation::LifecycleFrameSnapshot;
     use std::os::fd::{FromRawFd, OwnedFd};
     use std::time::Duration;
 
@@ -696,8 +733,14 @@ mod tests {
         }
     }
 
-    #[test]
-    fn lane_free_ready_pull_in_precedes_worker_reservation() {
+    fn ready_pull_in_owner_case(
+        pacing_ready: bool,
+        scheduler_ready: bool,
+        scheduler_target_mismatch: bool,
+        transaction_target_mismatch: bool,
+        worker_reservation_conflict: bool,
+        active_predictive_attempt: bool,
+    ) {
         let render_ahead = false;
         let atomic_commit_pending = false;
         let can_queue_worker_next = true;
@@ -828,23 +871,40 @@ mod tests {
 
         let mut frame_pacing = NativeFramePacing::from_env();
         frame_pacing.queue_visual(frame_id, 1);
-        frame_pacing
-            .note_render_started(NativeOutputPacingMode::PredictiveTriple, false)
-            .unwrap();
-
-        let pull_in = pull_ready_frame_into_reachable_opportunity_on_swapchain(
-            &mut swapchain,
-            &mut output_transactions,
-            &presentation_deadline,
-            &presentation_timing,
-            &mut frame_pacing,
-            MonotonicTimestampNs::new(1_003_000_000),
-            1,
-            300_000,
-        )
-        .unwrap();
-        assert_eq!(pull_in, ReadyPullInResult::PulledIn);
-
+        let before = swapchain.ready_identity().expect("physical READY identity");
+        if active_predictive_attempt {
+            frame_pacing.note_render_decision(NativeOutputPacingMode::PredictiveTriple, true);
+            frame_pacing
+                .begin_render_attempt(NativeOutputPacingMode::PredictiveTriple, true)
+                .expect("active frame creates one Predictive O1 attempt");
+            frame_pacing
+                .bind_predictive_o1(before)
+                .expect("Predictive O1 attempt binds the exact Fixed snapshot");
+        } else {
+            frame_pacing
+                .note_render_started(NativeOutputPacingMode::PredictiveTriple, false)
+                .unwrap();
+            frame_pacing
+                .bind_physical_output_frame(before)
+                .expect("pacing binds the exact rendered physical frame");
+        }
+        if pacing_ready {
+            frame_pacing.note_render_ready();
+            frame_pacing.note_ready_frame(frame_now.get(), false);
+        }
+        let predictive_attempt_before = if pacing_ready {
+            frame_pacing.ready_predictive_attempt_id()
+        } else {
+            frame_pacing.active_predictive_attempt_id()
+        };
+        let mut frame_scheduler = NativeFrameScheduler::new_with_refresh_interval_ns(6_060_606, 0);
+        if scheduler_ready {
+            let mut scheduler_target = old_target;
+            if scheduler_target_mismatch {
+                scheduler_target.sequence = scheduler_target.sequence.saturating_add(1);
+            }
+            frame_scheduler.note_ready_frame(Some(scheduler_target));
+        }
         let expected_target = presentation_deadline
             .ready_target_pull_in(
                 MonotonicTimestampNs::new(1_003_000_000),
@@ -857,12 +917,162 @@ mod tests {
             )
             .unwrap()
             .replacement_target();
+        if transaction_target_mismatch {
+            output_transactions
+                .replace_ready_target(transaction_id, old_target, expected_target)
+                .expect("test deliberately changes only the transaction target");
+        }
+        let conflicting_worker_ticket = worker_reservation_conflict.then(|| {
+            frame_pacing
+                .reserve_worker_submission(false)
+                .expect("worker pacing reservation succeeds")
+                .expect("active physical owner receives a worker ticket")
+        });
+
+        let mut wrong_source = before;
+        let other_fixed_target = presentation_deadline
+            .plan_normal(
+                MonotonicTimestampNs::new(1_020_000_000),
+                Duration::from_nanos(100_000),
+            )
+            .expect("distinct binding target for exact source identity check");
+        wrong_source.reservation = FramePresentationReservation::Fixed(other_fixed_target);
         assert_eq!(
-            swapchain
-                .ready_identity()
-                .and_then(|identity| identity.fixed_target()),
-            Some(expected_target)
+            OutputFrameKey::from(&wrong_source),
+            OutputFrameKey::from(&before)
         );
+        let mut replacement_identity = before;
+        replacement_identity.reservation = FramePresentationReservation::Fixed(expected_target);
+        assert!(
+            frame_pacing
+                .prepare_fixed_target_physical_metadata_rebase(wrong_source, replacement_identity)
+                .is_err(),
+            "same frame ID and OutputFrameKey do not excuse a different full source snapshot"
+        );
+        let mut changed_key = replacement_identity;
+        changed_key.frame_id = changed_key.frame_id.saturating_add(1);
+        assert!(
+            frame_pacing
+                .prepare_fixed_target_physical_metadata_rebase(before, changed_key)
+                .is_err(),
+            "Fixed target metadata rebase preserves OutputFrameKey"
+        );
+        let replacement_submit_window = presentation_timing
+            .submit_window(
+                expected_target.presentation_time.get(),
+                1_003_000_000,
+                300_000,
+            )
+            .expect("replacement target has a matching submit window");
+        assert!(
+            swapchain
+                .prepare_ready_target_replacement(
+                    before,
+                    other_fixed_target,
+                    expected_target,
+                    replacement_submit_window,
+                )
+                .is_err(),
+            "swapchain preflight rejects an unexpected old target"
+        );
+        let old_submit_window = presentation_timing
+            .submit_window(old_target.presentation_time.get(), 1_003_000_000, 300_000)
+            .expect("old target has a matching submit window");
+        assert!(swapchain
+            .prepare_ready_target_replacement(
+                before,
+                old_target,
+                old_target,
+                old_submit_window,
+            )
+            .is_err(), "swapchain preflight rejects a replacement that is not earlier");
+
+        let output_id = before.output_id;
+        let make_scene = |scene_frame_id, render_generation| NativeFrameSceneSnapshot {
+            output_id,
+            frame_id: scene_frame_id,
+            render_generation,
+            scene: NativeSceneSnapshot::from_surfaces_with_scene_nodes(&[], &[], Vec::new(), &[]),
+            cursor_damage: NativeCursorDamageBounds::default(),
+            presentation: PresentationFrameSnapshot::empty_for_output(output_id),
+            lifecycle: LifecycleFrameSnapshot::default(),
+            canonical_scene_evidence: None,
+            window_exit_evidence: Vec::new(),
+        };
+        let mut scene_history = NativeSceneHistory::new(make_scene(0, 0));
+        assert!(scene_history.replace_ready(make_scene(frame_id, before.render_generation)));
+        let scene_identity_before = scene_history.ready_frame_identity();
+
+        if scheduler_target_mismatch || transaction_target_mismatch || worker_reservation_conflict {
+            let before_transaction_target = output_transactions
+                .transaction(transaction_id)
+                .unwrap()
+                .descriptor()
+                .fixed_target();
+            let before_pacing_identity = frame_pacing.unsubmitted_physical_identity();
+            let wrong_scheduler_target = frame_scheduler.ready_target();
+            let result = pull_ready_frame_into_reachable_opportunity_on_swapchain(
+                &mut swapchain,
+                &mut output_transactions,
+                &presentation_deadline,
+                &presentation_timing,
+                &mut frame_pacing,
+                &mut frame_scheduler,
+                MonotonicTimestampNs::new(1_003_000_000),
+                1,
+                300_000,
+            )
+            .unwrap();
+            assert_eq!(result, ReadyPullInResult::RejectedIdentity);
+            assert_eq!(swapchain.ready_identity(), Some(before));
+            assert_eq!(
+                output_transactions
+                    .transaction(transaction_id)
+                    .unwrap()
+                    .descriptor()
+                    .fixed_target(),
+                before_transaction_target
+            );
+            assert_eq!(
+                frame_pacing.unsubmitted_physical_identity(),
+                before_pacing_identity
+            );
+            assert_eq!(frame_scheduler.ready_target(), wrong_scheduler_target);
+            assert_eq!(
+                frame_pacing.worker_reservation_ticket(),
+                conflicting_worker_ticket
+            );
+            assert_eq!(scene_history.ready_frame_identity(), scene_identity_before);
+            return;
+        }
+
+        let pull_in = pull_ready_frame_into_reachable_opportunity_on_swapchain(
+            &mut swapchain,
+            &mut output_transactions,
+            &presentation_deadline,
+            &presentation_timing,
+            &mut frame_pacing,
+            &mut frame_scheduler,
+            MonotonicTimestampNs::new(1_003_000_000),
+            1,
+            300_000,
+        )
+        .unwrap();
+        assert_eq!(pull_in, ReadyPullInResult::PulledIn);
+
+        let after = swapchain
+            .ready_identity()
+            .expect("same physical READY frame");
+        assert_eq!(OutputFrameKey::from(&before), OutputFrameKey::from(&after));
+        assert_eq!(after.fixed_target(), Some(expected_target));
+        assert_eq!(after.frame_id, before.frame_id);
+        assert_eq!(after.transaction_id, before.transaction_id);
+        assert_eq!(after.protocol_batch_id, before.protocol_batch_id);
+        assert_eq!(after.slot, before.slot);
+        assert_eq!(after.framebuffer_id, before.framebuffer_id);
+        assert_eq!(after.render_generation, before.render_generation);
+        assert_eq!(after.pool_generation, before.pool_generation);
+        assert_eq!(scene_history.ready_frame_identity(), scene_identity_before);
         assert_eq!(
             output_transactions
                 .transaction(transaction_id)
@@ -871,6 +1081,37 @@ mod tests {
                 .fixed_target(),
             Some(expected_target)
         );
+        assert_eq!(frame_pacing.unsubmitted_physical_identity(), Some(after));
+        let predictive_attempt_after = if pacing_ready {
+            frame_pacing.ready_predictive_attempt_id()
+        } else {
+            frame_pacing.active_predictive_attempt_id()
+        };
+        assert_eq!(predictive_attempt_after, predictive_attempt_before);
+        if let Some(attempt_id) = predictive_attempt_before {
+            assert_eq!(
+                frame_pacing.predictive_o1_physical_identity_for_test(attempt_id),
+                Some(after),
+                "fixed target rebasing retains the existing lifecycle snapshot"
+            );
+            assert_eq!(frame_pacing.predictive_o1_active_entries_for_test(), 1);
+        }
+        assert_eq!(frame_scheduler.ready_frame_queued(), scheduler_ready);
+        assert_eq!(
+            frame_scheduler.ready_target(),
+            scheduler_ready.then_some(expected_target)
+        );
+        if pacing_ready && scheduler_ready {
+            validate_reconfiguration_frame_ownership_for_swapchain(
+                &swapchain,
+                OutputEpochId::initial(),
+                &scene_history,
+                &frame_pacing,
+                &frame_scheduler,
+                &output_transactions,
+            )
+            .expect("strict READY validation accepts the rebased Fixed target");
+        }
         let ready_window = swapchain.ready_submit_window().expect("N+1 ready window");
         assert_eq!(
             ready_window.target_presentation_ns(),
@@ -881,11 +1122,13 @@ mod tests {
         // This is the lane-free handoff: the active pacing identity is
         // reserved only after the READY target has been replaced.
         let ticket = frame_pacing
-            .reserve_worker_submission(false)
+            .reserve_worker_submission(pacing_ready)
             .unwrap()
             .expect("lane-free frame reaches worker reservation");
         assert_eq!(ticket.frame_id().get(), frame_id);
-        assert!(!ticket.ready_submit());
+        assert_eq!(ticket.ready_submit(), pacing_ready);
+        assert_eq!(ticket.physical_identity(), Some(after));
+        assert_eq!(ticket.predictive_attempt_id(), predictive_attempt_before);
         assert_eq!(
             output_transactions
                 .transaction(transaction_id)
@@ -894,5 +1137,30 @@ mod tests {
                 .fixed_target(),
             Some(expected_target)
         );
+    }
+
+    #[test]
+    fn fixed_ready_pull_in_rebases_ready_transaction_swapchain_pacing_and_scheduler_owners() {
+        ready_pull_in_owner_case(true, true, false, false, false, true);
+    }
+
+    #[test]
+    fn lane_free_ready_pull_in_rebases_active_pacing_without_fabricating_scheduler_ready() {
+        ready_pull_in_owner_case(false, false, false, false, false, true);
+    }
+
+    #[test]
+    fn ready_target_pull_in_preflight_failure_leaves_every_owner_unchanged() {
+        ready_pull_in_owner_case(true, true, true, false, false, false);
+    }
+
+    #[test]
+    fn fixed_pull_in_rejects_a_transaction_target_that_does_not_match_swapchain() {
+        ready_pull_in_owner_case(true, true, false, true, false, false);
+    }
+
+    #[test]
+    fn fixed_pull_in_rejects_a_worker_owned_pacing_capability() {
+        ready_pull_in_owner_case(false, false, false, false, true, true);
     }
 }

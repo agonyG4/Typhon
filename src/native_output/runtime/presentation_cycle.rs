@@ -2088,13 +2088,16 @@ impl NativeRuntime {
                                     settled.deferred_o1_binding_failure;
                                 let ready_at_ns = settled.ready_at_ns;
                                 let waits_for_target = settled.waits_for_target;
+                                let mut settled_ready_target = explicit
+                                    .swapchain()?
+                                    .ready_identity()
+                                    .and_then(|identity| identity.fixed_target());
                                 let mut deferred_o1_safely_abandoned = false;
                                 if let Some(failure) = deferred_o1_binding_failure {
                                     debug_assert!(render_ahead && waits_for_target);
                                     server.note_frame_callbacks_deferred_ready(protocol_batch_id);
                                     frame_pacing.note_ready_frame(ready_at_ns, waits_for_target);
-                                    frame_scheduler
-                                        .note_ready_frame(prepared_reservation.fixed_target());
+                                    frame_scheduler.note_ready_frame(settled_ready_target);
                                     let owner = explicit.swapchain()?.ready_identity().ok_or_else(
                                         || {
                                             io::Error::other(
@@ -2132,16 +2135,16 @@ impl NativeRuntime {
                                     if waits_for_target {
                                         server.note_frame_callbacks_deferred_ready(protocol_batch_id);
                                         frame_pacing.note_ready_frame(ready_at_ns, waits_for_target);
-                                        frame_scheduler
-                                            .note_ready_frame(prepared_reservation.fixed_target());
+                                        frame_scheduler.note_ready_frame(settled_ready_target);
                                     }
-                                    if prepared_reservation.fixed_target().is_some() {
+                                    if settled_ready_target.is_some() {
                                         match super::presentation_ready::pull_ready_frame_into_reachable_opportunity(
                                             explicit,
                                             output_transactions,
                                             presentation_deadline,
                                             presentation_timing,
                                             frame_pacing,
+                                            frame_scheduler,
                                             MonotonicTimestampNs::new(ready_at_ns),
                                             output_epoch.get(),
                                             prediction.kms_dispatch_budget_ns,
@@ -2157,6 +2160,10 @@ impl NativeRuntime {
                                                 frame_pacing.note_ready_pull_in_rejected_identity();
                                             }
                                         }
+                                        settled_ready_target = explicit
+                                            .swapchain()?
+                                            .ready_identity()
+                                            .and_then(|identity| identity.fixed_target());
                                     }
                                     if waits_for_target && render_ahead {
                                         frame_pacing.note_predictive_unbound_ready();
@@ -2166,8 +2173,7 @@ impl NativeRuntime {
                                     if !async_render_fence_ready {
                                         server.note_frame_callbacks_deferred_ready(protocol_batch_id);
                                         frame_pacing.note_ready_frame(ready_at_ns, false);
-                                        frame_scheduler
-                                            .note_ready_frame(prepared_reservation.fixed_target());
+                                        frame_scheduler.note_ready_frame(settled_ready_target);
                                         *queued_redraw_requested = true;
                                         return Ok(());
                                     }
@@ -2216,7 +2222,7 @@ impl NativeRuntime {
                                             } => {
                                                 server.note_frame_callbacks_deferred_ready(protocol_batch_id);
                                                 frame_pacing.note_ready_frame(monotonic_now_ns()?, false);
-                                                frame_scheduler.note_ready_frame(prepared_reservation.fixed_target());
+                                                frame_scheduler.note_ready_frame(settled_ready_target);
                                                 return Ok(());
                                             }
                                             super::presentation_worker::ExplicitReadySubmissionOutcome::VariableRetryRequired {

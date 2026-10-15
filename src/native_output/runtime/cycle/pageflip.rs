@@ -3256,6 +3256,7 @@ impl NativeRuntime {
                     match explicit.bind_ready_deferred_o1_after_predecessor_pageflip(
                         output_transactions,
                         frame_pacing,
+                        frame_scheduler,
                         output_epoch.get(),
                         presented_at,
                     )? {

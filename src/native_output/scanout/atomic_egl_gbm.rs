@@ -3210,34 +3210,63 @@ impl AtomicEglGbmScanout {
         output_generation: u64,
         bind_at: MonotonicTimestampNs,
     ) -> io::Result<DeferredO1BindingResult> {
-        self.bind_ready_deferred_o1_internal(output_transactions, None, output_generation, bind_at)
+        let swapchain = self.swapchain_mut()?;
+        Self::bind_ready_deferred_o1_on_swapchain_internal(
+            swapchain,
+            output_transactions,
+            None,
+            None,
+            output_generation,
+            bind_at,
+        )
     }
 
     pub(crate) fn bind_ready_deferred_o1_after_predecessor_pageflip(
         &mut self,
         output_transactions: &mut OutputTransactionLedger,
         frame_pacing: &mut crate::native_output::pacing::NativeFramePacing,
+        frame_scheduler: &mut oblivion_one::native::scheduler::NativeFrameScheduler,
         output_generation: u64,
         bind_at: MonotonicTimestampNs,
     ) -> io::Result<DeferredO1BindingResult> {
-        self.bind_ready_deferred_o1_internal(
+        let swapchain = self.swapchain_mut()?;
+        Self::bind_ready_deferred_o1_on_swapchain(
+            swapchain,
             output_transactions,
-            Some(frame_pacing),
+            frame_pacing,
+            frame_scheduler,
             output_generation,
             bind_at,
         )
     }
 
-    fn bind_ready_deferred_o1_internal(
-        &mut self,
+    pub(crate) fn bind_ready_deferred_o1_on_swapchain(
+        swapchain: &mut AtomicOutputSwapchain,
         output_transactions: &mut OutputTransactionLedger,
-        mut frame_pacing: Option<&mut crate::native_output::pacing::NativeFramePacing>,
+        frame_pacing: &mut crate::native_output::pacing::NativeFramePacing,
+        frame_scheduler: &mut oblivion_one::native::scheduler::NativeFrameScheduler,
         output_generation: u64,
         bind_at: MonotonicTimestampNs,
     ) -> io::Result<DeferredO1BindingResult> {
-        let readiness = self
-            .swapchain()?
-            .deferred_o1_binding_readiness(output_generation);
+        Self::bind_ready_deferred_o1_on_swapchain_internal(
+            swapchain,
+            output_transactions,
+            Some(frame_pacing),
+            Some(frame_scheduler),
+            output_generation,
+            bind_at,
+        )
+    }
+
+    fn bind_ready_deferred_o1_on_swapchain_internal(
+        swapchain: &mut AtomicOutputSwapchain,
+        output_transactions: &mut OutputTransactionLedger,
+        mut frame_pacing: Option<&mut crate::native_output::pacing::NativeFramePacing>,
+        mut frame_scheduler: Option<&mut oblivion_one::native::scheduler::NativeFrameScheduler>,
+        output_generation: u64,
+        bind_at: MonotonicTimestampNs,
+    ) -> io::Result<DeferredO1BindingResult> {
+        let readiness = swapchain.deferred_o1_binding_readiness(output_generation);
         match readiness {
             DeferredO1BindingReadiness::NotDeferred => {
                 return Ok(DeferredO1BindingResult::NotReady);
@@ -3251,13 +3280,11 @@ impl AtomicEglGbmScanout {
             DeferredO1BindingReadiness::Bindable { .. } => {}
         }
         let Some((transaction_id, target, submit_window, advanced_intervals)) =
-            self.swapchain()?
-                .deferred_o1_binding_candidate_for_readiness(readiness, bind_at)?
+            swapchain.deferred_o1_binding_candidate_for_readiness(readiness, bind_at)?
         else {
             return Ok(DeferredO1BindingResult::NotReady);
         };
-        let before = self
-            .swapchain()?
+        let before = swapchain
             .ready_identity()
             .ok_or_else(|| io::Error::other("deferred O1 READY disappeared before binding"))?;
         if before.transaction_id != transaction_id
@@ -3279,7 +3306,7 @@ impl AtomicEglGbmScanout {
         let transaction_binding = output_transactions
             .prepare_deferred_o1_binding(transaction_id, target)
             .map_err(io::Error::other)?;
-        let swapchain_binding = self.swapchain()?.prepare_deferred_o1_binding_commit(
+        let swapchain_binding = swapchain.prepare_deferred_o1_binding_commit(
             before,
             transaction_id,
             target,
@@ -3296,7 +3323,11 @@ impl AtomicEglGbmScanout {
             })
             .transpose()
             .map_err(io::Error::other)?;
-        let swapchain = self.swapchain_mut()?;
+        let scheduler_binding = frame_scheduler
+            .as_deref()
+            .map(|scheduler| scheduler.prepare_ready_target_metadata_rebase(None, Some(target)))
+            .transpose()
+            .map_err(io::Error::other)?;
 
         output_transactions.commit_prepared_deferred_o1_binding(transaction_binding);
         swapchain.commit_prepared_deferred_o1_binding(swapchain_binding);
@@ -3304,6 +3335,11 @@ impl AtomicEglGbmScanout {
             (frame_pacing.as_deref_mut(), pacing_binding)
         {
             frame_pacing.commit_unsubmitted_physical_metadata_rebase(pacing_binding);
+        }
+        if let (Some(frame_scheduler), Some(scheduler_binding)) =
+            (frame_scheduler.as_deref_mut(), scheduler_binding)
+        {
+            frame_scheduler.commit_ready_target_metadata_rebase(scheduler_binding);
         }
         Ok(DeferredO1BindingResult::Bound { advanced_intervals })
     }

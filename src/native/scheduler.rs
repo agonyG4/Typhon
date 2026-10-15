@@ -149,6 +149,12 @@ struct WorkerSubmissionReservation {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreparedReadyTargetMetadataRebase {
+    expected_target: Option<PresentationTarget>,
+    replacement_target: Option<PresentationTarget>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubmissionReservationState {
     None,
     WorkerQueued { token: u64, transaction_id: u64 },
@@ -520,6 +526,32 @@ impl NativeFrameScheduler {
         self.refresh_deadline_ns = None;
         self.ready_frame_queued = true;
         self.ready_target = target;
+    }
+
+    pub fn prepare_ready_target_metadata_rebase(
+        &self,
+        expected_target: Option<PresentationTarget>,
+        replacement_target: Option<PresentationTarget>,
+    ) -> Result<PreparedReadyTargetMetadataRebase, &'static str> {
+        if !self.ready_frame_queued {
+            return Err("scheduler has no READY owner for target metadata rebase");
+        }
+        if self.ready_target != expected_target {
+            return Err("scheduler READY target does not match metadata rebase source");
+        }
+        Ok(PreparedReadyTargetMetadataRebase {
+            expected_target,
+            replacement_target,
+        })
+    }
+
+    pub fn commit_ready_target_metadata_rebase(
+        &mut self,
+        prepared: PreparedReadyTargetMetadataRebase,
+    ) {
+        debug_assert!(self.ready_frame_queued);
+        debug_assert_eq!(self.ready_target, prepared.expected_target);
+        self.ready_target = prepared.replacement_target;
     }
 
     pub fn consume_ready_frame(&mut self) {
@@ -1271,6 +1303,100 @@ mod tests {
         assert_eq!(scheduler.ready_target(), Some(target));
         assert!(scheduler.ready_frame_queued());
         assert_eq!(scheduler.decision(10), SchedulerDecision::WaitForRefresh);
+    }
+
+    #[test]
+    fn ready_target_metadata_rebase_preserves_newer_work_and_unrelated_owners() {
+        let target = render_ahead_context(10, true, false)
+            .presentation_target
+            .expect("test target");
+        let mut scheduler = NativeFrameScheduler::new(165, 0);
+        scheduler.note_ready_frame(None);
+        scheduler.visual_work_queued = true;
+        scheduler.protocol_work_queued = true;
+        scheduler.pending_page_flip_token = Some(41);
+        scheduler.pending_page_flip_submitted_at_ns = Some(9);
+        scheduler.pending_page_flip_transaction_id = Some(42);
+        scheduler.worker_queued = Some(WorkerSubmissionReservation {
+            token: 43,
+            transaction_id: 44,
+        });
+        scheduler.refresh_deadline_ns = Some(45);
+        scheduler.watchdog_deadline_ns = Some(46);
+        scheduler.watchdog_timeout_count = 7;
+        scheduler.watchdog_reported = true;
+        let before = scheduler;
+
+        let prepared = scheduler
+            .prepare_ready_target_metadata_rebase(None, Some(target))
+            .expect("the live READY owner can be rebased");
+        scheduler.commit_ready_target_metadata_rebase(prepared);
+
+        let mut expected = before;
+        expected.ready_target = Some(target);
+        assert_eq!(scheduler, expected);
+    }
+
+    #[test]
+    fn ready_target_metadata_rebase_rejects_missing_or_mismatched_ready_owners() {
+        let mut scheduler = NativeFrameScheduler::new(165, 0);
+        let target = render_ahead_context(10, true, false)
+            .presentation_target
+            .expect("test target");
+        assert!(
+            scheduler
+                .prepare_ready_target_metadata_rebase(None, Some(target))
+                .is_err()
+        );
+
+        scheduler.note_ready_frame(None);
+        assert!(
+            scheduler
+                .prepare_ready_target_metadata_rebase(Some(target), Some(target))
+                .is_err()
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "assertion `left == right` failed")]
+    fn ready_target_metadata_rebase_commit_detects_a_changed_preflight_owner() {
+        let mut scheduler = NativeFrameScheduler::new(165, 0);
+        let target = render_ahead_context(10, true, false)
+            .presentation_target
+            .expect("test target");
+        let replacement = render_ahead_context(11, true, false)
+            .presentation_target
+            .expect("replacement target");
+        scheduler.note_ready_frame(None);
+        let prepared = scheduler
+            .prepare_ready_target_metadata_rebase(None, Some(target))
+            .expect("preflight sees the expected READY owner");
+        let competing = scheduler
+            .prepare_ready_target_metadata_rebase(None, Some(replacement))
+            .expect("second preflight sees the unchanged READY owner");
+        scheduler.commit_ready_target_metadata_rebase(competing);
+        scheduler.commit_ready_target_metadata_rebase(prepared);
+    }
+
+    #[test]
+    fn rebased_ready_target_restores_submit_deadline_scheduling() {
+        let mut target = render_ahead_context(10, true, false)
+            .presentation_target
+            .expect("test target");
+        target.submit_not_before = MonotonicTimestampNs::new(100);
+        target.presentation_time = MonotonicTimestampNs::new(200);
+        target.physical_claim.presentation_time = target.presentation_time;
+        let mut scheduler = NativeFrameScheduler::new(165, 0);
+        scheduler.note_ready_frame(None);
+
+        assert_eq!(scheduler.decision(10), SchedulerDecision::SubmitReady);
+        let prepared = scheduler
+            .prepare_ready_target_metadata_rebase(None, Some(target))
+            .expect("READY target metadata preflights");
+        scheduler.commit_ready_target_metadata_rebase(prepared);
+        assert_eq!(scheduler.decision(99), SchedulerDecision::WaitForRefresh);
+        assert_eq!(scheduler.decision(100), SchedulerDecision::SubmitReady);
     }
 
     #[test]

@@ -249,6 +249,14 @@ pub(crate) struct PreparedDeferredO1TransactionBinding {
     bound_ready_at: MonotonicTimestampNs,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedReadyTargetTransactionReplacement {
+    transaction_id: OutputTransactionId,
+    expected_descriptor: OutputTransaction,
+    replacement_descriptor: OutputTransaction,
+    expected_ready_at: MonotonicTimestampNs,
+}
+
 impl OutputTransactionRecord {
     pub(crate) const fn descriptor(&self) -> &OutputTransaction {
         &self.descriptor
@@ -1185,25 +1193,60 @@ impl OutputTransactionLedger {
         expected: oblivion_one::native::presentation_deadline::PresentationTarget,
         replacement: oblivion_one::native::presentation_deadline::PresentationTarget,
     ) -> Result<(), OutputTransactionError> {
+        let prepared = self.prepare_ready_target_replacement(id, expected, replacement)?;
+        self.commit_prepared_ready_target_replacement(prepared);
+        Ok(())
+    }
+
+    pub(crate) fn prepare_ready_target_replacement(
+        &self,
+        id: OutputTransactionId,
+        expected: oblivion_one::native::presentation_deadline::PresentationTarget,
+        replacement: oblivion_one::native::presentation_deadline::PresentationTarget,
+    ) -> Result<PreparedReadyTargetTransactionReplacement, OutputTransactionError> {
         let state = self.state(id)?;
-        if !matches!(state, OutputTransactionState::Ready { .. }) {
+        let OutputTransactionState::Ready { ready_at } = state else {
             return Err(OutputTransactionError::PresentationTargetMismatch);
-        }
+        };
         let record = self
             .active
-            .get_mut(&id)
+            .get(&id)
             .ok_or(OutputTransactionError::UnknownTransaction)?;
         if !expected.is_binding()
             || !replacement.is_binding()
             || record.descriptor.reservation()
                 != super::transaction::FramePresentationReservation::Fixed(expected)
-            || !record
-                .descriptor
-                .replace_bound_target(expected, replacement)
         {
             return Err(OutputTransactionError::PresentationTargetMismatch);
         }
-        Ok(())
+        let mut replacement_descriptor = record.descriptor.clone();
+        if !replacement_descriptor.replace_bound_target(expected, replacement) {
+            return Err(OutputTransactionError::PresentationTargetMismatch);
+        }
+        Ok(PreparedReadyTargetTransactionReplacement {
+            transaction_id: id,
+            expected_descriptor: record.descriptor.clone(),
+            replacement_descriptor,
+            expected_ready_at: ready_at,
+        })
+    }
+
+    pub(crate) fn commit_prepared_ready_target_replacement(
+        &mut self,
+        prepared: PreparedReadyTargetTransactionReplacement,
+    ) {
+        let record = self
+            .active
+            .get_mut(&prepared.transaction_id)
+            .expect("preflighted READY target transaction remains active");
+        debug_assert_eq!(record.descriptor(), &prepared.expected_descriptor);
+        debug_assert_eq!(
+            record.state(),
+            OutputTransactionState::Ready {
+                ready_at: prepared.expected_ready_at,
+            }
+        );
+        record.descriptor = prepared.replacement_descriptor;
     }
 
     pub(crate) fn surface_damage(

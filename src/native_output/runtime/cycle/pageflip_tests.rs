@@ -1324,7 +1324,8 @@ fn atomic_ready_scene_publication_uses_physical_generation_after_cursor_change()
         PresentationFrameSnapshot::empty_for_output(owner.output_id),
         LifecycleFrameSnapshot::default(),
         (None, None),
-    );
+    )
+    .expect("atomic READY scene publication should succeed");
 
     assert_eq!(
         fixture.scene_history.ready_frame_identity(),

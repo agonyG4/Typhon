@@ -1980,6 +1980,14 @@ pub(crate) struct PreparedUnsubmittedPhysicalMetadataRebase {
     advanced_intervals: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PreparedFixedTargetPhysicalMetadataRebase {
+    old_identity: OutputFrameIdentitySnapshot,
+    new_identity: OutputFrameIdentitySnapshot,
+    lane: UnsubmittedPhysicalFrameLane,
+    predictive_attempt_id: Option<PredictiveO1AttemptId>,
+}
+
 impl WorkerPacingTicket {
     pub(crate) const fn reservation_id(self) -> WorkerPacingReservationId {
         self.reservation_id
@@ -2477,6 +2485,50 @@ impl PredictiveO1LifecycleLedger {
             return Err("Predictive O1 lifecycle is not ready for late binding");
         }
         Ok(())
+    }
+
+    fn validate_fixed_target_metadata_rebase(
+        &self,
+        attempt_id: PredictiveO1AttemptId,
+        old_identity: OutputFrameIdentitySnapshot,
+        new_identity: OutputFrameIdentitySnapshot,
+    ) -> Result<(), &'static str> {
+        let old_key = OutputFrameKey::from(&old_identity);
+        if old_key != OutputFrameKey::from(&new_identity) {
+            return Err("Predictive O1 fixed-target rebase changed physical frame identity");
+        }
+        let Some(entry) = self
+            .entries
+            .iter()
+            .flatten()
+            .find(|entry| entry.attempt_id == attempt_id)
+        else {
+            return Err("Predictive O1 attempt identity was not live for target rebase");
+        };
+        if entry.physical_key != Some(old_key) || entry.physical_state != Some(old_identity) {
+            return Err("Predictive O1 lifecycle metadata disagrees with target rebase source");
+        }
+        Ok(())
+    }
+
+    fn commit_fixed_target_metadata_rebase(
+        &mut self,
+        attempt_id: PredictiveO1AttemptId,
+        old_identity: OutputFrameIdentitySnapshot,
+        new_identity: OutputFrameIdentitySnapshot,
+    ) {
+        let entry = self
+            .entries
+            .iter_mut()
+            .flatten()
+            .find(|entry| entry.attempt_id == attempt_id)
+            .expect("preflighted Predictive O1 lifecycle remains live");
+        debug_assert_eq!(
+            entry.physical_key,
+            Some(OutputFrameKey::from(&old_identity))
+        );
+        debug_assert_eq!(entry.physical_state, Some(old_identity));
+        entry.physical_state = Some(new_identity);
     }
 
     fn commit_physical_metadata_rebase(
@@ -3408,6 +3460,152 @@ impl NativeFramePacing {
                 PacingField::u64("advanced_intervals", prepared.advanced_intervals),
             ],
         );
+    }
+
+    pub(crate) fn prepare_fixed_target_physical_metadata_rebase(
+        &self,
+        old_identity: OutputFrameIdentitySnapshot,
+        new_identity: OutputFrameIdentitySnapshot,
+    ) -> Result<PreparedFixedTargetPhysicalMetadataRebase, &'static str> {
+        let key = OutputFrameKey::from(&old_identity);
+        if key != OutputFrameKey::from(&new_identity) {
+            return Err("Fixed target metadata rebase changed OutputFrameKey");
+        }
+        let (
+            crate::native_output::presentation::transaction::FramePresentationReservation::Fixed(
+                old_target,
+            ),
+            crate::native_output::presentation::transaction::FramePresentationReservation::Fixed(
+                new_target,
+            ),
+        ) = (old_identity.reservation, new_identity.reservation)
+        else {
+            return Err("Fixed target metadata rebase requires Fixed reservations");
+        };
+        if !old_target.is_binding() || !new_target.is_binding() || old_target == new_target {
+            return Err("Fixed target metadata rebase requires distinct binding targets");
+        }
+        if !self.enabled {
+            return Ok(PreparedFixedTargetPhysicalMetadataRebase {
+                old_identity,
+                new_identity,
+                lane: UnsubmittedPhysicalFrameLane::Untracked,
+                predictive_attempt_id: None,
+            });
+        }
+
+        let ready_matches =
+            self.ready.is_some() && self.ready_physical_identity == Some(old_identity);
+        let active_matches =
+            self.active.is_some() && self.active_physical_identity == Some(old_identity);
+        if ready_matches == active_matches {
+            return Err("Fixed target metadata source is not one exact pacing owner");
+        }
+        let lane = if ready_matches {
+            UnsubmittedPhysicalFrameLane::Ready
+        } else {
+            UnsubmittedPhysicalFrameLane::Active
+        };
+        if (lane == UnsubmittedPhysicalFrameLane::Ready
+            && self
+                .active_physical_identity
+                .is_some_and(|identity| OutputFrameKey::from(&identity) == key))
+            || (lane == UnsubmittedPhysicalFrameLane::Active
+                && self
+                    .ready_physical_identity
+                    .is_some_and(|identity| OutputFrameKey::from(&identity) == key))
+        {
+            return Err("Fixed target metadata source has a conflicting pacing lane owner");
+        }
+        let owner_key = match lane {
+            UnsubmittedPhysicalFrameLane::Ready => self.ready_physical_key,
+            UnsubmittedPhysicalFrameLane::Active => self.active_physical_key,
+            UnsubmittedPhysicalFrameLane::Untracked => None,
+        };
+        if owner_key != Some(key) {
+            return Err("Fixed target metadata source does not match the pacing owner key");
+        }
+        if self
+            .pending_physical_identity
+            .is_some_and(|identity| OutputFrameKey::from(&identity) == key)
+        {
+            return Err("Fixed target metadata source is also owned by a pending frame");
+        }
+        if self
+            .worker_reservation
+            .is_some_and(|ticket| ticket.physical_key() == Some(key))
+            || match lane {
+                UnsubmittedPhysicalFrameLane::Ready => self.ready_worker_reservation_id.is_some(),
+                UnsubmittedPhysicalFrameLane::Active => self.active_worker_reservation_id.is_some(),
+                UnsubmittedPhysicalFrameLane::Untracked => false,
+            }
+        {
+            return Err("worker pacing reservation owns the Fixed target metadata source");
+        }
+
+        let predictive_attempt_id = match lane {
+            UnsubmittedPhysicalFrameLane::Ready => self.ready_predictive_attempt,
+            UnsubmittedPhysicalFrameLane::Active => self.active_predictive_attempt,
+            UnsubmittedPhysicalFrameLane::Untracked => None,
+        };
+        if let Some(attempt_id) = predictive_attempt_id {
+            self.predictive_o1_lifecycle
+                .validate_fixed_target_metadata_rebase(attempt_id, old_identity, new_identity)?;
+        }
+        Ok(PreparedFixedTargetPhysicalMetadataRebase {
+            old_identity,
+            new_identity,
+            lane,
+            predictive_attempt_id,
+        })
+    }
+
+    pub(crate) fn commit_fixed_target_physical_metadata_rebase(
+        &mut self,
+        prepared: PreparedFixedTargetPhysicalMetadataRebase,
+    ) {
+        let key = OutputFrameKey::from(&prepared.old_identity);
+        match prepared.lane {
+            UnsubmittedPhysicalFrameLane::Ready => {
+                debug_assert_eq!(self.ready_physical_identity, Some(prepared.old_identity));
+                debug_assert_eq!(self.ready_physical_key, Some(key));
+                debug_assert!(self.ready_worker_reservation_id.is_none());
+                debug_assert_eq!(
+                    self.ready_predictive_attempt,
+                    prepared.predictive_attempt_id
+                );
+                self.ready_physical_identity = Some(prepared.new_identity);
+            }
+            UnsubmittedPhysicalFrameLane::Active => {
+                debug_assert_eq!(self.active_physical_identity, Some(prepared.old_identity));
+                debug_assert_eq!(self.active_physical_key, Some(key));
+                debug_assert!(self.active_worker_reservation_id.is_none());
+                debug_assert_eq!(
+                    self.active_predictive_attempt,
+                    prepared.predictive_attempt_id
+                );
+                self.active_physical_identity = Some(prepared.new_identity);
+            }
+            UnsubmittedPhysicalFrameLane::Untracked => return,
+        }
+        debug_assert!(
+            !self
+                .worker_reservation
+                .is_some_and(|ticket| ticket.physical_key() == Some(key))
+        );
+        debug_assert!(
+            !self
+                .pending_physical_identity
+                .is_some_and(|identity| OutputFrameKey::from(&identity) == key)
+        );
+        if let Some(attempt_id) = prepared.predictive_attempt_id {
+            self.predictive_o1_lifecycle
+                .commit_fixed_target_metadata_rebase(
+                    attempt_id,
+                    prepared.old_identity,
+                    prepared.new_identity,
+                );
+        }
     }
 
     pub(crate) fn rebase_unsubmitted_physical_metadata(

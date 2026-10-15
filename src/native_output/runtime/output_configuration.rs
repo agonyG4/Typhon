@@ -1303,6 +1303,13 @@ impl NativeRuntime {
         ) {
             let swapchain = explicit.swapchain()?;
             let physical_ready = swapchain.ready_identity();
+            let scheduler_target_identity = self
+                .frame_scheduler
+                .ready_target()
+                .map(|target| target.identity());
+            let physical_target_identity = physical_ready
+                .and_then(|owner| owner.fixed_target())
+                .map(|target| target.identity());
             let transaction = physical_ready.and_then(|owner| {
                 self.output_transactions
                     .transaction(owner.transaction_id)
@@ -1356,13 +1363,13 @@ impl NativeRuntime {
                     .map(|commit| commit.phase),
             );
             return Err(io::Error::other(format!(
-                "{error}; output ownership diagnostic: output_epoch={} latest_submitted_frame_id={:?} latest_presented_frame_id={:?} physical_ready={physical_ready:?} scene_ready={:?} ready_transaction={transaction:?} pacing_identity={:?} pacing_lane={pacing_lane:?} scheduler_ready={} scheduler_target={:?} worker_queued={worker_queued:?} worker_transaction={worker_transaction:?} worker_ticket={worker_ticket:?} worker_scene={worker_scene:?} swapchain_submitted={:?} arbiter_queued=(token={:?},kind={:?},phase={:?}) arbiter_submitted=(token={:?},kind={:?},phase={:?}) kms_worker={worker_snapshot:?}",
+                "{error}; output ownership diagnostic: output_epoch={} scheduler_ready={} scheduler_target_identity={scheduler_target_identity:?} physical_target_identity={physical_target_identity:?} latest_submitted_frame_id={:?} latest_presented_frame_id={:?} physical_ready={physical_ready:?} scene_ready={:?} ready_transaction={transaction:?} pacing_identity={:?} pacing_lane={pacing_lane:?} scheduler_target={:?} worker_queued={worker_queued:?} worker_transaction={worker_transaction:?} worker_ticket={worker_ticket:?} worker_scene={worker_scene:?} swapchain_submitted={:?} arbiter_queued=(token={:?},kind={:?},phase={:?}) arbiter_submitted=(token={:?},kind={:?},phase={:?}) kms_worker={worker_snapshot:?}",
                 self.output_epoch.get(),
+                self.frame_scheduler.ready_frame_queued(),
                 self.scene_history.latest_submitted_frame_id(),
                 self.scene_history.presented_frame_id(),
                 self.scene_history.ready_frame_identity(),
                 self.frame_pacing.unsubmitted_physical_identity(),
-                self.frame_scheduler.ready_frame_queued(),
                 self.frame_scheduler.ready_target(),
                 swapchain.pending_identity(),
                 arbiter_snapshot.0,
