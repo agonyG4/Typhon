@@ -4935,7 +4935,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             dimensions,
-            vec![(184, 114), (92, 57), (184, 114), (368, 228)]
+            vec![(248, 174), (124, 87), (248, 174), (496, 348)]
         );
         assert!(
             graph

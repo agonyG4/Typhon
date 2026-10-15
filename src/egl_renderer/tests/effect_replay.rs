@@ -5063,9 +5063,11 @@ fn canonical_partial_repair_matches_full_render_for_staged_and_fused_paths() {
 
 #[test]
 fn canonical_noise_seed_fields_are_origin_and_translation_independent() {
-    let output_size = (257, 193);
-    let first_rect = EffectRect::new(64, 48, 101, 75).expect("first translated domain");
-    let translated_rect = EffectRect::new(76, 57, 101, 75).expect("translated domain");
+    // Leave room for the conservative aggregate capture halo on every side so
+    // the two translated captures have equal, unclipped physical domains.
+    let output_size = (401, 321);
+    let first_rect = EffectRect::new(128, 120, 101, 75).expect("first translated domain");
+    let translated_rect = EffectRect::new(140, 129, 101, 75).expect("translated domain");
     let material = oblivion_one::material::EffectiveMaterial {
         blur: 0.42,
         saturation: 0.31,
@@ -5183,5 +5185,53 @@ fn canonical_noise_seed_fields_are_origin_and_translation_independent() {
     assert!(
         distinct_noise_values.len() > 1,
         "canonical Noise test field should contain varying seeds"
+    );
+}
+
+#[test]
+fn canonical_noise_field_origin_is_invariant_with_capture_clipped_to_output() {
+    let output_size = (257, 193);
+    let effect_rect = EffectRect::new(64, 48, 101, 75).expect("edge-adjacent domain");
+    let material = oblivion_one::material::EffectiveMaterial {
+        blur: 0.42,
+        saturation: 0.31,
+        noise: 0.3,
+    };
+    let group = VisualGroupId::new(180).expect("noise group");
+    let (scene, registry) = terminal_builtin_blur_scene(effect_rect, group, material, None);
+    let bounds = EffectRect::new(0, 0, output_size.0, output_size.1).expect("output bounds");
+    let graph = terminal_graph_variant(&scene, &registry, bounds, false);
+    let tail = terminal_tail_capture_ids(&graph)[0];
+    let domain = terminal_stage_output_domain(&graph, tail.fragment);
+    assert_eq!(
+        domain.x, 0,
+        "the expanded capture clips at the left output edge"
+    );
+    assert_eq!(
+        domain.y, 0,
+        "the expanded capture clips at the top output edge"
+    );
+
+    let bottom_left = capture_canonical_staged_noise_field(
+        &graph,
+        output_size,
+        OutputFramebufferOrigin::BottomLeft,
+        tail.fragment,
+        domain,
+        effect_rect,
+        |harness| install_diagnostic_scene(harness, effect_rect, group),
+    );
+    let top_left = capture_canonical_staged_noise_field(
+        &graph,
+        output_size,
+        OutputFramebufferOrigin::TopLeftScanout,
+        tail.fragment,
+        domain,
+        effect_rect,
+        |harness| install_diagnostic_scene(harness, effect_rect, group),
+    );
+    assert_eq!(
+        bottom_left.pixels, top_left.pixels,
+        "canonical offscreen Noise field changed with framebuffer origin when capture is clipped"
     );
 }

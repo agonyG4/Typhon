@@ -1,10 +1,31 @@
 use super::{DualKawaseBlurSpec, EffectFootprint, EffectNodeKind, EffectValidationError};
 
-/// Returns the conservative physical source radius of the implemented
-/// downsample/upsample chain.  Each level samples a two-pixel-wide Kawase
-/// offset and doubles its source-space reach; the upsample chain mirrors the
-/// same levels.  `scale` converts the processing-space reach back to source
-/// pixels.
+/// Returns an aggregate source-space bound for the compiled Dual Kawase chain.
+///
+/// For `P` levels, the input texel scales of the downsample passes are bounded
+/// by `1, 2/s, ..., 2^(P-1)/s`; the upsample passes use
+/// `2/s, 4/s, ..., 2^P/s`. Both sums are at most
+/// `3 * (2^P - 1) / s`. `scaled_dimension()` followed by `ceil_div()` can only
+/// make a level texture larger than its ideal fractional size, so this also
+/// bounds every odd and tiny domain.
+///
+/// Each Kawase sample moves by `radius` input texels. Reverse demand also
+/// covers the sampler's linear-filtered texel cells: `sampled_input_axis_bounds()`
+/// can reach two input texels beyond that offset, and converting the covered
+/// physical input cells back to logical bounds adds at most one more input
+/// texel. Converting a demanded logical output interval to physical coverage
+/// adds one output texel. For every downsample after the first, that output
+/// texel is at most two input texels; for an upsample it is at most one. The
+/// first downsample is exceptional: its output texel can span `2/s` source
+/// pixels, so account for that separately. Thus offset, linear-filter, input
+/// conversion, and output-coverage support are bounded by
+/// `(radius + 5) * 3 * (2^P - 1) / s + 2/s`.
+///
+/// The final logical Composite can add one output pixel and three final-input
+/// texels (`3/s`); another output pixel covers conversion between sampled
+/// pixel cells and the planner's integer damage rectangle. Captures start at
+/// 1:1 source texel per logical pixel. The bound deliberately allows slack so
+/// it remains valid for every domain size, including ceil-div and odd sizes.
 pub fn dual_kawase_sampling_radius(
     radius: f32,
     passes: u8,
@@ -12,7 +33,12 @@ pub fn dual_kawase_sampling_radius(
 ) -> Result<u32, EffectValidationError> {
     let spec = DualKawaseBlurSpec::new(radius, passes, scale)?;
     let level_reach = (1u64 << spec.passes) - 1;
-    let reach = f64::from(spec.radius) * (2.0 * level_reach as f64) / f64::from(spec.scale);
+    let level_sum = level_reach as f64;
+    let inverse_scale = 1.0 / f64::from(spec.scale);
+    let reach = 3.0 * level_sum * (f64::from(spec.radius) + 5.0) * inverse_scale
+        + 2.0 * inverse_scale
+        + 2.0
+        + 3.0 * inverse_scale;
     if !reach.is_finite() || reach > f64::from(u32::MAX) {
         return Err(EffectValidationError::FootprintOverflow);
     }
@@ -141,6 +167,9 @@ mod tests {
             failure_policy: EffectFailurePolicy::Passthrough,
         };
         let validated = validate_effect_program(program).unwrap();
-        assert_eq!(validated.aggregate_footprint, EffectFootprint::symmetric(8));
+        assert_eq!(
+            validated.aggregate_footprint,
+            EffectFootprint::symmetric(dual_kawase_sampling_radius(4.0, 1, 1.0).unwrap())
+        );
     }
 }
