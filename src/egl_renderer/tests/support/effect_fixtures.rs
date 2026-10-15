@@ -307,6 +307,20 @@ pub(in crate::egl_renderer::tests) fn install_diagnostic_scene(
     rect: EffectRect,
     visual_group: VisualGroupId,
 ) {
+    install_diagnostic_scene_with_origin(
+        harness,
+        rect,
+        visual_group,
+        OutputFramebufferOrigin::BottomLeft,
+    );
+}
+
+pub(in crate::egl_renderer::tests) fn install_diagnostic_scene_with_origin(
+    harness: &mut GlesEffectTestHarness,
+    rect: EffectRect,
+    visual_group: VisualGroupId,
+    framebuffer_origin: OutputFramebufferOrigin,
+) {
     let width = harness.renderer.scene_state.current_size.0;
     let height = harness.renderer.scene_state.current_size.1;
     let mut background = Vec::with_capacity(width as usize * height as usize * 4);
@@ -342,7 +356,7 @@ pub(in crate::egl_renderer::tests) fn install_diagnostic_scene(
         EglRect::new(0.0, 0.0, width as f32, height as f32),
         width,
         height,
-        OutputFramebufferOrigin::BottomLeft,
+        framebuffer_origin,
     );
     let target_command = harness.renderer.scene_state.commands.len();
     push_draw_command(
@@ -357,7 +371,7 @@ pub(in crate::egl_renderer::tests) fn install_diagnostic_scene(
         ),
         width,
         height,
-        OutputFramebufferOrigin::BottomLeft,
+        framebuffer_origin,
     );
     harness.renderer.scene_state.commands[target_command].visual_group = Some(visual_group);
     harness.renderer.scene_state.scene_geometry_dirty = true;

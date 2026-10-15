@@ -8751,6 +8751,20 @@ mod tests {
     }
 
     #[test]
+    fn terminal_local_stage_metadata_accepts_color_matrix_tint_noise_order() {
+        let color_matrix = EffectNodeKind::ColorMatrix(ColorMatrixSpec::IDENTITY);
+        let tint = EffectNodeKind::Tint(crate::effects::TintSpec::WHITE);
+        let noise = EffectNodeKind::Noise(
+            NoiseSpec::new(NoiseKind::Hash, 0.3).expect("finite Noise stage"),
+        );
+
+        assert!(valid_terminal_local_stage_chain(
+            &color_matrix,
+            &[tint, noise]
+        ));
+    }
+
+    #[test]
     fn fifteen_builtin_blurs_elide_only_the_terminal_upsample_and_fragment() {
         let bounds = EffectRect::new(0, 0, 2_400, 600).unwrap();
         let off = compile_terminal_fusion_variant(15, bounds, false);
