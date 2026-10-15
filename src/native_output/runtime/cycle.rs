@@ -45,9 +45,11 @@ pub(super) use pageflip::abandon_overtaken_ready;
 pub(crate) use pageflip::recover_or_arm_suspended_output_ownership;
 pub(super) use pageflip::terminalize_suspended_frame_for_variable_retry;
 pub(super) use pageflip::terminalize_unsubmitted_frame_for_reconfiguration;
-pub(super) use pageflip::validate_reconfiguration_frame_ownership;
 #[cfg(test)]
 pub(crate) use pageflip::validate_reconfiguration_frame_ownership_for_swapchain;
+#[cfg(test)]
+pub(crate) use pageflip::validate_reconfiguration_frame_ownership_for_swapchain_with_arbiter;
+pub(crate) use pageflip::validate_reconfiguration_frame_ownership_with_arbiter;
 pub(crate) use pageflip::{
     ExplicitWorkerReplanRequest, preflight_explicit_worker_replan, restore_explicit_worker_replan,
 };

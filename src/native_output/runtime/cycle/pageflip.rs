@@ -821,7 +821,10 @@ enum OutputFrameRetirementInvariantError {
     SuspendedPhysicalIdentityMissing,
     PacingOwnerMissing,
     SceneReadyIdentityMismatch,
+    SceneSubmittedIdentityMismatch,
     SchedulerReadyOwnershipMismatch,
+    WorkerPacingOwnerMismatch,
+    LogicalOwnerWithoutPhysicalRole,
     OutputTransactionMissing,
     OutputTransactionIdentityMismatch,
     OutputTransactionNotUnsubmitted,
@@ -842,8 +845,17 @@ impl std::fmt::Display for OutputFrameRetirementInvariantError {
             Self::SceneReadyIdentityMismatch => {
                 formatter.write_str("unsubmitted READY has no matching scene-history READY owner")
             }
+            Self::SceneSubmittedIdentityMismatch => {
+                formatter.write_str("asynchronous physical owner has no matching submitted scene")
+            }
             Self::SchedulerReadyOwnershipMismatch => {
                 formatter.write_str("unsubmitted READY disagrees with scheduler READY ownership")
+            }
+            Self::WorkerPacingOwnerMismatch => {
+                formatter.write_str("worker-queued physical frame has no matching pacing ticket")
+            }
+            Self::LogicalOwnerWithoutPhysicalRole => {
+                formatter.write_str("logical frame owner has no physical or asynchronous role")
             }
             Self::OutputTransactionMissing => {
                 formatter.write_str("unsubmitted READY has no active output transaction")
@@ -889,7 +901,8 @@ fn validate_unsubmitted_output_frame_owners(
     if matches!(
         pacing_lane,
         crate::native_output::pacing::UnsubmittedPhysicalFrameLane::Ready
-    ) && !frame_scheduler.ready_frame_queued()
+    ) && (!frame_scheduler.ready_frame_queued()
+        || frame_scheduler.ready_target() != owner.reservation.fixed_target())
     {
         return Err(OutputFrameRetirementInvariantError::SchedulerReadyOwnershipMismatch.into());
     }
@@ -1257,13 +1270,38 @@ pub(crate) fn validate_reconfiguration_frame_ownership(
     frame_scheduler: &NativeFrameScheduler,
     output_transactions: &OutputTransactionLedger,
 ) -> NativeResult<()> {
-    let swapchain = explicit.swapchain()?;
-    validate_reconfiguration_frame_ownership_for_swapchain(
-        swapchain,
+    let empty_arbiter = AtomicCommitArbiter::new();
+    validate_reconfiguration_frame_ownership_with_arbiter(
+        explicit,
         output_epoch,
+        0,
         scene_history,
         frame_pacing,
         frame_scheduler,
+        &empty_arbiter,
+        output_transactions,
+    )
+}
+
+pub(crate) fn validate_reconfiguration_frame_ownership_with_arbiter(
+    explicit: &AtomicEglGbmScanout,
+    output_epoch: OutputEpochId,
+    crtc_id: u32,
+    scene_history: &NativeSceneHistory,
+    frame_pacing: &NativeFramePacing,
+    frame_scheduler: &NativeFrameScheduler,
+    atomic_commit_arbiter: &AtomicCommitArbiter,
+    output_transactions: &OutputTransactionLedger,
+) -> NativeResult<()> {
+    let swapchain = explicit.swapchain()?;
+    validate_reconfiguration_frame_ownership_for_swapchain_with_arbiter(
+        swapchain,
+        output_epoch,
+        crtc_id,
+        scene_history,
+        frame_pacing,
+        frame_scheduler,
+        atomic_commit_arbiter,
         output_transactions,
     )
 }
@@ -1276,6 +1314,79 @@ pub(crate) fn validate_reconfiguration_frame_ownership_for_swapchain(
     frame_scheduler: &NativeFrameScheduler,
     output_transactions: &OutputTransactionLedger,
 ) -> NativeResult<()> {
+    let empty_arbiter = AtomicCommitArbiter::new();
+    validate_reconfiguration_frame_ownership_for_swapchain_with_arbiter(
+        swapchain,
+        output_epoch,
+        0,
+        scene_history,
+        frame_pacing,
+        frame_scheduler,
+        &empty_arbiter,
+        output_transactions,
+    )
+}
+
+pub(crate) fn validate_reconfiguration_frame_ownership_for_swapchain_with_arbiter(
+    swapchain: &AtomicOutputSwapchain,
+    output_epoch: OutputEpochId,
+    crtc_id: u32,
+    scene_history: &NativeSceneHistory,
+    frame_pacing: &NativeFramePacing,
+    frame_scheduler: &NativeFrameScheduler,
+    atomic_commit_arbiter: &AtomicCommitArbiter,
+    output_transactions: &OutputTransactionLedger,
+) -> NativeResult<()> {
+    super::super::presentation_pipeline::validate_atomic_commit_roles(
+        output_epoch.get(),
+        crtc_id,
+        swapchain,
+        output_transactions,
+        atomic_commit_arbiter,
+    )
+    .map_err(io::Error::other)?;
+
+    let submitted_scene_matches = |identity: OutputFrameIdentitySnapshot, token: PageFlipToken| {
+        scene_history.submitted_identity(token.get())
+            == Some((
+                identity.output_id,
+                identity.frame_id,
+                identity.render_generation,
+            ))
+    };
+    let pending = swapchain.pending_identity();
+    let worker_queued = swapchain.worker_queued_identity();
+
+    if let Some(pending) = pending {
+        if !submitted_scene_matches(pending.frame, pending.token) {
+            return Err(OutputFrameRetirementInvariantError::SceneSubmittedIdentityMismatch.into());
+        }
+        frame_pacing
+            .validate_kernel_submitted_physical_owner(pending.frame, pending.token.get())
+            .map_err(|_| OutputFrameRetirementInvariantError::PacingOwnerMissing)?;
+    }
+    if let Some(worker_queued) = worker_queued {
+        if !submitted_scene_matches(worker_queued.frame, worker_queued.token) {
+            return Err(OutputFrameRetirementInvariantError::SceneSubmittedIdentityMismatch.into());
+        }
+        frame_pacing
+            .validate_optional_worker_queued_physical_owner(
+                frame_pacing.worker_reservation_ticket(),
+                worker_queued.frame,
+            )
+            .map_err(|_| OutputFrameRetirementInvariantError::WorkerPacingOwnerMismatch)?;
+    } else if frame_pacing
+        .worker_reservation_ticket()
+        .is_some_and(|ticket| ticket.physical_identity().is_some())
+    {
+        return Err(OutputFrameRetirementInvariantError::LogicalOwnerWithoutPhysicalRole.into());
+    }
+
+    let worker_commit_exists = atomic_commit_arbiter.worker_queued_commit().is_some();
+    if frame_pacing.worker_reservation_ticket().is_some() && !worker_commit_exists {
+        return Err(OutputFrameRetirementInvariantError::LogicalOwnerWithoutPhysicalRole.into());
+    }
+
     let physical_ready = swapchain.ready_identity();
     if let Some(owner) = physical_ready {
         validate_unsubmitted_ready_owners(
@@ -1287,14 +1398,32 @@ pub(crate) fn validate_reconfiguration_frame_ownership_for_swapchain(
             frame_scheduler,
             output_transactions,
         )?;
-        return Ok(());
     }
-    if frame_pacing.ready.is_some()
-        || frame_pacing.has_unbound_ready_owner()
-        || scene_history.has_ready_frame()
-        || frame_scheduler.ready_frame_queued()
-    {
-        return Err(OutputFrameRetirementInvariantError::PhysicalReadyIdentityChanged.into());
+    if physical_ready.is_none() {
+        if scene_history.has_ready_frame() || frame_scheduler.ready_frame_queued() {
+            return Err(
+                OutputFrameRetirementInvariantError::LogicalOwnerWithoutPhysicalRole.into(),
+            );
+        }
+        if frame_pacing.has_unbound_ready_owner()
+            || (frame_pacing.ready.is_some()
+                && frame_pacing.unsubmitted_physical_identity().is_none())
+        {
+            return Err(
+                OutputFrameRetirementInvariantError::LogicalOwnerWithoutPhysicalRole.into(),
+            );
+        }
+    }
+
+    if let Some(logical_owner) = frame_pacing.unsubmitted_physical_identity() {
+        let has_role = physical_ready == Some(logical_owner)
+            || pending.is_some_and(|owner| owner.frame == logical_owner)
+            || worker_queued.is_some_and(|owner| owner.frame == logical_owner);
+        if !has_role {
+            return Err(
+                OutputFrameRetirementInvariantError::LogicalOwnerWithoutPhysicalRole.into(),
+            );
+        }
     }
     Ok(())
 }
@@ -3124,18 +3253,15 @@ impl NativeRuntime {
                     }
                     completed_physical_identity = Some(frame.physical_identity);
                     explicit.note_physical_primary_presentation(physical_claim)?;
-                    match explicit.bind_ready_deferred_o1(
+                    match explicit.bind_ready_deferred_o1_after_predecessor_pageflip(
                         output_transactions,
+                        frame_pacing,
                         output_epoch.get(),
                         presented_at,
                     )? {
                         DeferredO1BindingResult::NotReady => {}
                         DeferredO1BindingResult::WaitingForPredecessor => {}
-                        DeferredO1BindingResult::Bound { advanced_intervals } => {
-                            frame_pacing.note_predictive_binding_after_predecessor_pageflip(
-                                advanced_intervals,
-                            );
-                        }
+                        DeferredO1BindingResult::Bound { .. } => {}
                         DeferredO1BindingResult::Stale(failure) => {
                             let owner =
                                 explicit.swapchain()?.ready_identity().ok_or_else(|| {

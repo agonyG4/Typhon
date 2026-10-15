@@ -1365,6 +1365,322 @@ fn atomic_ready_scene_publication_uses_physical_generation_after_cursor_change()
 }
 
 #[test]
+fn worker_queued_and_ready_successor_roles_are_individually_coherent() {
+    let mut fixture = variable_retry_fixture(VariableRetryPacingLane::Ready);
+    let output_epoch = fixture.output_epoch;
+    let crtc_id = 7;
+    let mut arbiter = AtomicCommitArbiter::new();
+    let worker_token = PageFlipToken::new(802).unwrap();
+    let (_worker, worker_ticket) =
+        queue_fixture_ready_as_worker(&mut fixture, &mut arbiter, worker_token, crtc_id);
+    let ready_successor = append_ready_successor(&mut fixture, 2, 2_000_000_000);
+
+    assert_ne!(ready_successor, fixture.owner);
+    assert_eq!(
+        fixture
+            .swapchain
+            .worker_queued_identity()
+            .map(|owner| owner.frame),
+        Some(fixture.owner)
+    );
+    assert_eq!(fixture.swapchain.ready_identity(), Some(ready_successor));
+    assert_eq!(
+        fixture.scene_history.submitted_identity(worker_token.get()),
+        Some((
+            fixture.owner.output_id,
+            fixture.owner.frame_id,
+            fixture.owner.render_generation
+        ))
+    );
+    assert_eq!(
+        fixture.scene_history.ready_frame_identity(),
+        Some((ready_successor.frame_id, ready_successor.render_generation))
+    );
+    assert_eq!(
+        fixture.frame_pacing.worker_reservation_ticket(),
+        Some(worker_ticket)
+    );
+    assert_eq!(
+        fixture.frame_pacing.unsubmitted_physical_identity(),
+        Some(ready_successor)
+    );
+    assert!(fixture.frame_scheduler.ready_frame_queued());
+    validate_reconfiguration_frame_ownership_for_swapchain_with_arbiter(
+        &fixture.swapchain,
+        output_epoch,
+        crtc_id,
+        &fixture.scene_history,
+        &fixture.frame_pacing,
+        &fixture.frame_scheduler,
+        &arbiter,
+        &fixture.output_transactions,
+    )
+    .expect("worker A and independently coherent READY successor B may coexist");
+}
+
+#[test]
+fn worker_queued_role_rejects_missing_or_mismatched_submitted_scene() {
+    use crate::native_output::presentation::ledger::OutputTransactionStateKind;
+
+    let crtc_id = 7;
+    let mut missing = variable_retry_fixture(VariableRetryPacingLane::Ready);
+    let mut missing_arbiter = AtomicCommitArbiter::new();
+    let token = PageFlipToken::new(811).unwrap();
+    let (_worker, _) =
+        queue_fixture_ready_as_worker(&mut missing, &mut missing_arbiter, token, crtc_id);
+    missing
+        .scene_history
+        .discard_submission_exact(
+            token.get(),
+            missing.owner.output_id,
+            missing.owner.frame_id,
+            missing.owner.render_generation,
+        )
+        .unwrap();
+    assert!(
+        validate_reconfiguration_frame_ownership_for_swapchain_with_arbiter(
+            &missing.swapchain,
+            missing.output_epoch,
+            crtc_id,
+            &missing.scene_history,
+            &missing.frame_pacing,
+            &missing.frame_scheduler,
+            &missing_arbiter,
+            &missing.output_transactions,
+        )
+        .is_err()
+    );
+
+    let mut wrong_scene = variable_retry_fixture(VariableRetryPacingLane::Ready);
+    let mut wrong_scene_arbiter = AtomicCommitArbiter::new();
+    let wrong_scene_token = PageFlipToken::new(812).unwrap();
+    let (_worker, _) = queue_fixture_ready_as_worker(
+        &mut wrong_scene,
+        &mut wrong_scene_arbiter,
+        wrong_scene_token,
+        crtc_id,
+    );
+    let original = wrong_scene.owner;
+    wrong_scene
+        .scene_history
+        .rollback_submission_to_ready(
+            wrong_scene_token.get(),
+            original.output_id,
+            original.frame_id,
+            original.render_generation,
+        )
+        .unwrap();
+    let successor = append_ready_successor(&mut wrong_scene, 2, 2_000_000_000);
+    assert_ne!(successor.frame_id, original.frame_id);
+    wrong_scene
+        .scene_history
+        .queue_submission_or_error(wrong_scene_token.get())
+        .unwrap();
+    assert_eq!(
+        wrong_scene
+            .scene_history
+            .submitted_identity(wrong_scene_token.get()),
+        Some((
+            successor.output_id,
+            successor.frame_id,
+            successor.render_generation
+        ))
+    );
+    let wrong_error = validate_reconfiguration_frame_ownership_for_swapchain_with_arbiter(
+        &wrong_scene.swapchain,
+        wrong_scene.output_epoch,
+        crtc_id,
+        &wrong_scene.scene_history,
+        &wrong_scene.frame_pacing,
+        &wrong_scene.frame_scheduler,
+        &wrong_scene_arbiter,
+        &wrong_scene.output_transactions,
+    )
+    .expect_err("a submitted scene for successor B cannot validate worker frame A");
+    assert!(wrong_error.to_string().contains("submitted scene"));
+
+    // The transaction role must remain Queued until the worker resolves.
+    let mut wrong_transaction = variable_retry_fixture(VariableRetryPacingLane::Ready);
+    let mut transaction_arbiter = AtomicCommitArbiter::new();
+    let transaction_token = PageFlipToken::new(813).unwrap();
+    let (_worker, _) = queue_fixture_ready_as_worker(
+        &mut wrong_transaction,
+        &mut transaction_arbiter,
+        transaction_token,
+        crtc_id,
+    );
+    assert_eq!(
+        wrong_transaction
+            .output_transactions
+            .transaction(wrong_transaction.owner.transaction_id)
+            .unwrap()
+            .state()
+            .kind(),
+        OutputTransactionStateKind::Queued
+    );
+    wrong_transaction
+        .output_transactions
+        .rollback_queued(wrong_transaction.owner.transaction_id)
+        .unwrap();
+    assert!(
+        validate_reconfiguration_frame_ownership_for_swapchain_with_arbiter(
+            &wrong_transaction.swapchain,
+            wrong_transaction.output_epoch,
+            crtc_id,
+            &wrong_transaction.scene_history,
+            &wrong_transaction.frame_pacing,
+            &wrong_transaction.frame_scheduler,
+            &transaction_arbiter,
+            &wrong_transaction.output_transactions,
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn worker_queued_role_rejects_orphaned_arbiter_pacing_and_scheduler_owners() {
+    use crate::native_output::presentation::ledger::OutputTransactionLedger;
+
+    let crtc_id = 7;
+
+    let mut wrong_arbiter = variable_retry_fixture(VariableRetryPacingLane::Ready);
+    let mut correct_arbiter = AtomicCommitArbiter::new();
+    let token = PageFlipToken::new(821).unwrap();
+    let (_worker, ticket) =
+        queue_fixture_ready_as_worker(&mut wrong_arbiter, &mut correct_arbiter, token, crtc_id);
+    let wrong_transaction_id = OutputTransactionId::new(NonZeroU64::new(99_999).unwrap());
+    let wrong_kind = AtomicCommitKind::CompositedPrimary {
+        transaction_id: wrong_transaction_id,
+        frame_id: wrong_arbiter.owner.frame_id,
+        framebuffer_id: wrong_arbiter.owner.framebuffer_id.get(),
+    };
+    let mut missing_transaction_arbiter = AtomicCommitArbiter::new();
+    missing_transaction_arbiter
+        .reserve_worker_queued(
+            token,
+            wrong_arbiter.output_epoch.get(),
+            crtc_id,
+            wrong_kind,
+            3,
+        )
+        .unwrap();
+    assert!(
+        validate_reconfiguration_frame_ownership_for_swapchain_with_arbiter(
+            &wrong_arbiter.swapchain,
+            wrong_arbiter.output_epoch,
+            crtc_id,
+            &wrong_arbiter.scene_history,
+            &wrong_arbiter.frame_pacing,
+            &wrong_arbiter.frame_scheduler,
+            &missing_transaction_arbiter,
+            &wrong_arbiter.output_transactions,
+        )
+        .is_err()
+    );
+
+    let mut mismatched_token_arbiter = AtomicCommitArbiter::new();
+    mismatched_token_arbiter
+        .reserve_worker_queued(
+            PageFlipToken::new(token.get() + 1).unwrap(),
+            wrong_arbiter.output_epoch.get(),
+            crtc_id,
+            AtomicCommitKind::CompositedPrimary {
+                transaction_id: wrong_arbiter.owner.transaction_id,
+                frame_id: wrong_arbiter.owner.frame_id,
+                framebuffer_id: wrong_arbiter.owner.framebuffer_id.get(),
+            },
+            3,
+        )
+        .unwrap();
+    assert!(
+        validate_reconfiguration_frame_ownership_for_swapchain_with_arbiter(
+            &wrong_arbiter.swapchain,
+            wrong_arbiter.output_epoch,
+            crtc_id,
+            &wrong_arbiter.scene_history,
+            &wrong_arbiter.frame_pacing,
+            &wrong_arbiter.frame_scheduler,
+            &mismatched_token_arbiter,
+            &wrong_arbiter.output_transactions,
+        )
+        .is_err()
+    );
+
+    let mut wrong_ticket_identity = wrong_arbiter.owner;
+    wrong_ticket_identity.frame_id = wrong_ticket_identity.frame_id.saturating_add(1);
+    assert!(
+        wrong_arbiter
+            .frame_pacing
+            .validate_worker_queued_physical_owner(ticket, wrong_ticket_identity)
+            .is_err()
+    );
+    assert!(
+        wrong_arbiter
+            .frame_pacing
+            .cancel_worker_submission(Some(ticket))
+    );
+    assert!(
+        validate_reconfiguration_frame_ownership_for_swapchain_with_arbiter(
+            &wrong_arbiter.swapchain,
+            wrong_arbiter.output_epoch,
+            crtc_id,
+            &wrong_arbiter.scene_history,
+            &wrong_arbiter.frame_pacing,
+            &wrong_arbiter.frame_scheduler,
+            &correct_arbiter,
+            &wrong_arbiter.output_transactions,
+        )
+        .is_err()
+    );
+
+    let mut wrong_scheduler = variable_retry_fixture(VariableRetryPacingLane::Ready);
+    let mut scheduler_arbiter = AtomicCommitArbiter::new();
+    let scheduler_token = PageFlipToken::new(822).unwrap();
+    let (_worker, _) = queue_fixture_ready_as_worker(
+        &mut wrong_scheduler,
+        &mut scheduler_arbiter,
+        scheduler_token,
+        crtc_id,
+    );
+    wrong_scheduler.frame_scheduler.note_ready_frame(None);
+    assert!(
+        validate_reconfiguration_frame_ownership_for_swapchain_with_arbiter(
+            &wrong_scheduler.swapchain,
+            wrong_scheduler.output_epoch,
+            crtc_id,
+            &wrong_scheduler.scene_history,
+            &wrong_scheduler.frame_pacing,
+            &wrong_scheduler.frame_scheduler,
+            &scheduler_arbiter,
+            &wrong_scheduler.output_transactions,
+        )
+        .is_err()
+    );
+
+    let mut orphan = variable_retry_fixture(VariableRetryPacingLane::Ready);
+    assert!(orphan.swapchain.suspend_abandon_ready().unwrap());
+    orphan
+        .scene_history
+        .discard_ready_if_identity(orphan.owner.frame_id, orphan.owner.render_generation);
+    orphan.frame_scheduler.consume_ready_frame();
+    let empty_ledger = OutputTransactionLedger::new_for_output(orphan.owner.output_id);
+    let empty_arbiter = AtomicCommitArbiter::new();
+    assert!(
+        validate_reconfiguration_frame_ownership_for_swapchain_with_arbiter(
+            &orphan.swapchain,
+            orphan.output_epoch,
+            crtc_id,
+            &orphan.scene_history,
+            &orphan.frame_pacing,
+            &orphan.frame_scheduler,
+            &empty_arbiter,
+            &empty_ledger,
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn invalidated_worker_replan_reaches_output_configuration_with_coherent_ready_owners() {
     use crate::native_output::NativeOutputReconfigurationBoundary;
     use crate::native_output::kms_worker::ValidationBaseInvalidationReason;

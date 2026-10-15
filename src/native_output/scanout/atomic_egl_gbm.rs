@@ -3203,6 +3203,31 @@ impl AtomicEglGbmScanout {
         output_generation: u64,
         bind_at: MonotonicTimestampNs,
     ) -> io::Result<DeferredO1BindingResult> {
+        self.bind_ready_deferred_o1_internal(output_transactions, None, output_generation, bind_at)
+    }
+
+    pub(crate) fn bind_ready_deferred_o1_after_predecessor_pageflip(
+        &mut self,
+        output_transactions: &mut OutputTransactionLedger,
+        frame_pacing: &mut crate::native_output::pacing::NativeFramePacing,
+        output_generation: u64,
+        bind_at: MonotonicTimestampNs,
+    ) -> io::Result<DeferredO1BindingResult> {
+        self.bind_ready_deferred_o1_internal(
+            output_transactions,
+            Some(frame_pacing),
+            output_generation,
+            bind_at,
+        )
+    }
+
+    fn bind_ready_deferred_o1_internal(
+        &mut self,
+        output_transactions: &mut OutputTransactionLedger,
+        mut frame_pacing: Option<&mut crate::native_output::pacing::NativeFramePacing>,
+        output_generation: u64,
+        bind_at: MonotonicTimestampNs,
+    ) -> io::Result<DeferredO1BindingResult> {
         let readiness = self
             .swapchain()?
             .deferred_o1_binding_readiness(output_generation);
@@ -3224,11 +3249,55 @@ impl AtomicEglGbmScanout {
         else {
             return Ok(DeferredO1BindingResult::NotReady);
         };
-        output_transactions
-            .bind_deferred_o1(transaction_id, target)
+        let before = self
+            .swapchain()?
+            .ready_identity()
+            .ok_or_else(|| io::Error::other("deferred O1 READY disappeared before binding"))?;
+        if before.transaction_id != transaction_id
+            || !matches!(
+                before.reservation,
+                FramePresentationReservation::DeferredO1(_)
+            )
+        {
+            return Err(io::Error::other(
+                "deferred O1 physical identity changed before binding preflight",
+            ));
+        }
+        let mut after = before;
+        after.reservation = FramePresentationReservation::Fixed(target);
+
+        // Preflight every current owner before any of them changes. The commit
+        // operations below only apply these prepared snapshots and cannot
+        // return a partial transition.
+        let transaction_binding = output_transactions
+            .prepare_deferred_o1_binding(transaction_id, target)
             .map_err(io::Error::other)?;
-        self.swapchain_mut()?
-            .commit_deferred_o1_binding(transaction_id, target, submit_window)?;
+        let swapchain_binding = self.swapchain()?.prepare_deferred_o1_binding_commit(
+            before,
+            transaction_id,
+            target,
+            submit_window,
+        )?;
+        let pacing_binding = frame_pacing
+            .as_deref()
+            .map(|pacing| {
+                pacing.prepare_unsubmitted_physical_metadata_rebase(
+                    before,
+                    after,
+                    advanced_intervals,
+                )
+            })
+            .transpose()
+            .map_err(io::Error::other)?;
+        let swapchain = self.swapchain_mut()?;
+
+        output_transactions.commit_prepared_deferred_o1_binding(transaction_binding);
+        swapchain.commit_prepared_deferred_o1_binding(swapchain_binding);
+        if let (Some(frame_pacing), Some(pacing_binding)) =
+            (frame_pacing.as_deref_mut(), pacing_binding)
+        {
+            frame_pacing.commit_unsubmitted_physical_metadata_rebase(pacing_binding);
+        }
         Ok(DeferredO1BindingResult::Bound { advanced_intervals })
     }
 

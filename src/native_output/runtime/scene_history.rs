@@ -113,6 +113,11 @@ impl NativeSceneHistory {
             .map(|snapshot| (snapshot.frame_id, snapshot.render_generation))
     }
 
+    #[cfg(test)]
+    pub(crate) fn ready_snapshot_for_test(&self) -> Option<&NativeFrameSceneSnapshot> {
+        self.ready.as_ref()
+    }
+
     pub(crate) fn has_ready_frame(&self) -> bool {
         self.ready.is_some()
     }

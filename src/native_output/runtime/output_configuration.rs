@@ -1291,12 +1291,14 @@ impl NativeRuntime {
         &self,
         explicit: &crate::native_output::scanout::AtomicEglGbmScanout,
     ) -> NativeResult<()> {
-        if let Err(error) = super::cycle::validate_reconfiguration_frame_ownership(
+        if let Err(error) = super::cycle::validate_reconfiguration_frame_ownership_with_arbiter(
             explicit,
             self.output_epoch,
+            self.target.crtc_id,
             &self.scene_history,
             &self.frame_pacing,
             &self.frame_scheduler,
+            &self.atomic_commit_arbiter,
             &self.output_transactions,
         ) {
             let swapchain = explicit.swapchain()?;
@@ -1305,6 +1307,32 @@ impl NativeRuntime {
                 self.output_transactions
                     .transaction(owner.transaction_id)
                     .map(|record| (owner.transaction_id, record.state().kind()))
+            });
+            let worker_queued = swapchain.worker_queued_identity();
+            let worker_transaction = worker_queued.and_then(|owner| {
+                self.output_transactions
+                    .transaction(owner.frame.transaction_id)
+                    .map(|record| {
+                        (
+                            owner.frame.transaction_id,
+                            record.state().kind(),
+                            record.descriptor().reservation(),
+                        )
+                    })
+            });
+            let worker_ticket = self.frame_pacing.worker_reservation_ticket().map(|ticket| {
+                (
+                    ticket,
+                    ticket.physical_identity(),
+                    ticket.physical_key(),
+                    ticket.ready_submit(),
+                )
+            });
+            let worker_scene = worker_queued.map(|owner| {
+                (
+                    owner.token,
+                    self.scene_history.submitted_identity(owner.token.get()),
+                )
             });
             let pacing_lane = physical_ready
                 .and_then(|owner| self.frame_pacing.unsubmitted_physical_frame_lane(owner));
@@ -1320,9 +1348,15 @@ impl NativeRuntime {
                 self.atomic_commit_arbiter.worker_queued_kind(),
                 self.atomic_commit_arbiter.kernel_submitted_token(),
                 self.atomic_commit_arbiter.kernel_submitted_kind(),
+                self.atomic_commit_arbiter
+                    .worker_queued_commit()
+                    .map(|commit| commit.phase),
+                self.atomic_commit_arbiter
+                    .kernel_submitted_commit()
+                    .map(|commit| commit.phase),
             );
             return Err(io::Error::other(format!(
-                "{error}; READY ownership diagnostic: output_epoch={} latest_submitted_frame_id={:?} latest_presented_frame_id={:?} physical_ready={physical_ready:?} scene_ready={:?} transaction={transaction:?} pacing_identity={:?} pacing_lane={pacing_lane:?} scheduler_ready={} scheduler_target={:?} worker_queued={:?} swapchain_submitted={:?} arbiter_queued=(token={:?},kind={:?}) arbiter_submitted=(token={:?},kind={:?}) kms_worker={worker_snapshot:?}",
+                "{error}; output ownership diagnostic: output_epoch={} latest_submitted_frame_id={:?} latest_presented_frame_id={:?} physical_ready={physical_ready:?} scene_ready={:?} ready_transaction={transaction:?} pacing_identity={:?} pacing_lane={pacing_lane:?} scheduler_ready={} scheduler_target={:?} worker_queued={worker_queued:?} worker_transaction={worker_transaction:?} worker_ticket={worker_ticket:?} worker_scene={worker_scene:?} swapchain_submitted={:?} arbiter_queued=(token={:?},kind={:?},phase={:?}) arbiter_submitted=(token={:?},kind={:?},phase={:?}) kms_worker={worker_snapshot:?}",
                 self.output_epoch.get(),
                 self.scene_history.latest_submitted_frame_id(),
                 self.scene_history.presented_frame_id(),
@@ -1330,12 +1364,13 @@ impl NativeRuntime {
                 self.frame_pacing.unsubmitted_physical_identity(),
                 self.frame_scheduler.ready_frame_queued(),
                 self.frame_scheduler.ready_target(),
-                swapchain.worker_queued_identity(),
                 swapchain.pending_identity(),
                 arbiter_snapshot.0,
                 arbiter_snapshot.1,
                 arbiter_snapshot.2,
                 arbiter_snapshot.3,
+                arbiter_snapshot.4,
+                arbiter_snapshot.5,
             ))
             .into());
         }
@@ -2481,12 +2516,14 @@ impl NativeRuntime {
         );
         if let NativeScanoutBackend::AtomicEglGbm(explicit) = &*self.scanout {
             debug_assert!(
-                super::cycle::validate_reconfiguration_frame_ownership(
+                super::cycle::validate_reconfiguration_frame_ownership_with_arbiter(
                     explicit,
                     output_epoch,
+                    self.target.crtc_id,
                     &self.scene_history,
                     &self.frame_pacing,
                     &self.frame_scheduler,
+                    &self.atomic_commit_arbiter,
                     &self.output_transactions,
                 )
                 .is_ok()
@@ -2686,12 +2723,14 @@ impl OutputConfigurationRuntime for NativeRuntime {
 
     fn quiesce_old_output_epoch(&mut self) -> Result<QuiescedOutputEpoch, String> {
         if let NativeScanoutBackend::AtomicEglGbm(explicit) = &*self.scanout {
-            super::cycle::validate_reconfiguration_frame_ownership(
+            super::cycle::validate_reconfiguration_frame_ownership_with_arbiter(
                 explicit,
                 self.output_epoch,
+                self.target.crtc_id,
                 &self.scene_history,
                 &self.frame_pacing,
                 &self.frame_scheduler,
+                &self.atomic_commit_arbiter,
                 &self.output_transactions,
             )
             .map_err(|error| error.to_string())?;

@@ -240,6 +240,15 @@ pub(crate) struct OutputTransactionRecord {
     state: OutputTransactionState,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedDeferredO1TransactionBinding {
+    transaction_id: OutputTransactionId,
+    expected_descriptor: OutputTransaction,
+    bound_descriptor: OutputTransaction,
+    expected_ready_at: MonotonicTimestampNs,
+    bound_ready_at: MonotonicTimestampNs,
+}
+
 impl OutputTransactionRecord {
     pub(crate) const fn descriptor(&self) -> &OutputTransaction {
         &self.descriptor
@@ -644,16 +653,26 @@ impl OutputTransactionLedger {
         id: OutputTransactionId,
         target: oblivion_one::native::presentation_deadline::PresentationTarget,
     ) -> Result<(), OutputTransactionError> {
+        let prepared = self.prepare_deferred_o1_binding(id, target)?;
+        self.commit_prepared_deferred_o1_binding(prepared);
+        Ok(())
+    }
+
+    pub(crate) fn prepare_deferred_o1_binding(
+        &mut self,
+        id: OutputTransactionId,
+        target: oblivion_one::native::presentation_deadline::PresentationTarget,
+    ) -> Result<PreparedDeferredO1TransactionBinding, OutputTransactionError> {
         let state = self.state(id)?;
-        if !matches!(state, OutputTransactionState::ReadyUnbound { .. }) {
+        let OutputTransactionState::ReadyUnbound { ready_at } = state else {
             return Err(self.invalid_transition(state, OutputTransactionTransitionKind::Ready));
-        }
+        };
         let record = self
             .active
-            .get_mut(&id)
-            .expect("ready-unbound transaction was observed above");
-        record
-            .descriptor
+            .get(&id)
+            .expect("active state was observed above");
+        let mut bound_descriptor = record.descriptor().clone();
+        bound_descriptor
             .bind_deferred_o1(target.physical_claim(), target.submit_not_before())
             .map_err(|error| match error {
                 FramePresentationBindingError::GenerationMismatch
@@ -663,10 +682,34 @@ impl OutputTransactionLedger {
                     OutputTransactionError::DeferredBindingRejected
                 }
             })?;
+        Ok(PreparedDeferredO1TransactionBinding {
+            transaction_id: id,
+            expected_descriptor: record.descriptor().clone(),
+            bound_descriptor,
+            expected_ready_at: ready_at,
+            bound_ready_at: target.render_start_deadline(),
+        })
+    }
+
+    pub(crate) fn commit_prepared_deferred_o1_binding(
+        &mut self,
+        prepared: PreparedDeferredO1TransactionBinding,
+    ) {
+        let record = self
+            .active
+            .get_mut(&prepared.transaction_id)
+            .expect("preflighted deferred O1 transaction remains active");
+        debug_assert_eq!(record.descriptor(), &prepared.expected_descriptor);
+        debug_assert_eq!(
+            record.state(),
+            OutputTransactionState::ReadyUnbound {
+                ready_at: prepared.expected_ready_at,
+            }
+        );
+        record.descriptor = prepared.bound_descriptor;
         record.state = OutputTransactionState::Ready {
-            ready_at: target.render_start_deadline(),
+            ready_at: prepared.bound_ready_at,
         };
-        Ok(())
     }
     pub(crate) fn mark_queued(
         &mut self,

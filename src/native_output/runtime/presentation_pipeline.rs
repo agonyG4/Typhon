@@ -33,6 +33,12 @@ pub(super) enum PipelineSnapshotError {
         owner: &'static str,
         transaction_id: OutputTransactionId,
     },
+    CommitCrtcMismatch {
+        owner: &'static str,
+        transaction_id: OutputTransactionId,
+        expected: u32,
+        actual: u32,
+    },
     MissingRenderingTarget,
     PipelineInvariant(PipelineValidationError),
 }
@@ -188,6 +194,20 @@ fn commit_snapshot(
                     transaction_id,
                 ));
             }
+            if physical.frame.output_id != descriptor.output_id() {
+                return Err(identity_mismatch(
+                    owner,
+                    "swapchain_output_id",
+                    transaction_id,
+                ));
+            }
+            if descriptor.obligations().frame_batch_id() != Some(physical.frame.protocol_batch_id) {
+                return Err(identity_mismatch(
+                    owner,
+                    "swapchain_protocol_batch_id",
+                    transaction_id,
+                ));
+            }
             if physical.frame.frame_id != frame_id {
                 return Err(identity_mismatch(
                     owner,
@@ -297,6 +317,90 @@ fn commit_snapshot(
         },
         kind,
     })
+}
+
+pub(super) fn validate_atomic_commit_roles(
+    output_generation: u64,
+    crtc_id: u32,
+    swapchain: &AtomicOutputSwapchain,
+    ledger: &OutputTransactionLedger,
+    arbiter: &AtomicCommitArbiter,
+) -> Result<(Option<QueuedCommitSnapshot>, Option<QueuedCommitSnapshot>), PipelineSnapshotError> {
+    let kernel_submitted = arbiter
+        .kernel_submitted_commit()
+        .map(|pending| {
+            commit_snapshot(
+                "kernel_submitted",
+                pending,
+                OutputTransactionStateKind::Submitted,
+                swapchain.pending_identity(),
+                ledger,
+            )
+        })
+        .transpose()?;
+    if kernel_submitted.is_none() && swapchain.pending_identity().is_some() {
+        let physical = swapchain
+            .pending_identity()
+            .expect("presence checked above");
+        return Err(PipelineSnapshotError::UnexpectedSwapchainRole {
+            owner: "swapchain_pending",
+            transaction_id: physical.frame.transaction_id,
+        });
+    }
+    let worker_queued_next = arbiter
+        .worker_queued_commit()
+        .map(|pending| {
+            commit_snapshot(
+                "worker_queued_next",
+                pending,
+                OutputTransactionStateKind::Queued,
+                swapchain.worker_queued_identity(),
+                ledger,
+            )
+        })
+        .transpose()?;
+    if worker_queued_next.is_none() && swapchain.worker_queued_identity().is_some() {
+        let physical = swapchain
+            .worker_queued_identity()
+            .expect("presence checked above");
+        return Err(PipelineSnapshotError::UnexpectedSwapchainRole {
+            owner: "swapchain_worker_queued",
+            transaction_id: physical.frame.transaction_id,
+        });
+    }
+    for (owner, commit) in [
+        ("kernel_submitted", kernel_submitted),
+        ("worker_queued_next", worker_queued_next),
+    ] {
+        if let Some(commit) = commit {
+            if commit.output_generation != output_generation {
+                return Err(PipelineSnapshotError::PipelineInvariant(
+                    PipelineValidationError::OutputGenerationMismatch {
+                        transaction_id: commit.kind.transaction_id(),
+                        expected: output_generation,
+                        actual: commit.output_generation,
+                    },
+                ));
+            }
+            if commit.crtc_id != crtc_id {
+                return Err(PipelineSnapshotError::CommitCrtcMismatch {
+                    owner,
+                    transaction_id: commit.kind.transaction_id(),
+                    expected: crtc_id,
+                    actual: commit.crtc_id,
+                });
+            }
+        }
+    }
+    if kernel_submitted
+        .zip(worker_queued_next)
+        .is_some_and(|(kernel, worker)| kernel.token == worker.token)
+    {
+        return Err(PipelineSnapshotError::PipelineInvariant(
+            PipelineValidationError::DuplicateCommitToken,
+        ));
+    }
+    Ok((kernel_submitted, worker_queued_next))
 }
 
 fn validate_presented_primary(
@@ -540,46 +644,8 @@ pub(super) fn build_output_pipeline_snapshot_with_presented(
             crtc_id,
         )?;
     }
-    let kernel_submitted = arbiter
-        .kernel_submitted_commit()
-        .map(|pending| {
-            commit_snapshot(
-                "kernel_submitted",
-                pending,
-                OutputTransactionStateKind::Submitted,
-                swapchain.pending_identity(),
-                ledger,
-            )
-        })
-        .transpose()?;
-    if kernel_submitted.is_none()
-        && let Some(physical) = swapchain.pending_identity()
-    {
-        return Err(PipelineSnapshotError::UnexpectedSwapchainRole {
-            owner: "swapchain_pending",
-            transaction_id: physical.frame.transaction_id,
-        });
-    }
-    let worker_queued_next = arbiter
-        .worker_queued_commit()
-        .map(|pending| {
-            commit_snapshot(
-                "worker_queued_next",
-                pending,
-                OutputTransactionStateKind::Queued,
-                swapchain.worker_queued_identity(),
-                ledger,
-            )
-        })
-        .transpose()?;
-    if worker_queued_next.is_none()
-        && let Some(physical) = swapchain.worker_queued_identity()
-    {
-        return Err(PipelineSnapshotError::UnexpectedSwapchainRole {
-            owner: "swapchain_worker_queued",
-            transaction_id: physical.frame.transaction_id,
-        });
-    }
+    let (kernel_submitted, worker_queued_next) =
+        validate_atomic_commit_roles(output_generation, crtc_id, swapchain, ledger, arbiter)?;
     let prepared = if let Some(ready) = swapchain.ready_identity() {
         let record = record_for_active_owner(ledger, "prepared_ready", ready.transaction_id)?;
         let descriptor = record.descriptor();

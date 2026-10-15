@@ -237,6 +237,12 @@ pub(super) use cursor_cycle::{
     resolve_native_cursor_for_server, synchronize_cursor_state_for_server,
 };
 pub(crate) use cycle::run;
+#[cfg(test)]
+pub(crate) use cycle::{
+    ExplicitWorkerReplanRequest, preflight_explicit_worker_replan, restore_explicit_worker_replan,
+    validate_reconfiguration_frame_ownership_for_swapchain,
+    validate_reconfiguration_frame_ownership_for_swapchain_with_arbiter,
+};
 use cycle_dispatch::NativeWaylandInputDispatchOutcome;
 #[cfg(test)]
 pub(crate) use frame::NativeCursorOutputDisposition;

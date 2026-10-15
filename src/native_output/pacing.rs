@@ -1972,6 +1972,14 @@ pub(crate) enum UnsubmittedPhysicalFrameLane {
     Untracked,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PreparedUnsubmittedPhysicalMetadataRebase {
+    old_identity: OutputFrameIdentitySnapshot,
+    new_identity: OutputFrameIdentitySnapshot,
+    predictive_attempt_id: Option<PredictiveO1AttemptId>,
+    advanced_intervals: u64,
+}
+
 impl WorkerPacingTicket {
     pub(crate) const fn reservation_id(self) -> WorkerPacingReservationId {
         self.reservation_id
@@ -2439,6 +2447,111 @@ impl PredictiveO1LifecycleLedger {
         }
         entry.physical_key = Some(OutputFrameKey::from(&physical_state));
         entry.physical_state = Some(physical_state);
+        Ok(())
+    }
+
+    fn validate_physical_metadata_rebase(
+        &self,
+        attempt_id: PredictiveO1AttemptId,
+        old_identity: OutputFrameIdentitySnapshot,
+        new_identity: OutputFrameIdentitySnapshot,
+    ) -> Result<(), &'static str> {
+        let old_key = OutputFrameKey::from(&old_identity);
+        if old_key != OutputFrameKey::from(&new_identity) {
+            return Err("Predictive O1 metadata rebase changed physical frame identity");
+        }
+        let Some(entry) = self
+            .entries
+            .iter()
+            .flatten()
+            .find(|entry| entry.attempt_id == attempt_id)
+        else {
+            return Err("Predictive O1 attempt identity was not live for metadata rebase");
+        };
+        if entry.physical_key != Some(old_key) || entry.physical_state != Some(old_identity) {
+            return Err("Predictive O1 lifecycle metadata disagrees with rebase source");
+        }
+        if entry.observed_stages & (1u8 << (PredictiveO1Stage::Bound as u8)) != 0
+            || !stage_transition_is_valid(entry.stage, PredictiveO1Stage::Bound)
+        {
+            return Err("Predictive O1 lifecycle is not ready for late binding");
+        }
+        Ok(())
+    }
+
+    fn commit_physical_metadata_rebase(
+        &mut self,
+        attempt_id: PredictiveO1AttemptId,
+        old_identity: OutputFrameIdentitySnapshot,
+        new_identity: OutputFrameIdentitySnapshot,
+    ) {
+        let entry = self
+            .entries
+            .iter_mut()
+            .flatten()
+            .find(|entry| entry.attempt_id == attempt_id)
+            .expect("preflighted Predictive O1 lifecycle remains live");
+        debug_assert_eq!(
+            entry.physical_key,
+            Some(OutputFrameKey::from(&old_identity))
+        );
+        debug_assert_eq!(entry.physical_state, Some(old_identity));
+        debug_assert!(stage_transition_is_valid(
+            entry.stage,
+            PredictiveO1Stage::Bound
+        ));
+        debug_assert_eq!(
+            entry.observed_stages & (1u8 << (PredictiveO1Stage::Bound as u8)),
+            0
+        );
+        entry.physical_state = Some(new_identity);
+        entry.stage = PredictiveO1Stage::Bound;
+        entry.observed_stages |= 1u8 << (PredictiveO1Stage::Bound as u8);
+    }
+
+    fn validate_worker_physical_state(
+        &self,
+        attempt_id: PredictiveO1AttemptId,
+        identity: OutputFrameIdentitySnapshot,
+    ) -> Result<(), &'static str> {
+        let key = OutputFrameKey::from(&identity);
+        let Some(entry) = self
+            .entries
+            .iter()
+            .flatten()
+            .find(|entry| entry.attempt_id == attempt_id)
+        else {
+            return Err("worker pacing ticket has no live Predictive O1 attempt");
+        };
+        if entry.physical_key != Some(key)
+            || entry.physical_state != Some(identity)
+            || entry.stage != PredictiveO1Stage::WorkerQueued
+        {
+            return Err("worker pacing ticket disagrees with Predictive O1 lifecycle state");
+        }
+        Ok(())
+    }
+
+    fn validate_submitted_physical_state(
+        &self,
+        attempt_id: PredictiveO1AttemptId,
+        identity: OutputFrameIdentitySnapshot,
+    ) -> Result<(), &'static str> {
+        let key = OutputFrameKey::from(&identity);
+        let Some(entry) = self
+            .entries
+            .iter()
+            .flatten()
+            .find(|entry| entry.attempt_id == attempt_id)
+        else {
+            return Err("submitted pacing owner has no live Predictive O1 attempt");
+        };
+        if entry.physical_key != Some(key)
+            || entry.physical_state != Some(identity)
+            || entry.stage != PredictiveO1Stage::Submitted
+        {
+            return Err("submitted pacing owner disagrees with Predictive O1 lifecycle state");
+        }
         Ok(())
     }
 
@@ -3133,6 +3246,10 @@ impl NativeFramePacing {
         self.worker_reservation.is_some()
     }
 
+    pub(crate) const fn worker_reservation_ticket(&self) -> Option<WorkerPacingTicket> {
+        self.worker_reservation
+    }
+
     pub(crate) const fn active_worker_owned(&self) -> bool {
         self.active_worker_reservation_id.is_some()
     }
@@ -3185,6 +3302,126 @@ impl NativeFramePacing {
         }
         self.active_physical_identity = Some(physical_identity);
         self.active_physical_key = Some(physical_key);
+        Ok(())
+    }
+
+    pub(crate) fn prepare_unsubmitted_physical_metadata_rebase(
+        &self,
+        old_identity: OutputFrameIdentitySnapshot,
+        new_identity: OutputFrameIdentitySnapshot,
+        advanced_intervals: u64,
+    ) -> Result<PreparedUnsubmittedPhysicalMetadataRebase, &'static str> {
+        let old_key = OutputFrameKey::from(&old_identity);
+        if old_key != OutputFrameKey::from(&new_identity) {
+            return Err("physical metadata rebase changed OutputFrameKey");
+        }
+        if !matches!(
+            old_identity.reservation,
+            crate::native_output::presentation::transaction::FramePresentationReservation::DeferredO1(_)
+        ) || !matches!(
+            new_identity.reservation,
+            crate::native_output::presentation::transaction::FramePresentationReservation::Fixed(_)
+        )
+        {
+            return Err("physical metadata rebase requires DeferredO1 to Fixed");
+        }
+        if !self.enabled {
+            return Ok(PreparedUnsubmittedPhysicalMetadataRebase {
+                old_identity,
+                new_identity,
+                predictive_attempt_id: None,
+                advanced_intervals,
+            });
+        }
+        if self.ready.is_none()
+            || self.ready_physical_identity != Some(old_identity)
+            || self.ready_physical_key != Some(old_key)
+        {
+            return Err("physical metadata rebase source is not the live READY pacing lane");
+        }
+        if self.active_physical_identity.is_some()
+            || self.pending_physical_identity.is_some_and(|identity| {
+                OutputFrameKey::from(&identity) == old_key
+                    || identity.frame_id >= old_identity.frame_id
+            })
+        {
+            return Err("physical metadata rebase conflicts with another physical frame");
+        }
+        if self.worker_reservation.is_some()
+            || self.ready_worker_reservation_id.is_some()
+            || self.active_worker_reservation_id.is_some()
+        {
+            return Err("worker pacing ticket exists before DeferredO1 metadata rebase");
+        }
+        let attempt_id = self
+            .ready_predictive_attempt
+            .ok_or("DeferredO1 READY has no live Predictive O1 attempt")?;
+        self.predictive_o1_lifecycle
+            .validate_physical_metadata_rebase(attempt_id, old_identity, new_identity)?;
+        Ok(PreparedUnsubmittedPhysicalMetadataRebase {
+            old_identity,
+            new_identity,
+            predictive_attempt_id: Some(attempt_id),
+            advanced_intervals,
+        })
+    }
+
+    pub(crate) fn commit_unsubmitted_physical_metadata_rebase(
+        &mut self,
+        prepared: PreparedUnsubmittedPhysicalMetadataRebase,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        let attempt_id = prepared
+            .predictive_attempt_id
+            .expect("enabled metadata rebase was preflighted with a Predictive O1 attempt");
+        let key = OutputFrameKey::from(&prepared.old_identity);
+        debug_assert_eq!(self.ready_physical_identity, Some(prepared.old_identity));
+        debug_assert_eq!(self.ready_physical_key, Some(key));
+        debug_assert_eq!(self.ready_predictive_attempt, Some(attempt_id));
+        debug_assert!(self.worker_reservation.is_none());
+        debug_assert!(self.ready_worker_reservation_id.is_none());
+        debug_assert!(self.active_worker_reservation_id.is_none());
+
+        self.ready_physical_identity = Some(prepared.new_identity);
+        self.ready_physical_key = Some(key);
+        self.predictive_o1_lifecycle
+            .commit_physical_metadata_rebase(
+                attempt_id,
+                prepared.old_identity,
+                prepared.new_identity,
+            );
+        self.predictive_o1_bound = self.predictive_o1_bound.saturating_add(1);
+        self.predictive_bound_after_predecessor_pageflip = self
+            .predictive_bound_after_predecessor_pageflip
+            .saturating_add(1);
+        self.predictive_binding_advanced_intervals = self
+            .predictive_binding_advanced_intervals
+            .saturating_add(prepared.advanced_intervals);
+        self.log(
+            "predictive_physical_metadata_rebased",
+            vec![
+                PacingField::u64("predictive_attempt_id", attempt_id.get()),
+                PacingField::u64("output_frame_id", prepared.new_identity.frame_id),
+                PacingField::u64("transaction_id", prepared.new_identity.transaction_id.get()),
+                PacingField::u64("advanced_intervals", prepared.advanced_intervals),
+            ],
+        );
+    }
+
+    pub(crate) fn rebase_unsubmitted_physical_metadata(
+        &mut self,
+        old_identity: OutputFrameIdentitySnapshot,
+        new_identity: OutputFrameIdentitySnapshot,
+        advanced_intervals: u64,
+    ) -> Result<(), &'static str> {
+        let prepared = self.prepare_unsubmitted_physical_metadata_rebase(
+            old_identity,
+            new_identity,
+            advanced_intervals,
+        )?;
+        self.commit_unsubmitted_physical_metadata_rebase(prepared);
         Ok(())
     }
 
@@ -3305,6 +3542,15 @@ impl NativeFramePacing {
     #[cfg(test)]
     pub(crate) fn predictive_o1_active_entries_for_test(&self) -> u64 {
         self.predictive_o1_lifecycle.active_entries()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn predictive_o1_physical_identity_for_test(
+        &self,
+        attempt_id: PredictiveO1AttemptId,
+    ) -> Option<OutputFrameIdentitySnapshot> {
+        self.predictive_o1_lifecycle
+            .physical_identity_for_attempt(attempt_id)
     }
 
     pub(crate) fn note_render_decision(
@@ -3850,6 +4096,80 @@ impl NativeFramePacing {
         Ok(Some(ticket))
     }
 
+    fn validate_worker_ticket_physical_identity(
+        &self,
+        ticket: WorkerPacingTicket,
+        expected_identity: OutputFrameIdentitySnapshot,
+    ) -> Result<(), &'static str> {
+        if !self.enabled {
+            return Err("cannot validate a worker ticket for disabled frame pacing");
+        }
+        if self.worker_reservation != Some(ticket) {
+            return Err("worker pacing reservation is not live");
+        }
+        let expected_key = OutputFrameKey::from(&expected_identity);
+        if ticket.physical_identity() != Some(expected_identity)
+            || ticket.physical_key() != Some(expected_key)
+        {
+            return Err("worker pacing ticket does not match queued physical identity");
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_worker_queued_physical_owner(
+        &self,
+        ticket: WorkerPacingTicket,
+        expected_identity: OutputFrameIdentitySnapshot,
+    ) -> Result<(), &'static str> {
+        self.validate_worker_ticket_physical_identity(ticket, expected_identity)?;
+        if !ticket.ready_submit() {
+            return Err("swapchain worker-queued frame did not reserve from READY");
+        }
+        // The ticket retains its own origin (`ready_submit`) and exact physical
+        // snapshot. A later render may advance that READY/ACTIVE lane while the
+        // queued worker still owns this capability, so do not infer worker role
+        // from the lane currently carrying the next visual frame.
+        if let Some(attempt_id) = ticket.predictive_attempt_id() {
+            self.predictive_o1_lifecycle
+                .validate_worker_physical_state(attempt_id, expected_identity)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_optional_worker_queued_physical_owner(
+        &self,
+        ticket: Option<WorkerPacingTicket>,
+        expected_identity: OutputFrameIdentitySnapshot,
+    ) -> Result<(), &'static str> {
+        if !self.enabled && ticket.is_none() {
+            return Ok(());
+        }
+        let ticket = ticket.ok_or("worker-queued physical owner has no pacing reservation")?;
+        self.validate_worker_queued_physical_owner(ticket, expected_identity)
+    }
+
+    pub(crate) fn validate_kernel_submitted_physical_owner(
+        &self,
+        expected_identity: OutputFrameIdentitySnapshot,
+        token: u64,
+    ) -> Result<(), &'static str> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.pending.is_none()
+            || self.pending_physical_identity != Some(expected_identity)
+            || self.pending_physical_key != Some(OutputFrameKey::from(&expected_identity))
+            || self.pending_token != Some(token)
+        {
+            return Err("kernel-submitted physical owner disagrees with pacing pending lane");
+        }
+        if let Some(attempt_id) = self.pending_predictive_attempt {
+            self.predictive_o1_lifecycle
+                .validate_submitted_physical_state(attempt_id, expected_identity)?;
+        }
+        Ok(())
+    }
+
     fn worker_submission_frame(&self, ready_submit: bool) -> Option<NativeOutputFrameId> {
         if ready_submit {
             self.ready
@@ -3984,18 +4304,9 @@ impl NativeFramePacing {
         ticket: WorkerPacingTicket,
         expected_identity: OutputFrameIdentitySnapshot,
     ) -> Result<(), &'static str> {
-        if !self.enabled {
-            return Err("cannot re-plan an untracked pacing owner");
-        }
-        if self.worker_reservation != Some(ticket) {
-            return Err("worker pacing reservation does not match re-plan ticket");
-        }
+        self.validate_worker_ticket_physical_identity(ticket, expected_identity)
+            .map_err(|_| "worker pacing reservation does not match re-plan physical identity")?;
         let expected_key = OutputFrameKey::from(&expected_identity);
-        if ticket.physical_identity() != Some(expected_identity)
-            || ticket.physical_key() != Some(expected_key)
-        {
-            return Err("worker pacing ticket does not match re-planned physical identity");
-        }
         let reservation_id = ticket.reservation_id();
         if ticket.ready_submit() {
             if self.ready_worker_reservation_id != Some(reservation_id)
@@ -4209,29 +4520,6 @@ impl NativeFramePacing {
     }
     pub(crate) fn note_render_ahead_ready(&mut self, now_ns: u64) {
         self.note_ready_frame(now_ns, true);
-    }
-
-    #[allow(clippy::collapsible_if)]
-    pub(crate) fn note_predictive_binding_after_predecessor_pageflip(
-        &mut self,
-        advanced_intervals: u64,
-    ) {
-        if !self.enabled {
-            return;
-        }
-        self.predictive_bound_after_predecessor_pageflip = self
-            .predictive_bound_after_predecessor_pageflip
-            .saturating_add(1);
-        self.predictive_binding_advanced_intervals = self
-            .predictive_binding_advanced_intervals
-            .saturating_add(advanced_intervals);
-        if let Some(identity) =
-            lifecycle_identity(self.ready_predictive_attempt, self.ready_physical_key)
-        {
-            if self.predictive_o1_lifecycle.contains_identity(identity) {
-                self.note_predictive_stage(identity, PredictiveO1Stage::Bound);
-            }
-        }
     }
 
     pub(crate) fn note_predictive_unbound_created(&mut self) {
