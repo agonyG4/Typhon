@@ -10,15 +10,17 @@
     and/or sell copies of the Software.
   </copyright>
 
-  <interface name="astrea_shortcuts_manager_v1" version="1">
+  <interface name="astrea_shortcuts_manager_v1" version="2">
     <description summary="Astrea compositor-owned shortcut registry">
       Registers client-owned shortcut resources. Matching and ownership policy
       are compositor-side; this protocol only receives compositor-dispatched
       shortcut events. For the reserved astrea-shell namespace, each
       namespace/name pair has one live owner. A newest valid registration
       replaces the previous owner, which receives cancelled, and the replaced
-      owner is never restored. Other namespaces retain their existing shared
-      registration behavior.
+      owner is never restored by ordinary registration. Version 2 also provides
+      a conditional registration request for clients recovering from cancellation;
+      that request fails without replacing an existing owner. Other namespaces
+      retain their existing shared registration behavior.
     </description>
 
     <request name="destroy" type="destructor"/>
@@ -29,16 +31,29 @@
       <arg name="name" type="string"/>
       <arg name="description" type="string"/>
     </request>
+
+    <request name="register_shortcut_if_available" since="2">
+      <description summary="register only when no owner exists">
+        Registers a shortcut only if its namespace/name pair currently has no
+        live owner. An occupied slot is reported through the new resource's
+        rejected event and the existing owner is left untouched.
+      </description>
+      <arg name="id" type="new_id" interface="astrea_shortcut_v1"/>
+      <arg name="namespace" type="string"/>
+      <arg name="name" type="string"/>
+      <arg name="description" type="string"/>
+    </request>
   </interface>
 
-  <interface name="astrea_shortcut_v1" version="1">
+  <interface name="astrea_shortcut_v1" version="2">
     <description summary="registered Astrea shortcut">
       A registered shortcut receives compositor-dispatched shortcut lifecycle
       events for its namespace/name pair. pressed is an initial action,
       repeated is a key-repeat action, released is an explicit release-trigger
-      action, and cancelled means ownership was replaced or registration was
-      rejected. Synthetic actions such as alt_tab_commit are separate logical
-      action presses; they are not releases of another shortcut.
+      action. cancelled means ownership was replaced. Version 2 rejected events
+      report an authorization failure or an occupied conditional registration.
+      Synthetic actions such as alt_tab_commit are separate logical action
+      presses; they are not releases of another shortcut.
     </description>
 
     <request name="destroy" type="destructor"/>
@@ -60,6 +75,24 @@
 
     <event name="cancelled">
       <arg name="serial" type="uint"/>
+    </event>
+
+    <event name="registered" since="2">
+      <description summary="registration was accepted by the compositor">
+        Confirms that this shortcut resource became the live registration for
+        its namespace/name pair.
+      </description>
+      <arg name="serial" type="uint"/>
+    </event>
+
+    <event name="rejected" since="2">
+      <description summary="registration request was rejected">
+        reason 1 means Astrea shell authorization failed. Reason 2 means a
+        conditional registration found an existing owner. Rejection never
+        changes the current owner.
+      </description>
+      <arg name="serial" type="uint"/>
+      <arg name="reason" type="uint"/>
     </event>
   </interface>
 </protocol>

@@ -57,6 +57,31 @@ impl AstreaShortcutRegistry {
         }
     }
 
+    fn register_if_available(
+        &mut self,
+        resource: astrea_shortcut_v1::AstreaShortcutV1,
+        namespace: String,
+        name: String,
+        cancellation_serial: u32,
+    ) -> bool {
+        self.remove_dead();
+        let occupied = if namespace == "astrea-shell" {
+            self.shell_owners.contains_key(&AstreaShortcutKey {
+                namespace: namespace.clone(),
+                name: name.clone(),
+            })
+        } else {
+            self.other_registrations
+                .iter()
+                .any(|registration| registration.namespace == namespace && registration.name == name)
+        };
+        if occupied {
+            return false;
+        }
+        self.register(resource, namespace, name, cancellation_serial);
+        true
+    }
+
     fn unregister(&mut self, resource: &astrea_shortcut_v1::AstreaShortcutV1) {
         let resource_id = resource.id().protocol_id();
         self.shell_owners.retain(|_, registration| {
@@ -287,6 +312,21 @@ impl CompositorState {
         let cancellation_serial = self.next_configure_serial();
         self.astrea_shortcut_registry
             .register(resource, namespace, name, cancellation_serial);
+    }
+
+    pub(in crate::compositor) fn register_astrea_shortcut_if_available(
+        &mut self,
+        resource: astrea_shortcut_v1::AstreaShortcutV1,
+        namespace: String,
+        name: String,
+    ) -> bool {
+        let cancellation_serial = self.next_configure_serial();
+        self.astrea_shortcut_registry.register_if_available(
+            resource,
+            namespace,
+            name,
+            cancellation_serial,
+        )
     }
 
     pub(in crate::compositor) fn unregister_astrea_shortcut(

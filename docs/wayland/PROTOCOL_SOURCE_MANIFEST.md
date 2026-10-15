@@ -153,7 +153,7 @@ The target contract is:
 | `zxdg_decoration_manager_v1` | 2 | always |
 | `xdg_activation_v1` | 1 | always |
 | `astrea_shell_auth_manager_v1` | 1 | always |
-| `astrea_shortcuts_manager_v1` | 1 | always |
+| `astrea_shortcuts_manager_v1` | 2 | always |
 | `astrea_shell_control_manager_v1` | 1 | always |
 | `astrea_screen_capture_manager_v1` | 1 | authenticated native screenshot capability |
 | `astrea_effects_manager_v1` | 1 | qualified native background-effect capability |

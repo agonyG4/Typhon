@@ -268,6 +268,8 @@ pub(in crate::compositor::tests) struct RegistryTestState {
     pub(in crate::compositor::tests) astrea_shortcut_pressed_timestamps: Vec<u32>,
     pub(in crate::compositor::tests) astrea_shortcut_cancelled_count: usize,
     pub(in crate::compositor::tests) astrea_shortcut_cancelled_serials: Vec<u32>,
+    pub(in crate::compositor::tests) astrea_shortcut_registered_serials: Vec<u32>,
+    pub(in crate::compositor::tests) astrea_shortcut_rejected: Vec<(u32, u32)>,
     pub(in crate::compositor::tests) astrea_shortcut_events: Vec<AstreaShortcutEventRecord>,
     pub(in crate::compositor::tests) background_effect_capabilities: Vec<u32>,
 }
@@ -291,6 +293,8 @@ pub(in crate::compositor::tests) enum AstreaShortcutEventRecord {
     Repeated { serial: u32, timestamp: u32 },
     Released { serial: u32, timestamp: u32 },
     Cancelled { serial: u32 },
+    Registered { serial: u32 },
+    Rejected { serial: u32, reason: u32 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -793,6 +797,18 @@ impl Dispatch<client_astrea_shortcut_v1::AstreaShortcutV1, ()> for RegistryTestS
                 state
                     .astrea_shortcut_events
                     .push(AstreaShortcutEventRecord::Cancelled { serial });
+            }
+            client_astrea_shortcut_v1::Event::Rejected { serial, reason } => {
+                state.astrea_shortcut_rejected.push((serial, reason));
+                state
+                    .astrea_shortcut_events
+                    .push(AstreaShortcutEventRecord::Rejected { serial, reason });
+            }
+            client_astrea_shortcut_v1::Event::Registered { serial } => {
+                state.astrea_shortcut_registered_serials.push(serial);
+                state
+                    .astrea_shortcut_events
+                    .push(AstreaShortcutEventRecord::Registered { serial });
             }
             client_astrea_shortcut_v1::Event::Repeated { serial, timestamp } => {
                 state

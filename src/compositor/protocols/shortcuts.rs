@@ -2,6 +2,31 @@ use crate::astrea_shortcuts::server::{astrea_shortcut_v1, astrea_shortcuts_manag
 
 use super::super::*;
 
+const REJECTION_AUTHORIZATION: u32 = 1;
+const REJECTION_ALREADY_OWNED: u32 = 2;
+
+fn reject_registration(
+    state: &mut CompositorState,
+    shortcut: &astrea_shortcut_v1::AstreaShortcutV1,
+    reason: u32,
+) {
+    let serial = state.next_configure_serial();
+    if shortcut.version() >= 2 {
+        shortcut.rejected(serial, reason);
+    } else {
+        shortcut.cancelled(serial);
+    }
+}
+
+fn acknowledge_registration(
+    state: &mut CompositorState,
+    shortcut: &astrea_shortcut_v1::AstreaShortcutV1,
+) {
+    if shortcut.version() >= 2 {
+        shortcut.registered(state.next_configure_serial());
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(in crate::compositor) struct AstreaShortcutResourceData {
     pub(in crate::compositor) _namespace: String,
@@ -47,9 +72,35 @@ impl Dispatch<astrea_shortcuts_manager_v1::AstreaShortcutsManagerV1, ()> for Com
                     },
                 );
                 if state.astrea_shortcut_registration_allowed(&namespace, client, dhandle) {
-                    state.register_astrea_shortcut(shortcut, namespace, name);
+                    state.register_astrea_shortcut(shortcut.clone(), namespace, name);
+                    acknowledge_registration(state, &shortcut);
                 } else {
-                    shortcut.cancelled(state.next_configure_serial());
+                    reject_registration(state, &shortcut, REJECTION_AUTHORIZATION);
+                }
+            }
+            astrea_shortcuts_manager_v1::Request::RegisterShortcutIfAvailable {
+                id,
+                namespace,
+                name,
+                description: _,
+            } => {
+                let shortcut = data_init.init(
+                    id,
+                    AstreaShortcutResourceData {
+                        _namespace: namespace.clone(),
+                        _name: name.clone(),
+                    },
+                );
+                if !state.astrea_shortcut_registration_allowed(&namespace, client, dhandle) {
+                    reject_registration(state, &shortcut, REJECTION_AUTHORIZATION);
+                } else if !state.register_astrea_shortcut_if_available(
+                    shortcut.clone(),
+                    namespace,
+                    name,
+                ) {
+                    reject_registration(state, &shortcut, REJECTION_ALREADY_OWNED);
+                } else {
+                    acknowledge_registration(state, &shortcut);
                 }
             }
         }

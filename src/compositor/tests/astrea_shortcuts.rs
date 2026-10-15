@@ -49,6 +49,177 @@ fn astrea_shortcuts_protocol_dispatches_registered_pressed_event() {
 }
 
 #[test]
+fn astrea_shortcuts_conditional_registration_does_not_replace_an_owner() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    commands
+        .send(ServerCommand::AuthorizeAstreaShellPid(std::process::id()))
+        .unwrap();
+    wait_for_server_commands(&commands);
+
+    let first_connection = Connection::from_socket(UnixStream::connect(&socket_path).unwrap())
+        .unwrap();
+    let (first_globals, mut first_queue) =
+        registry_queue_init::<RegistryTestState>(&first_connection).unwrap();
+    let first_qh = first_queue.handle();
+    let first_manager: client_astrea_shortcuts_manager_v1::AstreaShortcutsManagerV1 =
+        first_globals.bind(&first_qh, 2..=2, ()).unwrap();
+    let _first_owner = first_manager.register_shortcut(
+        "astrea-shell".to_string(),
+        "spotlight_toggle".to_string(),
+        "Existing owner".to_string(),
+        &first_qh,
+        (),
+    );
+    first_connection.flush().unwrap();
+    first_queue
+        .roundtrip(&mut RegistryTestState::default())
+        .unwrap();
+
+    let second_connection = Connection::from_socket(UnixStream::connect(&socket_path).unwrap())
+        .unwrap();
+    let (second_globals, mut second_queue) =
+        registry_queue_init::<RegistryTestState>(&second_connection).unwrap();
+    let second_qh = second_queue.handle();
+    let second_manager: client_astrea_shortcuts_manager_v1::AstreaShortcutsManagerV1 =
+        second_globals.bind(&second_qh, 2..=2, ()).unwrap();
+    let _rejected = second_manager.register_shortcut_if_available(
+        "astrea-shell".to_string(),
+        "spotlight_toggle".to_string(),
+        "Recovery attempt".to_string(),
+        &second_qh,
+        (),
+    );
+    second_connection.flush().unwrap();
+    let mut rejected_state = RegistryTestState::default();
+    second_queue.roundtrip(&mut rejected_state).unwrap();
+
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::EmitAstreaShortcut {
+            namespace: "astrea-shell".to_string(),
+            name: "spotlight_toggle".to_string(),
+            phase: AstreaShortcutPhase::Pressed,
+            timestamp: 60,
+            reply,
+        })
+        .unwrap();
+    assert_eq!(receiver.recv_timeout(Duration::from_secs(1)).unwrap(), 1);
+    let mut owner_state = RegistryTestState::default();
+    first_queue.roundtrip(&mut owner_state).unwrap();
+    stop_controllable_test_server(commands, server_thread);
+
+    assert_eq!(rejected_state.astrea_shortcut_rejected.len(), 1);
+    assert_eq!(rejected_state.astrea_shortcut_rejected[0].1, 2);
+    assert_eq!(rejected_state.astrea_shortcut_cancelled_count, 0);
+    assert_eq!(owner_state.astrea_shortcut_pressed_timestamps, vec![60]);
+}
+
+#[test]
+fn astrea_shortcuts_conditional_registration_claims_a_vacant_owner_slot() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    commands
+        .send(ServerCommand::AuthorizeAstreaShellPid(std::process::id()))
+        .unwrap();
+    wait_for_server_commands(&commands);
+
+    let first_connection = Connection::from_socket(UnixStream::connect(&socket_path).unwrap())
+        .unwrap();
+    let (first_globals, mut first_queue) =
+        registry_queue_init::<RegistryTestState>(&first_connection).unwrap();
+    let first_qh = first_queue.handle();
+    let first_manager: client_astrea_shortcuts_manager_v1::AstreaShortcutsManagerV1 =
+        first_globals.bind(&first_qh, 2..=2, ()).unwrap();
+    let first_owner = first_manager.register_shortcut(
+        "astrea-shell".to_string(),
+        "spotlight_toggle".to_string(),
+        "Temporary owner".to_string(),
+        &first_qh,
+        (),
+    );
+    first_connection.flush().unwrap();
+    first_queue
+        .roundtrip(&mut RegistryTestState::default())
+        .unwrap();
+    first_owner.destroy();
+    first_connection.flush().unwrap();
+    first_queue
+        .roundtrip(&mut RegistryTestState::default())
+        .unwrap();
+
+    let second_connection = Connection::from_socket(UnixStream::connect(&socket_path).unwrap())
+        .unwrap();
+    let (second_globals, mut second_queue) =
+        registry_queue_init::<RegistryTestState>(&second_connection).unwrap();
+    let second_qh = second_queue.handle();
+    let second_manager: client_astrea_shortcuts_manager_v1::AstreaShortcutsManagerV1 =
+        second_globals.bind(&second_qh, 2..=2, ()).unwrap();
+    let _new_owner = second_manager.register_shortcut_if_available(
+        "astrea-shell".to_string(),
+        "spotlight_toggle".to_string(),
+        "Recovered owner".to_string(),
+        &second_qh,
+        (),
+    );
+    second_connection.flush().unwrap();
+    let mut registration_state = RegistryTestState::default();
+    second_queue.roundtrip(&mut registration_state).unwrap();
+    assert_eq!(registration_state.astrea_shortcut_registered_serials.len(), 1);
+
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::EmitAstreaShortcut {
+            namespace: "astrea-shell".to_string(),
+            name: "spotlight_toggle".to_string(),
+            phase: AstreaShortcutPhase::Pressed,
+            timestamp: 61,
+            reply,
+        })
+        .unwrap();
+    assert_eq!(receiver.recv_timeout(Duration::from_secs(1)).unwrap(), 1);
+    let mut owner_state = RegistryTestState::default();
+    second_queue.roundtrip(&mut owner_state).unwrap();
+    stop_controllable_test_server(commands, server_thread);
+
+    assert_eq!(owner_state.astrea_shortcut_pressed_timestamps, vec![61]);
+}
+
+#[test]
+fn astrea_shortcuts_v2_reports_authorization_rejection_reason() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let connection = Connection::from_socket(UnixStream::connect(socket_path).unwrap()).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let manager: client_astrea_shortcuts_manager_v1::AstreaShortcutsManagerV1 =
+        globals.bind(&qh, 2..=2, ()).unwrap();
+    let _rejected = manager.register_shortcut(
+        "astrea-shell".to_string(),
+        "spotlight_toggle".to_string(),
+        "Unauthorized registration".to_string(),
+        &qh,
+        (),
+    );
+    connection.flush().unwrap();
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state).unwrap();
+    stop_controllable_test_server(commands, server_thread);
+
+    assert_eq!(state.astrea_shortcut_rejected.len(), 1);
+    assert_ne!(state.astrea_shortcut_rejected[0].0, 0);
+    assert_eq!(state.astrea_shortcut_rejected[0].1, 1);
+    assert_eq!(state.astrea_shortcut_cancelled_count, 0);
+}
+
+#[test]
 fn astrea_shortcuts_protocol_dispatches_each_lifecycle_phase() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();
@@ -113,7 +284,9 @@ fn astrea_shortcuts_protocol_dispatches_each_lifecycle_phase() {
                 AstreaShortcutEventRecord::Pressed { serial, .. }
                 | AstreaShortcutEventRecord::Repeated { serial, .. }
                 | AstreaShortcutEventRecord::Released { serial, .. }
-                | AstreaShortcutEventRecord::Cancelled { serial } => *serial != 0,
+                | AstreaShortcutEventRecord::Cancelled { serial }
+                | AstreaShortcutEventRecord::Registered { serial }
+                | AstreaShortcutEventRecord::Rejected { serial, .. } => *serial != 0,
             })
     );
 }
