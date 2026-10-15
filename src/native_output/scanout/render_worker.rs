@@ -21,6 +21,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod scratch_maintenance;
+
 use crate::egl_renderer::native_fence::NativeRenderFence;
 use crate::egl_renderer::{EglSceneFrameCommit, OutputDamage};
 use crate::native_output::presentation::transaction::OutputTransactionId;
@@ -394,6 +396,7 @@ pub(crate) struct AtomicRenderWorkerHandle {
     initialized: bool,
     fatal: Arc<AtomicBool>,
     control_lane_overflowed: bool,
+    scratch_residency_snapshot: Arc<crate::gpu_residency::AtomicEffectScratchResidencySnapshot>,
 }
 
 impl AtomicRenderWorkerHandle {
@@ -404,6 +407,9 @@ impl AtomicRenderWorkerHandle {
         let worker_event_fd = Arc::clone(&event_fd);
         let fatal = Arc::new(AtomicBool::new(false));
         let worker_fatal = Arc::clone(&fatal);
+        let scratch_residency_snapshot =
+            Arc::new(crate::gpu_residency::AtomicEffectScratchResidencySnapshot::default());
+        let worker_scratch_residency_snapshot = Arc::clone(&scratch_residency_snapshot);
         let (command_tx, command_rx) = mpsc::sync_channel(1);
         let (event_tx, event_rx) = mpsc::sync_channel(1);
         let (discovery_tx, discovery_rx) = mpsc::sync_channel(1);
@@ -442,6 +448,7 @@ impl AtomicRenderWorkerHandle {
                         event_tx,
                         worker_event_fd,
                         worker_fatal.clone(),
+                        worker_scratch_residency_snapshot,
                     );
                 });
                 if let Err(panic) = loop_result {
@@ -473,6 +480,7 @@ impl AtomicRenderWorkerHandle {
                 initialized: false,
                 fatal,
                 control_lane_overflowed: false,
+                scratch_residency_snapshot,
             },
             formats,
         ))
@@ -519,6 +527,12 @@ impl AtomicRenderWorkerHandle {
 
     pub(crate) fn event_fd(&self) -> i32 {
         self.event_fd.as_raw_fd()
+    }
+
+    pub(crate) fn scratch_residency_snapshot(
+        &self,
+    ) -> Option<crate::gpu_residency::EffectScratchResidencyLiveSnapshot> {
+        self.scratch_residency_snapshot.snapshot()
     }
 
     pub(crate) const fn busy(&self) -> bool {
@@ -969,12 +983,69 @@ fn render_worker_loop(
     events: SyncSender<AtomicRenderWorkerEvent>,
     event_fd: Arc<OwnedFd>,
     fatal: Arc<AtomicBool>,
+    scratch_residency_snapshot: Arc<crate::gpu_residency::AtomicEffectScratchResidencySnapshot>,
 ) {
     let mut bootstrap = Some(bootstrap);
     let mut domain: Option<AtomicRenderDomain> = None;
     let mut candidate_domain: Option<(AtomicRenderCandidateIdentity, AtomicRenderDomain)> = None;
     let mut applied_control_epoch = 0u64;
-    while let Ok(command) = commands.recv() {
+    loop {
+        let deadline = scratch_maintenance::nearest_deadline(
+            domain
+                .as_ref()
+                .and_then(AtomicRenderDomain::next_scratch_maintenance_deadline),
+            candidate_domain
+                .as_ref()
+                .and_then(|(_, domain)| domain.next_scratch_maintenance_deadline()),
+        );
+        let command = match scratch_maintenance::wait_for_command(&commands, deadline) {
+            scratch_maintenance::WaitOutcome::Command(command) => command,
+            scratch_maintenance::WaitOutcome::Disconnected => break,
+            scratch_maintenance::WaitOutcome::Maintenance => match commands.try_recv() {
+                Ok(command) => command,
+                Err(TryRecvError::Disconnected) => break,
+                Err(TryRecvError::Empty) => {
+                    let now = Instant::now();
+                    let target = scratch_maintenance::due_target(
+                        domain
+                            .as_ref()
+                            .and_then(AtomicRenderDomain::next_scratch_maintenance_deadline),
+                        candidate_domain
+                            .as_ref()
+                            .and_then(|(_, domain)| domain.next_scratch_maintenance_deadline()),
+                        now,
+                    );
+                    let result = match target {
+                        Some(scratch_maintenance::MaintenanceTarget::Active) => domain
+                            .as_mut()
+                            .ok_or_else(|| io::Error::other("active render domain is unavailable"))
+                            .and_then(|domain| domain.maintain_effect_scratch(now)),
+                        Some(scratch_maintenance::MaintenanceTarget::Candidate) => candidate_domain
+                            .as_mut()
+                            .map(|(_, domain)| domain)
+                            .ok_or_else(|| {
+                                io::Error::other("candidate render domain is unavailable")
+                            })
+                            .and_then(|domain| domain.maintain_effect_scratch(now)),
+                        None => Ok(()),
+                    };
+                    if result.is_err() {
+                        fatal.store(true, Ordering::Release);
+                        let _ = publish_event(
+                            &events,
+                            &event_fd,
+                            AtomicRenderWorkerEvent::Fatal {
+                                job_id: None,
+                                gpu_execution_uncertain: true,
+                                reason: "scratch_maintenance_failed",
+                            },
+                        );
+                        break;
+                    }
+                    continue;
+                }
+            },
+        };
         match command {
             RenderWorkerCommand::Initialize { init, response } => {
                 let Some(bootstrap) = bootstrap.take() else {
@@ -1007,6 +1078,9 @@ fn render_worker_loop(
                         .publish_effect_registry_generation((*effect_generation).clone())
                         .map_err(|error| io::Error::other(error.to_string()))?;
                     initialized.set_cursor_image(cursor_image);
+                    initialized.set_scratch_residency_publisher(Some(Arc::clone(
+                        &scratch_residency_snapshot,
+                    )));
                     domain = Some(initialized);
                     Ok(info)
                 })();
@@ -1449,6 +1523,10 @@ fn render_worker_loop(
                             fatal.store(true, Ordering::Release);
                             return;
                         };
+                        old_domain.set_scratch_residency_publisher(None);
+                        next_domain.set_scratch_residency_publisher(Some(Arc::clone(
+                            &scratch_residency_snapshot,
+                        )));
                         old_domain.teardown();
                         domain = Some(std::mem::replace(&mut next_domain, old_domain));
                         drop(next_domain);
@@ -1711,6 +1789,20 @@ fn render_worker_loop(
             }
         }
     }
+    if let Some((_, mut candidate)) = candidate_domain.take() {
+        candidate.teardown();
+    }
+    if let Some(mut domain) = domain.take() {
+        domain.teardown();
+    }
+    scratch_residency_snapshot.publish(
+        0,
+        0,
+        0,
+        0,
+        0,
+        crate::gpu_residency::ScratchResidencyTelemetry::default(),
+    );
 }
 
 pub(super) fn apply_render_control(
@@ -2118,6 +2210,9 @@ mod tests {
             initialized: true,
             fatal: Arc::clone(&fatal),
             control_lane_overflowed: false,
+            scratch_residency_snapshot: Arc::new(
+                crate::gpu_residency::AtomicEffectScratchResidencySnapshot::default(),
+            ),
         };
 
         worker.fail_control_lane();
@@ -2148,6 +2243,9 @@ mod tests {
             initialized: true,
             fatal,
             control_lane_overflowed: false,
+            scratch_residency_snapshot: Arc::new(
+                crate::gpu_residency::AtomicEffectScratchResidencySnapshot::default(),
+            ),
         };
 
         let rejected = worker.try_dispatch_effect_reload(AtomicRenderWorkerEffectReload {
@@ -2177,6 +2275,9 @@ mod tests {
             initialized: true,
             fatal,
             control_lane_overflowed: false,
+            scratch_residency_snapshot: Arc::new(
+                crate::gpu_residency::AtomicEffectScratchResidencySnapshot::default(),
+            ),
         };
 
         let error = worker

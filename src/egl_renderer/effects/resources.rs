@@ -12,7 +12,10 @@ use oblivion_one::effects::{
 };
 
 use super::super::CheckpointCausalState;
-use super::metrics::EffectResourceMetrics;
+
+mod scratch_gl;
+mod scratch_pool;
+mod scratch_residency;
 
 pub const DEFAULT_EFFECT_RESOURCE_HARD_BUDGET_BYTES: u64 = 128 * 1024 * 1024;
 pub const DEFAULT_EFFECT_CHECKPOINT_CACHE_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
@@ -322,6 +325,7 @@ pub struct PooledEffectTexture {
     last_used: u64,
     checked_out: bool,
     purpose: EffectTexturePurpose,
+    scratch_epoch: u64,
     identity: crate::gpu_residency::GpuResourceIdentity,
 }
 
@@ -469,6 +473,7 @@ pub struct EffectResourcePool {
     reuse_count: usize,
     retirement_count: usize,
     event_counters: crate::gpu_residency::GenerationEventCounters,
+    scratch_residency: scratch_residency::ScratchResidencyState,
 }
 
 impl EffectResourcePool {
@@ -497,6 +502,7 @@ impl EffectResourcePool {
             reuse_count: 0,
             retirement_count: 0,
             event_counters: crate::gpu_residency::GenerationEventCounters::new(generation),
+            scratch_residency: scratch_residency::ScratchResidencyState::default(),
         })
     }
 
@@ -504,96 +510,7 @@ impl EffectResourcePool {
         &mut self,
         key: EffectTextureKey,
     ) -> Result<PooledEffectTexture, EffectResourceError> {
-        let bytes = key.estimated_bytes()?;
-        self.clock = self.clock.saturating_add(1);
-        if let Some(texture) = self
-            .textures
-            .get_mut(&key)
-            .and_then(|textures| textures.iter_mut().find(|texture| !texture.checked_out))
-        {
-            texture.checked_out = true;
-            texture.last_used = self.clock;
-            texture.purpose = EffectTexturePurpose::Scratch;
-            self.reuse_count = self.reuse_count.saturating_add(1);
-            return Ok(texture.clone());
-        }
-
-        self.evict_until_fits(bytes);
-        let new_current = self
-            .current_bytes
-            .checked_add(bytes)
-            .ok_or(EffectResourceError::SizeOverflow)?;
-        if new_current > self.budget_bytes {
-            return Err(EffectResourceError::BudgetExceeded {
-                requested_bytes: bytes,
-                current_bytes: self.current_bytes,
-                budget_bytes: self.budget_bytes,
-            });
-        }
-        let id = self.next_id;
-        self.next_id = self
-            .next_id
-            .checked_add(1)
-            .ok_or(EffectResourceError::TextureIdOverflow)?;
-        let texture = PooledEffectTexture {
-            id,
-            key,
-            bytes,
-            last_used: self.clock,
-            checked_out: true,
-            purpose: EffectTexturePurpose::Scratch,
-            identity: crate::gpu_residency::GpuResourceIdentity::new(
-                self.event_counters.generation(),
-                id,
-            ),
-        };
-        self.textures.entry(key).or_default().push(texture.clone());
-        self.current_bytes = new_current;
-        self.peak_bytes = self.peak_bytes.max(new_current);
-        self.allocation_count = self.allocation_count.saturating_add(1);
-        self.event_counters.record_allocation(texture.identity);
-        Ok(texture)
-    }
-
-    pub fn return_texture(
-        &mut self,
-        texture: PooledEffectTexture,
-    ) -> Result<(), EffectResourceError> {
-        if texture.identity.generation() != self.event_counters.generation()
-            || texture.identity.local_id() != texture.id
-        {
-            self.event_counters.record_retirement(texture.identity);
-            return Err(EffectResourceError::UnknownTexture(texture.id));
-        }
-        let Some(cached) = self
-            .textures
-            .get_mut(&texture.key)
-            .and_then(|textures| textures.iter_mut().find(|cached| cached.id == texture.id))
-        else {
-            return Err(EffectResourceError::UnknownTexture(texture.id));
-        };
-        if !cached.checked_out {
-            return Err(EffectResourceError::TextureAlreadyReturned(texture.id));
-        }
-        cached.checked_out = false;
-        cached.last_used = self.clock;
-        cached.purpose = EffectTexturePurpose::Scratch;
-        Ok(())
-    }
-
-    fn set_purpose(&mut self, texture: &PooledEffectTexture, purpose: EffectTexturePurpose) {
-        if texture.identity.generation() != self.event_counters.generation()
-            || texture.identity.local_id() != texture.id
-        {
-            return;
-        }
-        if let Some(cached) = self
-            .textures
-            .get_mut(&texture.key)
-            .and_then(|textures| textures.iter_mut().find(|cached| cached.id == texture.id))
-        {
-            cached.purpose = purpose;
-        }
+        self.checkout_with_purpose(key, EffectTexturePurpose::Scratch)
     }
 
     #[allow(dead_code)]
@@ -667,71 +584,6 @@ impl EffectResourcePool {
         self.pending_evicted_ids.drain(..).collect()
     }
 
-    pub(crate) fn metrics(&self) -> EffectResourceMetrics {
-        let mut cached_texture_count = 0;
-        let mut checked_out_texture_count = 0;
-        let mut active_scratch_count = 0;
-        let mut active_scratch_bytes = 0_u64;
-        let mut reusable_scratch_count = 0;
-        let mut reusable_scratch_bytes = 0_u64;
-        let mut checkpoint_count = 0;
-        let mut checkpoint_bytes = 0_u64;
-        let mut lifecycle_retained_count = 0;
-        let mut lifecycle_retained_bytes = 0_u64;
-        let mut capture_count = 0;
-        let mut capture_bytes = 0_u64;
-        for texture in self.textures.values().flatten() {
-            cached_texture_count += 1;
-            checked_out_texture_count += usize::from(texture.checked_out);
-            match texture.purpose {
-                EffectTexturePurpose::Scratch if texture.checked_out => {
-                    active_scratch_count += 1;
-                    active_scratch_bytes = active_scratch_bytes.saturating_add(texture.bytes);
-                }
-                EffectTexturePurpose::Scratch => {
-                    reusable_scratch_count += 1;
-                    reusable_scratch_bytes = reusable_scratch_bytes.saturating_add(texture.bytes);
-                }
-                EffectTexturePurpose::Checkpoint => {
-                    checkpoint_count += 1;
-                    checkpoint_bytes = checkpoint_bytes.saturating_add(texture.bytes);
-                }
-                EffectTexturePurpose::LifecycleRetained => {
-                    lifecycle_retained_count += 1;
-                    lifecycle_retained_bytes =
-                        lifecycle_retained_bytes.saturating_add(texture.bytes);
-                }
-                EffectTexturePurpose::Capture => {
-                    capture_count += 1;
-                    capture_bytes = capture_bytes.saturating_add(texture.bytes);
-                }
-            }
-        }
-        EffectResourceMetrics {
-            generation: self.event_counters.generation(),
-            current_bytes: self.current_bytes,
-            peak_bytes: self.peak_bytes,
-            budget_bytes: self.budget_bytes,
-            cached_key_count: self.cached_key_count(),
-            cached_texture_count,
-            checked_out_texture_count,
-            eviction_count: self.eviction_count,
-            allocation_count: self.allocation_count,
-            reuse_count: self.reuse_count,
-            retirement_count: self.retirement_count,
-            active_scratch_count,
-            active_scratch_bytes,
-            reusable_scratch_count,
-            reusable_scratch_bytes,
-            checkpoint_count,
-            checkpoint_bytes,
-            lifecycle_retained_count,
-            lifecycle_retained_bytes,
-            capture_count,
-            capture_bytes,
-        }
-    }
-
     fn evict_until_fits(&mut self, requested_bytes: u64) {
         while self.current_bytes.saturating_add(requested_bytes) > self.budget_bytes {
             let mut candidates = self
@@ -801,6 +653,8 @@ pub(crate) struct EffectGlResourceCache {
     checkpoint_compatibility: Option<CheckpointCacheCompatibility>,
     checkpoint_frame_serial: u64,
     checkpoint_causal_baseline: Option<CheckpointCacheCausalBaseline>,
+    scratch_residency_publisher:
+        Option<std::sync::Arc<crate::gpu_residency::AtomicEffectScratchResidencySnapshot>>,
 }
 
 #[allow(dead_code)]
@@ -824,6 +678,7 @@ impl EffectGlResourceCache {
             checkpoint_compatibility: None,
             checkpoint_frame_serial: 0,
             checkpoint_causal_baseline: None,
+            scratch_residency_publisher: None,
         })
     }
 
@@ -853,7 +708,16 @@ impl EffectGlResourceCache {
         gl: &glow::Context,
         key: EffectTextureKey,
     ) -> Result<PooledEffectTexture, Box<dyn std::error::Error>> {
-        let texture = self.pool.checkout(key)?;
+        self.acquire_with_purpose(gl, key, EffectTexturePurpose::Scratch)
+    }
+
+    fn acquire_with_purpose(
+        &mut self,
+        gl: &glow::Context,
+        key: EffectTextureKey,
+        purpose: EffectTexturePurpose,
+    ) -> Result<PooledEffectTexture, Box<dyn std::error::Error>> {
+        let texture = self.pool.checkout_with_purpose(key, purpose)?;
         for id in self.pool.drain_evicted_texture_ids() {
             if let Some(gl_texture) = self.gl_textures.remove(&id) {
                 unsafe { gl.delete_texture(gl_texture) };
@@ -945,6 +809,15 @@ impl EffectGlResourceCache {
         plan: &GraphTexturePlan,
     ) -> Result<PooledEffectTexture, Box<dyn std::error::Error>> {
         self.acquire(gl, texture_key(plan))
+    }
+
+    fn acquire_plan_with_purpose(
+        &mut self,
+        gl: &glow::Context,
+        plan: &GraphTexturePlan,
+        purpose: EffectTexturePurpose,
+    ) -> Result<PooledEffectTexture, Box<dyn std::error::Error>> {
+        self.acquire_with_purpose(gl, texture_key(plan), purpose)
     }
 
     pub(crate) fn begin_checkpoint_frame(&mut self) -> u64 {
@@ -1165,7 +1038,11 @@ impl EffectGlResourceCache {
                         .saturating_add(bytes);
                     continue;
                 }
-                let texture = match self.acquire_plan(gl, plan) {
+                let texture = match self.acquire_plan_with_purpose(
+                    gl,
+                    plan,
+                    EffectTexturePurpose::Checkpoint,
+                ) {
                     Ok(texture) => texture,
                     Err(_) => {
                         admission.skipped_allocation =
@@ -1487,11 +1364,7 @@ impl EffectGlResourceCache {
         gl: &glow::Context,
         key: EffectTextureKey,
     ) -> Result<PooledEffectTexture, Box<dyn std::error::Error>> {
-        let mut texture = self.acquire(gl, key)?;
-        self.pool
-            .set_purpose(&texture, EffectTexturePurpose::LifecycleRetained);
-        texture.purpose = EffectTexturePurpose::LifecycleRetained;
-        Ok(texture)
+        self.acquire_with_purpose(gl, key, EffectTexturePurpose::LifecycleRetained)
     }
 
     pub(crate) fn acquire_capture(
@@ -1499,11 +1372,7 @@ impl EffectGlResourceCache {
         gl: &glow::Context,
         key: EffectTextureKey,
     ) -> Result<PooledEffectTexture, Box<dyn std::error::Error>> {
-        let mut texture = self.acquire(gl, key)?;
-        self.pool
-            .set_purpose(&texture, EffectTexturePurpose::Capture);
-        texture.purpose = EffectTexturePurpose::Capture;
-        Ok(texture)
+        self.acquire_with_purpose(gl, key, EffectTexturePurpose::Capture)
     }
 
     fn insert_checkpoint_capture(
@@ -1514,10 +1383,6 @@ impl EffectGlResourceCache {
         self.pool
             .set_purpose(&capture.texture, EffectTexturePurpose::Checkpoint);
         self.checkpoint_captures.insert(key, capture);
-    }
-
-    pub(crate) fn metrics(&self) -> EffectResourceMetrics {
-        self.pool.metrics()
     }
 
     pub(crate) fn cleanup_size_history(&mut self, gl: &glow::Context) {

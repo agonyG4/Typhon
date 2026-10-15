@@ -771,6 +771,13 @@ impl AtomicEglGbmScanout {
         }
     }
 
+    pub(crate) fn effect_scratch_residency_snapshot(
+        &self,
+    ) -> Option<crate::gpu_residency::EffectScratchResidencyLiveSnapshot> {
+        self.render_worker()
+            .and_then(AtomicRenderWorkerHandle::scratch_residency_snapshot)
+    }
+
     fn render_worker_mut(&mut self) -> Option<&mut AtomicRenderWorkerHandle> {
         match &mut self.render_transport {
             AtomicRenderTransport::Synchronous(_) => None,

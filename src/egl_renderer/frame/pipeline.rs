@@ -31,6 +31,7 @@ impl<'a> FramePipeline<'a> {
         resources: &'a mut RendererResourceState,
         output_target_space: LifecycleRenderTargetSpace,
     ) -> Self {
+        effects.effect_resources.begin_scratch_activity_frame();
         Self {
             gl,
             cursor_image,

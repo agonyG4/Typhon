@@ -913,6 +913,15 @@ impl NativeScanoutBackend {
         }
     }
 
+    pub(crate) fn effect_scratch_residency_snapshot(
+        &self,
+    ) -> Option<crate::gpu_residency::EffectScratchResidencyLiveSnapshot> {
+        match self {
+            Self::AtomicEglGbm(scanout) => scanout.effect_scratch_residency_snapshot(),
+            Self::NativeEglGbm(_) | Self::Gbm(_) | Self::Dumb(_) => None,
+        }
+    }
+
     pub(crate) fn invalidate_direct_validation_cache(&mut self) {
         if let Self::AtomicEglGbm(scanout) = self {
             scanout.invalidate_direct_validation_cache();

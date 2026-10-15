@@ -5,6 +5,12 @@
 
 use serde::{Deserialize, Serialize};
 
+mod scratch_telemetry;
+pub use scratch_telemetry::{
+    AtomicEffectScratchResidencySnapshot, EffectScratchResidencyLiveSnapshot,
+    ScratchResidencyTelemetry,
+};
+
 pub const RESOURCE_DOMAIN_COUNT: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -117,6 +123,8 @@ pub struct GpuResidencyDomainSnapshot {
     pub unknown_count: u64,
     pub unknown_bytes: u64,
     pub backing_identity_ambiguous_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scratch_residency: Option<ScratchResidencyTelemetry>,
 }
 
 impl Default for GpuResidencyDomainSnapshot {
@@ -160,6 +168,7 @@ impl GpuResidencyDomainSnapshot {
             unknown_count: 0,
             unknown_bytes: 0,
             backing_identity_ambiguous_count: 0,
+            scratch_residency: None,
         }
     }
 

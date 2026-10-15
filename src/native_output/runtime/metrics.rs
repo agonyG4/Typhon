@@ -305,6 +305,9 @@ impl NativeRuntime {
             self.render_telemetry.gpu_residency,
         );
         gpu_residency.set_domain(self.scanout.gpu_residency_domain_snapshot());
+        if let Some(scratch) = self.scanout.effect_scratch_residency_snapshot() {
+            gpu_residency.set_domain(scratch.domain_snapshot());
+        }
         gpu_residency.recompute_totals();
         let mut timing_scopes = BTreeMap::new();
         for (name, summary) in &self.timing_scopes {

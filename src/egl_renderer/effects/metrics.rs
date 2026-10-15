@@ -15,6 +15,7 @@ pub(crate) struct EffectResourceMetrics {
     pub active_scratch_bytes: u64,
     pub reusable_scratch_count: usize,
     pub reusable_scratch_bytes: u64,
+    pub scratch_residency: crate::gpu_residency::ScratchResidencyTelemetry,
     pub checkpoint_count: usize,
     pub checkpoint_bytes: u64,
     pub lifecycle_retained_count: usize,

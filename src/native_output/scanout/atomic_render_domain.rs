@@ -286,6 +286,31 @@ pub(super) struct AtomicRenderDomain {
 }
 
 impl AtomicRenderDomain {
+    pub(super) fn set_scratch_residency_publisher(
+        &mut self,
+        publisher: Option<
+            std::sync::Arc<crate::gpu_residency::AtomicEffectScratchResidencySnapshot>,
+        >,
+    ) {
+        if let Some(scene) = self.scene.as_mut() {
+            scene.set_scratch_residency_publisher(publisher);
+        }
+    }
+
+    pub(super) fn next_scratch_maintenance_deadline(&self) -> Option<std::time::Instant> {
+        self.scene
+            .as_ref()
+            .and_then(GlesSceneRenderer::next_scratch_maintenance_deadline)
+    }
+
+    pub(super) fn maintain_effect_scratch(&mut self, now: std::time::Instant) -> io::Result<()> {
+        self.activate_context()?;
+        if let Some(scene) = self.scene.as_mut() {
+            scene.maintain_effect_scratch(now);
+        }
+        Ok(())
+    }
+
     pub(super) fn activate_context(&self) -> io::Result<()> {
         let native_display = self
             .native_display

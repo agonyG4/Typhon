@@ -208,6 +208,29 @@ pub(crate) struct GlesRendererInfo {
 }
 
 impl GlesSceneRenderer {
+    pub(crate) fn set_scratch_residency_publisher(
+        &mut self,
+        publisher: Option<
+            std::sync::Arc<crate::gpu_residency::AtomicEffectScratchResidencySnapshot>,
+        >,
+    ) {
+        self.effect_runtime
+            .effect_resources
+            .set_scratch_residency_publisher(publisher);
+    }
+
+    pub(crate) fn next_scratch_maintenance_deadline(&self) -> Option<std::time::Instant> {
+        self.effect_runtime
+            .effect_resources
+            .next_scratch_maintenance_deadline()
+    }
+
+    pub(crate) fn maintain_effect_scratch(&mut self, now: std::time::Instant) -> bool {
+        self.effect_runtime
+            .effect_resources
+            .maintain_scratch(&self.gl, now)
+    }
+
     pub(crate) fn finish_render_work(&self) {
         unsafe { self.gl.finish() };
     }
