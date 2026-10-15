@@ -4,6 +4,7 @@ use std::os::unix::net::UnixStream;
 use super::{
     X11WindowHandle,
     atoms::{XwmAtomName, XwmAtoms},
+    capabilities::XwmCapabilities,
     window::X11WindowRegistry,
 };
 use crate::xwayland::XwaylandGeneration;
@@ -13,10 +14,40 @@ fn advertised_atoms_are_a_unique_implemented_subset() {
     let names = XwmAtoms::advertised_names();
     assert!(!names.is_empty());
     assert!(names.contains(&XwmAtomName::GtkFrameExtents));
+    assert!(names.contains(&XwmAtomName::NetWmMoveresize));
+    assert!(names.contains(&XwmAtomName::NetMoveResizeWindow));
     for (index, name) in names.iter().enumerate() {
         assert!(XwmAtomName::ALL.contains(name));
         assert!(!names[..index].contains(name));
     }
+}
+
+#[test]
+fn supported_atoms_apply_capabilities_without_filtering_moveresize() {
+    let normal_capabilities = XwmCapabilities {
+        composite: true,
+        xfixes: true,
+        shape: true,
+        randr: true,
+        sync: true,
+    };
+    let normal_supported = XwmAtoms::advertised_names_for(normal_capabilities).collect::<Vec<_>>();
+    assert!(normal_supported.contains(&XwmAtomName::NetWmMoveresize));
+    assert!(normal_supported.contains(&XwmAtomName::NetMoveResizeWindow));
+    assert!(normal_supported.contains(&XwmAtomName::NetWmSyncRequest));
+
+    let no_optional_extensions = XwmCapabilities {
+        composite: true,
+        xfixes: false,
+        shape: false,
+        randr: false,
+        sync: false,
+    };
+    let filtered_supported =
+        XwmAtoms::advertised_names_for(no_optional_extensions).collect::<Vec<_>>();
+    assert!(filtered_supported.contains(&XwmAtomName::NetWmMoveresize));
+    assert!(filtered_supported.contains(&XwmAtomName::NetMoveResizeWindow));
+    assert!(!filtered_supported.contains(&XwmAtomName::NetWmSyncRequest));
 }
 
 #[test]

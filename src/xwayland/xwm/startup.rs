@@ -44,6 +44,7 @@ use super::{
 };
 use crate::wm::WorkspaceManager;
 use crate::xwayland::XwaylandGeneration;
+use crate::xwayland::trace::{self, TraceFields};
 
 const MAX_SETUP_BYTES: usize = 64 * 1024;
 
@@ -705,10 +706,7 @@ impl XwmStartup {
             self.atoms().get(XwmAtomName::Utf8String),
             b"Typhon",
         )?;
-        let supported = XwmAtoms::advertised_names()
-            .iter()
-            .copied()
-            .filter(|name| capabilities.supports_atom(*name))
+        let supported = XwmAtoms::advertised_names_for(capabilities)
             .map(|name| self.atoms().get(name))
             .collect::<Vec<_>>();
         self.queue_property32(
@@ -750,7 +748,24 @@ impl XwmStartup {
         ] {
             self.queue_property32(root, atom, xproto::AtomEnum::CARDINAL.into(), &values)?;
         }
-        self.flush_connection()
+        self.flush_connection()?;
+        trace::emit("ewmh_supported_published", || {
+            TraceFields::new()
+                .field(
+                    "net_wm_moveresize",
+                    supported.contains(&self.atoms().get(XwmAtomName::NetWmMoveresize)),
+                )
+                .field(
+                    "net_moveresize_window",
+                    supported.contains(&self.atoms().get(XwmAtomName::NetMoveResizeWindow)),
+                )
+                .field(
+                    "sync_request",
+                    supported.contains(&self.atoms().get(XwmAtomName::NetWmSyncRequest)),
+                )
+                .field("atom_count", supported.len())
+        });
+        Ok(())
     }
 
     fn queue_existing_window_query(&mut self) -> Result<(), XwmStartupError> {

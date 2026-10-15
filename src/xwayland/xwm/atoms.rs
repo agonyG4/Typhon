@@ -2,6 +2,8 @@ use std::collections::HashMap;
 
 use x11rb::protocol::xproto::Atom;
 
+use super::capabilities::XwmCapabilities;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum XwmAtomName {
     WmS0,
@@ -339,6 +341,8 @@ impl XwmAtoms {
             XwmAtomName::GtkFrameExtents,
             XwmAtomName::WmChangeState,
             XwmAtomName::NetCloseWindow,
+            XwmAtomName::NetWmMoveresize,
+            XwmAtomName::NetMoveResizeWindow,
             XwmAtomName::NetWmState,
             XwmAtomName::NetWmStateFullscreen,
             XwmAtomName::NetWmStateMaximizedVert,
@@ -346,5 +350,14 @@ impl XwmAtoms {
             XwmAtomName::NetWmStateHidden,
             XwmAtomName::NetWmSyncRequest,
         ]
+    }
+
+    pub(crate) fn advertised_names_for(
+        capabilities: XwmCapabilities,
+    ) -> impl Iterator<Item = XwmAtomName> {
+        Self::advertised_names()
+            .iter()
+            .copied()
+            .filter(move |name| capabilities.supports_atom(*name))
     }
 }
