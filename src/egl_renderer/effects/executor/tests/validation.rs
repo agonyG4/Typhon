@@ -344,6 +344,7 @@ fn pruned_instance_does_not_realize_textures() {
     let pass = |id, instance, input, output| CompiledRenderPass {
         id: GraphPassId::new(id).unwrap(),
         kind: RenderPassKind::Fragment,
+        final_kawase_upsample: false,
         inputs: vec![input],
         output: Some(output),
         damage: EffectRegion::empty(),

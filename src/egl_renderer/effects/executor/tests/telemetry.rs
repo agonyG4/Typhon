@@ -508,6 +508,7 @@ fn effect_surface_consumer_plan_keeps_capture_only_source() {
     let pass = CompiledRenderPass {
         id: pass_id,
         kind: RenderPassKind::SceneCapture,
+        final_kawase_upsample: false,
         inputs: Vec::new(),
         output: Some(output),
         damage: EffectRegion::empty(),
@@ -809,6 +810,7 @@ fn effect_selection_follows_direct_presentation_and_graph_dependencies() {
     let pass = |id, instance, input, output| CompiledRenderPass {
         id: GraphPassId::new(id).unwrap(),
         kind: RenderPassKind::Fragment,
+        final_kawase_upsample: false,
         inputs: vec![input],
         output: Some(output),
         damage: EffectRegion::empty(),

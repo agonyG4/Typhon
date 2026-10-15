@@ -562,6 +562,7 @@ fn test_dmabuf_resource(
             size: (size.width, size.height),
             generation,
             egl_image: Some(fake_egl_image()),
+            telemetry: EglImageResourceTelemetry::Untracked,
         },
         dmabuf_key: Some(DmabufImageKey::from_handle(identity.id(), handle)),
         buffer_lifetime: Some(identity.downgrade()),

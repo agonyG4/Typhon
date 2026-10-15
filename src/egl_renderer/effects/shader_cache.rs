@@ -118,7 +118,7 @@ pub struct ShaderProgramCache {
     evicted: Vec<ShaderProgramKey>,
 }
 
-fn builtin_shader_programs() -> [(oblivion_one::effects::ShaderModuleId, u64, &'static str); 11] {
+fn builtin_shader_programs() -> [(oblivion_one::effects::ShaderModuleId, u64, &'static str); 13] {
     [
         (
             oblivion_one::effects::ShaderModuleId::new(INTERNAL_EFFECT_SHADER_MODULE_DOWNSAMPLE)
@@ -143,6 +143,12 @@ fn builtin_shader_programs() -> [(oblivion_one::effects::ShaderModuleId, u64, &'
                 .expect("builtin shader ids are non-zero"),
             0,
             blur::DUAL_KAWASE_UPSAMPLE_SHADER,
+        ),
+        (
+            oblivion_one::effects::ShaderModuleId::new(INTERNAL_EFFECT_SHADER_MODULE_UPSAMPLE)
+                .expect("builtin shader ids are non-zero"),
+            1,
+            blur::DUAL_KAWASE_UPSAMPLE_CANONICAL_SHADER,
         ),
         (
             oblivion_one::effects::ShaderModuleId::new(INTERNAL_EFFECT_SHADER_MODULE_COPY)
@@ -173,6 +179,12 @@ fn builtin_shader_programs() -> [(oblivion_one::effects::ShaderModuleId, u64, &'
                 .expect("builtin shader ids are non-zero"),
             0,
             super::executor::FRAGMENT_STAGE_FRAGMENT_SHADER,
+        ),
+        (
+            oblivion_one::effects::ShaderModuleId::new(INTERNAL_EFFECT_SHADER_MODULE_FRAGMENT)
+                .expect("builtin shader ids are non-zero"),
+            1,
+            super::executor::FRAGMENT_STAGE_FRAGMENT_CANONICAL_SHADER,
         ),
         (
             oblivion_one::effects::ShaderModuleId::new(INTERNAL_EFFECT_SHADER_MODULE_MASK)
@@ -707,10 +719,10 @@ mod tests {
             builtin_shader_program_count(),
             builtin_shader_programs().len()
         );
-        assert_eq!(builtin_shader_program_count(), 11);
-        assert_eq!(shader_cache_capacity_for_custom_shaders(0).unwrap(), 11);
-        assert_eq!(shader_cache_capacity_for_custom_shaders(1).unwrap(), 12);
-        assert_eq!(shader_cache_capacity_for_custom_shaders(120).unwrap(), 131);
+        assert_eq!(builtin_shader_program_count(), 13);
+        assert_eq!(shader_cache_capacity_for_custom_shaders(0).unwrap(), 13);
+        assert_eq!(shader_cache_capacity_for_custom_shaders(1).unwrap(), 14);
+        assert_eq!(shader_cache_capacity_for_custom_shaders(120).unwrap(), 133);
         assert_eq!(
             shader_cache_capacity_for_custom_shaders(usize::MAX),
             Err(ShaderCacheError::CapacityOverflow)
@@ -732,6 +744,33 @@ mod tests {
                         && source.contains("u_effect_noise_amount")
                 })
         );
+    }
+
+    #[test]
+    fn canonical_blur_variants_are_part_of_the_builtin_prewarm_set() {
+        let upsample =
+            oblivion_one::effects::ShaderModuleId::new(INTERNAL_EFFECT_SHADER_MODULE_UPSAMPLE)
+                .unwrap();
+        let fragment =
+            oblivion_one::effects::ShaderModuleId::new(INTERNAL_EFFECT_SHADER_MODULE_FRAGMENT)
+                .unwrap();
+        let programs = builtin_shader_programs();
+        assert!(programs.iter().any(|(module, variant, source)| {
+            *module == upsample
+                && *variant == 1
+                && source.contains("ivec2 storage_pixel = ivec2(floor(gl_FragCoord.xy))")
+                && source.contains("(local_pixel + vec2(0.5)) / u_effect_output_size")
+        }));
+        assert!(programs.iter().any(|(module, variant, source)| {
+            *module == fragment
+                && *variant == 1
+                && source.contains("uniform highp int u_effect_target_flip_y;")
+                && source.contains("uniform vec2 u_effect_output_size;")
+                && source.contains("uniform vec4 u_effect_input_domain;")
+                && source.contains("uniform vec4 u_effect_output_domain;")
+                && source.contains("texture(u_effect_input, typhon_effect_sample_uv(v_uv))")
+                && source.contains("typhon_canonical_effect_noise()")
+        }));
     }
 
     #[test]

@@ -1,6 +1,55 @@
 use super::*;
 use glow::HasContext;
 
+#[test]
+fn canonical_offscreen_dither_guard_restores_the_exact_previous_state() {
+    let harness = GlesEffectTestHarness::new(4, 4);
+    for initially_enabled in [true, false] {
+        unsafe {
+            if initially_enabled {
+                harness.gl.enable(glow::DITHER);
+            } else {
+                harness.gl.disable(glow::DITHER);
+            }
+        }
+        let draw_result = (|| -> Result<(), ()> {
+            let _restore = effects::canonical_offscreen_dither_restore(
+                &harness.gl,
+                effects::CanonicalBlurSemanticsPolicy::Canonical,
+                true,
+            )
+            .expect("canonical offscreen writes must own a DITHER guard");
+            assert!(!unsafe { harness.gl.is_enabled(glow::DITHER) });
+            Err(())
+        })();
+        assert_eq!(draw_result, Err(()));
+        assert_eq!(
+            unsafe { harness.gl.is_enabled(glow::DITHER) },
+            initially_enabled,
+            "the offscreen DITHER state must restore after an early return"
+        );
+    }
+
+    unsafe { harness.gl.enable(glow::DITHER) };
+    assert!(
+        effects::canonical_offscreen_dither_restore(
+            &harness.gl,
+            effects::CanonicalBlurSemanticsPolicy::Legacy,
+            true,
+        )
+        .is_none()
+    );
+    assert!(
+        effects::canonical_offscreen_dither_restore(
+            &harness.gl,
+            effects::CanonicalBlurSemanticsPolicy::Canonical,
+            false,
+        )
+        .is_none()
+    );
+    assert!(unsafe { harness.gl.is_enabled(glow::DITHER) });
+}
+
 fn compare_mrt_store_with_capture(
     label: &str,
     capture: &effects::DiagnosticTextureCapture,
@@ -784,6 +833,41 @@ fn render_terminal_replay_mode(
     (replay, read_diagnostic_pixels(&harness))
 }
 
+fn render_production_canonical_staged(
+    graph: &CompiledFrameGraph,
+    output_size: (u32, u32),
+    origin: OutputFramebufferOrigin,
+    install_scene: impl FnOnce(&mut GlesEffectTestHarness),
+    capture_passes: impl IntoIterator<Item = oblivion_one::effects::GraphPassId>,
+) -> (effects::TerminalBoundaryReplayExecution, Vec<u8>, bool) {
+    let mut harness = GlesEffectTestHarness::new(output_size.0, output_size.1);
+    install_scene(&mut harness);
+    harness
+        .renderer
+        .effect_runtime
+        .canonical_blur_semantics_policy = effects::CanonicalBlurSemanticsPolicy::Canonical;
+    unsafe { harness.gl.enable(glow::DITHER) };
+    let bounds = EffectRect::new(0, 0, output_size.0, output_size.1).expect("output bounds");
+    let config = effects::EffectDebugConfig::new(
+        effects::EffectDebugCaptureMode::Replay,
+        effects::EffectDebugKawaseMode::Partial,
+    );
+    let replay = execute_diagnostic_frame_with_terminal_replay(
+        &mut harness,
+        graph,
+        &diagnostic_repaint_plan_for_repairs_in_size(&[], true, output_size),
+        EffectRegion::from_rect(bounds),
+        true,
+        config,
+        origin,
+        effects::TerminalBoundaryReplay::ProductionCanonicalStaged,
+        capture_passes,
+        [],
+    );
+    let dither_restored = unsafe { harness.gl.is_enabled(glow::DITHER) };
+    (replay, read_diagnostic_pixels(&harness), dither_restored)
+}
+
 fn render_canonical_single_tail_pair(
     staged_graph: &CompiledFrameGraph,
     fused_graph: &CompiledFrameGraph,
@@ -791,7 +875,7 @@ fn render_canonical_single_tail_pair(
     origin: OutputFramebufferOrigin,
     install_scene: impl Fn(&mut GlesEffectTestHarness),
     case_name: &str,
-) -> (Vec<u8>, Vec<u8>) {
+) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     let staged_tails = terminal_tail_capture_ids(staged_graph);
     assert_eq!(staged_tails.len(), 1, "{case_name} staged graph tail count");
     let staged_tail = staged_tails[0];
@@ -862,6 +946,45 @@ fn render_canonical_single_tail_pair(
         staged_pixels, fused_pixels,
         "canonical staged and fused C differ for {case_name} at {origin:?}"
     );
+    let (production_replay, production_pixels, dither_restored) =
+        render_production_canonical_staged(
+            staged_graph,
+            output_size,
+            origin,
+            |harness| install_scene(harness),
+            [staged_tail.upsample, staged_tail.fragment],
+        );
+    assert!(
+        dither_restored,
+        "canonical offscreen draws must restore enabled DITHER for {origin:?}"
+    );
+    assert_eq!(
+        production_replay.captures[&staged_tail.upsample]
+            .pixels
+            .as_slice(),
+        staged_a.as_slice(),
+        "production canonical Up2 differs from qualified Up2 for {case_name} at {origin:?}"
+    );
+    assert_eq!(
+        production_replay.captures[&staged_tail.fragment]
+            .pixels
+            .as_slice(),
+        staged_b.as_slice(),
+        "production canonical Fragment/Noise differs from qualified model for {case_name} at {origin:?}"
+    );
+    assert_eq!(
+        production_pixels, staged_pixels,
+        "production canonical staged output differs from qualified model for {case_name} at {origin:?}"
+    );
+    let production_summary = summarize_rgba8_difference(
+        &production_pixels,
+        &staged_pixels,
+        output_size.0,
+        output_size.1,
+        origin,
+    );
+    assert_eq!(production_summary.changed_pixels, 0);
+    assert_eq!(production_summary.alpha_changed_pixels, 0);
     let summary = summarize_rgba8_difference(
         &staged_pixels,
         &fused_pixels,
@@ -871,7 +994,7 @@ fn render_canonical_single_tail_pair(
     );
     assert_eq!(summary.changed_pixels, 0, "{case_name} C changed pixels");
     assert_eq!(summary.alpha_changed_pixels, 0, "{case_name} alpha changed");
-    (staged_pixels, fused_pixels)
+    (staged_pixels, fused_pixels, production_pixels)
 }
 
 fn render_canonical_multi_tail_pair(
@@ -963,6 +1086,37 @@ fn render_canonical_multi_tail_pair(
             tail.instance.get()
         );
     }
+    let production_capture_passes = staged_tails
+        .iter()
+        .flat_map(|tail| [tail.upsample, tail.fragment])
+        .collect::<Vec<_>>();
+    let (production_replay, production_pixels, dither_restored) =
+        render_production_canonical_staged(
+            staged_graph,
+            output_size,
+            origin,
+            |harness| install_scene(harness),
+            production_capture_passes,
+        );
+    assert!(dither_restored, "canonical causal draw restores DITHER");
+    for tail in &staged_tails {
+        assert_eq!(
+            production_replay.captures[&tail.upsample].pixels,
+            staged_replay.captures[&tail.upsample].pixels,
+            "production causal canonical Up2 differs for instance {} at {origin:?}",
+            tail.instance.get()
+        );
+        assert_eq!(
+            production_replay.captures[&tail.fragment].pixels,
+            staged_replay.captures[&tail.fragment].pixels,
+            "production causal canonical Fragment differs for instance {} at {origin:?}",
+            tail.instance.get()
+        );
+    }
+    assert_eq!(
+        production_pixels, staged_pixels,
+        "production causal canonical C differs at {origin:?}"
+    );
     assert_eq!(staged_pixels, fused_pixels, "{case_name} final C differs");
     let summary = summarize_rgba8_difference(
         &staged_pixels,
@@ -994,9 +1148,17 @@ fn render_terminal_replay_after_partial_repair(
     repair: OutputRect,
     terminal_fusion: bool,
     mode: effects::TerminalBoundaryReplay,
+    production_canonical: bool,
 ) -> TerminalPartialRepairReplay {
     let mut harness = GlesEffectTestHarness::new(output_size.0, output_size.1);
     install_scene(&mut harness);
+    if production_canonical {
+        harness
+            .renderer
+            .effect_runtime
+            .canonical_blur_semantics_policy = effects::CanonicalBlurSemanticsPolicy::Canonical;
+        unsafe { harness.gl.enable(glow::DITHER) };
+    }
     let bounds = EffectRect::new(0, 0, output_size.0, output_size.1).expect("output bounds");
     let config = effects::EffectDebugConfig::new(
         effects::EffectDebugCaptureMode::Replay,
@@ -1015,6 +1177,9 @@ fn render_terminal_replay_after_partial_repair(
         [],
         [],
     );
+    if production_canonical {
+        assert!(unsafe { harness.gl.is_enabled(glow::DITHER) });
+    }
     println!("partial repair {origin:?} {terminal_fusion}: frame 0 complete");
     let initial_pixels = read_diagnostic_pixels(&harness);
     update_diagnostic_background_for_surface(&harness, 7, repair, [207, 43, 89, 255]);
@@ -1092,6 +1257,9 @@ fn render_terminal_replay_after_partial_repair(
         [],
         [],
     );
+    if production_canonical {
+        assert!(unsafe { harness.gl.is_enabled(glow::DITHER) });
+    }
     println!("partial repair {origin:?} {terminal_fusion}: frame 1 complete");
     println!("partial repair {origin:?} {terminal_fusion}: reading partial pixels");
     let partial_pixels = read_diagnostic_pixels(&harness);
@@ -1102,6 +1270,13 @@ fn render_terminal_replay_after_partial_repair(
     let mut reference_harness = GlesEffectTestHarness::new(output_size.0, output_size.1);
     println!("partial repair {origin:?} {terminal_fusion}: reference harness ready");
     install_scene(&mut reference_harness);
+    if production_canonical {
+        reference_harness
+            .renderer
+            .effect_runtime
+            .canonical_blur_semantics_policy = effects::CanonicalBlurSemanticsPolicy::Canonical;
+        unsafe { reference_harness.gl.enable(glow::DITHER) };
+    }
     update_diagnostic_background_for_surface(&reference_harness, 7, repair, [207, 43, 89, 255]);
     println!("partial repair {origin:?} {terminal_fusion}: compiling full reference");
     let full_source_damage = EffectRegion::from_rect(bounds);
@@ -1124,6 +1299,9 @@ fn render_terminal_replay_after_partial_repair(
         [],
         [],
     );
+    if production_canonical {
+        assert!(unsafe { reference_harness.gl.is_enabled(glow::DITHER) });
+    }
     println!("partial repair {origin:?} {terminal_fusion}: full reference complete");
     println!("partial repair {origin:?} {terminal_fusion}: reading full-reference pixels");
     let full_reference_pixels = read_diagnostic_pixels(&reference_harness);
@@ -4739,7 +4917,7 @@ fn canonical_staged_blur_exact_matrix_and_legacy_impact() {
             OutputFramebufferOrigin::BottomLeft,
             OutputFramebufferOrigin::TopLeftScanout,
         ] {
-            let (canonical_staged, _) = render_canonical_single_tail_pair(
+            let (canonical_staged, _, production_canonical) = render_canonical_single_tail_pair(
                 &staged_graph,
                 &fused_graph,
                 output_size,
@@ -4780,7 +4958,7 @@ fn canonical_staged_blur_exact_matrix_and_legacy_impact() {
                 let impact = report_rgba8_comparison(
                     &format!("old-vs-canonical {case_name} origin={origin:?}"),
                     &old_pixels,
-                    &canonical_staged,
+                    &production_canonical,
                     output_size.0,
                     output_size.1,
                     origin,
@@ -4972,6 +5150,7 @@ fn canonical_partial_repair_matches_full_render_for_staged_and_fused_paths() {
                 repair,
                 false,
                 effects::TerminalBoundaryReplay::CanonicalStaged,
+                false,
             )
         });
         let staged_source_impact = summarize_rgba8_difference(
@@ -5008,6 +5187,7 @@ fn canonical_partial_repair_matches_full_render_for_staged_and_fused_paths() {
                 repair,
                 true,
                 effects::TerminalBoundaryReplay::CanonicalTerminalQ1Q2,
+                false,
             )
         });
         if let Some(failure) = repair_pixel_mismatch(
@@ -5049,6 +5229,32 @@ fn canonical_partial_repair_matches_full_render_for_staged_and_fused_paths() {
             origin,
             &staged_replay.source_damage,
             &staged_replay.repair_graph,
+        ) {
+            repair_failures.push(failure);
+        }
+        let production_replay = render_terminal_replay_after_partial_repair(
+            &scene,
+            &registry,
+            &staged_graph,
+            output_size,
+            origin,
+            |harness| install_diagnostic_scene_with_origin(harness, rect, visual_group, origin),
+            repair,
+            false,
+            effects::TerminalBoundaryReplay::ProductionCanonicalStaged,
+            true,
+        );
+        if let Some(failure) = repair_pixel_mismatch(
+            "production canonical partial vs independent full reference",
+            "production full",
+            "production partial",
+            &production_replay.full_reference_pixels,
+            &production_replay.partial_pixels,
+            Some(&production_replay.initial_pixels),
+            output_size,
+            origin,
+            &production_replay.source_damage,
+            &production_replay.repair_graph,
         ) {
             repair_failures.push(failure);
         }

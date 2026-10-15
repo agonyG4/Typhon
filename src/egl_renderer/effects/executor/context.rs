@@ -284,6 +284,12 @@ impl<'a> EffectExecutionContext<'a> {
                 }),
             )
         });
+        let gl = self.gl;
+        let _canonical_dither_restore = canonical_offscreen_dither_restore(
+            gl,
+            self.runtime.canonical_blur_semantics_policy,
+            true,
+        );
         let capture_result: RendererResult<()> = (|| {
             let framebuffer = self
                 .runtime

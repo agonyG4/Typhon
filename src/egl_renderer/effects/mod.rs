@@ -1,4 +1,8 @@
 mod blur;
+mod canonical_blur_semantics;
+pub(crate) use canonical_blur_semantics::{
+    CanonicalBlurSemanticsPolicy, fragment_shader_variant, upsample_shader_variant,
+};
 mod capture;
 mod executor;
 mod gpu_timing;
@@ -18,6 +22,8 @@ pub(crate) use blur::{
 };
 #[cfg(test)]
 pub(crate) use executor::FRAGMENT_STAGE_FRAGMENT_SHADER;
+#[cfg(test)]
+pub(crate) use executor::canonical_offscreen_dither_restore;
 #[cfg(test)]
 pub(crate) use executor::with_test_offscreen_dither_policy;
 #[cfg(test)]

@@ -6,7 +6,7 @@ use super::dmabuf_import::{
     DmabufImportGlStage, DmabufImportPath, DmabufTextureImportError, first_drained_gl_error,
     settle_dmabuf_import_result,
 };
-use super::image::EglImageResource;
+use super::image::{EglImageResource, EglImageResourceTelemetry};
 use super::surface::{
     EglSurfaceResource, EglSurfaceResourceUpdate, SurfaceResourceLifetimeAction,
     classify_surface_resource_lifetime, reconcile_surface_resource_backing,
@@ -85,6 +85,7 @@ pub(super) fn test_shm_resource(synced_commit: Option<SurfaceCommitCounter>) -> 
             size: (2, 2),
             generation: 1,
             egl_image: None,
+            telemetry: EglImageResourceTelemetry::Untracked,
         },
         dmabuf_key: None,
         buffer_lifetime: None,

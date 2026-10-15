@@ -369,6 +369,8 @@ pub enum EffectColorConversion {
 pub struct CompiledRenderPass {
     pub id: GraphPassId,
     pub kind: RenderPassKind,
+    /// This is the level-zero full-resolution Up2 in a Dual Kawase node.
+    pub final_kawase_upsample: bool,
     pub inputs: Vec<GraphTextureId>,
     pub output: Option<GraphTextureId>,
     pub damage: EffectRegion,
@@ -2308,6 +2310,7 @@ impl GraphBuilder {
         self.passes.push(CompiledRenderPass {
             id,
             kind,
+            final_kawase_upsample: false,
             inputs,
             output,
             damage,
@@ -3273,6 +3276,13 @@ fn compile_instance(
                         Some(spec.radius),
                         instance.anchor_scope,
                     )?;
+                    if level == 0 {
+                        builder
+                            .passes
+                            .last_mut()
+                            .expect("final Kawase upsample pass was appended")
+                            .final_kawase_upsample = true;
+                    }
                     current = texture;
                 }
                 store_output(&mut outputs, slot, current)?;
@@ -3693,6 +3703,27 @@ mod tests {
                 .count(),
             15
         );
+        assert_eq!(
+            exact
+                .passes
+                .iter()
+                .filter(|pass| pass.final_kawase_upsample)
+                .count(),
+            15
+        );
+        for pass in &exact.passes {
+            let last_instance_upsample = exact.passes.iter().rev().find(|candidate| {
+                candidate.instance == pass.instance
+                    && candidate.kind == RenderPassKind::DualKawaseUpsample
+            });
+            assert_eq!(
+                pass.final_kawase_upsample,
+                pass.kind == RenderPassKind::DualKawaseUpsample
+                    && last_instance_upsample.is_some_and(|last| last.id == pass.id),
+                "pass {} has incorrect final-Up2 metadata",
+                pass.id.get()
+            );
+        }
     }
 
     #[test]
@@ -4136,6 +4167,7 @@ mod tests {
         CompiledRenderPass {
             id: GraphPassId::new(id).expect("test pass id must be non-zero"),
             kind: RenderPassKind::Fragment,
+            final_kawase_upsample: false,
             inputs: Vec::new(),
             output: None,
             damage: EffectRegion::empty(),
@@ -5260,6 +5292,7 @@ mod tests {
         CompiledRenderPass {
             id: GraphPassId::new(1).unwrap(),
             kind: RenderPassKind::SceneCapture,
+            final_kawase_upsample: false,
             inputs,
             output,
             damage: EffectRegion::empty(),

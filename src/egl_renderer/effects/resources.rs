@@ -3942,6 +3942,7 @@ mod tests {
             .map(|((inputs, output), id)| CompiledRenderPass {
                 id,
                 kind: RenderPassKind::Composite,
+                final_kawase_upsample: false,
                 inputs,
                 output: Some(output),
                 damage: EffectRegion::empty(),
@@ -4084,6 +4085,7 @@ mod tests {
             .map(|((inputs, output), id)| CompiledRenderPass {
                 id,
                 kind: RenderPassKind::Composite,
+                final_kawase_upsample: false,
                 inputs,
                 output: Some(output),
                 damage: EffectRegion::empty(),

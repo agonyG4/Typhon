@@ -34,6 +34,7 @@ use super::gpu_timing::{
     CompositeSceneReplayExecutionDetail, CompositeSceneReplayWork, PassTimingWork,
     ReplayCaptureExecutionDetail,
 };
+use super::{CanonicalBlurSemanticsPolicy, fragment_shader_variant, upsample_shader_variant};
 use super::{
     CapturePathFallbackReason, CheckpointCapturePath, EffectDebugCaptureMode, EffectDebugConfig,
     EffectDebugKawaseMode, EffectRuntime, FrameTraceSummary, PassTraceSummary, blur, capture,
@@ -83,6 +84,10 @@ pub(crate) use graph_runner::{
 };
 mod planning;
 use planning::*;
+mod gl_state;
+pub(crate) use gl_state::canonical_offscreen_dither_restore;
+#[cfg(test)]
+pub(crate) use gl_state::{DitherStateRestore, set_dither_state_with_restore};
 mod validation;
 pub(crate) use validation::EffectExecutionInvariantError;
 use validation::*;
@@ -114,7 +119,8 @@ pub(crate) use checkpoint::{checkpoint_causal_stability_plan, checkpoint_update_
 mod shaders;
 pub(crate) use shaders::{
     BLEND_STAGE_FRAGMENT_SHADER, COMPOSITE_FRAGMENT_SHADER, COPY_FRAGMENT_SHADER,
-    FRAGMENT_STAGE_FRAGMENT_SHADER, MASK_STAGE_FRAGMENT_SHADER, NORMALIZE_FRAGMENT_SHADER,
+    FRAGMENT_STAGE_FRAGMENT_CANONICAL_SHADER, FRAGMENT_STAGE_FRAGMENT_SHADER,
+    MASK_STAGE_FRAGMENT_SHADER, NORMALIZE_FRAGMENT_SHADER,
     TERMINAL_KAWASE_COMPOSITE_FRAGMENT_SHADER,
 };
 #[cfg(test)]

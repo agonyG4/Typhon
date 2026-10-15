@@ -206,6 +206,11 @@ pub(super) fn execute_capture(
         return Ok(None);
     }
     if direct_capture {
+        let _canonical_dither_restore = canonical_offscreen_dither_restore(
+            renderer.gl,
+            renderer.runtime.canonical_blur_semantics_policy,
+            target_plan.source != GraphTextureSource::Output,
+        );
         stats.record_capture_execution_with_mode(pass, capture_plan.executed, physical_pixels, 0);
         match capture_plan.executed {
             CaptureTimingMode::FramebufferBlit => {
@@ -291,6 +296,11 @@ pub(super) fn execute_capture(
             .effect_resources
             .invalidate_checkpoint_capture(key);
     }
+    let _canonical_dither_restore = canonical_offscreen_dither_restore(
+        renderer.gl,
+        renderer.runtime.canonical_blur_semantics_policy,
+        target_plan.source != GraphTextureSource::Output,
+    );
     renderer
         .runtime
         .effect_resources
@@ -582,6 +592,11 @@ pub(super) fn capture_scene_work_preservation_context(
         .runtime
         .effect_resources
         .acquire_capture(renderer.gl, key)?;
+    let _canonical_dither_restore = canonical_offscreen_dither_restore(
+        renderer.gl,
+        renderer.runtime.canonical_blur_semantics_policy,
+        true,
+    );
     let result = (|| {
         let output_framebuffer = renderer.scene.active_output_framebuffer;
         renderer.bind_active_output_framebuffer();

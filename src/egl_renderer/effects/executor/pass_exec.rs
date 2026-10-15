@@ -28,40 +28,16 @@ impl Drop for TestOffscreenDitherPolicyRestore {
 }
 
 #[cfg(test)]
-pub(super) struct TestOffscreenDitherStateRestore<'a> {
-    gl: &'a glow::Context,
-    previous: bool,
-}
-
-#[cfg(test)]
-impl Drop for TestOffscreenDitherStateRestore<'_> {
-    fn drop(&mut self) {
-        unsafe {
-            if self.previous {
-                self.gl.enable(glow::DITHER);
-            } else {
-                self.gl.disable(glow::DITHER);
-            }
-        }
-    }
-}
+pub(super) type TestOffscreenDitherStateRestore<'a> = DitherStateRestore<'a>;
 
 #[cfg(test)]
 pub(super) fn establish_test_offscreen_dither_state(
     gl: &glow::Context,
 ) -> Option<TestOffscreenDitherStateRestore<'_>> {
     TEST_OFFSCREEN_DITHER_POLICY.with(|policy| {
-        policy.get().map(|enabled| {
-            let previous = unsafe { gl.is_enabled(glow::DITHER) };
-            unsafe {
-                if enabled {
-                    gl.enable(glow::DITHER);
-                } else {
-                    gl.disable(glow::DITHER);
-                }
-            }
-            TestOffscreenDitherStateRestore { gl, previous }
-        })
+        policy
+            .get()
+            .map(|enabled| set_dither_state_with_restore(gl, enabled))
     })
 }
 
@@ -293,6 +269,11 @@ pub(super) fn execute_kawase_texture_stage(
     );
     let program = renderer.runtime.effect_shaders.lookup(shader_key)?;
     let (vertex_array, _) = renderer.ensure_effect_quad()?;
+    let _canonical_dither_restore = canonical_offscreen_dither_restore(
+        renderer.gl,
+        renderer.runtime.canonical_blur_semantics_policy,
+        true,
+    );
     renderer
         .runtime
         .effect_resources
@@ -367,6 +348,22 @@ pub(super) fn execute_kawase_texture_stage(
         ) {
             renderer.gl.uniform_1_f32(Some(&location), blur_radius);
         }
+        if kind == RenderPassKind::DualKawaseUpsample
+            && shader_variant == 1
+            && let Some(location) = uniform_location(
+                &mut renderer.runtime.effect_shaders,
+                renderer.gl,
+                shader_key,
+                program,
+                "u_effect_output_size",
+            )
+        {
+            renderer.gl.uniform_2_f32(
+                Some(&location),
+                output_layout.width.max(1) as f32,
+                output_layout.height.max(1) as f32,
+            );
+        }
         renderer.gl.bind_vertex_array(Some(vertex_array));
         if let Some((damage, output_plan)) = damage {
             draw_damage_scissors(renderer.gl, damage, output_plan, framebuffer_origin, None);
@@ -409,6 +406,15 @@ pub(super) fn execute_pass(
     capture_downsample_fusion: Option<CaptureDownsampleFusion>,
     stats: &mut EffectExecutionStats,
 ) -> RendererResult<Option<ReplayCaptureExecutionDetail>> {
+    if pass.terminal_kawase.is_some()
+        && renderer.runtime.canonical_blur_semantics_policy
+            == CanonicalBlurSemanticsPolicy::Canonical
+    {
+        return Err(io::Error::other(
+            "terminal Kawase fusion is disabled by canonical blur semantics",
+        )
+        .into());
+    }
     match pass.kind {
         RenderPassKind::SceneCapture | RenderPassKind::SurfaceCapture => {
             let replay_execution = execute_capture(
@@ -597,6 +603,28 @@ pub(super) fn execute_fullscreen_stage(
     let output_texture = textures
         .get(&output)
         .ok_or_else(|| io::Error::other("effect stage output is not realized"))?;
+    let built_in_fragment = module == INTERNAL_EFFECT_SHADER_MODULE_FRAGMENT
+        && matches!(
+            stage,
+            EffectNodeKind::ColorMatrix(_) | EffectNodeKind::Tint(_) | EffectNodeKind::Noise(_)
+        )
+        && !pass
+            .fused_stages
+            .iter()
+            .any(|fused| matches!(fused, EffectNodeKind::CustomFragment(_)));
+    let contains_noise = std::iter::once(stage)
+        .chain(pass.fused_stages.iter())
+        .any(|stage| matches!(stage, EffectNodeKind::Noise(_)));
+    let fragment_variant = fragment_shader_variant(
+        renderer.runtime.canonical_blur_semantics_policy,
+        built_in_fragment,
+        contains_noise,
+    );
+    let _canonical_dither_restore = canonical_offscreen_dither_restore(
+        renderer.gl,
+        renderer.runtime.canonical_blur_semantics_policy,
+        output_plan.source != GraphTextureSource::Output,
+    );
     renderer
         .runtime
         .effect_resources
@@ -607,10 +635,33 @@ pub(super) fn execute_fullscreen_stage(
         .ok_or_else(|| io::Error::other("effect stage shader id is zero"))?;
     let shader_key = ShaderProgramKey::new(
         module,
-        0,
+        fragment_variant,
         oblivion_one::effects::EffectWorkingSpace::LinearSrgb,
     );
     let program = renderer.runtime.effect_shaders.lookup(shader_key)?;
+    if fragment_variant == 1 {
+        for name in [
+            "u_effect_target_flip_y",
+            "u_effect_output_size",
+            "u_effect_input_domain",
+            "u_effect_output_domain",
+        ] {
+            if uniform_location(
+                &mut renderer.runtime.effect_shaders,
+                renderer.gl,
+                shader_key,
+                program,
+                name,
+            )
+            .is_none()
+            {
+                return Err(io::Error::other(format!(
+                    "canonical Fragment shader is missing uniform {name}"
+                ))
+                .into());
+            }
+        }
+    }
     let (vertex_array, _) = renderer.ensure_effect_quad()?;
     let target_flip_y = effect_target_requires_logical_y_flip(false, framebuffer_origin);
     let input_flip_y = effect_input_requires_sample_y_flip(input_plan.origin);
@@ -630,6 +681,51 @@ pub(super) fn execute_fullscreen_stage(
             renderer
                 .gl
                 .uniform_1_i32(Some(&location), i32::from(target_flip_y));
+        }
+        if fragment_variant == 1 {
+            if let Some(location) = uniform_location(
+                &mut renderer.runtime.effect_shaders,
+                renderer.gl,
+                shader_key,
+                program,
+                "u_effect_output_size",
+            ) {
+                renderer.gl.uniform_2_f32(
+                    Some(&location),
+                    output_plan.width.max(1) as f32,
+                    output_plan.height.max(1) as f32,
+                );
+            }
+            if let Some(location) = uniform_location(
+                &mut renderer.runtime.effect_shaders,
+                renderer.gl,
+                shader_key,
+                program,
+                "u_effect_input_domain",
+            ) {
+                renderer.gl.uniform_4_f32(
+                    Some(&location),
+                    input_plan.domain.x as f32,
+                    input_plan.domain.y as f32,
+                    input_plan.domain.width.max(1) as f32,
+                    input_plan.domain.height.max(1) as f32,
+                );
+            }
+            if let Some(location) = uniform_location(
+                &mut renderer.runtime.effect_shaders,
+                renderer.gl,
+                shader_key,
+                program,
+                "u_effect_output_domain",
+            ) {
+                renderer.gl.uniform_4_f32(
+                    Some(&location),
+                    output_plan.domain.x as f32,
+                    output_plan.domain.y as f32,
+                    output_plan.domain.width.max(1) as f32,
+                    output_plan.domain.height.max(1) as f32,
+                );
+            }
         }
         if matches!(stage, EffectNodeKind::CustomFragment(_))
             && let Some(location) = uniform_location(
@@ -1251,6 +1347,12 @@ fn execute_fullscreen_pass_impl(
         }
     };
     let output_is_framebuffer = output_plan.source == GraphTextureSource::Output;
+    let upsample_variant = upsample_shader_variant(
+        renderer.runtime.canonical_blur_semantics_policy,
+        pass.kind == RenderPassKind::DualKawaseUpsample,
+        pass.final_kawase_upsample,
+    ) as u8;
+    let canonical_final_upsample = upsample_variant == 1;
     if blur_shader
         && {
             #[cfg(test)]
@@ -1280,10 +1382,13 @@ fn execute_fullscreen_pass_impl(
         let output_binding = textures
             .get(&output)
             .ok_or_else(|| io::Error::other("effect output texture is not allocated"))?;
-        let variant = u8::from(
-            pass.kind == RenderPassKind::DualKawaseDownsample
-                && fragment_shader == blur::DUAL_KAWASE_DOWNSAMPLE_LINEAR_SHADER,
-        );
+        let variant = match pass.kind {
+            RenderPassKind::DualKawaseDownsample => {
+                u8::from(fragment_shader == blur::DUAL_KAWASE_DOWNSAMPLE_LINEAR_SHADER)
+            }
+            RenderPassKind::DualKawaseUpsample => upsample_variant,
+            _ => 0,
+        };
         return execute_kawase_texture_stage(
             renderer,
             input_texture,
@@ -1319,6 +1424,8 @@ fn execute_fullscreen_pass_impl(
             1
         } else if capture_fusion.is_some() {
             2
+        } else if pass.kind == RenderPassKind::DualKawaseUpsample {
+            u64::from(upsample_variant)
         } else if pass.kind == RenderPassKind::NormalizeInput
             || (pass.kind == RenderPassKind::DualKawaseDownsample
                 && fragment_shader == blur::DUAL_KAWASE_DOWNSAMPLE_LINEAR_SHADER)
@@ -1440,6 +1547,11 @@ fn execute_fullscreen_pass_impl(
                 .ok_or_else(|| io::Error::other("effect output texture is not allocated"))?,
         )
     };
+    let _canonical_dither_restore = canonical_offscreen_dither_restore(
+        renderer.gl,
+        renderer.runtime.canonical_blur_semantics_policy,
+        output_texture.is_some(),
+    );
     #[cfg(test)]
     let _dither_restore =
         output_texture.and_then(|_| establish_test_offscreen_dither_state(renderer.gl));
@@ -1883,6 +1995,21 @@ fn execute_fullscreen_pass_impl(
                     output_plan.domain.height.max(1) as f32,
                 );
             }
+        }
+        if canonical_final_upsample
+            && let Some(location) = uniform_location(
+                &mut renderer.runtime.effect_shaders,
+                renderer.gl,
+                shader_key,
+                program,
+                "u_effect_output_size",
+            )
+        {
+            renderer.gl.uniform_2_f32(
+                Some(&location),
+                output_plan.width.max(1) as f32,
+                output_plan.height.max(1) as f32,
+            );
         }
         #[cfg(test)]
         if diagnostic_shader.is_some() {

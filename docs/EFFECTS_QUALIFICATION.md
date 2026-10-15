@@ -79,6 +79,27 @@ before interpreting pass or timing changes. A pass-count reduction alone is
 not a native performance result; no native-performance claim is valid without
 comparable A/B evidence.
 
+## Canonical blur semantics (Milestone C)
+
+`TYPHON_EFFECT_CANONICAL_BLUR_SEMANTICS=legacy|canonical` selects the
+coordinate and offscreen-write semantics for effect rendering. Unset and
+unknown values select `legacy`; values are trimmed and matched without regard
+to case. Unknown and non-UTF8 values warn once per process. The default remains
+`legacy`.
+
+`canonical` uses pixel-center coordinates for the final Dual Kawase upsample
+and effect-local pixel-center coordinates for built-in procedural Noise. It
+disables `GL_DITHER` only while writing offscreen effect framebuffers, then
+restores the prior state. Final-output rendering does not change the DITHER
+state. These deterministic coordinates intentionally produce small output
+differences from legacy mode.
+
+Canonical semantics currently suppress terminal Kawase fusion because that
+shader does not yet implement the canonical upsample and Noise semantics. The
+existing Full-Kawase diagnostic continues to suppress fusion as well. This
+milestone establishes deterministic semantics and correctness; it makes no
+performance claim and has no native visual or performance qualification.
+
 ## Precomputed synthesized-window blur experiment
 
 The diagnostic environment variable is

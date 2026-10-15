@@ -201,6 +201,41 @@ void main() {
 }
 "#;
 
+pub(crate) const DUAL_KAWASE_UPSAMPLE_CANONICAL_SHADER: &str = r#"#version 300 es
+precision highp float;
+uniform sampler2D u_effect_input;
+uniform vec2 u_effect_texel_size;
+uniform float u_effect_blur_radius;
+uniform vec2 u_effect_output_size;
+uniform int u_effect_input_flip_y;
+uniform highp int u_effect_target_flip_y;
+in vec2 v_uv;
+out vec4 out_color;
+
+vec2 typhon_effect_sample_uv(vec2 logical_uv) {
+    return u_effect_input_flip_y != 0
+        ? vec2(logical_uv.x, 1.0 - logical_uv.y)
+        : logical_uv;
+}
+
+void main() {
+    ivec2 storage_pixel = ivec2(floor(gl_FragCoord.xy));
+    int logical_y = u_effect_target_flip_y != 0
+        ? storage_pixel.y
+        : int(u_effect_output_size.y) - 1 - storage_pixel.y;
+    vec2 local_pixel = vec2(float(storage_pixel.x), float(logical_y));
+    vec2 local_uv = (local_pixel + vec2(0.5)) / u_effect_output_size;
+    vec2 sample_uv = typhon_effect_sample_uv(local_uv);
+    vec2 offset = u_effect_texel_size * u_effect_blur_radius;
+    vec4 result = texture(u_effect_input, sample_uv) * 0.40;
+    result += texture(u_effect_input, sample_uv + vec2(offset.x, 0.0)) * 0.15;
+    result += texture(u_effect_input, sample_uv - vec2(offset.x, 0.0)) * 0.15;
+    result += texture(u_effect_input, sample_uv + vec2(0.0, offset.y)) * 0.15;
+    result += texture(u_effect_input, sample_uv - vec2(0.0, offset.y)) * 0.15;
+    out_color = result;
+}
+"#;
+
 #[allow(dead_code)] // The graph compiler owns dimensions; this guards future lowering callers.
 pub(crate) fn scaled_blur_dimensions(
     bounds: EffectRect,

@@ -1,5 +1,6 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use super::canonical_blur_semantics::{CANONICAL_BLUR_SEMANTICS_ENV, CanonicalBlurSemanticsPolicy};
 use super::trace::EffectDebugKawaseMode;
 
 pub(crate) const TERMINAL_BLUR_FUSION_ENV: &str = "TYPHON_EFFECT_TERMINAL_BLUR_FUSION";
@@ -47,10 +48,29 @@ pub(crate) fn parse_terminal_blur_fusion_policy(
 
 pub(crate) const fn terminal_fusion_enabled(
     policy: TerminalBlurFusionPolicy,
+    canonical_semantics: CanonicalBlurSemanticsPolicy,
     kawase_debug_mode: EffectDebugKawaseMode,
 ) -> bool {
     matches!(policy, TerminalBlurFusionPolicy::On)
+        && matches!(canonical_semantics, CanonicalBlurSemanticsPolicy::Legacy)
         && !matches!(kawase_debug_mode, EffectDebugKawaseMode::Full)
+}
+
+pub(crate) fn warn_canonical_semantics_suppresses_terminal_fusion_once(
+    policy: TerminalBlurFusionPolicy,
+    canonical_semantics: CanonicalBlurSemanticsPolicy,
+) {
+    if !matches!(policy, TerminalBlurFusionPolicy::On)
+        || !matches!(canonical_semantics, CanonicalBlurSemanticsPolicy::Canonical)
+    {
+        return;
+    }
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        eprintln!(
+            "warning: {TERMINAL_BLUR_FUSION_ENV}=on is suppressed while {CANONICAL_BLUR_SEMANTICS_ENV}=canonical"
+        );
+    }
 }
 
 fn warn_unknown_policy_once() {
@@ -101,16 +121,83 @@ mod tests {
 
         assert!(terminal_fusion_enabled(
             TerminalBlurFusionPolicy::On,
+            crate::egl_renderer::effects::CanonicalBlurSemanticsPolicy::Legacy,
             EffectDebugKawaseMode::Partial,
         ));
         assert!(!terminal_fusion_enabled(
             TerminalBlurFusionPolicy::On,
+            crate::egl_renderer::effects::CanonicalBlurSemanticsPolicy::Legacy,
             EffectDebugKawaseMode::Full,
         ));
         assert!(!terminal_fusion_enabled(
             TerminalBlurFusionPolicy::Off,
+            crate::egl_renderer::effects::CanonicalBlurSemanticsPolicy::Legacy,
             EffectDebugKawaseMode::Partial,
         ));
+    }
+
+    #[test]
+    fn effective_fusion_is_off_for_every_canonical_semantics_combination() {
+        use crate::egl_renderer::effects::CanonicalBlurSemanticsPolicy as Canonical;
+        use crate::egl_renderer::effects::EffectDebugKawaseMode as Debug;
+
+        let cases = [
+            (
+                TerminalBlurFusionPolicy::Off,
+                Canonical::Legacy,
+                Debug::Partial,
+                false,
+            ),
+            (
+                TerminalBlurFusionPolicy::Off,
+                Canonical::Legacy,
+                Debug::Full,
+                false,
+            ),
+            (
+                TerminalBlurFusionPolicy::Off,
+                Canonical::Canonical,
+                Debug::Partial,
+                false,
+            ),
+            (
+                TerminalBlurFusionPolicy::Off,
+                Canonical::Canonical,
+                Debug::Full,
+                false,
+            ),
+            (
+                TerminalBlurFusionPolicy::On,
+                Canonical::Legacy,
+                Debug::Partial,
+                true,
+            ),
+            (
+                TerminalBlurFusionPolicy::On,
+                Canonical::Legacy,
+                Debug::Full,
+                false,
+            ),
+            (
+                TerminalBlurFusionPolicy::On,
+                Canonical::Canonical,
+                Debug::Partial,
+                false,
+            ),
+            (
+                TerminalBlurFusionPolicy::On,
+                Canonical::Canonical,
+                Debug::Full,
+                false,
+            ),
+        ];
+        for (fusion, canonical, debug, expected) in cases {
+            assert_eq!(
+                terminal_fusion_enabled(fusion, canonical, debug),
+                expected,
+                "fusion={fusion:?} canonical={canonical:?} debug={debug:?}"
+            );
+        }
     }
 
     #[test]

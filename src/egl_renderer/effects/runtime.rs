@@ -4,10 +4,13 @@ use glow::HasContext;
 
 use super::super::program::create_capture_copy_program;
 use super::super::*;
+use super::canonical_blur_semantics::CanonicalBlurSemanticsPolicy;
 use super::gpu_timing::EffectGpuProfiler;
 use super::precomputed_window_blur::PrecomputedWindowBlurPolicy;
 use super::resources::EffectResourceBudgetConfig;
-use super::terminal_blur_fusion::TerminalBlurFusionPolicy;
+use super::terminal_blur_fusion::{
+    TerminalBlurFusionPolicy, warn_canonical_semantics_suppresses_terminal_fusion_once,
+};
 use super::{
     ShaderProgramCache, builtin_shader_program_count, shader_cache_capacity_for_custom_shaders,
 };
@@ -29,6 +32,7 @@ pub(in crate::egl_renderer) struct EffectRuntime {
     pub(in crate::egl_renderer) effect_gpu_profiler: EffectGpuProfiler,
     pub(in crate::egl_renderer) precomputed_window_blur_policy: PrecomputedWindowBlurPolicy,
     pub(in crate::egl_renderer) terminal_blur_fusion_policy: TerminalBlurFusionPolicy,
+    pub(in crate::egl_renderer) canonical_blur_semantics_policy: CanonicalBlurSemanticsPolicy,
     effect_clock_start: Instant,
     pub(in crate::egl_renderer) effect_time_seconds: f32,
     pub(in crate::egl_renderer) effect_delta_seconds: f32,
@@ -121,6 +125,13 @@ impl EffectRuntime {
         });
         let effect_resources =
             EffectGlResourceCache::with_budget_config(EffectResourceBudgetConfig::from_env())?;
+        let precomputed_window_blur_policy = PrecomputedWindowBlurPolicy::from_environment();
+        let terminal_blur_fusion_policy = TerminalBlurFusionPolicy::from_environment();
+        let canonical_blur_semantics_policy = CanonicalBlurSemanticsPolicy::from_environment();
+        warn_canonical_semantics_suppresses_terminal_fusion_once(
+            terminal_blur_fusion_policy,
+            canonical_blur_semantics_policy,
+        );
 
         Ok(Self {
             capture_program: programs.capture,
@@ -135,8 +146,9 @@ impl EffectRuntime {
             effect_quad: None,
             effect_trace: EffectExecutionTrace::new(None, None, None, None),
             effect_gpu_profiler,
-            precomputed_window_blur_policy: PrecomputedWindowBlurPolicy::from_environment(),
-            terminal_blur_fusion_policy: TerminalBlurFusionPolicy::from_environment(),
+            precomputed_window_blur_policy,
+            terminal_blur_fusion_policy,
+            canonical_blur_semantics_policy,
             effect_clock_start: Instant::now(),
             effect_time_seconds: 0.0,
             effect_delta_seconds: 0.0,

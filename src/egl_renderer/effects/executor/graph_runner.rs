@@ -4,6 +4,7 @@ use super::*;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TerminalBoundaryReplay {
     Legacy,
+    ProductionCanonicalStaged,
     CanonicalLegacyUp2,
     CanonicalStaged,
     FuseUp2AndFragment,
@@ -399,6 +400,7 @@ pub(super) fn execute_graph_passes_inner(
             terminal_replay.as_ref().map(|replay| replay.mode),
             Some(
                 TerminalBoundaryReplay::FuseUp2AndFragment
+                    | TerminalBoundaryReplay::ProductionCanonicalStaged
                     | TerminalBoundaryReplay::CanonicalLegacyUp2
                     | TerminalBoundaryReplay::CanonicalStaged
                     | TerminalBoundaryReplay::FuseFragmentAndComposite

@@ -268,6 +268,7 @@ pub(in crate::egl_renderer::tests) fn translated_capture_test_graph() -> (
     let pass = CompiledRenderPass {
         id: pass_id,
         kind: RenderPassKind::SceneCapture,
+        final_kawase_upsample: false,
         inputs: Vec::new(),
         output: Some(texture_id),
         damage: EffectRegion::empty(),

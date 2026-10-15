@@ -1546,6 +1546,7 @@ mod tests {
         let pass = CompiledRenderPass {
             id: oblivion_one::effects::GraphPassId::new(9).unwrap(),
             kind: RenderPassKind::Composite,
+            final_kawase_upsample: false,
             inputs: Vec::new(),
             output: None,
             damage: EffectRegion::empty(),
@@ -1588,6 +1589,7 @@ mod tests {
         let pass = CompiledRenderPass {
             id: oblivion_one::effects::GraphPassId::new(10).unwrap(),
             kind: RenderPassKind::DualKawaseDownsample,
+            final_kawase_upsample: false,
             inputs: Vec::new(),
             output: None,
             damage: EffectRegion::empty(),
@@ -1630,6 +1632,7 @@ mod tests {
         let pass = CompiledRenderPass {
             id: oblivion_one::effects::GraphPassId::new(11).unwrap(),
             kind: RenderPassKind::SceneCapture,
+            final_kawase_upsample: false,
             inputs: Vec::new(),
             output: Some(GraphTextureId::new(12).unwrap()),
             damage: EffectRegion::empty(),
@@ -1690,6 +1693,7 @@ mod tests {
         let pass = CompiledRenderPass {
             id: oblivion_one::effects::GraphPassId::new(13).unwrap(),
             kind: RenderPassKind::SceneCapture,
+            final_kawase_upsample: false,
             inputs: Vec::new(),
             output: None,
             damage: EffectRegion::empty(),

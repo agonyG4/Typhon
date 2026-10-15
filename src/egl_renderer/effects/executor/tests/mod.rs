@@ -30,6 +30,7 @@ fn test_pass(
     CompiledRenderPass {
         id: GraphPassId::new(id).unwrap(),
         kind,
+        final_kawase_upsample: false,
         inputs,
         output: Some(output),
         damage: EffectRegion::empty(),

@@ -443,6 +443,7 @@ impl FramePipeline<'_> {
             let debug_config = *super::super::effects::effect_debug_config();
             let terminal_kawase_fusion = super::super::effects::terminal_fusion_enabled(
                 self.effects.terminal_blur_fusion_policy,
+                self.effects.canonical_blur_semantics_policy,
                 debug_config.kawase_mode(),
             );
             match compile_frame_execution_variants_with_options(

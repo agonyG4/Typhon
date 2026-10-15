@@ -290,8 +290,17 @@ pub(crate) fn execute_precomputed_backdrop_build(
             let span = timing_scope.and_then(|scope| {
                 renderer.begin_precomputed_build_stage(scope, stage_index, kind, work, None)
             });
-            let shader_variant =
-                u8::from(kind == RenderPassKind::DualKawaseDownsample && input_is_linear);
+            let final_kawase_upsample =
+                kind == RenderPassKind::DualKawaseUpsample && stage_index + 1 == build.stages.len();
+            let shader_variant = if kind == RenderPassKind::DualKawaseDownsample {
+                u8::from(input_is_linear)
+            } else {
+                super::super::upsample_shader_variant(
+                    renderer.runtime.canonical_blur_semantics_policy,
+                    true,
+                    final_kawase_upsample,
+                ) as u8
+            };
             let targets = EffectExecutionTargets::ordinary(EffectFramebufferTarget::new(
                 renderer.scene.active_output_framebuffer,
             ));
