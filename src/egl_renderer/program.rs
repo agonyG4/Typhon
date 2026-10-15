@@ -30,6 +30,10 @@ pub(super) fn create_program_from_sources(
     let vertex_shader = compile_shader(gl, glow::VERTEX_SHADER, vertex_source)?;
     let fragment_shader = compile_shader(gl, glow::FRAGMENT_SHADER, fragment_source)?;
     let program = unsafe { gl.create_program().map_err(io::Error::other)? };
+    crate::gpu_residency::record_gpu_resource_allocation(
+        crate::gpu_residency::GpuResourceClass::ShaderProgram,
+        None,
+    );
     unsafe {
         gl.attach_shader(program, vertex_shader);
         gl.attach_shader(program, fragment_shader);
@@ -38,9 +42,21 @@ pub(super) fn create_program_from_sources(
         gl.detach_shader(program, fragment_shader);
         gl.delete_shader(vertex_shader);
         gl.delete_shader(fragment_shader);
+        crate::gpu_residency::record_gpu_resource_retirement(
+            crate::gpu_residency::GpuResourceClass::ShaderObject,
+            None,
+        );
+        crate::gpu_residency::record_gpu_resource_retirement(
+            crate::gpu_residency::GpuResourceClass::ShaderObject,
+            None,
+        );
         if !gl.get_program_link_status(program) {
             let log = gl.get_program_info_log(program);
             gl.delete_program(program);
+            crate::gpu_residency::record_gpu_resource_retirement(
+                crate::gpu_residency::GpuResourceClass::ShaderProgram,
+                None,
+            );
             return Err(io::Error::other(format!("EGL/GLES shader link failed: {log}")).into());
         }
     }
@@ -53,12 +69,20 @@ fn compile_shader(
     source: &str,
 ) -> RendererResult<<glow::Context as HasContext>::Shader> {
     let shader = unsafe { gl.create_shader(shader_type).map_err(io::Error::other)? };
+    crate::gpu_residency::record_gpu_resource_allocation(
+        crate::gpu_residency::GpuResourceClass::ShaderObject,
+        None,
+    );
     unsafe {
         gl.shader_source(shader, source);
         gl.compile_shader(shader);
         if !gl.get_shader_compile_status(shader) {
             let log = gl.get_shader_info_log(shader);
             gl.delete_shader(shader);
+            crate::gpu_residency::record_gpu_resource_retirement(
+                crate::gpu_residency::GpuResourceClass::ShaderObject,
+                None,
+            );
             return Err(io::Error::other(format!("EGL/GLES shader compile failed: {log}")).into());
         }
     }

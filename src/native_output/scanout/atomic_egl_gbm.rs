@@ -450,6 +450,10 @@ fn create_physical_output_pool(
             )?;
             let descriptor = explicit_framebuffer_descriptor(&bo)?;
             let framebuffer = add_explicit_framebuffer(drm, &descriptor)?;
+            crate::gpu_residency::record_gpu_resource_allocation(
+                crate::gpu_residency::GpuResourceClass::DrmFramebuffer,
+                None,
+            );
             framebuffer_created = Some(framebuffer);
             let id = OutputSlotId::new(u8::try_from(raw_id).unwrap()).unwrap();
             let physical = AtomicOutputSlotBacking::new(id, pool_generation, bo, framebuffer);
@@ -460,7 +464,7 @@ fn create_physical_output_pool(
             Ok(physical) => physical_slots.push(physical),
             Err(error) => {
                 if let Some(framebuffer) = framebuffer_created {
-                    let _ = drm_ffi::mode::rm_fb(drm, framebuffer.get());
+                    super::output_slot::remove_explicit_framebuffer(drm, framebuffer);
                 }
                 AtomicPhysicalOutputPool::remove_framebuffers(&physical_slots, drm);
                 drop(physical_slots);

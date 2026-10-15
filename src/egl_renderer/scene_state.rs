@@ -788,5 +788,26 @@ impl SceneRenderState {
             gl.delete_vertex_array(self.overlay_vertex_array);
             gl.delete_program(self.program);
         }
+        for capacity in [
+            self.scene_vertex_buffer_capacity,
+            self.overlay_vertex_buffer_capacity,
+        ] {
+            crate::gpu_residency::record_gpu_resource_retirement(
+                crate::gpu_residency::GpuResourceClass::UploadBufferBacking,
+                Some(capacity as u64),
+            );
+            crate::gpu_residency::record_gpu_resource_retirement(
+                crate::gpu_residency::GpuResourceClass::GlBufferObject,
+                None,
+            );
+            crate::gpu_residency::record_gpu_resource_retirement(
+                crate::gpu_residency::GpuResourceClass::VertexArrayObject,
+                None,
+            );
+        }
+        crate::gpu_residency::record_gpu_resource_retirement(
+            crate::gpu_residency::GpuResourceClass::ShaderProgram,
+            None,
+        );
     }
 }

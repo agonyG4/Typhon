@@ -102,6 +102,10 @@ impl NativeGbmScanout {
             let bo = device.create_buffer_object(width, height, gbm::Format::Xrgb8888, usage)?;
             let fb_id = add_gbm_framebuffer(kms.as_fd(), &bo)?;
             let pitch = bo.stride();
+            crate::gpu_residency::record_gpu_resource_allocation(
+                crate::gpu_residency::GpuResourceClass::OutputBacking,
+                Some(u64::from(pitch).saturating_mul(u64::from(height))),
+            );
             buffers.push(NativeGbmScanoutBuffer { bo, fb_id, pitch });
         }
         println!(
@@ -522,12 +526,19 @@ pub(crate) fn next_free_scanout_index(
 
 impl Drop for NativeGbmScanout {
     fn drop(&mut self) {
-        if !self.drm_cleanup_armed {
-            return;
-        }
         let fd = unsafe { BorrowedFd::borrow_raw(self.fd) };
         for buffer in &self.buffers {
-            let _ = drm_ffi::mode::rm_fb(fd, buffer.fb_id);
+            if self.drm_cleanup_armed {
+                let _ = drm_ffi::mode::rm_fb(fd, buffer.fb_id);
+            }
+            crate::gpu_residency::record_gpu_resource_retirement(
+                crate::gpu_residency::GpuResourceClass::DrmFramebuffer,
+                None,
+            );
+            crate::gpu_residency::record_gpu_resource_retirement(
+                crate::gpu_residency::GpuResourceClass::OutputBacking,
+                Some(u64::from(buffer.pitch).saturating_mul(u64::from(self.height))),
+            );
         }
     }
 }
@@ -588,7 +599,7 @@ pub(crate) fn add_gbm_framebuffer(
     bo: &gbm::BufferObject<()>,
 ) -> io::Result<u32> {
     let metadata = NativeGbmFramebufferMetadata::from_bo(bo);
-    drm_ffi::mode::add_fb2(
+    let framebuffer = drm_ffi::mode::add_fb2(
         fd,
         metadata.width,
         metadata.height,
@@ -598,8 +609,12 @@ pub(crate) fn add_gbm_framebuffer(
         &metadata.offsets,
         &metadata.modifiers,
         metadata.flags,
-    )
-    .map(|framebuffer| framebuffer.fb_id)
+    )?;
+    crate::gpu_residency::record_gpu_resource_allocation(
+        crate::gpu_residency::GpuResourceClass::DrmFramebuffer,
+        None,
+    );
+    Ok(framebuffer.fb_id)
 }
 
 pub(crate) fn set_fd_nonblocking(fd: RawFd) -> io::Result<()> {

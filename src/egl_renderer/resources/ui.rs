@@ -70,7 +70,12 @@ impl UiResourceStore {
             return Ok(());
         }
 
-        let mut resource = create_uploaded_resource(gl, width, height)?;
+        let mut resource = create_uploaded_resource(
+            gl,
+            width,
+            height,
+            crate::gpu_residency::GpuResourceClass::CursorBacking,
+        )?;
         write_argb_pixels_to_resource(
             gl,
             &resource,
@@ -97,7 +102,12 @@ impl UiResourceStore {
                 continue;
             }
 
-            let mut resource = create_uploaded_resource(gl, 1, 1)?;
+            let mut resource = create_uploaded_resource(
+                gl,
+                1,
+                1,
+                crate::gpu_residency::GpuResourceClass::UiTextureBacking,
+            )?;
             write_argb_pixels_to_resource(
                 gl,
                 &resource,
@@ -149,7 +159,12 @@ impl UiResourceStore {
             }
             let mut resource = match key {
                 DecorationResourceKey::Solid(color) => {
-                    let resource = create_uploaded_resource(gl, 1, 1)?;
+                    let resource = create_uploaded_resource(
+                        gl,
+                        1,
+                        1,
+                        crate::gpu_residency::GpuResourceClass::UiTextureBacking,
+                    )?;
                     write_argb_pixels_to_resource(
                         gl,
                         &resource,
@@ -163,7 +178,12 @@ impl UiResourceStore {
                     let asset = required_assets
                         .get(&asset_id)
                         .expect("required decoration asset was collected");
-                    let resource = create_uploaded_resource(gl, asset.width(), asset.height())?;
+                    let resource = create_uploaded_resource(
+                        gl,
+                        asset.width(),
+                        asset.height(),
+                        crate::gpu_residency::GpuResourceClass::UiTextureBacking,
+                    )?;
                     write_rgba_bytes_to_resource(
                         gl,
                         &resource,
@@ -295,5 +315,6 @@ fn test_image_resource(texture: glow::Texture) -> EglImageResource {
         size: (1, 1),
         generation: 1,
         egl_image: None,
+        telemetry: super::image::EglImageResourceTelemetry::Untracked,
     }
 }

@@ -273,13 +273,44 @@ pub(crate) struct CreatedGlesContext {
     pub(crate) priority: EglContextPriorityReport,
 }
 
+pub(crate) fn destroy_gles_context(
+    egl: &EglInstance,
+    display: egl::Display,
+    context: egl::Context,
+) -> Result<(), egl::Error> {
+    let result = egl.destroy_context(display, context);
+    if result.is_ok() {
+        crate::gpu_residency::record_gpu_resource_retirement(
+            crate::gpu_residency::GpuResourceClass::EglContext,
+            None,
+        );
+    }
+    result
+}
+
+pub(crate) fn destroy_gles_surface(
+    egl: &EglInstance,
+    display: egl::Display,
+    surface: egl::Surface,
+) -> Result<(), egl::Error> {
+    let result = egl.destroy_surface(display, surface);
+    if result.is_ok() {
+        crate::gpu_residency::record_gpu_resource_retirement(
+            crate::gpu_residency::GpuResourceClass::EglSurface,
+            None,
+        );
+    }
+    result
+}
+
 #[allow(dead_code)] // Retained for the default-priority GLES test contexts.
 pub(crate) fn create_gles_context(
     egl: &EglInstance,
     display: egl::Display,
     config: egl::Config,
 ) -> RendererResult<egl::Context> {
-    egl.create_context(display, config, None, gles_context_attributes())
+    egl
+        .create_context(display, config, None, gles_context_attributes())
         .map_err(|error| io::Error::other(format_gles3_context_error(&error)).into())
 }
 
@@ -316,6 +347,11 @@ pub(crate) fn create_compositor_gles_context(
             },
         )
     };
+
+    crate::gpu_residency::record_gpu_resource_allocation(
+        crate::gpu_residency::GpuResourceClass::EglContext,
+        None,
+    );
 
     Ok(CreatedGlesContext {
         context,

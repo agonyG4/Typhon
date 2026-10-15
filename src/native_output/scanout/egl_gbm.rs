@@ -333,6 +333,10 @@ impl NativeGbmFramebufferCache {
     pub(crate) fn clear(&mut self, fd: BorrowedFd<'_>) {
         for (_, fb_id) in self.entries.drain() {
             let _ = drm_ffi::mode::rm_fb(fd, fb_id);
+            crate::gpu_residency::record_gpu_resource_retirement(
+                crate::gpu_residency::GpuResourceClass::DrmFramebuffer,
+                None,
+            );
         }
     }
 }
@@ -492,19 +496,23 @@ impl NativeEglGbmScanout {
         } {
             Ok(surface) => surface,
             Err(error) => {
-                let _ = egl.destroy_context(egl_display, egl_context);
+                let _ = crate::egl_renderer::destroy_gles_context(&egl, egl_display, egl_context);
                 let _ = egl.terminate(egl_display);
                 return Err(native_egl_io_error(error));
             }
         };
+        crate::gpu_residency::record_gpu_resource_allocation(
+            crate::gpu_residency::GpuResourceClass::EglSurface,
+            None,
+        );
         if let Err(error) = egl.make_current(
             egl_display,
             Some(egl_surface),
             Some(egl_surface),
             Some(egl_context),
         ) {
-            let _ = egl.destroy_surface(egl_display, egl_surface);
-            let _ = egl.destroy_context(egl_display, egl_context);
+            let _ = crate::egl_renderer::destroy_gles_surface(&egl, egl_display, egl_surface);
+            let _ = crate::egl_renderer::destroy_gles_context(&egl, egl_display, egl_context);
             let _ = egl.terminate(egl_display);
             return Err(native_egl_io_error(error));
         }
@@ -537,8 +545,8 @@ impl NativeEglGbmScanout {
             Ok(scene) => scene,
             Err(error) => {
                 let _ = egl.make_current(egl_display, None, None, None);
-                let _ = egl.destroy_surface(egl_display, egl_surface);
-                let _ = egl.destroy_context(egl_display, egl_context);
+                let _ = crate::egl_renderer::destroy_gles_surface(&egl, egl_display, egl_surface);
+                let _ = crate::egl_renderer::destroy_gles_context(&egl, egl_display, egl_context);
                 let _ = egl.terminate(egl_display);
                 return Err(native_egl_io_error(error));
             }
@@ -1045,14 +1053,27 @@ impl Drop for NativeEglGbmScanout {
         self.scene.finish_render_work();
         self.scene.destroy(&self.egl, self.egl_display);
         let _ = self.egl.make_current(self.egl_display, None, None, None);
-        let _ = self.egl.destroy_surface(self.egl_display, self.egl_surface);
-        let _ = self.egl.destroy_context(self.egl_display, self.egl_context);
+        let _ = crate::egl_renderer::destroy_gles_surface(
+            &self.egl,
+            self.egl_display,
+            self.egl_surface,
+        );
+        let _ = crate::egl_renderer::destroy_gles_context(
+            &self.egl,
+            self.egl_display,
+            self.egl_context,
+        );
         let _ = self.egl.terminate(self.egl_display);
         if self.drm_cleanup_armed {
             let fd = unsafe { BorrowedFd::borrow_raw(self.fd) };
             self.framebuffer_cache.clear(fd);
         } else {
-            self.framebuffer_cache.entries.clear();
+            for _ in self.framebuffer_cache.entries.drain() {
+                crate::gpu_residency::record_gpu_resource_retirement(
+                    crate::gpu_residency::GpuResourceClass::DrmFramebuffer,
+                    None,
+                );
+            }
         }
     }
 }

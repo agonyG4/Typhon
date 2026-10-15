@@ -2111,6 +2111,12 @@ fn delete_query_pairs(gl: &glow::Context, queries: &mut Vec<QueryPair>) {
             gl.delete_query(pair.start);
             gl.delete_query(pair.end);
         }
+        for _ in 0..2 {
+            crate::gpu_residency::record_gpu_resource_retirement(
+                crate::gpu_residency::GpuResourceClass::QueryObject,
+                None,
+            );
+        }
     }
 }
 
@@ -2124,14 +2130,26 @@ fn create_query_pairs(gl: &glow::Context) -> Result<Vec<QueryPair>, ()> {
                 return Err(());
             }
         };
+        crate::gpu_residency::record_gpu_resource_allocation(
+            crate::gpu_residency::GpuResourceClass::QueryObject,
+            None,
+        );
         let end = match unsafe { gl.create_query() } {
             Ok(end) => end,
             Err(_) => {
                 unsafe { gl.delete_query(start) };
+                crate::gpu_residency::record_gpu_resource_retirement(
+                    crate::gpu_residency::GpuResourceClass::QueryObject,
+                    None,
+                );
                 delete_query_pairs(gl, &mut queries);
                 return Err(());
             }
         };
+        crate::gpu_residency::record_gpu_resource_allocation(
+            crate::gpu_residency::GpuResourceClass::QueryObject,
+            None,
+        );
         queries.push(QueryPair { start, end });
     }
     Ok(queries)

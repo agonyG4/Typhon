@@ -5,7 +5,13 @@
 
 use serde::{Deserialize, Serialize};
 
+mod resource_telemetry;
 mod scratch_telemetry;
+pub use resource_telemetry::{
+    GPU_RESOURCE_CLASS_COUNT, GpuResourceByteSemantics, GpuResourceClass, GpuResourceClassSnapshot,
+    GpuResourceTelemetrySnapshot, gpu_resource_telemetry_snapshot, record_gpu_resource_allocation,
+    record_gpu_resource_resize, record_gpu_resource_retirement,
+};
 pub use scratch_telemetry::{
     AtomicEffectScratchResidencySnapshot, EffectScratchResidencyLiveSnapshot,
     ScratchResidencyTelemetry,
@@ -362,6 +368,8 @@ impl Default for GpuResidencyRendererSummary {
 pub struct GpuResidencySnapshot {
     pub byte_semantics: String,
     pub domains: [GpuResidencyDomainSnapshot; RESOURCE_DOMAIN_COUNT],
+    #[serde(default)]
+    pub resource_telemetry: GpuResourceTelemetrySnapshot,
     pub compositor_owned_estimated_bytes: u64,
     pub externally_backed_imported_logical_bytes: u64,
     pub unique_observed_dmabuf_bytes: u64,
@@ -388,6 +396,7 @@ impl Default for GpuResidencySnapshot {
                 "estimated compositor bytes and logical imported bytes; not VRAM",
             ),
             domains: [GpuResidencyDomainSnapshot::default(); RESOURCE_DOMAIN_COUNT],
+            resource_telemetry: GpuResourceTelemetrySnapshot::default(),
             compositor_owned_estimated_bytes: 0,
             externally_backed_imported_logical_bytes: 0,
             unique_observed_dmabuf_bytes: 0,
@@ -537,6 +546,60 @@ impl GpuResidencySnapshot {
                 self.unaccounted_domain_count = self.unaccounted_domain_count.saturating_add(1);
             }
         }
+
+        let mut resource_telemetry = gpu_resource_telemetry_snapshot();
+        for row in self.domains {
+            let class = match row.domain {
+                ResourceDomain::OutputScanout => Some(GpuResourceClass::OutputBacking),
+                ResourceDomain::EffectsScratch
+                | ResourceDomain::EffectsCheckpoint
+                | ResourceDomain::LifecycleRetainedVisual
+                | ResourceDomain::Capture => None,
+                ResourceDomain::ClientImport => {
+                    Some(GpuResourceClass::RendererDmabufExternalBacking)
+                }
+                ResourceDomain::CursorDecoration => Some(GpuResourceClass::CursorBacking),
+                ResourceDomain::OtherUnknown => Some(GpuResourceClass::OtherUnknown),
+            };
+            let Some(class) = class else {
+                continue;
+            };
+            if row.coverage == ResourceCoverage::Uninstrumented && row.resource_count == 0 {
+                continue;
+            }
+            let known_live_bytes = match row.ownership {
+                ResourceOwnership::CompositorOwned => row.compositor_owned_estimated_bytes,
+                ResourceOwnership::ClientImportedExternallyBacked => row.external_mapping_bytes,
+                ResourceOwnership::DriverOrContextUnknown => row.unknown_bytes,
+            };
+            let live_count = match row.ownership {
+                ResourceOwnership::ClientImportedExternallyBacked => row.external_mapping_count,
+                _ => row.resource_count,
+            };
+            resource_telemetry.observe_owner_domain(
+                class,
+                live_count,
+                known_live_bytes,
+                row.coverage,
+            );
+        }
+        for class in [
+            GpuResourceClass::ShmUploadTextureBacking,
+            GpuResourceClass::UiTextureBacking,
+            GpuResourceClass::CursorBacking,
+            GpuResourceClass::CaptureBacking,
+            GpuResourceClass::UploadBufferBacking,
+            GpuResourceClass::FallbackScanoutBacking,
+        ] {
+            let class_snapshot = resource_telemetry.class(class);
+            self.resource_count = self
+                .resource_count
+                .saturating_add(class_snapshot.live_count);
+            self.compositor_owned_estimated_bytes = self
+                .compositor_owned_estimated_bytes
+                .saturating_add(class_snapshot.known_live_bytes);
+        }
+        self.resource_telemetry = resource_telemetry;
     }
 }
 

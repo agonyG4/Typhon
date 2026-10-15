@@ -54,8 +54,9 @@ pub(crate) use effects::replay_capture_region_layout;
 pub(crate) use egl_support::{
     CreatedGlesContext, EglContextPriorityPolicy, EglSwapBuffersWithDamage,
     choose_native_egl_config, choose_surfaceless_egl_config, create_compositor_gles_context,
-    detect_partial_repaint_capabilities, egl_swap_buffers_with_damage,
-    load_egl_image_target_texture_2d, load_swap_buffers_with_damage, native_visual_label,
+    destroy_gles_context, destroy_gles_surface, detect_partial_repaint_capabilities,
+    egl_swap_buffers_with_damage, load_egl_image_target_texture_2d, load_swap_buffers_with_damage,
+    native_visual_label,
 };
 #[cfg(test)]
 pub(in crate::egl_renderer) use egl_support::{
@@ -346,6 +347,20 @@ impl GlesSceneRenderer {
             MIN_VERTEX_BUFFER_BYTES,
         );
         let effect_runtime = EffectRuntime::new(&gl, egl, effect_programs)?;
+        for _ in 0..4 {
+            crate::gpu_residency::record_gpu_resource_allocation(
+                crate::gpu_residency::GpuResourceClass::VertexArrayObject,
+                None,
+            );
+            crate::gpu_residency::record_gpu_resource_allocation(
+                crate::gpu_residency::GpuResourceClass::GlBufferObject,
+                None,
+            );
+            crate::gpu_residency::record_gpu_resource_allocation(
+                crate::gpu_residency::GpuResourceClass::UploadBufferBacking,
+                Some(MIN_VERTEX_BUFFER_BYTES as u64),
+            );
+        }
         let presentation_opacity_location =
             unsafe { gl.get_uniform_location(program, "u_opacity") };
         Ok(Self {
@@ -668,13 +683,28 @@ impl GlesSceneRenderer {
 
         let result = (|| {
             let texture = unsafe { self.gl.create_texture().map_err(io::Error::other)? };
+            crate::gpu_residency::record_gpu_resource_allocation(
+                crate::gpu_residency::GpuResourceClass::GlTextureObject,
+                None,
+            );
             let framebuffer = match unsafe { self.gl.create_framebuffer() } {
                 Ok(framebuffer) => framebuffer,
                 Err(error) => {
                     unsafe { self.gl.delete_texture(texture) };
+                    crate::gpu_residency::record_gpu_resource_retirement(
+                        crate::gpu_residency::GpuResourceClass::GlTextureObject,
+                        None,
+                    );
                     return Err(io::Error::other(error).into());
                 }
             };
+            crate::gpu_residency::record_gpu_resource_allocation(
+                crate::gpu_residency::GpuResourceClass::FramebufferObject,
+                None,
+            );
+            let backing_bytes = u64::from(dimensions.width)
+                .saturating_mul(u64::from(dimensions.height))
+                .saturating_mul(4);
             let setup_result = (|| {
                 unsafe {
                     self.gl.bind_texture(glow::TEXTURE_2D, Some(texture));
@@ -708,6 +738,10 @@ impl GlesSceneRenderer {
                         glow::RGBA,
                         glow::UNSIGNED_BYTE,
                         glow::PixelUnpackData::Slice(None),
+                    );
+                    crate::gpu_residency::record_gpu_resource_allocation(
+                        crate::gpu_residency::GpuResourceClass::CaptureBacking,
+                        Some(backing_bytes),
                     );
                     self.gl
                         .bind_framebuffer(glow::FRAMEBUFFER, Some(framebuffer));
@@ -797,6 +831,18 @@ impl GlesSceneRenderer {
                 self.gl.delete_framebuffer(framebuffer);
                 self.gl.delete_texture(texture);
             }
+            crate::gpu_residency::record_gpu_resource_retirement(
+                crate::gpu_residency::GpuResourceClass::FramebufferObject,
+                None,
+            );
+            crate::gpu_residency::record_gpu_resource_retirement(
+                crate::gpu_residency::GpuResourceClass::GlTextureObject,
+                None,
+            );
+            crate::gpu_residency::record_gpu_resource_retirement(
+                crate::gpu_residency::GpuResourceClass::CaptureBacking,
+                Some(backing_bytes),
+            );
             draw_result
         })();
 
@@ -949,6 +995,7 @@ impl GlesSceneRenderer {
 
     #[cfg(test)]
     #[cfg(test)]
+    #[allow(dead_code, reason = "Reserved for diagnostic tests")]
     fn draw_command_batch_with_visibility(
         &mut self,
         scene: bool,

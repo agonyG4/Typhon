@@ -50,10 +50,14 @@ impl AtomicCursorBuffer {
                 return Err(error);
             }
         };
+        crate::gpu_residency::record_gpu_resource_allocation(
+            crate::gpu_residency::GpuResourceClass::DrmFramebuffer,
+            None,
+        );
         let map = match drm_ffi::mode::dumbbuffer::map(file.as_fd(), dumb.handle, 0, 0) {
             Ok(map) => map,
             Err(error) => {
-                let _ = drm_ffi::mode::rm_fb(file.as_fd(), framebuffer.get());
+                super::super::scanout::remove_explicit_framebuffer(file.as_fd(), framebuffer);
                 let _ = drm_ffi::mode::dumbbuffer::destroy(file.as_fd(), dumb.handle);
                 return Err(error);
             }
@@ -61,7 +65,7 @@ impl AtomicCursorBuffer {
         let size = match usize::try_from(dumb.size) {
             Ok(size) => size,
             Err(_) => {
-                let _ = drm_ffi::mode::rm_fb(file.as_fd(), framebuffer.get());
+                super::super::scanout::remove_explicit_framebuffer(file.as_fd(), framebuffer);
                 let _ = drm_ffi::mode::dumbbuffer::destroy(file.as_fd(), dumb.handle);
                 return Err(io::Error::other("Atomic cursor dumb buffer size overflow"));
             }
@@ -78,10 +82,14 @@ impl AtomicCursorBuffer {
         };
         if mapping == libc::MAP_FAILED {
             let error = io::Error::last_os_error();
-            let _ = drm_ffi::mode::rm_fb(file.as_fd(), framebuffer.get());
+            super::super::scanout::remove_explicit_framebuffer(file.as_fd(), framebuffer);
             let _ = drm_ffi::mode::dumbbuffer::destroy(file.as_fd(), dumb.handle);
             return Err(error);
         }
+        crate::gpu_residency::record_gpu_resource_allocation(
+            crate::gpu_residency::GpuResourceClass::CursorBacking,
+            Some(dumb.size),
+        );
         Ok(Self {
             fd: file.as_raw_fd(),
             handle: dumb.handle,
@@ -148,13 +156,17 @@ impl Drop for AtomicCursorBuffer {
     fn drop(&mut self) {
         if self.drm_cleanup_armed {
             let fd = unsafe { BorrowedFd::borrow_raw(self.fd) };
-            let _ = drm_ffi::mode::rm_fb(fd, self.framebuffer.get());
+            super::super::scanout::remove_explicit_framebuffer(fd, self.framebuffer);
         }
         let _ = unsafe { libc::munmap(self.mapping, self.size) };
         if self.drm_cleanup_armed {
             let fd = unsafe { BorrowedFd::borrow_raw(self.fd) };
             let _ = drm_ffi::mode::dumbbuffer::destroy(fd, self.handle);
         }
+        crate::gpu_residency::record_gpu_resource_retirement(
+            crate::gpu_residency::GpuResourceClass::CursorBacking,
+            Some(self.size as u64),
+        );
     }
 }
 

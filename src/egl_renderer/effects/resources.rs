@@ -647,6 +647,7 @@ pub(crate) struct EffectGlResourceCache {
     pool: EffectResourcePool,
     checkpoint_cache_budget_bytes: u64,
     gl_textures: HashMap<u64, glow::Texture>,
+    gl_texture_bytes: HashMap<u64, u64>,
     scratch_fbo: Option<glow::Framebuffer>,
     lifecycle_composition_fbo: Option<glow::Framebuffer>,
     checkpoint_captures: HashMap<CheckpointCaptureCacheKey, CachedCheckpointCapture>,
@@ -672,6 +673,7 @@ impl EffectGlResourceCache {
             pool: EffectResourcePool::with_budget(config.hard_budget_bytes)?,
             checkpoint_cache_budget_bytes: config.checkpoint_cache_budget_bytes,
             gl_textures: HashMap::new(),
+            gl_texture_bytes: HashMap::new(),
             scratch_fbo: None,
             lifecycle_composition_fbo: None,
             checkpoint_captures: HashMap::new(),
@@ -719,9 +721,7 @@ impl EffectGlResourceCache {
     ) -> Result<PooledEffectTexture, Box<dyn std::error::Error>> {
         let texture = self.pool.checkout_with_purpose(key, purpose)?;
         for id in self.pool.drain_evicted_texture_ids() {
-            if let Some(gl_texture) = self.gl_textures.remove(&id) {
-                unsafe { gl.delete_texture(gl_texture) };
-            }
+            self.delete_effect_texture(gl, id);
         }
         if let Entry::Vacant(entry) = self.gl_textures.entry(texture.id) {
             let gl_texture = match unsafe { gl.create_texture() } {
@@ -779,9 +779,47 @@ impl EffectGlResourceCache {
                     glow::PixelUnpackData::Slice(None),
                 );
             }
+            crate::gpu_residency::record_gpu_resource_allocation(
+                crate::gpu_residency::GpuResourceClass::EffectTextureBacking,
+                Some(texture.bytes),
+            );
+            crate::gpu_residency::record_gpu_resource_allocation(
+                crate::gpu_residency::GpuResourceClass::GlTextureObject,
+                None,
+            );
+            self.gl_texture_bytes.insert(texture.id, texture.bytes);
             entry.insert(gl_texture);
         }
         Ok(texture)
+    }
+
+    pub(super) fn delete_effect_texture(&mut self, gl: &glow::Context, id: u64) {
+        let Some(gl_texture) = self.gl_textures.remove(&id) else {
+            return;
+        };
+        unsafe { gl.delete_texture(gl_texture) };
+        if let Some(bytes) = self.gl_texture_bytes.remove(&id) {
+            crate::gpu_residency::record_gpu_resource_retirement(
+                crate::gpu_residency::GpuResourceClass::EffectTextureBacking,
+                Some(bytes),
+            );
+            crate::gpu_residency::record_gpu_resource_retirement(
+                crate::gpu_residency::GpuResourceClass::GlTextureObject,
+                None,
+            );
+        }
+    }
+
+    pub(super) fn delete_effect_framebuffer(
+        &mut self,
+        gl: &glow::Context,
+        framebuffer: glow::Framebuffer,
+    ) {
+        unsafe { gl.delete_framebuffer(framebuffer) };
+        crate::gpu_residency::record_gpu_resource_retirement(
+            crate::gpu_residency::GpuResourceClass::FramebufferObject,
+            None,
+        );
     }
 
     pub(crate) fn prepare_graph(
@@ -1257,6 +1295,10 @@ impl EffectGlResourceCache {
             framebuffer
         } else {
             let framebuffer = unsafe { gl.create_framebuffer().map_err(io::Error::other)? };
+            crate::gpu_residency::record_gpu_resource_allocation(
+                crate::gpu_residency::GpuResourceClass::FramebufferObject,
+                None,
+            );
             self.lifecycle_composition_fbo = Some(framebuffer);
             framebuffer
         };
@@ -1315,6 +1357,10 @@ impl EffectGlResourceCache {
             framebuffer
         } else {
             let framebuffer = unsafe { gl.create_framebuffer().map_err(io::Error::other)? };
+            crate::gpu_residency::record_gpu_resource_allocation(
+                crate::gpu_residency::GpuResourceClass::FramebufferObject,
+                None,
+            );
             self.scratch_fbo = Some(framebuffer);
             framebuffer
         };
@@ -1387,22 +1433,21 @@ impl EffectGlResourceCache {
 
     pub(crate) fn cleanup_size_history(&mut self, gl: &glow::Context) {
         for id in self.pool.cleanup_size_history() {
-            if let Some(texture) = self.gl_textures.remove(&id) {
-                unsafe { gl.delete_texture(texture) };
-            }
+            self.delete_effect_texture(gl, id);
         }
     }
 
     pub(crate) fn destroy(&mut self, gl: &glow::Context) {
         self.clear_checkpoint_capture_cache();
-        for (_, texture) in self.gl_textures.drain() {
-            unsafe { gl.delete_texture(texture) };
+        let texture_ids = self.gl_textures.keys().copied().collect::<Vec<_>>();
+        for id in texture_ids {
+            self.delete_effect_texture(gl, id);
         }
         if let Some(framebuffer) = self.scratch_fbo.take() {
-            unsafe { gl.delete_framebuffer(framebuffer) };
+            self.delete_effect_framebuffer(gl, framebuffer);
         }
         if let Some(framebuffer) = self.lifecycle_composition_fbo.take() {
-            unsafe { gl.delete_framebuffer(framebuffer) };
+            self.delete_effect_framebuffer(gl, framebuffer);
         }
         self.pool.cleanup_size_history();
     }

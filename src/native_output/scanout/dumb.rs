@@ -15,6 +15,10 @@ pub(crate) struct DumbFramebuffer {
 impl DumbFramebuffer {
     pub(crate) fn create(file: &fs::File, width: u32, height: u32) -> io::Result<Self> {
         let dumb = drm_ffi::mode::dumbbuffer::create(file.as_fd(), width, height, 32, 0)?;
+        crate::gpu_residency::record_gpu_resource_allocation(
+            crate::gpu_residency::GpuResourceClass::FallbackScanoutBacking,
+            Some(dumb.size),
+        );
         let fb = match drm_ffi::mode::add_fb(
             file.as_fd(),
             width,
@@ -27,14 +31,30 @@ impl DumbFramebuffer {
             Ok(fb) => fb,
             Err(error) => {
                 let _ = drm_ffi::mode::dumbbuffer::destroy(file.as_fd(), dumb.handle);
+                crate::gpu_residency::record_gpu_resource_retirement(
+                    crate::gpu_residency::GpuResourceClass::FallbackScanoutBacking,
+                    Some(dumb.size),
+                );
                 return Err(error);
             }
         };
+        crate::gpu_residency::record_gpu_resource_allocation(
+            crate::gpu_residency::GpuResourceClass::DrmFramebuffer,
+            None,
+        );
         let map = match drm_ffi::mode::dumbbuffer::map(file.as_fd(), dumb.handle, 0, 0) {
             Ok(map) => map,
             Err(error) => {
                 let _ = drm_ffi::mode::rm_fb(file.as_fd(), fb.fb_id);
+                crate::gpu_residency::record_gpu_resource_retirement(
+                    crate::gpu_residency::GpuResourceClass::DrmFramebuffer,
+                    None,
+                );
                 let _ = drm_ffi::mode::dumbbuffer::destroy(file.as_fd(), dumb.handle);
+                crate::gpu_residency::record_gpu_resource_retirement(
+                    crate::gpu_residency::GpuResourceClass::FallbackScanoutBacking,
+                    Some(dumb.size),
+                );
                 return Err(error);
             }
         };
@@ -51,7 +71,15 @@ impl DumbFramebuffer {
         if mapping == libc::MAP_FAILED {
             let error = io::Error::last_os_error();
             let _ = drm_ffi::mode::rm_fb(file.as_fd(), fb.fb_id);
+            crate::gpu_residency::record_gpu_resource_retirement(
+                crate::gpu_residency::GpuResourceClass::DrmFramebuffer,
+                None,
+            );
             let _ = drm_ffi::mode::dumbbuffer::destroy(file.as_fd(), dumb.handle);
+            crate::gpu_residency::record_gpu_resource_retirement(
+                crate::gpu_residency::GpuResourceClass::FallbackScanoutBacking,
+                Some(dumb.size),
+            );
             return Err(error);
         }
 
@@ -143,12 +171,19 @@ impl DumbFramebuffer {
 impl Drop for DumbFramebuffer {
     fn drop(&mut self) {
         let _ = unsafe { libc::munmap(self.mapping, self.size) };
-        if !self.drm_cleanup_armed {
-            return;
+        if self.drm_cleanup_armed {
+            let fd = unsafe { BorrowedFd::borrow_raw(self.fd) };
+            let _ = drm_ffi::mode::rm_fb(fd, self.fb_id);
+            let _ = drm_ffi::mode::dumbbuffer::destroy(fd, self.handle);
         }
-        let fd = unsafe { BorrowedFd::borrow_raw(self.fd) };
-        let _ = drm_ffi::mode::rm_fb(fd, self.fb_id);
-        let _ = drm_ffi::mode::dumbbuffer::destroy(fd, self.handle);
+        crate::gpu_residency::record_gpu_resource_retirement(
+            crate::gpu_residency::GpuResourceClass::DrmFramebuffer,
+            None,
+        );
+        crate::gpu_residency::record_gpu_resource_retirement(
+            crate::gpu_residency::GpuResourceClass::FallbackScanoutBacking,
+            Some(self.size as u64),
+        );
     }
 }
 

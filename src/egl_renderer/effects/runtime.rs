@@ -184,6 +184,14 @@ impl EffectRuntime {
         }
         let vertex_array = unsafe { gl.create_vertex_array().map_err(io::Error::other)? };
         let vertex_buffer = unsafe { gl.create_buffer().map_err(io::Error::other)? };
+        crate::gpu_residency::record_gpu_resource_allocation(
+            crate::gpu_residency::GpuResourceClass::VertexArrayObject,
+            None,
+        );
+        crate::gpu_residency::record_gpu_resource_allocation(
+            crate::gpu_residency::GpuResourceClass::GlBufferObject,
+            None,
+        );
         let vertices: [f32; 24] = [
             -1.0, -1.0, 0.0, 1.0, 1.0, -1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, -1.0, -1.0, 0.0, 1.0,
             1.0, 1.0, 1.0, 0.0, -1.0, 1.0, 0.0, 0.0,
@@ -203,6 +211,10 @@ impl EffectRuntime {
             gl.bind_buffer(glow::ARRAY_BUFFER, None);
             gl.bind_vertex_array(None);
         }
+        crate::gpu_residency::record_gpu_resource_allocation(
+            crate::gpu_residency::GpuResourceClass::UploadBufferBacking,
+            Some(24 * std::mem::size_of::<f32>() as u64),
+        );
         self.effect_quad = Some((vertex_array, vertex_buffer));
         Ok((vertex_array, vertex_buffer))
     }
@@ -216,6 +228,18 @@ impl EffectRuntime {
                 gl.delete_buffer(vertex_buffer);
                 gl.delete_vertex_array(vertex_array);
             }
+            crate::gpu_residency::record_gpu_resource_retirement(
+                crate::gpu_residency::GpuResourceClass::GlBufferObject,
+                None,
+            );
+            crate::gpu_residency::record_gpu_resource_retirement(
+                crate::gpu_residency::GpuResourceClass::VertexArrayObject,
+                None,
+            );
+            crate::gpu_residency::record_gpu_resource_retirement(
+                crate::gpu_residency::GpuResourceClass::UploadBufferBacking,
+                Some(24 * std::mem::size_of::<f32>() as u64),
+            );
         }
     }
 
@@ -223,6 +247,12 @@ impl EffectRuntime {
         unsafe {
             gl.delete_program(self.capture_program);
             gl.delete_program(self.capture_copy_program);
+        }
+        for _ in 0..2 {
+            crate::gpu_residency::record_gpu_resource_retirement(
+                crate::gpu_residency::GpuResourceClass::ShaderProgram,
+                None,
+            );
         }
     }
 

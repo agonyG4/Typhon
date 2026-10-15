@@ -100,10 +100,26 @@ impl LampRenderState {
         unsafe {
             if let Some(program) = self.program.take() {
                 gl.delete_program(program);
+                crate::gpu_residency::record_gpu_resource_retirement(
+                    crate::gpu_residency::GpuResourceClass::ShaderProgram,
+                    None,
+                );
             }
             gl.delete_buffer(self.vertex_buffer);
             gl.delete_vertex_array(self.vertex_array);
         }
+        crate::gpu_residency::record_gpu_resource_retirement(
+            crate::gpu_residency::GpuResourceClass::UploadBufferBacking,
+            Some(self.vertex_buffer_capacity as u64),
+        );
+        crate::gpu_residency::record_gpu_resource_retirement(
+            crate::gpu_residency::GpuResourceClass::GlBufferObject,
+            None,
+        );
+        crate::gpu_residency::record_gpu_resource_retirement(
+            crate::gpu_residency::GpuResourceClass::VertexArrayObject,
+            None,
+        );
     }
 
     pub(super) fn extend_surface_consumers(

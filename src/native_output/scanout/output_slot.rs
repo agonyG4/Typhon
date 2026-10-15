@@ -19,6 +19,7 @@ pub(crate) struct AtomicOutputSlotBacking {
     pub(crate) pool_generation: u64,
     pub(crate) bo: gbm::BufferObject<()>,
     pub(crate) framebuffer: FramebufferId,
+    telemetry_bytes: u64,
     content_validity: AtomicOutputSlotContentValidity,
 }
 
@@ -88,11 +89,17 @@ impl AtomicOutputSlotBacking {
         bo: gbm::BufferObject<()>,
         framebuffer: FramebufferId,
     ) -> Self {
+        let telemetry_bytes = u64::from(bo.stride()).saturating_mul(u64::from(bo.height()));
+        crate::gpu_residency::record_gpu_resource_allocation(
+            crate::gpu_residency::GpuResourceClass::OutputBacking,
+            Some(telemetry_bytes),
+        );
         Self {
             id,
             pool_generation,
             bo,
             framebuffer,
+            telemetry_bytes,
             content_validity: AtomicOutputSlotContentValidity::unpresented(),
         }
     }
@@ -157,6 +164,15 @@ impl AtomicOutputSlotBacking {
     }
 }
 
+impl Drop for AtomicOutputSlotBacking {
+    fn drop(&mut self) {
+        crate::gpu_residency::record_gpu_resource_retirement(
+            crate::gpu_residency::GpuResourceClass::OutputBacking,
+            Some(self.telemetry_bytes),
+        );
+    }
+}
+
 pub(crate) fn explicit_framebuffer_descriptor(
     bo: &gbm::BufferObject<()>,
 ) -> io::Result<ExplicitFramebufferDescriptor> {
@@ -199,6 +215,15 @@ pub(crate) fn add_explicit_framebuffer(
     )?;
     FramebufferId::new(framebuffer.fb_id)
         .ok_or_else(|| io::Error::other("AddFB2 returned framebuffer ID zero"))
+}
+
+pub(crate) fn remove_explicit_framebuffer(drm: BorrowedFd<'_>, framebuffer: FramebufferId) {
+    if drm_ffi::mode::rm_fb(drm, framebuffer.get()).is_ok() {
+        crate::gpu_residency::record_gpu_resource_retirement(
+            crate::gpu_residency::GpuResourceClass::DrmFramebuffer,
+            None,
+        );
+    }
 }
 
 pub(crate) struct AtomicPhysicalOutputPool {
@@ -325,7 +350,7 @@ impl AtomicPhysicalOutputPool {
 
     pub(crate) fn remove_framebuffers(slots: &[AtomicOutputSlotBacking], drm: BorrowedFd<'_>) {
         for slot in slots {
-            let _ = drm_ffi::mode::rm_fb(drm, slot.framebuffer.get());
+            remove_explicit_framebuffer(drm, slot.framebuffer);
         }
     }
 }

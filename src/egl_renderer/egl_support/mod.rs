@@ -17,7 +17,7 @@ pub(crate) use config::{
 pub(in crate::egl_renderer) use context::create_gles_context;
 pub(crate) use context::{
     CreatedGlesContext, EglContextPriorityPolicy, create_compositor_gles_context,
-    load_egl_image_target_texture_2d,
+    destroy_gles_context, destroy_gles_surface, load_egl_image_target_texture_2d,
 };
 #[cfg(test)]
 pub(in crate::egl_renderer) use context::{

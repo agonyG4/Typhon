@@ -66,6 +66,7 @@ pub(crate) struct ImportedDirectFramebuffer {
     pub(crate) framebuffer: FramebufferId,
     pub(crate) format: u32,
     pub(crate) modifier: u64,
+    logical_bytes: u64,
     gem_handles: Vec<u32>,
     drm_cleanup_armed: AtomicBool,
     io: Arc<dyn DirectFramebufferIo>,
@@ -80,6 +81,7 @@ impl std::fmt::Debug for ImportedDirectFramebuffer {
             .field("framebuffer", &self.framebuffer)
             .field("format", &self.format)
             .field("modifier", &self.modifier)
+            .field("logical_bytes", &self.logical_bytes)
             .field("gem_handles", &self.gem_handles)
             .finish()
     }
@@ -114,6 +116,10 @@ impl ImportedDirectFramebuffer {
             };
             if !gem_handles.contains(&handle) {
                 gem_handles.push(handle);
+                crate::gpu_residency::record_gpu_resource_allocation(
+                    crate::gpu_residency::GpuResourceClass::GemHandle,
+                    None,
+                );
             }
             planes.push(ExplicitFramebufferPlane {
                 handle,
@@ -167,12 +173,24 @@ impl ImportedDirectFramebuffer {
             close_gem_handles(&io, &gem_handles);
             return Err(io::Error::other("AddFB2 returned framebuffer ID zero"));
         }
+        crate::gpu_residency::record_gpu_resource_allocation(
+            crate::gpu_residency::GpuResourceClass::DrmFramebuffer,
+            None,
+        );
+        let logical_bytes = u64::from(buffer.size().width)
+            .saturating_mul(u64::from(buffer.size().height))
+            .saturating_mul(4);
+        crate::gpu_residency::record_gpu_resource_allocation(
+            crate::gpu_residency::GpuResourceClass::DirectScanoutDmabufExternalBacking,
+            Some(logical_bytes),
+        );
 
         Ok(Self {
             key,
             framebuffer,
             format: buffer.format().as_fourcc(),
             modifier: buffer.planes()[0].descriptor().modifier.0,
+            logical_bytes,
             gem_handles,
             drm_cleanup_armed: AtomicBool::new(true),
             io,
@@ -192,28 +210,45 @@ impl ImportedDirectFramebuffer {
 
 impl Drop for ImportedDirectFramebuffer {
     fn drop(&mut self) {
-        if !self.drm_cleanup_armed.load(Ordering::Acquire) {
-            return;
-        }
         // KMS must stop referring to the framebuffer before its imported GEM
         // handles are closed. Keep this order even when one cleanup operation
         // fails so the remaining resources are still attempted.
-        if let Err(error) = self.io.remove_framebuffer(self.framebuffer) {
-            self.cleanup_failures.fetch_add(1, Ordering::Relaxed);
-            eprintln!("direct scanout: failed to remove framebuffer: {error}");
-        }
-        for handle in &self.gem_handles {
-            if let Err(error) = self.io.gem_close(*handle) {
+        if self.drm_cleanup_armed.load(Ordering::Acquire) {
+            if let Err(error) = self.io.remove_framebuffer(self.framebuffer) {
                 self.cleanup_failures.fetch_add(1, Ordering::Relaxed);
-                eprintln!("direct scanout: failed to close GEM handle {handle}: {error}");
+                eprintln!("direct scanout: failed to remove framebuffer: {error}");
             }
         }
+        for handle in &self.gem_handles {
+            if self.drm_cleanup_armed.load(Ordering::Acquire) {
+                if let Err(error) = self.io.gem_close(*handle) {
+                    self.cleanup_failures.fetch_add(1, Ordering::Relaxed);
+                    eprintln!("direct scanout: failed to close GEM handle {handle}: {error}");
+                }
+            }
+            crate::gpu_residency::record_gpu_resource_retirement(
+                crate::gpu_residency::GpuResourceClass::GemHandle,
+                None,
+            );
+        }
+        crate::gpu_residency::record_gpu_resource_retirement(
+            crate::gpu_residency::GpuResourceClass::DrmFramebuffer,
+            None,
+        );
+        crate::gpu_residency::record_gpu_resource_retirement(
+            crate::gpu_residency::GpuResourceClass::DirectScanoutDmabufExternalBacking,
+            Some(self.logical_bytes),
+        );
     }
 }
 
 fn close_gem_handles(io: &Arc<dyn DirectFramebufferIo>, handles: &[u32]) {
     for handle in handles {
         let _ = io.gem_close(*handle);
+        crate::gpu_residency::record_gpu_resource_retirement(
+            crate::gpu_residency::GpuResourceClass::GemHandle,
+            None,
+        );
     }
 }
 

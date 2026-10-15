@@ -178,6 +178,7 @@ impl RendererResourceState {
                     size: (1, 1),
                     generation: 1,
                     egl_image: None,
+                    telemetry: image::EglImageResourceTelemetry::Untracked,
                 },
                 dmabuf_key: None,
                 buffer_lifetime: None,
@@ -208,7 +209,12 @@ impl RendererResourceState {
         height: u32,
         rgba: Option<&[u8]>,
     ) -> RendererResult<glow::Texture> {
-        let image = image::create_uploaded_resource(gl, width, height)?;
+        let image = image::create_uploaded_resource(
+            gl,
+            width,
+            height,
+            crate::gpu_residency::GpuResourceClass::ShmUploadTextureBacking,
+        )?;
         if let Some(rgba) = rgba {
             image::write_rgba_bytes_to_resource(
                 gl,
@@ -240,7 +246,12 @@ impl RendererResourceState {
         height: u32,
         rgba: Option<&[u8]>,
     ) -> RendererResult<glow::Texture> {
-        let image = image::create_uploaded_resource(gl, width, height)?;
+        let image = image::create_uploaded_resource(
+            gl,
+            width,
+            height,
+            crate::gpu_residency::GpuResourceClass::UiTextureBacking,
+        )?;
         if let Some(rgba) = rgba {
             image::write_rgba_bytes_to_resource(
                 gl,

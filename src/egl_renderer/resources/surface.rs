@@ -611,7 +611,12 @@ fn create_surface_resource(
 ) -> RendererResult<EglSurfaceResource> {
     let image = if surface.cpu_pixels().is_some() {
         let buffer_size = surface.buffer_size();
-        let mut resource = create_uploaded_resource(gl, buffer_size.width, buffer_size.height)?;
+        let mut resource = create_uploaded_resource(
+            gl,
+            buffer_size.width,
+            buffer_size.height,
+            crate::gpu_residency::GpuResourceClass::ShmUploadTextureBacking,
+        )?;
         write_surface_pixels_to_resource(gl, &resource, surface, true, upload);
         resource.generation = surface.generation;
         resource

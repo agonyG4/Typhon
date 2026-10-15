@@ -14,7 +14,9 @@ use super::super::{
     EglInstance, GlEglImageTargetTexture2DOes, RendererResult, native_egl_debug_enabled,
 };
 use super::ResourceTelemetry;
-use super::image::{EglImageGuard, EglImageResource, configure_texture};
+use super::image::{
+    EglImageGuard, EglImageResource, EglImageResourceTelemetry, GlTextureGuard, configure_texture,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum DmabufImportGlStage {
@@ -313,36 +315,38 @@ impl DmabufImporter {
             gl.create_texture()
                 .map_err(|error| DmabufTextureImportError::TextureCreation(error.to_owned()))?
         };
+        let texture = GlTextureGuard::new(
+            gl,
+            texture,
+            crate::gpu_residency::GpuResourceClass::ImportedGlTextureView,
+        );
         if let Err(error) = check_dmabuf_gl_stage(gl, DmabufImportGlStage::TextureCreation) {
-            unsafe { gl.delete_texture(texture) };
             return Err(error.into());
         }
         unsafe {
-            gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+            gl.bind_texture(glow::TEXTURE_2D, Some(texture.texture()));
         }
         if let Err(error) = check_dmabuf_gl_stage(gl, DmabufImportGlStage::Bind) {
-            unsafe { gl.delete_texture(texture) };
             return Err(error.into());
         }
         configure_texture(gl);
         if let Err(error) = check_dmabuf_gl_stage(gl, DmabufImportGlStage::TextureConfiguration) {
-            unsafe { gl.delete_texture(texture) };
             return Err(error.into());
         }
         unsafe {
             image_target_texture_2d(glow::TEXTURE_2D, image_guard.image().as_ptr());
         }
         if let Err(error) = check_dmabuf_gl_stage(gl, DmabufImportGlStage::ImageTarget) {
-            unsafe { gl.delete_texture(texture) };
             return Err(error.into());
         }
 
         let size = handle.size();
         Ok(EglImageResource {
-            texture,
+            texture: texture.disarm(),
             size: (size.width, size.height),
             generation,
             egl_image: Some(image_guard.disarm()),
+            telemetry: EglImageResourceTelemetry::Imported,
         })
     }
 }

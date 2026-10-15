@@ -239,6 +239,7 @@ impl DmabufResourceState {
                     size: (1, 1),
                     generation: 1,
                     egl_image: None,
+                    telemetry: super::image::EglImageResourceTelemetry::Untracked,
                 },
                 buffer_lifetime,
                 surface_id,

@@ -7,11 +7,63 @@ use oblivion_one::compositor::{RenderableSurface, SurfaceDamageRect};
 use super::super::{EglInstance, GlTexture, RendererResult};
 use super::upload::UploadScratch;
 
+#[derive(Debug, Clone, Copy)]
+pub(super) enum EglImageResourceTelemetry {
+    Uploaded {
+        backing_class: crate::gpu_residency::GpuResourceClass,
+        backing_bytes: u64,
+    },
+    Imported,
+    #[cfg(test)]
+    Untracked,
+}
+
 pub(super) struct EglImageResource {
     pub(super) texture: GlTexture,
     pub(super) size: (u32, u32),
     pub(super) generation: u64,
     pub(super) egl_image: Option<egl::Image>,
+    pub(super) telemetry: EglImageResourceTelemetry,
+}
+
+pub(super) struct GlTextureGuard<'a> {
+    gl: &'a glow::Context,
+    texture: Option<GlTexture>,
+    class: crate::gpu_residency::GpuResourceClass,
+}
+
+impl<'a> GlTextureGuard<'a> {
+    pub(super) fn new(
+        gl: &'a glow::Context,
+        texture: GlTexture,
+        class: crate::gpu_residency::GpuResourceClass,
+    ) -> Self {
+        crate::gpu_residency::record_gpu_resource_allocation(class, None);
+        Self {
+            gl,
+            texture: Some(texture),
+            class,
+        }
+    }
+
+    pub(super) fn texture(&self) -> GlTexture {
+        self.texture.expect("GL texture guard must own a texture")
+    }
+
+    pub(super) fn disarm(mut self) -> GlTexture {
+        self.texture
+            .take()
+            .expect("GL texture guard must own a texture")
+    }
+}
+
+impl Drop for GlTextureGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(texture) = self.texture.take() {
+            unsafe { self.gl.delete_texture(texture) };
+            crate::gpu_residency::record_gpu_resource_retirement(self.class, None);
+        }
+    }
 }
 
 pub(crate) struct EglImageGuard<F>
@@ -27,6 +79,10 @@ where
     F: FnMut(egl::Image),
 {
     pub(crate) fn new(image: egl::Image, destroy: F) -> Self {
+        crate::gpu_residency::record_gpu_resource_allocation(
+            crate::gpu_residency::GpuResourceClass::ImportedEglImageView,
+            None,
+        );
         Self {
             image: Some(image),
             destroy,
@@ -51,6 +107,10 @@ where
     fn drop(&mut self) {
         if let Some(image) = self.image.take() {
             (self.destroy)(image);
+            crate::gpu_residency::record_gpu_resource_retirement(
+                crate::gpu_residency::GpuResourceClass::ImportedEglImageView,
+                None,
+            );
         }
     }
 }
@@ -59,8 +119,17 @@ pub(super) fn create_uploaded_resource(
     gl: &glow::Context,
     width: u32,
     height: u32,
+    backing_class: crate::gpu_residency::GpuResourceClass,
 ) -> RendererResult<EglImageResource> {
     let texture = unsafe { gl.create_texture().map_err(io::Error::other)? };
+    let backing_bytes = u64::from(width)
+        .saturating_mul(u64::from(height))
+        .saturating_mul(4);
+    crate::gpu_residency::record_gpu_resource_allocation(backing_class, Some(backing_bytes));
+    crate::gpu_residency::record_gpu_resource_allocation(
+        crate::gpu_residency::GpuResourceClass::GlTextureObject,
+        None,
+    );
     unsafe {
         gl.bind_texture(glow::TEXTURE_2D, Some(texture));
         configure_texture(gl);
@@ -81,6 +150,10 @@ pub(super) fn create_uploaded_resource(
         size: (width, height),
         generation: 0,
         egl_image: None,
+        telemetry: EglImageResourceTelemetry::Uploaded {
+            backing_class,
+            backing_bytes,
+        },
     })
 }
 
@@ -256,7 +329,36 @@ pub(super) fn destroy_image_resource(
     unsafe {
         gl.delete_texture(resource.texture);
     }
+    match resource.telemetry {
+        EglImageResourceTelemetry::Uploaded {
+            backing_class,
+            backing_bytes,
+        } => {
+            crate::gpu_residency::record_gpu_resource_retirement(
+                backing_class,
+                Some(backing_bytes),
+            );
+            crate::gpu_residency::record_gpu_resource_retirement(
+                crate::gpu_residency::GpuResourceClass::GlTextureObject,
+                None,
+            );
+        }
+        EglImageResourceTelemetry::Imported => {
+            crate::gpu_residency::record_gpu_resource_retirement(
+                crate::gpu_residency::GpuResourceClass::ImportedGlTextureView,
+                None,
+            );
+        }
+        #[cfg(test)]
+        EglImageResourceTelemetry::Untracked => {}
+    }
     if let Some(image) = resource.egl_image {
         let _ = egl.destroy_image(egl_display, image);
+        if matches!(resource.telemetry, EglImageResourceTelemetry::Imported) {
+            crate::gpu_residency::record_gpu_resource_retirement(
+                crate::gpu_residency::GpuResourceClass::ImportedEglImageView,
+                None,
+            );
+        }
     }
 }

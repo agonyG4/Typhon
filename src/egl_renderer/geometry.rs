@@ -2188,6 +2188,11 @@ pub(super) fn ensure_vertex_buffer_capacity(
     let capacity = required_size
         .max(MIN_VERTEX_BUFFER_BYTES)
         .next_power_of_two();
+    crate::gpu_residency::record_gpu_resource_resize(
+        crate::gpu_residency::GpuResourceClass::UploadBufferBacking,
+        (*current_capacity > 0).then_some(*current_capacity as u64),
+        Some(capacity as u64),
+    );
     unsafe {
         gl.bind_buffer(glow::ARRAY_BUFFER, Some(vertex_buffer));
         gl.buffer_data_size(glow::ARRAY_BUFFER, capacity as i32, glow::DYNAMIC_DRAW);

@@ -309,6 +309,10 @@ impl ShaderProgramCache {
         self.evict_until_room(Some(gl));
         if self.entries.len() >= self.capacity && !self.entries.contains_key(&key) {
             unsafe { gl.delete_program(program) };
+            crate::gpu_residency::record_gpu_resource_retirement(
+                crate::gpu_residency::GpuResourceClass::ShaderProgram,
+                None,
+            );
             return Err(io::Error::other("effect shader cache is full").into());
         }
         self.entries.insert(
@@ -422,6 +426,10 @@ impl ShaderProgramCache {
         for (_, entry) in self.entries.drain() {
             if let Some(program) = entry.program {
                 unsafe { gl.delete_program(program) };
+                crate::gpu_residency::record_gpu_resource_retirement(
+                    crate::gpu_residency::GpuResourceClass::ShaderProgram,
+                    None,
+                );
             }
         }
     }
@@ -436,6 +444,10 @@ impl ShaderProgramCache {
             };
             if let (Some(gl), Some(program)) = (gl, entry.program) {
                 unsafe { gl.delete_program(program) };
+                crate::gpu_residency::record_gpu_resource_retirement(
+                    crate::gpu_residency::GpuResourceClass::ShaderProgram,
+                    None,
+                );
             }
             self.evicted.push(key);
         }

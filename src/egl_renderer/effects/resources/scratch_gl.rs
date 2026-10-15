@@ -47,16 +47,14 @@ impl super::EffectGlResourceCache {
             unsafe {
                 gl.bind_framebuffer(glow::FRAMEBUFFER, None);
                 if let Some(framebuffer) = self.scratch_fbo.take() {
-                    gl.delete_framebuffer(framebuffer);
+                    self.delete_effect_framebuffer(gl, framebuffer);
                 }
                 if let Some(framebuffer) = self.lifecycle_composition_fbo.take() {
-                    gl.delete_framebuffer(framebuffer);
+                    self.delete_effect_framebuffer(gl, framebuffer);
                 }
             }
             for retired in &batch.retired {
-                if let Some(texture) = self.gl_textures.remove(&retired.id) {
-                    unsafe { gl.delete_texture(texture) };
-                }
+                self.delete_effect_texture(gl, retired.id);
             }
         }
         let _ = self.metrics();

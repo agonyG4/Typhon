@@ -255,7 +255,7 @@ impl AtomicRenderDomainBootstrap {
                 let egl = &self.native_display.egl;
                 let _ = egl.make_current(display, None, None, None);
                 if let Some(context) = created_context {
-                    let _ = egl.destroy_context(display, context);
+                    let _ = crate::egl_renderer::destroy_gles_context(egl, display, context);
                 }
                 Err(error)
             }
@@ -660,9 +660,11 @@ impl AtomicRenderDomain {
             let _ = native_display
                 .egl
                 .make_current(native_display.display, None, None, None);
-            let _ = native_display
-                .egl
-                .destroy_context(native_display.display, context);
+            let _ = crate::egl_renderer::destroy_gles_context(
+                &native_display.egl,
+                native_display.display,
+                context,
+            );
             self.egl_context = None;
         }
         drop(self.gl.take());
@@ -773,9 +775,21 @@ impl AtomicRenderPool {
             |slot| unsafe {
                 gl.delete_framebuffer(slot.gl_framebuffer);
                 gl.delete_texture(slot.texture);
+                crate::gpu_residency::record_gpu_resource_retirement(
+                    crate::gpu_residency::GpuResourceClass::FramebufferObject,
+                    None,
+                );
+                crate::gpu_residency::record_gpu_resource_retirement(
+                    crate::gpu_residency::GpuResourceClass::GlTextureObject,
+                    None,
+                );
             },
             |slot| {
                 let _ = egl.destroy_image(display, slot.egl_image);
+                crate::gpu_residency::record_gpu_resource_retirement(
+                    crate::gpu_residency::GpuResourceClass::ImportedEglImageView,
+                    None,
+                );
             },
         );
     }
@@ -835,6 +849,10 @@ impl AtomicRenderSlot {
         });
 
         let texture = unsafe { gl.create_texture().map_err(io::Error::other)? };
+        crate::gpu_residency::record_gpu_resource_allocation(
+            crate::gpu_residency::GpuResourceClass::GlTextureObject,
+            None,
+        );
         unsafe {
             gl.bind_texture(glow::TEXTURE_2D, Some(texture));
             gl.tex_parameter_i32(
@@ -850,6 +868,10 @@ impl AtomicRenderSlot {
             image_target(glow::TEXTURE_2D, image_guard.image().as_ptr());
             if gl.get_error() != glow::NO_ERROR {
                 gl.delete_texture(texture);
+                crate::gpu_residency::record_gpu_resource_retirement(
+                    crate::gpu_residency::GpuResourceClass::GlTextureObject,
+                    None,
+                );
                 return Err(io::Error::other(
                     "glEGLImageTargetTexture2DOES failed for explicit output BO",
                 ));
@@ -859,9 +881,17 @@ impl AtomicRenderSlot {
             Ok(framebuffer) => framebuffer,
             Err(error) => {
                 unsafe { gl.delete_texture(texture) };
+                crate::gpu_residency::record_gpu_resource_retirement(
+                    crate::gpu_residency::GpuResourceClass::GlTextureObject,
+                    None,
+                );
                 return Err(io::Error::other(error));
             }
         };
+        crate::gpu_residency::record_gpu_resource_allocation(
+            crate::gpu_residency::GpuResourceClass::FramebufferObject,
+            None,
+        );
         unsafe {
             gl.bind_framebuffer(glow::FRAMEBUFFER, Some(framebuffer));
             gl.framebuffer_texture_2d(
@@ -874,6 +904,14 @@ impl AtomicRenderSlot {
             if gl.check_framebuffer_status(glow::FRAMEBUFFER) != glow::FRAMEBUFFER_COMPLETE {
                 gl.delete_framebuffer(framebuffer);
                 gl.delete_texture(texture);
+                crate::gpu_residency::record_gpu_resource_retirement(
+                    crate::gpu_residency::GpuResourceClass::FramebufferObject,
+                    None,
+                );
+                crate::gpu_residency::record_gpu_resource_retirement(
+                    crate::gpu_residency::GpuResourceClass::GlTextureObject,
+                    None,
+                );
                 return Err(io::Error::other("explicit output FBO is incomplete"));
             }
             gl.bind_framebuffer(glow::FRAMEBUFFER, None);
