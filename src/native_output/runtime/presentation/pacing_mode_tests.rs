@@ -105,7 +105,7 @@ fn reactive_advisory_pending_target_does_not_reserve_a_false_o1_frontier() {
             .expect("reactive target");
     assert_eq!(reactive.reason, PresentationTargetReason::ReactiveDouble);
     assert_eq!(reactive.authority(), PresentationTargetAuthority::Advisory);
-    assert_eq!(reactive.sequence, 4);
+    assert_eq!(reactive.sequence, 2);
 
     let successor = plan_visual_target_for_budget(
         &mut planner,
@@ -143,7 +143,7 @@ fn advisory_predecessor_does_not_make_an_existing_o1_target_churn() {
     let reactive =
         reactive_or_commit_timing_target(&planner, None, None, now, Duration::from_millis(17))
             .expect("reactive target");
-    assert_eq!(reactive.sequence, 4);
+    assert_eq!(reactive.sequence, 2);
 
     let scheduled = plan_visual_target_for_budget(
         &mut planner,
@@ -185,10 +185,9 @@ fn callback_driven_165hz_oracle_keeps_primary_content_one_refresh_apart() {
     let mut planner = PresentationDeadlinePlanner::new(refresh);
     assert_eq!(planner.note_presented(presented_at), 1);
 
-    // The 17 ms prediction deliberately models conservative metadata while
-    // the actual service below is one millisecond and the callback reaction is
-    // 500 us.  The first frame is physically the next refresh even though its
-    // advisory target lands several intervals later.
+    // The 17 ms prediction deliberately models conservative metadata. Each
+    // modeled presentation still advances by one refresh, so advisory
+    // selection and render-ahead must preserve cadence while retaining risk.
     let mut pending = reactive_or_commit_timing_target(
         &planner,
         None,
@@ -202,6 +201,7 @@ fn callback_driven_165hz_oracle_keeps_primary_content_one_refresh_apart() {
     let mut primary_intervals = Vec::new();
     let mut expected_physical_sequence = 1;
     let mut render_ahead_successes = 0;
+    let mut max_future_primary_depth = 0;
     for _ in 0..128 {
         let callback_commit = MonotonicTimestampNs::new(physical_presented_at.get() + 500_000);
         let successor = plan_visual_target_for_budget(
@@ -209,7 +209,7 @@ fn callback_driven_165hz_oracle_keeps_primary_content_one_refresh_apart() {
             true,
             Some(pending),
             callback_commit,
-            Duration::from_millis(1),
+            Duration::from_millis(17),
             true,
             true,
             false,
@@ -217,6 +217,11 @@ fn callback_driven_165hz_oracle_keeps_primary_content_one_refresh_apart() {
         )
         .expect("one-refresh O1 successor");
         render_ahead_successes += 1;
+        let future_primary_depth =
+            usize::from(pending.is_binding()) + usize::from(successor.is_binding());
+        assert!(future_primary_depth <= 2);
+        max_future_primary_depth = max_future_primary_depth.max(future_primary_depth);
+        assert_eq!(successor.sequence, pending.sequence + 1);
 
         physical_presented_at =
             MonotonicTimestampNs::new(physical_presented_at.get() + refresh.as_nanos() as u64);
@@ -227,11 +232,23 @@ fn callback_driven_165hz_oracle_keeps_primary_content_one_refresh_apart() {
         );
         primary_intervals.push(refresh.as_nanos() as u64);
         assert_eq!(successor.sequence, expected_physical_sequence + 1);
+        assert_eq!(
+            successor.presentation_time.get(),
+            physical_presented_at.get() + refresh.as_nanos() as u64
+        );
         assert!(successor.is_binding());
+        assert_eq!(successor.physical_claim.sequence, successor.sequence);
+        assert_eq!(
+            successor.physical_claim.presentation_time,
+            successor.presentation_time
+        );
+        assert!(successor.predicted_unreachable);
+        assert!(successor.selection_evidence.earliest_feasible_sequence > successor.sequence);
         pending = successor;
     }
 
     assert_eq!(render_ahead_successes, 128);
+    assert_eq!(max_future_primary_depth, 2);
     assert!(
         primary_intervals
             .iter()
@@ -240,7 +257,7 @@ fn callback_driven_165hz_oracle_keeps_primary_content_one_refresh_apart() {
 }
 
 #[test]
-fn genuinely_slow_render_keeps_a_later_opportunity_legitimate() {
+fn pessimistic_reactive_prediction_preserves_next_physical_cadence() {
     let refresh = Duration::from_nanos(6_060_606);
     let presented_at = MonotonicTimestampNs::new(1_000_000_000);
     let mut planner = PresentationDeadlinePlanner::new(refresh);
@@ -254,8 +271,25 @@ fn genuinely_slow_render_keeps_a_later_opportunity_legitimate() {
         .expect("slow client target");
 
     assert_eq!(target.authority(), PresentationTargetAuthority::Advisory);
-    assert_eq!(target.sequence, 3);
-    assert!(target.presentation_time.get() > presented_at.get() + 6_060_606);
+    assert_eq!(target.sequence, 2);
+    assert_eq!(
+        target.presentation_time.get(),
+        presented_at.get() + 6_060_606
+    );
+    assert!(target.predicted_unreachable);
+    assert_eq!(
+        target.render_start_deadline.get(),
+        presented_at.get() + 500_000
+    );
+    assert_eq!(
+        target.submit_not_before().get(),
+        presented_at.get() + 500_000
+    );
+    assert_eq!(target.physical_claim.sequence, target.sequence);
+    assert_eq!(
+        target.physical_claim.presentation_time,
+        target.presentation_time
+    );
 }
 
 #[test]

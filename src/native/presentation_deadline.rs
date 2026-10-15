@@ -52,6 +52,8 @@ pub enum PresentationTargetAuthority {
 #[doc(hidden)]
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct TargetSelectionEvidence {
+    /// First refresh which the prediction considers feasible for this work.
+    /// This may be later than the physical cadence opportunity being pursued.
     pub earliest_feasible_sequence: u64,
     pub binding: bool,
 }
@@ -90,6 +92,7 @@ impl PrimaryRefreshClaim {
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PresentationTarget {
+    /// Physical fixed-vsync opportunity being pursued by this target.
     pub sequence: u64,
     pub presentation_time: MonotonicTimestampNs,
     pub submit_not_before: MonotonicTimestampNs,
@@ -98,6 +101,7 @@ pub struct PresentationTarget {
     pub reason: PresentationTargetReason,
     pub clock_generation: u64,
     pub estimated: bool,
+    /// The prediction says this selected cadence opportunity may be missed.
     pub predicted_unreachable: bool,
     pub physical_claim: PrimaryRefreshClaim,
     pub selection_evidence: TargetSelectionEvidence,
@@ -394,36 +398,38 @@ impl PresentationDeadlinePlanner {
         predicted_total_cost: Duration,
     ) -> Option<PresentationTarget> {
         let ready_at = now.checked_add(predicted_total_cost)?;
-        let (sequence, presentation_time, estimated) = self.earliest_reachable(ready_at)?;
-        let physical_claim = self.next_physical_claim().unwrap_or(PrimaryRefreshClaim {
+        let selected = self.first_future_refresh(now)?;
+        let earliest_feasible_sequence =
+            self.prediction_feasible_opportunity(selected, ready_at)?.0;
+        let (sequence, presentation_time, estimated) = selected;
+        let physical_claim = PrimaryRefreshClaim {
             sequence,
             presentation_time,
             clock_generation: self.clock_generation,
-        });
+        };
         Some(PresentationTarget {
             sequence,
             presentation_time,
             submit_not_before: now,
-            // Reactive Double starts rendering as soon as the normal frame
-            // opportunity arrives. The reachable target is accounting
-            // metadata and must not turn into a render-start gate.
+            // Reactive Double pursues the nearest future physical opportunity
+            // and starts immediately. Risk evidence must not gate render start.
             render_start_deadline: now,
             refresh_interval: self.refresh_interval,
             reason: PresentationTargetReason::ReactiveDouble,
             clock_generation: self.clock_generation,
             estimated,
-            predicted_unreachable: false,
+            predicted_unreachable: ready_at > presentation_time,
             physical_claim,
             selection_evidence: TargetSelectionEvidence {
-                earliest_feasible_sequence: physical_claim.sequence,
+                earliest_feasible_sequence,
                 binding: false,
             },
         })
     }
 
-    /// Select the first reachable refresh opportunity strictly after an
-    /// already-owned future target. The lower bound is an ownership/order
-    /// constraint, not a render-start deadline.
+    /// Select the first physical refresh opportunity strictly after an
+    /// already-selected target. The lower bound is an ordering constraint,
+    /// while prediction feasibility is recorded separately.
     pub fn reactive_target_after(
         &self,
         now: MonotonicTimestampNs,
@@ -431,18 +437,23 @@ impl PresentationDeadlinePlanner {
         lower_bound: PresentationTarget,
     ) -> Option<PresentationTarget> {
         let ready_at = now.checked_add(predicted_total_cost)?;
-        let lower_bound = self.physical_predecessor_for(lower_bound);
-        let (sequence, presentation_time, estimated) =
-            self.earliest_reachable_after(ready_at, lower_bound)?;
-
-        let physical_claim = lower_bound
-            .physical_claim()
-            .successor(self.refresh_interval)
-            .unwrap_or(PrimaryRefreshClaim {
-                sequence,
-                presentation_time,
-                clock_generation: self.clock_generation,
-            });
+        let lower_bound = self
+            .is_current(lower_bound)
+            .then(|| self.physical_predecessor_for(lower_bound));
+        let selected = match lower_bound {
+            Some(lower_bound) => {
+                self.first_future_refresh_after(now, lower_bound.physical_claim())?
+            }
+            None => self.first_future_refresh(now)?,
+        };
+        let earliest_feasible_sequence =
+            self.prediction_feasible_opportunity(selected, ready_at)?.0;
+        let (sequence, presentation_time, estimated) = selected;
+        let physical_claim = PrimaryRefreshClaim {
+            sequence,
+            presentation_time,
+            clock_generation: self.clock_generation,
+        };
         Some(PresentationTarget {
             sequence,
             presentation_time,
@@ -452,10 +463,10 @@ impl PresentationDeadlinePlanner {
             reason: PresentationTargetReason::ReactiveDouble,
             clock_generation: self.clock_generation,
             estimated,
-            predicted_unreachable: false,
+            predicted_unreachable: ready_at > presentation_time,
             physical_claim,
             selection_evidence: TargetSelectionEvidence {
-                earliest_feasible_sequence: physical_claim.sequence,
+                earliest_feasible_sequence,
                 binding: false,
             },
         })
@@ -476,8 +487,11 @@ impl PresentationDeadlinePlanner {
         }
         let lower_bound = self.physical_predecessor_for(lower_bound);
         let ready_at = now.checked_add(predicted_total_cost)?;
-        let (sequence, presentation_time, estimated) =
-            self.earliest_reachable_after(ready_at, lower_bound)?;
+        let selected = self.first_future_refresh_after(now, lower_bound.physical_claim())?;
+        let earliest_feasible_sequence =
+            self.prediction_feasible_opportunity(selected, ready_at)?.0;
+        let (sequence, presentation_time, estimated) = selected;
+        let predicted_unreachable = ready_at > presentation_time;
         let submit_not_before = if estimated || reason == PresentationTargetReason::ReactiveDouble {
             now
         } else {
@@ -489,9 +503,16 @@ impl PresentationDeadlinePlanner {
             predicted_total_cost,
             reason,
             estimated,
-            false,
+            predicted_unreachable,
             submit_not_before,
         );
+        let target = PresentationTarget {
+            selection_evidence: TargetSelectionEvidence {
+                earliest_feasible_sequence,
+                binding: reason != PresentationTargetReason::ReactiveDouble,
+            },
+            ..target
+        };
         self.scheduled = Some(target);
         Some(target)
     }
@@ -541,12 +562,16 @@ impl PresentationDeadlinePlanner {
         if unreachable
             && !matches!(
                 reason,
-                PresentationTargetReason::ProvenReadinessMiss
+                PresentationTargetReason::PredictedPressure
+                    | PresentationTargetReason::ProvenReadinessMiss
                     | PresentationTargetReason::ForcedValidation
             )
         {
             return None;
         }
+        let selected = (sequence, presentation_time, predecessor.estimated);
+        let earliest_feasible_sequence =
+            self.prediction_feasible_opportunity(selected, ready_at)?.0;
         let target = self.make_target(
             sequence,
             presentation_time,
@@ -559,6 +584,13 @@ impl PresentationDeadlinePlanner {
                 .checked_add(SUBMIT_NOT_BEFORE_GUARD)
                 .unwrap_or(predecessor.presentation_time),
         );
+        let target = PresentationTarget {
+            selection_evidence: TargetSelectionEvidence {
+                earliest_feasible_sequence,
+                binding: reason != PresentationTargetReason::ReactiveDouble,
+            },
+            ..target
+        };
         self.scheduled = Some(target);
         Some(target)
     }
@@ -675,15 +707,121 @@ impl PresentationDeadlinePlanner {
         if !self.is_current(future_primary) {
             return None;
         }
-        if future_primary.is_binding() {
-            return Some(future_primary.physical_claim());
+        Some(future_primary.physical_claim())
+    }
+
+    /// Select the first fixed-vsync opportunity strictly after `now`.
+    /// Prediction is intentionally not an input to cadence selection.
+    fn first_future_refresh(
+        &self,
+        now: MonotonicTimestampNs,
+    ) -> Option<(u64, MonotonicTimestampNs, bool)> {
+        let Some(anchor) = self.last_presented_at else {
+            return Some((
+                self.last_presented_sequence.checked_add(1)?,
+                now.checked_add(self.refresh_interval)?,
+                true,
+            ));
+        };
+        let refresh_ns = duration_ns(self.refresh_interval).max(1);
+        let intervals = now
+            .get()
+            .saturating_sub(anchor.get())
+            .checked_div(refresh_ns)?
+            .checked_add(1)?;
+        Some((
+            self.last_presented_sequence.checked_add(intervals)?,
+            MonotonicTimestampNs::new(
+                anchor
+                    .get()
+                    .checked_add(intervals.checked_mul(refresh_ns)?)?,
+            ),
+            false,
+        ))
+    }
+
+    /// Select the first fixed-vsync opportunity strictly after both `now`
+    /// and an existing physical claim.
+    fn first_future_refresh_after(
+        &self,
+        now: MonotonicTimestampNs,
+        lower_bound: PrimaryRefreshClaim,
+    ) -> Option<(u64, MonotonicTimestampNs, bool)> {
+        if lower_bound.clock_generation != self.clock_generation {
+            return self.first_future_refresh(now);
         }
-        let presentation_time = self.last_presented_at?.checked_add(self.refresh_interval)?;
-        Some(PrimaryRefreshFrontier {
-            sequence: self.last_presented_sequence.saturating_add(1),
-            presentation_time,
-            clock_generation: self.clock_generation,
-        })
+
+        let threshold =
+            MonotonicTimestampNs::new(now.get().max(lower_bound.presentation_time.get()));
+        if self.last_presented_at.is_none() {
+            let refresh_ns = duration_ns(self.refresh_interval).max(1);
+            let intervals = threshold
+                .get()
+                .saturating_sub(lower_bound.presentation_time.get())
+                .checked_div(refresh_ns)?
+                .checked_add(1)?;
+            return Some((
+                lower_bound.sequence.checked_add(intervals)?,
+                MonotonicTimestampNs::new(
+                    lower_bound
+                        .presentation_time
+                        .get()
+                        .checked_add(intervals.checked_mul(refresh_ns)?)?,
+                ),
+                true,
+            ));
+        }
+
+        let (mut sequence, mut presentation_time, estimated) =
+            self.first_future_refresh(threshold)?;
+        let refresh_ns = duration_ns(self.refresh_interval).max(1);
+        let sequence_steps = if sequence <= lower_bound.sequence {
+            lower_bound.sequence.checked_sub(sequence)?.checked_add(1)?
+        } else {
+            0
+        };
+        let time_steps = if presentation_time <= lower_bound.presentation_time {
+            lower_bound
+                .presentation_time
+                .get()
+                .checked_sub(presentation_time.get())?
+                .checked_div(refresh_ns)?
+                .checked_add(1)?
+        } else {
+            0
+        };
+        let steps = sequence_steps.max(time_steps);
+        if steps > 0 {
+            sequence = sequence.checked_add(steps)?;
+            presentation_time = MonotonicTimestampNs::new(
+                presentation_time
+                    .get()
+                    .checked_add(steps.checked_mul(refresh_ns)?)?,
+            );
+        }
+        Some((sequence, presentation_time, estimated))
+    }
+
+    fn prediction_feasible_opportunity(
+        &self,
+        selected: (u64, MonotonicTimestampNs, bool),
+        ready_at: MonotonicTimestampNs,
+    ) -> Option<(u64, MonotonicTimestampNs, bool)> {
+        if ready_at <= selected.1 {
+            return Some(selected);
+        }
+        let refresh_ns = duration_ns(self.refresh_interval).max(1);
+        let intervals = (ready_at.get() - selected.1.get()).div_ceil(refresh_ns);
+        Some((
+            selected.0.checked_add(intervals)?,
+            MonotonicTimestampNs::new(
+                selected
+                    .1
+                    .get()
+                    .checked_add(intervals.checked_mul(refresh_ns)?)?,
+            ),
+            selected.2,
+        ))
     }
 
     fn earliest_reachable(
@@ -704,38 +842,6 @@ impl PresentationDeadlinePlanner {
             .checked_add(intervals.checked_mul(refresh_ns)?)
             .map(MonotonicTimestampNs)?;
         Some((sequence, presentation_time, false))
-    }
-
-    fn earliest_reachable_after(
-        &self,
-        ready_at: MonotonicTimestampNs,
-        lower_bound: PresentationTarget,
-    ) -> Option<(u64, MonotonicTimestampNs, bool)> {
-        if !self.is_current(lower_bound) {
-            return self.earliest_reachable(ready_at);
-        }
-        let base = self.earliest_reachable(ready_at)?;
-        let refresh_ns = duration_ns(self.refresh_interval).max(1);
-        let lower_bound_estimated = lower_bound.estimated;
-        let lower_bound = lower_bound.physical_claim();
-        let mut sequence = lower_bound.sequence.checked_add(1)?;
-        let mut presentation_time = lower_bound
-            .presentation_time
-            .checked_add(self.refresh_interval)?;
-        if presentation_time < ready_at {
-            let intervals = (ready_at.get() - presentation_time.get()).div_ceil(refresh_ns);
-            sequence = sequence.checked_add(intervals)?;
-            presentation_time = MonotonicTimestampNs::new(
-                presentation_time
-                    .get()
-                    .checked_add(intervals.checked_mul(refresh_ns)?)?,
-            );
-        }
-        if base.1 > presentation_time || (base.1 == presentation_time && base.0 > sequence) {
-            Some((base.0, base.1, base.2 || lower_bound_estimated))
-        } else {
-            Some((sequence, presentation_time, base.2 || lower_bound_estimated))
-        }
     }
 
     fn earliest_reachable_after_claim(
@@ -808,14 +914,6 @@ impl PresentationDeadlinePlanner {
         }
         self.last_abandoned_target_identity = None;
         target
-    }
-
-    fn next_physical_claim(&self) -> Option<PrimaryRefreshClaim> {
-        Some(PrimaryRefreshClaim {
-            sequence: self.last_presented_sequence.checked_add(1)?,
-            presentation_time: self.last_presented_at?.checked_add(self.refresh_interval)?,
-            clock_generation: self.clock_generation,
-        })
     }
 }
 
@@ -893,7 +991,7 @@ mod tests {
     }
 
     #[test]
-    fn predictive_render_ahead_rejects_an_unreachable_next_target() {
+    fn predicted_pressure_keeps_an_unreachable_immediate_successor_armed() {
         let mut planner = PresentationDeadlinePlanner::new(Duration::from_nanos(REFRESH_NS));
         planner.note_presented(MonotonicTimestampNs::new(70_000_000));
         let pending = planner
@@ -903,16 +1001,30 @@ mod tests {
             )
             .unwrap();
 
-        assert!(
-            planner
-                .plan_render_ahead(
-                    pending,
-                    MonotonicTimestampNs::new(78_000_001),
-                    Duration::from_millis(12),
-                    PresentationTargetReason::PredictedPressure,
-                )
-                .is_none()
-        );
+        let now = MonotonicTimestampNs::new(78_000_001);
+        let first = planner
+            .plan_render_ahead(
+                pending,
+                now,
+                Duration::from_millis(12),
+                PresentationTargetReason::PredictedPressure,
+            )
+            .expect("predicted pressure must still arm the physical successor");
+        let repeated = planner
+            .plan_render_ahead(
+                pending,
+                now,
+                Duration::from_millis(12),
+                PresentationTargetReason::PredictedPressure,
+            )
+            .expect("repeated evaluation preserves the armed successor");
+
+        assert_eq!(first.sequence, pending.sequence + 1);
+        assert_eq!(first.presentation_time.get(), 90_000_000);
+        assert!(first.predicted_unreachable);
+        assert_eq!(first.selection_evidence.earliest_feasible_sequence, 4);
+        assert_eq!(repeated, first);
+        assert_eq!(planner.scheduled_target(), Some(first));
     }
 
     #[test]
@@ -1319,50 +1431,85 @@ mod tests {
     }
 
     #[test]
-    fn advisory_reactive_target_uses_the_next_physical_refresh_as_frontier() {
+    fn pessimistic_reactive_prediction_keeps_the_next_cadence_and_reports_risk() {
         let refresh = Duration::from_nanos(6_060_606);
         let mut planner = PresentationDeadlinePlanner::new(refresh);
         let presented_at = MonotonicTimestampNs::new(1_000_000_000);
         planner.note_presented(presented_at);
+        let now = MonotonicTimestampNs::new(1_000_500_000);
         let advisory = planner
-            .reactive_target(
-                MonotonicTimestampNs::new(1_000_500_000),
-                Duration::from_millis(17),
-            )
+            .reactive_target(now, Duration::from_millis(17))
             .unwrap();
 
-        assert_eq!(advisory.sequence, 4);
+        assert_eq!(advisory.sequence, 2);
+        assert_eq!(
+            advisory.presentation_time.get(),
+            presented_at.get() + refresh.as_nanos() as u64
+        );
+        assert_eq!(advisory.authority(), PresentationTargetAuthority::Advisory);
+        assert!(advisory.predicted_unreachable);
+        assert_eq!(advisory.render_start_deadline, now);
+        assert_eq!(advisory.submit_not_before(), now);
+        assert_eq!(advisory.physical_claim.sequence, advisory.sequence);
+        assert_eq!(
+            advisory.physical_claim.presentation_time,
+            advisory.presentation_time
+        );
         assert_eq!(
             planner.primary_refresh_frontier(advisory),
             Some(PrimaryRefreshFrontier {
-                sequence: 2,
-                presentation_time: MonotonicTimestampNs::new(1_006_060_606),
+                sequence: advisory.sequence,
+                presentation_time: advisory.presentation_time,
                 clock_generation: 1,
             })
         );
         assert_eq!(
             advisory.selection_evidence(),
             TargetSelectionEvidence {
-                earliest_feasible_sequence: 2,
+                earliest_feasible_sequence: 4,
                 binding: false,
             }
         );
     }
 
     #[test]
-    fn reactive_target_selects_first_reachable_opportunity_after_a_late_wake() {
+    fn reactive_target_selects_a_strictly_future_refresh_at_an_exact_boundary() {
+        let mut planner = PresentationDeadlinePlanner::new(Duration::from_nanos(REFRESH_NS));
+        planner.note_presented(MonotonicTimestampNs::new(70_000_000));
+
+        let target = planner
+            .reactive_target(MonotonicTimestampNs::new(80_000_000), Duration::ZERO)
+            .unwrap();
+
+        assert_eq!(target.sequence, 3);
+        assert_eq!(target.presentation_time.get(), 90_000_000);
+    }
+
+    #[test]
+    fn reactive_target_skips_elapsed_opportunities_but_not_for_prediction() {
         let mut planner = PresentationDeadlinePlanner::new(Duration::from_nanos(REFRESH_NS));
         planner.note_presented(MonotonicTimestampNs::new(70_000_000));
 
         let target = planner
             .reactive_target(
                 MonotonicTimestampNs::new(95_000_000),
-                Duration::from_millis(2),
+                Duration::from_millis(20),
             )
             .unwrap();
 
         assert_eq!(target.sequence, 4);
         assert_eq!(target.presentation_time.get(), 100_000_000);
+        assert!(target.predicted_unreachable);
+        assert_eq!(target.selection_evidence.earliest_feasible_sequence, 6);
+        assert_eq!(target.physical_claim.sequence, target.sequence);
+        assert_eq!(
+            target.physical_claim.presentation_time,
+            target.presentation_time
+        );
+        assert_eq!(
+            planner.primary_refresh_frontier(target),
+            Some(target.physical_claim)
+        );
         assert_eq!(target.submit_not_before().get(), 95_000_000);
         assert_eq!(target.render_start_deadline.get(), 95_000_000);
         assert_eq!(planner.scheduled_target(), None);
@@ -1394,7 +1541,37 @@ mod tests {
     }
 
     #[test]
-    fn reactive_target_after_skips_multiple_unreachable_opportunities() {
+    fn reactive_target_after_uses_prediction_as_evidence_not_ordering() {
+        let mut planner = PresentationDeadlinePlanner::new(Duration::from_nanos(10_000_000));
+        planner.note_presented(MonotonicTimestampNs::new(70_000_000));
+        let lower_bound = planner
+            .plan_normal(
+                MonotonicTimestampNs::new(71_000_000),
+                Duration::from_millis(2),
+            )
+            .unwrap();
+
+        let target = planner
+            .reactive_target_after(
+                MonotonicTimestampNs::new(72_000_000),
+                Duration::from_millis(50),
+                lower_bound,
+            )
+            .unwrap();
+
+        assert_eq!(target.sequence, lower_bound.sequence + 1);
+        assert_eq!(target.presentation_time.get(), 90_000_000);
+        assert!(target.predicted_unreachable);
+        assert_eq!(target.selection_evidence.earliest_feasible_sequence, 7);
+        assert_eq!(target.physical_claim.sequence, target.sequence);
+        assert_eq!(
+            target.physical_claim.presentation_time,
+            target.presentation_time
+        );
+    }
+
+    #[test]
+    fn reactive_target_after_skips_elapsed_refreshes_only() {
         let mut planner = PresentationDeadlinePlanner::new(Duration::from_nanos(10_000_000));
         planner.note_presented(MonotonicTimestampNs::new(70_000_000));
         let lower_bound = planner
@@ -1407,13 +1584,66 @@ mod tests {
         let target = planner
             .reactive_target_after(
                 MonotonicTimestampNs::new(95_000_000),
-                Duration::from_millis(2),
+                Duration::from_millis(20),
                 lower_bound,
             )
             .unwrap();
 
         assert_eq!(target.sequence, 4);
         assert_eq!(target.presentation_time.get(), 100_000_000);
+        assert!(target.predicted_unreachable);
+        assert_eq!(target.selection_evidence.earliest_feasible_sequence, 6);
+    }
+
+    #[test]
+    fn reactive_target_after_orders_strictly_after_an_advisory_cadence_target() {
+        let mut planner = PresentationDeadlinePlanner::new(Duration::from_nanos(10_000_000));
+        planner.note_presented(MonotonicTimestampNs::new(70_000_000));
+        let now = MonotonicTimestampNs::new(95_000_000);
+        let advisory = planner
+            .reactive_target(now, Duration::from_millis(20))
+            .unwrap();
+        assert_eq!(advisory.sequence, 4);
+
+        let target = planner
+            .reactive_target_after(now, Duration::from_millis(20), advisory)
+            .unwrap();
+
+        assert_eq!(target.sequence, advisory.sequence + 1);
+        assert_eq!(target.presentation_time.get(), 110_000_000);
+        assert!(target.predicted_unreachable);
+        assert_eq!(target.selection_evidence.earliest_feasible_sequence, 6);
+        assert_eq!(target.physical_claim.sequence, target.sequence);
+        assert_eq!(
+            target.physical_claim.presentation_time,
+            target.presentation_time
+        );
+    }
+
+    #[test]
+    fn successor_after_keeps_the_first_future_refresh_after_its_lower_bound() {
+        let mut planner = PresentationDeadlinePlanner::new(Duration::from_nanos(10_000_000));
+        planner.note_presented(MonotonicTimestampNs::new(70_000_000));
+        let lower_bound = planner
+            .plan_normal(
+                MonotonicTimestampNs::new(71_000_000),
+                Duration::from_millis(2),
+            )
+            .unwrap();
+
+        let target = planner
+            .plan_successor_after(
+                lower_bound,
+                MonotonicTimestampNs::new(72_000_000),
+                Duration::from_millis(20),
+                PresentationTargetReason::PredictedPressure,
+            )
+            .unwrap();
+
+        assert_eq!(target.sequence, lower_bound.sequence + 1);
+        assert_eq!(target.presentation_time.get(), 90_000_000);
+        assert!(target.predicted_unreachable);
+        assert_eq!(target.selection_evidence.earliest_feasible_sequence, 4);
     }
 
     #[test]
@@ -1427,6 +1657,25 @@ mod tests {
             assert_eq!(target.sequence, expected_sequence);
             assert_eq!(target.reason, PresentationTargetReason::ReactiveDouble);
             assert_eq!(planner.scheduled_target(), None);
+            presented_at = target.presentation_time;
+            assert_eq!(planner.note_presented(presented_at), expected_sequence);
+        }
+    }
+
+    #[test]
+    fn pessimistic_reactive_prediction_preserves_one_refresh_cadence_for_one_thousand_frames() {
+        let refresh = Duration::from_nanos(6_060_606);
+        let mut planner = PresentationDeadlinePlanner::new(refresh);
+        let mut presented_at = MonotonicTimestampNs::new(1_000_000_000);
+        assert_eq!(planner.note_presented(presented_at), 1);
+
+        for expected_sequence in 2..=1_001 {
+            let target = planner
+                .reactive_target(presented_at, Duration::from_millis(17))
+                .unwrap();
+            assert_eq!(target.sequence, expected_sequence);
+            assert!(target.predicted_unreachable);
+            assert!(target.selection_evidence.earliest_feasible_sequence > target.sequence);
             presented_at = target.presentation_time;
             assert_eq!(planner.note_presented(presented_at), expected_sequence);
         }
