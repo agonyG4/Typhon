@@ -1141,7 +1141,7 @@ mod tests {
 
     #[test]
     fn fixed_ready_pull_in_rebases_ready_transaction_swapchain_pacing_and_scheduler_owners() {
-        ready_pull_in_owner_case(true, true, false, false, false, true);
+        ready_pull_in_owner_case(true, true, false, false, false, false);
     }
 
     #[test]
