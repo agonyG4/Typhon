@@ -1765,6 +1765,121 @@ fn clipboard_selection_after_unrelated_input_uses_a_fresh_mutation_epoch() {
 }
 
 #[test]
+fn unfocused_untrusted_client_cannot_publish_clipboard_selection() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let connection = Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ()).unwrap();
+    let manager: client_wl_data_device_manager::WlDataDeviceManager =
+        globals.bind(&qh, 1..=3, ()).unwrap();
+    let device = manager.get_data_device(&seat, &qh, ());
+    let source = manager.create_data_source(&qh, ());
+    source.offer("image/png".to_string());
+    connection.flush().unwrap();
+
+    let before = capture_clipboard_state(&commands);
+    let mut state = RegistryTestState::default();
+    device.set_selection(Some(&source), 0);
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    let after = capture_clipboard_state(&commands);
+
+    let _server = stop_controllable_test_server(commands, server_thread);
+    assert_eq!(
+        after, before,
+        "an unfocused untrusted client must not replace selection"
+    );
+    assert!(state.data_device_selection_events.is_empty());
+}
+
+#[test]
+fn authorized_astrea_shell_can_publish_clipboard_while_another_client_is_focused() {
+    let socket_name = unique_socket_name();
+    let mut server = OwnCompositorServer::bind(&socket_name).unwrap();
+    server.authorize_astrea_shell_pid(std::process::id());
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let shell_connection =
+        Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (shell_globals, mut shell_queue) =
+        registry_queue_init::<RegistryTestState>(&shell_connection).unwrap();
+    let shell_qh = shell_queue.handle();
+    let shell_seat: client_wl_seat::WlSeat = shell_globals.bind(&shell_qh, 1..=7, ()).unwrap();
+    let shell_manager: client_wl_data_device_manager::WlDataDeviceManager =
+        shell_globals.bind(&shell_qh, 1..=3, ()).unwrap();
+    let shell_device = shell_manager.get_data_device(&shell_seat, &shell_qh, ());
+    let shell_source = shell_manager.create_data_source(&shell_qh, ());
+    shell_source.offer("image/png".to_string());
+    shell_connection.flush().unwrap();
+
+    let target_connection =
+        Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (target_globals, mut target_queue) =
+        registry_queue_init::<RegistryTestState>(&target_connection).unwrap();
+    let target_qh = target_queue.handle();
+    let compositor: client_wl_compositor::WlCompositor =
+        target_globals.bind(&target_qh, 1..=6, ()).unwrap();
+    let wm_base: client_xdg_wm_base::XdgWmBase =
+        target_globals.bind(&target_qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = target_globals.bind(&target_qh, 1..=1, ()).unwrap();
+    let target_seat: client_wl_seat::WlSeat = target_globals.bind(&target_qh, 1..=7, ()).unwrap();
+    let _target_keyboard = target_seat.get_keyboard(&target_qh, ());
+    let target_manager: client_wl_data_device_manager::WlDataDeviceManager =
+        target_globals.bind(&target_qh, 1..=3, ()).unwrap();
+    let _target_device = target_manager.get_data_device(&target_seat, &target_qh, ());
+    let (target_surface, target_xdg_surface, _target_toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &target_qh, 160, 120).unwrap();
+    target_surface.commit();
+    target_connection.flush().unwrap();
+
+    let mut shell_state = RegistryTestState::default();
+    let mut target_state = RegistryTestState::default();
+    shell_queue.roundtrip(&mut shell_state).unwrap();
+    target_queue.roundtrip(&mut target_state).unwrap();
+    commit_registered_initial_xdg_test_buffer(&target_xdg_surface);
+    target_connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    target_queue.roundtrip(&mut target_state).unwrap();
+    focus_root_window(&commands, target_surface.id().protocol_id());
+    wait_for_server_commands(&commands);
+    target_queue.roundtrip(&mut target_state).unwrap();
+
+    assert!(target_state.keyboard_enter_serial.is_some());
+    shell_state.clipboard_payload = Some(b"valid source transfer payload".to_vec());
+    let clipboard_before = capture_clipboard_state(&commands);
+    shell_device.set_selection(Some(&shell_source), 0);
+    shell_connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    shell_queue.roundtrip(&mut shell_state).unwrap();
+    target_queue.roundtrip(&mut target_state).unwrap();
+    let clipboard_after = capture_clipboard_state(&commands);
+    let offer = target_state
+        .data_device_selection_offer
+        .clone()
+        .expect("focused application receives screenshot clipboard offer");
+    let mime_types = target_state.data_offer_mime_types.clone();
+    let (read_fd, write_fd) = owned_pipe().unwrap();
+    offer.receive("image/png".to_string(), write_fd.as_fd());
+    target_connection.flush().unwrap();
+    drop(write_fd);
+    target_queue.roundtrip(&mut target_state).unwrap();
+    shell_queue.roundtrip(&mut shell_state).unwrap();
+    let mut transferred = Vec::new();
+    File::from(read_fd).read_to_end(&mut transferred).unwrap();
+
+    let _server = stop_controllable_test_server(commands, server_thread);
+    assert!(clipboard_after.generation > clipboard_before.generation);
+    assert_eq!(mime_types, ["image/png"]);
+    assert_eq!(transferred, b"valid source transfer payload");
+}
+
+#[test]
 fn client_teardown_retires_its_core_primary_and_data_control_offers() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();

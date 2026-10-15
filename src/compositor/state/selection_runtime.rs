@@ -571,11 +571,15 @@ impl CompositorState {
 
     pub(in crate::compositor) fn set_clipboard_selection(
         &mut self,
+        client: &Client,
+        handle: &DisplayHandle,
         client_id: &ClientId,
         source: Option<wl_data_source::WlDataSource>,
         serial: u32,
     ) -> bool {
-        if !self.client_has_keyboard_focus(client_id) {
+        if !self.client_has_keyboard_focus(client_id)
+            && !self.astrea_shell_client_allowed(client, handle)
+        {
             self.note_selection_admission_rejection(
                 SelectionKind::Clipboard,
                 client_id,

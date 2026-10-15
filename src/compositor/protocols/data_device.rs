@@ -52,7 +52,7 @@ impl Dispatch<wl_data_device::WlDataDevice, DataDeviceData> for CompositorState 
         resource: &wl_data_device::WlDataDevice,
         request: wl_data_device::Request,
         data: &DataDeviceData,
-        _dhandle: &DisplayHandle,
+        dhandle: &DisplayHandle,
         _data_init: &mut DataInit<'_, Self>,
     ) {
         match request {
@@ -100,7 +100,7 @@ impl Dispatch<wl_data_device::WlDataDevice, DataDeviceData> for CompositorState 
                     );
                     return;
                 }
-                state.set_clipboard_selection(&data.client_id, source, serial);
+                state.set_clipboard_selection(client, dhandle, &data.client_id, source, serial);
             }
             wl_data_device::Request::StartDrag {
                 source,
