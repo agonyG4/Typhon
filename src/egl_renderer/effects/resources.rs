@@ -469,6 +469,9 @@ pub struct EffectResourcePool {
     clock: u64,
     pending_evicted_ids: VecDeque<u64>,
     eviction_count: usize,
+    pressure_evicted_estimated_bytes: u64,
+    protected_pressure_eviction_count: u64,
+    protected_pressure_evicted_estimated_bytes: u64,
     allocation_count: usize,
     reuse_count: usize,
     retirement_count: usize,
@@ -498,6 +501,9 @@ impl EffectResourcePool {
             clock: 0,
             pending_evicted_ids: VecDeque::new(),
             eviction_count: 0,
+            pressure_evicted_estimated_bytes: 0,
+            protected_pressure_eviction_count: 0,
+            protected_pressure_evicted_estimated_bytes: 0,
             allocation_count: 0,
             reuse_count: 0,
             retirement_count: 0,
@@ -591,15 +597,39 @@ impl EffectResourcePool {
                 .values()
                 .flatten()
                 .filter(|texture| !texture.checked_out)
-                .map(|texture| (texture.last_used, texture.id))
+                .map(|texture| {
+                    let protected_scratch = texture.purpose == EffectTexturePurpose::Scratch
+                        && self.scratch_residency.protects_epoch(texture.scratch_epoch);
+                    let tier = match (texture.purpose, protected_scratch) {
+                        (EffectTexturePurpose::Scratch, false) => 0_u8,
+                        (EffectTexturePurpose::Scratch, true) => 2,
+                        _ => 1,
+                    };
+                    (
+                        tier,
+                        texture.last_used,
+                        texture.id,
+                        texture.bytes,
+                        protected_scratch,
+                    )
+                })
                 .collect::<Vec<_>>();
             candidates.sort_unstable();
-            let Some((_, id)) = candidates.first().copied() else {
+            let Some((_, _, id, bytes, protected_scratch)) = candidates.first().copied() else {
                 break;
             };
             if self.remove_texture(id) {
                 self.pending_evicted_ids.push_back(id);
                 self.eviction_count = self.eviction_count.saturating_add(1);
+                self.pressure_evicted_estimated_bytes =
+                    self.pressure_evicted_estimated_bytes.saturating_add(bytes);
+                if protected_scratch {
+                    self.protected_pressure_eviction_count =
+                        self.protected_pressure_eviction_count.saturating_add(1);
+                    self.protected_pressure_evicted_estimated_bytes = self
+                        .protected_pressure_evicted_estimated_bytes
+                        .saturating_add(bytes);
+                }
             } else {
                 break;
             }

@@ -913,12 +913,29 @@ impl NativeScanoutBackend {
         }
     }
 
+    pub(crate) fn next_effect_scratch_maintenance_deadline(&self) -> Option<std::time::Instant> {
+        match self {
+            Self::AtomicEglGbm(scanout) => scanout.next_effect_scratch_maintenance_deadline(),
+            Self::NativeEglGbm(scanout) => scanout.next_effect_scratch_maintenance_deadline(),
+            Self::Gbm(_) | Self::Dumb(_) => None,
+        }
+    }
+
+    pub(crate) fn maintain_effect_scratch(&mut self, now: std::time::Instant) -> io::Result<()> {
+        match self {
+            Self::AtomicEglGbm(scanout) => scanout.maintain_effect_scratch(now),
+            Self::NativeEglGbm(scanout) => scanout.maintain_effect_scratch(now),
+            Self::Gbm(_) | Self::Dumb(_) => Ok(()),
+        }
+    }
+
     pub(crate) fn effect_scratch_residency_snapshot(
         &self,
     ) -> Option<crate::gpu_residency::EffectScratchResidencyLiveSnapshot> {
         match self {
             Self::AtomicEglGbm(scanout) => scanout.effect_scratch_residency_snapshot(),
-            Self::NativeEglGbm(_) | Self::Gbm(_) | Self::Dumb(_) => None,
+            Self::NativeEglGbm(scanout) => Some(scanout.effect_scratch_residency_snapshot()),
+            Self::Gbm(_) | Self::Dumb(_) => None,
         }
     }
 

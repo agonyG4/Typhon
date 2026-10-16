@@ -20,6 +20,16 @@ pub struct ScratchResidencyTelemetry {
     pub cold_reclaimed_texture_count: u64,
     pub cold_reclaimed_estimated_bytes: u64,
     pub pressure_eviction_count: u64,
+    pub pressure_evicted_estimated_bytes: u64,
+    pub protected_pressure_eviction_count: u64,
+    pub protected_pressure_evicted_estimated_bytes: u64,
+    pub pool_current_estimated_bytes: u64,
+    pub pool_peak_estimated_bytes: u64,
+    pub pool_hard_budget_estimated_bytes: u64,
+    pub cached_key_count: u64,
+    pub allocation_count: u64,
+    pub reuse_count: u64,
+    pub retirement_count: u64,
 }
 
 /// Lock-free snapshot shared with the control plane. The renderer remains the
@@ -31,7 +41,7 @@ pub struct AtomicEffectScratchResidencySnapshot {
     fields: [AtomicU64; FIELD_COUNT],
 }
 
-const FIELD_COUNT: usize = 17;
+const FIELD_COUNT: usize = 27;
 const OWNER_GENERATION: usize = 0;
 const ACTIVE_COUNT: usize = 1;
 const ACTIVE_BYTES: usize = 2;
@@ -49,6 +59,16 @@ const COLD_EVENTS: usize = 13;
 const COLD_TEXTURES: usize = 14;
 const COLD_BYTES: usize = 15;
 const PRESSURE_EVICTIONS: usize = 16;
+const PRESSURE_EVICTED_BYTES: usize = 17;
+const PROTECTED_PRESSURE_EVICTIONS: usize = 18;
+const PROTECTED_PRESSURE_BYTES: usize = 19;
+const POOL_CURRENT_BYTES: usize = 20;
+const POOL_PEAK_BYTES: usize = 21;
+const POOL_HARD_BUDGET_BYTES: usize = 22;
+const CACHED_KEY_COUNT: usize = 23;
+const ALLOCATION_COUNT: usize = 24;
+const REUSE_COUNT: usize = 25;
+const RETIREMENT_COUNT: usize = 26;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct EffectScratchResidencyLiveSnapshot {
@@ -89,6 +109,16 @@ impl AtomicEffectScratchResidencySnapshot {
             policy.cold_reclaimed_texture_count,
             policy.cold_reclaimed_estimated_bytes,
             policy.pressure_eviction_count,
+            policy.pressure_evicted_estimated_bytes,
+            policy.protected_pressure_eviction_count,
+            policy.protected_pressure_evicted_estimated_bytes,
+            policy.pool_current_estimated_bytes,
+            policy.pool_peak_estimated_bytes,
+            policy.pool_hard_budget_estimated_bytes,
+            policy.cached_key_count,
+            policy.allocation_count,
+            policy.reuse_count,
+            policy.retirement_count,
         ];
         for (field, value) in self.fields.iter().zip(values) {
             field.store(value, Ordering::Relaxed);
@@ -129,6 +159,16 @@ impl AtomicEffectScratchResidencySnapshot {
                 cold_reclaimed_texture_count: value(COLD_TEXTURES),
                 cold_reclaimed_estimated_bytes: value(COLD_BYTES),
                 pressure_eviction_count: value(PRESSURE_EVICTIONS),
+                pressure_evicted_estimated_bytes: value(PRESSURE_EVICTED_BYTES),
+                protected_pressure_eviction_count: value(PROTECTED_PRESSURE_EVICTIONS),
+                protected_pressure_evicted_estimated_bytes: value(PROTECTED_PRESSURE_BYTES),
+                pool_current_estimated_bytes: value(POOL_CURRENT_BYTES),
+                pool_peak_estimated_bytes: value(POOL_PEAK_BYTES),
+                pool_hard_budget_estimated_bytes: value(POOL_HARD_BUDGET_BYTES),
+                cached_key_count: value(CACHED_KEY_COUNT),
+                allocation_count: value(ALLOCATION_COUNT),
+                reuse_count: value(REUSE_COUNT),
+                retirement_count: value(RETIREMENT_COUNT),
             };
             fence(Ordering::Acquire);
             let after = self.sequence.load(Ordering::Acquire);
@@ -224,6 +264,16 @@ mod tests {
             cold_reclaimed_texture_count: 8,
             cold_reclaimed_estimated_bytes: 4096,
             pressure_eviction_count: 2,
+            pressure_evicted_estimated_bytes: 512,
+            protected_pressure_eviction_count: 1,
+            protected_pressure_evicted_estimated_bytes: 256,
+            pool_current_estimated_bytes: 8192,
+            pool_peak_estimated_bytes: 16_384,
+            pool_hard_budget_estimated_bytes: 32_768,
+            cached_key_count: 3,
+            allocation_count: 12,
+            reuse_count: 9,
+            retirement_count: 5,
         };
         snapshot.publish(11, 0, 0, 4, 1024, policy);
         assert_eq!(
@@ -234,6 +284,16 @@ mod tests {
         assert_eq!(encoded["protectedEpochStart"], 8);
         assert_eq!(encoded["warmReclaimedEstimatedBytes"], 2048);
         assert!(serde_json::from_value::<ScratchResidencyTelemetry>(encoded).is_ok());
+
+        let older = serde_json::json!({
+            "latestActivityEpoch": 9,
+            "pressureEvictionCount": 2
+        });
+        let older = serde_json::from_value::<ScratchResidencyTelemetry>(older)
+            .expect("older scratch policy snapshot deserializes");
+        assert_eq!(older.pressure_eviction_count, 2);
+        assert_eq!(older.pressure_evicted_estimated_bytes, 0);
+        assert_eq!(older.pool_hard_budget_estimated_bytes, 0);
     }
 
     #[test]

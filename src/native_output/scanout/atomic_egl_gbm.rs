@@ -543,6 +543,16 @@ enum AtomicRenderTransport {
     Worker(AtomicRenderWorkerHandle),
 }
 
+fn reactor_scratch_maintenance_deadline(
+    transport: AtomicRenderTransportKind,
+    synchronous_deadline: Option<Instant>,
+) -> Option<Instant> {
+    match transport {
+        AtomicRenderTransportKind::Synchronous => synchronous_deadline,
+        AtomicRenderTransportKind::Worker => None,
+    }
+}
+
 /// Reactor-owned physical half of an output-configuration candidate. Its BOs
 /// remain alive until the render worker acknowledges candidate destruction or
 /// promotion of the matching render domain.
@@ -775,11 +785,43 @@ impl AtomicEglGbmScanout {
         }
     }
 
+    pub(crate) fn next_effect_scratch_maintenance_deadline(&self) -> Option<std::time::Instant> {
+        match &self.render_transport {
+            AtomicRenderTransport::Synchronous(domain) => reactor_scratch_maintenance_deadline(
+                AtomicRenderTransportKind::Synchronous,
+                domain.next_scratch_maintenance_deadline(),
+            ),
+            AtomicRenderTransport::Worker(_) => {
+                reactor_scratch_maintenance_deadline(AtomicRenderTransportKind::Worker, None)
+            }
+        }
+    }
+
+    pub(crate) fn maintain_effect_scratch(&mut self, now: std::time::Instant) -> io::Result<()> {
+        match &mut self.render_transport {
+            AtomicRenderTransport::Synchronous(domain) => {
+                if !domain
+                    .next_scratch_maintenance_deadline()
+                    .is_some_and(|deadline| deadline <= now)
+                {
+                    return Ok(());
+                }
+                domain.maintain_effect_scratch(now)?;
+            }
+            AtomicRenderTransport::Worker(_) => {}
+        }
+        Ok(())
+    }
+
     pub(crate) fn effect_scratch_residency_snapshot(
         &self,
     ) -> Option<crate::gpu_residency::EffectScratchResidencyLiveSnapshot> {
-        self.render_worker()
-            .and_then(AtomicRenderWorkerHandle::scratch_residency_snapshot)
+        match &self.render_transport {
+            AtomicRenderTransport::Synchronous(domain) => {
+                domain.effect_scratch_residency_snapshot()
+            }
+            AtomicRenderTransport::Worker(worker) => worker.scratch_residency_snapshot(),
+        }
     }
 
     fn render_worker_mut(&mut self) -> Option<&mut AtomicRenderWorkerHandle> {
@@ -4166,5 +4208,22 @@ mod tests {
         assert_eq!(feedback.formats(), &[safe]);
         assert_eq!(feedback.format_table_formats(), &[safe]);
         assert!(!feedback.advertises(DrmFormat::Xbgr8888, DrmModifier(3)));
+    }
+
+    #[test]
+    fn worker_transport_keeps_scratch_deadline_ownership_off_the_reactor() {
+        let deadline = Instant::now() + Duration::from_secs(2);
+
+        assert_eq!(
+            reactor_scratch_maintenance_deadline(
+                AtomicRenderTransportKind::Synchronous,
+                Some(deadline),
+            ),
+            Some(deadline)
+        );
+        assert_eq!(
+            reactor_scratch_maintenance_deadline(AtomicRenderTransportKind::Worker, Some(deadline),),
+            None
+        );
     }
 }

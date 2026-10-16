@@ -22,6 +22,10 @@ pub(in crate::egl_renderer) struct PreparedEffectGraphExecution<'a> {
     lifecycle_trace_summary: Option<FrameTraceSummary>,
     overlay_rects: Vec<OutputRect>,
     skip_final_scene_replay: bool,
+    graph_pool_residency_before: Option<(
+        super::super::EffectGraphMetrics,
+        super::super::metrics::EffectResourceMetrics,
+    )>,
 }
 
 impl PreparedEffectGraphExecution<'_> {
@@ -419,6 +423,7 @@ pub(crate) fn prepare_effect_graph_execution_with_external_bindings<'a>(
     scene_replay_work_mode_override: Option<SceneReplayWorkMode>,
     external_bindings: HashMap<GraphTextureId, GraphTextureBinding>,
 ) -> RendererResult<PreparedEffectGraphExecution<'a>> {
+    let graph_pool_residency_before = graph_pool_residency_before(context, graph);
     let compatibility = CheckpointCacheCompatibility {
         output_size: context.scene.current_size,
         framebuffer_origin_top_left: framebuffer_origin == OutputFramebufferOrigin::TopLeftScanout,
@@ -464,6 +469,7 @@ pub(crate) fn prepare_effect_graph_execution_with_external_bindings<'a>(
         lifecycle_trace_summary: None,
         overlay_rects: Vec::new(),
         skip_final_scene_replay: false,
+        graph_pool_residency_before,
     })
 }
 
@@ -477,6 +483,7 @@ pub(crate) fn prepare_lifecycle_effect_graph_execution<'a>(
     selection: &'a EffectExecutionSelection,
     skip_final_scene_replay: bool,
 ) -> RendererResult<PreparedEffectGraphExecution<'a>> {
+    let graph_pool_residency_before = graph_pool_residency_before(context, graph);
     let trace_summary = FrameTraceSummary {
         selected_effect_count: Some(selection.executed_instances.len()),
         graph_pass_count: Some(graph.stats.passes),
@@ -511,6 +518,22 @@ pub(crate) fn prepare_lifecycle_effect_graph_execution<'a>(
         lifecycle_trace_summary: Some(trace_summary),
         overlay_rects: Vec::new(),
         skip_final_scene_replay,
+        graph_pool_residency_before,
+    })
+}
+
+fn graph_pool_residency_before(
+    context: &EffectExecutionContext<'_>,
+    graph: &CompiledFrameGraph,
+) -> Option<(
+    super::super::EffectGraphMetrics,
+    super::super::metrics::EffectResourceMetrics,
+)> {
+    context.runtime.effect_trace.enabled().then(|| {
+        (
+            super::super::graph_metrics(graph),
+            context.runtime.effect_resources.metrics(),
+        )
     })
 }
 
@@ -640,6 +663,13 @@ pub(crate) fn finish_prepared_effect_graph_execution(
         .runtime
         .effect_trace
         .frame_boundary("effect_graph_release", "end", trace_summary);
+    if let Some((graph_metrics, before)) = prepared.graph_pool_residency_before {
+        let after = context.runtime.effect_resources.metrics();
+        context
+            .runtime
+            .effect_trace
+            .graph_pool_residency(graph_metrics, before, after);
+    }
     match (execution_result, release_result) {
         (Ok(stats), Ok(())) => Ok(stats),
         (Err(error), _) => Err(error),

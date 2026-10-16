@@ -226,6 +226,14 @@ impl GlesSceneRenderer {
             .next_scratch_maintenance_deadline()
     }
 
+    pub(crate) fn effect_scratch_residency_snapshot(
+        &self,
+    ) -> crate::gpu_residency::EffectScratchResidencyLiveSnapshot {
+        self.effect_runtime
+            .effect_resources
+            .effect_scratch_residency_snapshot()
+    }
+
     pub(crate) fn maintain_effect_scratch(&mut self, now: std::time::Instant) -> bool {
         self.effect_runtime
             .effect_resources

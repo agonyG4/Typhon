@@ -18,6 +18,17 @@ impl NativeRuntime {
             .flatten();
         let control_timeout_deadline = self.control_server.next_deadline_ns();
         let system_action_transport_deadline = self.system_action_transport.next_deadline_ns();
+        let scratch_deadline_now = std::time::Instant::now();
+        let scratch_maintenance_deadline_ns = self
+            .scanout
+            .next_effect_scratch_maintenance_deadline()
+            .map(|deadline| {
+                super::wake_plan::instant_deadline_to_monotonic_ns(
+                    deadline,
+                    scratch_deadline_now,
+                    now_ns,
+                )
+            });
         let scheduler_wake_requirement = self.current_scheduler_wake_requirement(now_ns)?;
         let scheduler_wake_requirement = gate_scheduler_for_output_configuration(
             self.pending_output_configuration.is_some(),
@@ -72,6 +83,7 @@ impl NativeRuntime {
                 .is_running()
                 .then(|| self.input_state.keyboard_repeat_deadline_ns())
                 .flatten(),
+            scratch_maintenance_deadline_ns,
             input_backlog: self.input_epoch.backlog_pending(),
             astrea_publication: self.server.has_pending_astrea_toplevel_publication(),
             commit_timing_planning: self.server.has_pending_commit_timing_planning(),
@@ -112,6 +124,7 @@ impl NativeRuntime {
                     NativeDeadlineOwner::DmabufRetry => "deadline:dmabuf_retry",
                     NativeDeadlineOwner::OutputConfiguration => "deadline:output_configuration",
                     NativeDeadlineOwner::KeyboardRepeat => "deadline:keyboard_repeat",
+                    NativeDeadlineOwner::ScratchMaintenance => "deadline:scratch_maintenance",
                 }
             } else if plan
                 .continuation

@@ -9,6 +9,7 @@ use crate::egl_renderer::damage::{
     PartialRepaintComplexityPolicy, RepaintMode, RepaintPlan,
 };
 
+use super::metrics::{EffectGraphMetrics, EffectResourceMetrics};
 use oblivion_one::effects::{
     CompiledFrameGraph, CompiledRenderPass, EffectDemandPlanStats, GraphTextureId,
     GraphTextureSource, RenderPassKind,
@@ -759,6 +760,32 @@ impl EffectExecutionTrace {
         }
     }
 
+    pub(crate) fn graph_pool_residency(
+        &self,
+        graph: EffectGraphMetrics,
+        before: EffectResourceMetrics,
+        after: EffectResourceMetrics,
+    ) {
+        self.event(|| {
+            format!(
+                "event=effect_graph_pool_residency frame_id={} graph_peak_live_textures={} graph_peak_live_bytes={} pool_bytes_before={} pool_bytes_after={} pool_allocations_delta={} pool_reuses_delta={} pool_pressure_evictions_delta={} pool_cached_texture_count_after={} pool_cached_key_count_after={}",
+                optional_u64(self.frame_id),
+                graph.peak_live_textures,
+                graph.peak_live_bytes,
+                before.current_bytes,
+                after.current_bytes,
+                after.allocation_count.saturating_sub(before.allocation_count),
+                after.reuse_count.saturating_sub(before.reuse_count),
+                after
+                    .scratch_residency
+                    .pressure_eviction_count
+                    .saturating_sub(before.scratch_residency.pressure_eviction_count),
+                after.cached_texture_count,
+                after.cached_key_count,
+            )
+        });
+    }
+
     pub(crate) fn effect_repaint_provenance<F>(&self, make_snapshot: F)
     where
         F: FnOnce() -> EffectRepaintProvenanceSnapshot,
@@ -1353,6 +1380,57 @@ mod tests {
         });
 
         assert!(!formatted.get());
+    }
+
+    #[test]
+    fn graph_pool_residency_trace_reports_graph_demand_and_pool_deltas() {
+        let trace =
+            EffectExecutionTrace::enabled_for_test().with_frame_context(Some(17), None, None, None);
+        let before = EffectResourceMetrics {
+            current_bytes: 1_000,
+            allocation_count: 4,
+            reuse_count: 8,
+            cached_texture_count: 3,
+            cached_key_count: 2,
+            scratch_residency: crate::gpu_residency::ScratchResidencyTelemetry {
+                pressure_eviction_count: 5,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let after = EffectResourceMetrics {
+            current_bytes: 1_400,
+            allocation_count: 6,
+            reuse_count: 11,
+            cached_texture_count: 4,
+            cached_key_count: 3,
+            scratch_residency: crate::gpu_residency::ScratchResidencyTelemetry {
+                pressure_eviction_count: 7,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        clear_test_events();
+        trace.graph_pool_residency(
+            EffectGraphMetrics {
+                peak_live_textures: 9,
+                peak_live_bytes: 2_048,
+                ..Default::default()
+            },
+            before,
+            after,
+        );
+        let events = take_test_events();
+        assert_eq!(events.len(), 1);
+        assert!(events[0].contains("graph_peak_live_textures=9"));
+        assert!(events[0].contains("graph_peak_live_bytes=2048"));
+        assert!(events[0].contains("pool_bytes_before=1000 pool_bytes_after=1400"));
+        assert!(events[0].contains("pool_allocations_delta=2 pool_reuses_delta=3"));
+        assert!(events[0].contains("pool_pressure_evictions_delta=2"));
+        assert!(
+            events[0].contains("pool_cached_texture_count_after=4 pool_cached_key_count_after=3")
+        );
     }
 
     #[test]

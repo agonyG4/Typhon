@@ -640,4 +640,223 @@ mod tests {
         assert_eq!(pool.event_counters.retirement_count(), retirements);
         assert_eq!(pool.metrics().current_bytes, 0);
     }
+
+    #[test]
+    fn pressure_eviction_prefers_epoch_zero_scratch_over_protected_scratch() {
+        let base = Instant::now();
+        let mut pool = EffectResourcePool::with_budget(600).expect("test budget is valid");
+        pool.begin_scratch_activity_frame();
+        let protected = allocate_and_return_scratch(&mut pool, 5, 5, base);
+        let epoch_zero = pool
+            .checkout_with_purpose_at(key(25, 5), EffectTexturePurpose::Scratch, None)
+            .expect("epoch-zero scratch allocates");
+        let epoch_zero_id = epoch_zero.id;
+        pool.textures
+            .values_mut()
+            .flatten()
+            .find(|texture| texture.id == epoch_zero_id)
+            .expect("epoch-zero scratch remains resident")
+            .scratch_epoch = 0;
+        return_at(&mut pool, epoch_zero, base + Duration::from_millis(1));
+        assert!(
+            pool.scratch_residency
+                .protects_epoch(protected.scratch_epoch)
+        );
+        assert!(!pool.scratch_residency.protects_epoch(0));
+
+        let replacement = pool
+            .checkout_with_purpose_at(
+                key(20, 5),
+                EffectTexturePurpose::Scratch,
+                Some(base + Duration::from_millis(2)),
+            )
+            .expect("pressure allocation fits after the stale candidate is evicted");
+
+        assert!(
+            pool.textures
+                .values()
+                .flatten()
+                .any(|texture| texture.id == protected.id)
+        );
+        assert!(
+            pool.textures
+                .values()
+                .flatten()
+                .all(|texture| texture.id != epoch_zero_id)
+        );
+        assert_eq!(pool.current_bytes, 500);
+        let metrics = pool.metrics();
+        assert_eq!(metrics.scratch_residency.pressure_eviction_count, 1);
+        assert_eq!(
+            metrics.scratch_residency.pressure_evicted_estimated_bytes,
+            500
+        );
+        assert_eq!(
+            metrics.scratch_residency.protected_pressure_eviction_count,
+            0
+        );
+        assert_eq!(
+            metrics
+                .scratch_residency
+                .protected_pressure_evicted_estimated_bytes,
+            0
+        );
+        return_at(&mut pool, replacement, base + Duration::from_millis(3));
+    }
+
+    #[test]
+    fn pressure_eviction_prefers_stale_nonzero_epoch_over_protected_scratch() {
+        let base = Instant::now();
+        let mut pool = EffectResourcePool::with_budget(500).expect("test budget is valid");
+        let protected = allocate_and_return_scratch(&mut pool, 5, 5, base);
+        let stale = allocate_and_return_scratch(&mut pool, 6, 5, base + Duration::from_millis(1));
+        let protected_id = protected.id;
+        let stale_id = stale.id;
+        pool.scratch_residency.epoch = 3;
+        for texture in pool.textures.values_mut().flatten() {
+            texture.scratch_epoch = if texture.id == protected_id { 3 } else { 1 };
+        }
+
+        let replacement = pool
+            .checkout_with_purpose_at(key(20, 5), EffectTexturePurpose::Scratch, None)
+            .expect("stale nonzero epoch makes enough room");
+
+        assert!(
+            pool.textures
+                .values()
+                .flatten()
+                .any(|texture| texture.id == protected_id)
+        );
+        assert!(
+            pool.textures
+                .values()
+                .flatten()
+                .all(|texture| texture.id != stale_id)
+        );
+        let metrics = pool.metrics();
+        assert_eq!(metrics.current_bytes, 500);
+        assert_eq!(metrics.scratch_residency.pressure_eviction_count, 1);
+        assert_eq!(
+            metrics.scratch_residency.pressure_evicted_estimated_bytes,
+            120
+        );
+        assert_eq!(
+            metrics.scratch_residency.protected_pressure_eviction_count,
+            0
+        );
+        return_at(&mut pool, replacement, base + Duration::from_millis(2));
+    }
+
+    #[test]
+    fn pressure_eviction_keeps_deterministic_lru_id_order_within_a_tier() {
+        let base = Instant::now();
+        let mut pool = EffectResourcePool::with_budget(800).expect("test budget is valid");
+        pool.begin_scratch_activity_frame();
+        let first = pool
+            .checkout_with_purpose_at(key(10, 10), EffectTexturePurpose::Checkpoint, None)
+            .expect("first idle candidate allocates");
+        let second = pool
+            .checkout_with_purpose_at(key(10, 10), EffectTexturePurpose::Checkpoint, None)
+            .expect("second concurrent candidate allocates");
+        let first_id = first.id;
+        let second_id = second.id;
+        return_at(&mut pool, first, base);
+        return_at(&mut pool, second, base);
+        for texture in pool.textures.values_mut().flatten() {
+            texture.scratch_epoch = 0;
+            texture.last_used = 7;
+        }
+
+        let replacement = pool
+            .checkout_with_purpose_at(key(5, 10), EffectTexturePurpose::Scratch, None)
+            .expect("one candidate is enough to satisfy the budget");
+
+        assert_eq!(
+            pool.pending_evicted_ids.iter().copied().collect::<Vec<_>>(),
+            [first_id]
+        );
+        assert!(
+            pool.textures
+                .values()
+                .flatten()
+                .any(|texture| texture.id == second_id)
+        );
+        return_at(&mut pool, replacement, base);
+    }
+
+    #[test]
+    fn pressure_eviction_reclaims_protected_scratch_when_the_hard_cap_requires_it() {
+        let base = Instant::now();
+        let mut pool = EffectResourcePool::with_budget(400).expect("test budget is valid");
+        let protected = allocate_and_return_scratch(&mut pool, 10, 10, base);
+        let protected_id = protected.id;
+        let replacement = pool
+            .checkout_with_purpose_at(key(20, 5), EffectTexturePurpose::Capture, None)
+            .expect("hard budget may evict the protected reusable scratch");
+
+        assert!(
+            pool.textures
+                .values()
+                .flatten()
+                .all(|texture| texture.id != protected_id)
+        );
+        let metrics = pool.metrics();
+        assert_eq!(metrics.current_bytes, 400);
+        assert_eq!(metrics.scratch_residency.pressure_eviction_count, 1);
+        assert_eq!(
+            metrics.scratch_residency.pressure_evicted_estimated_bytes,
+            400
+        );
+        assert_eq!(
+            metrics.scratch_residency.protected_pressure_eviction_count,
+            1
+        );
+        assert_eq!(
+            metrics
+                .scratch_residency
+                .protected_pressure_evicted_estimated_bytes,
+            400
+        );
+        return_at(&mut pool, replacement, base + Duration::from_millis(1));
+    }
+
+    #[test]
+    fn pressure_eviction_never_reclaims_active_scratch_or_underflows_bytes() {
+        let base = Instant::now();
+        let mut pool = EffectResourcePool::with_budget(400).expect("test budget is valid");
+        let active = acquire_scratch_at(&mut pool, 10, 10, base);
+        let result =
+            pool.checkout_with_purpose_at(key(10, 10), EffectTexturePurpose::Capture, None);
+
+        assert!(matches!(
+            result,
+            Err(super::super::EffectResourceError::BudgetExceeded { .. })
+        ));
+        assert!(
+            pool.textures
+                .values()
+                .flatten()
+                .any(|texture| texture.id == active.id && texture.checked_out)
+        );
+        assert_eq!(pool.current_bytes, 400);
+        assert_eq!(pool.metrics().current_bytes, 400);
+        assert_eq!(pool.metrics().retirement_count, 0);
+        assert_eq!(pool.pressure_evicted_estimated_bytes, 0);
+    }
+
+    #[test]
+    fn exact_key_scratch_reuse_precedes_pressure_eviction() {
+        let base = Instant::now();
+        let mut pool = EffectResourcePool::with_budget(400).expect("test budget is valid");
+        let cached = allocate_and_return_scratch(&mut pool, 10, 10, base);
+        let reused = pool
+            .checkout_with_purpose_at(key(10, 10), EffectTexturePurpose::Scratch, None)
+            .expect("exact key hits before pressure eviction");
+
+        assert_eq!(reused.id, cached.id);
+        assert_eq!(pool.eviction_count, 0);
+        assert_eq!(pool.current_bytes, 400);
+        assert_eq!(pool.allocation_count, 1);
+        assert_eq!(pool.reuse_count, 1);
+    }
 }

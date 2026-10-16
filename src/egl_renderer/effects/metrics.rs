@@ -24,6 +24,21 @@ pub(crate) struct EffectResourceMetrics {
     pub capture_bytes: u64,
 }
 
+impl EffectResourceMetrics {
+    pub(crate) fn scratch_residency_live_snapshot(
+        self,
+    ) -> crate::gpu_residency::EffectScratchResidencyLiveSnapshot {
+        crate::gpu_residency::EffectScratchResidencyLiveSnapshot {
+            owner_generation: self.generation,
+            active_count: u64::try_from(self.active_scratch_count).unwrap_or(u64::MAX),
+            active_bytes: self.active_scratch_bytes,
+            reusable_count: u64::try_from(self.reusable_scratch_count).unwrap_or(u64::MAX),
+            reusable_bytes: self.reusable_scratch_bytes,
+            policy: self.scratch_residency,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum EffectFailureReason {
     GraphCompile,

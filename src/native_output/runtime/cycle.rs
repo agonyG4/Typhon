@@ -1096,6 +1096,31 @@ impl NativeRuntime {
         cycle: &NativeCycleState,
         render_attempted: bool,
     ) -> NativeResult<()> {
+        let maintenance_now = std::time::Instant::now();
+        let scratch_maintenance_due = self
+            .scanout
+            .next_effect_scratch_maintenance_deadline()
+            .is_some_and(|deadline| deadline <= maintenance_now);
+        if scratch_maintenance_due {
+            // This shared cycle tail follows pageflip settlement, input and
+            // protocol work, and any frame/render work selected for the wake.
+            // One bounded batch runs here, then the normal wake arbiter is
+            // refreshed before the reactor can wait on a now-stale deadline.
+            let phase_start_ns = self
+                .slow_cycle_trace
+                .enabled()
+                .then(monotonic_now_ns)
+                .transpose()?;
+            self.scanout.maintain_effect_scratch(maintenance_now)?;
+            if let Some(start_ns) = phase_start_ns {
+                self.slow_cycle_trace.record_phase(
+                    SlowCyclePhase::PostWakeMaintenance,
+                    start_ns,
+                    monotonic_now_ns()?,
+                );
+            }
+            self.arm_runtime_deadline()?;
+        }
         self.flush_presentation_trace();
         if !self.slow_cycle_trace.enabled() {
             return Ok(());

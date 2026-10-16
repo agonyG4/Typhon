@@ -311,6 +311,14 @@ impl AtomicRenderDomain {
         Ok(())
     }
 
+    pub(super) fn effect_scratch_residency_snapshot(
+        &self,
+    ) -> Option<crate::gpu_residency::EffectScratchResidencyLiveSnapshot> {
+        self.scene
+            .as_ref()
+            .map(GlesSceneRenderer::effect_scratch_residency_snapshot)
+    }
+
     pub(super) fn activate_context(&self) -> io::Result<()> {
         let native_display = self
             .native_display

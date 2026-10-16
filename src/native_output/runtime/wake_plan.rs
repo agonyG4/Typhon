@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use crate::native_output::kms_worker::KmsCommitWorkerTransport;
 use oblivion_one::native::event_loop::NativeEventLoop;
 pub(crate) use oblivion_one::native::event_loop::{
@@ -39,9 +41,10 @@ pub(crate) enum NativeDeadlineOwner {
     DmabufRetry,
     OutputConfiguration,
     KeyboardRepeat,
+    ScratchMaintenance,
 }
 
-const DEADLINE_OWNER_COUNT: usize = 14;
+const DEADLINE_OWNER_COUNT: usize = 15;
 
 const fn deadline_owner_index(owner: NativeDeadlineOwner) -> usize {
     match owner {
@@ -59,6 +62,7 @@ const fn deadline_owner_index(owner: NativeDeadlineOwner) -> usize {
         NativeDeadlineOwner::SystemActionTransport => 11,
         NativeDeadlineOwner::CursorPlanningRetry => 12,
         NativeDeadlineOwner::CursorSynchronousAdmission => 13,
+        NativeDeadlineOwner::ScratchMaintenance => 14,
     }
 }
 
@@ -114,6 +118,7 @@ pub(crate) struct NativeWakePlanInputs {
     pub(crate) dmabuf_retry_deadline_ns: Option<u64>,
     pub(crate) output_configuration_deadline_ns: Option<u64>,
     pub(crate) keyboard_repeat_deadline_ns: Option<u64>,
+    pub(crate) scratch_maintenance_deadline_ns: Option<u64>,
     pub(crate) input_backlog: bool,
     pub(crate) astrea_publication: bool,
     pub(crate) commit_timing_planning: bool,
@@ -151,6 +156,7 @@ pub(crate) struct NativeWakeAuthorityMetrics {
     pub(crate) deadline_owner_dmabuf_retry: u64,
     pub(crate) deadline_owner_output_configuration: u64,
     pub(crate) deadline_owner_keyboard_repeat: u64,
+    pub(crate) deadline_owner_scratch_maintenance: u64,
 }
 
 impl NativeWakeAuthorityMetrics {
@@ -272,6 +278,10 @@ impl NativeWakeAuthorityMetrics {
                         self.deadline_owner_keyboard_repeat =
                             self.deadline_owner_keyboard_repeat.saturating_add(1)
                     }
+                    NativeDeadlineOwner::ScratchMaintenance => {
+                        self.deadline_owner_scratch_maintenance =
+                            self.deadline_owner_scratch_maintenance.saturating_add(1)
+                    }
                 }
             }
             None => {
@@ -297,7 +307,7 @@ impl NativeWakeAuthorityMetrics {
 
     pub(crate) fn summary_line(&self, event_loop: &NativeEventLoop) -> String {
         format!(
-            "event=native_wake_authority_summary runtime_timer_arms={} runtime_timer_disarms={} runtime_continuation_requests={} runtime_continuation_coalesced={} runtime_continuation_wakes={} input_backlog_continuations={} astrea_publication_continuations={} commit_timing_planning_continuations={} xwayland_continuations={} control_timeout_continuations={} scene_visual_debt_continuations={} frame_scheduler_continuations={} scene_visual_debt_without_wake_owner={} stale_deadline_rearms={} past_deadline_arms={} stale_frame_scheduler={} stale_presentation_target={} stale_atomic_watchdog={} stale_explicit_sync={} stale_xwayland={} stale_cursor={} stale_cursor_planning_retry={} stale_cursor_sync_admission={} stale_control={} stale_surface_pacing={} stale_dmabuf_retry={} stale_output_configuration={} stale_keyboard_repeat={} past_frame_scheduler={} past_presentation_target={} past_atomic_watchdog={} past_explicit_sync={} past_xwayland={} past_cursor={} past_cursor_planning_retry={} past_cursor_sync_admission={} past_control={} past_surface_pacing={} past_dmabuf_retry={} past_output_configuration={} past_keyboard_repeat={} deadline_owner_frame_scheduler={} deadline_owner_presentation_target={} deadline_owner_atomic_watchdog={} deadline_owner_explicit_sync={} deadline_owner_xwayland={} deadline_owner_cursor={} deadline_owner_cursor_planning_retry={} deadline_owner_cursor_sync_admission={} deadline_owner_control={} deadline_owner_surface_pacing={} deadline_owner_dmabuf_retry={} deadline_owner_output_configuration={} deadline_owner_keyboard_repeat={}",
+            "event=native_wake_authority_summary runtime_timer_arms={} runtime_timer_disarms={} runtime_continuation_requests={} runtime_continuation_coalesced={} runtime_continuation_wakes={} input_backlog_continuations={} astrea_publication_continuations={} commit_timing_planning_continuations={} xwayland_continuations={} control_timeout_continuations={} scene_visual_debt_continuations={} frame_scheduler_continuations={} scene_visual_debt_without_wake_owner={} stale_deadline_rearms={} past_deadline_arms={} stale_frame_scheduler={} stale_presentation_target={} stale_atomic_watchdog={} stale_explicit_sync={} stale_xwayland={} stale_cursor={} stale_cursor_planning_retry={} stale_cursor_sync_admission={} stale_control={} stale_surface_pacing={} stale_dmabuf_retry={} stale_output_configuration={} stale_keyboard_repeat={} stale_scratch_maintenance={} past_frame_scheduler={} past_presentation_target={} past_atomic_watchdog={} past_explicit_sync={} past_xwayland={} past_cursor={} past_cursor_planning_retry={} past_cursor_sync_admission={} past_control={} past_surface_pacing={} past_dmabuf_retry={} past_output_configuration={} past_keyboard_repeat={} past_scratch_maintenance={} deadline_owner_frame_scheduler={} deadline_owner_presentation_target={} deadline_owner_atomic_watchdog={} deadline_owner_explicit_sync={} deadline_owner_xwayland={} deadline_owner_cursor={} deadline_owner_cursor_planning_retry={} deadline_owner_cursor_sync_admission={} deadline_owner_control={} deadline_owner_surface_pacing={} deadline_owner_dmabuf_retry={} deadline_owner_output_configuration={} deadline_owner_keyboard_repeat={} deadline_owner_scratch_maintenance={}",
             self.runtime_timer_arms,
             self.runtime_timer_disarms,
             event_loop.continuation_requests(),
@@ -339,6 +349,8 @@ impl NativeWakeAuthorityMetrics {
                 [deadline_owner_index(NativeDeadlineOwner::OutputConfiguration)],
             self.stale_deadline_arms_by_owner
                 [deadline_owner_index(NativeDeadlineOwner::KeyboardRepeat)],
+            self.stale_deadline_arms_by_owner
+                [deadline_owner_index(NativeDeadlineOwner::ScratchMaintenance)],
             self.past_deadline_arms_by_owner
                 [deadline_owner_index(NativeDeadlineOwner::FrameScheduler)],
             self.past_deadline_arms_by_owner
@@ -365,6 +377,8 @@ impl NativeWakeAuthorityMetrics {
                 [deadline_owner_index(NativeDeadlineOwner::OutputConfiguration)],
             self.past_deadline_arms_by_owner
                 [deadline_owner_index(NativeDeadlineOwner::KeyboardRepeat)],
+            self.past_deadline_arms_by_owner
+                [deadline_owner_index(NativeDeadlineOwner::ScratchMaintenance)],
             self.deadline_owner_frame_scheduler,
             self.deadline_owner_presentation_target,
             self.deadline_owner_atomic_watchdog,
@@ -378,6 +392,7 @@ impl NativeWakeAuthorityMetrics {
             self.deadline_owner_dmabuf_retry,
             self.deadline_owner_output_configuration,
             self.deadline_owner_keyboard_repeat,
+            self.deadline_owner_scratch_maintenance,
         )
     }
 }
@@ -385,6 +400,15 @@ impl NativeWakeAuthorityMetrics {
 pub(crate) fn build_native_wake_plan(inputs: NativeWakePlanInputs) -> NativeWakePlan {
     let mut continuation = NativeContinuationReasons::default();
     let mut deadline = inputs.scheduler_wake_requirement.deadline();
+    deadline = earliest_deadline(
+        deadline,
+        inputs
+            .scratch_maintenance_deadline_ns
+            .map(|at_ns| NativeDeadline {
+                owner: NativeDeadlineOwner::ScratchMaintenance,
+                at_ns,
+            }),
+    );
     if matches!(
         inputs.scheduler_wake_requirement,
         NativeSchedulerWakeRequirement::ImmediatePresentation { .. }
@@ -617,6 +641,16 @@ const fn earliest_deadline(
         (None, Some(candidate)) => Some(candidate),
         (current, None) => current,
     }
+}
+
+pub(crate) fn instant_deadline_to_monotonic_ns(
+    deadline: Instant,
+    now: Instant,
+    now_ns: u64,
+) -> u64 {
+    let remaining_ns =
+        u64::try_from(deadline.saturating_duration_since(now).as_nanos()).unwrap_or(u64::MAX);
+    now_ns.saturating_add(remaining_ns)
 }
 
 #[cfg(test)]
@@ -1417,6 +1451,153 @@ mod tests {
                 owner: NativeDeadlineOwner::PresentationTarget,
                 at_ns: 2_000,
             })
+        );
+    }
+
+    #[test]
+    fn future_scratch_deadline_joins_the_shared_earliest_deadline_arbitration() {
+        let plan = build_native_wake_plan(NativeWakePlanInputs {
+            now_ns: 10,
+            scratch_maintenance_deadline_ns: Some(50),
+            ..NativeWakePlanInputs::default()
+        });
+
+        assert_eq!(
+            plan.deadline,
+            Some(NativeDeadline {
+                owner: NativeDeadlineOwner::ScratchMaintenance,
+                at_ns: 50,
+            })
+        );
+    }
+
+    #[test]
+    fn earlier_frame_deadline_wins_over_later_scratch_maintenance() {
+        let plan = build_native_wake_plan(NativeWakePlanInputs {
+            scheduler_wake_requirement: NativeSchedulerWakeRequirement::Deadline(NativeDeadline {
+                owner: NativeDeadlineOwner::PresentationTarget,
+                at_ns: 40,
+            }),
+            scratch_maintenance_deadline_ns: Some(50),
+            ..NativeWakePlanInputs::default()
+        });
+
+        assert_eq!(
+            plan.deadline,
+            Some(NativeDeadline {
+                owner: NativeDeadlineOwner::PresentationTarget,
+                at_ns: 40,
+            })
+        );
+    }
+
+    #[test]
+    fn earlier_scratch_deadline_wins_over_later_presentation_deadline() {
+        let plan = build_native_wake_plan(NativeWakePlanInputs {
+            scheduler_wake_requirement: NativeSchedulerWakeRequirement::Deadline(NativeDeadline {
+                owner: NativeDeadlineOwner::PresentationTarget,
+                at_ns: 60,
+            }),
+            scratch_maintenance_deadline_ns: Some(50),
+            ..NativeWakePlanInputs::default()
+        });
+
+        assert_eq!(
+            plan.deadline,
+            Some(NativeDeadline {
+                owner: NativeDeadlineOwner::ScratchMaintenance,
+                at_ns: 50,
+            })
+        );
+    }
+
+    #[test]
+    fn scratch_maintenance_has_an_independent_wake_authority_metric() {
+        let plan = build_native_wake_plan(NativeWakePlanInputs {
+            now_ns: 10,
+            scratch_maintenance_deadline_ns: Some(50),
+            ..NativeWakePlanInputs::default()
+        });
+        let mut metrics = NativeWakeAuthorityMetrics::default();
+        metrics.observe_plan(plan, 10, None, None);
+
+        assert_eq!(metrics.deadline_owner_scratch_maintenance, 1);
+        assert_eq!(
+            metrics.stale_deadline_arms_by_owner
+                [deadline_owner_index(NativeDeadlineOwner::ScratchMaintenance)],
+            0
+        );
+        assert!(
+            metrics
+                .summary_line(&NativeEventLoop::new().unwrap())
+                .contains("deadline_owner_scratch_maintenance=1")
+        );
+    }
+
+    #[test]
+    fn no_scratch_deadline_arms_no_scratch_timer() {
+        let plan = build_native_wake_plan(NativeWakePlanInputs::default());
+        assert_eq!(plan.deadline, None);
+    }
+
+    #[test]
+    fn due_scratch_deadline_is_removed_or_replaced_after_one_maintenance_opportunity() {
+        let due_plan = build_native_wake_plan(NativeWakePlanInputs {
+            now_ns: 100,
+            scratch_maintenance_deadline_ns: Some(100),
+            ..NativeWakePlanInputs::default()
+        });
+        assert_eq!(
+            due_plan.deadline,
+            Some(NativeDeadline {
+                owner: NativeDeadlineOwner::ScratchMaintenance,
+                at_ns: 100,
+            })
+        );
+
+        let converged_plan = build_native_wake_plan(NativeWakePlanInputs {
+            now_ns: 101,
+            ..NativeWakePlanInputs::default()
+        });
+        assert_eq!(converged_plan.deadline, None);
+
+        let continued_plan = build_native_wake_plan(NativeWakePlanInputs {
+            now_ns: 101,
+            scratch_maintenance_deadline_ns: Some(101 + 5_000_000),
+            ..NativeWakePlanInputs::default()
+        });
+        assert_eq!(continued_plan.deadline.unwrap().at_ns, 5_000_101);
+    }
+
+    #[test]
+    fn immediate_frame_scheduler_work_remains_a_continuation_ahead_of_maintenance() {
+        let plan = build_native_wake_plan(NativeWakePlanInputs {
+            scheduler_wake_requirement: NativeSchedulerWakeRequirement::ImmediatePresentation {
+                action: SchedulerDecision::Render,
+            },
+            scratch_maintenance_deadline_ns: Some(100),
+            ..NativeWakePlanInputs::default()
+        });
+
+        assert!(
+            plan.continuation
+                .contains(NativeContinuationReason::FrameScheduler)
+        );
+        assert_eq!(
+            plan.deadline.map(|deadline| deadline.owner),
+            Some(NativeDeadlineOwner::ScratchMaintenance)
+        );
+    }
+
+    #[test]
+    fn instant_scratch_deadline_conversion_is_relative_and_saturating() {
+        let now = std::time::Instant::now();
+        let future = instant_deadline_to_monotonic_ns(now + Duration::from_millis(2), now, 1_000);
+        assert!((2_000_000..=2_000_001).contains(&future.saturating_sub(1_000)));
+        assert_eq!(instant_deadline_to_monotonic_ns(now, now, 7_000), 7_000);
+        assert_eq!(
+            instant_deadline_to_monotonic_ns(now, now, u64::MAX),
+            u64::MAX
         );
     }
 }

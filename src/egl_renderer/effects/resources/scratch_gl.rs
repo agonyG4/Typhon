@@ -24,6 +24,12 @@ impl super::EffectGlResourceCache {
         metrics
     }
 
+    pub(crate) fn effect_scratch_residency_snapshot(
+        &self,
+    ) -> crate::gpu_residency::EffectScratchResidencyLiveSnapshot {
+        self.metrics().scratch_residency_live_snapshot()
+    }
+
     pub(crate) fn set_scratch_residency_publisher(
         &mut self,
         publisher: Option<
@@ -180,6 +186,11 @@ mod tests {
         for texture in cached_gl_textures {
             assert!(!unsafe { harness.gl.is_texture(texture) });
         }
+        let cold_snapshot = cache.effect_scratch_residency_snapshot();
+        assert_eq!(cold_snapshot.reusable_count, 0);
+        assert_eq!(cold_snapshot.reusable_bytes, 0);
+        assert_eq!(cold_snapshot.policy.pool_current_estimated_bytes, 0);
+        assert_eq!(cache.next_scratch_maintenance_deadline(), None);
 
         let cold_restart = cache
             .acquire(&harness.gl, make_key(10))
@@ -230,5 +241,248 @@ mod tests {
             .release(immediately_reused)
             .expect("reused cold scratch returns");
         cache.destroy(&harness.gl);
+    }
+
+    #[test]
+    fn partial_cold_maintenance_rearms_once_after_a_bounded_batch() {
+        let harness = crate::egl_renderer::tests::GlesEffectTestHarness::new(16, 16);
+        let mut cache = EffectGlResourceCache::new();
+        let make_key = |size| {
+            EffectTextureKey::new(
+                size,
+                size,
+                EffectTextureFormat::Rgba8,
+                EffectTextureFilter::Nearest,
+                EffectWorkingSpace::OutputEncodedSrgb,
+            )
+        };
+        for size in 4..22 {
+            let texture = cache
+                .acquire(&harness.gl, make_key(size))
+                .expect("scratch texture realizes");
+            cache.release(texture).expect("scratch texture returns");
+        }
+
+        let warm_deadline = cache
+            .next_scratch_maintenance_deadline()
+            .expect("scratch activity arms maintenance");
+        assert!(!cache.maintain_scratch(
+            &harness.gl,
+            warm_deadline + std::time::Duration::from_millis(1),
+        ));
+        let cold_deadline = cache
+            .next_scratch_maintenance_deadline()
+            .expect("cold-idle deadline remains after warm convergence");
+        let first_batch_at = cold_deadline + std::time::Duration::from_millis(1);
+
+        assert!(cache.maintain_scratch(&harness.gl, first_batch_at));
+        assert_eq!(cache.pool.metrics().reusable_scratch_count, 2);
+        let continuation_deadline = cache
+            .next_scratch_maintenance_deadline()
+            .expect("partial cold trim rearms one continuation");
+        assert_eq!(
+            continuation_deadline,
+            first_batch_at + std::time::Duration::from_millis(5)
+        );
+
+        assert!(!cache.maintain_scratch(&harness.gl, continuation_deadline));
+        assert_eq!(cache.pool.metrics().reusable_scratch_count, 0);
+        assert_eq!(cache.next_scratch_maintenance_deadline(), None);
+        cache.destroy(&harness.gl);
+    }
+
+    #[test]
+    fn cold_maintenance_keeps_active_gl_scratch_until_it_is_returned() {
+        let harness = crate::egl_renderer::tests::GlesEffectTestHarness::new(16, 16);
+        let mut cache = EffectGlResourceCache::new();
+        let key = EffectTextureKey::new(
+            8,
+            8,
+            EffectTextureFormat::Rgba8,
+            EffectTextureFilter::Nearest,
+            EffectWorkingSpace::OutputEncodedSrgb,
+        );
+        let active = cache
+            .acquire(&harness.gl, key)
+            .expect("active scratch realizes");
+        let texture = cache.gl_textures[&active.id];
+        let warm_deadline = cache
+            .next_scratch_maintenance_deadline()
+            .expect("active scratch schedules warm maintenance");
+        assert!(!cache.maintain_scratch(
+            &harness.gl,
+            warm_deadline + std::time::Duration::from_millis(1),
+        ));
+        let cold_deadline = cache
+            .next_scratch_maintenance_deadline()
+            .expect("active scratch still schedules cold convergence");
+        let cold_now = cold_deadline + std::time::Duration::from_millis(1);
+
+        assert!(!cache.maintain_scratch(&harness.gl, cold_now));
+        assert!(cache.pool.is_checked_out(active.id));
+        assert!(unsafe { harness.gl.is_texture(texture) });
+        assert_eq!(cache.next_scratch_maintenance_deadline(), None);
+
+        cache.release(active).expect("active scratch returns");
+        let returned_deadline = cache
+            .next_scratch_maintenance_deadline()
+            .expect("returning active scratch re-arms cold cleanup");
+        assert!(returned_deadline <= cold_now);
+        assert!(!cache.maintain_scratch(&harness.gl, cold_now));
+        assert!(!unsafe { harness.gl.is_texture(texture) });
+        assert_eq!(cache.pool.metrics().reusable_scratch_count, 0);
+        assert_eq!(cache.next_scratch_maintenance_deadline(), None);
+        cache.destroy(&harness.gl);
+    }
+
+    #[test]
+    fn synchronous_scene_renderer_warm_and_cold_maintenance_preserves_then_converges() {
+        let mut harness = crate::egl_renderer::tests::GlesEffectTestHarness::new(16, 16);
+        let make_key = |size| {
+            EffectTextureKey::new(
+                size,
+                size,
+                EffectTextureFormat::Rgba8,
+                EffectTextureFilter::Nearest,
+                EffectWorkingSpace::OutputEncodedSrgb,
+            )
+        };
+        let stale = harness
+            .renderer
+            .effect_runtime
+            .effect_resources
+            .acquire(&harness.gl, make_key(8))
+            .expect("stale renderer scratch allocates");
+        let stale_id = stale.id;
+        harness
+            .renderer
+            .effect_runtime
+            .effect_resources
+            .release(stale)
+            .expect("stale renderer scratch returns");
+        let warm_deadline = harness
+            .renderer
+            .next_scratch_maintenance_deadline()
+            .expect("synchronous renderer exposes its scratch deadline");
+
+        harness
+            .renderer
+            .effect_runtime
+            .effect_resources
+            .begin_scratch_activity_frame();
+        let previous = harness
+            .renderer
+            .effect_runtime
+            .effect_resources
+            .acquire(&harness.gl, make_key(9))
+            .expect("previous epoch scratch allocates");
+        let previous_id = previous.id;
+        harness
+            .renderer
+            .effect_runtime
+            .effect_resources
+            .release(previous)
+            .expect("previous epoch scratch returns");
+        harness
+            .renderer
+            .effect_runtime
+            .effect_resources
+            .begin_scratch_activity_frame();
+        let latest = harness
+            .renderer
+            .effect_runtime
+            .effect_resources
+            .acquire(&harness.gl, make_key(10))
+            .expect("latest epoch scratch allocates");
+        let latest_id = latest.id;
+        harness
+            .renderer
+            .effect_runtime
+            .effect_resources
+            .release(latest)
+            .expect("latest epoch scratch returns");
+
+        assert!(
+            !harness
+                .renderer
+                .maintain_effect_scratch(warm_deadline + std::time::Duration::from_millis(1))
+        );
+        let warm_snapshot = harness.renderer.effect_scratch_residency_snapshot();
+        assert_eq!(warm_snapshot.active_count, 0);
+        assert_eq!(warm_snapshot.reusable_count, 2);
+        assert_eq!(warm_snapshot.policy.warm_reclaimed_texture_count, 1);
+        assert!(
+            !harness
+                .renderer
+                .effect_runtime
+                .effect_resources
+                .gl_textures
+                .contains_key(&stale_id)
+        );
+        assert!(
+            harness
+                .renderer
+                .effect_runtime
+                .effect_resources
+                .gl_textures
+                .contains_key(&previous_id)
+        );
+        assert!(
+            harness
+                .renderer
+                .effect_runtime
+                .effect_resources
+                .gl_textures
+                .contains_key(&latest_id)
+        );
+
+        let active = harness
+            .renderer
+            .effect_runtime
+            .effect_resources
+            .acquire(&harness.gl, make_key(10))
+            .expect("protected latest scratch reuses");
+        assert_eq!(active.id, latest_id);
+        let cold_deadline = harness
+            .renderer
+            .next_scratch_maintenance_deadline()
+            .expect("renderer keeps its cold deadline");
+        assert!(
+            !harness
+                .renderer
+                .maintain_effect_scratch(cold_deadline + std::time::Duration::from_millis(1))
+        );
+        let active_snapshot = harness.renderer.effect_scratch_residency_snapshot();
+        assert_eq!(active_snapshot.active_count, 1);
+        assert_eq!(active_snapshot.reusable_count, 0);
+        assert!(
+            harness
+                .renderer
+                .effect_runtime
+                .effect_resources
+                .gl_textures
+                .contains_key(&latest_id)
+        );
+        assert_eq!(harness.renderer.next_scratch_maintenance_deadline(), None);
+
+        harness
+            .renderer
+            .effect_runtime
+            .effect_resources
+            .release(active)
+            .expect("active scratch returns");
+        let returned_deadline = harness
+            .renderer
+            .next_scratch_maintenance_deadline()
+            .expect("renderer re-arms cleanup after the active lease returns");
+        assert!(!harness.renderer.maintain_effect_scratch(returned_deadline));
+        let cold_snapshot = harness.renderer.effect_scratch_residency_snapshot();
+        assert_eq!(cold_snapshot.active_count, 0);
+        assert_eq!(cold_snapshot.reusable_count, 0);
+        assert_eq!(cold_snapshot.reusable_bytes, 0);
+        assert_eq!(cold_snapshot.policy.pool_current_estimated_bytes, 0);
+        assert_eq!(cold_snapshot.policy.cold_reclaim_events, 2);
+        assert_eq!(cold_snapshot.policy.cold_reclaimed_texture_count, 2);
+        assert_eq!(harness.renderer.next_scratch_maintenance_deadline(), None);
     }
 }

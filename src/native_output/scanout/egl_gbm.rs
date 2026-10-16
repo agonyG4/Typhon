@@ -356,8 +356,9 @@ fn finish_render_work_on_error<T, E>(
 
 #[cfg(test)]
 mod lifecycle_render_completion_tests {
-    use super::finish_render_work_on_error;
+    use super::{finish_render_work_on_error, maintain_scratch_after_context_activation};
     use std::cell::Cell;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn failed_post_draw_operation_finishes_render_work_before_error_propagates() {
@@ -380,11 +381,88 @@ mod lifecycle_render_completion_tests {
         assert_eq!(result, Ok(7));
         assert_eq!(finish_count.get(), 0);
     }
+
+    #[test]
+    fn compatibility_scratch_deletion_waits_for_context_activation() {
+        let phase = Cell::new(0);
+        let now = Instant::now();
+        let maintained = maintain_scratch_after_context_activation(
+            Some(now),
+            now,
+            || {
+                assert_eq!(phase.get(), 0);
+                phase.set(1);
+                Ok(())
+            },
+            |_| {
+                assert_eq!(phase.get(), 1);
+                phase.set(2);
+            },
+        )
+        .expect("maintenance succeeds after the context is current");
+
+        assert!(maintained);
+        assert_eq!(phase.get(), 2);
+        assert!(
+            !maintain_scratch_after_context_activation(
+                Some(now + Duration::from_secs(1)),
+                now,
+                || panic!("a future deadline must not activate the context"),
+                |_| panic!("a future deadline must not destroy resources"),
+            )
+            .expect("future maintenance is a no-op")
+        );
+    }
+}
+
+fn maintain_scratch_after_context_activation(
+    deadline: Option<std::time::Instant>,
+    now: std::time::Instant,
+    make_current: impl FnOnce() -> io::Result<()>,
+    maintain: impl FnOnce(std::time::Instant),
+) -> io::Result<bool> {
+    if !deadline.is_some_and(|deadline| deadline <= now) {
+        return Ok(false);
+    }
+    make_current()?;
+    maintain(now);
+    Ok(true)
 }
 
 impl NativeEglGbmScanout {
     pub(crate) fn finish_render_work(&self) {
         self.scene.finish_render_work();
+    }
+
+    pub(crate) fn next_effect_scratch_maintenance_deadline(&self) -> Option<std::time::Instant> {
+        self.scene.next_scratch_maintenance_deadline()
+    }
+
+    pub(crate) fn maintain_effect_scratch(&mut self, now: std::time::Instant) -> io::Result<()> {
+        let deadline = self.scene.next_scratch_maintenance_deadline();
+        let egl = &self.egl;
+        let display = self.egl_display;
+        let surface = self.egl_surface;
+        let context = self.egl_context;
+        let scene = &mut self.scene;
+        let _ = maintain_scratch_after_context_activation(
+            deadline,
+            now,
+            || {
+                egl.make_current(display, Some(surface), Some(surface), Some(context))
+                    .map_err(native_egl_io_error)
+            },
+            |now| {
+                scene.maintain_effect_scratch(now);
+            },
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn effect_scratch_residency_snapshot(
+        &self,
+    ) -> crate::gpu_residency::EffectScratchResidencyLiveSnapshot {
+        self.scene.effect_scratch_residency_snapshot()
     }
 
     pub(crate) fn lifecycle_animation_available(&self) -> bool {
