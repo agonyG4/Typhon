@@ -1007,6 +1007,8 @@ pub struct CompositorState {
     astrea_shell_authenticated_clients: HashSet<ClientId>,
     astrea_screen_captures: HashMap<ClientId, AstreaScreenCapturePending>,
     astrea_shell_client_pids: HashSet<u32>,
+    // Start-time identity for the selection exception; PID alone is reusable.
+    astrea_shell_registered_process_start_times: HashMap<u32, u64>,
     astrea_shell_capability_verifier:
         Option<astrea_shell_capability::AstreaShellCapabilityVerifier>,
     typhon_socket_name: Option<String>,

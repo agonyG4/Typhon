@@ -578,7 +578,7 @@ impl CompositorState {
         serial: u32,
     ) -> bool {
         if !self.client_has_keyboard_focus(client_id)
-            && !self.astrea_shell_client_allowed(client, handle)
+            && !self.astrea_shell_clipboard_client_allowed(client, handle)
         {
             self.note_selection_admission_rejection(
                 SelectionKind::Clipboard,

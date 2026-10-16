@@ -166,16 +166,26 @@ const ASTREA_SHELL_PID_ANCESTOR_LIMIT: usize = 32;
 impl CompositorState {
     pub(in crate::compositor) fn authorize_astrea_shell_pid(&mut self, pid: u32) {
         self.astrea_shell_client_pids.insert(pid);
+        if let Some(start_time) = proc_process_start_time(pid) {
+            self.astrea_shell_registered_process_start_times
+                .insert(pid, start_time);
+        } else {
+            self.astrea_shell_registered_process_start_times
+                .remove(&pid);
+        }
     }
 
     pub(in crate::compositor) fn revoke_astrea_shell_pid(&mut self, pid: u32) {
         self.astrea_shell_client_pids.remove(&pid);
+        self.astrea_shell_registered_process_start_times
+            .remove(&pid);
     }
 
     #[cfg(test)]
     pub(in crate::compositor) fn clear_astrea_shell_authorization(&mut self) {
         self.astrea_shell_authenticated_clients.clear();
         self.astrea_shell_client_pids.clear();
+        self.astrea_shell_registered_process_start_times.clear();
         self.astrea_toplevel_authorized_clients.clear();
     }
 
@@ -242,6 +252,33 @@ impl CompositorState {
                 pid,
                 &self.astrea_shell_client_pids,
                 proc_parent_pid,
+            )
+    }
+
+    pub(in crate::compositor) fn astrea_shell_clipboard_client_allowed(
+        &self,
+        client: &Client,
+        handle: &DisplayHandle,
+    ) -> bool {
+        // Qt's native clipboard can use a separate Wayland connection from
+        // Astrea's authenticated private connection, but remains in the shell PID.
+        if self
+            .astrea_shell_authenticated_clients
+            .contains(&client.id())
+        {
+            return true;
+        }
+        let Ok(credentials) = client.get_credentials(handle) else {
+            return false;
+        };
+        let Ok(pid) = u32::try_from(credentials.pid) else {
+            return false;
+        };
+        credentials.uid == effective_uid()
+            && astrea_shell_pid_has_registered_identity_with_lookup(
+                pid,
+                &self.astrea_shell_registered_process_start_times,
+                proc_process_start_time,
             )
     }
 
@@ -387,6 +424,60 @@ fn proc_parent_pid(pid: u32) -> Option<u32> {
     let mut fields = fields_after_comm.split_whitespace();
     fields.next()?;
     fields.next()?.parse().ok()
+}
+
+fn proc_process_start_time(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let close_paren = stat.rfind(')')?;
+    stat.get(close_paren + 2..)?
+        .split_whitespace()
+        .nth(19)?
+        .parse()
+        .ok()
+}
+
+fn astrea_shell_pid_has_registered_identity_with_lookup(
+    pid: u32,
+    registered_start_times: &HashMap<u32, u64>,
+    mut process_start_time: impl FnMut(u32) -> Option<u64>,
+) -> bool {
+    let Some(registered_start_time) = registered_start_times.get(&pid) else {
+        return false;
+    };
+    process_start_time(pid) == Some(*registered_start_time)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clipboard_shell_authorization_requires_exact_live_process_identity() {
+        let mut registered_start_times = HashMap::from([(100_u32, 900_u64)]);
+
+        assert!(astrea_shell_pid_has_registered_identity_with_lookup(
+            100,
+            &registered_start_times,
+            |pid| (pid == 100).then_some(900),
+        ));
+        assert!(!astrea_shell_pid_has_registered_identity_with_lookup(
+            101,
+            &registered_start_times,
+            |pid| (pid == 101).then_some(901),
+        ));
+        assert!(!astrea_shell_pid_has_registered_identity_with_lookup(
+            100,
+            &registered_start_times,
+            |_| Some(901),
+        ));
+
+        registered_start_times.remove(&100);
+        assert!(!astrea_shell_pid_has_registered_identity_with_lookup(
+            100,
+            &registered_start_times,
+            |_| Some(900),
+        ));
+    }
 }
 
 fn effective_uid() -> u32 {

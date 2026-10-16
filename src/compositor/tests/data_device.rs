@@ -2,8 +2,10 @@ use super::*;
 use std::{fs::File, sync::Arc};
 use wayland_server::{Client, Display};
 
+const TEST_PNG_1X1_RGBA: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\rIDATx\x9c\x63\xf8\xcf\xc0\xf0\x1f\x00\x05\x00\x01\xff\x89\x99\x3d\x1d\x00\x00\x00\x00IEND\xae\x42\x60\x82";
+
 #[test]
-fn v3_source_can_offer_mime_after_start_drag_before_target_enter() {
+fn v3_drag_transfers_png_and_offers_uri_after_start_drag_before_target_enter() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();
     let socket_path = runtime_socket_path(&socket_name);
@@ -111,7 +113,8 @@ fn v3_source_can_offer_mime_after_start_drag_before_target_enter() {
     target_queue.roundtrip(&mut target_state).unwrap();
     assert_eq!(source_state.data_source_cancelled_count, 0);
 
-    source.offer("text/plain".to_string());
+    source.offer("image/png".to_string());
+    source.offer("text/uri-list".to_string());
     source.offer("text/plain".to_string());
     source_connection.flush().unwrap();
     source_queue
@@ -126,7 +129,74 @@ fn v3_source_can_offer_mime_after_start_drag_before_target_enter() {
     target_queue.roundtrip(&mut target_state).unwrap();
     source_queue.roundtrip(&mut source_state).unwrap();
     assert_eq!(target_state.data_device_enter_count, 1);
-    assert_eq!(target_state.data_offer_mime_types, vec!["text/plain"]);
+    assert_eq!(
+        target_state.data_offer_mime_types,
+        vec![
+            "image/png".to_string(),
+            "text/uri-list".to_string(),
+            "text/plain".to_string()
+        ]
+    );
+
+    let offer = target_state
+        .data_device_drag_offer
+        .clone()
+        .expect("destination must receive the screenshot DnD offer");
+    let enter_serial = target_state
+        .data_device_enter_serial
+        .expect("destination must receive the DnD enter serial");
+    offer.accept(enter_serial, Some("image/png".to_string()));
+    offer.set_actions(
+        client_wl_data_device_manager::DndAction::Copy,
+        client_wl_data_device_manager::DndAction::Copy,
+    );
+    target_connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    target_queue.roundtrip(&mut target_state).unwrap();
+    source_queue.roundtrip(&mut source_state).unwrap();
+
+    commands
+        .send(ServerCommand::PointerButton {
+            button: 0x110,
+            pressed: false,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    target_queue.roundtrip(&mut target_state).unwrap();
+    source_queue.roundtrip(&mut source_state).unwrap();
+    assert_eq!(target_state.data_device_drop_count, 1);
+
+    source_state.clipboard_payload = Some(TEST_PNG_1X1_RGBA.to_vec());
+    let (read_fd, write_fd) = owned_pipe().unwrap();
+    offer.receive("image/png".to_string(), write_fd.as_fd());
+    target_connection.flush().unwrap();
+    drop(write_fd);
+    wait_for_server_commands(&commands);
+    source_queue.roundtrip(&mut source_state).unwrap();
+    target_queue.roundtrip(&mut target_state).unwrap();
+    let mut transferred_png = Vec::new();
+    File::from(read_fd)
+        .read_to_end(&mut transferred_png)
+        .unwrap();
+    assert_eq!(transferred_png, TEST_PNG_1X1_RGBA);
+    assert!(transferred_png.starts_with(b"\x89PNG\r\n\x1a\n"));
+    assert_eq!(
+        u32::from_be_bytes(transferred_png[16..20].try_into().unwrap()),
+        1
+    );
+    assert_eq!(
+        u32::from_be_bytes(transferred_png[20..24].try_into().unwrap()),
+        1
+    );
+    assert_eq!(source_state.data_source_send_mime_types, ["image/png"]);
+
+    offer.finish();
+    target_connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    source_queue.roundtrip(&mut source_state).unwrap();
+    target_queue.roundtrip(&mut target_state).unwrap();
+    assert_eq!(source_state.data_source_dnd_finished_count, 1);
+    assert_eq!(source_state.data_source_cancelled_count, 0);
 
     let _server = stop_controllable_test_server(commands, server_thread);
 }
@@ -1771,6 +1841,57 @@ fn unfocused_untrusted_client_cannot_publish_clipboard_selection() {
     let socket_path = runtime_socket_path(&socket_name);
     let (commands, server_thread) = spawn_controllable_test_server(server);
 
+    let owner_connection =
+        Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (owner_globals, mut owner_queue) =
+        registry_queue_init::<RegistryTestState>(&owner_connection).unwrap();
+    let owner_qh = owner_queue.handle();
+    let owner_compositor: client_wl_compositor::WlCompositor =
+        owner_globals.bind(&owner_qh, 1..=6, ()).unwrap();
+    let owner_wm_base: client_xdg_wm_base::XdgWmBase =
+        owner_globals.bind(&owner_qh, 1..=6, ()).unwrap();
+    let owner_shm: client_wl_shm::WlShm = owner_globals.bind(&owner_qh, 1..=1, ()).unwrap();
+    let owner_seat: client_wl_seat::WlSeat = owner_globals.bind(&owner_qh, 1..=7, ()).unwrap();
+    let _owner_keyboard = owner_seat.get_keyboard(&owner_qh, ());
+    let owner_manager: client_wl_data_device_manager::WlDataDeviceManager =
+        owner_globals.bind(&owner_qh, 1..=3, ()).unwrap();
+    let owner_device = owner_manager.get_data_device(&owner_seat, &owner_qh, ());
+    let (owner_surface, owner_xdg_surface, _owner_toplevel) = create_test_buffered_toplevel(
+        &owner_compositor,
+        &owner_wm_base,
+        &owner_shm,
+        &owner_qh,
+        160,
+        120,
+    )
+    .unwrap();
+    let owner_source = owner_manager.create_data_source(&owner_qh, ());
+    owner_source.offer("image/png".to_string());
+    owner_surface.commit();
+    owner_connection.flush().unwrap();
+    let mut owner_state = RegistryTestState::default();
+    owner_queue.roundtrip(&mut owner_state).unwrap();
+    wait_for_server_commands(&commands);
+    commit_registered_initial_xdg_test_buffer(&owner_xdg_surface);
+    owner_connection.flush().unwrap();
+    owner_queue.roundtrip(&mut owner_state).unwrap();
+    wait_for_server_commands(&commands);
+
+    focus_root_window(&commands, owner_surface.id().protocol_id());
+    wait_for_server_commands(&commands);
+    owner_queue.roundtrip(&mut owner_state).unwrap();
+    assert!(owner_state.keyboard_enter_serial.is_some());
+    owner_device.set_selection(Some(&owner_source), 0);
+    owner_connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    owner_queue.roundtrip(&mut owner_state).unwrap();
+    let previous_owner_offer_id = owner_state
+        .data_device_selection_offer
+        .as_ref()
+        .map(|offer| offer.id().protocol_id());
+    let previous_owner = capture_clipboard_state(&commands);
+    assert!(previous_owner.active_source);
+
     let connection = Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
     let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
     let qh = queue.handle();
@@ -1782,19 +1903,141 @@ fn unfocused_untrusted_client_cannot_publish_clipboard_selection() {
     source.offer("image/png".to_string());
     connection.flush().unwrap();
 
-    let before = capture_clipboard_state(&commands);
     let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state).unwrap();
+    wait_for_server_commands(&commands);
+    let before = capture_clipboard_state(&commands);
+    assert_eq!(
+        before.source_count, 2,
+        "both data sources must be registered"
+    );
+    assert!(before.active_source);
+    owner_state.data_device_selection_events.clear();
+
     device.set_selection(Some(&source), 0);
     connection.flush().unwrap();
     queue.roundtrip(&mut state).unwrap();
+    wait_for_server_commands(&commands);
+    owner_queue.roundtrip(&mut owner_state).unwrap();
     let after = capture_clipboard_state(&commands);
+    let owner_offer_after_attempt = owner_state
+        .data_device_selection_offer
+        .as_ref()
+        .map(|offer| offer.id().protocol_id());
+    let forbidden_selection_events = owner_state.data_device_selection_events.clone();
 
     let _server = stop_controllable_test_server(commands, server_thread);
     assert_eq!(
         after, before,
         "an unfocused untrusted client must not replace selection"
     );
+    assert_eq!(after.generation, previous_owner.generation);
+    assert_eq!(after.mutation_epoch, previous_owner.mutation_epoch);
+    assert_eq!(owner_offer_after_attempt, previous_owner_offer_id);
+    assert!(
+        forbidden_selection_events.is_empty(),
+        "the focused clipboard client must not receive an offer from the rejected source"
+    );
     assert!(state.data_device_selection_events.is_empty());
+}
+
+#[test]
+fn unfocused_shell_descendant_cannot_publish_clipboard_selection() {
+    let socket_name = unique_socket_name();
+    let mut server = OwnCompositorServer::bind(&socket_name).unwrap();
+    server.authorize_astrea_shell_pid(std::process::id());
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let control_name = unique_socket_name();
+    let control_path = runtime_socket_path(&control_name);
+    let listener = std::os::unix::net::UnixListener::bind(&control_path).unwrap();
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("--ignored")
+        .arg("--nocapture")
+        .arg("compositor::tests::data_device::clipboard_selection_child_publisher")
+        .env(
+            "ASTREA_TEST_WAYLAND_SOCKET",
+            socket_path.to_string_lossy().as_ref(),
+        )
+        .env(
+            "ASTREA_TEST_CONTROL_SOCKET",
+            control_path.to_string_lossy().as_ref(),
+        )
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let (mut control, _) = listener.accept().unwrap();
+    let mut ready = [0_u8; 1];
+    std::io::Read::read_exact(&mut control, &mut ready).unwrap();
+    wait_for_server_commands(&commands);
+    let before = capture_clipboard_state(&commands);
+    let registered_before_attempt = before.source_count == 1;
+    std::io::Write::write_all(&mut control, b"P").unwrap();
+    let mut complete = [0_u8; 1];
+    std::io::Read::read_exact(&mut control, &mut complete).unwrap();
+    wait_for_server_commands(&commands);
+    let after = capture_clipboard_state(&commands);
+    std::io::Write::write_all(&mut control, b"R").unwrap();
+    let child_status = child.wait().unwrap();
+    wait_for_server_commands(&commands);
+
+    let _server = stop_controllable_test_server(commands, server_thread);
+    assert!(
+        registered_before_attempt,
+        "the child source must be registered before the baseline"
+    );
+    assert!(
+        child_status.success(),
+        "child Wayland publisher test must complete"
+    );
+    assert_eq!(
+        complete,
+        [b'D'],
+        "the child must attempt publication before the post-attempt snapshot"
+    );
+    assert_eq!(after.generation, before.generation);
+    assert_eq!(after.mutation_epoch, before.mutation_epoch);
+    assert_eq!(after.source_count, before.source_count);
+}
+
+#[test]
+#[ignore = "child mode is invoked by unfocused_shell_descendant_cannot_publish_clipboard_selection"]
+fn clipboard_selection_child_publisher() {
+    let (Ok(socket_path), Ok(control_path)) = (
+        std::env::var("ASTREA_TEST_WAYLAND_SOCKET"),
+        std::env::var("ASTREA_TEST_CONTROL_SOCKET"),
+    ) else {
+        return;
+    };
+
+    let connection = Connection::from_socket(UnixStream::connect(socket_path).unwrap()).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ()).unwrap();
+    let manager: client_wl_data_device_manager::WlDataDeviceManager =
+        globals.bind(&qh, 1..=3, ()).unwrap();
+    let device = manager.get_data_device(&seat, &qh, ());
+    let source = manager.create_data_source(&qh, ());
+    source.offer("image/png".to_string());
+    connection.flush().unwrap();
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state).unwrap();
+
+    let mut control = std::os::unix::net::UnixStream::connect(control_path).unwrap();
+    std::io::Write::write_all(&mut control, b"R").unwrap();
+    let mut publish = [0_u8; 1];
+    std::io::Read::read_exact(&mut control, &mut publish).unwrap();
+    assert_eq!(publish, [b'P']);
+    device.set_selection(Some(&source), 0);
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    std::io::Write::write_all(&mut control, b"D").unwrap();
+    let mut release = [0_u8; 1];
+    std::io::Read::read_exact(&mut control, &mut release).unwrap();
+    assert_eq!(release, [b'R']);
 }
 
 #[test]
@@ -1851,7 +2094,7 @@ fn authorized_astrea_shell_can_publish_clipboard_while_another_client_is_focused
     target_queue.roundtrip(&mut target_state).unwrap();
 
     assert!(target_state.keyboard_enter_serial.is_some());
-    shell_state.clipboard_payload = Some(b"valid source transfer payload".to_vec());
+    shell_state.clipboard_payload = Some(TEST_PNG_1X1_RGBA.to_vec());
     let clipboard_before = capture_clipboard_state(&commands);
     shell_device.set_selection(Some(&shell_source), 0);
     shell_connection.flush().unwrap();
@@ -1876,7 +2119,172 @@ fn authorized_astrea_shell_can_publish_clipboard_while_another_client_is_focused
     let _server = stop_controllable_test_server(commands, server_thread);
     assert!(clipboard_after.generation > clipboard_before.generation);
     assert_eq!(mime_types, ["image/png"]);
-    assert_eq!(transferred, b"valid source transfer payload");
+    assert_eq!(transferred, TEST_PNG_1X1_RGBA);
+    assert!(transferred.starts_with(b"\x89PNG\r\n\x1a\n"));
+    assert_eq!(
+        u32::from_be_bytes(transferred[16..20].try_into().unwrap()),
+        1
+    );
+    assert_eq!(
+        u32::from_be_bytes(transferred[20..24].try_into().unwrap()),
+        1
+    );
+}
+
+#[test]
+#[ignore = "requires screenshot-controller-test from the Eclipse Aether build tree"]
+fn qt_wayland_screenshot_clipboard_reaches_focused_destination() {
+    let helper_path = std::env::var_os("ASTREA_TEST_SCREENSHOT_QT_HELPER")
+        .expect("set ASTREA_TEST_SCREENSHOT_QT_HELPER to the Aether screenshot-controller-test");
+    let pictures_path = std::env::var_os("ASTREA_TEST_PICTURES_DIR")
+        .expect("set ASTREA_TEST_PICTURES_DIR to an Aether build-tree directory");
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let target_connection =
+        Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (target_globals, mut target_queue) =
+        registry_queue_init::<RegistryTestState>(&target_connection).unwrap();
+    let target_qh = target_queue.handle();
+    let compositor: client_wl_compositor::WlCompositor =
+        target_globals.bind(&target_qh, 1..=6, ()).unwrap();
+    let wm_base: client_xdg_wm_base::XdgWmBase =
+        target_globals.bind(&target_qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = target_globals.bind(&target_qh, 1..=1, ()).unwrap();
+    let seat: client_wl_seat::WlSeat = target_globals.bind(&target_qh, 1..=7, ()).unwrap();
+    let _keyboard = seat.get_keyboard(&target_qh, ());
+    let manager: client_wl_data_device_manager::WlDataDeviceManager =
+        target_globals.bind(&target_qh, 1..=3, ()).unwrap();
+    let _device = manager.get_data_device(&seat, &target_qh, ());
+    let (surface, xdg_surface, _toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &target_qh, 160, 120).unwrap();
+    surface.commit();
+    target_connection.flush().unwrap();
+    let mut target_state = RegistryTestState::default();
+    target_queue.roundtrip(&mut target_state).unwrap();
+    commit_registered_initial_xdg_test_buffer(&xdg_surface);
+    target_connection.flush().unwrap();
+    target_queue.roundtrip(&mut target_state).unwrap();
+    focus_root_window(&commands, surface.id().protocol_id());
+    wait_for_server_commands(&commands);
+    target_queue.roundtrip(&mut target_state).unwrap();
+    assert!(target_state.keyboard_enter_serial.is_some());
+    let before = capture_clipboard_state(&commands);
+
+    let control_name = unique_socket_name();
+    let control_path = runtime_socket_path(&control_name);
+    let listener = std::os::unix::net::UnixListener::bind(&control_path).unwrap();
+    let pictures_path = std::path::PathBuf::from(&pictures_path);
+    let xdg_config_path = pictures_path.join("test-xdg-config");
+    std::fs::create_dir_all(&xdg_config_path).unwrap();
+    std::fs::write(
+        xdg_config_path.join("user-dirs.dirs"),
+        format!(
+            "XDG_PICTURES_DIR=\"{}\"\n",
+            pictures_path.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    let wayland_display = socket_path
+        .file_name()
+        .expect("Wayland test socket must have a filename");
+    let mut child = std::process::Command::new(helper_path)
+        .arg("nativeWaylandClipboardPublisherForTyphonIntegration")
+        .env("QT_QPA_PLATFORM", "wayland")
+        .env("WAYLAND_DISPLAY", wayland_display)
+        .env(
+            "ASTREA_TEST_CLIPBOARD_CONTROL_SOCKET",
+            control_path.as_os_str(),
+        )
+        .env("ASTREA_TEST_PICTURES_DIR", &pictures_path)
+        .env("XDG_CONFIG_HOME", &xdg_config_path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    commands
+        .send(ServerCommand::AuthorizeAstreaShellPid(child.id()))
+        .unwrap();
+    wait_for_server_commands(&commands);
+
+    let mut listener_poll = libc::pollfd {
+        fd: std::os::fd::AsRawFd::as_raw_fd(&listener),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let ready = unsafe { libc::poll(&mut listener_poll, 1, 10_000) };
+    if ready <= 0 {
+        let _ = child.kill();
+        let _ = child.wait();
+        let _server = stop_controllable_test_server(commands, server_thread);
+        panic!("Qt Wayland clipboard helper did not connect to its control socket");
+    }
+    let (mut control, _) = listener.accept().unwrap();
+    let mut message = [0_u8; 1];
+    std::io::Read::read_exact(&mut control, &mut message).unwrap();
+    assert_eq!(message, [b'R']);
+    wait_for_server_commands(&commands);
+    std::io::Write::write_all(&mut control, b"P").unwrap();
+    if let Err(error) = std::io::Read::read_exact(&mut control, &mut message) {
+        let child_output = child.wait_with_output().unwrap();
+        wait_for_server_commands(&commands);
+        let _server = stop_controllable_test_server(commands, server_thread);
+        panic!(
+            "Qt screenshot helper exited before publishing ({}): stdout={} stderr={}",
+            error,
+            String::from_utf8_lossy(&child_output.stdout),
+            String::from_utf8_lossy(&child_output.stderr)
+        );
+    }
+    assert_eq!(message, [b'D']);
+    wait_for_server_commands(&commands);
+
+    target_queue.roundtrip(&mut target_state).unwrap();
+    let offer = target_state
+        .data_device_selection_offer
+        .clone()
+        .expect("focused Wayland destination must receive the Qt screenshot clipboard");
+    assert!(target_state
+        .data_offer_mime_types
+        .iter()
+        .any(|mime_type| mime_type == "image/png"));
+    let after_publication = capture_clipboard_state(&commands);
+
+    let (read_fd, write_fd) = owned_pipe().unwrap();
+    offer.receive("image/png".to_string(), write_fd.as_fd());
+    target_connection.flush().unwrap();
+    drop(write_fd);
+    wait_for_server_commands(&commands);
+    target_queue.roundtrip(&mut target_state).unwrap();
+    let mut transferred_png = Vec::new();
+    File::from(read_fd)
+        .read_to_end(&mut transferred_png)
+        .unwrap();
+
+    assert!(transferred_png.starts_with(b"\x89PNG\r\n\x1a\n"));
+    assert_eq!(
+        u32::from_be_bytes(transferred_png[16..20].try_into().unwrap()),
+        4
+    );
+    assert_eq!(
+        u32::from_be_bytes(transferred_png[20..24].try_into().unwrap()),
+        3
+    );
+    std::io::Write::write_all(&mut control, b"V").unwrap();
+    std::io::Write::write_all(&mut control, &(transferred_png.len() as u32).to_ne_bytes())
+        .unwrap();
+    std::io::Write::write_all(&mut control, &transferred_png).unwrap();
+    std::io::Read::read_exact(&mut control, &mut message).unwrap();
+    assert_eq!(message, [b'K']);
+    let child_output = child.wait_with_output().unwrap();
+    wait_for_server_commands(&commands);
+
+    let _server = stop_controllable_test_server(commands, server_thread);
+    assert!(child_output.status.success(), "Qt helper failed: {}", String::from_utf8_lossy(&child_output.stderr));
+    assert!(after_publication.generation > before.generation);
+    assert!(after_publication.active_source);
 }
 
 #[test]
