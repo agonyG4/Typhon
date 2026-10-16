@@ -669,8 +669,8 @@ mod tests {
                 ewma_ns: 2_000_000,
                 upper_positive_deviation_ns: 4_000_000,
                 central_risk_ns: 10_000_000,
-                selected_risk_ns: 10_000_000,
-                selected_source: BranchRiskSource::PositiveDeviation,
+                selected_risk_ns: 8_000_000,
+                selected_source: BranchRiskSource::EvidenceCeiling,
             },
             queue_ready: BranchRiskDiagnostics {
                 window: SampleWindowDiagnostics {
@@ -714,7 +714,7 @@ mod tests {
 
         assert!(output.contains("Exact R raw p50/p95/p99/max: 1000000/1000000/1000000/8000000 ns"));
         assert!(output.contains("Exact Q raw p50/p95/p99/max: 1000000/3000000/4000000/4000000 ns"));
-        assert!(output.contains("Exact R model ewma/dev/central/selected: 2000000/4000000/10000000/10000000 ns (positive_deviation)"));
+        assert!(output.contains("Exact R model ewma/dev/central/selected: 2000000/4000000/10000000/8000000 ns (evidence_ceiling)"));
         assert!(output.contains("Exact Q model ewma/dev/central/selected: 2000000/500000/3000000/3000000 ns (recent_p95)"));
         assert!(output.contains(
             "Pipeline p95 C/H/GPU-tail/observed-after-fence: 5000000/1000000/2000000/3000000 ns"

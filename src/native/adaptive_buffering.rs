@@ -283,6 +283,13 @@ struct BranchRiskHistory {
     last_sample_at: Option<MonotonicTimestampNs>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct BranchRiskSelection {
+    central_risk_ns: u64,
+    selected_risk_ns: u64,
+    selected_source: BranchRiskSource,
+}
+
 impl Default for BranchRiskHistory {
     fn default() -> Self {
         Self {
@@ -317,35 +324,46 @@ impl BranchRiskHistory {
         self.last_sample_at = Some(at);
     }
 
-    fn risk_ns(&self) -> u64 {
-        nearest_rank(&self.samples_ns, 95).max(
-            self.ewma_ns
-                .saturating_add(self.upper_positive_deviation_ns.saturating_mul(2)),
-        )
-    }
-
-    fn diagnostics(&self, refresh_interval_ns: u64) -> BranchRiskDiagnostics {
-        let window = sample_window_diagnostics(&self.samples_ns, refresh_interval_ns);
+    fn selection(&self) -> BranchRiskSelection {
+        let recent_p95_ns = nearest_rank(&self.samples_ns, 95);
+        let recent_max_ns = self.samples_ns.iter().copied().max().unwrap_or(0);
         let central_risk_ns = self
             .ewma_ns
             .saturating_add(self.upper_positive_deviation_ns.saturating_mul(2));
-        let selected_risk_ns = window.p95_ns.max(central_risk_ns);
+        let selected_risk_ns = recent_p95_ns.max(central_risk_ns.min(recent_max_ns));
         let selected_source = if self.samples_ns.is_empty() {
             BranchRiskSource::None
-        } else if window.p95_ns >= central_risk_ns {
+        } else if central_risk_ns > recent_max_ns {
+            BranchRiskSource::EvidenceCeiling
+        } else if recent_p95_ns >= central_risk_ns {
             // Ties intentionally report the recent p95 floor.
             BranchRiskSource::RecentP95
         } else {
             BranchRiskSource::PositiveDeviation
         };
 
+        BranchRiskSelection {
+            central_risk_ns,
+            selected_risk_ns,
+            selected_source,
+        }
+    }
+
+    fn risk_ns(&self) -> u64 {
+        self.selection().selected_risk_ns
+    }
+
+    fn diagnostics(&self, refresh_interval_ns: u64) -> BranchRiskDiagnostics {
+        let window = sample_window_diagnostics(&self.samples_ns, refresh_interval_ns);
+        let selection = self.selection();
+
         BranchRiskDiagnostics {
             window,
             ewma_ns: self.ewma_ns,
             upper_positive_deviation_ns: self.upper_positive_deviation_ns,
-            central_risk_ns,
-            selected_risk_ns,
-            selected_source,
+            central_risk_ns: selection.central_risk_ns,
+            selected_risk_ns: selection.selected_risk_ns,
+            selected_source: selection.selected_source,
         }
     }
 }
@@ -1206,6 +1224,21 @@ fn mix_rounded(new: u64, old: u64, alpha_num: u64, alpha_den: u64) -> u64 {
 
 fn duration_ns(duration: Duration) -> u64 {
     u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+fn branch_history_with_window_and_model(
+    samples: impl IntoIterator<Item = u64>,
+    ewma_ns: u64,
+    upper_positive_deviation_ns: u64,
+) -> BranchRiskHistory {
+    let mut history = BranchRiskHistory::default();
+    for sample_ns in samples {
+        push_bounded(&mut history.samples_ns, sample_ns);
+    }
+    history.ewma_ns = ewma_ns;
+    history.upper_positive_deviation_ns = upper_positive_deviation_ns;
+    history
 }
 
 #[cfg(test)]
@@ -2613,19 +2646,129 @@ mod exact_parallel_diagnostics_tests {
         assert_eq!(render.window.over_refresh_samples, 1);
         assert_eq!(render.window.over_two_refresh_samples, 0);
         assert!(render.central_risk_ns > render.window.p95_ns);
+        assert!(render.central_risk_ns > render.window.max_ns);
+        assert_eq!(render.selected_risk_ns, render.window.max_ns);
+        assert_eq!(render.selected_source.as_str(), "evidence_ceiling");
         assert_eq!(
-            render.selected_risk_ns,
-            render.window.p95_ns.max(render.central_risk_ns)
+            journal.exact_parallel.render_ready.risk_ns(),
+            render.selected_risk_ns
         );
+    }
+
+    #[test]
+    fn branch_risk_keeps_positive_deviation_below_the_evidence_ceiling() {
+        let history = branch_history_with_window_and_model(
+            std::iter::repeat_n(1_000_000, SAMPLE_CAPACITY - 1).chain([8_000_000]),
+            2_000_000,
+            2_000_000,
+        );
+
+        let diagnostics = history.diagnostics(REFRESH_NS);
+
+        assert_eq!(diagnostics.window.p95_ns, 1_000_000);
+        assert_eq!(diagnostics.window.max_ns, 8_000_000);
+        assert_eq!(diagnostics.central_risk_ns, 6_000_000);
+        assert_eq!(diagnostics.selected_risk_ns, 6_000_000);
         assert_eq!(
-            render.selected_source,
-            if render.central_risk_ns > render.window.p95_ns {
-                BranchRiskSource::PositiveDeviation
+            diagnostics.selected_source,
+            BranchRiskSource::PositiveDeviation
+        );
+        assert_eq!(history.risk_ns(), diagnostics.selected_risk_ns);
+    }
+
+    #[test]
+    fn branch_risk_uses_recurring_p95_when_it_exceeds_central_risk() {
+        let history = branch_history_with_window_and_model(
+            std::iter::repeat_n(3_000_000, SAMPLE_CAPACITY),
+            2_000_000,
+            500_000,
+        );
+
+        let diagnostics = history.diagnostics(REFRESH_NS);
+
+        assert_eq!(diagnostics.window.p95_ns, 3_000_000);
+        assert_eq!(diagnostics.window.max_ns, 3_000_000);
+        assert_eq!(diagnostics.central_risk_ns, 3_000_000);
+        assert_eq!(diagnostics.selected_risk_ns, 3_000_000);
+        assert_eq!(diagnostics.selected_source, BranchRiskSource::RecentP95);
+        assert_eq!(history.risk_ns(), diagnostics.selected_risk_ns);
+    }
+
+    #[test]
+    fn branch_risk_evidence_ceiling_tracks_normal_ring_eviction() {
+        let mut history = BranchRiskHistory::default();
+        for sample in 0..SAMPLE_CAPACITY {
+            let sample_ns = if sample + 1 == SAMPLE_CAPACITY {
+                15_000_000
             } else {
-                BranchRiskSource::RecentP95
-            }
+                1_000_000
+            };
+            history.record(
+                sample_ns,
+                MonotonicTimestampNs::new(100_000_000 + sample as u64 * 10_000_000),
+            );
+        }
+
+        let before_eviction = history.diagnostics(REFRESH_NS);
+        assert_eq!(before_eviction.window.max_ns, 15_000_000);
+        assert!(before_eviction.central_risk_ns > before_eviction.window.max_ns);
+
+        for sample in 0..SAMPLE_CAPACITY {
+            history.record(
+                1_000_000,
+                MonotonicTimestampNs::new(
+                    100_000_000 + (SAMPLE_CAPACITY + sample) as u64 * 10_000_000,
+                ),
+            );
+        }
+
+        let after_eviction = history.diagnostics(REFRESH_NS);
+        assert_eq!(after_eviction.window.max_ns, 1_000_000);
+        assert!(after_eviction.central_risk_ns > after_eviction.window.max_ns);
+        assert_eq!(
+            after_eviction.selected_risk_ns,
+            after_eviction.window.max_ns
         );
-        assert_eq!(render.selected_source, BranchRiskSource::PositiveDeviation);
+        assert_eq!(after_eviction.selected_source.as_str(), "evidence_ceiling");
+        assert_eq!(history.risk_ns(), after_eviction.selected_risk_ns);
+    }
+
+    #[test]
+    fn warm_parallel_render_and_queue_risks_use_independent_evidence_ceilings() {
+        let mut journal = AdaptiveRenderJournal::default();
+        journal.exact_parallel.render_ready = branch_history_with_window_and_model(
+            std::iter::repeat_n(4_000_000, SAMPLE_CAPACITY),
+            2_000_000,
+            5_000_000,
+        );
+        journal.exact_parallel.queue_ready = branch_history_with_window_and_model(
+            std::iter::repeat_n(9_000_000, SAMPLE_CAPACITY),
+            5_000_000,
+            4_000_000,
+        );
+        for _ in 0..WARM_PARALLEL_MIN_SAMPLES {
+            journal.record_fixed_submission_budget(500_000);
+        }
+
+        let prediction = journal.base_prediction(Duration::from_millis(10), false, 200_000);
+        let diagnostics = journal.exact_parallel_diagnostics(REFRESH_NS);
+
+        assert_eq!(
+            prediction.estimator_mode,
+            PredictionEstimatorMode::WarmParallel
+        );
+        assert_eq!(prediction.exact_render_ready_risk_ns, 4_000_000);
+        assert_eq!(prediction.exact_queue_ready_risk_ns, 9_000_000);
+        assert_eq!(diagnostics.render_ready.window.max_ns, 4_000_000);
+        assert_eq!(diagnostics.queue_ready.window.max_ns, 9_000_000);
+        assert_eq!(
+            diagnostics.render_ready.selected_source.as_str(),
+            "evidence_ceiling"
+        );
+        assert_eq!(
+            diagnostics.queue_ready.selected_source.as_str(),
+            "evidence_ceiling"
+        );
     }
 
     #[test]

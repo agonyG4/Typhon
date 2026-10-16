@@ -780,6 +780,7 @@ pub enum BranchRiskSource {
     None,
     RecentP95,
     PositiveDeviation,
+    EvidenceCeiling,
 }
 
 impl BranchRiskSource {
@@ -788,6 +789,7 @@ impl BranchRiskSource {
             Self::None => "none",
             Self::RecentP95 => "recent_p95",
             Self::PositiveDeviation => "positive_deviation",
+            Self::EvidenceCeiling => "evidence_ceiling",
         }
     }
 }
@@ -1627,5 +1629,23 @@ mod tests {
         for (state, expected) in states {
             assert_eq!(serde_json::to_value(state).unwrap(), expected);
         }
+    }
+
+    #[test]
+    fn exact_parallel_evidence_ceiling_source_round_trips_in_control_snapshots() {
+        let diagnostics = ExactParallelDiagnostics {
+            render_ready: BranchRiskDiagnostics {
+                selected_source: BranchRiskSource::EvidenceCeiling,
+                ..BranchRiskDiagnostics::default()
+            },
+            ..ExactParallelDiagnostics::default()
+        };
+
+        let encoded = serde_json::to_value(diagnostics).unwrap();
+        assert_eq!(encoded["renderReady"]["selectedSource"], "evidence_ceiling");
+        assert_eq!(
+            serde_json::from_value::<ExactParallelDiagnostics>(encoded).unwrap(),
+            diagnostics
+        );
     }
 }
