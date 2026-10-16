@@ -1327,7 +1327,8 @@ impl NativeRuntime {
                         )
                     })
             });
-            let worker_ticket = self.frame_pacing.worker_reservation_ticket().map(|ticket| {
+            let worker_pacing_ticket = self.frame_pacing.worker_reservation_ticket();
+            let worker_ticket = worker_pacing_ticket.map(|ticket| {
                 (
                     ticket,
                     ticket.physical_identity(),
@@ -1335,6 +1336,18 @@ impl NativeRuntime {
                     ticket.ready_submit(),
                 )
             });
+            let worker_queued_present = worker_queued.is_some();
+            let worker_queued_frame_id = worker_queued.map(|owner| owner.frame.frame_id);
+            let worker_queued_token = worker_queued.map(|owner| owner.token.get());
+            let worker_ticket_present = worker_pacing_ticket.is_some();
+            let worker_ticket_reservation_id =
+                worker_pacing_ticket.map(|ticket| ticket.reservation_id().get());
+            let worker_ticket_frame_id = worker_pacing_ticket.map(|ticket| ticket.frame_id().get());
+            let worker_ticket_ready_submit =
+                worker_pacing_ticket.map(|ticket| ticket.ready_submit());
+            let worker_ticket_physical_frame_id = worker_pacing_ticket
+                .and_then(|ticket| ticket.physical_identity())
+                .map(|identity| identity.frame_id);
             let worker_scene = worker_queued.map(|owner| {
                 (
                     owner.token,
@@ -1363,9 +1376,10 @@ impl NativeRuntime {
                     .map(|commit| commit.phase),
             );
             return Err(io::Error::other(format!(
-                "{error}; output ownership diagnostic: output_epoch={} scheduler_ready={} scheduler_target_identity={scheduler_target_identity:?} physical_target_identity={physical_target_identity:?} latest_submitted_frame_id={:?} latest_presented_frame_id={:?} physical_ready={physical_ready:?} scene_ready={:?} ready_transaction={transaction:?} pacing_identity={:?} pacing_lane={pacing_lane:?} scheduler_target={:?} worker_queued={worker_queued:?} worker_transaction={worker_transaction:?} worker_ticket={worker_ticket:?} worker_scene={worker_scene:?} swapchain_submitted={:?} arbiter_queued=(token={:?},kind={:?},phase={:?}) arbiter_submitted=(token={:?},kind={:?},phase={:?}) kms_worker={worker_snapshot:?}",
+                "{error}; output ownership diagnostic: output_epoch={} scheduler_ready={} worker_queued_present={} worker_queued_frame_id={worker_queued_frame_id:?} worker_queued_token={worker_queued_token:?} worker_ticket_present={worker_ticket_present} worker_ticket_reservation_id={worker_ticket_reservation_id:?} worker_ticket_frame_id={worker_ticket_frame_id:?} worker_ticket_ready_submit={worker_ticket_ready_submit:?} worker_ticket_physical_frame_id={worker_ticket_physical_frame_id:?} scheduler_target_identity={scheduler_target_identity:?} physical_target_identity={physical_target_identity:?} latest_submitted_frame_id={:?} latest_presented_frame_id={:?} physical_ready={physical_ready:?} scene_ready={:?} ready_transaction={transaction:?} pacing_identity={:?} pacing_lane={pacing_lane:?} scheduler_target={:?} worker_queued={worker_queued:?} worker_transaction={worker_transaction:?} worker_ticket={worker_ticket:?} worker_scene={worker_scene:?} swapchain_submitted={:?} arbiter_queued=(token={:?},kind={:?},phase={:?}) arbiter_submitted=(token={:?},kind={:?},phase={:?}) kms_worker={worker_snapshot:?}",
                 self.output_epoch.get(),
                 self.frame_scheduler.ready_frame_queued(),
+                worker_queued_present,
                 self.scene_history.latest_submitted_frame_id(),
                 self.scene_history.presented_frame_id(),
                 self.scene_history.ready_frame_identity(),

@@ -4320,13 +4320,11 @@ impl NativeFramePacing {
         expected_identity: OutputFrameIdentitySnapshot,
     ) -> Result<(), &'static str> {
         self.validate_worker_ticket_physical_identity(ticket, expected_identity)?;
-        if !ticket.ready_submit() {
-            return Err("swapchain worker-queued frame did not reserve from READY");
-        }
-        // The ticket retains its own origin (`ready_submit`) and exact physical
-        // snapshot. A later render may advance that READY/ACTIVE lane while the
-        // queued worker still owns this capability, so do not infer worker role
-        // from the lane currently carrying the next visual frame.
+        // `ready_submit` is frozen origin metadata for submit accounting,
+        // cancellation, and reversible replan. Both ACTIVE-origin and
+        // READY-origin tickets may own a WORKER_QUEUED physical capability;
+        // the ticket's exact physical identity and key above establish that
+        // ownership even if a later render advances either pacing lane.
         if let Some(attempt_id) = ticket.predictive_attempt_id() {
             self.predictive_o1_lifecycle
                 .validate_worker_physical_state(attempt_id, expected_identity)?;

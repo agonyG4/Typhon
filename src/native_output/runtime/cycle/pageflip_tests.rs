@@ -1366,6 +1366,126 @@ fn atomic_ready_scene_publication_uses_physical_generation_after_cursor_change()
 }
 
 #[test]
+fn active_origin_worker_queued_owner_validates_while_reconfiguration_stays_blocked() {
+    use crate::native_output::NativeOutputReconfigurationBoundary;
+    use crate::native_output::presentation::ledger::OutputTransactionStateKind;
+    use crate::native_output::scanout::OutputFrameKey;
+    use oblivion_one::native::presentation_deadline::MonotonicTimestampNs;
+
+    let mut fixture = variable_retry_fixture(VariableRetryPacingLane::Active);
+    let frame_a = fixture.owner;
+    let crtc_id = 7;
+    let worker_token = PageFlipToken::new(823).unwrap();
+    let queued_at = MonotonicTimestampNs::new(3);
+
+    assert_eq!(fixture.swapchain.ready_identity(), Some(frame_a));
+    assert_eq!(
+        fixture.scene_history.ready_frame_identity(),
+        Some((frame_a.frame_id, frame_a.render_generation))
+    );
+    assert_eq!(
+        fixture
+            .output_transactions
+            .transaction(frame_a.transaction_id)
+            .unwrap()
+            .state()
+            .kind(),
+        OutputTransactionStateKind::Ready
+    );
+    assert_eq!(
+        fixture.frame_pacing.active_physical_identity(),
+        Some(frame_a)
+    );
+    assert!(!fixture.frame_scheduler.ready_frame_queued());
+
+    let ticket = fixture
+        .frame_pacing
+        .reserve_worker_submission(false)
+        .expect("ACTIVE-origin worker reservation")
+        .expect("ACTIVE-origin worker ticket");
+    assert!(!ticket.ready_submit());
+    assert_eq!(ticket.physical_identity(), Some(frame_a));
+    assert_eq!(ticket.physical_key(), Some(OutputFrameKey::from(&frame_a)));
+    assert_eq!(
+        fixture.frame_pacing.worker_reservation_ticket(),
+        Some(ticket)
+    );
+
+    let kind = AtomicCommitKind::CompositedPrimary {
+        transaction_id: frame_a.transaction_id,
+        frame_id: frame_a.frame_id,
+        framebuffer_id: frame_a.framebuffer_id.get(),
+    };
+    let (_submission_fence, _) = fixture
+        .swapchain
+        .take_ready_for_worker(worker_token, queued_at)
+        .expect("physical READY moves to WORKER_QUEUED");
+    fixture
+        .output_transactions
+        .mark_queued(
+            frame_a.transaction_id,
+            fixture.output_epoch.get(),
+            queued_at,
+        )
+        .expect("transaction moves to Queued");
+    let mut arbiter = AtomicCommitArbiter::new();
+    arbiter
+        .reserve_worker_queued(
+            worker_token,
+            fixture.output_epoch.get(),
+            crtc_id,
+            kind,
+            queued_at.get(),
+        )
+        .expect("Atomic arbiter owns the worker token");
+    fixture
+        .scene_history
+        .queue_submission_or_error(worker_token.get())
+        .expect("scene READY moves to submitted under the worker token");
+    assert!(!fixture.frame_scheduler.ready_frame_queued());
+    assert_eq!(
+        fixture
+            .output_transactions
+            .transaction(frame_a.transaction_id)
+            .unwrap()
+            .state()
+            .kind(),
+        OutputTransactionStateKind::Queued
+    );
+
+    validate_reconfiguration_frame_ownership_for_swapchain_with_arbiter(
+        &fixture.swapchain,
+        fixture.output_epoch,
+        crtc_id,
+        &fixture.scene_history,
+        &fixture.frame_pacing,
+        &fixture.frame_scheduler,
+        &arbiter,
+        &fixture.output_transactions,
+    )
+    .expect("ACTIVE-origin pacing capability coherently owns WORKER_QUEUED frame A");
+
+    let boundary = NativeOutputReconfigurationBoundary {
+        worker_queued_next_owned: fixture.swapchain.worker_queued_identity().is_some(),
+        atomic_commit_arbiter_owned: arbiter.worker_queued_commit().is_some(),
+        presentation_transaction_owned: fixture
+            .output_transactions
+            .transaction(frame_a.transaction_id)
+            .is_some_and(|transaction| {
+                transaction.state().kind() == OutputTransactionStateKind::Queued
+            }),
+        pacing_worker_reservation_owned: fixture.frame_pacing.worker_reservation_ticket().is_some(),
+        ..NativeOutputReconfigurationBoundary::default()
+    };
+    assert!(boundary.worker_queued_next_owned);
+    assert!(boundary.atomic_commit_arbiter_owned);
+    assert!(boundary.presentation_transaction_owned);
+    assert!(boundary.pacing_worker_reservation_owned);
+    assert!(!boundary.is_safe());
+    assert!(!boundary.is_safe_to_retire_unsubmitted_ready_frame());
+}
+
+#[test]
 fn worker_queued_and_ready_successor_roles_are_individually_coherent() {
     let mut fixture = variable_retry_fixture(VariableRetryPacingLane::Ready);
     let output_epoch = fixture.output_epoch;
