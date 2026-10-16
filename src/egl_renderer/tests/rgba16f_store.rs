@@ -274,7 +274,7 @@ layout(location = 3) out highp uvec4 out_manual_half_bits;"#;
         "void main() {",
         &format!(
             "{}\n\nvoid main() {{",
-            crate::egl_renderer::effects::TEST_MANUAL_BINARY16_GLSL
+            crate::egl_renderer::effects::RGBA16F_RTZ_GLSL
         ),
     );
     let stored_expression = final_statement
@@ -1142,6 +1142,16 @@ void main() {
                 );
                 assert_constant_provenance(&probe, value);
                 let summary = classify_mrt(&probe);
+                if !dither {
+                    assert_eq!(
+                        summary.store_matches_toward_zero, summary.total_channels,
+                        "DITHER-off RGBA16F stores must round toward zero for case={name}"
+                    );
+                    assert_eq!(
+                        summary.store_matches_manual_half, summary.total_channels,
+                        "promoted manual RTZ bits must match DITHER-off RGBA16F stores for case={name}"
+                    );
+                }
                 println!("RGBA16F_MRT case={name} dither={dither} classify={summary:?}");
                 for channel in 0..4 {
                     print_distribution(&format!("case={name} dither={dither}"), &probe, channel);

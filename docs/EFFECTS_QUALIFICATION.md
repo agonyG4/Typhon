@@ -52,18 +52,34 @@ once per process. The default remains `off` during qualification.
 
 This is an exact causal physical-rendering optimization. It keeps each
 window's existing scene capture and checkpoint dependencies, and does not
-precompute or share backdrop state. For an eligible canonical blur it removes
-the final full-resolution Kawase materialization and the local material
-texture, then runs that final upsample and the existing ColorMatrix/Tint/Noise
-chain inside the final Composite. The Composite remains authoritative for
-output encoding, alpha mode, presentation opacity, analytic coverage,
-visual-group clipping, blending, framebuffer orientation, and damage scissors.
+precompute or share backdrop state. For an eligible blur it removes the final
+full-resolution Kawase materialization and the local material texture, then
+runs that final upsample and the local material chain inside the final
+Composite. The Composite remains authoritative for output encoding, alpha
+mode, presentation opacity, analytic coverage, visual-group clipping,
+blending, framebuffer orientation, and damage scissors.
 
 `EffectDebugKawaseMode::Full` disables terminal fusion for that frame so the
 existing full-Kawase diagnostic continues to show the unfused stages. The
-terminal shader is prewarmed as Composite variant 1. Its upsample work remains
-timed as `Composite`; compare total Effects GPU time and frame/fence tails,
-since Composite duration is expected to increase.
+legacy terminal shader remains experimental as Composite variant 1. The exact
+canonical terminal shader is prewarmed as Composite variant 2. Both are
+prewarmed during runtime initialization; terminal fusion remains Off by
+default.
+
+`TYPHON_EFFECT_CANONICAL_BLUR_SEMANTICS=canonical` together with
+`TYPHON_EFFECT_TERMINAL_BLUR_FUSION=on` is an exact-rendering combination.
+Canonical staged rendering is the numerical reference. The canonical terminal
+shader reproduces the two removed RGBA16F round-toward-zero stores in ALU: Q1
+after the final Up2 taps and Q2 after ColorMatrix, Tint, Noise, and Fragment
+sanitization. It uses the same canonical local coordinates for final Up2 and
+procedural Noise. `legacy + fusion=on` continues to select the experimental
+legacy terminal shader. Full-Kawase diagnostics suppress fusion for either
+semantics policy.
+
+This milestone qualifies deterministic compiler and headless GLES correctness
+only. No native performance claim has been made. The fused upsample work remains
+timed as `Composite`; native comparison should compare total Effects GPU time
+and frame/fence tails after separate manual qualification.
 
 Before a native comparison, require deterministic compiler, demand-footprint,
 shader-coordinate, and real GLES off/on equivalence checks. The synthesized
@@ -94,11 +110,12 @@ restores the prior state. Final-output rendering does not change the DITHER
 state. These deterministic coordinates intentionally produce small output
 differences from legacy mode.
 
-Canonical semantics currently suppress terminal Kawase fusion because that
-shader does not yet implement the canonical upsample and Noise semantics. The
-existing Full-Kawase diagnostic continues to suppress fusion as well. This
-milestone establishes deterministic semantics and correctness; it makes no
-performance claim and has no native visual or performance qualification.
+Canonical semantics can use either staged rendering or exact terminal fusion
+when fusion is explicitly enabled. The canonical staged renderer remains the
+numerical reference. The canonical terminal shader reproduces the removed Q1
+and Q2 RGBA16F round-toward-zero boundaries in ALU. Full-Kawase diagnostics
+still suppress terminal fusion. This milestone establishes deterministic
+headless correctness; it makes no native performance claim or qualification.
 
 ## Precomputed synthesized-window blur experiment
 

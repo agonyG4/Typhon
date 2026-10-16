@@ -5,6 +5,7 @@ use super::*;
 pub(crate) enum TerminalBoundaryReplay {
     Legacy,
     ProductionCanonicalStaged,
+    ProductionCanonicalFused,
     CanonicalLegacyUp2,
     CanonicalStaged,
     FuseUp2AndFragment,

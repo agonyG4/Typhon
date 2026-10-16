@@ -1,7 +1,6 @@
-use std::sync::atomic::{AtomicBool, Ordering};
-
-use super::canonical_blur_semantics::{CANONICAL_BLUR_SEMANTICS_ENV, CanonicalBlurSemanticsPolicy};
+use super::canonical_blur_semantics::CanonicalBlurSemanticsPolicy;
 use super::trace::EffectDebugKawaseMode;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub(crate) const TERMINAL_BLUR_FUSION_ENV: &str = "TYPHON_EFFECT_TERMINAL_BLUR_FUSION";
 
@@ -48,28 +47,19 @@ pub(crate) fn parse_terminal_blur_fusion_policy(
 
 pub(crate) const fn terminal_fusion_enabled(
     policy: TerminalBlurFusionPolicy,
-    canonical_semantics: CanonicalBlurSemanticsPolicy,
+    _canonical_semantics: CanonicalBlurSemanticsPolicy,
     kawase_debug_mode: EffectDebugKawaseMode,
 ) -> bool {
     matches!(policy, TerminalBlurFusionPolicy::On)
-        && matches!(canonical_semantics, CanonicalBlurSemanticsPolicy::Legacy)
         && !matches!(kawase_debug_mode, EffectDebugKawaseMode::Full)
 }
 
-pub(crate) fn warn_canonical_semantics_suppresses_terminal_fusion_once(
-    policy: TerminalBlurFusionPolicy,
+pub(crate) const fn terminal_composite_shader_variant(
     canonical_semantics: CanonicalBlurSemanticsPolicy,
-) {
-    if !matches!(policy, TerminalBlurFusionPolicy::On)
-        || !matches!(canonical_semantics, CanonicalBlurSemanticsPolicy::Canonical)
-    {
-        return;
-    }
-    static WARNED: AtomicBool = AtomicBool::new(false);
-    if !WARNED.swap(true, Ordering::Relaxed) {
-        eprintln!(
-            "warning: {TERMINAL_BLUR_FUSION_ENV}=on is suppressed while {CANONICAL_BLUR_SEMANTICS_ENV}=canonical"
-        );
+) -> u64 {
+    match canonical_semantics {
+        CanonicalBlurSemanticsPolicy::Legacy => 1,
+        CanonicalBlurSemanticsPolicy::Canonical => 2,
     }
 }
 
@@ -84,7 +74,7 @@ fn warn_unknown_policy_once() {
 mod tests {
     use super::{
         TERMINAL_BLUR_FUSION_ENV, TerminalBlurFusionPolicy, parse_terminal_blur_fusion_policy,
-        terminal_fusion_enabled,
+        terminal_composite_shader_variant, terminal_fusion_enabled,
     };
 
     #[test]
@@ -134,10 +124,20 @@ mod tests {
             crate::egl_renderer::effects::CanonicalBlurSemanticsPolicy::Legacy,
             EffectDebugKawaseMode::Partial,
         ));
+        assert!(terminal_fusion_enabled(
+            TerminalBlurFusionPolicy::On,
+            crate::egl_renderer::effects::CanonicalBlurSemanticsPolicy::Canonical,
+            EffectDebugKawaseMode::Partial,
+        ));
+        assert!(!terminal_fusion_enabled(
+            TerminalBlurFusionPolicy::On,
+            crate::egl_renderer::effects::CanonicalBlurSemanticsPolicy::Canonical,
+            EffectDebugKawaseMode::Full,
+        ));
     }
 
     #[test]
-    fn effective_fusion_is_off_for_every_canonical_semantics_combination() {
+    fn fusion_policy_truth_table_keeps_full_debug_staged_under_both_semantics() {
         use crate::egl_renderer::effects::CanonicalBlurSemanticsPolicy as Canonical;
         use crate::egl_renderer::effects::EffectDebugKawaseMode as Debug;
 
@@ -182,7 +182,7 @@ mod tests {
                 TerminalBlurFusionPolicy::On,
                 Canonical::Canonical,
                 Debug::Partial,
-                false,
+                true,
             ),
             (
                 TerminalBlurFusionPolicy::On,
@@ -198,6 +198,14 @@ mod tests {
                 "fusion={fusion:?} canonical={canonical:?} debug={debug:?}"
             );
         }
+    }
+
+    #[test]
+    fn terminal_composite_variant_follows_semantic_policy() {
+        use crate::egl_renderer::effects::CanonicalBlurSemanticsPolicy as Canonical;
+
+        assert_eq!(terminal_composite_shader_variant(Canonical::Legacy), 1);
+        assert_eq!(terminal_composite_shader_variant(Canonical::Canonical), 2);
     }
 
     #[test]

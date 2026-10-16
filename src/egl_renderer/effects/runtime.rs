@@ -8,9 +8,7 @@ use super::canonical_blur_semantics::CanonicalBlurSemanticsPolicy;
 use super::gpu_timing::EffectGpuProfiler;
 use super::precomputed_window_blur::PrecomputedWindowBlurPolicy;
 use super::resources::EffectResourceBudgetConfig;
-use super::terminal_blur_fusion::{
-    TerminalBlurFusionPolicy, warn_canonical_semantics_suppresses_terminal_fusion_once,
-};
+use super::terminal_blur_fusion::TerminalBlurFusionPolicy;
 use super::{
     ShaderProgramCache, builtin_shader_program_count, shader_cache_capacity_for_custom_shaders,
 };
@@ -128,10 +126,6 @@ impl EffectRuntime {
         let precomputed_window_blur_policy = PrecomputedWindowBlurPolicy::from_environment();
         let terminal_blur_fusion_policy = TerminalBlurFusionPolicy::from_environment();
         let canonical_blur_semantics_policy = CanonicalBlurSemanticsPolicy::from_environment();
-        warn_canonical_semantics_suppresses_terminal_fusion_once(
-            terminal_blur_fusion_policy,
-            canonical_blur_semantics_policy,
-        );
 
         Ok(Self {
             capture_program: programs.capture,

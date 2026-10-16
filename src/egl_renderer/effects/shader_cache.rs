@@ -118,7 +118,7 @@ pub struct ShaderProgramCache {
     evicted: Vec<ShaderProgramKey>,
 }
 
-fn builtin_shader_programs() -> [(oblivion_one::effects::ShaderModuleId, u64, &'static str); 13] {
+fn builtin_shader_programs() -> [(oblivion_one::effects::ShaderModuleId, u64, &'static str); 14] {
     [
         (
             oblivion_one::effects::ShaderModuleId::new(INTERNAL_EFFECT_SHADER_MODULE_DOWNSAMPLE)
@@ -173,6 +173,12 @@ fn builtin_shader_programs() -> [(oblivion_one::effects::ShaderModuleId, u64, &'
                 .expect("builtin shader ids are non-zero"),
             1,
             super::executor::TERMINAL_KAWASE_COMPOSITE_FRAGMENT_SHADER,
+        ),
+        (
+            oblivion_one::effects::ShaderModuleId::new(INTERNAL_EFFECT_SHADER_MODULE_COMPOSITE)
+                .expect("builtin shader ids are non-zero"),
+            2,
+            super::executor::TERMINAL_KAWASE_COMPOSITE_CANONICAL_FRAGMENT_SHADER,
         ),
         (
             oblivion_one::effects::ShaderModuleId::new(INTERNAL_EFFECT_SHADER_MODULE_FRAGMENT)
@@ -719,10 +725,10 @@ mod tests {
             builtin_shader_program_count(),
             builtin_shader_programs().len()
         );
-        assert_eq!(builtin_shader_program_count(), 13);
-        assert_eq!(shader_cache_capacity_for_custom_shaders(0).unwrap(), 13);
-        assert_eq!(shader_cache_capacity_for_custom_shaders(1).unwrap(), 14);
-        assert_eq!(shader_cache_capacity_for_custom_shaders(120).unwrap(), 133);
+        assert_eq!(builtin_shader_program_count(), 14);
+        assert_eq!(shader_cache_capacity_for_custom_shaders(0).unwrap(), 14);
+        assert_eq!(shader_cache_capacity_for_custom_shaders(1).unwrap(), 15);
+        assert_eq!(shader_cache_capacity_for_custom_shaders(120).unwrap(), 134);
         assert_eq!(
             shader_cache_capacity_for_custom_shaders(usize::MAX),
             Err(ShaderCacheError::CapacityOverflow)
@@ -742,6 +748,23 @@ mod tests {
                         && *variant == 1
                         && source.contains("u_effect_blur_radius")
                         && source.contains("u_effect_noise_amount")
+                })
+        );
+    }
+
+    #[test]
+    fn canonical_terminal_composite_variant_is_part_of_the_builtin_prewarm_set() {
+        let composite =
+            oblivion_one::effects::ShaderModuleId::new(INTERNAL_EFFECT_SHADER_MODULE_COMPOSITE)
+                .unwrap();
+        assert!(
+            builtin_shader_programs()
+                .iter()
+                .any(|(module, variant, source)| {
+                    *module == composite
+                        && *variant == 2
+                        && source.contains("typhon_virtual_rgba16f_rtz(result)")
+                        && source.contains("typhon_canonical_effect_noise()")
                 })
         );
     }

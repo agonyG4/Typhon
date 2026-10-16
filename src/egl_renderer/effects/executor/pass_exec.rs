@@ -406,15 +406,6 @@ pub(super) fn execute_pass(
     capture_downsample_fusion: Option<CaptureDownsampleFusion>,
     stats: &mut EffectExecutionStats,
 ) -> RendererResult<Option<ReplayCaptureExecutionDetail>> {
-    if pass.terminal_kawase.is_some()
-        && renderer.runtime.canonical_blur_semantics_policy
-            == CanonicalBlurSemanticsPolicy::Canonical
-    {
-        return Err(io::Error::other(
-            "terminal Kawase fusion is disabled by canonical blur semantics",
-        )
-        .into());
-    }
     match pass.kind {
         RenderPassKind::SceneCapture | RenderPassKind::SurfaceCapture => {
             let replay_execution = execute_capture(
@@ -551,7 +542,14 @@ pub(super) fn execute_pass(
         }
         RenderPassKind::Composite | RenderPassKind::OutputPostProcess => {
             let fragment_shader = if pass.terminal_kawase.is_some() {
-                TERMINAL_KAWASE_COMPOSITE_FRAGMENT_SHADER
+                match renderer.runtime.canonical_blur_semantics_policy {
+                    CanonicalBlurSemanticsPolicy::Legacy => {
+                        TERMINAL_KAWASE_COMPOSITE_FRAGMENT_SHADER
+                    }
+                    CanonicalBlurSemanticsPolicy::Canonical => {
+                        TERMINAL_KAWASE_COMPOSITE_CANONICAL_FRAGMENT_SHADER
+                    }
+                }
             } else {
                 COMPOSITE_FRAGMENT_SHADER
             };
@@ -1421,7 +1419,9 @@ fn execute_fullscreen_pass_impl(
     let shader_key = ShaderProgramKey::new(
         ShaderModuleId::new(module).expect("static effect shader ids are non-zero"),
         if pass.terminal_kawase.is_some() {
-            1
+            super::super::terminal_composite_shader_variant(
+                renderer.runtime.canonical_blur_semantics_policy,
+            )
         } else if capture_fusion.is_some() {
             2
         } else if pass.kind == RenderPassKind::DualKawaseUpsample {
@@ -1459,6 +1459,9 @@ fn execute_fullscreen_pass_impl(
     };
     #[cfg(not(test))]
     let program = renderer.runtime.effect_shaders.lookup(shader_key)?;
+    let canonical_terminal_composite = pass.terminal_kawase.is_some()
+        && renderer.runtime.canonical_blur_semantics_policy
+            == CanonicalBlurSemanticsPolicy::Canonical;
     if pass.terminal_kawase.is_some() && {
         #[cfg(test)]
         {
@@ -1504,6 +1507,33 @@ fn execute_fullscreen_pass_impl(
             {
                 return Err(io::Error::other(format!(
                     "terminal composite shader is missing uniform {name}"
+                ))
+                .into());
+            }
+        }
+    }
+    if canonical_terminal_composite && {
+        #[cfg(test)]
+        {
+            diagnostic_shader.is_none()
+        }
+        #[cfg(not(test))]
+        {
+            true
+        }
+    } {
+        for name in ["u_effect_target_flip_y", "u_effect_output_domain"] {
+            if uniform_location(
+                &mut renderer.runtime.effect_shaders,
+                renderer.gl,
+                shader_key,
+                program,
+                name,
+            )
+            .is_none()
+            {
+                return Err(io::Error::other(format!(
+                    "canonical terminal composite shader is missing uniform {name}"
                 ))
                 .into());
             }
@@ -1991,6 +2021,36 @@ fn execute_fullscreen_pass_impl(
             ) {
                 renderer.gl.uniform_2_f32(
                     Some(&location),
+                    output_plan.domain.width.max(1) as f32,
+                    output_plan.domain.height.max(1) as f32,
+                );
+            }
+        }
+        if canonical_terminal_composite {
+            if let Some(location) = uniform_location(
+                &mut renderer.runtime.effect_shaders,
+                renderer.gl,
+                shader_key,
+                program,
+                "u_effect_output_size",
+            ) {
+                renderer.gl.uniform_2_f32(
+                    Some(&location),
+                    output_plan.width.max(1) as f32,
+                    output_plan.height.max(1) as f32,
+                );
+            }
+            if let Some(location) = uniform_location(
+                &mut renderer.runtime.effect_shaders,
+                renderer.gl,
+                shader_key,
+                program,
+                "u_effect_output_domain",
+            ) {
+                renderer.gl.uniform_4_f32(
+                    Some(&location),
+                    output_plan.domain.x as f32,
+                    output_plan.domain.y as f32,
                     output_plan.domain.width.max(1) as f32,
                     output_plan.domain.height.max(1) as f32,
                 );

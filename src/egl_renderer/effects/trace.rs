@@ -979,14 +979,17 @@ impl EffectExecutionTrace {
     pub(crate) fn terminal_blur_fusion(
         &self,
         policy: &'static str,
+        canonical_semantics: &'static str,
+        terminal_shader_variant: Option<u64>,
         candidates: usize,
         fusions: usize,
         passes_elided: usize,
     ) {
         self.event(|| {
             format!(
-                "event=effect_terminal_blur_fusion frame_id={} terminal_blur_fusion_policy={policy} terminal_blur_fusion_candidates={candidates} terminal_blur_fusions={fusions} terminal_blur_passes_elided={passes_elided}",
+                "event=effect_terminal_blur_fusion frame_id={} terminal_blur_fusion_policy={policy} canonical_blur_semantics={canonical_semantics} terminal_composite_variant={} terminal_blur_fusion_candidates={candidates} terminal_blur_fusions={fusions} terminal_blur_passes_elided={passes_elided}",
                 optional_u64(self.frame_id),
+                terminal_shader_variant.map_or_else(|| "none".to_owned(), |variant| variant.to_string()),
             )
         });
     }

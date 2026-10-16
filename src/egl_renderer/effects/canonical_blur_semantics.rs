@@ -10,6 +10,13 @@ pub(crate) enum CanonicalBlurSemanticsPolicy {
 }
 
 impl CanonicalBlurSemanticsPolicy {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::Canonical => "canonical",
+        }
+    }
+
     pub(crate) fn from_environment() -> Self {
         let (policy, unknown) = match std::env::var_os(CANONICAL_BLUR_SEMANTICS_ENV) {
             None => (Self::Legacy, false),

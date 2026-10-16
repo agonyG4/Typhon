@@ -846,6 +846,8 @@ fn render_production_canonical_staged(
         .renderer
         .effect_runtime
         .canonical_blur_semantics_policy = effects::CanonicalBlurSemanticsPolicy::Canonical;
+    harness.renderer.effect_runtime.terminal_blur_fusion_policy =
+        effects::TerminalBlurFusionPolicy::Off;
     unsafe { harness.gl.enable(glow::DITHER) };
     let bounds = EffectRect::new(0, 0, output_size.0, output_size.1).expect("output bounds");
     let config = effects::EffectDebugConfig::new(
@@ -868,6 +870,42 @@ fn render_production_canonical_staged(
     (replay, read_diagnostic_pixels(&harness), dither_restored)
 }
 
+fn render_production_canonical_fused(
+    graph: &CompiledFrameGraph,
+    output_size: (u32, u32),
+    origin: OutputFramebufferOrigin,
+    install_scene: impl FnOnce(&mut GlesEffectTestHarness),
+) -> (Vec<u8>, bool) {
+    let mut harness = GlesEffectTestHarness::new(output_size.0, output_size.1);
+    install_scene(&mut harness);
+    harness
+        .renderer
+        .effect_runtime
+        .canonical_blur_semantics_policy = effects::CanonicalBlurSemanticsPolicy::Canonical;
+    harness.renderer.effect_runtime.terminal_blur_fusion_policy =
+        effects::TerminalBlurFusionPolicy::On;
+    unsafe { harness.gl.enable(glow::DITHER) };
+    let bounds = EffectRect::new(0, 0, output_size.0, output_size.1).expect("output bounds");
+    let config = effects::EffectDebugConfig::new(
+        effects::EffectDebugCaptureMode::Replay,
+        effects::EffectDebugKawaseMode::Partial,
+    );
+    execute_diagnostic_frame_with_terminal_replay(
+        &mut harness,
+        graph,
+        &diagnostic_repaint_plan_for_repairs_in_size(&[], true, output_size),
+        EffectRegion::from_rect(bounds),
+        true,
+        config,
+        origin,
+        effects::TerminalBoundaryReplay::ProductionCanonicalFused,
+        [],
+        [],
+    );
+    let dither_untouched = unsafe { harness.gl.is_enabled(glow::DITHER) };
+    (read_diagnostic_pixels(&harness), dither_untouched)
+}
+
 fn render_canonical_single_tail_pair(
     staged_graph: &CompiledFrameGraph,
     fused_graph: &CompiledFrameGraph,
@@ -886,65 +924,50 @@ fn render_canonical_single_tail_pair(
         .expect("fused graph retains one terminal Composite");
     assert_eq!(fused_terminal.instance, staged_tail.instance);
 
-    let (staged_replay, staged_pixels) =
-        effects::with_test_offscreen_dither_policy(Some(false), || {
-            render_terminal_replay_mode(
-                staged_graph,
-                output_size,
-                origin,
-                |harness| install_scene(harness),
-                effects::TerminalBoundaryReplay::CanonicalStaged,
-                [staged_tail.upsample, staged_tail.fragment],
-                [staged_tail.fragment],
-            )
-        });
-    let (fused_replay, fused_pixels) =
-        effects::with_test_offscreen_dither_policy(Some(false), || {
-            render_terminal_replay_mode(
-                fused_graph,
-                output_size,
-                origin,
-                |harness| install_scene(harness),
-                effects::TerminalBoundaryReplay::CanonicalTerminalQ1Q2,
-                [],
-                [fused_terminal.id],
-            )
-        });
+    let (fused_probe_replay, _) = effects::with_test_offscreen_dither_policy(Some(false), || {
+        render_terminal_replay_mode(
+            fused_graph,
+            output_size,
+            origin,
+            |harness| install_scene(harness),
+            effects::TerminalBoundaryReplay::CanonicalTerminalQ1Q2,
+            [],
+            [fused_terminal.id],
+        )
+    });
 
-    let staged_a = &staged_replay.captures[&staged_tail.upsample].pixels;
-    let fused_a = &fused_replay.stage_probes
+    let fused_a = &fused_probe_replay.stage_probes
         [&(fused_terminal.id, effects::TerminalDiagnosticStage::Up2)]
         .pixels;
-    assert_eq!(
-        staged_a, fused_a,
-        "{case_name} canonical A differs for {origin:?}"
-    );
-    let staged_b = &staged_replay.captures[&staged_tail.fragment].pixels;
-    let fused_b = &fused_replay.stage_probes[&(
+    let fused_b = &fused_probe_replay.stage_probes[&(
         fused_terminal.id,
         effects::TerminalDiagnosticStage::Fragment,
     )]
         .pixels;
+    let staged_noise_replay = effects::with_test_offscreen_dither_policy(Some(false), || {
+        render_terminal_replay_mode(
+            staged_graph,
+            output_size,
+            origin,
+            |harness| install_scene(harness),
+            effects::TerminalBoundaryReplay::CanonicalStaged,
+            [],
+            [staged_tail.fragment],
+        )
+        .0
+    });
     assert_eq!(
-        staged_b, fused_b,
-        "{case_name} canonical B differs for {origin:?}"
-    );
-    assert_eq!(
-        staged_replay.stage_probes[&(
+        staged_noise_replay.stage_probes[&(
             staged_tail.fragment,
             effects::TerminalDiagnosticStage::CanonicalNoiseBits
         )]
             .pixels,
-        fused_replay.stage_probes[&(
+        fused_probe_replay.stage_probes[&(
             fused_terminal.id,
             effects::TerminalDiagnosticStage::CanonicalNoiseBits
         )]
             .pixels,
         "{case_name} canonical Noise bits differ for {origin:?}"
-    );
-    assert_eq!(
-        staged_pixels, fused_pixels,
-        "canonical staged and fused C differ for {case_name} at {origin:?}"
     );
     let (production_replay, production_pixels, dither_restored) =
         render_production_canonical_staged(
@@ -962,31 +985,30 @@ fn render_canonical_single_tail_pair(
         production_replay.captures[&staged_tail.upsample]
             .pixels
             .as_slice(),
-        staged_a.as_slice(),
-        "production canonical Up2 differs from qualified Up2 for {case_name} at {origin:?}"
+        fused_a.as_slice(),
+        "production canonical A differs for {case_name} at {origin:?}"
     );
     assert_eq!(
         production_replay.captures[&staged_tail.fragment]
             .pixels
             .as_slice(),
-        staged_b.as_slice(),
-        "production canonical Fragment/Noise differs from qualified model for {case_name} at {origin:?}"
+        fused_b.as_slice(),
+        "production canonical B differs for {case_name} at {origin:?}"
+    );
+    let (fused_pixels, fused_dither_untouched) =
+        render_production_canonical_fused(fused_graph, output_size, origin, |harness| {
+            install_scene(harness)
+        });
+    assert!(
+        fused_dither_untouched,
+        "terminal output must leave DITHER untouched"
     );
     assert_eq!(
-        production_pixels, staged_pixels,
-        "production canonical staged output differs from qualified model for {case_name} at {origin:?}"
+        production_pixels, fused_pixels,
+        "production canonical staged and fused C differ for {case_name} at {origin:?}"
     );
-    let production_summary = summarize_rgba8_difference(
-        &production_pixels,
-        &staged_pixels,
-        output_size.0,
-        output_size.1,
-        origin,
-    );
-    assert_eq!(production_summary.changed_pixels, 0);
-    assert_eq!(production_summary.alpha_changed_pixels, 0);
     let summary = summarize_rgba8_difference(
-        &staged_pixels,
+        &production_pixels,
         &fused_pixels,
         output_size.0,
         output_size.1,
@@ -994,7 +1016,7 @@ fn render_canonical_single_tail_pair(
     );
     assert_eq!(summary.changed_pixels, 0, "{case_name} C changed pixels");
     assert_eq!(summary.alpha_changed_pixels, 0, "{case_name} alpha changed");
-    (staged_pixels, fused_pixels, production_pixels)
+    (production_pixels.clone(), fused_pixels, production_pixels)
 }
 
 fn render_canonical_multi_tail_pair(
@@ -1024,30 +1046,28 @@ fn render_canonical_multi_tail_pair(
         .iter()
         .map(|pass| pass.id)
         .collect::<Vec<_>>();
-    let (staged_replay, staged_pixels) =
-        effects::with_test_offscreen_dither_policy(Some(false), || {
-            render_terminal_replay_mode(
-                staged_graph,
-                output_size,
-                origin,
-                |harness| install_scene(harness),
-                effects::TerminalBoundaryReplay::CanonicalStaged,
-                capture_passes,
-                staged_tails.iter().map(|tail| tail.fragment),
-            )
-        });
-    let (fused_replay, fused_pixels) =
-        effects::with_test_offscreen_dither_policy(Some(false), || {
-            render_terminal_replay_mode(
-                fused_graph,
-                output_size,
-                origin,
-                |harness| install_scene(harness),
-                effects::TerminalBoundaryReplay::CanonicalTerminalQ1Q2,
-                [],
-                probe_passes,
-            )
-        });
+    let (staged_replay, _) = effects::with_test_offscreen_dither_policy(Some(false), || {
+        render_terminal_replay_mode(
+            staged_graph,
+            output_size,
+            origin,
+            |harness| install_scene(harness),
+            effects::TerminalBoundaryReplay::CanonicalStaged,
+            capture_passes,
+            staged_tails.iter().map(|tail| tail.fragment),
+        )
+    });
+    let (fused_replay, _) = effects::with_test_offscreen_dither_policy(Some(false), || {
+        render_terminal_replay_mode(
+            fused_graph,
+            output_size,
+            origin,
+            |harness| install_scene(harness),
+            effects::TerminalBoundaryReplay::CanonicalTerminalQ1Q2,
+            [],
+            probe_passes,
+        )
+    });
 
     for tail in &staged_tails {
         let fused_terminal = fused_terminals
@@ -1100,26 +1120,42 @@ fn render_canonical_multi_tail_pair(
         );
     assert!(dither_restored, "canonical causal draw restores DITHER");
     for tail in &staged_tails {
+        let fused_terminal = fused_terminals
+            .iter()
+            .find(|pass| pass.instance == tail.instance)
+            .expect("matching fused tail exists");
         assert_eq!(
             production_replay.captures[&tail.upsample].pixels,
-            staged_replay.captures[&tail.upsample].pixels,
+            fused_replay.stage_probes[&(fused_terminal.id, effects::TerminalDiagnosticStage::Up2)]
+                .pixels,
             "production causal canonical Up2 differs for instance {} at {origin:?}",
             tail.instance.get()
         );
         assert_eq!(
             production_replay.captures[&tail.fragment].pixels,
-            staged_replay.captures[&tail.fragment].pixels,
+            fused_replay.stage_probes[&(
+                fused_terminal.id,
+                effects::TerminalDiagnosticStage::Fragment
+            )]
+                .pixels,
             "production causal canonical Fragment differs for instance {} at {origin:?}",
             tail.instance.get()
         );
     }
-    assert_eq!(
-        production_pixels, staged_pixels,
-        "production causal canonical C differs at {origin:?}"
+    let (fused_pixels, fused_dither_untouched) =
+        render_production_canonical_fused(fused_graph, output_size, origin, |harness| {
+            install_scene(harness)
+        });
+    assert!(
+        fused_dither_untouched,
+        "canonical terminal output must leave DITHER untouched"
     );
-    assert_eq!(staged_pixels, fused_pixels, "{case_name} final C differs");
+    assert_eq!(
+        production_pixels, fused_pixels,
+        "production causal canonical staged/fused C differs for {case_name} at {origin:?}"
+    );
     let summary = summarize_rgba8_difference(
-        &staged_pixels,
+        &production_pixels,
         &fused_pixels,
         output_size.0,
         output_size.1,
@@ -1127,7 +1163,7 @@ fn render_canonical_multi_tail_pair(
     );
     assert_eq!(summary.changed_pixels, 0, "{case_name} changed pixels");
     assert_eq!(summary.alpha_changed_pixels, 0, "{case_name} alpha changed");
-    (staged_pixels, fused_pixels)
+    (production_pixels, fused_pixels)
 }
 
 struct TerminalPartialRepairReplay {
@@ -1157,6 +1193,11 @@ fn render_terminal_replay_after_partial_repair(
             .renderer
             .effect_runtime
             .canonical_blur_semantics_policy = effects::CanonicalBlurSemanticsPolicy::Canonical;
+        harness.renderer.effect_runtime.terminal_blur_fusion_policy = if terminal_fusion {
+            effects::TerminalBlurFusionPolicy::On
+        } else {
+            effects::TerminalBlurFusionPolicy::Off
+        };
         unsafe { harness.gl.enable(glow::DITHER) };
     }
     let bounds = EffectRect::new(0, 0, output_size.0, output_size.1).expect("output bounds");
@@ -1275,6 +1316,14 @@ fn render_terminal_replay_after_partial_repair(
             .renderer
             .effect_runtime
             .canonical_blur_semantics_policy = effects::CanonicalBlurSemanticsPolicy::Canonical;
+        reference_harness
+            .renderer
+            .effect_runtime
+            .terminal_blur_fusion_policy = if terminal_fusion {
+            effects::TerminalBlurFusionPolicy::On
+        } else {
+            effects::TerminalBlurFusionPolicy::Off
+        };
         unsafe { reference_harness.gl.enable(glow::DITHER) };
     }
     update_diagnostic_background_for_surface(&reference_harness, 7, repair, [207, 43, 89, 255]);
@@ -1455,6 +1504,42 @@ fn capture_canonical_staged_noise_field(
         ),
         "stage probe storage is local to its graph texture domain"
     );
+    crop_diagnostic_capture_to_effect_domain(&capture, effect_domain)
+}
+
+fn capture_canonical_terminal_noise_field(
+    graph: &CompiledFrameGraph,
+    output_size: (u32, u32),
+    origin: OutputFramebufferOrigin,
+    terminal_pass: oblivion_one::effects::GraphPassId,
+    effect_domain: EffectRect,
+    install_scene: impl FnOnce(&mut GlesEffectTestHarness),
+) -> effects::DiagnosticTextureCapture {
+    let mut harness = GlesEffectTestHarness::new(output_size.0, output_size.1);
+    install_scene(&mut harness);
+    let bounds = EffectRect::new(0, 0, output_size.0, output_size.1).expect("output bounds");
+    let replay = effects::with_test_offscreen_dither_policy(Some(false), || {
+        execute_diagnostic_frame_with_terminal_replay(
+            &mut harness,
+            graph,
+            &diagnostic_repaint_plan_for_repairs_in_size(&[], true, output_size),
+            EffectRegion::from_rect(bounds),
+            true,
+            effects::EffectDebugConfig::new(
+                effects::EffectDebugCaptureMode::Replay,
+                effects::EffectDebugKawaseMode::Partial,
+            ),
+            origin,
+            effects::TerminalBoundaryReplay::CanonicalTerminalQ1Q2,
+            [],
+            [terminal_pass],
+        )
+    });
+    let capture = replay.stage_probes[&(
+        terminal_pass,
+        effects::TerminalDiagnosticStage::CanonicalNoiseBits,
+    )]
+        .clone();
     crop_diagnostic_capture_to_effect_domain(&capture, effect_domain)
 }
 
@@ -4709,59 +4794,31 @@ fn canonical_staged_blur_matches_canonical_terminal_fusion_exactly() {
         1,
         "canonical staged graph has one terminal tail"
     );
-    let tail = tails[0];
-    let fused_composite = fused_graph
-        .passes
-        .iter()
-        .find(|pass| pass.terminal_kawase.is_some())
-        .expect("canonical fused graph retains its terminal Composite");
+    assert!(
+        fused_graph
+            .passes
+            .iter()
+            .any(|pass| pass.terminal_kawase.is_some()),
+        "canonical fused graph retains its terminal Composite"
+    );
+    assert_eq!(staged_graph.stats.terminal_blur_fusions, 0);
+    assert_eq!(fused_graph.stats.terminal_blur_fusions, 1);
 
     for origin in [
         OutputFramebufferOrigin::BottomLeft,
         OutputFramebufferOrigin::TopLeftScanout,
     ] {
-        let (staged, canonical_staged) =
-            effects::with_test_offscreen_dither_policy(Some(false), || {
-                render_terminal_replay_mode(
-                    &staged_graph,
-                    output_size,
-                    origin,
-                    |harness| install_diagnostic_scene(harness, rect, visual_group),
-                    effects::TerminalBoundaryReplay::CanonicalStaged,
-                    [tail.upsample, tail.fragment],
-                    [],
-                )
-            });
-        let (fused, canonical_fused) =
-            effects::with_test_offscreen_dither_policy(Some(false), || {
-                render_terminal_replay_mode(
-                    &fused_graph,
-                    output_size,
-                    origin,
-                    |harness| install_diagnostic_scene(harness, rect, visual_group),
-                    effects::TerminalBoundaryReplay::CanonicalTerminalQ1Q2,
-                    [],
-                    [fused_composite.id],
-                )
-            });
-
-        assert_eq!(
-            staged.captures[&tail.upsample].pixels,
-            fused.stage_probes[&(fused_composite.id, effects::TerminalDiagnosticStage::Up2)].pixels,
-            "canonical A differs for {origin:?}"
+        let (_, fused, staged) = render_canonical_single_tail_pair(
+            &staged_graph,
+            &fused_graph,
+            output_size,
+            origin,
+            |harness| install_diagnostic_scene(harness, rect, visual_group),
+            "canonical_default_material",
         );
         assert_eq!(
-            staged.captures[&tail.fragment].pixels,
-            fused.stage_probes[&(
-                fused_composite.id,
-                effects::TerminalDiagnosticStage::Fragment
-            )]
-                .pixels,
-            "canonical B differs for {origin:?}"
-        );
-        assert_eq!(
-            canonical_staged, canonical_fused,
-            "canonical C differs for {origin:?}"
+            staged, fused,
+            "production canonical C differs for {origin:?}"
         );
     }
 }
@@ -5139,20 +5196,18 @@ fn canonical_partial_repair_matches_full_render_for_staged_and_fused_paths() {
         OutputFramebufferOrigin::BottomLeft,
         OutputFramebufferOrigin::TopLeftScanout,
     ] {
-        let staged_replay = effects::with_test_offscreen_dither_policy(Some(false), || {
-            render_terminal_replay_after_partial_repair(
-                &scene,
-                &registry,
-                &staged_graph,
-                output_size,
-                origin,
-                |harness| install_diagnostic_scene_with_origin(harness, rect, visual_group, origin),
-                repair,
-                false,
-                effects::TerminalBoundaryReplay::CanonicalStaged,
-                false,
-            )
-        });
+        let staged_replay = render_terminal_replay_after_partial_repair(
+            &scene,
+            &registry,
+            &staged_graph,
+            output_size,
+            origin,
+            |harness| install_diagnostic_scene_with_origin(harness, rect, visual_group, origin),
+            repair,
+            false,
+            effects::TerminalBoundaryReplay::ProductionCanonicalStaged,
+            true,
+        );
         let staged_source_impact = summarize_rgba8_difference(
             &staged_replay.initial_pixels,
             &staged_replay.full_reference_pixels,
@@ -5176,20 +5231,18 @@ fn canonical_partial_repair_matches_full_render_for_staged_and_fused_paths() {
             repair_failures.push(failure);
         }
 
-        let fused_replay = effects::with_test_offscreen_dither_policy(Some(false), || {
-            render_terminal_replay_after_partial_repair(
-                &scene,
-                &registry,
-                &fused_graph,
-                output_size,
-                origin,
-                |harness| install_diagnostic_scene_with_origin(harness, rect, visual_group, origin),
-                repair,
-                true,
-                effects::TerminalBoundaryReplay::CanonicalTerminalQ1Q2,
-                false,
-            )
-        });
+        let fused_replay = render_terminal_replay_after_partial_repair(
+            &scene,
+            &registry,
+            &fused_graph,
+            output_size,
+            origin,
+            |harness| install_diagnostic_scene_with_origin(harness, rect, visual_group, origin),
+            repair,
+            true,
+            effects::TerminalBoundaryReplay::ProductionCanonicalFused,
+            true,
+        );
         if let Some(failure) = repair_pixel_mismatch(
             "canonical C1 partial vs independent full reference",
             "full",
@@ -5232,32 +5285,6 @@ fn canonical_partial_repair_matches_full_render_for_staged_and_fused_paths() {
         ) {
             repair_failures.push(failure);
         }
-        let production_replay = render_terminal_replay_after_partial_repair(
-            &scene,
-            &registry,
-            &staged_graph,
-            output_size,
-            origin,
-            |harness| install_diagnostic_scene_with_origin(harness, rect, visual_group, origin),
-            repair,
-            false,
-            effects::TerminalBoundaryReplay::ProductionCanonicalStaged,
-            true,
-        );
-        if let Some(failure) = repair_pixel_mismatch(
-            "production canonical partial vs independent full reference",
-            "production full",
-            "production partial",
-            &production_replay.full_reference_pixels,
-            &production_replay.partial_pixels,
-            Some(&production_replay.initial_pixels),
-            output_size,
-            origin,
-            &production_replay.source_damage,
-            &production_replay.repair_graph,
-        ) {
-            repair_failures.push(failure);
-        }
         assert!(fused_terminal.terminal_kawase.is_some());
     }
     assert!(
@@ -5289,8 +5316,21 @@ fn canonical_noise_seed_fields_are_origin_and_translation_independent() {
     let first_graph = terminal_graph_variant(&first_scene, &first_registry, bounds, false);
     let translated_graph =
         terminal_graph_variant(&translated_scene, &translated_registry, bounds, false);
+    let first_fused_graph = terminal_graph_variant(&first_scene, &first_registry, bounds, true);
+    let translated_fused_graph =
+        terminal_graph_variant(&translated_scene, &translated_registry, bounds, true);
     let first_tail = terminal_tail_capture_ids(&first_graph)[0];
     let translated_tail = terminal_tail_capture_ids(&translated_graph)[0];
+    let first_fused_terminal = first_fused_graph
+        .passes
+        .iter()
+        .find(|pass| pass.terminal_kawase.is_some())
+        .expect("first fused graph retains its terminal pass");
+    let translated_fused_terminal = translated_fused_graph
+        .passes
+        .iter()
+        .find(|pass| pass.terminal_kawase.is_some())
+        .expect("translated fused graph retains its terminal pass");
     let first_domain = terminal_stage_output_domain(&first_graph, first_tail.fragment);
     let translated_domain =
         terminal_stage_output_domain(&translated_graph, translated_tail.fragment);
@@ -5334,6 +5374,38 @@ fn canonical_noise_seed_fields_are_origin_and_translation_independent() {
         translated_rect,
         |harness| install_diagnostic_scene(harness, translated_rect, translated_group),
     );
+    let first_fused_bottom = capture_canonical_terminal_noise_field(
+        &first_fused_graph,
+        output_size,
+        OutputFramebufferOrigin::BottomLeft,
+        first_fused_terminal.id,
+        first_rect,
+        |harness| install_diagnostic_scene(harness, first_rect, first_group),
+    );
+    let first_fused_top = capture_canonical_terminal_noise_field(
+        &first_fused_graph,
+        output_size,
+        OutputFramebufferOrigin::TopLeftScanout,
+        first_fused_terminal.id,
+        first_rect,
+        |harness| install_diagnostic_scene(harness, first_rect, first_group),
+    );
+    let translated_fused_bottom = capture_canonical_terminal_noise_field(
+        &translated_fused_graph,
+        output_size,
+        OutputFramebufferOrigin::BottomLeft,
+        translated_fused_terminal.id,
+        translated_rect,
+        |harness| install_diagnostic_scene(harness, translated_rect, translated_group),
+    );
+    let translated_fused_top = capture_canonical_terminal_noise_field(
+        &translated_fused_graph,
+        output_size,
+        OutputFramebufferOrigin::TopLeftScanout,
+        translated_fused_terminal.id,
+        translated_rect,
+        |harness| install_diagnostic_scene(harness, translated_rect, translated_group),
+    );
     for (capture_name, capture) in [
         ("first TopLeftScanout", &first_top),
         ("translated BottomLeft", &translated_bottom),
@@ -5361,6 +5433,18 @@ fn canonical_noise_seed_fields_are_origin_and_translation_independent() {
         ("first TopLeftScanout", &first_top, first_rect),
         ("translated BottomLeft", &translated_bottom, translated_rect),
         ("translated TopLeftScanout", &translated, translated_rect),
+        ("first fused BottomLeft", &first_fused_bottom, first_rect),
+        ("first fused TopLeftScanout", &first_fused_top, first_rect),
+        (
+            "translated fused BottomLeft",
+            &translated_fused_bottom,
+            translated_rect,
+        ),
+        (
+            "translated fused TopLeftScanout",
+            &translated_fused_top,
+            translated_rect,
+        ),
     ];
     for (edge, local_x, local_y) in edge_and_center_pixels {
         let expected =
@@ -5407,7 +5491,13 @@ fn canonical_noise_field_origin_is_invariant_with_capture_clipped_to_output() {
     let (scene, registry) = terminal_builtin_blur_scene(effect_rect, group, material, None);
     let bounds = EffectRect::new(0, 0, output_size.0, output_size.1).expect("output bounds");
     let graph = terminal_graph_variant(&scene, &registry, bounds, false);
+    let fused_graph = terminal_graph_variant(&scene, &registry, bounds, true);
     let tail = terminal_tail_capture_ids(&graph)[0];
+    let fused_terminal = fused_graph
+        .passes
+        .iter()
+        .find(|pass| pass.terminal_kawase.is_some())
+        .expect("fused graph retains its terminal pass");
     let domain = terminal_stage_output_domain(&graph, tail.fragment);
     assert_eq!(
         domain.x, 0,
@@ -5436,8 +5526,32 @@ fn canonical_noise_field_origin_is_invariant_with_capture_clipped_to_output() {
         effect_rect,
         |harness| install_diagnostic_scene(harness, effect_rect, group),
     );
+    let fused_bottom_left = capture_canonical_terminal_noise_field(
+        &fused_graph,
+        output_size,
+        OutputFramebufferOrigin::BottomLeft,
+        fused_terminal.id,
+        effect_rect,
+        |harness| install_diagnostic_scene(harness, effect_rect, group),
+    );
+    let fused_top_left = capture_canonical_terminal_noise_field(
+        &fused_graph,
+        output_size,
+        OutputFramebufferOrigin::TopLeftScanout,
+        fused_terminal.id,
+        effect_rect,
+        |harness| install_diagnostic_scene(harness, effect_rect, group),
+    );
     assert_eq!(
         bottom_left.pixels, top_left.pixels,
         "canonical offscreen Noise field changed with framebuffer origin when capture is clipped"
+    );
+    assert_eq!(
+        fused_bottom_left.pixels, fused_top_left.pixels,
+        "canonical terminal Noise field changed with framebuffer origin when capture is clipped"
+    );
+    assert_eq!(
+        bottom_left.pixels, fused_bottom_left.pixels,
+        "canonical terminal Noise field differs from the canonical staged field"
     );
 }

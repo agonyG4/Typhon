@@ -10,7 +10,9 @@ mod metrics;
 mod precomputed_window_blur;
 pub(crate) use precomputed_window_blur::PrecomputedWindowBlurPolicy;
 mod terminal_blur_fusion;
-pub(crate) use terminal_blur_fusion::terminal_fusion_enabled;
+#[cfg(test)]
+pub(crate) use terminal_blur_fusion::TerminalBlurFusionPolicy;
+pub(crate) use terminal_blur_fusion::{terminal_composite_shader_variant, terminal_fusion_enabled};
 mod resources;
 mod runtime;
 mod shader_cache;
@@ -29,7 +31,7 @@ pub(crate) use executor::with_test_offscreen_dither_policy;
 #[cfg(test)]
 pub(crate) use executor::{
     BLEND_STAGE_FRAGMENT_SHADER, EffectPassBlendMode, MASK_STAGE_FRAGMENT_SHADER,
-    NORMALIZE_FRAGMENT_SHADER, TEST_MANUAL_BINARY16_GLSL, establish_effect_pass_blend_state,
+    NORMALIZE_FRAGMENT_SHADER, RGBA16F_RTZ_GLSL, establish_effect_pass_blend_state,
 };
 #[cfg(test)]
 pub(crate) const COPY_FRAGMENT_SHADER: &str = executor::COPY_FRAGMENT_SHADER;

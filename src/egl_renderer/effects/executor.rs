@@ -117,20 +117,22 @@ use checkpoint::*;
 pub(crate) use checkpoint::{checkpoint_causal_stability_plan, checkpoint_update_rects_for_test};
 
 mod shaders;
+#[cfg(test)]
+pub(crate) use shaders::RGBA16F_RTZ_GLSL;
 pub(crate) use shaders::{
     BLEND_STAGE_FRAGMENT_SHADER, COMPOSITE_FRAGMENT_SHADER, COPY_FRAGMENT_SHADER,
     FRAGMENT_STAGE_FRAGMENT_CANONICAL_SHADER, FRAGMENT_STAGE_FRAGMENT_SHADER,
     MASK_STAGE_FRAGMENT_SHADER, NORMALIZE_FRAGMENT_SHADER,
-    TERMINAL_KAWASE_COMPOSITE_FRAGMENT_SHADER,
+    TERMINAL_KAWASE_COMPOSITE_CANONICAL_FRAGMENT_SHADER, TERMINAL_KAWASE_COMPOSITE_FRAGMENT_SHADER,
 };
 #[cfg(test)]
 pub(crate) use shaders::{
     DIAGNOSTIC_KAWASE_ONLY_FRAGMENT_SHADER, DIAGNOSTIC_LEGACY_UP2_FRAGMENT_SHADER,
     DIAGNOSTIC_MATERIAL_COMPOSITE_FRAGMENT_SHADER, DIAGNOSTIC_MATERIAL_COMPOSITE_VERTEX_SHADER,
-    DIAGNOSTIC_TERMINAL_UP2_FRAGMENT_STAGE_SHADER, TEST_MANUAL_BINARY16_GLSL,
-    diagnostic_fragment_stage_boundary_probe_shader, diagnostic_fragment_stage_q2_shader,
-    diagnostic_kawase_only_channel_bits_shader, diagnostic_kawase_only_shader,
-    diagnostic_legacy_up2_canonical_shader, diagnostic_terminal_shader_with_virtual_boundaries,
+    DIAGNOSTIC_TERMINAL_UP2_FRAGMENT_STAGE_SHADER, diagnostic_fragment_stage_boundary_probe_shader,
+    diagnostic_fragment_stage_q2_shader, diagnostic_kawase_only_channel_bits_shader,
+    diagnostic_kawase_only_shader, diagnostic_legacy_up2_canonical_shader,
+    diagnostic_terminal_shader_with_virtual_boundaries,
 };
 
 #[cfg(test)]

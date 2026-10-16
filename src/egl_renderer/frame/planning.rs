@@ -505,8 +505,15 @@ impl FramePipeline<'_> {
                 graph.stats.terminal_blur_passes_elided,
             )
         });
+        let terminal_shader_variant = (terminal_fusion_stats.1 > 0).then(|| {
+            super::super::effects::terminal_composite_shader_variant(
+                self.effects.canonical_blur_semantics_policy,
+            )
+        });
         self.effects.effect_trace.terminal_blur_fusion(
             self.effects.terminal_blur_fusion_policy.as_str(),
+            self.effects.canonical_blur_semantics_policy.as_str(),
+            terminal_shader_variant,
             terminal_fusion_stats.0,
             terminal_fusion_stats.1,
             terminal_fusion_stats.2,
