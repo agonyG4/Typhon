@@ -13,6 +13,7 @@ pub(crate) struct NativeLegacyHardwareCursor {
     pub(crate) hotspot_y: i32,
     pub(crate) active: bool,
     image: Arc<CompositorCursorImage>,
+    telemetry_bytes: u64,
 }
 
 impl NativeLegacyHardwareCursor {
@@ -53,7 +54,8 @@ impl NativeLegacyHardwareCursor {
             bo.stride(),
         )?;
         bo.write(&cursor_bytes)?;
-        Ok(Self {
+        let telemetry_bytes = legacy_cursor_storage_estimate(bo.stride(), bo.height());
+        let cursor = Self {
             fd: kms.as_raw_fd(),
             crtc_id,
             width: bo.width(),
@@ -64,7 +66,13 @@ impl NativeLegacyHardwareCursor {
             _device: device,
             active: false,
             image: image.clone(),
-        })
+            telemetry_bytes,
+        };
+        crate::gpu_residency::record_gpu_resource_allocation(
+            crate::gpu_residency::GpuResourceClass::CursorBacking,
+            Some(telemetry_bytes),
+        );
+        Ok(cursor)
     }
 
     pub(crate) fn matches_image(&self, image: &Arc<CompositorCursorImage>) -> bool {
@@ -121,18 +129,35 @@ pub(crate) const fn legacy_cursor_position(
     )
 }
 
+fn legacy_cursor_storage_estimate(stride: u32, height: u32) -> u64 {
+    u64::from(stride).saturating_mul(u64::from(height))
+}
+
 impl Drop for NativeLegacyHardwareCursor {
     fn drop(&mut self) {
         let _ = self.disable();
+        crate::gpu_residency::record_gpu_resource_retirement(
+            crate::gpu_residency::GpuResourceClass::CursorBacking,
+            Some(self.telemetry_bytes),
+        );
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::legacy_cursor_position;
+    use super::{legacy_cursor_position, legacy_cursor_storage_estimate};
 
     #[test]
     fn legacy_cursor_move_subtracts_hotspot() {
         assert_eq!(legacy_cursor_position(40, 30, 7, 9), (33, 21));
+    }
+
+    #[test]
+    fn legacy_cursor_bytes_use_actual_stride_times_height() {
+        assert_eq!(legacy_cursor_storage_estimate(320, 64), 20_480);
+        assert_eq!(
+            legacy_cursor_storage_estimate(u32::MAX, u32::MAX),
+            u64::from(u32::MAX) * u64::from(u32::MAX)
+        );
     }
 }

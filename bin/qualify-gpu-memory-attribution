@@ -1,0 +1,517 @@
+#!/usr/bin/env python3
+"""Read-only GPU memory attribution sampler for a running Typhon process."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import statistics
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from typing import Any, Callable
+
+
+class QualificationError(RuntimeError):
+    pass
+
+
+class UnsupportedMemoryField(QualificationError):
+    pass
+
+
+class IncoherentSnapshot(QualificationError):
+    pass
+
+
+def parse_pmon_fb_mib(output: str, pid: int) -> float | None:
+    """Parse the exact PID's framebuffer MiB column from `pmon -s m`."""
+    header: list[str] | None = None
+    for line in output.splitlines():
+        fields = line.lstrip("# ").split()
+        lowered = [field.lower() for field in fields]
+        if "gpu" in lowered and "pid" in lowered and "type" in lowered:
+            header = lowered
+            break
+    if header is None:
+        raise UnsupportedMemoryField("nvidia-smi pmon output has no column header")
+    pid_index = header.index("pid")
+    fb_index = next((i for i, name in enumerate(header) if name in ("fb", "fb_mib")), None)
+    if fb_index is None:
+        raise UnsupportedMemoryField("nvidia-smi pmon output has no framebuffer-memory column")
+    for line in output.splitlines():
+        fields = line.lstrip("# ").split()
+        if not fields or fields[0].lower() in ("gpu", "idx") or len(fields) <= max(pid_index, fb_index):
+            continue
+        try:
+            row_pid = int(fields[pid_index])
+        except ValueError:
+            continue
+        if row_pid != pid:
+            continue
+        value = fields[fb_index]
+        if value in ("-", "N/A", "n/a"):
+            raise UnsupportedMemoryField("framebuffer-memory field is unsupported for this process")
+        try:
+            return float(value)
+        except ValueError as error:
+            raise UnsupportedMemoryField(f"invalid framebuffer-memory value: {value}") from error
+    return None
+
+
+def _proc_start_time(pid: int) -> tuple[int, str]:
+    stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    close = stat.rfind(")")
+    if close < 0:
+        raise QualificationError("cannot parse process stat record")
+    fields_after_comm = stat[close + 1 :].split()
+    if len(fields_after_comm) <= 19:
+        raise QualificationError("process stat record lacks start time")
+    start_ticks = int(fields_after_comm[19])
+    boot_time = next(
+        int(line.split()[1])
+        for line in Path("/proc/stat").read_text(encoding="utf-8").splitlines()
+        if line.startswith("btime ")
+    )
+    start_epoch = boot_time + start_ticks / os.sysconf("SC_CLK_TCK")
+    start_iso = datetime.fromtimestamp(start_epoch, timezone.utc).isoformat()
+    return start_ticks, start_iso
+
+
+def _process_environment_value(pid: int, name: str) -> str | None:
+    raw = Path(f"/proc/{pid}/environ").read_bytes()
+    prefix = name.encode("utf-8") + b"="
+    for item in raw.split(b"\0"):
+        if item.startswith(prefix):
+            return item[len(prefix) :].decode("utf-8", errors="replace")
+    return None
+
+
+def process_identity(pid: int) -> dict[str, Any]:
+    proc_exe = Path(f"/proc/{pid}/exe")
+    try:
+        exe_path = os.readlink(proc_exe)
+        stat = proc_exe.stat()
+        start_ticks, start_iso = _proc_start_time(pid)
+        digest = hashlib.sha256()
+        with proc_exe.open("rb") as binary:
+            for block in iter(lambda: binary.read(1024 * 1024), b""):
+                digest.update(block)
+        worker_value = _process_environment_value(pid, "OBLIVION_ONE_RENDER_WORKER")
+    except (OSError, StopIteration) as error:
+        raise QualificationError(f"cannot identify PID {pid}: {error}") from error
+    return {
+        "pid": pid,
+        "exe": exe_path.removesuffix(" (deleted)"),
+        "binary_sha256": digest.hexdigest(),
+        "binary_mtime_unix_ns": stat.st_mtime_ns,
+        "binary_mtime_utc": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(),
+        "process_start_time_ticks": start_ticks,
+        "process_start_time_utc": start_iso,
+        "oblivion_one_render_worker": worker_value,
+    }
+
+
+def same_process_identity(before: dict[str, Any], after: dict[str, Any]) -> bool:
+    return all(
+        before.get(key) == after.get(key)
+        for key in ("pid", "exe", "binary_sha256", "process_start_time_ticks")
+    )
+
+
+def find_typhon_pid() -> int:
+    matches: list[int] = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            exe = os.readlink(entry / "exe")
+        except OSError:
+            continue
+        if Path(exe.removesuffix(" (deleted)")).name == "oblivion-one":
+            matches.append(int(entry.name))
+    if len(matches) != 1:
+        raise QualificationError(f"expected one running oblivion-one process; found {matches}")
+    return matches[0]
+
+
+def git_identity(repo: Path) -> dict[str, str]:
+    def git(*args: str) -> str:
+        result = subprocess.run(
+            ["git", "-C", str(repo), *args],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        return result.stdout.strip()
+
+    return {"head": git("rev-parse", "HEAD"), "branch": git("branch", "--show-current")}
+
+
+def _find_gpu_residency(node: Any) -> dict[str, Any] | None:
+    if isinstance(node, dict):
+        residency = node.get("gpuResidency", node.get("gpu_residency"))
+        if isinstance(residency, dict):
+            return residency
+        for value in node.values():
+            found = _find_gpu_residency(value)
+            if found is not None:
+                return found
+    elif isinstance(node, list):
+        for value in node:
+            found = _find_gpu_residency(value)
+            if found is not None:
+                return found
+    return None
+
+
+def coherent_internal_sample(
+    fetch: Callable[[], dict[str, Any]], attempts: int = 3
+) -> tuple[dict[str, Any], dict[str, Any], int]:
+    last_residency: dict[str, Any] | None = None
+    for attempt in range(1, attempts + 1):
+        snapshot = fetch()
+        residency = _find_gpu_residency(snapshot)
+        if residency is None:
+            raise QualificationError("astreactl output has no gpuResidency object")
+        telemetry = residency.get("resource_telemetry", {})
+        last_residency = residency
+        if telemetry.get("coherent") is True:
+            return snapshot, residency, attempt - 1
+    raise IncoherentSnapshot(
+        f"resource telemetry remained incoherent after {attempts} attempts; "
+        f"last event_sequence={((last_residency or {}).get('resource_telemetry') or {}).get('event_sequence')}"
+    )
+
+
+def drm_fdinfo_probe(pid: int) -> dict[str, Any]:
+    contents: list[str] = []
+    try:
+        descriptors = list(Path(f"/proc/{pid}/fd").iterdir())
+    except OSError as error:
+        return {"supported": False, "reason": f"fd_directory_unavailable: {error}", "fields": {}}
+    for descriptor in descriptors:
+        try:
+            target = os.readlink(descriptor)
+            if not target.startswith("/dev/dri/"):
+                continue
+            content = Path(f"/proc/{pid}/fdinfo/{descriptor.name}").read_text(encoding="utf-8")
+        except OSError:
+            continue
+        contents.append(content)
+    return parse_drm_fdinfo_contents(contents)
+
+
+def parse_drm_fdinfo_contents(contents: list[str]) -> dict[str, Any]:
+    observed: dict[str, list[str]] = {}
+    for content in contents:
+        for line in content.splitlines():
+            key, separator, value = line.partition(":")
+            if separator and key.strip().startswith("drm-") and (
+                "memory" in key.lower() or "client-id" in key.lower()
+            ):
+                observed.setdefault(key.strip(), []).append(value.strip())
+    return {
+        "supported": bool(observed),
+        "reason": None if observed else "no_standard_drm_memory_fields",
+        "fields": observed,
+    }
+
+
+def summarize_mib(values: list[float | None]) -> dict[str, Any]:
+    present = [value for value in values if value is not None]
+    return {
+        "samples": values,
+        "min": min(present) if present else None,
+        "median": statistics.median(present) if present else None,
+        "max": max(present) if present else None,
+        "valid_sample_count": len(present),
+        "observer": "nvidia-smi pmon -s m",
+        "semantics": "independent per-process framebuffer-memory observation",
+        "unit": "MiB",
+    }
+
+
+def _run_json(command: list[str]) -> dict[str, Any]:
+    result = subprocess.run(command, check=True, text=True, capture_output=True, timeout=15)
+    return json.loads(result.stdout)
+
+
+def _driver_info() -> dict[str, str | None]:
+    result = subprocess.run(
+        [
+            "nvidia-smi",
+            "--query-gpu=driver_version,name",
+            "--format=csv,noheader,nounits",
+        ],
+        check=True,
+        text=True,
+        capture_output=True,
+        timeout=10,
+    )
+    first = result.stdout.strip().splitlines()[0]
+    driver, separator, name = first.partition(",")
+    return {"driver_version": driver.strip(), "gpu_name": name.strip() if separator else None}
+
+
+def _internal_fetch() -> dict[str, Any]:
+    return _run_json(["astreactl", "--json", "performance"])
+
+
+def _error_summary(error: BaseException) -> str:
+    if isinstance(error, subprocess.CalledProcessError):
+        detail = (error.stderr or error.stdout or "").strip().splitlines()
+        suffix = f": {detail[-1][:240]}" if detail else ""
+        return f"{error.cmd!r} exited with status {error.returncode}{suffix}"
+    return str(error)
+
+
+def qualify(args: argparse.Namespace) -> dict[str, Any]:
+    pid = args.pid if args.pid is not None else find_typhon_pid()
+    identity = process_identity(pid)
+    if Path(identity["exe"]).name != "oblivion-one":
+        raise QualificationError(f"PID {pid} is not an oblivion-one process: {identity['exe']}")
+    expected_binary_sha256 = None
+    if args.expected_binary is not None:
+        digest = hashlib.sha256()
+        with args.expected_binary.open("rb") as binary:
+            for block in iter(lambda: binary.read(1024 * 1024), b""):
+                digest.update(block)
+        expected_binary_sha256 = digest.hexdigest()
+    git = git_identity(Path(args.repo).resolve())
+    driver = _driver_info()
+    pmon_samples: list[float | None] = []
+    internal_samples: list[dict[str, Any]] = []
+    failure: str | None = None
+    process_verified = True
+    if expected_binary_sha256 is not None and identity["binary_sha256"] != expected_binary_sha256:
+        failure = "running_binary_hash_does_not_match_expected_binary"
+    for index in range(args.samples):
+        try:
+            before = process_identity(pid)
+            if not same_process_identity(identity, before):
+                failure = "target_pid_identity_changed_before_sample"
+                process_verified = False
+                break
+        except QualificationError as error:
+            failure = failure or str(error)
+            process_verified = False
+            break
+
+        try:
+            _internal, residency, retries = coherent_internal_sample(
+                _internal_fetch, args.coherence_retries
+            )
+            telemetry = residency.get("resource_telemetry", {})
+            sample_accounting_errors = sum(
+                int(row.get("accounting_error_count", 0))
+                for row in telemetry.get("classes", [])
+            )
+            internal_sample = {
+                "sample_index": index + 1,
+                "coherent": telemetry.get("coherent") is True,
+                "event_sequence": telemetry.get("event_sequence"),
+                "snapshot_retries": telemetry.get("snapshot_retries"),
+                "accounting_error_count": sample_accounting_errors,
+                "tool_coherence_retries": retries,
+                "attribution_summary": residency.get("attribution_summary", {}),
+                "resource_telemetry": telemetry,
+                "renderer_import_cache": residency.get("renderer_import_cache", {}),
+                "renderer_import_cache_available": residency.get(
+                    "renderer_import_cache_available", False
+                ),
+                "direct_import_cache": residency.get("direct_import_cache", {}),
+                "domains": residency.get("domains", []),
+            }
+            internal_error = None
+        except (QualificationError, OSError, subprocess.SubprocessError, json.JSONDecodeError) as error:
+            internal_error = f"internal_sample_failed: {_error_summary(error)}"
+            internal_sample = {
+                "sample_index": index + 1,
+                "coherent": False,
+                "sample_error": internal_error,
+            }
+            sample_accounting_errors = None
+
+        try:
+            pmon = subprocess.run(
+                ["nvidia-smi", "pmon", "-s", "m", "-c", "1"],
+                check=True,
+                text=True,
+                capture_output=True,
+                timeout=10,
+            )
+            fb_mib = parse_pmon_fb_mib(pmon.stdout, pid)
+            pmon_error = None
+        except (UnsupportedMemoryField, OSError, subprocess.SubprocessError) as error:
+            fb_mib = None
+            pmon_error = f"pmon_sample_failed: {_error_summary(error)}"
+
+        try:
+            after = process_identity(pid)
+            if not same_process_identity(identity, after):
+                failure = "target_pid_identity_changed_during_sample"
+                process_verified = False
+                break
+        except QualificationError as error:
+            failure = str(error)
+            process_verified = False
+            break
+
+        internal_samples.append(internal_sample)
+        pmon_samples.append(fb_mib)
+        if failure is None and internal_error is not None:
+            failure = internal_error
+        if failure is None and pmon_error is not None:
+            failure = pmon_error
+        if failure is None and fb_mib is None:
+            failure = "target_pid_missing_from_nvidia_pmon_sample"
+        if failure is None and sample_accounting_errors != 0:
+            failure = "resource_telemetry_accounting_errors_nonzero"
+        if index + 1 < args.samples:
+            time.sleep(args.interval)
+
+    try:
+        final_identity = process_identity(pid)
+    except QualificationError:
+        final_identity = None
+        process_verified = False
+        if failure is None:
+            failure = "target_pid_unavailable_after_sampling"
+    if final_identity is not None and not same_process_identity(identity, final_identity):
+        process_verified = False
+        if failure is None:
+            failure = "target_pid_identity_changed_after_sampling"
+
+    last = internal_samples[-1] if internal_samples else {}
+    attribution = last.get("attribution_summary", {})
+    telemetry = last.get("resource_telemetry", {})
+    classes = telemetry.get("classes", [])
+    aliases = {
+        row.get("class"): row.get("effective_live_count", row.get("live_count", 0))
+        for row in classes
+        if row.get("class") in ("imported_egl_image_view", "imported_gl_texture_view")
+    }
+    driver_objects = {
+        row.get("class"): row.get("effective_live_count", row.get("live_count", 0))
+        for row in classes
+        if row.get("byte_semantics") == "driver_managed_unknown"
+    }
+    accounting_errors = sum(int(row.get("accounting_error_count", 0)) for row in classes)
+    if failure is None and expected_binary_sha256 is None:
+        failure = "expected_binary_sha256_not_supplied"
+    mismatches = [
+        row.get("class")
+        for row in classes
+        if row.get("live_state_matches") is False
+    ]
+    mismatch_details = [
+        {
+            "class": row.get("class"),
+            "event_live_count": row.get("event_live_count"),
+            "owner_observed_live_count": row.get("owner_observed_live_count"),
+            "live_count_delta": row.get("live_count_delta"),
+            "event_known_live_bytes": row.get("event_known_live_bytes"),
+            "owner_observed_known_live_bytes": row.get("owner_observed_known_live_bytes"),
+            "known_live_bytes_delta": row.get("known_live_bytes_delta"),
+        }
+        for row in classes
+        if row.get("live_state_matches") is False
+    ]
+    report = {
+        "captured_at_utc": datetime.now(timezone.utc).isoformat(),
+        "valid": (
+            failure is None
+            and len(internal_samples) == args.samples
+            and all(sample.get("coherent") is True for sample in internal_samples)
+            and len(pmon_samples) == args.samples
+            and accounting_errors == 0
+            and process_verified
+            and expected_binary_sha256 is not None
+            and identity["binary_sha256"] == expected_binary_sha256
+        ),
+        "invalid_reason": failure,
+        "process_identity": identity,
+        "current_git": git,
+        "expected_binary_sha256": expected_binary_sha256,
+        "binary_hash_matches_expected": (
+            identity["binary_sha256"] == expected_binary_sha256
+            if expected_binary_sha256 is not None
+            else None
+        ),
+        "process_identity_verified": process_verified,
+        "driver": driver,
+        "nvidia_process_fb_mib": summarize_mib(pmon_samples),
+        "owned_storage_estimated_bytes": attribution.get("owned_storage_estimated_bytes"),
+        "external_mapping_logical_bytes": attribution.get("external_mapping_logical_bytes"),
+        "unique_external_backing_bytes": attribution.get("unique_external_backing_bytes"),
+        "physical_vram_claim": attribution.get("physical_vram_claim", False),
+        "alias_view_counts": aliases,
+        "driver_managed_unknown_counts": driver_objects,
+        "coverage_reconciliation_status": {
+            "coherent": telemetry.get("coherent") is True,
+            "event_sequence": telemetry.get("event_sequence"),
+            "snapshot_retries": telemetry.get("snapshot_retries"),
+            "accounting_error_count": accounting_errors,
+            "reconciliation_mismatch_classes": mismatches,
+            "reconciliation_mismatches": mismatch_details,
+            "live_unresolved_class_count": attribution.get("live_unresolved_class_count"),
+            "live_unresolved_domain_count": attribution.get("live_unresolved_domain_count"),
+        },
+        "renderer_import_cache": last.get("renderer_import_cache", {}),
+        "renderer_import_cache_available": last.get(
+            "renderer_import_cache_available", False
+        ),
+        "direct_import_cache": last.get("direct_import_cache", {}),
+        "drm_fdinfo": drm_fdinfo_probe(pid),
+        "internal_samples": internal_samples,
+        "accounting_note": "These categories are not arithmetically additive into a physical-VRAM claim.",
+    }
+    return report
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--pid", type=int, help="exact oblivion-one PID; defaults to unique matching process")
+    parser.add_argument("--repo", default=str(Path(__file__).resolve().parents[1]))
+    parser.add_argument("--samples", type=int, default=10)
+    parser.add_argument("--interval", type=float, default=1.0)
+    parser.add_argument("--coherence-retries", type=int, default=3)
+    parser.add_argument("--expected-binary", type=Path, help="release binary that the running PID must match")
+    parser.add_argument("--output", type=Path, help="write the JSON report to this path")
+    args = parser.parse_args()
+    if args.samples < 1 or args.interval < 0 or args.coherence_retries < 1:
+        parser.error("samples/retries must be positive and interval must be non-negative")
+    if shutil.which("astreactl") is None:
+        parser.error("astreactl is not available in PATH")
+    try:
+        report = qualify(args)
+    except (QualificationError, OSError, subprocess.SubprocessError, json.JSONDecodeError) as error:
+        print(f"qualification failed: {error}", file=sys.stderr)
+        return 2
+    encoded = json.dumps(report, indent=2, sort_keys=True)
+    if args.output:
+        args.output.write_text(encoded + "\n", encoding="utf-8")
+        print(f"JSON report: {args.output}")
+    else:
+        print(encoded)
+    print(
+        "GPU attribution: "
+        f"valid={report['valid']} pid={report['process_identity']['pid']} "
+        f"FB MiB min/median/max={report['nvidia_process_fb_mib']['min']}/"
+        f"{report['nvidia_process_fb_mib']['median']}/"
+        f"{report['nvidia_process_fb_mib']['max']} "
+        f"owned_estimate_bytes={report['owned_storage_estimated_bytes']} "
+        f"external_logical_bytes={report['external_mapping_logical_bytes']}",
+        file=sys.stderr,
+    )
+    return 0 if report["valid"] else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

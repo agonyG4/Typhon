@@ -13,7 +13,9 @@ pub(super) enum EglImageResourceTelemetry {
         backing_class: crate::gpu_residency::GpuResourceClass,
         backing_bytes: u64,
     },
-    Imported,
+    Imported {
+        logical_bytes: Option<u64>,
+    },
     #[cfg(test)]
     Untracked,
 }
@@ -343,7 +345,11 @@ pub(super) fn destroy_image_resource(
                 None,
             );
         }
-        EglImageResourceTelemetry::Imported => {
+        EglImageResourceTelemetry::Imported { logical_bytes } => {
+            crate::gpu_residency::record_gpu_resource_retirement(
+                crate::gpu_residency::GpuResourceClass::RendererDmabufExternalBacking,
+                logical_bytes,
+            );
             crate::gpu_residency::record_gpu_resource_retirement(
                 crate::gpu_residency::GpuResourceClass::ImportedGlTextureView,
                 None,
@@ -354,7 +360,10 @@ pub(super) fn destroy_image_resource(
     }
     if let Some(image) = resource.egl_image {
         let _ = egl.destroy_image(egl_display, image);
-        if matches!(resource.telemetry, EglImageResourceTelemetry::Imported) {
+        if matches!(
+            resource.telemetry,
+            EglImageResourceTelemetry::Imported { .. }
+        ) {
             crate::gpu_residency::record_gpu_resource_retirement(
                 crate::gpu_residency::GpuResourceClass::ImportedEglImageView,
                 None,

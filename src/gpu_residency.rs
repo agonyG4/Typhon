@@ -9,8 +9,8 @@ mod resource_telemetry;
 mod scratch_telemetry;
 pub use resource_telemetry::{
     GPU_RESOURCE_CLASS_COUNT, GpuResourceByteSemantics, GpuResourceClass, GpuResourceClassSnapshot,
-    GpuResourceTelemetrySnapshot, gpu_resource_telemetry_snapshot, record_gpu_resource_allocation,
-    record_gpu_resource_resize, record_gpu_resource_retirement,
+    GpuResourceLiveStateSource, GpuResourceTelemetrySnapshot, gpu_resource_telemetry_snapshot,
+    record_gpu_resource_allocation, record_gpu_resource_resize, record_gpu_resource_retirement,
 };
 pub use scratch_telemetry::{
     AtomicEffectScratchResidencySnapshot, EffectScratchResidencyLiveSnapshot,
@@ -323,6 +323,92 @@ pub struct GpuResidencyRendererSummary {
     pub lifecycle_retained_visual: GpuResidencyDomainSnapshot,
     pub capture: GpuResidencyDomainSnapshot,
     pub client_import: GpuResidencyDomainSnapshot,
+    pub renderer_import_cache: RendererImportCacheDiagnostics,
+    pub client_import_observation_available: bool,
+}
+
+/// Durable renderer DMA-BUF cache counters copied from the cache owner.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RendererImportCacheDiagnostics {
+    pub active_mapping_count: u64,
+    pub active_known_logical_bytes: u64,
+    pub active_unknown_size_count: u64,
+    pub cached_mapping_count: u64,
+    pub cached_known_logical_bytes: u64,
+    pub cached_unknown_size_count: u64,
+    pub cache_peak_entries: u64,
+    pub cache_peak_known_logical_bytes: u64,
+    pub cache_hits_total: u64,
+    pub cache_misses_total: u64,
+    pub cache_insertions_total: u64,
+    pub cache_replacements_total: u64,
+    pub cache_evictions_dead_total: u64,
+    pub cache_evictions_surface_bound_total: u64,
+    pub cache_evictions_surface_destroyed_total: u64,
+    pub imports_total: u64,
+    pub current_resource_reuses_total: u64,
+    pub cache_reuses_total: u64,
+    pub import_failures_total: u64,
+    pub max_entries_for_one_surface: u64,
+    pub per_surface_entry_limit: u64,
+}
+
+/// Direct-import cache diagnostics copied from the output owner.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectImportCacheDiagnostics {
+    pub current_entries: u64,
+    pub capacity: u64,
+    pub reclaimable_entries: u64,
+    pub externally_pinned_entries: u64,
+    pub known_logical_mapping_bytes: u64,
+    pub unknown_logical_mapping_count: u64,
+    pub hits_total: u64,
+    pub imports_total: u64,
+    pub dead_identity_evictions_total: u64,
+    pub capacity_evictions_total: u64,
+    pub session_rebind_retirements_total: u64,
+    pub cleanup_failures: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UniqueExternalBackingUnavailableReason {
+    PhysicalBackingIdentityUnavailable,
+}
+
+/// Separate accounting domains that must not be added into physical VRAM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GpuMemoryAttributionSummary {
+    pub owned_storage_estimated_bytes: u64,
+    pub external_mapping_logical_bytes: u64,
+    pub alias_view_live_count: u64,
+    pub driver_managed_unknown_live_object_count: u64,
+    pub live_unresolved_class_count: u64,
+    pub live_unresolved_domain_count: u64,
+    pub identity_ambiguous_external_mapping_count: u64,
+    pub unique_external_backing_bytes: Option<u64>,
+    pub unique_external_backing_bytes_unavailable_reason:
+        Option<UniqueExternalBackingUnavailableReason>,
+    pub physical_vram_claim: bool,
+}
+
+impl Default for GpuMemoryAttributionSummary {
+    fn default() -> Self {
+        Self {
+            owned_storage_estimated_bytes: 0,
+            external_mapping_logical_bytes: 0,
+            alias_view_live_count: 0,
+            driver_managed_unknown_live_object_count: 0,
+            live_unresolved_class_count: 0,
+            live_unresolved_domain_count: 0,
+            identity_ambiguous_external_mapping_count: 0,
+            unique_external_backing_bytes: None,
+            unique_external_backing_bytes_unavailable_reason: Some(
+                UniqueExternalBackingUnavailableReason::PhysicalBackingIdentityUnavailable,
+            ),
+            physical_vram_claim: false,
+        }
+    }
 }
 
 impl Default for GpuResidencyRendererSummary {
@@ -356,8 +442,10 @@ impl Default for GpuResidencyRendererSummary {
                 GpuResidencyOwner::EglRenderer,
                 ResourceDomain::ClientImport,
                 ResourceOwnership::ClientImportedExternallyBacked,
-                ResourceCoverage::PartiallyInstrumented,
+                ResourceCoverage::Instrumented,
             ),
+            renderer_import_cache: RendererImportCacheDiagnostics::default(),
+            client_import_observation_available: false,
         }
     }
 }
@@ -370,6 +458,18 @@ pub struct GpuResidencySnapshot {
     pub domains: [GpuResidencyDomainSnapshot; RESOURCE_DOMAIN_COUNT],
     #[serde(default)]
     pub resource_telemetry: GpuResourceTelemetrySnapshot,
+    #[serde(default)]
+    pub attribution_summary: GpuMemoryAttributionSummary,
+    #[serde(default)]
+    pub renderer_import_cache: RendererImportCacheDiagnostics,
+    #[serde(default)]
+    pub renderer_import_cache_available: bool,
+    #[serde(default)]
+    pub direct_import_cache: DirectImportCacheDiagnostics,
+    #[serde(default)]
+    pub live_unresolved_class_count: u64,
+    #[serde(default)]
+    pub live_unresolved_domain_count: u64,
     pub compositor_owned_estimated_bytes: u64,
     pub externally_backed_imported_logical_bytes: u64,
     pub unique_observed_dmabuf_bytes: u64,
@@ -397,6 +497,12 @@ impl Default for GpuResidencySnapshot {
             ),
             domains: [GpuResidencyDomainSnapshot::default(); RESOURCE_DOMAIN_COUNT],
             resource_telemetry: GpuResourceTelemetrySnapshot::default(),
+            attribution_summary: GpuMemoryAttributionSummary::default(),
+            renderer_import_cache: RendererImportCacheDiagnostics::default(),
+            renderer_import_cache_available: false,
+            direct_import_cache: DirectImportCacheDiagnostics::default(),
+            live_unresolved_class_count: 0,
+            live_unresolved_domain_count: 0,
             compositor_owned_estimated_bytes: 0,
             externally_backed_imported_logical_bytes: 0,
             unique_observed_dmabuf_bytes: 0,
@@ -480,11 +586,17 @@ impl Default for GpuResidencySnapshot {
 impl GpuResidencySnapshot {
     pub fn from_renderer(summary: GpuResidencyRendererSummary) -> Self {
         let mut snapshot = Self::default();
+        snapshot.renderer_import_cache = summary.renderer_import_cache;
+        snapshot.renderer_import_cache_available = summary.client_import_observation_available;
         snapshot.set_domain(summary.effects_scratch);
         snapshot.set_domain(summary.effects_checkpoint);
         snapshot.set_domain(summary.lifecycle_retained_visual);
         snapshot.set_domain(summary.capture);
         snapshot.set_domain(summary.client_import);
+        if !summary.client_import_observation_available {
+            snapshot.domains[ResourceDomain::ClientImport.index()].coverage =
+                ResourceCoverage::Uninstrumented;
+        }
         snapshot.recompute_totals();
         snapshot
     }
@@ -599,8 +711,65 @@ impl GpuResidencySnapshot {
                 .compositor_owned_estimated_bytes
                 .saturating_add(class_snapshot.known_live_bytes);
         }
+        self.live_unresolved_domain_count = count_live_unresolved_domains(&self.domains);
+        self.attribution_summary =
+            build_attribution_summary(&resource_telemetry, self.live_unresolved_domain_count);
+        self.live_unresolved_class_count = self.attribution_summary.live_unresolved_class_count;
         self.resource_telemetry = resource_telemetry;
     }
+}
+
+fn build_attribution_summary(
+    resource_telemetry: &GpuResourceTelemetrySnapshot,
+    live_unresolved_domain_count: u64,
+) -> GpuMemoryAttributionSummary {
+    let mut summary = GpuMemoryAttributionSummary::default();
+    for class in &resource_telemetry.classes {
+        match class.byte_semantics {
+            GpuResourceByteSemantics::OwnedStorageEstimate => {
+                summary.owned_storage_estimated_bytes = summary
+                    .owned_storage_estimated_bytes
+                    .saturating_add(class.effective_known_live_bytes);
+            }
+            GpuResourceByteSemantics::ExternalBackingLogical => {
+                summary.external_mapping_logical_bytes = summary
+                    .external_mapping_logical_bytes
+                    .saturating_add(class.effective_known_live_bytes);
+                summary.identity_ambiguous_external_mapping_count = summary
+                    .identity_ambiguous_external_mapping_count
+                    .saturating_add(class.effective_live_count);
+            }
+            GpuResourceByteSemantics::AliasViewNoStorage => {
+                summary.alias_view_live_count = summary
+                    .alias_view_live_count
+                    .saturating_add(class.effective_live_count);
+            }
+            GpuResourceByteSemantics::DriverManagedUnknown => {
+                summary.driver_managed_unknown_live_object_count = summary
+                    .driver_managed_unknown_live_object_count
+                    .saturating_add(class.effective_live_count);
+            }
+        }
+        if class.effective_live_count > 0
+            && class.live_state_coverage != ResourceCoverage::Instrumented
+        {
+            summary.live_unresolved_class_count =
+                summary.live_unresolved_class_count.saturating_add(1);
+        }
+    }
+    summary.live_unresolved_domain_count = live_unresolved_domain_count;
+    summary
+}
+
+fn count_live_unresolved_domains(
+    domains: &[GpuResidencyDomainSnapshot; RESOURCE_DOMAIN_COUNT],
+) -> u64 {
+    domains
+        .iter()
+        .filter(|domain| {
+            domain.resource_count > 0 && domain.coverage != ResourceCoverage::Instrumented
+        })
+        .count() as u64
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -715,6 +884,17 @@ impl GenerationEventCounters {
 mod tests {
     use super::*;
 
+    fn telemetry_row_mut(
+        telemetry: &mut GpuResourceTelemetrySnapshot,
+        class: GpuResourceClass,
+    ) -> &mut GpuResourceClassSnapshot {
+        telemetry
+            .classes
+            .iter_mut()
+            .find(|row| row.class == class)
+            .expect("resource class exists")
+    }
+
     #[test]
     fn explicit_output_slots_follow_owner_protection_state() {
         let summary = output_pool_domain_snapshot(
@@ -820,5 +1000,309 @@ mod tests {
         assert_eq!(events.allocation_count(), 0);
         assert_eq!(events.retirement_count(), 0);
         assert_eq!(events.live_count(), 0);
+    }
+
+    #[test]
+    fn owner_observation_preserves_event_state_and_reports_reconciliation() {
+        let mut telemetry = GpuResourceTelemetrySnapshot::default();
+        let class = GpuResourceClass::RendererDmabufExternalBacking;
+        let row = telemetry_row_mut(&mut telemetry, class);
+        row.lifecycle_event_coverage = ResourceCoverage::Instrumented;
+        row.event_live_count = 5;
+        row.event_known_live_bytes = 4096;
+        row.effective_live_count = 5;
+        row.effective_known_live_bytes = 4096;
+        row.live_count = 5;
+        row.known_live_bytes = 4096;
+
+        telemetry.observe_owner_domain(class, 5, 4096, ResourceCoverage::PartiallyInstrumented);
+
+        let row = telemetry.class(class);
+        assert_eq!(row.event_live_count, 5);
+        assert_eq!(row.event_known_live_bytes, 4096);
+        assert_eq!(row.owner_observed_live_count, Some(5));
+        assert_eq!(row.owner_observed_known_live_bytes, Some(4096));
+        assert_eq!(row.effective_live_count, 5);
+        assert_eq!(row.effective_known_live_bytes, 4096);
+        assert_eq!(row.live_count, 5);
+        assert_eq!(row.known_live_bytes, 4096);
+        assert_eq!(
+            row.live_state_source,
+            GpuResourceLiveStateSource::Reconciled
+        );
+        assert_eq!(row.live_state_matches, Some(true));
+        assert_eq!(row.live_count_delta, Some(0));
+        assert_eq!(row.known_live_bytes_delta, Some(0));
+    }
+
+    #[test]
+    fn event_owner_count_mismatch_remains_visible_without_being_called_a_leak() {
+        let mut telemetry = GpuResourceTelemetrySnapshot::default();
+        let class = GpuResourceClass::ShaderProgram;
+        let row = telemetry_row_mut(&mut telemetry, class);
+        row.event_live_count = 4;
+        row.event_known_live_bytes = 0;
+        row.effective_live_count = 4;
+        row.live_count = 4;
+
+        telemetry.observe_owner_domain(class, 3, 0, ResourceCoverage::PartiallyInstrumented);
+
+        let row = telemetry.class(class);
+        assert_eq!(row.event_live_count, 4);
+        assert_eq!(row.owner_observed_live_count, Some(3));
+        assert_eq!(row.effective_live_count, 4);
+        assert_eq!(row.live_count_delta, Some(1));
+        assert_eq!(row.live_state_matches, Some(false));
+        assert_eq!(
+            row.live_state_source,
+            GpuResourceLiveStateSource::EventLedger
+        );
+    }
+
+    #[test]
+    fn event_owner_byte_mismatch_is_visible() {
+        let mut telemetry = GpuResourceTelemetrySnapshot::default();
+        let class = GpuResourceClass::ShaderProgram;
+        let row = telemetry_row_mut(&mut telemetry, class);
+        row.event_live_count = 1;
+        row.event_known_live_bytes = 4096;
+        row.effective_live_count = 1;
+        row.effective_known_live_bytes = 4096;
+
+        telemetry.observe_owner_domain(class, 1, 3072, ResourceCoverage::Instrumented);
+
+        let row = telemetry.class(class);
+        assert_eq!(row.known_live_bytes_delta, Some(1024));
+        assert_eq!(row.live_state_matches, Some(false));
+        assert_eq!(row.effective_known_live_bytes, 4096);
+        assert_eq!(
+            row.live_state_source,
+            GpuResourceLiveStateSource::EventLedger
+        );
+    }
+
+    #[test]
+    fn no_owner_observation_leaves_event_state_authoritative() {
+        let mut telemetry = GpuResourceTelemetrySnapshot::default();
+        let class = GpuResourceClass::ShaderProgram;
+        let row = telemetry_row_mut(&mut telemetry, class);
+        row.event_live_count = 2;
+        row.effective_live_count = 2;
+        row.live_count = 2;
+        row.recompute_effective_live_state();
+
+        let row = telemetry.class(class);
+        assert_eq!(row.owner_observed_live_count, None);
+        assert_eq!(row.effective_live_count, 2);
+        assert_eq!(
+            row.live_state_source,
+            GpuResourceLiveStateSource::EventLedger
+        );
+    }
+
+    #[test]
+    fn default_renderer_handoff_does_not_fabricate_a_zero_owner_observation() {
+        let snapshot = GpuResidencySnapshot::from_renderer(GpuResidencyRendererSummary::default());
+        let row = snapshot
+            .resource_telemetry
+            .class(GpuResourceClass::RendererDmabufExternalBacking);
+        assert_eq!(row.owner_observed_live_count, None);
+        assert!(!snapshot.renderer_import_cache_available);
+    }
+
+    #[test]
+    fn serialization_keeps_event_and_owner_observations_distinct() {
+        let mut telemetry = GpuResourceTelemetrySnapshot::default();
+        let class = GpuResourceClass::ShaderProgram;
+        let row = telemetry_row_mut(&mut telemetry, class);
+        row.event_live_count = 5;
+        row.event_known_live_bytes = 0;
+        row.effective_live_count = 5;
+        row.live_count = 5;
+        telemetry.observe_owner_domain(class, 3, 0, ResourceCoverage::PartiallyInstrumented);
+        let row_index = telemetry
+            .classes
+            .iter()
+            .position(|row| row.class == class)
+            .expect("resource class exists");
+
+        let json = serde_json::to_value(telemetry).expect("telemetry serializes");
+        assert_eq!(json["classes"][row_index]["event_live_count"], 5);
+        assert_eq!(json["classes"][row_index]["owner_observed_live_count"], 3);
+        assert_eq!(json["classes"][row_index]["effective_live_count"], 5);
+        assert_eq!(json["classes"][row_index]["live_count"], 5);
+        assert_eq!(
+            json["classes"][row_index]["live_state_source"],
+            "event_ledger"
+        );
+    }
+
+    #[test]
+    fn older_resource_snapshots_deserialize_with_safe_coherence_defaults() {
+        let mut json = serde_json::to_value(GpuResourceTelemetrySnapshot::default())
+            .expect("default telemetry serializes");
+        json.as_object_mut().expect("object").remove("coherent");
+        json.as_object_mut()
+            .expect("object")
+            .remove("event_sequence");
+        json.as_object_mut()
+            .expect("object")
+            .remove("snapshot_retries");
+        for class in json["classes"].as_array_mut().expect("classes") {
+            let row = class.as_object_mut().expect("class row");
+            for key in [
+                "live_state_coverage",
+                "lifecycle_event_coverage",
+                "event_live_count",
+                "event_known_live_bytes",
+                "owner_observed_live_count",
+                "owner_observed_known_live_bytes",
+                "owner_observed_coverage",
+                "effective_live_count",
+                "effective_known_live_bytes",
+                "live_state_source",
+                "live_count_delta",
+                "known_live_bytes_delta",
+                "live_state_matches",
+            ] {
+                row.remove(key);
+            }
+        }
+
+        let restored = serde_json::from_value::<GpuResourceTelemetrySnapshot>(json)
+            .expect("older telemetry snapshot deserializes");
+        assert!(!restored.coherent);
+        assert_eq!(restored.event_sequence, 0);
+        assert_eq!(restored.snapshot_retries, 0);
+    }
+
+    #[test]
+    fn attribution_summary_never_claims_physical_vram_or_unique_backing_bytes() {
+        let mut snapshot = GpuResidencySnapshot::default();
+        snapshot.recompute_totals();
+        let json = serde_json::to_value(snapshot).expect("residency snapshot serializes");
+
+        assert_eq!(json["attribution_summary"]["physical_vram_claim"], false);
+        assert!(json["attribution_summary"]["unique_external_backing_bytes"].is_null());
+        assert_eq!(
+            json["attribution_summary"]["unique_external_backing_bytes_unavailable_reason"],
+            "physical_backing_identity_unavailable"
+        );
+    }
+
+    #[test]
+    fn older_residency_snapshots_receive_safe_stage_two_point_three_defaults() {
+        let mut json = serde_json::to_value(GpuResidencySnapshot::default())
+            .expect("default residency snapshot serializes");
+        let object = json.as_object_mut().expect("snapshot object");
+        for key in [
+            "attribution_summary",
+            "renderer_import_cache",
+            "renderer_import_cache_available",
+            "direct_import_cache",
+            "live_unresolved_class_count",
+            "live_unresolved_domain_count",
+        ] {
+            object.remove(key);
+        }
+
+        let restored = serde_json::from_value::<GpuResidencySnapshot>(json)
+            .expect("older residency snapshot deserializes");
+        assert!(!restored.attribution_summary.physical_vram_claim);
+        assert_eq!(
+            restored.attribution_summary.unique_external_backing_bytes,
+            None
+        );
+        assert_eq!(restored.renderer_import_cache.imports_total, 0);
+        assert!(!restored.renderer_import_cache_available);
+        assert_eq!(restored.direct_import_cache.current_entries, 0);
+        assert_eq!(restored.live_unresolved_class_count, 0);
+        assert_eq!(restored.live_unresolved_domain_count, 0);
+    }
+
+    #[test]
+    fn attribution_summary_keeps_owned_external_alias_and_unknown_objects_separate() {
+        let mut telemetry = GpuResourceTelemetrySnapshot::default();
+        for (class, live_count, bytes, coverage) in [
+            (
+                GpuResourceClass::OutputBacking,
+                1,
+                11,
+                ResourceCoverage::Instrumented,
+            ),
+            (
+                GpuResourceClass::CursorBacking,
+                1,
+                3,
+                ResourceCoverage::Instrumented,
+            ),
+            (
+                GpuResourceClass::RendererDmabufExternalBacking,
+                2,
+                20,
+                ResourceCoverage::Instrumented,
+            ),
+            (
+                GpuResourceClass::DirectScanoutDmabufExternalBacking,
+                1,
+                0,
+                ResourceCoverage::Instrumented,
+            ),
+            (
+                GpuResourceClass::ImportedEglImageView,
+                4,
+                0,
+                ResourceCoverage::Instrumented,
+            ),
+            (
+                GpuResourceClass::ImportedGlTextureView,
+                5,
+                0,
+                ResourceCoverage::Instrumented,
+            ),
+            (
+                GpuResourceClass::GlTextureObject,
+                9,
+                0,
+                ResourceCoverage::Instrumented,
+            ),
+            (
+                GpuResourceClass::DrmFramebuffer,
+                1,
+                0,
+                ResourceCoverage::PartiallyInstrumented,
+            ),
+        ] {
+            let row = telemetry
+                .classes
+                .iter_mut()
+                .find(|row| row.class == class)
+                .expect("resource class exists");
+            row.effective_live_count = live_count;
+            row.effective_known_live_bytes = bytes;
+            row.live_state_coverage = coverage;
+        }
+
+        let summary = build_attribution_summary(&telemetry, 0);
+        assert_eq!(summary.owned_storage_estimated_bytes, 14);
+        assert_eq!(summary.external_mapping_logical_bytes, 20);
+        assert_eq!(summary.alias_view_live_count, 9);
+        assert_eq!(summary.driver_managed_unknown_live_object_count, 10);
+        assert_eq!(summary.live_unresolved_class_count, 1);
+        assert_eq!(summary.live_unresolved_domain_count, 0);
+        assert_eq!(summary.identity_ambiguous_external_mapping_count, 3);
+        assert_eq!(summary.unique_external_backing_bytes, None);
+        assert!(!summary.physical_vram_claim);
+    }
+
+    #[test]
+    fn live_unresolved_domain_count_ignores_empty_unknown_rows_and_finds_live_partial_rows() {
+        let mut snapshot = GpuResidencySnapshot::default();
+        assert_eq!(count_live_unresolved_domains(&snapshot.domains), 0);
+
+        snapshot.domains[ResourceDomain::ClientImport.index()].resource_count = 2;
+        snapshot.domains[ResourceDomain::ClientImport.index()].coverage =
+            ResourceCoverage::PartiallyInstrumented;
+        assert_eq!(count_live_unresolved_domains(&snapshot.domains), 1);
     }
 }

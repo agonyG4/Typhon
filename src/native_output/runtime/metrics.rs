@@ -305,6 +305,7 @@ impl NativeRuntime {
             self.render_telemetry.gpu_residency,
         );
         gpu_residency.set_domain(self.scanout.gpu_residency_domain_snapshot());
+        gpu_residency.direct_import_cache = self.scanout.direct_import_cache_diagnostics();
         if let Some(scratch) = self.scanout.effect_scratch_residency_snapshot() {
             gpu_residency.set_domain(scratch.domain_snapshot());
         }

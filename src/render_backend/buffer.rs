@@ -253,18 +253,25 @@ impl DmabufImageKey {
     /// Return a packed logical payload estimate only for formats whose
     /// compositor representation is known to be 32 bits per pixel.
     pub fn logical_payload_bytes(&self) -> Option<u64> {
-        match DrmFormat::from_fourcc(self.format) {
-            DrmFormat::Argb8888 | DrmFormat::Xrgb8888 | DrmFormat::Xbgr8888 => {
-                u64::from(self.width)
-                    .checked_mul(u64::from(self.height))?
-                    .checked_mul(4)
-            }
-            DrmFormat::Other(_) => None,
-        }
+        dmabuf_logical_payload_bytes(DrmFormat::from_fourcc(self.format), self.width, self.height)
     }
 
     pub const fn buffer_id(&self) -> BufferId {
         self.buffer_id
+    }
+}
+
+/// Packed logical payload for known 32-bit formats. This does not describe
+/// exporter allocation size, modifier tiling, or physical backing identity.
+pub fn dmabuf_logical_payload_bytes(format: DrmFormat, width: u32, height: u32) -> Option<u64> {
+    match format {
+        DrmFormat::Argb8888 | DrmFormat::Xrgb8888 | DrmFormat::Xbgr8888 => {
+            let Some(pixels) = u64::from(width).checked_mul(u64::from(height)) else {
+                return None;
+            };
+            pixels.checked_mul(4)
+        }
+        DrmFormat::Other(_) => None,
     }
 }
 
@@ -576,6 +583,10 @@ mod identity_tests {
         );
         assert_eq!(
             key(u32::from_le_bytes(*b"NV12")).logical_payload_bytes(),
+            None
+        );
+        assert_eq!(
+            dmabuf_logical_payload_bytes(DrmFormat::Xrgb8888, u32::MAX, u32::MAX),
             None
         );
     }

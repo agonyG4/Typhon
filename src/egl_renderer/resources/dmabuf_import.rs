@@ -5,7 +5,7 @@ use khronos_egl as egl;
 use oblivion_one::{
     compositor::RenderableSurface,
     render_backend::{
-        buffer::DrmModifier,
+        buffer::{DrmModifier, dmabuf_logical_payload_bytes},
         egl_gles::{EGL_LINUX_DMA_BUF_EXT, EglGlesDmabufImportAttributes, EglGlesImportError},
     },
 };
@@ -341,12 +341,17 @@ impl DmabufImporter {
         }
 
         let size = handle.size();
+        let logical_bytes = dmabuf_logical_payload_bytes(handle.format(), size.width, size.height);
+        crate::gpu_residency::record_gpu_resource_allocation(
+            crate::gpu_residency::GpuResourceClass::RendererDmabufExternalBacking,
+            logical_bytes,
+        );
         Ok(EglImageResource {
             texture: texture.disarm(),
             size: (size.width, size.height),
             generation,
             egl_image: Some(image_guard.disarm()),
-            telemetry: EglImageResourceTelemetry::Imported,
+            telemetry: EglImageResourceTelemetry::Imported { logical_bytes },
         })
     }
 }

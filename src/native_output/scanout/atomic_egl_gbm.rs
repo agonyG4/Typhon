@@ -1434,6 +1434,12 @@ impl AtomicEglGbmScanout {
         summary
     }
 
+    pub(crate) fn direct_import_cache_diagnostics(
+        &self,
+    ) -> crate::gpu_residency::DirectImportCacheDiagnostics {
+        self.direct.framebuffer_cache.diagnostics()
+    }
+
     pub(crate) fn next_pool_generation(&self) -> io::Result<u64> {
         self.swapchain()?
             .pool_generation()

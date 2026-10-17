@@ -448,5 +448,18 @@ impl<'a> ResourceTelemetry<'a> {
         summary: crate::gpu_residency::GpuResidencyDomainSnapshot,
     ) {
         self.frame_stats.gpu_residency.client_import = summary;
+        self.frame_stats
+            .gpu_residency
+            .client_import_observation_available = true;
+    }
+
+    pub(super) fn publish_renderer_import_cache_diagnostics(
+        &mut self,
+        diagnostics: crate::gpu_residency::RendererImportCacheDiagnostics,
+    ) {
+        self.frame_stats.gpu_residency.renderer_import_cache = diagnostics;
+        self.frame_stats
+            .gpu_residency
+            .client_import_observation_available = true;
     }
 }

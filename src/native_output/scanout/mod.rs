@@ -913,6 +913,15 @@ impl NativeScanoutBackend {
         }
     }
 
+    pub(crate) fn direct_import_cache_diagnostics(
+        &self,
+    ) -> crate::gpu_residency::DirectImportCacheDiagnostics {
+        match self {
+            Self::AtomicEglGbm(scanout) => scanout.direct_import_cache_diagnostics(),
+            Self::NativeEglGbm(_) | Self::Gbm(_) | Self::Dumb(_) => Default::default(),
+        }
+    }
+
     pub(crate) fn next_effect_scratch_maintenance_deadline(&self) -> Option<std::time::Instant> {
         match self {
             Self::AtomicEglGbm(scanout) => scanout.next_effect_scratch_maintenance_deadline(),

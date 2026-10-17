@@ -12,6 +12,7 @@ use oblivion_one::{
     native::{drm, kms::FramebufferId},
     render_backend::buffer::{
         BufferIdentity, DmabufBufferHandle, DmabufImageKey, DrmModifier, WeakBufferIdentity,
+        dmabuf_logical_payload_bytes,
     },
 };
 
@@ -66,7 +67,7 @@ pub(crate) struct ImportedDirectFramebuffer {
     pub(crate) framebuffer: FramebufferId,
     pub(crate) format: u32,
     pub(crate) modifier: u64,
-    logical_bytes: u64,
+    logical_bytes: Option<u64>,
     gem_handles: Vec<u32>,
     drm_cleanup_armed: AtomicBool,
     io: Arc<dyn DirectFramebufferIo>,
@@ -177,12 +178,14 @@ impl ImportedDirectFramebuffer {
             crate::gpu_residency::GpuResourceClass::DrmFramebuffer,
             None,
         );
-        let logical_bytes = u64::from(buffer.size().width)
-            .saturating_mul(u64::from(buffer.size().height))
-            .saturating_mul(4);
+        let logical_bytes = dmabuf_logical_payload_bytes(
+            buffer.format(),
+            buffer.size().width,
+            buffer.size().height,
+        );
         crate::gpu_residency::record_gpu_resource_allocation(
             crate::gpu_residency::GpuResourceClass::DirectScanoutDmabufExternalBacking,
-            Some(logical_bytes),
+            logical_bytes,
         );
 
         Ok(Self {
@@ -237,7 +240,7 @@ impl Drop for ImportedDirectFramebuffer {
         );
         crate::gpu_residency::record_gpu_resource_retirement(
             crate::gpu_residency::GpuResourceClass::DirectScanoutDmabufExternalBacking,
-            Some(self.logical_bytes),
+            self.logical_bytes,
         );
     }
 }
@@ -395,6 +398,11 @@ pub(crate) struct DirectFramebufferCache {
     io: Arc<dyn DirectFramebufferIo>,
     use_counter: u64,
     cleanup_failures: Arc<AtomicU64>,
+    hits_total: u64,
+    imports_total: u64,
+    dead_identity_evictions_total: u64,
+    capacity_evictions_total: u64,
+    session_rebind_retirements_total: u64,
 }
 
 impl DirectFramebufferCache {
@@ -418,6 +426,11 @@ impl DirectFramebufferCache {
             io,
             use_counter: 0,
             cleanup_failures: Arc::new(AtomicU64::new(0)),
+            hits_total: 0,
+            imports_total: 0,
+            dead_identity_evictions_total: 0,
+            capacity_evictions_total: 0,
+            session_rebind_retirements_total: 0,
         }
     }
 
@@ -430,6 +443,7 @@ impl DirectFramebufferCache {
         self.use_counter = self.use_counter.wrapping_add(1);
         if let Some(entry) = self.entries.get_mut(&key) {
             entry.last_used = self.use_counter;
+            self.hits_total = self.hits_total.saturating_add(1);
             return Ok((Arc::clone(&entry.framebuffer), true));
         }
         if !self.evict_if_needed() {
@@ -443,6 +457,7 @@ impl DirectFramebufferCache {
             identity,
             buffer,
         )?);
+        self.imports_total = self.imports_total.saturating_add(1);
         self.entries.insert(
             key,
             DirectFramebufferCacheEntry {
@@ -471,8 +486,13 @@ impl DirectFramebufferCache {
     }
 
     fn evict_if_needed(&mut self) -> bool {
+        let dead_identity_evictions_total = &mut self.dead_identity_evictions_total;
         self.entries.retain(|_, entry| {
-            Arc::strong_count(&entry.framebuffer) != 1 || entry.identity.is_alive()
+            let keep = Arc::strong_count(&entry.framebuffer) != 1 || entry.identity.is_alive();
+            if !keep {
+                *dead_identity_evictions_total = dead_identity_evictions_total.saturating_add(1);
+            }
+            keep
         });
         while self.entries.len() >= self.capacity {
             let Some(key) = self
@@ -485,6 +505,7 @@ impl DirectFramebufferCache {
                 return false;
             };
             self.entries.remove(&key);
+            self.capacity_evictions_total = self.capacity_evictions_total.saturating_add(1);
         }
         true
     }
@@ -501,6 +522,9 @@ impl DirectFramebufferCache {
             .drain()
             .map(|(_, entry)| entry)
             .collect::<Vec<_>>();
+        self.session_rebind_retirements_total = self
+            .session_rebind_retirements_total
+            .saturating_add(entries.len() as u64);
         entries.sort_by_key(|entry| entry.last_used);
         for entry in entries {
             drop(entry);
@@ -521,6 +545,37 @@ impl DirectFramebufferCache {
 
     pub(crate) fn cleanup_failures(&self) -> u64 {
         self.cleanup_failures.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn diagnostics(&self) -> crate::gpu_residency::DirectImportCacheDiagnostics {
+        let mut diagnostics = crate::gpu_residency::DirectImportCacheDiagnostics {
+            current_entries: self.entries.len() as u64,
+            capacity: self.capacity as u64,
+            hits_total: self.hits_total,
+            imports_total: self.imports_total,
+            dead_identity_evictions_total: self.dead_identity_evictions_total,
+            capacity_evictions_total: self.capacity_evictions_total,
+            session_rebind_retirements_total: self.session_rebind_retirements_total,
+            cleanup_failures: self.cleanup_failures(),
+            ..Default::default()
+        };
+        for entry in self.entries.values() {
+            if Arc::strong_count(&entry.framebuffer) == 1 {
+                diagnostics.reclaimable_entries = diagnostics.reclaimable_entries.saturating_add(1);
+            } else {
+                diagnostics.externally_pinned_entries =
+                    diagnostics.externally_pinned_entries.saturating_add(1);
+            }
+            if let Some(bytes) = entry.framebuffer.logical_bytes {
+                diagnostics.known_logical_mapping_bytes = diagnostics
+                    .known_logical_mapping_bytes
+                    .saturating_add(bytes);
+            } else {
+                diagnostics.unknown_logical_mapping_count =
+                    diagnostics.unknown_logical_mapping_count.saturating_add(1);
+            }
+        }
+        diagnostics
     }
 
     #[cfg(test)]
@@ -546,6 +601,7 @@ mod tests {
         formats: Mutex<Vec<u32>>,
         fail_prime: Mutex<bool>,
         fail_add: Mutex<bool>,
+        fail_remove: Mutex<bool>,
     }
 
     impl DirectFramebufferIo for FakeIo {
@@ -574,6 +630,9 @@ mod tests {
 
         fn remove_framebuffer(&self, _framebuffer: FramebufferId) -> io::Result<()> {
             self.events.lock().unwrap().push("rm_fb".into());
+            if *self.fail_remove.lock().unwrap() {
+                return Err(io::Error::from_raw_os_error(libc::EIO));
+            }
             Ok(())
         }
 
@@ -721,8 +780,18 @@ mod tests {
         assert!(!cache.get_or_import(&identity, &buffer).unwrap().1);
         assert!(cache.get_or_import(&identity, &buffer).unwrap().1);
         assert_eq!(cache.len(), 1);
+        let diagnostics = cache.diagnostics();
+        assert_eq!(diagnostics.current_entries, 1);
+        assert_eq!(diagnostics.capacity, 64);
+        assert_eq!(diagnostics.reclaimable_entries, 1);
+        assert_eq!(diagnostics.externally_pinned_entries, 0);
+        assert_eq!(diagnostics.known_logical_mapping_bytes, 64);
+        assert_eq!(diagnostics.unknown_logical_mapping_count, 0);
+        assert_eq!(diagnostics.hits_total, 1);
+        assert_eq!(diagnostics.imports_total, 1);
         cache.rebind_session_generation(DrmSessionGeneration::new(2).unwrap());
         assert_eq!(cache.len(), 0);
+        assert_eq!(cache.diagnostics().session_rebind_retirements_total, 1);
         assert_eq!(*io.events.lock().unwrap(), ["add_fb", "rm_fb", "gem_close"]);
     }
 
@@ -817,6 +886,8 @@ mod tests {
         let buffer = test_buffer(&identity);
         assert!(!cache.get_or_import(&identity, &buffer).unwrap().1);
         assert_eq!(cache.len(), 1);
+        assert_eq!(cache.diagnostics().dead_identity_evictions_total, 1);
+        assert_eq!(cache.diagnostics().imports_total, 2);
     }
 
     #[test]
@@ -838,11 +909,37 @@ mod tests {
                 .get_or_import(&second_identity, &second_buffer)
                 .is_err()
         );
+        assert_eq!(cache.diagnostics().externally_pinned_entries, 1);
+        assert_eq!(cache.diagnostics().capacity_evictions_total, 0);
         drop(pinned);
         assert!(
             cache
                 .get_or_import(&second_identity, &second_buffer)
                 .is_ok()
         );
+        assert_eq!(cache.diagnostics().capacity_evictions_total, 1);
+    }
+
+    #[test]
+    fn cleanup_failures_are_exposed_in_direct_cache_diagnostics() {
+        let mut ids = oblivion_one::render_backend::buffer::BufferIdAllocator::default();
+        let io = Arc::new(FakeIo {
+            fail_remove: Mutex::new(true),
+            ..Default::default()
+        });
+        let mut cache = DirectFramebufferCache::with_io(io, DrmSessionGeneration::new(1).unwrap());
+        cache.capacity = 1;
+
+        let first_identity = ids.allocate().unwrap();
+        let first_buffer = test_buffer(&first_identity);
+        drop(cache.get_or_import(&first_identity, &first_buffer).unwrap());
+        let second_identity = ids.allocate().unwrap();
+        let second_buffer = test_buffer(&second_identity);
+        let _ = cache
+            .get_or_import(&second_identity, &second_buffer)
+            .unwrap();
+
+        assert_eq!(cache.diagnostics().cleanup_failures, 1);
+        assert_eq!(cache.diagnostics().capacity_evictions_total, 1);
     }
 }

@@ -50,10 +50,6 @@ impl AtomicCursorBuffer {
                 return Err(error);
             }
         };
-        crate::gpu_residency::record_gpu_resource_allocation(
-            crate::gpu_residency::GpuResourceClass::DrmFramebuffer,
-            None,
-        );
         let map = match drm_ffi::mode::dumbbuffer::map(file.as_fd(), dumb.handle, 0, 0) {
             Ok(map) => map,
             Err(error) => {
@@ -86,6 +82,10 @@ impl AtomicCursorBuffer {
             let _ = drm_ffi::mode::dumbbuffer::destroy(file.as_fd(), dumb.handle);
             return Err(error);
         }
+        crate::gpu_residency::record_gpu_resource_allocation(
+            crate::gpu_residency::GpuResourceClass::DrmFramebuffer,
+            None,
+        );
         crate::gpu_residency::record_gpu_resource_allocation(
             crate::gpu_residency::GpuResourceClass::CursorBacking,
             Some(dumb.size),
@@ -166,6 +166,10 @@ impl Drop for AtomicCursorBuffer {
         crate::gpu_residency::record_gpu_resource_retirement(
             crate::gpu_residency::GpuResourceClass::CursorBacking,
             Some(self.size as u64),
+        );
+        crate::gpu_residency::record_gpu_resource_retirement(
+            crate::gpu_residency::GpuResourceClass::DrmFramebuffer,
+            None,
         );
     }
 }

@@ -355,8 +355,7 @@ impl RendererResourceState {
                 if let Some(resource) = self.surfaces.resources.get_mut(&surface.surface_id) {
                     resource.image.generation = surface.generation;
                 }
-                telemetry.dmabuf_current_resource_reuse();
-                telemetry.dmabuf_reuse();
+                self.dmabuf.note_current_resource_reuse(telemetry);
                 return Ok(());
             }
             EglSurfaceResourceUpdate::UploadDamage | EglSurfaceResourceUpdate::FullShmResync => {
@@ -427,7 +426,7 @@ impl RendererResourceState {
                 .dmabuf
                 .settle_import_result(result, context, telemetry)?
             {
-                telemetry.dmabuf_imported();
+                self.dmabuf.note_import_success(telemetry);
                 self.surfaces.resources.insert(surface.surface_id, resource);
             }
         } else {
@@ -488,7 +487,6 @@ impl RendererResourceState {
             }
             cached.image.generation = surface.generation;
             self.dmabuf.note_cache_hit(telemetry);
-            telemetry.dmabuf_reuse();
             if let Some(old) = self.surfaces.resources.insert(
                 surface.surface_id,
                 EglSurfaceResource {
@@ -539,7 +537,7 @@ impl RendererResourceState {
                 .dmabuf
                 .settle_import_result(result, context, telemetry)?
             {
-                telemetry.dmabuf_imported();
+                self.dmabuf.note_import_success(telemetry);
                 self.surfaces.resources.insert(surface.surface_id, resource);
             }
             return Ok(());
@@ -572,7 +570,7 @@ impl RendererResourceState {
             .dmabuf
             .settle_import_result(result, context, telemetry)?
         {
-            telemetry.dmabuf_imported();
+            self.dmabuf.note_import_success(telemetry);
             self.surfaces.resources.insert(surface.surface_id, resource);
         }
         Ok(())
