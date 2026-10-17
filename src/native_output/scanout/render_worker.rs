@@ -184,6 +184,37 @@ pub(crate) enum AtomicRenderControl {
     FinishRenderWork,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AtomicRenderWorkerFailureReason {
+    PendingControlOverflow,
+    ControlEpochExhausted,
+    PendingControlSequenceCorrupt,
+    ApplyControlsCommandFull,
+    ApplyControlsDisconnected,
+    ApplyControlsEpochMismatch,
+    ApplyControlsRejected,
+    ApplyControlsTimeout,
+    ApplyControlsReplyDisconnected,
+    StartupEffectReloadTimeout,
+}
+
+impl AtomicRenderWorkerFailureReason {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::PendingControlOverflow => "pending_control_overflow",
+            Self::ControlEpochExhausted => "control_epoch_exhausted",
+            Self::PendingControlSequenceCorrupt => "pending_control_sequence_corrupt",
+            Self::ApplyControlsCommandFull => "apply_controls_command_full",
+            Self::ApplyControlsDisconnected => "apply_controls_disconnected",
+            Self::ApplyControlsEpochMismatch => "apply_controls_epoch_mismatch",
+            Self::ApplyControlsRejected => "apply_controls_rejected",
+            Self::ApplyControlsTimeout => "apply_controls_timeout",
+            Self::ApplyControlsReplyDisconnected => "apply_controls_reply_disconnected",
+            Self::StartupEffectReloadTimeout => "startup_effect_reload_timeout",
+        }
+    }
+}
+
 pub(crate) struct AtomicRenderWorkerCompletion {
     pub(crate) job_id: RenderWorkerJobId,
     pub(crate) frame_id: u64,
@@ -395,11 +426,32 @@ pub(crate) struct AtomicRenderWorkerHandle {
     busy: bool,
     initialized: bool,
     fatal: Arc<AtomicBool>,
-    control_lane_overflowed: bool,
+    control_lane_failure: Option<AtomicRenderWorkerFailureReason>,
+    control_lane_failure_reported: bool,
     scratch_residency_snapshot: Arc<crate::gpu_residency::AtomicEffectScratchResidencySnapshot>,
 }
 
 impl AtomicRenderWorkerHandle {
+    #[cfg(test)]
+    pub(super) fn test_handle() -> Self {
+        let (commands, _command_rx) = mpsc::sync_channel(1);
+        let (_events_tx, events) = mpsc::sync_channel(1);
+        Self {
+            commands,
+            events,
+            event_fd: Arc::new(create_eventfd().expect("eventfd")),
+            join: None,
+            busy: false,
+            initialized: true,
+            fatal: Arc::new(AtomicBool::new(false)),
+            control_lane_failure: None,
+            control_lane_failure_reported: false,
+            scratch_residency_snapshot: Arc::new(
+                crate::gpu_residency::AtomicEffectScratchResidencySnapshot::default(),
+            ),
+        }
+    }
+
     pub(crate) fn start(
         render_device_fd: OwnedFd,
     ) -> io::Result<(Self, AtomicRenderWorkerDiscovery)> {
@@ -479,7 +531,8 @@ impl AtomicRenderWorkerHandle {
                 busy: false,
                 initialized: false,
                 fatal,
-                control_lane_overflowed: false,
+                control_lane_failure: None,
+                control_lane_failure_reported: false,
                 scratch_residency_snapshot,
             },
             formats,
@@ -825,7 +878,7 @@ impl AtomicRenderWorkerHandle {
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 self.fatal.store(true, Ordering::Release);
-                self.fail_control_lane();
+                self.fail_control_lane(AtomicRenderWorkerFailureReason::StartupEffectReloadTimeout);
                 Err(String::from(
                     "render worker startup effect reload exceeded the 30 second bound",
                 ))
@@ -860,11 +913,17 @@ impl AtomicRenderWorkerHandle {
             response: response_tx,
         };
         if let Err(error) = self.commands.try_send(command) {
-            let reason = match error {
-                TrySendError::Full(_) => "render worker command slot was unexpectedly full",
-                TrySendError::Disconnected(_) => "render worker disconnected during control rebind",
+            let (reason, failure_reason) = match error {
+                TrySendError::Full(_) => (
+                    "render worker command slot was unexpectedly full",
+                    AtomicRenderWorkerFailureReason::ApplyControlsCommandFull,
+                ),
+                TrySendError::Disconnected(_) => (
+                    "render worker disconnected during control rebind",
+                    AtomicRenderWorkerFailureReason::ApplyControlsDisconnected,
+                ),
             };
-            self.fail_control_lane();
+            self.fail_control_lane(failure_reason);
             return Err(io::Error::other(reason));
         }
         self.busy = true;
@@ -875,28 +934,30 @@ impl AtomicRenderWorkerHandle {
             }
             Ok(Ok(applied_epoch)) => {
                 self.busy = false;
-                self.fail_control_lane();
+                self.fail_control_lane(AtomicRenderWorkerFailureReason::ApplyControlsEpochMismatch);
                 Err(io::Error::other(format!(
                     "renderer control rebind acknowledged epoch {applied_epoch}, expected {required_control_epoch}"
                 )))
             }
             Ok(Err(error)) => {
                 self.busy = false;
-                self.fail_control_lane();
+                self.fail_control_lane(AtomicRenderWorkerFailureReason::ApplyControlsRejected);
                 Err(error)
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 // The worker may still own GL/EGL state. Keep `busy` set and
                 // report fatal uncertainty so no render or physical teardown
                 // can assume the rebind completed.
-                self.fail_control_lane();
+                self.fail_control_lane(AtomicRenderWorkerFailureReason::ApplyControlsTimeout);
                 Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "render worker did not acknowledge quiesced renderer controls",
                 ))
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                self.fail_control_lane();
+                self.fail_control_lane(
+                    AtomicRenderWorkerFailureReason::ApplyControlsReplyDisconnected,
+                );
                 Err(io::Error::other(
                     "render worker dropped quiesced renderer control acknowledgment",
                 ))
@@ -908,19 +969,25 @@ impl AtomicRenderWorkerHandle {
         drain_eventfd(&self.event_fd)
     }
 
-    pub(crate) fn fail_control_lane(&mut self) {
-        self.control_lane_overflowed = true;
+    pub(crate) fn fail_control_lane(&mut self, reason: AtomicRenderWorkerFailureReason) {
+        if self.control_lane_failure.is_none() {
+            self.control_lane_failure = Some(reason);
+        }
         self.fatal.store(true, Ordering::Release);
         let _ = signal_eventfd(&self.event_fd);
     }
 
     pub(crate) fn try_take_event(&mut self) -> io::Result<Option<AtomicRenderWorkerEvent>> {
         self.drain_eventfd()?;
-        if std::mem::take(&mut self.control_lane_overflowed) {
+        if let Some(reason) = self
+            .control_lane_failure
+            .filter(|_| !self.control_lane_failure_reported)
+        {
+            self.control_lane_failure_reported = true;
             return Ok(Some(AtomicRenderWorkerEvent::Fatal {
                 job_id: None,
                 gpu_execution_uncertain: self.busy,
-                reason: "control_lane_overflow",
+                reason: reason.as_str(),
             }));
         }
         match self.events.try_recv() {
@@ -1986,7 +2053,7 @@ fn publish_event(
     }
 }
 
-fn validate_render_control_batch(
+pub(super) fn validate_render_control_batch(
     applied_epoch: u64,
     controls: &[SequencedRenderControl],
     required_epoch: u64,
@@ -2196,6 +2263,45 @@ mod tests {
     }
 
     #[test]
+    fn control_lane_failure_reports_first_specific_cause() {
+        let (commands, _command_rx) = mpsc::sync_channel(1);
+        commands
+            .try_send(RenderWorkerCommand::Shutdown)
+            .expect("fill the command slot");
+        let (_events_tx, events) = mpsc::sync_channel(1);
+        let event_fd = Arc::new(create_eventfd().expect("eventfd"));
+        let fatal = Arc::new(AtomicBool::new(false));
+        let mut worker = AtomicRenderWorkerHandle {
+            commands,
+            events,
+            event_fd,
+            join: None,
+            busy: false,
+            initialized: true,
+            fatal,
+            control_lane_failure: None,
+            control_lane_failure_reported: false,
+            scratch_residency_snapshot: Arc::new(
+                crate::gpu_residency::AtomicEffectScratchResidencySnapshot::default(),
+            ),
+        };
+
+        worker
+            .apply_controls_while_quiesced(Vec::new(), 0)
+            .expect_err("a full ApplyControls command slot is fatal");
+        worker.fail_control_lane(AtomicRenderWorkerFailureReason::ApplyControlsTimeout);
+
+        assert!(matches!(
+            worker.try_take_event().expect("read fatal eventfd"),
+            Some(AtomicRenderWorkerEvent::Fatal {
+                job_id: None,
+                gpu_execution_uncertain: false,
+                reason: "apply_controls_command_full",
+            })
+        ));
+    }
+
+    #[test]
     fn control_lane_overflow_is_a_waking_fatal_worker_event() {
         let (commands, _command_rx) = mpsc::sync_channel(1);
         let (_events_tx, events) = mpsc::sync_channel(1);
@@ -2209,13 +2315,14 @@ mod tests {
             busy: true,
             initialized: true,
             fatal: Arc::clone(&fatal),
-            control_lane_overflowed: false,
+            control_lane_failure: None,
+            control_lane_failure_reported: false,
             scratch_residency_snapshot: Arc::new(
                 crate::gpu_residency::AtomicEffectScratchResidencySnapshot::default(),
             ),
         };
 
-        worker.fail_control_lane();
+        worker.fail_control_lane(AtomicRenderWorkerFailureReason::PendingControlOverflow);
 
         assert!(fatal.load(Ordering::Acquire));
         assert!(matches!(
@@ -2223,7 +2330,7 @@ mod tests {
             Some(AtomicRenderWorkerEvent::Fatal {
                 job_id: None,
                 gpu_execution_uncertain: true,
-                reason: "control_lane_overflow",
+                reason: "pending_control_overflow",
             })
         ));
     }
@@ -2242,7 +2349,8 @@ mod tests {
             busy: true,
             initialized: true,
             fatal,
-            control_lane_overflowed: false,
+            control_lane_failure: None,
+            control_lane_failure_reported: false,
             scratch_residency_snapshot: Arc::new(
                 crate::gpu_residency::AtomicEffectScratchResidencySnapshot::default(),
             ),
@@ -2274,7 +2382,8 @@ mod tests {
             busy: true,
             initialized: true,
             fatal,
-            control_lane_overflowed: false,
+            control_lane_failure: None,
+            control_lane_failure_reported: false,
             scratch_residency_snapshot: Arc::new(
                 crate::gpu_residency::AtomicEffectScratchResidencySnapshot::default(),
             ),

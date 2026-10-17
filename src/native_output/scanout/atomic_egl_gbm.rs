@@ -43,10 +43,10 @@ pub(crate) use super::atomic_render_domain::{AtomicRenderedFrameParts, AtomicSlo
 use super::render_worker::{
     AtomicRenderCandidateIdentity, AtomicRenderCandidateJob, AtomicRenderControl,
     AtomicRenderTransportKind, AtomicRenderWorkerCapture, AtomicRenderWorkerEffectReload,
-    AtomicRenderWorkerEvent, AtomicRenderWorkerHandle, AtomicRenderWorkerIdentity,
-    AtomicRenderWorkerInitialFrame, AtomicRenderWorkerJob, AtomicRenderWorkerPolicy,
-    AtomicRenderWorkerReleaseFence, AtomicRenderWorkerStartup, RenderWorkerJobId,
-    SequencedRenderControl, apply_render_control,
+    AtomicRenderWorkerEvent, AtomicRenderWorkerFailureReason, AtomicRenderWorkerHandle,
+    AtomicRenderWorkerIdentity, AtomicRenderWorkerInitialFrame, AtomicRenderWorkerJob,
+    AtomicRenderWorkerPolicy, AtomicRenderWorkerReleaseFence, AtomicRenderWorkerStartup,
+    RenderWorkerJobId, SequencedRenderControl, apply_render_control, validate_render_control_batch,
 };
 use super::*;
 use crate::native_output::presentation::async_validation::CompositedPresentationValidationKey;
@@ -63,36 +63,277 @@ fn elapsed_nanos(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CoalescibleRenderControl {
+    CursorImage,
+    MaterialGeneration,
+    PresentedDamageInvalidation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingRenderControlFailure {
+    Overflow,
+    EpochExhausted,
+    SequenceCorrupt,
+}
+
+impl PendingRenderControlFailure {
+    const fn worker_reason(self) -> AtomicRenderWorkerFailureReason {
+        match self {
+            Self::Overflow => AtomicRenderWorkerFailureReason::PendingControlOverflow,
+            Self::EpochExhausted => AtomicRenderWorkerFailureReason::ControlEpochExhausted,
+            Self::SequenceCorrupt => AtomicRenderWorkerFailureReason::PendingControlSequenceCorrupt,
+        }
+    }
+
+    const fn message(self) -> &'static str {
+        match self {
+            Self::Overflow => {
+                "bounded renderer-control lane is full; refusing to drop renderer state"
+            }
+            Self::EpochExhausted => "renderer control epoch exhausted",
+            Self::SequenceCorrupt => "renderer-control pending suffix is not contiguous",
+        }
+    }
+}
+
+#[derive(Default)]
+struct PendingRenderControlKindCounts {
+    commit_presented: usize,
+    discard_rendered: usize,
+    damage_invalidation: usize,
+    material_generation: usize,
+    effect_registry_generation: usize,
+    cursor_image: usize,
+    pool_rebind: usize,
+    finish_render_work: usize,
+    other: usize,
+}
+
+impl PendingRenderControlKindCounts {
+    fn record(&mut self, control: &AtomicRenderControl) {
+        match control {
+            AtomicRenderControl::CommitPresented { .. } => self.commit_presented += 1,
+            AtomicRenderControl::DiscardRendered { .. } => self.discard_rendered += 1,
+            AtomicRenderControl::InvalidatePresentedDamageHistory => {
+                self.damage_invalidation += 1;
+            }
+            AtomicRenderControl::PublishMaterialEffectGeneration(_) => {
+                self.material_generation += 1;
+            }
+            AtomicRenderControl::PublishEffectRegistryGeneration(_) => {
+                self.effect_registry_generation += 1;
+            }
+            AtomicRenderControl::SetCursorImage(_) => self.cursor_image += 1,
+            AtomicRenderControl::RebindPoolGeneration(_) => self.pool_rebind += 1,
+            AtomicRenderControl::FinishRenderWork => self.finish_render_work += 1,
+            AtomicRenderControl::FrameSwapFailed => self.other += 1,
+        }
+    }
+}
+
+fn render_control_kind(control: &AtomicRenderControl) -> &'static str {
+    match control {
+        AtomicRenderControl::CommitPresented { .. } => "commit_presented",
+        AtomicRenderControl::DiscardRendered { .. } => "discard_rendered",
+        AtomicRenderControl::InvalidatePresentedDamageHistory => "damage_invalidation",
+        AtomicRenderControl::FrameSwapFailed => "other",
+        AtomicRenderControl::PublishMaterialEffectGeneration(_) => "material_generation",
+        AtomicRenderControl::PublishEffectRegistryGeneration(_) => "effect_registry_generation",
+        AtomicRenderControl::SetCursorImage(_) => "cursor_image",
+        AtomicRenderControl::RebindPoolGeneration(_) => "pool_rebind",
+        AtomicRenderControl::FinishRenderWork => "finish_render_work",
+    }
+}
+
+fn coalescible_render_control(control: &AtomicRenderControl) -> Option<CoalescibleRenderControl> {
+    match control {
+        AtomicRenderControl::SetCursorImage(_) => Some(CoalescibleRenderControl::CursorImage),
+        AtomicRenderControl::PublishMaterialEffectGeneration(_) => {
+            Some(CoalescibleRenderControl::MaterialGeneration)
+        }
+        AtomicRenderControl::InvalidatePresentedDamageHistory => {
+            Some(CoalescibleRenderControl::PresentedDamageInvalidation)
+        }
+        _ => None,
+    }
+}
+
+/// Mutates only the reactor-owned, worker-unobserved suffix. Any control not
+/// listed above is an ordered revision barrier.
+fn enqueue_pending_render_control(
+    pending_render_controls: &mut Vec<SequencedRenderControl>,
+    render_control_epoch: &mut u64,
+    coalesced_revision_count: &mut u64,
+    peak_pending_depth: &mut usize,
+    control: AtomicRenderControl,
+) -> Result<(), PendingRenderControlFailure> {
+    let observed_base_epoch = if let Some(first) = pending_render_controls.first() {
+        let base_epoch = first
+            .epoch
+            .checked_sub(1)
+            .ok_or(PendingRenderControlFailure::SequenceCorrupt)?;
+        let last_epoch = base_epoch
+            .checked_add(pending_render_controls.len() as u64)
+            .ok_or(PendingRenderControlFailure::SequenceCorrupt)?;
+        if last_epoch != *render_control_epoch
+            || pending_render_controls
+                .iter()
+                .enumerate()
+                .any(|(index, pending)| pending.epoch != base_epoch + index as u64 + 1)
+        {
+            return Err(PendingRenderControlFailure::SequenceCorrupt);
+        }
+        base_epoch
+    } else {
+        *render_control_epoch
+    };
+
+    let incoming_class = coalescible_render_control(&control);
+    let latest_segment_start = pending_render_controls
+        .iter()
+        .rposition(|pending| coalescible_render_control(&pending.control).is_none())
+        .map_or(0, |barrier_index| barrier_index + 1);
+    let replacement_index = incoming_class.and_then(|incoming_class| {
+        (latest_segment_start..pending_render_controls.len())
+            .rev()
+            .find(|&index| {
+                coalescible_render_control(&pending_render_controls[index].control)
+                    == Some(incoming_class)
+            })
+    });
+    let replacement = replacement_index.is_some();
+    let new_pending_len = if replacement {
+        pending_render_controls.len()
+    } else {
+        pending_render_controls
+            .len()
+            .checked_add(1)
+            .ok_or(PendingRenderControlFailure::Overflow)?
+    };
+    if new_pending_len > MAX_PENDING_RENDER_CONTROLS {
+        return Err(PendingRenderControlFailure::Overflow);
+    }
+    let new_high_water_epoch = observed_base_epoch
+        .checked_add(new_pending_len as u64)
+        .ok_or(PendingRenderControlFailure::EpochExhausted)?;
+    if new_high_water_epoch < *render_control_epoch {
+        return Err(PendingRenderControlFailure::SequenceCorrupt);
+    }
+
+    if let Some(replacement_index) = replacement_index {
+        pending_render_controls.remove(replacement_index);
+        *coalesced_revision_count = coalesced_revision_count.saturating_add(1);
+    }
+    pending_render_controls.push(SequencedRenderControl { epoch: 0, control });
+    let mut next_epoch = observed_base_epoch;
+    for pending in pending_render_controls.iter_mut() {
+        next_epoch = next_epoch
+            .checked_add(1)
+            .expect("pending epochs were prevalidated before mutation");
+        pending.epoch = next_epoch;
+    }
+    *render_control_epoch = (*render_control_epoch).max(new_high_water_epoch);
+    *peak_pending_depth = (*peak_pending_depth).max(pending_render_controls.len());
+    Ok(())
+}
+
+fn log_pending_render_control_failure(
+    failure: PendingRenderControlFailure,
+    pending_render_controls: &[SequencedRenderControl],
+    render_control_epoch: u64,
+    incoming_control_kind: &'static str,
+    coalesced_revision_count: u64,
+    peak_pending_depth: usize,
+) {
+    let mut counts = PendingRenderControlKindCounts::default();
+    for pending in pending_render_controls {
+        counts.record(&pending.control);
+    }
+    let oldest_pending_epoch = pending_render_controls
+        .first()
+        .map_or(0, |control| control.epoch);
+    let newest_pending_epoch = pending_render_controls
+        .last()
+        .map_or(0, |control| control.epoch);
+    eprintln!(
+        "native render worker: renderer-control lane failure: failure_reason={} pending_control_count={} capacity={} render_control_epoch={} oldest_pending_epoch={} newest_pending_epoch={} incoming_control_kind={} commit_presented={} discard_rendered={} damage_invalidation={} material_generation={} effect_registry_generation={} cursor_image={} pool_rebind={} finish_render_work={} other={} coalesced_revisions={} peak_pending_depth={}",
+        failure.worker_reason().as_str(),
+        pending_render_controls.len(),
+        MAX_PENDING_RENDER_CONTROLS,
+        render_control_epoch,
+        oldest_pending_epoch,
+        newest_pending_epoch,
+        incoming_control_kind,
+        counts.commit_presented,
+        counts.discard_rendered,
+        counts.damage_invalidation,
+        counts.material_generation,
+        counts.effect_registry_generation,
+        counts.cursor_image,
+        counts.pool_rebind,
+        counts.finish_render_work,
+        counts.other,
+        coalesced_revision_count,
+        peak_pending_depth,
+    );
+}
+
 fn queue_render_control_parts(
     render_transport: &mut AtomicRenderTransport,
     pending_render_controls: &mut Vec<SequencedRenderControl>,
     render_control_epoch: &mut u64,
     render_control_overflowed: &mut bool,
+    coalesced_revision_count: &mut u64,
+    peak_pending_depth: &mut usize,
     control: AtomicRenderControl,
 ) -> io::Result<()> {
     match render_transport {
         AtomicRenderTransport::Synchronous(domain) => apply_render_control(domain, control),
         AtomicRenderTransport::Worker(worker) => {
-            if pending_render_controls.len() >= MAX_PENDING_RENDER_CONTROLS {
-                *render_control_overflowed = true;
-                worker.fail_control_lane();
-                return Err(io::Error::other(
-                    "bounded renderer-control lane is full; refusing to drop renderer state",
-                ));
-            }
-            let Some(next_epoch) = render_control_epoch.checked_add(1) else {
-                *render_control_overflowed = true;
-                worker.fail_control_lane();
-                return Err(io::Error::other("renderer control epoch exhausted"));
-            };
-            *render_control_epoch = next_epoch;
-            pending_render_controls.push(SequencedRenderControl {
-                epoch: *render_control_epoch,
+            let incoming_control_kind = render_control_kind(&control);
+            match enqueue_pending_render_control(
+                pending_render_controls,
+                render_control_epoch,
+                coalesced_revision_count,
+                peak_pending_depth,
                 control,
-            });
-            Ok(())
+            ) {
+                Ok(()) => Ok(()),
+                Err(failure) => {
+                    *render_control_overflowed = true;
+                    log_pending_render_control_failure(
+                        failure,
+                        pending_render_controls,
+                        *render_control_epoch,
+                        incoming_control_kind,
+                        *coalesced_revision_count,
+                        *peak_pending_depth,
+                    );
+                    worker.fail_control_lane(failure.worker_reason());
+                    Err(io::Error::other(failure.message()))
+                }
+            }
         }
     }
+}
+
+fn take_pending_render_controls_for_job(
+    pending_render_controls: &mut Vec<SequencedRenderControl>,
+    render_control_epoch: u64,
+    render_control_overflowed: bool,
+) -> io::Result<(Vec<SequencedRenderControl>, u64)> {
+    if render_control_overflowed {
+        return Err(io::Error::other(
+            "renderer-control lane failed before worker admission",
+        ));
+    }
+    // Moving this suffix into a worker command is the observation boundary;
+    // later updates start a fresh segment at `render_control_epoch`.
+    Ok((
+        std::mem::take(pending_render_controls),
+        render_control_epoch,
+    ))
 }
 
 fn teardown_render_before_physical(
@@ -168,6 +409,8 @@ pub(crate) struct AtomicEglGbmScanout {
     pending_render_controls: Vec<SequencedRenderControl>,
     render_control_epoch: u64,
     render_control_overflowed: bool,
+    coalesced_render_control_revisions: u64,
+    peak_pending_render_control_depth: usize,
     render_slot_identities: Vec<(OutputSlotId, u64)>,
     lifecycle_animation_available: bool,
     squash_animation_available: bool,
@@ -762,20 +1005,18 @@ impl AtomicEglGbmScanout {
             &mut self.pending_render_controls,
             &mut self.render_control_epoch,
             &mut self.render_control_overflowed,
+            &mut self.coalesced_render_control_revisions,
+            &mut self.peak_pending_render_control_depth,
             control,
         )
     }
 
     fn take_render_controls_for_job(&mut self) -> io::Result<(Vec<SequencedRenderControl>, u64)> {
-        if self.render_control_overflowed {
-            return Err(io::Error::other(
-                "renderer-control lane overflowed before worker admission",
-            ));
-        }
-        Ok((
-            std::mem::take(&mut self.pending_render_controls),
+        take_pending_render_controls_for_job(
+            &mut self.pending_render_controls,
             self.render_control_epoch,
-        ))
+            self.render_control_overflowed,
+        )
     }
 
     fn render_worker(&self) -> Option<&AtomicRenderWorkerHandle> {
@@ -1986,6 +2227,8 @@ impl AtomicEglGbmScanout {
             pending_render_controls: Vec::new(),
             render_control_epoch: 0,
             render_control_overflowed: false,
+            coalesced_render_control_revisions: 0,
+            peak_pending_render_control_depth: 0,
             render_slot_identities,
             lifecycle_animation_available: render_info.lifecycle_animation_available,
             squash_animation_available: render_info.squash_animation_available,
@@ -3499,6 +3742,8 @@ impl AtomicEglGbmScanout {
             pending_render_controls,
             render_control_epoch,
             render_control_overflowed,
+            coalesced_render_control_revisions,
+            peak_pending_render_control_depth,
             ..
         } = self;
         let swapchain = swapchain
@@ -3807,6 +4052,461 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
     use std::time::Duration;
+
+    fn cursor_image(
+        revision: u32,
+    ) -> std::sync::Arc<oblivion_one::cursor_theme::CompositorCursorImage> {
+        std::sync::Arc::new(
+            oblivion_one::cursor_theme::CompositorCursorImage::from_argb8888(
+                vec![revision],
+                1,
+                1,
+                0,
+                0,
+            )
+            .expect("valid one-pixel cursor image"),
+        )
+    }
+
+    fn material_generation(revision: u64) -> oblivion_one::effects::EffectRegistryGeneration {
+        let mut generation = oblivion_one::effects::EffectRegistryGeneration::empty();
+        generation.generation = revision;
+        generation
+    }
+
+    fn queue_worker_control(
+        transport: &mut AtomicRenderTransport,
+        pending: &mut Vec<SequencedRenderControl>,
+        epoch: &mut u64,
+        overflowed: &mut bool,
+        control: AtomicRenderControl,
+    ) -> io::Result<()> {
+        let mut coalesced_revision_count = 0;
+        let mut peak_pending_depth = pending.len();
+        queue_render_control_parts(
+            transport,
+            pending,
+            epoch,
+            overflowed,
+            &mut coalesced_revision_count,
+            &mut peak_pending_depth,
+            control,
+        )
+    }
+
+    #[test]
+    fn cursor_control_storm_keeps_only_the_newest_unobserved_image() {
+        let mut transport = AtomicRenderTransport::Worker(AtomicRenderWorkerHandle::test_handle());
+        let mut pending = Vec::new();
+        let mut epoch = 0;
+        let mut overflowed = false;
+        let mut newest = None;
+
+        for revision in 0..64 {
+            let image = cursor_image(revision);
+            queue_worker_control(
+                &mut transport,
+                &mut pending,
+                &mut epoch,
+                &mut overflowed,
+                AtomicRenderControl::SetCursorImage(std::sync::Arc::clone(&image)),
+            )
+            .expect("unobserved cursor revisions coalesce");
+            newest = Some(image);
+        }
+
+        assert!(!overflowed);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(epoch, 1, "replacement must not consume a new revision");
+        let AtomicRenderControl::SetCursorImage(pending_image) = &pending[0].control else {
+            panic!("the newest cursor image remains pending");
+        };
+        assert!(std::sync::Arc::ptr_eq(
+            pending_image,
+            newest.as_ref().expect("at least one cursor revision")
+        ));
+    }
+
+    #[test]
+    fn material_control_storm_keeps_only_the_newest_complete_generation() {
+        let mut transport = AtomicRenderTransport::Worker(AtomicRenderWorkerHandle::test_handle());
+        let mut pending = Vec::new();
+        let mut epoch = 0;
+        let mut overflowed = false;
+        let mut newest_revision = 0;
+
+        for revision in 1..=64 {
+            let generation = material_generation(revision);
+            queue_worker_control(
+                &mut transport,
+                &mut pending,
+                &mut epoch,
+                &mut overflowed,
+                AtomicRenderControl::PublishMaterialEffectGeneration(generation),
+            )
+            .expect("unobserved material generations coalesce");
+            newest_revision = revision;
+        }
+
+        assert!(!overflowed);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(epoch, 1);
+        let AtomicRenderControl::PublishMaterialEffectGeneration(pending_generation) =
+            &pending[0].control
+        else {
+            panic!("the newest material generation remains pending");
+        };
+        assert_eq!(pending_generation.generation, newest_revision);
+    }
+
+    #[test]
+    fn presented_damage_invalidation_storm_folds_to_one_unobserved_revision() {
+        let mut transport = AtomicRenderTransport::Worker(AtomicRenderWorkerHandle::test_handle());
+        let mut pending = Vec::new();
+        let mut epoch = 0;
+        let mut overflowed = false;
+
+        for _ in 0..64 {
+            queue_worker_control(
+                &mut transport,
+                &mut pending,
+                &mut epoch,
+                &mut overflowed,
+                AtomicRenderControl::InvalidatePresentedDamageHistory,
+            )
+            .expect("unobserved damage invalidations fold together");
+        }
+
+        assert!(!overflowed);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(epoch, 1);
+        assert!(matches!(
+            &pending[0].control,
+            AtomicRenderControl::InvalidatePresentedDamageHistory
+        ));
+    }
+
+    #[test]
+    fn mixed_revision_storm_keeps_latest_payloads_in_last_occurrence_order() {
+        let mut transport = AtomicRenderTransport::Worker(AtomicRenderWorkerHandle::test_handle());
+        let mut pending = Vec::new();
+        let mut epoch = 7;
+        let mut overflowed = false;
+        let cursor_c3 = cursor_image(3);
+        let material_m2 = material_generation(2);
+
+        for control in [
+            AtomicRenderControl::PublishMaterialEffectGeneration(material_generation(1)),
+            AtomicRenderControl::SetCursorImage(cursor_image(1)),
+            AtomicRenderControl::InvalidatePresentedDamageHistory,
+            AtomicRenderControl::SetCursorImage(cursor_image(2)),
+            AtomicRenderControl::PublishMaterialEffectGeneration(material_generation(2)),
+            AtomicRenderControl::InvalidatePresentedDamageHistory,
+            AtomicRenderControl::SetCursorImage(std::sync::Arc::clone(&cursor_c3)),
+        ] {
+            queue_worker_control(
+                &mut transport,
+                &mut pending,
+                &mut epoch,
+                &mut overflowed,
+                control,
+            )
+            .expect("mixed unobserved revisions coalesce");
+        }
+
+        assert!(!overflowed);
+        assert_eq!(pending.len(), 3);
+        assert_eq!(
+            pending
+                .iter()
+                .map(|control| control.epoch)
+                .collect::<Vec<_>>(),
+            vec![8, 9, 10]
+        );
+        assert_eq!(epoch, 10);
+        assert!(matches!(
+            &pending[0].control,
+            AtomicRenderControl::PublishMaterialEffectGeneration(generation)
+                if generation.generation == material_m2.generation
+        ));
+        assert!(matches!(
+            &pending[1].control,
+            AtomicRenderControl::InvalidatePresentedDamageHistory
+        ));
+        assert!(matches!(
+            &pending[2].control,
+            AtomicRenderControl::SetCursorImage(image)
+                if std::sync::Arc::ptr_eq(image, &cursor_c3)
+        ));
+        assert!(validate_render_control_batch(7, &pending, 10).is_ok());
+    }
+
+    #[test]
+    fn ordered_controls_split_revision_segments_for_cursor_and_material_state() {
+        let mut transport = AtomicRenderTransport::Worker(AtomicRenderWorkerHandle::test_handle());
+        let mut pending = Vec::new();
+        let mut epoch = 0;
+        let mut overflowed = false;
+        let cursor_c1 = cursor_image(1);
+        let cursor_c2 = cursor_image(2);
+        let material_m1 = material_generation(1);
+        let material_m2 = material_generation(2);
+
+        for control in [
+            AtomicRenderControl::SetCursorImage(std::sync::Arc::clone(&cursor_c1)),
+            AtomicRenderControl::FrameSwapFailed,
+            AtomicRenderControl::SetCursorImage(std::sync::Arc::clone(&cursor_c2)),
+            AtomicRenderControl::PublishMaterialEffectGeneration(material_m1.clone()),
+            AtomicRenderControl::FrameSwapFailed,
+            AtomicRenderControl::PublishMaterialEffectGeneration(material_m2.clone()),
+        ] {
+            queue_worker_control(
+                &mut transport,
+                &mut pending,
+                &mut epoch,
+                &mut overflowed,
+                control,
+            )
+            .expect("ordered barriers preserve both state revisions");
+        }
+
+        assert!(!overflowed);
+        assert_eq!(pending.len(), 6);
+        assert!(matches!(
+            &pending[0].control,
+            AtomicRenderControl::SetCursorImage(image)
+                if std::sync::Arc::ptr_eq(image, &cursor_c1)
+        ));
+        assert!(matches!(
+            &pending[1].control,
+            AtomicRenderControl::FrameSwapFailed
+        ));
+        assert!(matches!(
+            &pending[2].control,
+            AtomicRenderControl::SetCursorImage(image)
+                if std::sync::Arc::ptr_eq(image, &cursor_c2)
+        ));
+        assert!(matches!(
+            &pending[3].control,
+            AtomicRenderControl::PublishMaterialEffectGeneration(generation)
+                if generation.generation == material_m1.generation
+        ));
+        assert!(matches!(
+            &pending[4].control,
+            AtomicRenderControl::FrameSwapFailed
+        ));
+        assert!(matches!(
+            &pending[5].control,
+            AtomicRenderControl::PublishMaterialEffectGeneration(generation)
+                if generation.generation == material_m2.generation
+        ));
+    }
+
+    #[test]
+    fn effect_registry_publication_barriers_material_generation_coalescing() {
+        let mut transport = AtomicRenderTransport::Worker(AtomicRenderWorkerHandle::test_handle());
+        let mut pending = Vec::new();
+        let mut epoch = 0;
+        let mut overflowed = false;
+        let material_m1 = material_generation(1);
+        let registry_r1 = material_generation(10);
+        let material_m2 = material_generation(2);
+
+        for control in [
+            AtomicRenderControl::PublishMaterialEffectGeneration(material_m1.clone()),
+            AtomicRenderControl::PublishEffectRegistryGeneration(registry_r1.clone()),
+            AtomicRenderControl::PublishMaterialEffectGeneration(material_m2.clone()),
+        ] {
+            queue_worker_control(
+                &mut transport,
+                &mut pending,
+                &mut epoch,
+                &mut overflowed,
+                control,
+            )
+            .expect("registry publication remains an ordered barrier");
+        }
+
+        assert!(!overflowed);
+        assert_eq!(pending.len(), 3);
+        assert!(matches!(
+            &pending[0].control,
+            AtomicRenderControl::PublishMaterialEffectGeneration(generation)
+                if generation.generation == material_m1.generation
+        ));
+        assert!(matches!(
+            &pending[1].control,
+            AtomicRenderControl::PublishEffectRegistryGeneration(generation)
+                if generation.generation == registry_r1.generation
+        ));
+        assert!(matches!(
+            &pending[2].control,
+            AtomicRenderControl::PublishMaterialEffectGeneration(generation)
+                if generation.generation == material_m2.generation
+        ));
+    }
+
+    #[test]
+    fn ordered_control_overflow_remains_fatal_without_dropping_pending_controls() {
+        let mut transport = AtomicRenderTransport::Worker(AtomicRenderWorkerHandle::test_handle());
+        let mut pending = Vec::new();
+        let mut epoch = 0;
+        let mut overflowed = false;
+
+        for _ in 0..MAX_PENDING_RENDER_CONTROLS {
+            queue_worker_control(
+                &mut transport,
+                &mut pending,
+                &mut epoch,
+                &mut overflowed,
+                AtomicRenderControl::FrameSwapFailed,
+            )
+            .expect("the bounded ordered-control lane has room");
+        }
+        assert!(
+            queue_worker_control(
+                &mut transport,
+                &mut pending,
+                &mut epoch,
+                &mut overflowed,
+                AtomicRenderControl::FrameSwapFailed,
+            )
+            .is_err()
+        );
+
+        assert!(overflowed);
+        assert_eq!(pending.len(), MAX_PENDING_RENDER_CONTROLS);
+        assert_eq!(epoch, MAX_PENDING_RENDER_CONTROLS as u64);
+        assert!(pending.iter().enumerate().all(|(index, control)| {
+            control.epoch == index as u64 + 1
+                && matches!(&control.control, AtomicRenderControl::FrameSwapFailed)
+        }));
+        let AtomicRenderTransport::Worker(worker) = &mut transport else {
+            unreachable!();
+        };
+        assert!(matches!(
+            worker.try_take_event().expect("read overflow eventfd"),
+            Some(AtomicRenderWorkerEvent::Fatal {
+                reason: "pending_control_overflow",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn candidate_promotion_storm_is_bounded_and_feeds_the_next_worker_job() {
+        let mut transport = AtomicRenderTransport::Worker(AtomicRenderWorkerHandle::test_handle());
+        let mut pending = Vec::new();
+        let mut epoch = 0;
+        let mut overflowed = false;
+        let mut promotion_coalesced = 0;
+        let mut promotion_peak = 0;
+        let cursor_before_promotion = cursor_image(100);
+        let material_before_promotion = material_generation(100);
+
+        enqueue_pending_render_control(
+            &mut pending,
+            &mut epoch,
+            &mut promotion_coalesced,
+            &mut promotion_peak,
+            AtomicRenderControl::SetCursorImage(std::sync::Arc::clone(&cursor_before_promotion)),
+        )
+        .expect("pre-promotion cursor control queues");
+        enqueue_pending_render_control(
+            &mut pending,
+            &mut epoch,
+            &mut promotion_coalesced,
+            &mut promotion_peak,
+            AtomicRenderControl::PublishMaterialEffectGeneration(material_before_promotion.clone()),
+        )
+        .expect("pre-promotion material control queues");
+        let (promotion_controls, promotion_epoch) =
+            take_pending_render_controls_for_job(&mut pending, epoch, overflowed)
+                .expect("PromoteCandidate takes the current reactor-owned suffix");
+        assert_eq!(promotion_controls.len(), 2);
+        assert!(validate_render_control_batch(0, &promotion_controls, promotion_epoch).is_ok());
+
+        // The worker owns the promotion command now; only new reactor-owned
+        // controls may change while teardown and candidate promotion run.
+        let mut newest_cursor = None;
+        let mut newest_material_revision = 0;
+        for revision in 0..64 {
+            let cursor = cursor_image(revision);
+            let material = material_generation(u64::from(revision));
+            queue_worker_control(
+                &mut transport,
+                &mut pending,
+                &mut epoch,
+                &mut overflowed,
+                AtomicRenderControl::SetCursorImage(std::sync::Arc::clone(&cursor)),
+            )
+            .expect("cursor changes stay bounded during promotion");
+            queue_worker_control(
+                &mut transport,
+                &mut pending,
+                &mut epoch,
+                &mut overflowed,
+                AtomicRenderControl::PublishMaterialEffectGeneration(material),
+            )
+            .expect("material changes stay bounded during promotion");
+            queue_worker_control(
+                &mut transport,
+                &mut pending,
+                &mut epoch,
+                &mut overflowed,
+                AtomicRenderControl::InvalidatePresentedDamageHistory,
+            )
+            .expect("damage invalidations stay bounded during promotion");
+            newest_cursor = Some(cursor);
+            newest_material_revision = u64::from(revision);
+        }
+        assert!(!overflowed);
+        assert!(pending.len() <= MAX_PENDING_RENDER_CONTROLS);
+
+        // After CandidatePromoted, this is the same take path used by the
+        // first ordinary worker command against the promoted render domain.
+        let (post_promotion_controls, required_epoch) =
+            take_pending_render_controls_for_job(&mut pending, epoch, overflowed)
+                .expect("post-promotion command takes the accumulated suffix");
+        assert_eq!(pending.len(), 0);
+        assert_eq!(post_promotion_controls.len(), 3);
+        assert_eq!(
+            post_promotion_controls
+                .iter()
+                .map(|control| control.epoch)
+                .collect::<Vec<_>>(),
+            vec![
+                promotion_epoch + 1,
+                promotion_epoch + 2,
+                promotion_epoch + 3
+            ]
+        );
+        assert!(
+            validate_render_control_batch(
+                promotion_epoch,
+                &post_promotion_controls,
+                required_epoch
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            &post_promotion_controls[0].control,
+            AtomicRenderControl::SetCursorImage(image)
+                if std::sync::Arc::ptr_eq(
+                    image,
+                    newest_cursor.as_ref().expect("cursor revisions were queued")
+                )
+        ));
+        assert!(matches!(
+            &post_promotion_controls[1].control,
+            AtomicRenderControl::PublishMaterialEffectGeneration(generation)
+                if generation.generation == newest_material_revision
+        ));
+        assert!(matches!(
+            &post_promotion_controls[2].control,
+            AtomicRenderControl::InvalidatePresentedDamageHistory
+        ));
+    }
 
     fn adaptive_sync_validation_key() -> CompositedPresentationValidationKey {
         CompositedPresentationValidationKey::new(

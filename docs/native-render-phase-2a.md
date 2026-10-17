@@ -122,10 +122,10 @@ an explicit renderer-control boundary:
 | `commit_presented(frame, damage)` | Commits repaint history and damage-tracker state, publishes the presented scene key, and updates history depth after confirmed pageflip. | Lossless terminal operation. `CommitPresented(N)` must stay ordered relative to later operations that read or extend presented-damage history. |
 | `discard_rendered(frame)` | Discards the repaint plan and invalidates effect checkpoint capture contents. | Lossless terminal operation; preserve checkpoint invalidation. |
 | `frame_swap_failed()` | Resets repaint history after a failed compatibility swap. | Lossless failure control operation. |
-| `invalidate_presented_damage_history()` | Clears presented repaint history and scene key, and invalidates checkpoint capture contents. | Ordered control operation. Adjacent invalidations may be folded only when no commit, discard, or render-admission boundary lies between them. |
-| `publish_material_effect_generation(...)` | Publishes material state and invalidates presented history. | Configuration update with an invalidation side effect; a newer complete generation may replace an unobserved one only behind a revision barrier. |
+| `invalidate_presented_damage_history()` | Clears presented repaint history and scene key, and invalidates checkpoint capture contents. | Repeated invalidations may fold within one unobserved revision segment. |
+| `publish_material_effect_generation(...)` | Publishes material state and invalidates presented history. | A newer complete generation may replace an unobserved material generation in the same revision segment. |
 | `publish_effect_registry_generation(...)` | Compiles and publishes a registry generation, returns an error on failure, and invalidates presented history on success. | Ordered configuration operation unless Phase 2B proves coalescing preserves intermediate compile failures and the last successfully active generation. The job must name the generation it consumes. |
-| `set_cursor_image(...)` | Replaces the cursor image, updates damage tracking, marks cursor resources stale, and invalidates repaint history. | Latest-value configuration can replace an unobserved image only when the worker retains the required damage invalidation and revision ordering. |
+| `set_cursor_image(...)` | Replaces the cursor image, updates damage tracking, marks cursor resources stale, and invalidates repaint history. | The newest unobserved image may replace an earlier image in the same revision segment; normal cursor damage invalidation remains part of applying it. |
 | `reload_trusted_effect_registry(...)` | Runs the trusted reload publisher and returns a success/error plus the resulting generation; registry publication reaches the GL renderer. | Ordered request/completion, not a fire-and-forget latest-value update. Its admission/backpressure and response ownership need a bounded policy before Phase 2B. |
 
 The lifecycle and squash capability queries are also renderer-owned facts:
@@ -139,6 +139,18 @@ remain a worker-side operation with asynchronous completion if reactor code
 needs its result. The current presentation-cycle fallback paths call this
 barrier synchronously, so they must not retain a direct reactor-to-renderer
 call in Phase 2B.
+
+The reactor-owned pending-control suffix is the only place where these three
+state revisions may be coalesced. Draining that suffix into `Render`,
+`PrepareCandidate`, `PromoteCandidate`, `Capture`, `ReloadEffects`,
+`CreateReleaseFence`, or `ApplyControls` is the worker-observation boundary;
+after that move, the batch is immutable to the reactor. Within the current
+unobserved segment, a replacement removes only the previous revision of the
+same class and appends the new revision, preserving last-update order. Any
+other control ends the segment and remains an ordered barrier. The pending
+suffix is resequenced contiguously from the same worker-observable base epoch,
+and remains bounded to 16 entries. A full lane of non-coalescible controls
+still fails closed rather than dropping a required operation.
 
 The physical Atomic swapchain has three slots
 (`EXPLICIT_OUTPUT_SLOT_CAPACITY == 3`). Its invariants prevent slot-role
