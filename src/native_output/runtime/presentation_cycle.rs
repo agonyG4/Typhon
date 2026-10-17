@@ -1972,6 +1972,9 @@ impl NativeRuntime {
                         }
                         match render_outcome {
                             AtomicFrameRenderOutcome::WorkerDispatched { identity, context } => {
+                                frame_pacing
+                                    .mark_render_worker_dispatched()
+                                    .map_err(io::Error::other)?;
                                 if pending_render_worker_identity.is_some()
                                     || pending_render_worker_context.is_some()
                                     || pending_render_worker_outer.is_some()

@@ -561,6 +561,63 @@ fn submit_rejection_releases_input_fence_once() {
     handle.join().unwrap();
 }
 
+#[test]
+fn permission_rejected_atomic_commit_returns_its_exact_unsubmitted_job() {
+    let executor = Arc::new(ScriptedExecutor {
+        outcomes: Mutex::new(VecDeque::from([Err(
+            oblivion_one::native::kms::AtomicKmsErrorKind::PermissionOrSession,
+        )])),
+        submitted: Mutex::new(Vec::new()),
+    });
+    let handle = KmsCommitWorkerHandle::start(executor).unwrap();
+    let job = test_job(33);
+    let expected_token = job.token;
+    let expected_transaction = job.transaction_id;
+    let expected_kind = job.kind;
+    let expected_framebuffer = match job.primary {
+        KmsPrimaryUpdate::Framebuffer { framebuffer, .. } => framebuffer,
+        KmsPrimaryUpdate::Unchanged => panic!("test job has a primary framebuffer"),
+    };
+    reserve_for_test(&handle, job.kind).enqueue(job).unwrap();
+
+    let events = wait_for_fence_event(
+        &handle,
+        33,
+        |event| matches!(event, KmsWorkerEvent::SubmitRejected { job, .. } if job.token == expected_token),
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, KmsWorkerEvent::Submitted { .. }))
+    );
+    let rejection = events
+        .iter()
+        .find_map(|event| match event {
+            KmsWorkerEvent::SubmitRejected { job, error } => Some((job, error)),
+            _ => None,
+        })
+        .expect("permission failure returns a rejected job");
+    assert_eq!(rejection.0.token, expected_token);
+    assert_eq!(rejection.0.transaction_id, expected_transaction);
+    assert_eq!(rejection.0.kind, expected_kind);
+    assert!(matches!(
+        &rejection.0.primary,
+        KmsPrimaryUpdate::Framebuffer { framebuffer, .. } if *framebuffer == expected_framebuffer
+    ));
+    assert_eq!(
+        rejection.1.kind,
+        oblivion_one::native::kms::AtomicKmsErrorKind::PermissionOrSession
+    );
+    assert!(
+        !handle.inflight(),
+        "a rejected ioctl is never acked as submitted"
+    );
+
+    drop(events);
+    handle.request_quiesce();
+    handle.join().unwrap();
+}
+
 #[derive(Debug)]
 pub(super) struct BarrierExecutor {
     started: Barrier,

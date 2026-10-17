@@ -337,6 +337,106 @@ pub(crate) struct OutputFrameIdentitySnapshot {
     pub(crate) reservation: FramePresentationReservation,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OutputSwapchainRole {
+    Current,
+    WorkerQueued,
+    KernelSubmitted,
+    Ready,
+    Rendering,
+    Quarantined,
+    Suspended { index: usize },
+}
+
+/// Structured explanation of a broken physical-slot ownership invariant.
+/// Adaptive future-primary credit is intentionally not part of this type:
+/// it limits new admission and cannot revoke ownership already in flight.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum OutputSwapchainInvariantError {
+    SlotOutsidePool {
+        role: OutputSwapchainRole,
+        slot: OutputSlotId,
+    },
+    SlotAliasing {
+        slot: OutputSlotId,
+        first_role: OutputSwapchainRole,
+        second_role: OutputSwapchainRole,
+    },
+    OwnershipCapacityExceeded {
+        owner_count: usize,
+        capacity: usize,
+    },
+    MultiplePreparedFrames {
+        ready_slot: OutputSlotId,
+        rendering_slot: OutputSlotId,
+    },
+    RenderingReservationWithoutSlot,
+    RenderingReservationGenerationMismatch {
+        expected_pool_generation: u64,
+        actual_generation: u64,
+    },
+    FuturePrimaryOwnershipExceeded {
+        pending: bool,
+        worker_queued: bool,
+        prepared: bool,
+    },
+    FramePresentationDomainInvalid {
+        role: OutputSwapchainRole,
+        identity: OutputFrameIdentitySnapshot,
+        cause: String,
+    },
+    FramePoolGenerationMismatch {
+        role: OutputSwapchainRole,
+        identity: OutputFrameIdentitySnapshot,
+        expected_pool_generation: u64,
+        actual_pool_generation: u64,
+    },
+    FrameTargetClaimInvalid {
+        role: OutputSwapchainRole,
+        identity: OutputFrameIdentitySnapshot,
+        cause: String,
+    },
+    FrameTargetGenerationMismatch {
+        role: OutputSwapchainRole,
+        identity: OutputFrameIdentitySnapshot,
+        pool_generation: u64,
+        target_generation: u64,
+        claim_generation: u64,
+    },
+    VariableOpportunityGenerationMismatch {
+        role: OutputSwapchainRole,
+        identity: OutputFrameIdentitySnapshot,
+        expected_pool_generation: u64,
+        actual_generation: u64,
+    },
+    SuspendedPoolGenerationMismatch {
+        slot: OutputSlotId,
+        expected_pool_generation: u64,
+        actual_pool_generation: u64,
+    },
+    SuspendedFrameOwnerMismatch {
+        slot: OutputSlotId,
+        identity: OutputFrameIdentitySnapshot,
+        expected_pool_generation: u64,
+    },
+    PresentationOpportunityFrontierInvalid {
+        cause: String,
+    },
+    FutureClaimOrderInvalid {
+        role: OutputSwapchainRole,
+        identity: OutputFrameIdentitySnapshot,
+        cause: String,
+    },
+}
+
+impl std::fmt::Display for OutputSwapchainInvariantError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{self:?}")
+    }
+}
+
+impl std::error::Error for OutputSwapchainInvariantError {}
+
 impl OutputFrameIdentitySnapshot {
     pub(crate) const fn fixed_target(self) -> Option<PresentationTarget> {
         self.reservation.fixed_target()
@@ -580,9 +680,9 @@ impl AtomicOutputSwapchain {
         if self.ready.is_some() {
             return Err(io::Error::other("an output frame is already ready"));
         }
-        if future_primary_limit < 2 && self.pending.is_some() {
+        if future_primary_limit < 2 && (self.pending.is_some() || self.worker_queued.is_some()) {
             return Err(io::Error::other(
-                "future-primary limit cannot acquire a third output slot while pageflip is pending",
+                "future-primary limit cannot admit a new output slot while a primary commit is in flight",
             ));
         }
         let slot = self
@@ -615,7 +715,8 @@ impl AtomicOutputSwapchain {
             && !self.has_suspended_ownership()
             && self.rendering.is_none()
             && self.ready.is_none()
-            && !(future_primary_limit < 2 && self.pending.is_some())
+            && !(future_primary_limit < 2
+                && (self.pending.is_some() || self.worker_queued.is_some()))
             && self.free_slot_count() > 0
     }
 
@@ -2209,56 +2310,104 @@ impl AtomicOutputSwapchain {
     }
 
     pub(crate) fn validate_invariants(&self) -> io::Result<()> {
+        self.validate_invariants_diagnostic()
+            .map_err(io::Error::other)
+    }
+
+    pub(crate) fn validate_invariants_diagnostic(
+        &self,
+    ) -> Result<(), OutputSwapchainInvariantError> {
         let roles = [
-            Some(self.current),
-            self.worker_queued_slot(),
-            self.pending_slot(),
-            self.ready_slot(),
-            self.rendering,
-            self.quarantine_slot_id(),
+            (OutputSwapchainRole::Current, Some(self.current)),
+            (OutputSwapchainRole::WorkerQueued, self.worker_queued_slot()),
+            (OutputSwapchainRole::KernelSubmitted, self.pending_slot()),
+            (OutputSwapchainRole::Ready, self.ready_slot()),
+            (OutputSwapchainRole::Rendering, self.rendering),
+            (OutputSwapchainRole::Quarantined, self.quarantine_slot_id()),
         ];
-        let occupied: Vec<_> = roles.into_iter().flatten().collect();
-        let mut occupied = occupied;
-        occupied.extend(
-            self.suspended
-                .iter()
-                .flatten()
-                .map(|suspended| suspended.slot),
-        );
-        if occupied.iter().any(|slot| !self.slots.contains(*slot)) {
-            return Err(io::Error::other(
-                "output role references a slot outside the explicit pool",
-            ));
-        }
-        for (index, slot) in occupied.iter().enumerate() {
-            if occupied[index + 1..].contains(slot) {
-                return Err(io::Error::other("explicit output slot roles alias"));
+        let mut owner_count = 0;
+        for (index, (role, maybe_slot)) in roles.iter().enumerate() {
+            let Some(slot) = maybe_slot else {
+                continue;
+            };
+            owner_count += 1;
+            if !self.slots.contains(*slot) {
+                return Err(OutputSwapchainInvariantError::SlotOutsidePool {
+                    role: *role,
+                    slot: *slot,
+                });
+            }
+            for (first_role, first_slot) in &roles[..index] {
+                if *first_slot == Some(*slot) {
+                    return Err(OutputSwapchainInvariantError::SlotAliasing {
+                        slot: *slot,
+                        first_role: *first_role,
+                        second_role: *role,
+                    });
+                }
             }
         }
-        if occupied.len() > EXPLICIT_OUTPUT_SLOT_CAPACITY {
-            return Err(io::Error::other(
-                "explicit output ownership exceeds three slots",
-            ));
+        for (index, maybe_suspended) in self.suspended.iter().enumerate() {
+            let Some(suspended) = maybe_suspended else {
+                continue;
+            };
+            owner_count += 1;
+            let role = OutputSwapchainRole::Suspended { index };
+            if !self.slots.contains(suspended.slot) {
+                return Err(OutputSwapchainInvariantError::SlotOutsidePool {
+                    role,
+                    slot: suspended.slot,
+                });
+            }
+            for (first_role, first_slot) in &roles {
+                if *first_slot == Some(suspended.slot) {
+                    return Err(OutputSwapchainInvariantError::SlotAliasing {
+                        slot: suspended.slot,
+                        first_role: *first_role,
+                        second_role: role,
+                    });
+                }
+            }
+            for (first_index, previous) in self.suspended[..index].iter().enumerate() {
+                if previous
+                    .as_ref()
+                    .is_some_and(|previous| previous.slot == suspended.slot)
+                {
+                    return Err(OutputSwapchainInvariantError::SlotAliasing {
+                        slot: suspended.slot,
+                        first_role: OutputSwapchainRole::Suspended { index: first_index },
+                        second_role: role,
+                    });
+                }
+            }
         }
-        if self.ready.is_some() && self.rendering.is_some() {
-            return Err(io::Error::other(
-                "more than one composited primary is prepared",
-            ));
+        if owner_count > EXPLICIT_OUTPUT_SLOT_CAPACITY {
+            return Err(OutputSwapchainInvariantError::OwnershipCapacityExceeded {
+                owner_count,
+                capacity: EXPLICIT_OUTPUT_SLOT_CAPACITY,
+            });
+        }
+        if let (Some(ready_slot), Some(rendering_slot)) = (self.ready_slot(), self.rendering) {
+            return Err(OutputSwapchainInvariantError::MultiplePreparedFrames {
+                ready_slot,
+                rendering_slot,
+            });
         }
         match (self.rendering, self.rendering_reservation) {
             (None, Some(_)) => {
-                return Err(io::Error::other(
-                    "rendering reservation has no active rendering slot",
-                ));
+                return Err(OutputSwapchainInvariantError::RenderingReservationWithoutSlot);
             }
-            (Some(_), Some(reservation))
-                if reservation
-                    .physical_opportunity_id()
-                    .is_some_and(|id| id.clock_generation() != self.pool_generation) =>
-            {
-                return Err(io::Error::other(
-                    "rendering reservation belongs to an old presentation generation",
-                ));
+            (Some(_), Some(reservation)) => {
+                if let Some(id) = reservation.physical_opportunity_id()
+                    && id.clock_generation() != self.pool_generation
+                {
+                    return Err(
+                        OutputSwapchainInvariantError::RenderingReservationGenerationMismatch {
+                            expected_pool_generation: self.pool_generation,
+                            actual_generation: id.clock_generation(),
+                        },
+                    );
+                }
             }
             _ => {}
         }
@@ -2266,111 +2415,147 @@ impl AtomicOutputSwapchain {
             && self.worker_queued.is_some()
             && (self.ready.is_some() || self.rendering.is_some())
         {
-            return Err(io::Error::other(
-                "pending plus worker-queued-next cannot own a third future primary",
-            ));
+            return Err(
+                OutputSwapchainInvariantError::FuturePrimaryOwnershipExceeded {
+                    pending: true,
+                    worker_queued: true,
+                    prepared: true,
+                },
+            );
         }
-        for frame in [
-            self.pending.as_ref().map(|pending| &pending.frame),
-            self.worker_queued.as_ref().map(|queued| &queued.frame),
-            self.ready.as_ref(),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            frame.validate_presentation_domain()?;
+        for (role, frame) in [
+            (
+                OutputSwapchainRole::KernelSubmitted,
+                self.pending.as_ref().map(|pending| &pending.frame),
+            ),
+            (
+                OutputSwapchainRole::WorkerQueued,
+                self.worker_queued.as_ref().map(|queued| &queued.frame),
+            ),
+            (OutputSwapchainRole::Ready, self.ready.as_ref()),
+        ] {
+            let Some(frame) = frame else {
+                continue;
+            };
+            let identity = OutputFrameIdentitySnapshot::from(frame);
+            frame.validate_presentation_domain().map_err(|error| {
+                OutputSwapchainInvariantError::FramePresentationDomainInvalid {
+                    role,
+                    identity,
+                    cause: error.to_string(),
+                }
+            })?;
             if frame.pool_generation != self.pool_generation {
-                return Err(io::Error::other(
-                    "output frame belongs to an old swapchain generation",
-                ));
+                return Err(OutputSwapchainInvariantError::FramePoolGenerationMismatch {
+                    role,
+                    identity,
+                    expected_pool_generation: self.pool_generation,
+                    actual_pool_generation: frame.pool_generation,
+                });
             }
             match frame.reservation {
                 FramePresentationReservation::Fixed(target) => {
-                    self.validate_target_claim(target)?;
+                    self.validate_target_claim(target).map_err(|error| {
+                        OutputSwapchainInvariantError::FrameTargetClaimInvalid {
+                            role,
+                            identity,
+                            cause: error.to_string(),
+                        }
+                    })?;
+                    let claim_generation = target.physical_claim().clock_generation;
                     if target.clock_generation != self.pool_generation
-                        || target.physical_claim().clock_generation != self.pool_generation
+                        || claim_generation != self.pool_generation
                     {
-                        return Err(io::Error::other(
-                            "output frame belongs to an old presentation generation",
-                        ));
+                        return Err(
+                            OutputSwapchainInvariantError::FrameTargetGenerationMismatch {
+                                role,
+                                identity,
+                                pool_generation: self.pool_generation,
+                                target_generation: target.clock_generation,
+                                claim_generation,
+                            },
+                        );
                     }
                 }
                 FramePresentationReservation::Variable(reservation) => {
-                    if reservation.opportunity().id().clock_generation() != self.pool_generation {
-                        return Err(io::Error::other(
-                            "variable output frame belongs to an old presentation generation",
-                        ));
+                    let actual_generation = reservation.opportunity().id().clock_generation();
+                    if actual_generation != self.pool_generation {
+                        return Err(
+                            OutputSwapchainInvariantError::VariableOpportunityGenerationMismatch {
+                                role,
+                                identity,
+                                expected_pool_generation: self.pool_generation,
+                                actual_generation,
+                            },
+                        );
                     }
                 }
                 FramePresentationReservation::DeferredO1(_) => {}
             }
         }
-        for suspended in self.suspended.iter().flatten() {
+        for (index, maybe_suspended) in self.suspended.iter().enumerate() {
+            let Some(suspended) = maybe_suspended else {
+                continue;
+            };
             if suspended.pool_generation != self.pool_generation {
-                return Err(io::Error::other(
-                    "suspended output slot belongs to an old swapchain generation",
-                ));
+                return Err(
+                    OutputSwapchainInvariantError::SuspendedPoolGenerationMismatch {
+                        slot: suspended.slot,
+                        expected_pool_generation: self.pool_generation,
+                        actual_pool_generation: suspended.pool_generation,
+                    },
+                );
             }
-            if suspended.abandoned_frame.as_ref().is_some_and(|frame| {
-                frame.pool_generation != self.pool_generation || frame.slot != suspended.slot
-            }) {
-                return Err(io::Error::other(
-                    "suspended output slot frame belongs to an invalid owner",
-                ));
+            if let Some(frame) = suspended.abandoned_frame.as_ref()
+                && (frame.pool_generation != self.pool_generation || frame.slot != suspended.slot)
+            {
+                return Err(OutputSwapchainInvariantError::SuspendedFrameOwnerMismatch {
+                    slot: suspended.slot,
+                    identity: OutputFrameIdentitySnapshot::from(frame),
+                    expected_pool_generation: self.pool_generation,
+                });
             }
+            let _role = OutputSwapchainRole::Suspended { index };
         }
-        let pending_claim = self.pending.as_ref().and_then(|pending| {
-            pending
-                .frame
-                .reservation
-                .physical_opportunity()
-                .map(|opportunity| opportunity.id())
-        });
-        let worker_claim = self.worker_queued.as_ref().and_then(|queued| {
-            queued
-                .frame
-                .reservation
-                .physical_opportunity()
-                .map(|opportunity| opportunity.id())
-        });
-        let ready_claim = self.ready.as_ref().and_then(|ready| {
-            ready
-                .reservation
-                .physical_opportunity()
-                .map(|opportunity| opportunity.id())
-        });
-        let frontier = PresentationOpportunityFrontier::from_claims(
-            [pending_claim, worker_claim, ready_claim]
-                .into_iter()
-                .flatten(),
-        )
-        .map_err(|error| {
-            io::Error::other(format!("presentation opportunity frontier: {error:?}"))
+        let claims = [
+            self.pending.as_ref().and_then(|pending| {
+                pending
+                    .frame
+                    .reservation
+                    .physical_opportunity()
+                    .map(|opportunity| opportunity.id())
+            }),
+            self.worker_queued.as_ref().and_then(|queued| {
+                queued
+                    .frame
+                    .reservation
+                    .physical_opportunity()
+                    .map(|opportunity| opportunity.id())
+            }),
+            self.ready.as_ref().and_then(|ready| {
+                ready
+                    .reservation
+                    .physical_opportunity()
+                    .map(|opportunity| opportunity.id())
+            }),
+        ];
+        let frontier = PresentationOpportunityFrontier::from_claims(claims.into_iter().flatten())
+            .map_err(|error| {
+            OutputSwapchainInvariantError::PresentationOpportunityFrontierInvalid {
+                cause: format!("{error:?}"),
+            }
         })?;
         let _latest_claim = frontier.latest();
-        self.validate_live_future_primary_claims()
+        self.validate_live_future_primary_claims_diagnostic()
     }
 
+    /// Pacing mode controls admission; it does not change which existing
+    /// swapchain ownership states are structurally valid.
     pub(crate) fn validate_invariants_for(
         &self,
-        pacing_mode: NativeOutputPacingMode,
+        _pacing_mode: NativeOutputPacingMode,
     ) -> io::Result<()> {
-        self.validate_invariants_for_limit(
-            u8::from(pacing_mode == NativeOutputPacingMode::PredictiveTriple) + 1,
-        )
-    }
-
-    pub(crate) fn validate_invariants_for_limit(&self, future_primary_limit: u8) -> io::Result<()> {
-        self.validate_invariants()?;
-        if future_primary_limit < 2
-            && (self.pending.is_some() || self.worker_queued.is_some())
-            && (self.ready.is_some() || self.rendering.is_some())
-        {
-            return Err(io::Error::other(
-                "ReactiveDouble cannot own a ready or rendering slot while pageflip is pending",
-            ));
-        }
-        Ok(())
+        self.validate_invariants()
     }
 
     fn quarantine_slot(
@@ -2552,28 +2737,53 @@ impl AtomicOutputSwapchain {
         }
     }
 
-    fn validate_live_future_primary_claims(&self) -> io::Result<()> {
-        let reservations = [
-            self.pending
-                .as_ref()
-                .map(|pending| pending.frame.reservation),
-            self.worker_queued
-                .as_ref()
-                .map(|queued| queued.frame.reservation),
-            self.ready.as_ref().map(|ready| ready.reservation),
+    fn validate_live_future_primary_claims_diagnostic(
+        &self,
+    ) -> Result<(), OutputSwapchainInvariantError> {
+        let frames = [
+            (
+                OutputSwapchainRole::KernelSubmitted,
+                self.pending.as_ref().map(|pending| &pending.frame),
+            ),
+            (
+                OutputSwapchainRole::WorkerQueued,
+                self.worker_queued.as_ref().map(|queued| &queued.frame),
+            ),
+            (OutputSwapchainRole::Ready, self.ready.as_ref()),
         ];
-        let mut previous = None;
-        for reservation in reservations.into_iter().flatten() {
+        let mut previous: Option<(
+            OutputSwapchainRole,
+            OutputFrameIdentitySnapshot,
+            FramePresentationReservation,
+        )> = None;
+        for (role, maybe_frame) in frames {
+            let Some(frame) = maybe_frame else {
+                continue;
+            };
+            let reservation = frame.reservation;
             if reservation.is_deferred_o1() {
                 continue;
             }
+            let identity = OutputFrameIdentitySnapshot::from(frame);
             if let Some(last_presented) = self.last_presented_primary_claim {
-                validate_claim_before_reservation(last_presented, reservation)?;
+                validate_claim_before_reservation(last_presented, reservation).map_err(
+                    |error| OutputSwapchainInvariantError::FutureClaimOrderInvalid {
+                        role,
+                        identity,
+                        cause: error.to_string(),
+                    },
+                )?;
             }
-            if let Some(earlier) = previous {
-                validate_strictly_later_reservation(earlier, reservation)?;
+            if let Some((_, _, earlier)) = previous {
+                validate_strictly_later_reservation(earlier, reservation).map_err(|error| {
+                    OutputSwapchainInvariantError::FutureClaimOrderInvalid {
+                        role,
+                        identity,
+                        cause: error.to_string(),
+                    }
+                })?;
             }
-            previous = Some(reservation);
+            previous = Some((role, identity, reservation));
         }
         Ok(())
     }
@@ -2762,6 +2972,69 @@ mod tests {
 
     fn fd_is_open(fd: i32) -> bool {
         (unsafe { libc::fcntl(fd, libc::F_GETFD) }) >= 0
+    }
+
+    fn explicit_slot_set() -> OutputSlotSet {
+        OutputSlotSet::new([
+            OutputSlotId::new(0).expect("slot 0"),
+            OutputSlotId::new(1).expect("slot 1"),
+            OutputSlotId::new(2).expect("slot 2"),
+        ])
+        .expect("three-slot output pool")
+    }
+
+    #[test]
+    fn invariant_diagnostics_distinguish_aliases_from_generation_failures() {
+        let current = OutputSlotId::new(0).expect("current slot");
+        let mut aliased =
+            AtomicOutputSwapchain::from_presented_slots(explicit_slot_set(), current, 1)
+                .expect("test swapchain");
+        aliased.rendering = Some(current);
+        assert_eq!(
+            aliased.validate_invariants_diagnostic(),
+            Err(OutputSwapchainInvariantError::SlotAliasing {
+                slot: current,
+                first_role: OutputSwapchainRole::Current,
+                second_role: OutputSwapchainRole::Rendering,
+            }),
+            "only the same physical slot held by two roles is classified as aliasing"
+        );
+
+        let mut wrong_generation =
+            AtomicOutputSwapchain::from_presented_slots(explicit_slot_set(), current, 1)
+                .expect("test swapchain");
+        let ready_slot = wrong_generation.acquire_render_slot().unwrap();
+        let frame = test_frame(
+            &wrong_generation,
+            ready_slot,
+            test_target(1, 1, PresentationTargetReason::Normal),
+        );
+        wrong_generation.finish_render_owned(frame).unwrap();
+        wrong_generation
+            .ready
+            .as_mut()
+            .expect("READY frame")
+            .pool_generation = 2;
+        assert!(matches!(
+            wrong_generation.validate_invariants_diagnostic(),
+            Err(OutputSwapchainInvariantError::FramePoolGenerationMismatch {
+                role: OutputSwapchainRole::Ready,
+                expected_pool_generation: 1,
+                actual_pool_generation: 2,
+                ..
+            })
+        ));
+
+        let mut inconsistent =
+            AtomicOutputSwapchain::from_presented_slots(explicit_slot_set(), current, 1)
+                .expect("test swapchain");
+        inconsistent.rendering_reservation = Some(FramePresentationReservation::Fixed(
+            test_target(1, 1, PresentationTargetReason::Normal),
+        ));
+        assert_eq!(
+            inconsistent.validate_invariants_diagnostic(),
+            Err(OutputSwapchainInvariantError::RenderingReservationWithoutSlot)
+        );
     }
 
     #[test]

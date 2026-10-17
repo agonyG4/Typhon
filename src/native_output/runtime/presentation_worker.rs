@@ -207,12 +207,11 @@ pub(super) fn settle_atomic_rendered_outcome(
             if context.finish_render_work_on_failure {
                 context.explicit.finish_render_work();
             }
-            context
-                .server
-                .cancel_lifecycle_precapture_after_render_failure();
-            context.frame_pacing.note_predictive_o1_failed();
-            context.frame_pacing.cancel_unsubmitted_render();
-            return Err(Box::new(error));
+            return Err(io::Error::other(format!(
+                "rendered Atomic outcome has no physical READY identity; pacing ownership remains held: cause={error} active_pacing_owner={:?}",
+                context.frame_pacing.active,
+            ))
+            .into());
         }
     };
     if physical_identity.frame_id != frame_id
@@ -222,11 +221,6 @@ pub(super) fn settle_atomic_rendered_outcome(
         if context.finish_render_work_on_failure {
             context.explicit.finish_render_work();
         }
-        context
-            .server
-            .cancel_lifecycle_precapture_after_render_failure();
-        context.frame_pacing.note_predictive_o1_failed();
-        context.frame_pacing.cancel_unsubmitted_render();
         return Err(io::Error::other(format!(
             "rendered Atomic outcome disagrees with physical READY owner: physical_ready={physical_identity:?} outcome_frame={frame_id} outcome_transaction={} outcome_protocol_batch={}",
             transaction_id.get(),
@@ -241,12 +235,11 @@ pub(super) fn settle_atomic_rendered_outcome(
         if context.finish_render_work_on_failure {
             context.explicit.finish_render_work();
         }
-        context
-            .server
-            .cancel_lifecycle_precapture_after_render_failure();
-        context.frame_pacing.note_predictive_o1_failed();
-        context.frame_pacing.cancel_unsubmitted_render();
-        return Err(io::Error::other(error).into());
+        return Err(io::Error::other(format!(
+            "cannot bind rendered Atomic frame to pacing owner: cause={error} physical_ready={physical_identity:?} active_pacing_owner={:?}",
+            context.frame_pacing.active,
+        ))
+        .into());
     }
     context.frame_pacing.note_render_ready();
     if let Some(advanced_intervals) = deferred_o1_binding_advanced_intervals {

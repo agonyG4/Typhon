@@ -1188,6 +1188,95 @@ fn reactive_double_exposes_no_third_render_slot_while_pageflip_is_pending() {
 }
 
 #[test]
+fn reactive_double_credit_drop_preserves_already_authorized_in_flight_frames() {
+    let mut swapchain = AtomicOutputSwapchain::from_presented_slots(
+        explicit_slot_set(),
+        OutputSlotId::new(0).unwrap(),
+        72,
+    )
+    .unwrap();
+
+    let pending_slot = swapchain.acquire_render_slot_for_limit(2).unwrap();
+    swapchain
+        .finish_render(pending_slot, 1, test_render_fence())
+        .unwrap();
+    let pending_token = PageFlipToken::new(720).unwrap();
+    swapchain.submit_ready(pending_token, None).unwrap();
+
+    let authorized_ready_slot = swapchain.acquire_render_slot_for_limit(2).unwrap();
+    swapchain
+        .finish_render(authorized_ready_slot, 2, test_render_fence())
+        .unwrap();
+    let ready_identity = swapchain.ready_identity().unwrap();
+
+    swapchain
+        .validate_invariants()
+        .expect("a policy change does not invalidate an authorized READY frame");
+    assert!(!swapchain.render_target_available_for_limit(1));
+    assert!(swapchain.acquire_render_slot_for_limit(1).is_err());
+
+    let worker_token = PageFlipToken::new(721).unwrap();
+    let (render_fence, cursor_owner) = swapchain
+        .take_ready_for_worker(worker_token, MonotonicTimestampNs::new(3))
+        .expect("the already-authorized READY frame remains submit-capable");
+    drop(render_fence);
+    drop(cursor_owner);
+    assert_eq!(
+        swapchain.worker_queued_identity().unwrap().frame,
+        ready_identity
+    );
+    swapchain
+        .validate_invariants()
+        .expect("worker-queued ownership remains valid after credit drops");
+
+    swapchain
+        .complete_pageflip(pending_token, 72)
+        .expect("the predecessor pageflip retires by its own token");
+    swapchain
+        .promote_worker_queued(
+            worker_token,
+            None,
+            MonotonicTimestampNs::new(4),
+            MonotonicTimestampNs::new(5),
+        )
+        .expect("the queued successor promotes after its predecessor retires");
+    let completed = swapchain
+        .complete_pageflip(worker_token, 72)
+        .expect("the exact queued successor completes");
+    assert_eq!(completed.frame.id, ready_identity.frame_id);
+    assert_eq!(completed.new_current, ready_identity.slot);
+    swapchain
+        .validate_invariants()
+        .expect("pageflip completion retains valid ownership after credit drops");
+}
+
+#[test]
+fn reactive_double_blocks_new_render_behind_worker_queued_primary() {
+    let mut swapchain = AtomicOutputSwapchain::from_presented_slots(
+        explicit_slot_set(),
+        OutputSlotId::new(0).unwrap(),
+        73,
+    )
+    .unwrap();
+    let slot = swapchain.acquire_render_slot_for_limit(2).unwrap();
+    swapchain
+        .finish_render(slot, 1, test_render_fence())
+        .unwrap();
+    let token = PageFlipToken::new(730).unwrap();
+    let (render_fence, cursor_owner) = swapchain
+        .take_ready_for_worker(token, MonotonicTimestampNs::new(2))
+        .expect("the authorized primary enters the worker queue");
+    drop(render_fence);
+    drop(cursor_owner);
+
+    swapchain
+        .validate_invariants()
+        .expect("worker-queued ownership is structurally valid");
+    assert!(!swapchain.render_target_available_for_limit(1));
+    assert!(swapchain.acquire_render_slot_for_limit(1).is_err());
+}
+
+#[test]
 fn predictive_triple_can_acquire_exactly_one_slot_behind_pending() {
     let mut swapchain = AtomicOutputSwapchain::from_presented_slots(
         explicit_slot_set(),

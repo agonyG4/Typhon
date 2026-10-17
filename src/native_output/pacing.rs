@@ -461,6 +461,77 @@ mod tests {
     }
 
     #[test]
+    fn reactive_render_attempt_requires_a_real_active_owner() {
+        let mut pacing = NativeFramePacing::from_env();
+        pacing.enabled = true;
+        pacing.note_render_decision(NativeOutputPacingMode::ReactiveDouble, false);
+
+        assert_eq!(
+            pacing.begin_render_attempt(NativeOutputPacingMode::ReactiveDouble, false),
+            Err("render attempt started without an active pacing owner")
+        );
+    }
+
+    #[test]
+    fn render_worker_cancellation_and_new_demand_preserve_the_in_flight_owner() {
+        let mut pacing = NativeFramePacing::from_env();
+        pacing.enabled = true;
+        pacing.queue_visual(1, 1);
+        let owner = pacing
+            .active
+            .expect("queued visual has a real pacing owner");
+        pacing.note_render_decision(NativeOutputPacingMode::ReactiveDouble, false);
+        pacing
+            .begin_render_attempt(NativeOutputPacingMode::ReactiveDouble, false)
+            .expect("the active frame owns this render attempt");
+        pacing
+            .mark_render_worker_dispatched()
+            .expect("the asynchronous worker pins the active owner");
+
+        pacing.queue_visual(2, 2);
+        pacing.cancel_unsubmitted_render();
+        assert_eq!(pacing.active, Some(owner));
+        assert_eq!(pacing.render_worker_owner, Some(owner));
+
+        let physical = predictive_physical_identity(901, 1);
+        pacing
+            .bind_physical_output_frame(physical)
+            .expect("worker completion binds to the original active owner");
+        pacing.note_render_ready();
+        pacing
+            .finish_render_worker_with_ready_frame(3, false)
+            .expect("the bound physical frame receives the worker's pinned owner");
+
+        assert_eq!(pacing.active, None);
+        assert_eq!(pacing.ready, Some(owner));
+        assert_eq!(pacing.ready_physical_identity, Some(physical));
+        assert_eq!(pacing.render_worker_owner, None);
+    }
+
+    #[test]
+    fn render_worker_failure_releases_only_its_owner_before_cancellation() {
+        let mut pacing = NativeFramePacing::from_env();
+        pacing.enabled = true;
+        pacing.queue_visual(1, 1);
+        let owner = pacing.active.expect("queued visual has an owner");
+        pacing
+            .begin_render_attempt(NativeOutputPacingMode::ReactiveDouble, false)
+            .expect("render attempt starts");
+        pacing
+            .mark_render_worker_dispatched()
+            .expect("worker owns the attempt");
+        pacing.cancel_unsubmitted_render();
+        assert_eq!(pacing.active, Some(owner));
+
+        pacing
+            .finish_render_worker_without_frame()
+            .expect("failed worker result ends its exact attempt");
+        pacing.cancel_unsubmitted_render();
+        assert_eq!(pacing.active, None);
+        assert!(!pacing.has_unsettled_output_frame_ownership());
+    }
+
+    #[test]
     fn worker_cancel_settles_reserved_frame_after_active_becomes_ready() {
         let mut pacing = NativeFramePacing::from_env();
         pacing.enabled = true;
@@ -2788,6 +2859,7 @@ pub(crate) struct NativeFramePacing {
     active_physical_identity: Option<OutputFrameIdentitySnapshot>,
     active_physical_key: Option<OutputFrameKey>,
     active_origin: PreparedFrameOrigin,
+    render_worker_owner: Option<NativeOutputFrameId>,
     pub(crate) active_queued_ns: Option<u64>,
     active_queued_frame_id: Option<NativeOutputFrameId>,
     pub(crate) pending: Option<NativeOutputFrameId>,
@@ -3001,6 +3073,11 @@ pub(crate) struct NativePacingTimingMetrics {
 }
 
 impl NativeFramePacing {
+    #[cfg(test)]
+    pub(crate) fn enable_for_test(&mut self) {
+        self.enabled = true;
+    }
+
     pub(crate) fn from_env() -> Self {
         let summary_enabled = std::env::var("TYPHON_FRAME_PACING_DEBUG")
             .ok()
@@ -3020,6 +3097,7 @@ impl NativeFramePacing {
             active_physical_identity: None,
             active_physical_key: None,
             active_origin: PreparedFrameOrigin::Normal,
+            render_worker_owner: None,
             active_queued_ns: None,
             active_queued_frame_id: None,
             pending: None,
@@ -3214,6 +3292,18 @@ impl NativeFramePacing {
         if !self.enabled {
             return;
         }
+        if let Some(owner) = self.render_worker_owner {
+            if self.trace.is_some() {
+                self.log(
+                    "visual_work_coalesced_with_render_worker_owner",
+                    vec![
+                        frame_id_field(Some(owner)),
+                        PacingField::u64("render_generation", render_generation),
+                    ],
+                );
+            }
+            return;
+        }
         if self.active.is_some() {
             // An active worker reservation may describe the predecessor
             // visual while the scheduler has already accepted newer visual
@@ -3324,6 +3414,12 @@ impl NativeFramePacing {
         let physical_key = OutputFrameKey::from(&physical_identity);
         if self.active.is_none() {
             return Err("physical output frame has no active pacing owner");
+        }
+        if self
+            .render_worker_owner
+            .is_some_and(|owner| self.active != Some(owner))
+        {
+            return Err("physical output frame does not match its render-worker pacing owner");
         }
         if self
             .active_physical_identity
@@ -3681,7 +3777,8 @@ impl NativeFramePacing {
             && (self.active.is_some()
                 || self.ready.is_some()
                 || self.pending.is_some()
-                || self.worker_reservation.is_some())
+                || self.worker_reservation.is_some()
+                || self.render_worker_owner.is_some())
     }
 
     pub(crate) fn rebase_after_output_epoch(&mut self) {
@@ -3704,6 +3801,9 @@ impl NativeFramePacing {
     ) -> Result<(), &'static str> {
         if !self.enabled {
             return Ok(());
+        }
+        if self.render_worker_owner.is_some() {
+            return Err("render worker still owns the active pacing frame");
         }
         if self.ready_physical_identity == Some(physical_identity) {
             return self
@@ -3789,11 +3889,9 @@ impl NativeFramePacing {
         if !self.enabled {
             return Ok(());
         }
-        // A render attempt may legitimately reuse the active logical pacing
-        // ID while an older worker submission is still in flight. The old
-        // ticket remains valid, but its lane affiliation must not follow the
-        // new attempt.
-        self.active_worker_reservation_id = None;
+        if self.render_worker_owner.is_some() {
+            return Err("render attempt started while a prior render worker owns the active frame");
+        }
         let origin = match (pacing_mode, render_ahead) {
             (NativeOutputPacingMode::ReactiveDouble, false) => PreparedFrameOrigin::ReactiveDouble,
             (NativeOutputPacingMode::PredictiveTriple, true) => PreparedFrameOrigin::PredictiveO1,
@@ -3803,6 +3901,16 @@ impl NativeFramePacing {
         if origin == PreparedFrameOrigin::PredictiveO1 {
             self.active
                 .ok_or("Predictive O1 render started without an active frame")?;
+        } else {
+            self.active
+                .ok_or("render attempt started without an active pacing owner")?;
+        }
+        // A render attempt may legitimately reuse the active logical pacing
+        // ID while an older KMS worker submission is still in flight. The old
+        // ticket remains valid, but its lane affiliation must not follow the
+        // new attempt. Validate the new owner before changing that sidecar.
+        self.active_worker_reservation_id = None;
+        if origin == PreparedFrameOrigin::PredictiveO1 {
             let attempt_id = self.predictive_o1_attempt_ids.next();
             self.predictive_o1_lifecycle.insert(attempt_id)?;
             self.active_predictive_attempt = Some(attempt_id);
@@ -3810,6 +3918,63 @@ impl NativeFramePacing {
             self.note_predictive_unbound_created();
         }
         self.active_origin = origin;
+        Ok(())
+    }
+
+    /// Pin the real ACTIVE owner across asynchronous render-worker execution.
+    /// Cancellation requests are deferred until the worker reports whether it
+    /// produced a physical frame or safely abandoned the attempt.
+    pub(crate) fn mark_render_worker_dispatched(&mut self) -> Result<(), &'static str> {
+        if !self.enabled {
+            return Ok(());
+        }
+        let owner = self
+            .active
+            .ok_or("render worker dispatched without an active pacing owner")?;
+        if self.render_worker_owner.is_some() {
+            return Err("render worker already owns an active pacing frame");
+        }
+        self.render_worker_owner = Some(owner);
+        Ok(())
+    }
+
+    /// End a dispatched render attempt which produced no physical READY frame.
+    /// Callers may then use the normal cancellation path for its ACTIVE owner.
+    pub(crate) fn finish_render_worker_without_frame(&mut self) -> Result<(), &'static str> {
+        if !self.enabled {
+            return Ok(());
+        }
+        let owner = self
+            .render_worker_owner
+            .ok_or("render worker completion has no pacing owner")?;
+        if self.active != Some(owner) {
+            return Err("render worker completion no longer owns the active pacing frame");
+        }
+        self.render_worker_owner = None;
+        Ok(())
+    }
+
+    /// Transfer a pinned render-worker owner into pacing READY after its exact
+    /// physical output identity has been bound.
+    pub(crate) fn finish_render_worker_with_ready_frame(
+        &mut self,
+        now_ns: u64,
+        waits_for_target: bool,
+    ) -> Result<(), &'static str> {
+        if !self.enabled {
+            return Ok(());
+        }
+        let owner = self
+            .render_worker_owner
+            .ok_or("render worker READY handoff has no pinned pacing owner")?;
+        if self.active != Some(owner) {
+            return Err("render worker READY handoff no longer owns the active pacing frame");
+        }
+        if self.active_physical_identity.is_none() {
+            return Err("render worker READY handoff has no bound physical output identity");
+        }
+        self.render_worker_owner = None;
+        self.note_ready_frame(now_ns, waits_for_target);
         Ok(())
     }
 
@@ -3832,6 +3997,13 @@ impl NativeFramePacing {
     /// future caller accidentally moves admission earlier again.
     fn clear_unsubmitted_render(&mut self, terminal: PredictiveReadyTerminal) {
         if !self.enabled {
+            return;
+        }
+        if let Some(owner) = self.render_worker_owner {
+            self.log(
+                "render_worker_owner_cancellation_deferred",
+                vec![frame_id_field(Some(owner))],
+            );
             return;
         }
         if let Some(identity) =

@@ -302,9 +302,10 @@ fn pipeline_checks_slot_aliasing_across_empty_commit_positions() {
 }
 
 #[test]
-fn reactive_double_rejects_pending_plus_prepared() {
+fn reactive_double_limits_new_admission_without_invalidating_prepared_rendering() {
     let mut snapshot = empty_snapshot();
     snapshot.pacing_mode = NativeOutputPacingMode::ReactiveDouble;
+    snapshot.future_primary_limit = 1;
     snapshot.kernel_submitted = Some(composed_commit(1, 1, 0, 10));
     snapshot.prepared = PreparedCompositedState::Rendering {
         slot: OutputSlotId::new(1).unwrap(),
@@ -315,6 +316,28 @@ fn reactive_double_rejects_pending_plus_prepared() {
     };
 
     assert_eq!(snapshot.validate(), Ok(()));
+    assert!(
+        !snapshot.can_render_composed(),
+        "lowered future-primary credit blocks a new render while the authorized render is active"
+    );
+    assert!(
+        !snapshot.can_pre_admit_primary(),
+        "lowered future-primary credit does not admit another primary"
+    );
+}
+
+#[test]
+fn reactive_double_credit_drop_keeps_authorized_ready_primary_valid() {
+    let mut snapshot = with_current(empty_snapshot());
+    snapshot.pacing_mode = NativeOutputPacingMode::ReactiveDouble;
+    snapshot.future_primary_limit = 1;
+    snapshot.kernel_submitted = Some(composed_commit(1, 1, 1, 10));
+    snapshot.prepared = ready(2, 2, 2);
+
+    assert_eq!(snapshot.validate(), Ok(()));
+    assert_eq!(snapshot.future_primary_depth(), 2);
+    assert!(!snapshot.can_render_composed());
+    assert!(!snapshot.can_pre_admit_primary());
 }
 
 #[test]

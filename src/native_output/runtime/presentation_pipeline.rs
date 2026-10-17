@@ -2,7 +2,7 @@ use super::atomic_commit::PendingAtomicCommit;
 use super::*;
 use crate::native_output::presentation::plane::PresentedPlaneSnapshot;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum PipelineSnapshotError {
     MissingTransaction {
         owner: &'static str,
@@ -40,6 +40,7 @@ pub(super) enum PipelineSnapshotError {
         actual: u32,
     },
     MissingRenderingTarget,
+    SwapchainInvariant(Box<OutputSwapchainInvariantError>),
     PipelineInvariant(PipelineValidationError),
 }
 
@@ -629,12 +630,8 @@ pub(super) fn build_output_pipeline_snapshot_with_presented(
     presented_planes: crate::native_output::presentation::plane::PresentedPlaneSnapshot,
 ) -> Result<OutputPipelineSnapshot, PipelineSnapshotError> {
     swapchain
-        .validate_invariants_for_limit(future_primary_limit)
-        .map_err(|_| {
-            PipelineSnapshotError::PipelineInvariant(PipelineValidationError::SlotAliasing {
-                slot: swapchain.current(),
-            })
-        })?;
+        .validate_invariants_diagnostic()
+        .map_err(|error| PipelineSnapshotError::SwapchainInvariant(Box::new(error)))?;
     if let Some(current) = presented_planes.primary {
         validate_presented_primary(
             current,
@@ -1155,6 +1152,46 @@ mod tests {
         .expect("quarantine remains a valid pipeline state");
 
         assert_eq!(snapshot.free_compositor_slots, 0);
+    }
+
+    #[test]
+    fn swapchain_validation_error_keeps_generation_identity_in_snapshot_error() {
+        let mut swapchain = swapchain();
+        let mut stale_target = cursor_target();
+        stale_target.clock_generation = 2;
+        stale_target.physical_claim.clock_generation = 2;
+        swapchain
+            .acquire_render_slot_for_reservation(
+                2,
+                FramePresentationReservation::Fixed(stale_target),
+            )
+            .expect("test creates an old-generation rendering reservation");
+
+        let error = build_output_pipeline_snapshot_with_presented(
+            1,
+            7,
+            NativeOutputPacingMode::ReactiveDouble,
+            1,
+            &swapchain,
+            &OutputTransactionLedger::new(),
+            &AtomicCommitArbiter::new(),
+            None,
+            None,
+            TripleCapability::Capable,
+            PresentedPlaneSnapshot::legacy(None),
+        )
+        .expect_err("invalid rendering generation is rejected");
+
+        assert_eq!(
+            error,
+            PipelineSnapshotError::SwapchainInvariant(Box::new(
+                OutputSwapchainInvariantError::RenderingReservationGenerationMismatch {
+                    expected_pool_generation: 1,
+                    actual_generation: 2,
+                },
+            )),
+            "a generation failure must not be fabricated as slot aliasing"
+        );
     }
 
     #[test]
