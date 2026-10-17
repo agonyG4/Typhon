@@ -3761,6 +3761,8 @@ impl AtomicEglGbmScanout {
                 pending_render_controls,
                 render_control_epoch,
                 render_control_overflowed,
+                coalesced_render_control_revisions,
+                peak_pending_render_control_depth,
                 AtomicRenderControl::DiscardRendered {
                     frame: frame.scene_commit,
                 },
