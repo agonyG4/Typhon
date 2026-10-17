@@ -332,11 +332,11 @@ pub(crate) fn effect_execution_demand_for_repaint_plan(
 ) -> oblivion_one::effects::EffectExecutionDemand {
     let repair_region =
         super::effect_region_from_output_damage(&plan.repair_damage, output_width, output_height);
-    let conservative_full = plan.mode == RepaintMode::Full;
+    let caller_conservative_full = false;
     oblivion_one::effects::plan_effect_execution_demand_with_kawase_mode(
         graph,
         &repair_region,
-        conservative_full,
+        caller_conservative_full,
         effect_debug_config().kawase_mode() == EffectDebugKawaseMode::Full,
     )
 }
@@ -352,10 +352,11 @@ fn effect_execution_demand_for_repaint_plan_with_diagnostics(
 ) {
     let repair_region =
         super::effect_region_from_output_damage(&plan.repair_damage, output_width, output_height);
+    let caller_conservative_full = false;
     oblivion_one::effects::plan_effect_execution_demand_with_diagnostics(
         graph,
         &repair_region,
-        plan.mode == RepaintMode::Full,
+        caller_conservative_full,
         effect_debug_config().kawase_mode() == EffectDebugKawaseMode::Full,
     )
 }

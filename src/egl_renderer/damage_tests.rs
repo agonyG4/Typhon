@@ -418,6 +418,78 @@ fn graph_for_effect_instances(
     ))
 }
 
+fn compiled_blur_graph(
+    regions: &[oblivion_one::effects::EffectRect],
+) -> oblivion_one::effects::CompiledFrameGraph {
+    use oblivion_one::compositor::{
+        EffectAnchor, EffectAnchorScope, EffectSceneOrder, ResolvedEffectInstance,
+        ResolvedEffectScene,
+    };
+    use oblivion_one::effects::{
+        DualKawaseBlurSpec, EffectAlphaMode, EffectFailurePolicy, EffectFrameDemand, EffectNode,
+        EffectNodeId, EffectParameterBlock, EffectProgram, EffectProgramId, EffectRegistry,
+        EffectSource, EffectWorkingSpace, FrameExecutionPlan, compile_frame_execution_plan,
+        validate_effect_program,
+    };
+
+    let source = EffectNodeId::new(1).unwrap();
+    let blur = EffectNodeId::new(2).unwrap();
+    let program = EffectProgram {
+        id: EffectProgramId::new(1).unwrap(),
+        nodes: vec![
+            EffectNode::source(source, EffectSource::Backdrop),
+            EffectNode::dual_kawase(blur, source, DualKawaseBlurSpec::new(4.0, 2, 1.0).unwrap()),
+        ],
+        output: blur,
+        working_space: EffectWorkingSpace::LinearSrgb,
+        alpha_mode: EffectAlphaMode::Opaque,
+        outsets: oblivion_one::effects::EffectOutsets::ZERO,
+        frame_demand: EffectFrameDemand::OnDamage,
+        failure_policy: EffectFailurePolicy::Passthrough,
+    };
+    let validated = validate_effect_program(program).unwrap();
+    let mut registry = EffectRegistry::empty();
+    registry.insert(validated).unwrap();
+
+    let instances = regions
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(index, region)| {
+            let id = u64::try_from(index + 1).unwrap();
+            let surface = u32::try_from(index + 1).unwrap();
+            ResolvedEffectInstance {
+                id: oblivion_one::effects::EffectInstanceId::new(id).unwrap(),
+                program: EffectProgramId::new(1).unwrap(),
+                anchor: EffectAnchor::BeforeSurface(surface),
+                target_bounds: region,
+                region: oblivion_one::effects::EffectRegion::from_rect(region),
+                parameter_block: EffectParameterBlock::default(),
+                coverage: None,
+                signature: id,
+                frame_demand: EffectFrameDemand::OnDamage,
+                visual_group: None,
+                anchor_scope: EffectAnchorScope::VisualGroup,
+                backdrop_reuse: crate::compositor::EffectBackdropReuse::Exact,
+                scene_order: EffectSceneOrder::for_anchor(EffectAnchor::BeforeSurface(surface)),
+            }
+        })
+        .collect();
+    let scene = ResolvedEffectScene::new(1, instances);
+    let output_bounds = oblivion_one::effects::EffectRect::new(0, 0, 100, 80).unwrap();
+    let plan = compile_frame_execution_plan(
+        &scene,
+        &oblivion_one::effects::EffectRegion::empty(),
+        output_bounds,
+        &registry,
+    )
+    .unwrap();
+    let FrameExecutionPlan::EffectGraph(graph) = plan else {
+        panic!("visible blur effects must compile to an effect graph");
+    };
+    graph
+}
+
 fn empty_effect_graph() -> oblivion_one::effects::CompiledFrameGraph {
     oblivion_one::effects::CompiledFrameGraph {
         passes: Vec::new(),
@@ -1453,20 +1525,58 @@ fn effect_execution_resolution_reports_budget_exhaustion_without_overwriting_cau
 
 #[test]
 fn initial_full_resolution_does_not_count_a_partial_iteration() {
-    let graph = empty_effect_graph();
+    let graph = compiled_blur_graph(&[effect_rect(10, 10, 20, 20), effect_rect(60, 10, 20, 20)]);
     let planner = partial_planner((100, 80), partial_capabilities());
     let mut plan = planner.full_plan(OutputDamage::Full, Some(2), FullRepaintReason::ForcedFull);
 
-    let (_demand, snapshot) = resolve_effect_execution_for_repaint_plan_with_diagnostics(
+    let (demand, snapshot) = resolve_effect_execution_for_repaint_plan_with_diagnostics(
         &planner, &graph, &mut plan, 100, 80,
     );
 
     assert_eq!(snapshot.outcome.as_str(), "initial_full");
+    assert_eq!(snapshot.demand_conservative_cause.as_str(), "none");
+    assert_eq!(snapshot.iterations_attempted, 0);
+    assert!(!demand.is_conservative_full());
+    assert_eq!(demand.instances.len(), 2);
+    assert_eq!(snapshot.final_repaint_mode, RepaintMode::Full);
     assert_eq!(
-        snapshot.demand_conservative_cause.as_str(),
-        "caller_conservative_full"
+        snapshot.final_repaint_reason,
+        Some(FullRepaintReason::ForcedFull)
+    );
+}
+
+#[test]
+fn initial_full_invalid_graph_remains_conservative_without_relabeling_caller() {
+    let mut graph =
+        compiled_blur_graph(&[effect_rect(10, 10, 20, 20), effect_rect(60, 10, 20, 20)]);
+    graph.instances[0].dependencies =
+        vec![oblivion_one::effects::EffectInstanceId::new(99).unwrap()];
+    let planner = partial_planner((100, 80), partial_capabilities());
+    let mut plan = planner.full_plan(OutputDamage::Full, Some(2), FullRepaintReason::ForcedFull);
+
+    let (demand, snapshot) = resolve_effect_execution_for_repaint_plan_with_diagnostics(
+        &planner, &graph, &mut plan, 100, 80,
+    );
+
+    assert!(demand.is_conservative_full());
+    assert_eq!(
+        snapshot.outcome,
+        EffectExecutionResolutionOutcome::InitialFull
     );
     assert_eq!(snapshot.iterations_attempted, 0);
+    assert_eq!(
+        snapshot.demand_conservative_cause.as_str(),
+        "graph_metadata_incomplete"
+    );
+    assert_eq!(
+        snapshot
+            .graph_metadata_issue
+            .map(|issue| issue.kind.as_str()),
+        Some("dependency_missing_or_not_unique")
+    );
+    assert_eq!(plan.mode, RepaintMode::Full);
+    assert_eq!(plan.repair_damage, OutputDamage::Full);
+    assert_eq!(snapshot.final_repaint_mode, RepaintMode::Full);
     assert_eq!(
         snapshot.final_repaint_reason,
         Some(FullRepaintReason::ForcedFull)
@@ -1553,8 +1663,7 @@ fn capture_work_does_not_cause_full_demand_recompute() {
 
 #[test]
 fn full_repaint_keeps_all_visible_effects_live() {
-    let effect_region = oblivion_one::effects::EffectRegion::from_rect(effect_rect(10, 10, 20, 20));
-    let graph = graph_for_effect_region(1, effect_region);
+    let graph = compiled_blur_graph(&[effect_rect(10, 10, 20, 20), effect_rect(50, 10, 20, 20)]);
     let mut planner = partial_planner((100, 80), partial_capabilities());
     let first = planner.plan(
         OutputDamage::rects(100, 80, [rect(10, 10, 20, 20)]),
@@ -1570,8 +1679,10 @@ fn full_repaint_keeps_all_visible_effects_live() {
 
     assert_eq!(plan.mode, RepaintMode::Full);
     assert_eq!(plan.repair_damage, OutputDamage::Full);
-    assert!(demand.is_conservative_full());
+    assert!(!demand.is_conservative_full());
+    assert_eq!(demand.instances.len(), 2);
     assert!(demand.contains(oblivion_one::effects::EffectInstanceId::new(1).unwrap()));
+    assert!(demand.contains(oblivion_one::effects::EffectInstanceId::new(2).unwrap()));
 }
 
 #[test]

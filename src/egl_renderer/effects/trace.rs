@@ -1622,6 +1622,26 @@ mod tests {
     }
 
     #[test]
+    fn full_repaint_begin_trace_reports_presentation_and_demand_separately() {
+        let trace = EffectExecutionTrace::enabled_for_test();
+        let summary = FrameTraceSummary {
+            repaint_mode: Some("full"),
+            demand_plan: Some(oblivion_one::effects::EffectDemandPlanStats {
+                conservative_full: false,
+                ..Default::default()
+            }),
+            ..FrameTraceSummary::default()
+        };
+
+        clear_test_events();
+        trace.frame_boundary("effect_demand_plan", "begin", summary);
+        let line = take_test_events().pop().expect("demand trace event");
+
+        assert!(line.contains("repaint_mode=full"));
+        assert!(line.contains("conservative_full=false"));
+    }
+
+    #[test]
     fn visible_clip_fallback_trace_identifies_authoritative_output() {
         let trace = EffectExecutionTrace::enabled_for_test();
         let pass = CompiledRenderPass {

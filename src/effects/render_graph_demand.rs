@@ -117,10 +117,10 @@ pub(crate) struct RegionalEffectDemandPlan {
 pub(crate) fn plan_regional_effect_demand(
     graph: &CompiledFrameGraph,
     repair_region: &EffectRegion,
-    conservative_full: bool,
+    caller_conservative_full: bool,
     full_kawase: bool,
 ) -> Result<RegionalEffectDemandPlan, EffectDemandRegionalFallbackReason> {
-    if conservative_full {
+    if caller_conservative_full {
         return Err(EffectDemandRegionalFallbackReason::CallerConservativeFull);
     }
     if !repair_region.is_empty() && repair_region.bounding_rect().is_none() {

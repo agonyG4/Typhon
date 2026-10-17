@@ -842,21 +842,26 @@ fn dependency_edge_count(graph: &CompiledFrameGraph) -> usize {
 pub fn plan_effect_execution_demand(
     graph: &CompiledFrameGraph,
     repair_region: &EffectRegion,
-    conservative_full: bool,
+    caller_conservative_full: bool,
 ) -> EffectExecutionDemand {
-    plan_effect_execution_demand_with_kawase_mode(graph, repair_region, conservative_full, false)
+    plan_effect_execution_demand_with_kawase_mode(
+        graph,
+        repair_region,
+        caller_conservative_full,
+        false,
+    )
 }
 
 pub fn plan_effect_execution_demand_with_kawase_mode(
     graph: &CompiledFrameGraph,
     repair_region: &EffectRegion,
-    conservative_full: bool,
+    caller_conservative_full: bool,
     full_kawase: bool,
 ) -> EffectExecutionDemand {
     plan_effect_execution_demand_with_kawase_mode_observing(
         graph,
         repair_region,
-        conservative_full,
+        caller_conservative_full,
         full_kawase,
         None,
     )
@@ -866,14 +871,14 @@ pub fn plan_effect_execution_demand_with_kawase_mode(
 pub fn plan_effect_execution_demand_with_diagnostics(
     graph: &CompiledFrameGraph,
     repair_region: &EffectRegion,
-    conservative_full: bool,
+    caller_conservative_full: bool,
     full_kawase: bool,
 ) -> (EffectExecutionDemand, EffectExecutionDemandDiagnostics) {
     let mut diagnostics = EffectExecutionDemandDiagnostics::default();
     let demand = plan_effect_execution_demand_with_kawase_mode_observing(
         graph,
         repair_region,
-        conservative_full,
+        caller_conservative_full,
         full_kawase,
         Some(&mut diagnostics),
     );
@@ -883,14 +888,14 @@ pub fn plan_effect_execution_demand_with_diagnostics(
 fn plan_effect_execution_demand_with_kawase_mode_observing(
     graph: &CompiledFrameGraph,
     repair_region: &EffectRegion,
-    conservative_full: bool,
+    caller_conservative_full: bool,
     full_kawase: bool,
     diagnostics: Option<&mut EffectExecutionDemandDiagnostics>,
 ) -> EffectExecutionDemand {
     plan_effect_execution_demand_with_policy_observing(
         graph,
         repair_region,
-        conservative_full,
+        caller_conservative_full,
         full_kawase,
         configured_effect_demand_planner_policy(),
         diagnostics,
@@ -902,14 +907,14 @@ fn plan_effect_execution_demand_with_kawase_mode_observing(
 pub fn plan_effect_execution_demand_with_policy(
     graph: &CompiledFrameGraph,
     repair_region: &EffectRegion,
-    conservative_full: bool,
+    caller_conservative_full: bool,
     full_kawase: bool,
     policy: EffectDemandPlannerPolicy,
 ) -> EffectExecutionDemand {
     plan_effect_execution_demand_with_policy_observing(
         graph,
         repair_region,
-        conservative_full,
+        caller_conservative_full,
         full_kawase,
         policy,
         None,
@@ -920,7 +925,7 @@ pub fn plan_effect_execution_demand_with_policy(
 pub fn plan_effect_execution_demand_with_policy_and_diagnostics(
     graph: &CompiledFrameGraph,
     repair_region: &EffectRegion,
-    conservative_full: bool,
+    caller_conservative_full: bool,
     full_kawase: bool,
     policy: EffectDemandPlannerPolicy,
 ) -> (EffectExecutionDemand, EffectExecutionDemandDiagnostics) {
@@ -928,7 +933,7 @@ pub fn plan_effect_execution_demand_with_policy_and_diagnostics(
     let demand = plan_effect_execution_demand_with_policy_observing(
         graph,
         repair_region,
-        conservative_full,
+        caller_conservative_full,
         full_kawase,
         policy,
         Some(&mut diagnostics),
@@ -939,7 +944,7 @@ pub fn plan_effect_execution_demand_with_policy_and_diagnostics(
 fn plan_effect_execution_demand_with_policy_observing(
     graph: &CompiledFrameGraph,
     repair_region: &EffectRegion,
-    conservative_full: bool,
+    caller_conservative_full: bool,
     full_kawase: bool,
     policy: EffectDemandPlannerPolicy,
     mut diagnostics: Option<&mut EffectExecutionDemandDiagnostics>,
@@ -952,7 +957,7 @@ fn plan_effect_execution_demand_with_policy_observing(
         let mut demand = plan_effect_execution_demand_legacy(
             graph,
             repair_region,
-            conservative_full,
+            caller_conservative_full,
             full_kawase,
             diagnostics.as_deref_mut(),
         );
@@ -960,7 +965,7 @@ fn plan_effect_execution_demand_with_policy_observing(
         return demand;
     }
 
-    match plan_regional_effect_demand(graph, repair_region, conservative_full, full_kawase) {
+    match plan_regional_effect_demand(graph, repair_region, caller_conservative_full, full_kawase) {
         Ok(regional) => {
             let instances = graph
                 .instances
@@ -998,7 +1003,7 @@ fn plan_effect_execution_demand_with_policy_observing(
             let mut demand = plan_effect_execution_demand_legacy(
                 graph,
                 repair_region,
-                conservative_full,
+                caller_conservative_full,
                 full_kawase,
                 diagnostics.as_deref_mut(),
             );
@@ -1048,12 +1053,12 @@ fn regional_fallback_cause(
 fn plan_effect_execution_demand_legacy(
     graph: &CompiledFrameGraph,
     repair_region: &EffectRegion,
-    conservative_full: bool,
+    caller_conservative_full: bool,
     full_kawase: bool,
     mut diagnostics: Option<&mut EffectExecutionDemandDiagnostics>,
 ) -> EffectExecutionDemand {
     let repair_rect_count = repair_region.rects().len();
-    if conservative_full {
+    if caller_conservative_full {
         if let Some(diagnostics) = diagnostics.as_deref_mut() {
             diagnostics.cause = EffectDemandConservativeCause::CallerConservativeFull;
         }
@@ -7466,7 +7471,7 @@ mod tests {
     }
 
     #[test]
-    fn full_repair_keeps_complete_internal_domains_and_constrains_final() {
+    fn caller_conservative_full_keeps_complete_internal_domains_and_constrains_final() {
         let (scene, registry) = blur_scene();
         let output_bounds = EffectRect::new(0, 0, 1920, 1080).unwrap();
         let FrameExecutionPlan::EffectGraph(graph) =
@@ -7476,8 +7481,11 @@ mod tests {
             panic!("visible blur must compile to an effect graph");
         };
 
-        let demand = plan_effect_execution_demand(&graph, &EffectRegion::empty(), true);
+        let caller_conservative_full = true;
+        let demand =
+            plan_effect_execution_demand(&graph, &EffectRegion::empty(), caller_conservative_full);
 
+        assert!(demand.is_conservative_full());
         assert_eq!(demand.plan_stats().pass_count_selected, graph.passes.len());
         assert_eq!(demand.plan_stats().partial_pass_count, 1);
         assert_eq!(
@@ -8371,6 +8379,12 @@ mod tests {
         );
 
         assert!(!diagnostics.regional_fallback);
+        assert!(
+            graph
+                .passes
+                .iter()
+                .any(|pass| pass.kind == RenderPassKind::DualKawaseDownsample)
+        );
         assert_eq!(
             regional
                 .instances
@@ -8395,6 +8409,101 @@ mod tests {
             regional.plan_stats().pass_count_selected,
             legacy.plan_stats().pass_count_selected
         );
+
+        for demand in [&legacy, &regional] {
+            assert!(!demand.is_conservative_full());
+            assert_eq!(demand.instances.len(), graph.instances.len());
+            assert!(demand.plan_stats().partial_pass_count > 0);
+            assert_eq!(demand.plan_stats().pass_conservative_fallbacks, 0);
+            assert!(
+                demand.plan_stats().full_domain_pass_count
+                    < demand.plan_stats().pass_count_selected
+            );
+            let internal_kawase_passes = graph
+                .passes
+                .iter()
+                .filter(|pass| {
+                    matches!(
+                        pass.kind,
+                        RenderPassKind::DualKawaseDownsample | RenderPassKind::DualKawaseUpsample
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert!(!internal_kawase_passes.is_empty());
+            assert!(internal_kawase_passes.iter().any(|pass| {
+                let output = pass.output.expect("compiled Kawase output");
+                let texture = graph
+                    .textures
+                    .iter()
+                    .find(|texture| texture.id == output)
+                    .expect("compiled Kawase output texture");
+                demand
+                    .pass_output_region(pass.id)
+                    .is_some_and(|region| !full_region_is_demanded(region, texture.domain))
+            }));
+
+            for instance in &graph.instances {
+                let final_pass = graph
+                    .passes
+                    .iter()
+                    .rev()
+                    .find(|pass| {
+                        pass.instance == instance.id
+                            && matches!(
+                                pass.kind,
+                                RenderPassKind::Composite | RenderPassKind::OutputPostProcess
+                            )
+                    })
+                    .expect("each visible effect has a final output pass");
+                let final_region = demand
+                    .pass_output_region(final_pass.id)
+                    .expect("selected final output pass has a demand");
+                assert!(region_is_subset_of(
+                    &instance.output_influence_region,
+                    final_region
+                ));
+            }
+
+            let mut checked_reverse_dependency = false;
+            for pass in &graph.passes {
+                let Some(demanded_output) = demand.pass_output_region(pass.id) else {
+                    continue;
+                };
+                if demanded_output.is_empty() {
+                    continue;
+                }
+                let Some(output_id) = pass.output else {
+                    continue;
+                };
+                let Some(output_texture) = graph.textures.iter().find(|t| t.id == output_id) else {
+                    continue;
+                };
+
+                for input_id in &pass.inputs {
+                    let Some(input_texture) = graph.textures.iter().find(|t| t.id == *input_id)
+                    else {
+                        continue;
+                    };
+                    let Some(producer) = graph.passes.iter().find(|candidate| {
+                        candidate.instance == pass.instance && candidate.output == Some(*input_id)
+                    }) else {
+                        continue;
+                    };
+                    let required =
+                        required_input_region(pass, demanded_output, output_texture, input_texture)
+                            .expect("compiled dependency has representable required input demand");
+                    if required.is_empty() {
+                        continue;
+                    }
+                    let producer_demand = demand
+                        .pass_output_region(producer.id)
+                        .expect("required producer pass has a planned demand");
+                    assert!(region_is_subset_of(&required, producer_demand));
+                    checked_reverse_dependency = true;
+                }
+            }
+            assert!(checked_reverse_dependency);
+        }
     }
 
     #[test]

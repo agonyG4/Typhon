@@ -33,6 +33,23 @@ use super::{
     types::{EglFrameOutcome, EglSceneDrawRequest, FrameSkipReason},
 };
 
+fn effect_demand_plan_begin_seed(
+    plan: &RepaintPlan,
+    graph: &oblivion_one::effects::CompiledFrameGraph,
+) -> oblivion_one::effects::EffectDemandPlanStats {
+    oblivion_one::effects::EffectDemandPlanStats {
+        repair_rect_count: plan.repair_damage.rect_count(),
+        dependency_edge_count: graph.instances.iter().fold(0, |count, instance| {
+            count.saturating_add(instance.dependencies.len())
+        }),
+        dependency_propagations: 0,
+        planner_policy: configured_effect_demand_planner_policy(),
+        max_instance_region_rect_count: 0,
+        conservative_full: false,
+        ..oblivion_one::effects::EffectDemandPlanStats::default()
+    }
+}
+
 pub(super) struct FrameBeginState {
     pub(super) width: u32,
     pub(super) height: u32,
@@ -608,17 +625,7 @@ impl FramePipeline<'_> {
             .effect_trace
             .enabled()
             .then(|| {
-                compiled_graph.map(|graph| oblivion_one::effects::EffectDemandPlanStats {
-                    repair_rect_count: planned.plan.repair_damage.rect_count(),
-                    dependency_edge_count: graph.instances.iter().fold(0, |count, instance| {
-                        count.saturating_add(instance.dependencies.len())
-                    }),
-                    dependency_propagations: 0,
-                    planner_policy: configured_effect_demand_planner_policy(),
-                    max_instance_region_rect_count: 0,
-                    conservative_full: planned.plan.mode == RepaintMode::Full,
-                    ..oblivion_one::effects::EffectDemandPlanStats::default()
-                })
+                compiled_graph.map(|graph| effect_demand_plan_begin_seed(&planned.plan, graph))
             })
             .flatten();
         let mut demand_trace_begin_summary = telemetry::effect_trace_summary(
@@ -925,5 +932,32 @@ pub(in crate::egl_renderer) fn resolve_scene_damage_authority(
         (OutputDamage::Full, true)
     } else {
         (output_damage, false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn full_presentation_begin_seed_does_not_claim_caller_conservative_demand() {
+        let graph = oblivion_one::effects::CompiledFrameGraph {
+            passes: Vec::new(),
+            textures: Vec::new(),
+            instances: Vec::new(),
+            final_damage: oblivion_one::effects::EffectRegion::empty(),
+            stats: Default::default(),
+        };
+        let plan = RepaintPlan {
+            render_damage: OutputDamage::Full,
+            repair_damage: OutputDamage::Full,
+            mode: RepaintMode::Full,
+            fallback_reason: None,
+            ..RepaintPlan::default()
+        };
+
+        let seed = effect_demand_plan_begin_seed(&plan, &graph);
+
+        assert!(!seed.conservative_full);
     }
 }
