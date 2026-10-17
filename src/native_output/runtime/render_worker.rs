@@ -61,9 +61,33 @@ fn handoff_render_worker_ready(
     Ok(())
 }
 
+/// End a worker attempt without READY only after scanout returns a successful
+/// terminal no-frame outcome. `settle_render_completion` emits these variants
+/// after its pre-GPU cancellation or post-GPU completion and protocol
+/// obligation settlement have succeeded; an `Err` carries no such proof.
+fn settle_render_worker_after_terminal_no_frame(
+    frame_pacing: &mut NativeFramePacing,
+    outcome: &crate::native_output::scanout::AtomicFrameRenderOutcome,
+) -> Result<(), &'static str> {
+    match outcome {
+        crate::native_output::scanout::AtomicFrameRenderOutcome::Skipped { .. }
+        | crate::native_output::scanout::AtomicFrameRenderOutcome::RetryPresentationState {
+            ..
+        }
+        | crate::native_output::scanout::AtomicFrameRenderOutcome::LifecycleFallback { .. } => {
+            frame_pacing.finish_render_worker_without_frame()
+        }
+        crate::native_output::scanout::AtomicFrameRenderOutcome::Rendered { .. }
+        | crate::native_output::scanout::AtomicFrameRenderOutcome::WorkerDispatched { .. } => {
+            Err("render worker outcome does not prove terminal no-frame ownership")
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ExpectedRenderWorkerFrame {
     output_epoch: crate::native_output::OutputEpochId,
+    output_id: oblivion_one::core::OutputId,
     frame_id: u64,
     transaction_id: crate::native_output::OutputTransactionId,
     protocol_batch_id: oblivion_one::compositor::CompositorFrameBatchId,
@@ -71,14 +95,17 @@ struct ExpectedRenderWorkerFrame {
     framebuffer_id: u32,
     render_generation: u64,
     pool_generation: u64,
+    reservation: crate::native_output::presentation::transaction::FramePresentationReservation,
 }
 
 impl ExpectedRenderWorkerFrame {
     fn from_context(
         context: &crate::native_output::scanout::AtomicRenderSettlementContext,
+        output_id: oblivion_one::core::OutputId,
     ) -> Self {
         Self {
             output_epoch: context.output_epoch,
+            output_id,
             frame_id: context.frame_id,
             transaction_id: context.transaction_id,
             protocol_batch_id: context.protocol_batch_id,
@@ -86,20 +113,34 @@ impl ExpectedRenderWorkerFrame {
             framebuffer_id: context.framebuffer_id,
             render_generation: context.render_generation,
             pool_generation: context.pool_generation,
+            reservation: context.prepare_intent.map_or(
+                context.reservation.frame_reservation(),
+                crate::native_output::presentation::transaction::FramePresentationReservation::DeferredO1,
+            ),
         }
+    }
+
+    fn identity_snapshot(
+        self,
+    ) -> Option<crate::native_output::scanout::OutputFrameIdentitySnapshot> {
+        Some(crate::native_output::scanout::OutputFrameIdentitySnapshot {
+            output_id: self.output_id,
+            frame_id: self.frame_id,
+            protocol_batch_id: self.protocol_batch_id,
+            transaction_id: self.transaction_id,
+            slot: self.slot,
+            framebuffer_id: oblivion_one::native::kms::FramebufferId::new(self.framebuffer_id)?,
+            render_generation: self.render_generation,
+            pool_generation: self.pool_generation,
+            reservation: self.reservation,
+        })
     }
 
     fn exactly_matches(
         self,
         identity: crate::native_output::scanout::OutputFrameIdentitySnapshot,
     ) -> bool {
-        self.frame_id == identity.frame_id
-            && self.transaction_id == identity.transaction_id
-            && self.protocol_batch_id == identity.protocol_batch_id
-            && self.slot == identity.slot
-            && identity.framebuffer_id.get() == self.framebuffer_id
-            && self.render_generation == identity.render_generation
-            && self.pool_generation == identity.pool_generation
+        self.identity_snapshot() == Some(identity)
     }
 
     fn may_own_same_physical_slot(
@@ -107,6 +148,8 @@ impl ExpectedRenderWorkerFrame {
         identity: crate::native_output::scanout::OutputFrameIdentitySnapshot,
     ) -> bool {
         self.slot == identity.slot
+            || self.framebuffer_id == identity.framebuffer_id.get()
+            || self.output_id != identity.output_id
             || self.frame_id == identity.frame_id
             || self.transaction_id == identity.transaction_id
             || self.protocol_batch_id == identity.protocol_batch_id
@@ -114,51 +157,109 @@ impl ExpectedRenderWorkerFrame {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RenderWorkerPhysicalOwnershipSnapshot {
+    output_id: oblivion_one::core::OutputId,
+    pool_generation: u64,
+    ready_identity: Option<crate::native_output::scanout::OutputFrameIdentitySnapshot>,
+    rendering_slot: Option<crate::native_output::scanout::OutputSlotId>,
+    quarantined_slot: Option<crate::native_output::scanout::OutputSlotId>,
+    suspended_expected_frame: bool,
+    has_suspended_ownership: bool,
+    worker_queued: Option<crate::native_output::scanout::QueuedOutputFrameIdentitySnapshot>,
+    kernel_submitted: Option<crate::native_output::scanout::QueuedOutputFrameIdentitySnapshot>,
+}
+
+impl RenderWorkerPhysicalOwnershipSnapshot {
+    fn from_swapchain(
+        expected: ExpectedRenderWorkerFrame,
+        swapchain: &crate::native_output::scanout::AtomicOutputSwapchain,
+    ) -> Self {
+        let expected_identity = expected.identity_snapshot();
+        Self {
+            output_id: swapchain.output_id(),
+            pool_generation: swapchain.pool_generation(),
+            ready_identity: swapchain.ready_identity(),
+            rendering_slot: swapchain.rendering_slot(),
+            quarantined_slot: swapchain.quarantine_slot_id(),
+            suspended_expected_frame: expected_identity
+                .is_some_and(|identity| swapchain.contains_suspended_frame(identity)),
+            has_suspended_ownership: swapchain.has_suspended_ownership(),
+            worker_queued: swapchain.worker_queued_identity(),
+            kernel_submitted: swapchain.pending_identity(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RenderWorkerSettlementFailureDisposition {
     PhysicalReadyRetained,
     PhysicalOwnershipUnsettled,
-    NoPhysicalFrame,
+    PhysicalOwnershipConflict,
+    OutputEpochMismatch,
+    SwapchainUnavailable,
+    OutputIdentityMismatch,
+    PoolGenerationMismatch,
+    NoTerminalRetirementProof,
 }
 
 /// Preserve a worker's real pacing owner if scanout crossed into READY before
-/// a later transaction-sidecar step failed. If the same slot is still
-/// Rendering or quarantined, or READY identity is ambiguous, retain the pin
-/// and fail closed. Only a settled no-frame outcome may release the pin and
-/// cancel the attempt.
+/// a later transaction-sidecar step failed. Failure to observe the expected
+/// frame in a particular swapchain role is not proof of terminalization: the
+/// frame may be suspended, queued, submitted, owned by another swapchain, or
+/// have outstanding GPU/protocol obligations. Error settlement may release
+/// this pin only through an independently proven terminal outcome.
 fn settle_render_worker_failure_ownership(
     pacing: &mut NativeFramePacing,
     expected: ExpectedRenderWorkerFrame,
     current_output_epoch: crate::native_output::OutputEpochId,
-    ready_identity: Option<crate::native_output::scanout::OutputFrameIdentitySnapshot>,
-    rendering_slot: Option<crate::native_output::scanout::OutputSlotId>,
-    quarantined_slot: Option<crate::native_output::scanout::OutputSlotId>,
+    ownership: Option<RenderWorkerPhysicalOwnershipSnapshot>,
     now_ns: u64,
 ) -> Result<RenderWorkerSettlementFailureDisposition, &'static str> {
     if expected.output_epoch != current_output_epoch {
-        return Ok(RenderWorkerSettlementFailureDisposition::PhysicalOwnershipUnsettled);
+        return Ok(RenderWorkerSettlementFailureDisposition::OutputEpochMismatch);
     }
-    if let Some(identity) = ready_identity {
-        if expected.exactly_matches(identity) {
-            pacing.bind_physical_output_frame(identity)?;
-            pacing.finish_render_worker_with_ready_frame(now_ns, false)?;
-            return Ok(RenderWorkerSettlementFailureDisposition::PhysicalReadyRetained);
-        }
-        if expected.may_own_same_physical_slot(identity) {
-            return Ok(RenderWorkerSettlementFailureDisposition::PhysicalOwnershipUnsettled);
-        }
+    let Some(ownership) = ownership else {
+        return Ok(RenderWorkerSettlementFailureDisposition::SwapchainUnavailable);
+    };
+    if ownership.output_id != expected.output_id {
+        return Ok(RenderWorkerSettlementFailureDisposition::OutputIdentityMismatch);
     }
-
-    if rendering_slot == Some(expected.slot) {
-        return Ok(RenderWorkerSettlementFailureDisposition::PhysicalOwnershipUnsettled);
-    }
-    if quarantined_slot == Some(expected.slot) {
-        return Ok(RenderWorkerSettlementFailureDisposition::PhysicalOwnershipUnsettled);
+    if ownership.pool_generation != expected.pool_generation {
+        return Ok(RenderWorkerSettlementFailureDisposition::PoolGenerationMismatch);
     }
 
-    pacing.finish_render_worker_without_frame()?;
-    pacing.note_predictive_o1_failed();
-    pacing.cancel_unsubmitted_render();
-    Ok(RenderWorkerSettlementFailureDisposition::NoPhysicalFrame)
+    let expected_is_still_owned = ownership.rendering_slot == Some(expected.slot)
+        || ownership.quarantined_slot == Some(expected.slot)
+        || ownership.suspended_expected_frame
+        || ownership
+            .worker_queued
+            .is_some_and(|queued| expected.may_own_same_physical_slot(queued.frame))
+        || ownership
+            .kernel_submitted
+            .is_some_and(|submitted| expected.may_own_same_physical_slot(submitted.frame));
+    let ready_identity = ownership.ready_identity;
+    let ready_matches = ready_identity.is_some_and(|identity| expected.exactly_matches(identity));
+    let ready_may_alias =
+        ready_identity.is_some_and(|identity| expected.may_own_same_physical_slot(identity));
+
+    if ready_matches && expected_is_still_owned {
+        return Ok(RenderWorkerSettlementFailureDisposition::PhysicalOwnershipConflict);
+    }
+    if expected_is_still_owned {
+        return Ok(RenderWorkerSettlementFailureDisposition::PhysicalOwnershipUnsettled);
+    }
+    if ready_may_alias && !ready_matches {
+        return Ok(RenderWorkerSettlementFailureDisposition::PhysicalOwnershipConflict);
+    }
+    if let Some(identity) = ready_identity.filter(|identity| expected.exactly_matches(*identity)) {
+        pacing.bind_physical_output_frame(identity)?;
+        pacing.finish_render_worker_with_ready_frame(now_ns, false)?;
+        return Ok(RenderWorkerSettlementFailureDisposition::PhysicalReadyRetained);
+    }
+    if ownership.has_suspended_ownership {
+        return Ok(RenderWorkerSettlementFailureDisposition::PhysicalOwnershipUnsettled);
+    }
+    Ok(RenderWorkerSettlementFailureDisposition::NoTerminalRetirementProof)
 }
 
 impl NativeRuntime {
@@ -355,7 +456,8 @@ impl NativeRuntime {
 
         let release_safety = context.dmabuf_gpu_release_safety;
         let release_lease_id = context.dmabuf_gpu_release_lease_id;
-        let expected_worker_frame = ExpectedRenderWorkerFrame::from_context(&context);
+        let expected_worker_frame =
+            ExpectedRenderWorkerFrame::from_context(&context, self.output_id);
         let outcome = self.scanout.settle_render_worker_completion(
             context,
             completion.frozen_frame,
@@ -368,18 +470,17 @@ impl NativeRuntime {
         let outcome = match outcome {
             Ok(outcome) => outcome,
             Err(error) => {
-                let swapchain = self.scanout.explicit_output_swapchain();
-                let ready_identity = swapchain.and_then(|swapchain| swapchain.ready_identity());
-                let rendering_slot = swapchain.and_then(|swapchain| swapchain.rendering_slot());
-                let quarantined_slot =
-                    swapchain.and_then(|swapchain| swapchain.quarantine_slot_id());
+                let ownership = self.scanout.explicit_output_swapchain().map(|swapchain| {
+                    RenderWorkerPhysicalOwnershipSnapshot::from_swapchain(
+                        expected_worker_frame,
+                        swapchain,
+                    )
+                });
                 let disposition = settle_render_worker_failure_ownership(
                     &mut self.frame_pacing,
                     expected_worker_frame,
                     self.output_epoch,
-                    ready_identity,
-                    rendering_slot,
-                    quarantined_slot,
+                    ownership,
                     monotonic_now_ns().map_err(|clock_error| {
                         io::Error::other(format!(
                             "render worker settlement failed ({error}); could not timestamp ownership preservation: {clock_error}"
@@ -392,19 +493,19 @@ impl NativeRuntime {
                     ))
                 })?;
                 return Err(Box::new(io::Error::other(format!(
-                    "render worker settlement failed ({error}); physical ownership disposition={disposition:?} current_output_epoch={} ready={ready_identity:?} rendering_slot={rendering_slot:?} quarantined_slot={quarantined_slot:?} expected={expected_worker_frame:?}",
+                    "render worker settlement failed ({error}); physical ownership disposition={disposition:?} current_output_epoch={} ownership={ownership:?} expected={expected_worker_frame:?}",
                     self.output_epoch.get(),
                 ))));
             }
         };
 
-        if !matches!(
+        if matches!(
             &outcome,
-            crate::native_output::scanout::AtomicFrameRenderOutcome::Rendered { .. }
-                | crate::native_output::scanout::AtomicFrameRenderOutcome::WorkerDispatched { .. }
+            crate::native_output::scanout::AtomicFrameRenderOutcome::Skipped { .. }
+                | crate::native_output::scanout::AtomicFrameRenderOutcome::RetryPresentationState { .. }
+                | crate::native_output::scanout::AtomicFrameRenderOutcome::LifecycleFallback { .. }
         ) {
-            self.frame_pacing
-                .finish_render_worker_without_frame()
+            settle_render_worker_after_terminal_no_frame(&mut self.frame_pacing, &outcome)
                 .map_err(io::Error::other)?;
         }
 
@@ -816,6 +917,7 @@ impl NativeRuntime {
 mod ownership_tests {
     use super::*;
     use crate::native_output::scanout::OutputFrameIdentitySnapshot;
+    use std::os::fd::{FromRawFd, OwnedFd};
 
     fn physical_identity(
         frame_id: u64,
@@ -843,6 +945,7 @@ mod ownership_tests {
     fn expected(identity: OutputFrameIdentitySnapshot) -> ExpectedRenderWorkerFrame {
         ExpectedRenderWorkerFrame {
             output_epoch: crate::native_output::OutputEpochId::initial(),
+            output_id: identity.output_id,
             frame_id: identity.frame_id,
             transaction_id: identity.transaction_id,
             protocol_batch_id: identity.protocol_batch_id,
@@ -850,7 +953,69 @@ mod ownership_tests {
             framebuffer_id: identity.framebuffer_id.get(),
             render_generation: identity.render_generation,
             pool_generation: identity.pool_generation,
+            reservation: identity.reservation,
         }
+    }
+
+    fn empty_ownership(
+        expected: ExpectedRenderWorkerFrame,
+    ) -> RenderWorkerPhysicalOwnershipSnapshot {
+        RenderWorkerPhysicalOwnershipSnapshot {
+            output_id: expected.output_id,
+            pool_generation: expected.pool_generation,
+            ready_identity: None,
+            rendering_slot: None,
+            quarantined_slot: None,
+            suspended_expected_frame: false,
+            has_suspended_ownership: false,
+            worker_queued: None,
+            kernel_submitted: None,
+        }
+    }
+
+    fn test_swapchain(
+        pool_generation: u64,
+    ) -> crate::native_output::scanout::AtomicOutputSwapchain {
+        let slots = crate::native_output::scanout::OutputSlotSet::new([
+            crate::native_output::scanout::OutputSlotId::new(0).unwrap(),
+            crate::native_output::scanout::OutputSlotId::new(1).unwrap(),
+            crate::native_output::scanout::OutputSlotId::new(2).unwrap(),
+        ])
+        .unwrap();
+        crate::native_output::scanout::AtomicOutputSwapchain::from_presented_slots_for_output(
+            oblivion_one::core::OutputId::from_raw(1).unwrap(),
+            slots,
+            crate::native_output::scanout::OutputSlotId::new(0).unwrap(),
+            pool_generation,
+        )
+        .unwrap()
+    }
+
+    fn test_render_fence() -> crate::egl_renderer::native_fence::NativeRenderFence {
+        let mut pipe = [-1; 2];
+        assert_eq!(
+            unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
+        unsafe { libc::close(pipe[1]) };
+        crate::egl_renderer::native_fence::NativeRenderFence::from_submission_fd(unsafe {
+            OwnedFd::from_raw_fd(pipe[0])
+        })
+    }
+
+    fn ready_swapchain(
+        pool_generation: u64,
+    ) -> (
+        crate::native_output::scanout::AtomicOutputSwapchain,
+        OutputFrameIdentitySnapshot,
+    ) {
+        let mut swapchain = test_swapchain(pool_generation);
+        let slot = swapchain.acquire_render_slot().unwrap();
+        swapchain
+            .finish_render(slot, 17, test_render_fence())
+            .unwrap();
+        let identity = swapchain.ready_identity().unwrap();
+        (swapchain, identity)
     }
 
     fn dispatched_pacing() -> NativeFramePacing {
@@ -869,16 +1034,16 @@ mod ownership_tests {
 
     #[test]
     fn settlement_error_after_physical_ready_preserves_its_pacing_owner() {
-        let identity = physical_identity(9, 1, 4);
+        let (swapchain, identity) = ready_swapchain(4);
         let mut pacing = dispatched_pacing();
+        let ownership =
+            RenderWorkerPhysicalOwnershipSnapshot::from_swapchain(expected(identity), &swapchain);
 
         let disposition = settle_render_worker_failure_ownership(
             &mut pacing,
             expected(identity),
             crate::native_output::OutputEpochId::initial(),
-            Some(identity),
-            None,
-            None,
+            Some(ownership),
             22,
         )
         .expect("exact READY identity should be adopted");
@@ -896,38 +1061,115 @@ mod ownership_tests {
         let expected_identity = physical_identity(9, 1, 4);
         let mismatched_generation = physical_identity(9, 1, 5);
         let mut pacing = dispatched_pacing();
+        let mut ownership = empty_ownership(expected(expected_identity));
+        ownership.ready_identity = Some(mismatched_generation);
 
         let disposition = settle_render_worker_failure_ownership(
             &mut pacing,
             expected(expected_identity),
             crate::native_output::OutputEpochId::initial(),
-            Some(mismatched_generation),
-            None,
-            None,
+            Some(ownership),
             22,
         )
         .expect("same physical slot with different generation must stay pinned");
 
         assert_eq!(
             disposition,
-            RenderWorkerSettlementFailureDisposition::PhysicalOwnershipUnsettled
+            RenderWorkerSettlementFailureDisposition::PhysicalOwnershipConflict
         );
         assert_eq!(pacing.unsubmitted_physical_identity(), None);
         assert!(pacing.has_unsettled_output_frame_ownership());
     }
 
     #[test]
+    fn ready_identity_mismatch_is_not_adopted() {
+        let (swapchain, identity) = ready_swapchain(4);
+        let mut wrong_output = identity;
+        wrong_output.output_id = oblivion_one::core::OutputId::from_raw(2).unwrap();
+        let mut wrong_frame = identity;
+        wrong_frame.frame_id += 1;
+        let mut wrong_transaction = identity;
+        wrong_transaction.transaction_id = crate::native_output::OutputTransactionId::new(
+            std::num::NonZeroU64::new(identity.transaction_id.get() + 1).unwrap(),
+        );
+        let mut wrong_batch = identity;
+        wrong_batch.protocol_batch_id = oblivion_one::compositor::CompositorFrameBatchId::new(
+            std::num::NonZeroU64::new(identity.protocol_batch_id.get() + 1).unwrap(),
+        );
+        let mut wrong_slot = identity;
+        wrong_slot.slot = crate::native_output::scanout::OutputSlotId::new(2).unwrap();
+        let mut wrong_framebuffer = identity;
+        wrong_framebuffer.framebuffer_id =
+            oblivion_one::native::kms::FramebufferId::new(43).unwrap();
+        let mut wrong_render_generation = identity;
+        wrong_render_generation.render_generation += 1;
+        let mut wrong_pool_generation = identity;
+        wrong_pool_generation.pool_generation += 1;
+        let mut wrong_reservation = identity;
+        let crate::native_output::presentation::transaction::FramePresentationReservation::Fixed(
+            target,
+        ) = identity.reservation
+        else {
+            panic!("test frame uses a fixed presentation reservation");
+        };
+        wrong_reservation.reservation =
+            crate::native_output::presentation::transaction::FramePresentationReservation::Fixed(
+                oblivion_one::native::presentation_deadline::PresentationTarget {
+                    sequence: target.sequence + 1,
+                    ..target
+                },
+            );
+
+        for (label, mismatched_ready) in [
+            ("output", wrong_output),
+            ("frame", wrong_frame),
+            ("transaction", wrong_transaction),
+            ("batch", wrong_batch),
+            ("slot", wrong_slot),
+            ("framebuffer", wrong_framebuffer),
+            ("render generation", wrong_render_generation),
+            ("pool generation", wrong_pool_generation),
+            ("reservation", wrong_reservation),
+        ] {
+            let expected = expected(identity);
+            assert!(!expected.exactly_matches(mismatched_ready), "{label}");
+            let mut ownership =
+                RenderWorkerPhysicalOwnershipSnapshot::from_swapchain(expected, &swapchain);
+            ownership.ready_identity = Some(mismatched_ready);
+            let mut pacing = dispatched_pacing();
+            let owner = pacing.active;
+
+            let disposition = settle_render_worker_failure_ownership(
+                &mut pacing,
+                expected,
+                crate::native_output::OutputEpochId::initial(),
+                Some(ownership),
+                22,
+            )
+            .expect("mismatched READY identity must be retained as a conflict");
+
+            assert_eq!(
+                disposition,
+                RenderWorkerSettlementFailureDisposition::PhysicalOwnershipConflict,
+                "{label}"
+            );
+            assert_eq!(pacing.active, owner, "{label}");
+            assert!(pacing.has_unsettled_output_frame_ownership(), "{label}");
+        }
+    }
+
+    #[test]
     fn settlement_error_with_slot_still_rendering_keeps_owner_pinned() {
         let identity = physical_identity(9, 1, 4);
         let mut pacing = dispatched_pacing();
+        let mut ownership = empty_ownership(expected(identity));
+        ownership.rendering_slot = Some(identity.slot);
 
         let disposition = settle_render_worker_failure_ownership(
             &mut pacing,
             expected(identity),
             crate::native_output::OutputEpochId::initial(),
-            None,
-            Some(identity.slot),
-            None,
+            Some(ownership),
             22,
         )
         .expect("a still-rendering slot remains owned until fatal recovery");
@@ -941,47 +1183,84 @@ mod ownership_tests {
     }
 
     #[test]
-    fn no_frame_settlement_error_releases_only_its_worker_owner() {
+    fn absent_swapchain_observations_do_not_prove_safe_frame_retirement() {
         let identity = physical_identity(9, 1, 4);
         let mut pacing = dispatched_pacing();
+        let ownership = empty_ownership(expected(identity));
 
         let disposition = settle_render_worker_failure_ownership(
             &mut pacing,
             expected(identity),
             crate::native_output::OutputEpochId::initial(),
-            None,
-            None,
-            None,
+            Some(ownership),
             22,
         )
-        .expect("no-frame result can terminalize the attempt");
+        .expect("an empty role snapshot is not terminalization evidence");
 
         assert_eq!(
             disposition,
-            RenderWorkerSettlementFailureDisposition::NoPhysicalFrame
+            RenderWorkerSettlementFailureDisposition::NoTerminalRetirementProof
         );
-        assert!(!pacing.has_unsettled_output_frame_ownership());
+        assert_eq!(pacing.unsubmitted_physical_identity(), None);
+        assert!(pacing.has_unsettled_output_frame_ownership());
+    }
+
+    #[test]
+    fn missing_or_replaced_swapchain_cannot_release_the_worker_owner() {
+        let identity = physical_identity(9, 1, 4);
+        let expected = expected(identity);
+        let mut pacing = dispatched_pacing();
+        let owner = pacing.active;
+
+        assert_eq!(
+            settle_render_worker_failure_ownership(
+                &mut pacing,
+                expected,
+                crate::native_output::OutputEpochId::initial(),
+                None,
+                22,
+            )
+            .unwrap(),
+            RenderWorkerSettlementFailureDisposition::SwapchainUnavailable
+        );
+
+        let mut replaced_pool = empty_ownership(expected);
+        replaced_pool.pool_generation += 1;
+        assert_eq!(
+            settle_render_worker_failure_ownership(
+                &mut pacing,
+                expected,
+                crate::native_output::OutputEpochId::initial(),
+                Some(replaced_pool),
+                22,
+            )
+            .unwrap(),
+            RenderWorkerSettlementFailureDisposition::PoolGenerationMismatch
+        );
+        pacing.cancel_unsubmitted_render();
+        assert_eq!(pacing.active, owner);
+        assert!(pacing.has_unsettled_output_frame_ownership());
     }
 
     #[test]
     fn settlement_error_from_old_output_epoch_cannot_adopt_a_new_epoch_frame() {
         let identity = physical_identity(9, 1, 4);
         let mut pacing = dispatched_pacing();
+        let mut ownership = empty_ownership(expected(identity));
+        ownership.ready_identity = Some(identity);
 
         let disposition = settle_render_worker_failure_ownership(
             &mut pacing,
             expected(identity),
             crate::native_output::OutputEpochId::initial().next(),
-            Some(identity),
-            None,
-            None,
+            Some(ownership),
             22,
         )
         .expect("output epoch mismatch is retained as unsettled ownership");
 
         assert_eq!(
             disposition,
-            RenderWorkerSettlementFailureDisposition::PhysicalOwnershipUnsettled
+            RenderWorkerSettlementFailureDisposition::OutputEpochMismatch
         );
         assert_eq!(pacing.unsubmitted_physical_identity(), None);
         assert!(pacing.has_unsettled_output_frame_ownership());
@@ -989,16 +1268,26 @@ mod ownership_tests {
 
     #[test]
     fn settlement_error_with_slot_quarantined_keeps_owner_pinned() {
-        let identity = physical_identity(9, 1, 4);
+        let mut swapchain = test_swapchain(4);
+        let slot = swapchain.acquire_render_slot().unwrap();
+        let quarantine_fence = test_render_fence().take_timing_fd();
+        swapchain
+            .quarantine_rendering(
+                quarantine_fence,
+                crate::native_output::scanout::OutputQuarantineReason::PostDrawRenderFailure,
+            )
+            .unwrap();
+        let identity = physical_identity(9, slot.get(), 4);
         let mut pacing = dispatched_pacing();
+        let ownership =
+            RenderWorkerPhysicalOwnershipSnapshot::from_swapchain(expected(identity), &swapchain);
+        assert_eq!(ownership.quarantined_slot, Some(slot));
 
         let disposition = settle_render_worker_failure_ownership(
             &mut pacing,
             expected(identity),
             crate::native_output::OutputEpochId::initial(),
-            None,
-            None,
-            Some(identity.slot),
+            Some(ownership),
             22,
         )
         .expect("a quarantined slot remains owned until fatal recovery");
@@ -1009,6 +1298,182 @@ mod ownership_tests {
         );
         assert_eq!(pacing.unsubmitted_physical_identity(), None);
         assert!(pacing.has_unsettled_output_frame_ownership());
+    }
+
+    #[test]
+    fn suspended_worker_queued_and_kernel_submitted_frames_stay_owned() {
+        let current_epoch = crate::native_output::OutputEpochId::initial();
+        let token = oblivion_one::native::kms::PageFlipToken::new(77).unwrap();
+
+        let (mut suspended_swapchain, suspended_identity) = ready_swapchain(4);
+        suspended_swapchain.suspend_abandon_ready().unwrap();
+        let suspended_expected = expected(suspended_identity);
+        let suspended = RenderWorkerPhysicalOwnershipSnapshot::from_swapchain(
+            suspended_expected,
+            &suspended_swapchain,
+        );
+
+        let (mut worker_swapchain, worker_identity) = ready_swapchain(4);
+        worker_swapchain
+            .take_ready_for_worker(token, crate::native_output::MonotonicTimestampNs::new(1))
+            .unwrap();
+        let worker_expected = expected(worker_identity);
+        let worker_queued = RenderWorkerPhysicalOwnershipSnapshot::from_swapchain(
+            worker_expected,
+            &worker_swapchain,
+        );
+
+        let (mut submitted_swapchain, submitted_identity) = ready_swapchain(4);
+        submitted_swapchain
+            .take_ready_for_worker(token, crate::native_output::MonotonicTimestampNs::new(1))
+            .unwrap();
+        submitted_swapchain
+            .promote_worker_queued(
+                token,
+                None,
+                crate::native_output::MonotonicTimestampNs::new(2),
+                crate::native_output::MonotonicTimestampNs::new(3),
+            )
+            .unwrap();
+        let submitted_expected = expected(submitted_identity);
+        let submitted = RenderWorkerPhysicalOwnershipSnapshot::from_swapchain(
+            submitted_expected,
+            &submitted_swapchain,
+        );
+
+        for (expected, ownership) in [
+            (suspended_expected, suspended),
+            (worker_expected, worker_queued),
+            (submitted_expected, submitted),
+        ] {
+            let mut pacing = dispatched_pacing();
+            let owner = pacing.active;
+            assert_eq!(
+                settle_render_worker_failure_ownership(
+                    &mut pacing,
+                    expected,
+                    current_epoch,
+                    Some(ownership),
+                    22,
+                )
+                .unwrap(),
+                RenderWorkerSettlementFailureDisposition::PhysicalOwnershipUnsettled
+            );
+            pacing.cancel_unsubmitted_render();
+            assert_eq!(pacing.active, owner);
+            assert!(pacing.has_unsettled_output_frame_ownership());
+        }
+    }
+
+    #[test]
+    fn successful_terminal_no_frame_outcome_releases_only_after_slot_cancellation() {
+        let identity = physical_identity(1, 1, 4);
+        let slots = crate::native_output::scanout::OutputSlotSet::new([
+            crate::native_output::scanout::OutputSlotId::new(0).unwrap(),
+            identity.slot,
+            crate::native_output::scanout::OutputSlotId::new(2).unwrap(),
+        ])
+        .unwrap();
+        let mut swapchain =
+            crate::native_output::scanout::AtomicOutputSwapchain::from_presented_slots(
+                slots,
+                crate::native_output::scanout::OutputSlotId::new(0).unwrap(),
+                identity.pool_generation,
+            )
+            .unwrap();
+        let rendering_slot = swapchain.acquire_render_slot().unwrap();
+        assert_eq!(rendering_slot, identity.slot);
+
+        let worker_expected = expected(identity);
+        let mut pacing = dispatched_pacing();
+        let owner = pacing.active;
+        let rendering =
+            RenderWorkerPhysicalOwnershipSnapshot::from_swapchain(worker_expected, &swapchain);
+        assert_eq!(rendering.rendering_slot, Some(identity.slot));
+        assert_eq!(
+            settle_render_worker_failure_ownership(
+                &mut pacing,
+                worker_expected,
+                crate::native_output::OutputEpochId::initial(),
+                Some(rendering),
+                22,
+            )
+            .unwrap(),
+            RenderWorkerSettlementFailureDisposition::PhysicalOwnershipUnsettled
+        );
+        pacing.cancel_unsubmitted_render();
+        assert_eq!(pacing.active, owner);
+
+        swapchain.cancel_render_before_gpu(rendering_slot).unwrap();
+        assert_eq!(swapchain.rendering_slot(), None);
+
+        let outcome =
+            crate::native_output::scanout::AtomicFrameRenderOutcome::RetryPresentationState {
+                render_us: 0,
+            };
+        settle_render_worker_after_terminal_no_frame(&mut pacing, &outcome)
+            .expect("successful scanout settlement is explicit no-frame evidence");
+        assert_eq!(pacing.active, owner);
+        pacing.cancel_unsubmitted_render();
+        assert!(!pacing.has_unsettled_output_frame_ownership());
+
+        // Reconfiguration is now allowed to move the lifecycle to a new
+        // output epoch and pool. A subsequent worker frame must be able to
+        // complete the full READY -> worker -> pending -> pageflip path.
+        let next_epoch = crate::native_output::OutputEpochId::initial().next();
+        pacing.rebase_after_output_epoch();
+        let mut next_swapchain = test_swapchain(5);
+        pacing.queue_visual(30, 18);
+        pacing
+            .note_render_started(NativeOutputPacingMode::ReactiveDouble, false)
+            .unwrap();
+        pacing.mark_render_worker_dispatched().unwrap();
+        let next_slot = next_swapchain.acquire_render_slot().unwrap();
+        next_swapchain
+            .finish_render(next_slot, 18, test_render_fence())
+            .unwrap();
+        let next_identity = next_swapchain.ready_identity().unwrap();
+        let mut next_expected = expected(next_identity);
+        next_expected.output_epoch = next_epoch;
+        let next_ownership =
+            RenderWorkerPhysicalOwnershipSnapshot::from_swapchain(next_expected, &next_swapchain);
+        assert_eq!(
+            settle_render_worker_failure_ownership(
+                &mut pacing,
+                next_expected,
+                next_epoch,
+                Some(next_ownership),
+                31,
+            )
+            .unwrap(),
+            RenderWorkerSettlementFailureDisposition::PhysicalReadyRetained
+        );
+        assert!(pacing.has_unsettled_output_frame_ownership());
+
+        let token = oblivion_one::native::kms::PageFlipToken::new(78).unwrap();
+        let (_submission_fence, _) = next_swapchain
+            .take_ready_for_worker(token, crate::native_output::MonotonicTimestampNs::new(32))
+            .unwrap();
+        next_swapchain
+            .promote_worker_queued(
+                token,
+                None,
+                crate::native_output::MonotonicTimestampNs::new(33),
+                crate::native_output::MonotonicTimestampNs::new(34),
+            )
+            .unwrap();
+        pacing.note_submit(
+            token.get(),
+            34,
+            true,
+            NativeOutputPacingMode::ReactiveDouble,
+        );
+        let completed = next_swapchain.complete_pageflip(token, 5).unwrap();
+        let completed_identity = OutputFrameIdentitySnapshot::from(&completed.frame);
+        assert_eq!(completed_identity, next_identity);
+        pacing.note_pageflip_exact(Some(completed_identity), 35, 34, token.get(), 16_666);
+        assert!(!pacing.has_unsettled_output_frame_ownership());
+        assert_eq!(next_swapchain.current(), next_slot);
     }
 }
 
