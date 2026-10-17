@@ -7110,7 +7110,7 @@ mod tests {
     }
 
     #[test]
-    fn full_repair_keeps_all_visible_effects_live() {
+    fn explicit_caller_conservative_demand_keeps_all_visible_effects_live() {
         let (scene, registry) = separated_blur_scene();
         let FrameExecutionPlan::EffectGraph(graph) = compile_frame_execution_plan(
             &scene,

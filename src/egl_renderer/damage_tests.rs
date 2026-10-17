@@ -422,8 +422,8 @@ fn compiled_blur_graph(
     regions: &[oblivion_one::effects::EffectRect],
 ) -> oblivion_one::effects::CompiledFrameGraph {
     use oblivion_one::compositor::{
-        EffectAnchor, EffectAnchorScope, EffectSceneOrder, ResolvedEffectInstance,
-        ResolvedEffectScene,
+        EffectAnchor, EffectAnchorScope, EffectBackdropReuse, EffectSceneOrder,
+        ResolvedEffectInstance, ResolvedEffectScene,
     };
     use oblivion_one::effects::{
         DualKawaseBlurSpec, EffectAlphaMode, EffectFailurePolicy, EffectFrameDemand, EffectNode,
@@ -470,7 +470,7 @@ fn compiled_blur_graph(
                 frame_demand: EffectFrameDemand::OnDamage,
                 visual_group: None,
                 anchor_scope: EffectAnchorScope::VisualGroup,
-                backdrop_reuse: crate::compositor::EffectBackdropReuse::Exact,
+                backdrop_reuse: EffectBackdropReuse::Exact,
                 scene_order: EffectSceneOrder::for_anchor(EffectAnchor::BeforeSurface(surface)),
             }
         })
