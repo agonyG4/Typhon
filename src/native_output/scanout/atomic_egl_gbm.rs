@@ -11,6 +11,9 @@ use oblivion_one::compositor::{
     DmabufKmsPreferredState, DrmContentType, FrameBatchDiscardReason, OwnCompositorServer,
     SurfaceDamagePresentation, SurfacePipelineEvent,
 };
+use oblivion_one::native::adaptive_buffering::{
+    DeferredO1BindingOrigin, DeferredO1BindingTimingEvidence,
+};
 use oblivion_one::native::buffering::O1AdmissionObservation;
 use oblivion_one::native::buffering::PresentationOpportunity;
 use oblivion_one::native::kms::{AtomicDiscovery, DrmFormatModifierPair, FramebufferId};
@@ -3304,6 +3307,7 @@ impl AtomicEglGbmScanout {
             protocol_batch_id,
             composite_started_at,
             rendered_at,
+            deferred_o1_binding_timing: None,
             client_commit_ns: callback_timing.map(|timing| timing.commit_ns),
             callback_reaction_ns: callback_timing.and_then(|timing| timing.reaction_ns),
             callback_admission_ns: callback_timing.and_then(|timing| timing.admission_ns),
@@ -3418,6 +3422,7 @@ impl AtomicEglGbmScanout {
             protocol_batch_id,
             composite_started_at,
             rendered_at,
+            deferred_o1_binding_timing,
             client_commit_ns,
             callback_reaction_ns,
             callback_admission_ns,
@@ -3475,6 +3480,7 @@ impl AtomicEglGbmScanout {
                 presentation_timing,
                 composite_started_at,
                 rendered_at,
+                deferred_o1_binding_timing,
                 worker_queued_at: completed.worker_queued_at,
                 submit_started_at: completed.submit_started_at,
                 submit_returned_at: completed.submit_returned_at,
@@ -3513,6 +3519,8 @@ impl AtomicEglGbmScanout {
             None,
             output_generation,
             bind_at,
+            DeferredO1BindingOrigin::RenderCompletion,
+            bind_at,
         )
     }
 
@@ -3523,6 +3531,7 @@ impl AtomicEglGbmScanout {
         frame_scheduler: &mut oblivion_one::native::scheduler::NativeFrameScheduler,
         output_generation: u64,
         bind_at: MonotonicTimestampNs,
+        authority_observed_at: MonotonicTimestampNs,
     ) -> io::Result<DeferredO1BindingResult> {
         let swapchain = self.swapchain_mut()?;
         Self::bind_ready_deferred_o1_on_swapchain(
@@ -3532,6 +3541,8 @@ impl AtomicEglGbmScanout {
             frame_scheduler,
             output_generation,
             bind_at,
+            DeferredO1BindingOrigin::PredecessorPageflip,
+            authority_observed_at,
         )
     }
 
@@ -3542,6 +3553,8 @@ impl AtomicEglGbmScanout {
         frame_scheduler: &mut oblivion_one::native::scheduler::NativeFrameScheduler,
         output_generation: u64,
         bind_at: MonotonicTimestampNs,
+        origin: DeferredO1BindingOrigin,
+        authority_observed_at: MonotonicTimestampNs,
     ) -> io::Result<DeferredO1BindingResult> {
         Self::bind_ready_deferred_o1_on_swapchain_internal(
             swapchain,
@@ -3550,6 +3563,8 @@ impl AtomicEglGbmScanout {
             Some(frame_scheduler),
             output_generation,
             bind_at,
+            origin,
+            authority_observed_at,
         )
     }
 
@@ -3560,6 +3575,8 @@ impl AtomicEglGbmScanout {
         mut frame_scheduler: Option<&mut oblivion_one::native::scheduler::NativeFrameScheduler>,
         output_generation: u64,
         bind_at: MonotonicTimestampNs,
+        origin: DeferredO1BindingOrigin,
+        authority_observed_at: MonotonicTimestampNs,
     ) -> io::Result<DeferredO1BindingResult> {
         let readiness = swapchain.deferred_o1_binding_readiness(output_generation);
         match readiness {
@@ -3636,6 +3653,19 @@ impl AtomicEglGbmScanout {
         {
             frame_scheduler.commit_ready_target_metadata_rebase(scheduler_binding);
         }
+        let bound_committed_at = monotonic_now_ns().ok().map(MonotonicTimestampNs::new);
+        let timing_evidence_attached = swapchain.record_deferred_o1_binding_timing_evidence(
+            before,
+            DeferredO1BindingTimingEvidence {
+                origin,
+                authority_observed_at,
+                bound_committed_at,
+            },
+        );
+        debug_assert!(
+            timing_evidence_attached,
+            "deferred O1 timing evidence failed to attach after binding committed"
+        );
         Ok(DeferredO1BindingResult::Bound { advanced_intervals })
     }
 
@@ -3960,6 +3990,7 @@ pub(crate) struct PresentedOutputFrame {
     pub(crate) presentation_timing: KmsPresentationTiming,
     pub(crate) composite_started_at: MonotonicTimestampNs,
     pub(crate) rendered_at: MonotonicTimestampNs,
+    pub(crate) deferred_o1_binding_timing: Option<DeferredO1BindingTimingEvidence>,
     pub(crate) worker_queued_at: Option<MonotonicTimestampNs>,
     pub(crate) submit_started_at: MonotonicTimestampNs,
     pub(crate) submit_returned_at: MonotonicTimestampNs,

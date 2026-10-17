@@ -201,6 +201,21 @@ pub enum FenceTimestampQuality {
     ObservedApproximate,
 }
 
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeferredO1BindingOrigin {
+    RenderCompletion,
+    PredecessorPageflip,
+}
+
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeferredO1BindingTimingEvidence {
+    pub origin: DeferredO1BindingOrigin,
+    pub authority_observed_at: MonotonicTimestampNs,
+    pub bound_committed_at: Option<MonotonicTimestampNs>,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct FrameTimingObservation {
     pub frame_id: u64,
@@ -400,6 +415,14 @@ struct ExactParallelRiskJournal {
     fence_after_rendered_observed: DiagnosticSampleHistory,
     rendered_observed_after_fence: DiagnosticSampleHistory,
     decomposition_invalid_samples: u64,
+    deferred_ready_to_authority_observed: DiagnosticSampleHistory,
+    deferred_authority_to_bind_committed: DiagnosticSampleHistory,
+    deferred_bind_committed_to_worker_queue: DiagnosticSampleHistory,
+    deferred_o1_decomposition_samples: u64,
+    deferred_o1_predecessor_pageflip_bind_samples: u64,
+    deferred_o1_render_completion_bind_samples: u64,
+    deferred_o1_decomposition_invalid_samples: u64,
+    deferred_o1_binding_timestamp_unavailable_samples: u64,
 }
 
 impl ExactParallelRiskJournal {
@@ -462,6 +485,76 @@ impl ExactParallelRiskJournal {
         }
     }
 
+    fn record_deferred_o1_decomposition(
+        &mut self,
+        observation: &FrameTimingObservation,
+        rendered_observed_at: Option<MonotonicTimestampNs>,
+        evidence: Option<DeferredO1BindingTimingEvidence>,
+    ) {
+        let Some(evidence) = evidence else {
+            return;
+        };
+        let Some(rendered_observed_at) = rendered_observed_at else {
+            return;
+        };
+        let Some(worker_queued_at) = observation.worker_queued_at else {
+            return;
+        };
+
+        match evidence.origin {
+            DeferredO1BindingOrigin::PredecessorPageflip => {
+                self.deferred_o1_predecessor_pageflip_bind_samples = self
+                    .deferred_o1_predecessor_pageflip_bind_samples
+                    .saturating_add(1);
+            }
+            DeferredO1BindingOrigin::RenderCompletion => {
+                self.deferred_o1_render_completion_bind_samples = self
+                    .deferred_o1_render_completion_bind_samples
+                    .saturating_add(1);
+            }
+        }
+
+        let Some(bound_committed_at) = evidence.bound_committed_at else {
+            self.deferred_o1_binding_timestamp_unavailable_samples = self
+                .deferred_o1_binding_timestamp_unavailable_samples
+                .saturating_add(1);
+            return;
+        };
+
+        let rendered_ns = rendered_observed_at.get();
+        let authority_ns = evidence.authority_observed_at.get();
+        let bound_ns = bound_committed_at.get();
+        let worker_queued_ns = worker_queued_at.get();
+        if rendered_ns > authority_ns || authority_ns > bound_ns || bound_ns > worker_queued_ns {
+            self.deferred_o1_decomposition_invalid_samples = self
+                .deferred_o1_decomposition_invalid_samples
+                .saturating_add(1);
+            return;
+        }
+
+        let h_total = worker_queued_ns - rendered_ns;
+        let h_wait = authority_ns - rendered_ns;
+        let h_bind = bound_ns - authority_ns;
+        let h_admission = worker_queued_ns - bound_ns;
+        if h_wait
+            .checked_add(h_bind)
+            .and_then(|sum| sum.checked_add(h_admission))
+            != Some(h_total)
+        {
+            self.deferred_o1_decomposition_invalid_samples = self
+                .deferred_o1_decomposition_invalid_samples
+                .saturating_add(1);
+            return;
+        }
+
+        self.deferred_ready_to_authority_observed.record(h_wait);
+        self.deferred_authority_to_bind_committed.record(h_bind);
+        self.deferred_bind_committed_to_worker_queue
+            .record(h_admission);
+        self.deferred_o1_decomposition_samples =
+            self.deferred_o1_decomposition_samples.saturating_add(1);
+    }
+
     fn diagnostics(&self, refresh_interval_ns: u64) -> ExactParallelDiagnostics {
         let mut queue_before_fence_samples = 0;
         let mut fence_before_queue_samples = 0;
@@ -498,6 +591,24 @@ impl ExactParallelRiskJournal {
             fence_before_queue_samples,
             equal_samples,
             decomposition_invalid_samples: self.decomposition_invalid_samples,
+            deferred_ready_to_authority_observed: self
+                .deferred_ready_to_authority_observed
+                .diagnostics(refresh_interval_ns),
+            deferred_authority_to_bind_committed: self
+                .deferred_authority_to_bind_committed
+                .diagnostics(refresh_interval_ns),
+            deferred_bind_committed_to_worker_queue: self
+                .deferred_bind_committed_to_worker_queue
+                .diagnostics(refresh_interval_ns),
+            deferred_o1_decomposition_samples: self.deferred_o1_decomposition_samples,
+            deferred_o1_predecessor_pageflip_bind_samples: self
+                .deferred_o1_predecessor_pageflip_bind_samples,
+            deferred_o1_render_completion_bind_samples: self
+                .deferred_o1_render_completion_bind_samples,
+            deferred_o1_decomposition_invalid_samples: self
+                .deferred_o1_decomposition_invalid_samples,
+            deferred_o1_binding_timestamp_unavailable_samples: self
+                .deferred_o1_binding_timestamp_unavailable_samples,
         }
     }
 }
@@ -678,16 +789,36 @@ impl AdaptiveRenderJournal {
         observation: FrameTimingObservation,
         rendered_observed_at: Option<MonotonicTimestampNs>,
     ) -> Option<(u64, u64)> {
-        let (render_ready_ns, queue_ready_ns) = exact_parallel_branch_samples_ns(&observation)?;
-        self.exact_parallel.record(
-            render_ready_ns,
-            queue_ready_ns,
-            observation.composite_started_at,
+        self.record_frame_service_observation_with_deferred_timing(
+            observation,
+            rendered_observed_at,
+            None,
+        )
+    }
+
+    pub fn record_frame_service_observation_with_deferred_timing(
+        &mut self,
+        observation: FrameTimingObservation,
+        rendered_observed_at: Option<MonotonicTimestampNs>,
+        deferred_o1_binding_timing: Option<DeferredO1BindingTimingEvidence>,
+    ) -> Option<(u64, u64)> {
+        let exact_branch_samples = exact_parallel_branch_samples_ns(&observation);
+        if let Some((render_ready_ns, queue_ready_ns)) = exact_branch_samples {
+            self.exact_parallel.record(
+                render_ready_ns,
+                queue_ready_ns,
+                observation.composite_started_at,
+            );
+            self.exact_parallel
+                .record_decomposition(&observation, rendered_observed_at);
+            self.miss_recovery_remaining = self.miss_recovery_remaining.saturating_sub(1);
+        }
+        self.exact_parallel.record_deferred_o1_decomposition(
+            &observation,
+            rendered_observed_at,
+            deferred_o1_binding_timing,
         );
-        self.exact_parallel
-            .record_decomposition(&observation, rendered_observed_at);
-        self.miss_recovery_remaining = self.miss_recovery_remaining.saturating_sub(1);
-        Some((render_ready_ns, queue_ready_ns))
+        exact_branch_samples
     }
 
     /// Computes raw exact-branch distributions only for explicit performance
@@ -2613,6 +2744,25 @@ mod exact_parallel_diagnostics_tests {
         );
     }
 
+    fn rendered_deferred(
+        journal: &mut AdaptiveRenderJournal,
+        observation: FrameTimingObservation,
+        rendered_at: u64,
+        origin: DeferredO1BindingOrigin,
+        authority_observed_at: u64,
+        bound_committed_at: Option<u64>,
+    ) {
+        journal.record_frame_service_observation_with_deferred_timing(
+            observation,
+            Some(MonotonicTimestampNs::new(rendered_at)),
+            Some(DeferredO1BindingTimingEvidence {
+                origin,
+                authority_observed_at: MonotonicTimestampNs::new(authority_observed_at),
+                bound_committed_at: bound_committed_at.map(MonotonicTimestampNs::new),
+            }),
+        );
+    }
+
     #[test]
     fn raw_branch_window_exposes_a_rare_spike_and_selected_source() {
         let mut journal = AdaptiveRenderJournal::default();
@@ -2821,6 +2971,295 @@ mod exact_parallel_diagnostics_tests {
         assert_eq!(diagnostics.fence_before_queue_samples, 0);
         assert_eq!(diagnostics.equal_samples, 0);
         assert_eq!(diagnostics.decomposition_invalid_samples, 0);
+    }
+
+    #[test]
+    fn deferred_o1_components_are_an_exact_per_sample_h_decomposition() {
+        let mut journal = AdaptiveRenderJournal::default();
+        let observation = observation(1_000_000, 4_000_000, 5_300_000);
+        rendered_deferred(
+            &mut journal,
+            observation,
+            3_000_000,
+            DeferredO1BindingOrigin::PredecessorPageflip,
+            5_000_000,
+            Some(5_100_000),
+        );
+        let mut control = AdaptiveRenderJournal::default();
+        control.record_frame_service_observation(observation);
+        let prediction = journal.prediction(Duration::from_millis(10));
+        let control_prediction = control.prediction(Duration::from_millis(10));
+        assert_eq!(
+            prediction.exact_render_ready_risk_ns,
+            control_prediction.exact_render_ready_risk_ns
+        );
+        assert_eq!(
+            prediction.exact_queue_ready_risk_ns,
+            control_prediction.exact_queue_ready_risk_ns
+        );
+        assert_eq!(
+            prediction.parallel_service_ns,
+            control_prediction.parallel_service_ns
+        );
+        assert_eq!(
+            prediction.warm_parallel_total_cost_ns,
+            control_prediction.warm_parallel_total_cost_ns
+        );
+        assert_eq!(prediction.total_cost_ns, control_prediction.total_cost_ns);
+        assert_eq!(prediction.estimator_mode, control_prediction.estimator_mode);
+
+        let diagnostics = journal.exact_parallel_diagnostics(REFRESH_NS);
+        let h_total = diagnostics.post_render_handoff.latest_ns;
+        let h_wait = diagnostics.deferred_ready_to_authority_observed.latest_ns;
+        let h_bind = diagnostics.deferred_authority_to_bind_committed.latest_ns;
+        let h_admission = diagnostics
+            .deferred_bind_committed_to_worker_queue
+            .latest_ns;
+        assert_eq!(h_total, 2_300_000);
+        assert_eq!((h_wait, h_bind, h_admission), (2_000_000, 100_000, 200_000));
+        assert_eq!(h_wait + h_bind + h_admission, h_total);
+        assert_eq!(diagnostics.deferred_o1_decomposition_samples, 1);
+        assert_eq!(diagnostics.deferred_o1_predecessor_pageflip_bind_samples, 1);
+        assert_eq!(diagnostics.deferred_o1_render_completion_bind_samples, 0);
+        assert_eq!(diagnostics.deferred_o1_decomposition_invalid_samples, 0);
+    }
+
+    #[test]
+    fn deferred_o1_render_completion_authority_has_zero_ready_wait() {
+        let mut journal = AdaptiveRenderJournal::default();
+        rendered_deferred(
+            &mut journal,
+            observation(1_000_000, 4_000_000, 3_300_000),
+            3_000_000,
+            DeferredO1BindingOrigin::RenderCompletion,
+            3_000_000,
+            Some(3_100_000),
+        );
+
+        let diagnostics = journal.exact_parallel_diagnostics(REFRESH_NS);
+        assert_eq!(diagnostics.deferred_ready_to_authority_observed.count, 1);
+        assert_eq!(
+            diagnostics.deferred_ready_to_authority_observed.latest_ns,
+            0
+        );
+        assert_eq!(
+            diagnostics.deferred_authority_to_bind_committed.latest_ns,
+            100_000
+        );
+        assert_eq!(
+            diagnostics
+                .deferred_bind_committed_to_worker_queue
+                .latest_ns,
+            200_000
+        );
+        assert_eq!(diagnostics.deferred_o1_render_completion_bind_samples, 1);
+        assert_eq!(diagnostics.deferred_o1_decomposition_invalid_samples, 0);
+    }
+
+    #[test]
+    fn deferred_o1_evidence_does_not_change_warm_parallel_prediction() {
+        let mut journal = AdaptiveRenderJournal::default();
+        let mut control = AdaptiveRenderJournal::default();
+        for sample in 0..WARM_PARALLEL_MIN_SAMPLES {
+            let composite = 100_000_000 + sample as u64 * 50_000_000;
+            let observation = observation(composite, composite + 3_000_000, composite + 4_000_000);
+            let rendered_at = composite + 1_000_000;
+            rendered_deferred(
+                &mut journal,
+                observation,
+                rendered_at,
+                DeferredO1BindingOrigin::PredecessorPageflip,
+                rendered_at + 1_000_000,
+                Some(rendered_at + 1_100_000),
+            );
+            control.record_frame_service_observation(observation);
+            journal.record_fixed_submission_budget(500_000);
+            control.record_fixed_submission_budget(500_000);
+        }
+
+        let prediction = journal.prediction(Duration::from_nanos(REFRESH_NS));
+        let control_prediction = control.prediction(Duration::from_nanos(REFRESH_NS));
+        assert_eq!(
+            prediction.estimator_mode,
+            PredictionEstimatorMode::WarmParallel
+        );
+        assert_eq!(prediction, control_prediction);
+        assert_eq!(
+            prediction.exact_render_ready_risk_ns,
+            control_prediction.exact_render_ready_risk_ns
+        );
+        assert_eq!(
+            prediction.exact_queue_ready_risk_ns,
+            control_prediction.exact_queue_ready_risk_ns
+        );
+        assert_eq!(
+            prediction.parallel_service_ns,
+            control_prediction.parallel_service_ns
+        );
+        assert_eq!(
+            prediction.warm_parallel_total_cost_ns,
+            control_prediction.warm_parallel_total_cost_ns
+        );
+        assert_eq!(prediction.total_cost_ns, control_prediction.total_cost_ns);
+
+        let diagnostics = journal.exact_parallel_diagnostics(REFRESH_NS);
+        assert_eq!(
+            diagnostics.deferred_o1_decomposition_samples,
+            WARM_PARALLEL_MIN_SAMPLES as u64
+        );
+        assert_eq!(
+            journal.prediction(Duration::from_nanos(REFRESH_NS)),
+            prediction
+        );
+    }
+
+    #[test]
+    fn malformed_deferred_o1_timing_rejects_only_auxiliary_decomposition() {
+        let observation = observation(1_000_000, 4_000_000, 5_300_000);
+        let mut journal = AdaptiveRenderJournal::default();
+        let mut control = AdaptiveRenderJournal::default();
+        rendered_deferred(
+            &mut journal,
+            observation,
+            3_000_000,
+            DeferredO1BindingOrigin::PredecessorPageflip,
+            2_900_000,
+            Some(3_100_000),
+        );
+        control.record_frame_service_observation(observation);
+
+        assert_eq!(
+            journal.prediction(Duration::from_millis(10)),
+            control.prediction(Duration::from_millis(10))
+        );
+        let diagnostics = journal.exact_parallel_diagnostics(REFRESH_NS);
+        assert_eq!(diagnostics.render_ready.window.count, 1);
+        assert_eq!(diagnostics.queue_ready.window.count, 1);
+        assert_eq!(diagnostics.post_render_handoff.latest_ns, 2_300_000);
+        assert_eq!(diagnostics.deferred_o1_decomposition_samples, 0);
+        assert_eq!(diagnostics.deferred_o1_decomposition_invalid_samples, 1);
+        assert_eq!(diagnostics.decomposition_invalid_samples, 0);
+    }
+
+    #[test]
+    fn deferred_o1_missing_bind_timestamp_is_counted_without_a_decomposition_sample() {
+        let mut journal = AdaptiveRenderJournal::default();
+        rendered_deferred(
+            &mut journal,
+            observation(1_000_000, 4_000_000, 5_300_000),
+            3_000_000,
+            DeferredO1BindingOrigin::PredecessorPageflip,
+            5_000_000,
+            None,
+        );
+
+        let diagnostics = journal.exact_parallel_diagnostics(REFRESH_NS);
+        assert_eq!(diagnostics.render_ready.window.count, 1);
+        assert_eq!(diagnostics.queue_ready.window.count, 1);
+        assert_eq!(
+            diagnostics.deferred_o1_binding_timestamp_unavailable_samples,
+            1
+        );
+        assert_eq!(diagnostics.deferred_o1_decomposition_samples, 0);
+    }
+
+    #[test]
+    fn deferred_o1_decomposition_uses_worker_queue_without_a_fence_timestamp() {
+        let mut journal = AdaptiveRenderJournal::default();
+        let mut observation = observation(1_000_000, 4_000_000, 5_300_000);
+        observation.fence_signaled_at = None;
+        rendered_deferred(
+            &mut journal,
+            observation,
+            3_000_000,
+            DeferredO1BindingOrigin::PredecessorPageflip,
+            5_000_000,
+            Some(5_100_000),
+        );
+
+        let diagnostics = journal.exact_parallel_diagnostics(REFRESH_NS);
+        assert_eq!(diagnostics.render_ready.window.count, 0);
+        assert_eq!(diagnostics.queue_ready.window.count, 0);
+        assert_eq!(diagnostics.post_render_handoff.count, 0);
+        assert_eq!(diagnostics.deferred_o1_decomposition_samples, 1);
+        assert_eq!(
+            diagnostics.deferred_ready_to_authority_observed.latest_ns,
+            2_000_000
+        );
+        assert_eq!(
+            diagnostics.deferred_authority_to_bind_committed.latest_ns,
+            100_000
+        );
+        assert_eq!(
+            diagnostics
+                .deferred_bind_committed_to_worker_queue
+                .latest_ns,
+            200_000
+        );
+    }
+
+    #[test]
+    fn non_deferred_frames_do_not_populate_deferred_o1_histories() {
+        let mut journal = AdaptiveRenderJournal::default();
+        rendered(
+            &mut journal,
+            observation(1_000_000, 4_000_000, 5_300_000),
+            3_000_000,
+        );
+
+        let diagnostics = journal.exact_parallel_diagnostics(REFRESH_NS);
+        assert_eq!(diagnostics.post_render_handoff.latest_ns, 2_300_000);
+        assert_eq!(diagnostics.deferred_ready_to_authority_observed.count, 0);
+        assert_eq!(diagnostics.deferred_authority_to_bind_committed.count, 0);
+        assert_eq!(diagnostics.deferred_bind_committed_to_worker_queue.count, 0);
+        assert_eq!(diagnostics.deferred_o1_decomposition_samples, 0);
+    }
+
+    #[test]
+    fn deferred_o1_histories_remain_bounded() {
+        let mut journal = AdaptiveRenderJournal::default();
+        for sample in 0..=SAMPLE_CAPACITY {
+            let composite = sample as u64 * 10_000_000;
+            let rendered_at = composite + 1_000_000;
+            let origin = if sample % 2 == 0 {
+                DeferredO1BindingOrigin::PredecessorPageflip
+            } else {
+                DeferredO1BindingOrigin::RenderCompletion
+            };
+            let authority = if origin == DeferredO1BindingOrigin::RenderCompletion {
+                rendered_at
+            } else {
+                rendered_at + 100_000
+            };
+            let bound = authority + 100_000;
+            let queued = bound + 200_000;
+            rendered_deferred(
+                &mut journal,
+                observation(composite, composite + 3_000_000, queued),
+                rendered_at,
+                origin,
+                authority,
+                Some(bound),
+            );
+        }
+
+        let diagnostics = journal.exact_parallel_diagnostics(REFRESH_NS);
+        assert_eq!(
+            diagnostics.deferred_ready_to_authority_observed.count,
+            SAMPLE_CAPACITY
+        );
+        assert_eq!(
+            diagnostics.deferred_authority_to_bind_committed.count,
+            SAMPLE_CAPACITY
+        );
+        assert_eq!(
+            diagnostics.deferred_bind_committed_to_worker_queue.count,
+            SAMPLE_CAPACITY
+        );
+        assert_eq!(
+            diagnostics.deferred_o1_decomposition_samples,
+            (SAMPLE_CAPACITY + 1) as u64
+        );
     }
 
     #[test]

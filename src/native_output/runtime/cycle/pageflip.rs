@@ -3259,6 +3259,7 @@ impl NativeRuntime {
                         frame_scheduler,
                         output_epoch.get(),
                         presented_at,
+                        MonotonicTimestampNs::new(compositor_receive_ns),
                     )? {
                         DeferredO1BindingResult::NotReady => {}
                         DeferredO1BindingResult::WaitingForPredecessor => {}
@@ -3582,7 +3583,7 @@ impl NativeRuntime {
                         readiness,
                     );
                     let exact_branch_sample =
-                        render_journal.record_frame_service_observation_with_rendered(
+                        render_journal.record_frame_service_observation_with_deferred_timing(
                             FrameTimingObservation {
                                 frame_id: frame.frame_id,
                                 target,
@@ -3591,6 +3592,7 @@ impl NativeRuntime {
                                 fence_signaled_at: frame.fence_signal,
                             },
                             Some(frame.rendered_at),
+                            frame.deferred_o1_binding_timing,
                         );
                     let post_record_prediction = render_journal.prediction(target.refresh_interval);
                     let recovery_remaining_before =

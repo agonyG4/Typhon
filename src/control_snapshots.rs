@@ -820,6 +820,14 @@ pub struct ExactParallelDiagnostics {
     pub fence_before_queue_samples: usize,
     pub equal_samples: usize,
     pub decomposition_invalid_samples: u64,
+    pub deferred_ready_to_authority_observed: SampleWindowDiagnostics,
+    pub deferred_authority_to_bind_committed: SampleWindowDiagnostics,
+    pub deferred_bind_committed_to_worker_queue: SampleWindowDiagnostics,
+    pub deferred_o1_decomposition_samples: u64,
+    pub deferred_o1_predecessor_pageflip_bind_samples: u64,
+    pub deferred_o1_render_completion_bind_samples: u64,
+    pub deferred_o1_decomposition_invalid_samples: u64,
+    pub deferred_o1_binding_timestamp_unavailable_samples: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1638,13 +1646,50 @@ mod tests {
                 selected_source: BranchRiskSource::EvidenceCeiling,
                 ..BranchRiskDiagnostics::default()
             },
+            deferred_ready_to_authority_observed: SampleWindowDiagnostics {
+                count: 1,
+                p95_ns: 2_000_000,
+                ..SampleWindowDiagnostics::default()
+            },
+            deferred_o1_decomposition_samples: 1,
+            deferred_o1_predecessor_pageflip_bind_samples: 1,
             ..ExactParallelDiagnostics::default()
         };
 
         let encoded = serde_json::to_value(diagnostics).unwrap();
         assert_eq!(encoded["renderReady"]["selectedSource"], "evidence_ceiling");
+        assert_eq!(encoded["deferredO1DecompositionSamples"], 1);
+        assert_eq!(
+            encoded["deferredReadyToAuthorityObserved"]["p95Ns"],
+            2_000_000
+        );
         assert_eq!(
             serde_json::from_value::<ExactParallelDiagnostics>(encoded).unwrap(),
+            diagnostics
+        );
+    }
+
+    #[test]
+    fn exact_parallel_deferred_o1_diagnostics_have_serde_defaults() {
+        let diagnostics = ExactParallelDiagnostics::default();
+        let encoded = serde_json::to_value(diagnostics).unwrap();
+
+        assert_eq!(encoded["deferredReadyToAuthorityObserved"]["count"], 0);
+        assert_eq!(encoded["deferredAuthorityToBindCommitted"]["count"], 0);
+        assert_eq!(encoded["deferredBindCommittedToWorkerQueue"]["count"], 0);
+
+        let mut legacy = encoded;
+        let object = legacy.as_object_mut().unwrap();
+        object.remove("deferredReadyToAuthorityObserved");
+        object.remove("deferredAuthorityToBindCommitted");
+        object.remove("deferredBindCommittedToWorkerQueue");
+        object.remove("deferredO1DecompositionSamples");
+        object.remove("deferredO1PredecessorPageflipBindSamples");
+        object.remove("deferredO1RenderCompletionBindSamples");
+        object.remove("deferredO1DecompositionInvalidSamples");
+        object.remove("deferredO1BindingTimestampUnavailableSamples");
+        assert_eq!(
+            serde_json::from_value::<ExactParallelDiagnostics>(legacy).unwrap(),
             diagnostics
         );
     }

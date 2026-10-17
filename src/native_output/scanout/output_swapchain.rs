@@ -7,7 +7,11 @@ use std::{
 use std::num::NonZeroU64;
 
 use oblivion_one::compositor::{CompositorFrameBatchId, SurfaceDamagePresentation};
-use oblivion_one::native::adaptive_buffering::FenceTimestampQuality;
+#[cfg(test)]
+use oblivion_one::native::adaptive_buffering::DeferredO1BindingOrigin;
+use oblivion_one::native::adaptive_buffering::{
+    DeferredO1BindingTimingEvidence, FenceTimestampQuality,
+};
 use oblivion_one::native::buffering::O1AdmissionObservation;
 use oblivion_one::native::kms::{FramebufferId, PageFlipToken};
 #[cfg(test)]
@@ -207,6 +211,7 @@ pub(crate) struct RenderedOutputFrame {
     pub(crate) protocol_batch_id: CompositorFrameBatchId,
     pub(crate) composite_started_at: MonotonicTimestampNs,
     pub(crate) rendered_at: MonotonicTimestampNs,
+    pub(crate) deferred_o1_binding_timing: Option<DeferredO1BindingTimingEvidence>,
     pub(crate) client_commit_ns: Option<u64>,
     pub(crate) callback_reaction_ns: Option<u64>,
     pub(crate) callback_admission_ns: Option<u64>,
@@ -838,6 +843,7 @@ impl AtomicOutputSwapchain {
             protocol_batch_id,
             composite_started_at: now,
             rendered_at: now,
+            deferred_o1_binding_timing: None,
             client_commit_ns: None,
             callback_reaction_ns: None,
             callback_admission_ns: None,
@@ -990,6 +996,7 @@ impl AtomicOutputSwapchain {
             ),
             composite_started_at: now,
             rendered_at: now,
+            deferred_o1_binding_timing: None,
             client_commit_ns: None,
             callback_reaction_ns: None,
             callback_admission_ns: None,
@@ -2233,6 +2240,24 @@ impl AtomicOutputSwapchain {
         ));
         ready.reservation = FramePresentationReservation::Fixed(prepared.target);
         ready.presentation_timing = KmsPresentationTiming::Fixed(prepared.submit_window);
+    }
+
+    pub(crate) fn record_deferred_o1_binding_timing_evidence(
+        &mut self,
+        expected_identity: OutputFrameIdentitySnapshot,
+        evidence: DeferredO1BindingTimingEvidence,
+    ) -> bool {
+        let Some(ready) = self.ready.as_mut() else {
+            return false;
+        };
+        if OutputFrameKey::from(&*ready) != OutputFrameKey::from(&expected_identity)
+            || !matches!(ready.reservation, FramePresentationReservation::Fixed(_))
+            || ready.deferred_o1_binding_timing.is_some()
+        {
+            return false;
+        }
+        ready.deferred_o1_binding_timing = Some(evidence);
+        true
     }
 
     pub(crate) fn ready_submit_window(&self) -> Option<KmsSubmitWindow> {
@@ -3837,6 +3862,7 @@ mod tests {
             protocol_batch_id: batch_id,
             composite_started_at: now,
             rendered_at: now,
+            deferred_o1_binding_timing: None,
             client_commit_ns: None,
             callback_reaction_ns: None,
             callback_admission_ns: None,
@@ -4079,6 +4105,18 @@ mod tests {
             .expect("successor B reaches READY while predecessor A is pending");
         let before = swapchain.ready_identity().expect("deferred READY B");
         assert_eq!(before.reservation, deferred_reservation);
+        assert_eq!(
+            swapchain.deferred_o1_binding_readiness(1),
+            DeferredO1BindingReadiness::WaitingForPredecessor
+        );
+        assert_eq!(
+            swapchain
+                .ready
+                .as_ref()
+                .and_then(|frame| frame.deferred_o1_binding_timing),
+            None,
+            "waiting READY frames have no successful-bind evidence"
+        );
         let FramePresentationReservation::DeferredO1(intent) = before.reservation else {
             panic!("successor B starts as DeferredO1");
         };
@@ -4155,6 +4193,7 @@ mod tests {
                 clock_generation: 1,
             },
         );
+        let compositor_receive_at = now(12_180_000);
         let mut missing_scheduler =
             NativeFrameScheduler::new_with_refresh_interval_ns(6_060_606, 0);
         assert!(
@@ -4165,11 +4204,21 @@ mod tests {
                 &mut missing_scheduler,
                 1,
                 now(12_200_000),
+                DeferredO1BindingOrigin::PredecessorPageflip,
+                compositor_receive_at,
             )
             .is_err(),
             "late bind requires the existing scheduler READY owner"
         );
         assert_eq!(swapchain.ready_identity(), Some(before));
+        assert_eq!(
+            swapchain
+                .ready
+                .as_ref()
+                .and_then(|frame| frame.deferred_o1_binding_timing),
+            None,
+            "failed binding preflight does not attach successful-bind evidence"
+        );
         assert_eq!(frame_pacing.unsubmitted_physical_identity(), Some(before));
         assert_eq!(
             output_transactions
@@ -4188,6 +4237,8 @@ mod tests {
             &mut frame_scheduler,
             1,
             now(12_200_000),
+            DeferredO1BindingOrigin::PredecessorPageflip,
+            compositor_receive_at,
         )
         .expect("production late-bind entry point succeeds after predecessor pageflip")
         {
@@ -4195,6 +4246,39 @@ mod tests {
             result => panic!("expected production late bind, got {result:?}"),
         };
         let after = swapchain.ready_identity().expect("fixed READY B");
+        let binding_timing = swapchain
+            .ready
+            .as_ref()
+            .and_then(|frame| frame.deferred_o1_binding_timing)
+            .expect("successful physical bind records timing evidence on READY frame");
+        assert_eq!(
+            binding_timing.origin,
+            DeferredO1BindingOrigin::PredecessorPageflip
+        );
+        assert_eq!(binding_timing.authority_observed_at, compositor_receive_at);
+        assert!(binding_timing.bound_committed_at.is_some());
+        assert!(matches!(
+            AtomicEglGbmScanout::bind_ready_deferred_o1_on_swapchain(
+                &mut swapchain,
+                &mut output_transactions,
+                &mut frame_pacing,
+                &mut frame_scheduler,
+                1,
+                now(12_210_000),
+                DeferredO1BindingOrigin::PredecessorPageflip,
+                compositor_receive_at,
+            )
+            .expect("already bound READY frame is not rebound"),
+            DeferredO1BindingResult::NotReady
+        ));
+        assert_eq!(
+            swapchain
+                .ready
+                .as_ref()
+                .and_then(|frame| frame.deferred_o1_binding_timing),
+            Some(binding_timing),
+            "NotReady does not replace successful binding evidence"
+        );
         assert!(matches!(
             after.reservation,
             FramePresentationReservation::Fixed(_)
@@ -4411,6 +4495,13 @@ mod tests {
             Some(after)
         );
         assert_eq!(
+            swapchain
+                .worker_queued
+                .as_ref()
+                .and_then(|queued| queued.frame.deferred_o1_binding_timing),
+            Some(binding_timing)
+        );
+        assert_eq!(
             scene_history.submitted_identity(token.get()),
             Some((after.output_id, after.frame_id, after.render_generation))
         );
@@ -4483,6 +4574,13 @@ mod tests {
         .expect("production replan restores every exact READY owner");
         assert_eq!(swapchain.ready_identity(), Some(after));
         assert_eq!(swapchain.worker_queued_identity(), None);
+        assert_eq!(
+            swapchain
+                .ready
+                .as_ref()
+                .and_then(|frame| frame.deferred_o1_binding_timing),
+            Some(binding_timing)
+        );
         assert_eq!(scene_history.ready_snapshot_for_test(), Some(&frozen_scene));
         assert_eq!(scene_history.submitted_identity(token.get()), None);
         assert_eq!(frame_pacing.unsubmitted_physical_identity(), Some(after));
@@ -4515,6 +4613,39 @@ mod tests {
         assert!(submission_fence.is_none());
         assert_eq!(frame_pacing.predictive_o1_created, 1);
         assert_eq!(frame_pacing.predictive_o1_invalid_stage_transitions, 0);
+
+        let pending_token = PageFlipToken::new(904).expect("pending frame token");
+        let pending_queued_at = now(12_300_000);
+        let (render_fence, cursor_owner) = swapchain
+            .take_ready_for_worker(pending_token, pending_queued_at)
+            .expect("the same fixed READY frame queues again after replan");
+        drop(render_fence);
+        drop(cursor_owner);
+        assert_eq!(
+            swapchain
+                .worker_queued
+                .as_ref()
+                .and_then(|queued| queued.frame.deferred_o1_binding_timing),
+            Some(binding_timing)
+        );
+        swapchain
+            .promote_worker_queued(pending_token, None, now(12_400_000), now(12_500_000))
+            .expect("worker success moves the exact frame to pending");
+        assert_eq!(
+            swapchain
+                .pending
+                .as_ref()
+                .map(|pending| pending.frame.deferred_o1_binding_timing),
+            Some(Some(binding_timing))
+        );
+        let completed = swapchain
+            .complete_pageflip(pending_token, 1)
+            .expect("the same physical frame completes pageflip");
+        assert_eq!(OutputFrameKey::from(&completed.frame), key);
+        assert_eq!(
+            completed.frame.deferred_o1_binding_timing,
+            Some(binding_timing)
+        );
     }
     #[test]
     fn deferred_o1_skips_an_already_impossible_successor() {
@@ -4786,6 +4917,13 @@ mod tests {
 
     #[test]
     fn deferred_o1_binds_when_predecessor_presents_before_render_completion() {
+        use crate::native_output::DeferredO1BindingResult;
+        use crate::native_output::pacing::NativeFramePacing;
+        use crate::native_output::presentation::ledger::OutputTransactionLedger;
+        use crate::native_output::presentation::transaction::OutputTransaction;
+        use crate::native_output::scanout::AtomicEglGbmScanout;
+        use oblivion_one::native::scheduler::{NativeFrameScheduler, NativeOutputPacingMode};
+
         let predecessor_claim = PrimaryRefreshClaim {
             sequence: 2,
             presentation_time: MonotonicTimestampNs::new(12_121_212),
@@ -4809,14 +4947,76 @@ mod tests {
                 predecessor,
             ))
             .expect("deferred render completes after predecessor pageflip");
-        let (_, target, _, _) = swapchain
-            .deferred_o1_binding_candidate(1, now(12_200_000))
-            .expect("binding candidate lookup")
-            .expect("deferred frame should bind after render completion");
-        assert!(matches!(
-            swapchain.deferred_o1_binding_readiness(1),
-            DeferredO1BindingReadiness::Bindable { .. }
-        ));
+        let before = swapchain.ready_identity().expect("deferred READY frame");
+        let FramePresentationReservation::DeferredO1(intent) = before.reservation else {
+            panic!("the frame remains Deferred O1 until the successful bind");
+        };
+        let mut output_transactions = OutputTransactionLedger::new_for_output(before.output_id);
+        output_transactions
+            .insert(
+                OutputTransaction::composited_deferred_o1(
+                    before.output_id,
+                    before.transaction_id,
+                    1,
+                    now(1),
+                    intent,
+                    NativeOutputPacingMode::PredictiveTriple,
+                    before.frame_id,
+                    before.render_generation,
+                    before.pool_generation,
+                    before.slot,
+                    before.framebuffer_id.get(),
+                    None,
+                    before.protocol_batch_id,
+                )
+                .expect("Deferred O1 transaction"),
+            )
+            .expect("transaction enters ledger");
+        output_transactions
+            .mark_ready_unbound(before.transaction_id, now(2))
+            .expect("transaction reaches ReadyUnbound");
+        let mut frame_pacing = NativeFramePacing::from_env();
+        frame_pacing.queue_visual(2, before.render_generation);
+        frame_pacing.note_render_decision(NativeOutputPacingMode::PredictiveTriple, true);
+        frame_pacing
+            .begin_render_attempt(NativeOutputPacingMode::PredictiveTriple, true)
+            .expect("render-completion O1 attempt");
+        frame_pacing
+            .bind_predictive_o1(before)
+            .expect("pacing owns the exact deferred frame");
+        frame_pacing.note_render_ready();
+        frame_pacing.note_ready_frame(3, true);
+        frame_pacing.note_predictive_unbound_ready();
+        let mut frame_scheduler = NativeFrameScheduler::new_with_refresh_interval_ns(6_060_606, 0);
+        frame_scheduler.note_ready_frame(None);
+        let rendered_at = now(12_150_000);
+        let result = AtomicEglGbmScanout::bind_ready_deferred_o1_on_swapchain(
+            &mut swapchain,
+            &mut output_transactions,
+            &mut frame_pacing,
+            &mut frame_scheduler,
+            1,
+            rendered_at,
+            DeferredO1BindingOrigin::RenderCompletion,
+            rendered_at,
+        )
+        .expect("render-completion bind uses existing predecessor authority");
+        assert!(matches!(result, DeferredO1BindingResult::Bound { .. }));
+        let FramePresentationReservation::Fixed(target) = swapchain
+            .ready_identity()
+            .expect("bound READY frame")
+            .reservation
+        else {
+            panic!("successful render-completion binding fixes the target");
+        };
+        let timing = swapchain
+            .ready
+            .as_ref()
+            .and_then(|frame| frame.deferred_o1_binding_timing)
+            .expect("render-completion bind records frame timing evidence");
+        assert_eq!(timing.origin, DeferredO1BindingOrigin::RenderCompletion);
+        assert_eq!(timing.authority_observed_at, rendered_at);
+        assert!(timing.bound_committed_at.is_some());
         assert_eq!(target.physical_claim().sequence, 3);
     }
 
@@ -4896,6 +5096,14 @@ mod tests {
             Some(DeferredO1BindingFailure::IdentityMismatch)
         );
         assert!(swapchain.ready_is_deferred_o1());
+        assert_eq!(
+            swapchain
+                .ready
+                .as_ref()
+                .and_then(|frame| frame.deferred_o1_binding_timing),
+            None,
+            "stale predecessor ownership does not attach binding evidence"
+        );
     }
 
     #[test]
@@ -4930,6 +5138,14 @@ mod tests {
             Some(DeferredO1BindingFailure::GenerationMismatch)
         );
         assert!(swapchain.ready_is_deferred_o1());
+        assert_eq!(
+            swapchain
+                .ready
+                .as_ref()
+                .and_then(|frame| frame.deferred_o1_binding_timing),
+            None,
+            "stale generation ownership does not attach binding evidence"
+        );
     }
 
     #[test]

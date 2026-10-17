@@ -823,6 +823,7 @@ mod tests {
                 protocol_batch_id,
                 composite_started_at: frame_now,
                 rendered_at: frame_now,
+                deferred_o1_binding_timing: None,
                 client_commit_ns: None,
                 callback_reaction_ns: None,
                 callback_admission_ns: None,

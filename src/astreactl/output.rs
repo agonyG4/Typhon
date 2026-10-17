@@ -12,6 +12,7 @@ Exact Q raw p50/p95/p99/max: {}/{}/{}/{} ns\n\
 Exact R model ewma/dev/central/selected: {}/{}/{}/{} ns ({})\n\
 Exact Q model ewma/dev/central/selected: {}/{}/{}/{} ns ({})\n\
 Pipeline p95 C/H/GPU-tail/observed-after-fence: {}/{}/{}/{} ns\n\
+Deferred O1 component p95 ready->authority/bind/admission: {}/{}/{} ns (valid {}; origin pageflip/render {}/{}; invalid/missing {}/{})\n\
 R/Q over 1R/2R: {}/{}, {}/{}\n\
 Fence-before-queue / queue-before-fence: {}/{} (equal {})",
         render.window.p50_ns,
@@ -36,6 +37,14 @@ Fence-before-queue / queue-before-fence: {}/{} (equal {})",
         diagnostics.post_render_handoff.p95_ns,
         diagnostics.fence_after_rendered_observed.p95_ns,
         diagnostics.rendered_observed_after_fence.p95_ns,
+        diagnostics.deferred_ready_to_authority_observed.p95_ns,
+        diagnostics.deferred_authority_to_bind_committed.p95_ns,
+        diagnostics.deferred_bind_committed_to_worker_queue.p95_ns,
+        diagnostics.deferred_o1_decomposition_samples,
+        diagnostics.deferred_o1_predecessor_pageflip_bind_samples,
+        diagnostics.deferred_o1_render_completion_bind_samples,
+        diagnostics.deferred_o1_decomposition_invalid_samples,
+        diagnostics.deferred_o1_binding_timestamp_unavailable_samples,
         render.window.over_refresh_samples,
         render.window.over_two_refresh_samples,
         queue.window.over_refresh_samples,
@@ -704,6 +713,23 @@ mod tests {
                 p95_ns: 3_000_000,
                 ..SampleWindowDiagnostics::default()
             },
+            deferred_ready_to_authority_observed: SampleWindowDiagnostics {
+                p95_ns: 2_000_000,
+                ..SampleWindowDiagnostics::default()
+            },
+            deferred_authority_to_bind_committed: SampleWindowDiagnostics {
+                p95_ns: 100_000,
+                ..SampleWindowDiagnostics::default()
+            },
+            deferred_bind_committed_to_worker_queue: SampleWindowDiagnostics {
+                p95_ns: 200_000,
+                ..SampleWindowDiagnostics::default()
+            },
+            deferred_o1_decomposition_samples: 12,
+            deferred_o1_predecessor_pageflip_bind_samples: 10,
+            deferred_o1_render_completion_bind_samples: 2,
+            deferred_o1_decomposition_invalid_samples: 1,
+            deferred_o1_binding_timestamp_unavailable_samples: 3,
             queue_before_fence_samples: 7,
             fence_before_queue_samples: 8,
             equal_samples: 9,
@@ -718,6 +744,9 @@ mod tests {
         assert!(output.contains("Exact Q model ewma/dev/central/selected: 2000000/500000/3000000/3000000 ns (recent_p95)"));
         assert!(output.contains(
             "Pipeline p95 C/H/GPU-tail/observed-after-fence: 5000000/1000000/2000000/3000000 ns"
+        ));
+        assert!(output.contains(
+            "Deferred O1 component p95 ready->authority/bind/admission: 2000000/100000/200000 ns (valid 12; origin pageflip/render 10/2; invalid/missing 1/3)"
         ));
         assert!(output.contains("R/Q over 1R/2R: 1/1, 1/1"));
         assert!(output.contains("Fence-before-queue / queue-before-fence: 8/7 (equal 9)"));
