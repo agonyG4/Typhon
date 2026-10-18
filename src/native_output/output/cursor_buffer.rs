@@ -5,9 +5,182 @@ use oblivion_one::cursor_theme::CompositorCursorImage;
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CursorFramebufferLifecycleEvent {
+    #[cfg(test)]
+    BeforeFramebufferAcquired,
+    AddFb2Succeeded,
+    SetupFailedAfterAddFb2 {
+        rm_fb_succeeded: bool,
+    },
+    ArmedOwnerDrop {
+        rm_fb_succeeded: bool,
+    },
+    DisarmedOwnerDrop,
+    CursorBackingReady,
+    CursorBackingDrop,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct CursorFramebufferLifecyclePlan {
+    drm_allocations: u8,
+    drm_retirements_via_remove: u8,
+    drm_retirements_without_remove: u8,
+    remove_framebuffer: bool,
+    cursor_backing_allocations: u8,
+    cursor_backing_retirements: u8,
+}
+
+const fn cursor_framebuffer_lifecycle_plan(
+    event: CursorFramebufferLifecycleEvent,
+) -> CursorFramebufferLifecyclePlan {
+    match event {
+        #[cfg(test)]
+        CursorFramebufferLifecycleEvent::BeforeFramebufferAcquired => {
+            CursorFramebufferLifecyclePlan {
+                drm_allocations: 0,
+                drm_retirements_via_remove: 0,
+                drm_retirements_without_remove: 0,
+                remove_framebuffer: false,
+                cursor_backing_allocations: 0,
+                cursor_backing_retirements: 0,
+            }
+        }
+        CursorFramebufferLifecycleEvent::AddFb2Succeeded => CursorFramebufferLifecyclePlan {
+            drm_allocations: 1,
+            ..CursorFramebufferLifecyclePlan::zeroed()
+        },
+        CursorFramebufferLifecycleEvent::SetupFailedAfterAddFb2 { rm_fb_succeeded }
+        | CursorFramebufferLifecycleEvent::ArmedOwnerDrop { rm_fb_succeeded } => {
+            CursorFramebufferLifecyclePlan {
+                drm_retirements_via_remove: if rm_fb_succeeded { 1 } else { 0 },
+                remove_framebuffer: true,
+                ..CursorFramebufferLifecyclePlan::zeroed()
+            }
+        }
+        CursorFramebufferLifecycleEvent::DisarmedOwnerDrop => CursorFramebufferLifecyclePlan {
+            drm_retirements_without_remove: 1,
+            ..CursorFramebufferLifecyclePlan::zeroed()
+        },
+        CursorFramebufferLifecycleEvent::CursorBackingReady => CursorFramebufferLifecyclePlan {
+            cursor_backing_allocations: 1,
+            ..CursorFramebufferLifecyclePlan::zeroed()
+        },
+        CursorFramebufferLifecycleEvent::CursorBackingDrop => CursorFramebufferLifecyclePlan {
+            cursor_backing_retirements: 1,
+            ..CursorFramebufferLifecyclePlan::zeroed()
+        },
+    }
+}
+
+impl CursorFramebufferLifecyclePlan {
+    const fn zeroed() -> Self {
+        Self {
+            drm_allocations: 0,
+            drm_retirements_via_remove: 0,
+            drm_retirements_without_remove: 0,
+            remove_framebuffer: false,
+            cursor_backing_allocations: 0,
+            cursor_backing_retirements: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum NativeCursorSourceKey {
     Theme,
     Client(NativeCursorImageKey),
+}
+
+#[cfg(test)]
+mod lifecycle_plan_tests {
+    use super::*;
+
+    #[test]
+    fn successful_addfb2_ownership_plans_one_drm_framebuffer_allocation() {
+        let plan =
+            cursor_framebuffer_lifecycle_plan(CursorFramebufferLifecycleEvent::AddFb2Succeeded);
+
+        assert_eq!(plan.drm_allocations, 1);
+        assert_eq!(plan.drm_retirements_via_remove, 0);
+        assert_eq!(plan.drm_retirements_without_remove, 0);
+        assert_eq!(plan.cursor_backing_allocations, 0);
+    }
+
+    #[test]
+    fn post_addfb2_construction_failure_plans_one_matching_retirement_on_successful_rm_fb() {
+        let acquired =
+            cursor_framebuffer_lifecycle_plan(CursorFramebufferLifecycleEvent::AddFb2Succeeded);
+        let retired = cursor_framebuffer_lifecycle_plan(
+            CursorFramebufferLifecycleEvent::SetupFailedAfterAddFb2 {
+                rm_fb_succeeded: true,
+            },
+        );
+
+        assert!(retired.remove_framebuffer);
+        assert_eq!(acquired.drm_allocations, 1);
+        assert_eq!(retired.drm_retirements_via_remove, 1);
+        assert_eq!(retired.drm_retirements_without_remove, 0);
+    }
+
+    #[test]
+    fn failed_rm_fb_does_not_manufacture_a_drm_framebuffer_retirement() {
+        let plan =
+            cursor_framebuffer_lifecycle_plan(CursorFramebufferLifecycleEvent::ArmedOwnerDrop {
+                rm_fb_succeeded: false,
+            });
+
+        assert!(plan.remove_framebuffer);
+        assert_eq!(plan.drm_retirements_via_remove, 0);
+        assert_eq!(plan.drm_retirements_without_remove, 0);
+    }
+
+    #[test]
+    fn armed_drop_has_one_remove_retirement_path_and_no_second_retirement() {
+        let plan =
+            cursor_framebuffer_lifecycle_plan(CursorFramebufferLifecycleEvent::ArmedOwnerDrop {
+                rm_fb_succeeded: true,
+            });
+
+        assert!(plan.remove_framebuffer);
+        assert_eq!(plan.drm_retirements_via_remove, 1);
+        assert_eq!(plan.drm_retirements_without_remove, 0);
+    }
+
+    #[test]
+    fn disarmed_drop_skips_rm_fb_and_retires_the_tracked_owner_once() {
+        let plan =
+            cursor_framebuffer_lifecycle_plan(CursorFramebufferLifecycleEvent::DisarmedOwnerDrop);
+
+        assert!(!plan.remove_framebuffer);
+        assert_eq!(plan.drm_retirements_via_remove, 0);
+        assert_eq!(plan.drm_retirements_without_remove, 1);
+    }
+
+    #[test]
+    fn pre_allocation_failure_cannot_retire_an_unrecorded_framebuffer() {
+        let plan = cursor_framebuffer_lifecycle_plan(
+            CursorFramebufferLifecycleEvent::BeforeFramebufferAcquired,
+        );
+
+        assert_eq!(plan.drm_allocations, 0);
+        assert_eq!(plan.drm_retirements_via_remove, 0);
+        assert_eq!(plan.drm_retirements_without_remove, 0);
+        assert!(!plan.remove_framebuffer);
+    }
+
+    #[test]
+    fn cursor_backing_events_are_independent_from_drm_framebuffer_events() {
+        let created =
+            cursor_framebuffer_lifecycle_plan(CursorFramebufferLifecycleEvent::CursorBackingReady);
+        let retired =
+            cursor_framebuffer_lifecycle_plan(CursorFramebufferLifecycleEvent::CursorBackingDrop);
+
+        assert_eq!(created.cursor_backing_allocations, 1);
+        assert_eq!(created.drm_allocations, 0);
+        assert_eq!(retired.cursor_backing_retirements, 1);
+        assert_eq!(retired.drm_retirements_via_remove, 0);
+        assert_eq!(retired.drm_retirements_without_remove, 0);
+    }
 }
 
 #[derive(Debug)]
@@ -50,10 +223,18 @@ impl AtomicCursorBuffer {
                 return Err(error);
             }
         };
+        let framebuffer_plan =
+            cursor_framebuffer_lifecycle_plan(CursorFramebufferLifecycleEvent::AddFb2Succeeded);
+        for _ in 0..framebuffer_plan.drm_allocations {
+            crate::gpu_residency::record_gpu_resource_allocation(
+                crate::gpu_residency::GpuResourceClass::DrmFramebuffer,
+                None,
+            );
+        }
         let map = match drm_ffi::mode::dumbbuffer::map(file.as_fd(), dumb.handle, 0, 0) {
             Ok(map) => map,
             Err(error) => {
-                super::super::scanout::remove_explicit_framebuffer(file.as_fd(), framebuffer);
+                remove_failed_cursor_framebuffer(file.as_fd(), framebuffer);
                 let _ = drm_ffi::mode::dumbbuffer::destroy(file.as_fd(), dumb.handle);
                 return Err(error);
             }
@@ -61,7 +242,7 @@ impl AtomicCursorBuffer {
         let size = match usize::try_from(dumb.size) {
             Ok(size) => size,
             Err(_) => {
-                super::super::scanout::remove_explicit_framebuffer(file.as_fd(), framebuffer);
+                remove_failed_cursor_framebuffer(file.as_fd(), framebuffer);
                 let _ = drm_ffi::mode::dumbbuffer::destroy(file.as_fd(), dumb.handle);
                 return Err(io::Error::other("Atomic cursor dumb buffer size overflow"));
             }
@@ -78,18 +259,18 @@ impl AtomicCursorBuffer {
         };
         if mapping == libc::MAP_FAILED {
             let error = io::Error::last_os_error();
-            super::super::scanout::remove_explicit_framebuffer(file.as_fd(), framebuffer);
+            remove_failed_cursor_framebuffer(file.as_fd(), framebuffer);
             let _ = drm_ffi::mode::dumbbuffer::destroy(file.as_fd(), dumb.handle);
             return Err(error);
         }
-        crate::gpu_residency::record_gpu_resource_allocation(
-            crate::gpu_residency::GpuResourceClass::DrmFramebuffer,
-            None,
-        );
-        crate::gpu_residency::record_gpu_resource_allocation(
-            crate::gpu_residency::GpuResourceClass::CursorBacking,
-            Some(dumb.size),
-        );
+        let cursor_backing_plan =
+            cursor_framebuffer_lifecycle_plan(CursorFramebufferLifecycleEvent::CursorBackingReady);
+        for _ in 0..cursor_backing_plan.cursor_backing_allocations {
+            crate::gpu_residency::record_gpu_resource_allocation(
+                crate::gpu_residency::GpuResourceClass::CursorBacking,
+                Some(dumb.size),
+            );
+        }
         Ok(Self {
             fd: file.as_raw_fd(),
             handle: dumb.handle,
@@ -126,6 +307,16 @@ impl AtomicCursorBuffer {
     }
 }
 
+fn remove_failed_cursor_framebuffer(drm: BorrowedFd<'_>, framebuffer: FramebufferId) {
+    let rm_fb_succeeded = super::super::scanout::remove_explicit_framebuffer(drm, framebuffer);
+    let plan = cursor_framebuffer_lifecycle_plan(
+        CursorFramebufferLifecycleEvent::SetupFailedAfterAddFb2 { rm_fb_succeeded },
+    );
+    debug_assert_eq!(plan.drm_retirements_via_remove, u8::from(rm_fb_succeeded));
+    debug_assert!(plan.remove_framebuffer);
+    let _ = plan;
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct CursorFramebufferPin {
     framebuffer: FramebufferId,
@@ -156,21 +347,39 @@ impl Drop for AtomicCursorBuffer {
     fn drop(&mut self) {
         if self.drm_cleanup_armed {
             let fd = unsafe { BorrowedFd::borrow_raw(self.fd) };
-            super::super::scanout::remove_explicit_framebuffer(fd, self.framebuffer);
+            let rm_fb_succeeded =
+                super::super::scanout::remove_explicit_framebuffer(fd, self.framebuffer);
+            let plan = cursor_framebuffer_lifecycle_plan(
+                CursorFramebufferLifecycleEvent::ArmedOwnerDrop { rm_fb_succeeded },
+            );
+            debug_assert_eq!(plan.drm_retirements_via_remove, u8::from(rm_fb_succeeded));
+            debug_assert!(plan.remove_framebuffer);
+            let _ = plan;
+        } else {
+            let plan = cursor_framebuffer_lifecycle_plan(
+                CursorFramebufferLifecycleEvent::DisarmedOwnerDrop,
+            );
+            for _ in 0..plan.drm_retirements_without_remove {
+                crate::gpu_residency::record_gpu_resource_retirement(
+                    crate::gpu_residency::GpuResourceClass::DrmFramebuffer,
+                    None,
+                );
+            }
+            debug_assert!(!plan.remove_framebuffer);
         }
         let _ = unsafe { libc::munmap(self.mapping, self.size) };
         if self.drm_cleanup_armed {
             let fd = unsafe { BorrowedFd::borrow_raw(self.fd) };
             let _ = drm_ffi::mode::dumbbuffer::destroy(fd, self.handle);
         }
-        crate::gpu_residency::record_gpu_resource_retirement(
-            crate::gpu_residency::GpuResourceClass::CursorBacking,
-            Some(self.size as u64),
-        );
-        crate::gpu_residency::record_gpu_resource_retirement(
-            crate::gpu_residency::GpuResourceClass::DrmFramebuffer,
-            None,
-        );
+        let cursor_backing_plan =
+            cursor_framebuffer_lifecycle_plan(CursorFramebufferLifecycleEvent::CursorBackingDrop);
+        for _ in 0..cursor_backing_plan.cursor_backing_retirements {
+            crate::gpu_residency::record_gpu_resource_retirement(
+                crate::gpu_residency::GpuResourceClass::CursorBacking,
+                Some(self.size as u64),
+            );
+        }
     }
 }
 

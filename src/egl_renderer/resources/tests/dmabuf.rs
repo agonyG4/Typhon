@@ -1,6 +1,252 @@
+use super::super::surface::summarize_active_dmabuf_resources;
 use super::*;
 
 use std::io;
+
+#[test]
+fn active_dmabuf_summary_is_empty_for_an_empty_surface_store() {
+    let summary = summarize_active_dmabuf_resources(&HashMap::new());
+
+    assert_eq!(summary.active_mapping_count, 0);
+    assert_eq!(summary.known_logical_bytes, 0);
+    assert_eq!(summary.unknown_size_mapping_count, 0);
+}
+
+#[test]
+fn active_dmabuf_summary_ignores_shm_and_uploaded_resources() {
+    let resources = HashMap::from([(7, test_shm_resource(None))]);
+
+    let summary = summarize_active_dmabuf_resources(&resources);
+
+    assert_eq!(summary.active_mapping_count, 0);
+    assert_eq!(summary.known_logical_bytes, 0);
+    assert_eq!(summary.unknown_size_mapping_count, 0);
+}
+
+#[test]
+fn one_imported_active_resource_reports_its_logical_payload_bytes() {
+    let mut ids = BufferIdAllocator::default();
+    let identity = ids.allocate().expect("test buffer identity");
+    let handle = test_dmabuf_handle(256, 144, 1024, DrmModifier::LINEAR);
+    let key = DmabufImageKey::from_handle(identity.id(), &handle);
+    let resources = HashMap::from([(7, test_dmabuf_resource(&identity, &handle, 1))]);
+
+    let summary = summarize_active_dmabuf_resources(&resources);
+
+    assert_eq!(summary.active_mapping_count, 1);
+    assert_eq!(
+        summary.known_logical_bytes,
+        key.logical_payload_bytes().unwrap()
+    );
+    assert_eq!(summary.unknown_size_mapping_count, 0);
+}
+
+#[test]
+fn unknown_format_import_remains_unknown_without_invented_bytes() {
+    let mut ids = BufferIdAllocator::default();
+    let identity = ids.allocate().expect("test buffer identity");
+    let handle = test_dmabuf_handle_with_format(
+        256,
+        144,
+        1024,
+        DrmModifier::LINEAR,
+        DrmFormat::Other(u32::from_le_bytes(*b"NV12")),
+    );
+    let resources = HashMap::from([(7, test_dmabuf_resource(&identity, &handle, 1))]);
+
+    let summary = summarize_active_dmabuf_resources(&resources);
+
+    assert_eq!(summary.active_mapping_count, 1);
+    assert_eq!(summary.known_logical_bytes, 0);
+    assert_eq!(summary.unknown_size_mapping_count, 1);
+}
+
+#[test]
+fn replacing_the_active_imported_resource_updates_the_owner_bytes() {
+    let mut ids = BufferIdAllocator::default();
+    let first_identity = ids.allocate().expect("first test buffer identity");
+    let replacement_identity = ids.allocate().expect("replacement test buffer identity");
+    let first_handle = test_dmabuf_handle(256, 144, 1024, DrmModifier::LINEAR);
+    let replacement_handle = test_dmabuf_handle(128, 72, 512, DrmModifier::LINEAR);
+    let first_key = DmabufImageKey::from_handle(first_identity.id(), &first_handle);
+    let replacement_key =
+        DmabufImageKey::from_handle(replacement_identity.id(), &replacement_handle);
+    let mut resources =
+        HashMap::from([(7, test_dmabuf_resource(&first_identity, &first_handle, 1))]);
+
+    resources.insert(
+        7,
+        test_dmabuf_resource(&replacement_identity, &replacement_handle, 2),
+    );
+
+    let summary = summarize_active_dmabuf_resources(&resources);
+    assert_eq!(summary.active_mapping_count, 1);
+    assert_eq!(
+        summary.known_logical_bytes,
+        replacement_key.logical_payload_bytes().unwrap()
+    );
+    assert_ne!(
+        summary.known_logical_bytes,
+        first_key.logical_payload_bytes().unwrap()
+    );
+}
+
+#[test]
+fn removing_an_active_imported_resource_returns_owner_inventory_to_zero() {
+    let mut ids = BufferIdAllocator::default();
+    let identity = ids.allocate().expect("test buffer identity");
+    let handle = test_dmabuf_handle(256, 144, 1024, DrmModifier::LINEAR);
+    let mut resources = HashMap::from([(7, test_dmabuf_resource(&identity, &handle, 1))]);
+
+    resources.remove(&7);
+
+    let summary = summarize_active_dmabuf_resources(&resources);
+    assert_eq!(summary.active_mapping_count, 0);
+    assert_eq!(summary.known_logical_bytes, 0);
+    assert_eq!(summary.unknown_size_mapping_count, 0);
+}
+
+#[test]
+fn publication_excludes_cached_imports_from_active_owners_but_reports_cache_separately() {
+    let mut ids = BufferIdAllocator::default();
+    let active_identity = ids.allocate().expect("active test buffer identity");
+    let cached_identity = ids.allocate().expect("cached test buffer identity");
+    let active_handle = test_dmabuf_handle(256, 144, 1024, DrmModifier::LINEAR);
+    let cached_handle = test_dmabuf_handle(128, 72, 512, DrmModifier::LINEAR);
+    let active_key = DmabufImageKey::from_handle(active_identity.id(), &active_handle);
+    let cached_key = DmabufImageKey::from_handle(cached_identity.id(), &cached_handle);
+    let active_bytes = active_key.logical_payload_bytes().unwrap();
+    let cached_bytes = cached_key.logical_payload_bytes().unwrap();
+    let mut state = RendererResourceState::new(None);
+    state
+        .surfaces
+        .resources
+        .insert(7, test_dmabuf_resource(&active_identity, &active_handle, 1));
+    state.dmabuf.test_insert_texture(
+        cached_key,
+        glow::NativeTexture(std::num::NonZeroU32::new(2).unwrap()),
+        cached_identity.downgrade(),
+        8,
+    );
+    let mut frame_stats = GlesSceneFrameStats::default();
+    let mut telemetry = ResourceTelemetry::new(&mut frame_stats);
+
+    state.publish_current_dmabuf_owner_metrics(&mut telemetry);
+
+    let owners = frame_stats.gpu_residency.client_import;
+    let cache = frame_stats.gpu_residency.renderer_import_cache;
+    assert_eq!(owners.active_count, 1);
+    assert_eq!(owners.active_bytes, active_bytes);
+    assert_eq!(owners.reusable_count, 1);
+    assert_eq!(owners.reusable_bytes, cached_bytes);
+    assert_eq!(owners.external_mapping_count, 2);
+    assert_eq!(cache.active_mapping_count, 1);
+    assert_eq!(cache.active_known_logical_bytes, active_bytes);
+    assert_eq!(cache.cached_mapping_count, 1);
+    assert_eq!(cache.cached_known_logical_bytes, cached_bytes);
+}
+
+#[test]
+fn publication_after_realization_insertion_observes_the_new_active_resource() {
+    let mut ids = BufferIdAllocator::default();
+    let identity = ids.allocate().expect("test buffer identity");
+    let handle = test_dmabuf_handle(256, 144, 1024, DrmModifier::LINEAR);
+    let key = DmabufImageKey::from_handle(identity.id(), &handle);
+    let mut state = RendererResourceState::new(None);
+
+    let mut before_stats = GlesSceneFrameStats::default();
+    state.publish_current_dmabuf_owner_metrics(&mut ResourceTelemetry::new(&mut before_stats));
+    assert_eq!(
+        before_stats
+            .gpu_residency
+            .client_import
+            .external_mapping_count,
+        0
+    );
+
+    state
+        .surfaces
+        .resources
+        .insert(7, test_dmabuf_resource(&identity, &handle, 1));
+    let mut after_stats = GlesSceneFrameStats::default();
+    state.publish_current_dmabuf_owner_metrics(&mut ResourceTelemetry::new(&mut after_stats));
+
+    assert_eq!(
+        after_stats
+            .gpu_residency
+            .client_import
+            .external_mapping_count,
+        1
+    );
+    assert_eq!(
+        after_stats
+            .gpu_residency
+            .client_import
+            .external_mapping_bytes,
+        key.logical_payload_bytes().unwrap()
+    );
+}
+
+#[test]
+fn publication_after_demotion_reports_zero_active_and_one_cached_mapping() {
+    let mut ids = BufferIdAllocator::default();
+    let identity = ids.allocate().expect("test buffer identity");
+    let handle = test_dmabuf_handle(256, 144, 1024, DrmModifier::LINEAR);
+    let key = DmabufImageKey::from_handle(identity.id(), &handle);
+    let bytes = key.logical_payload_bytes().unwrap();
+    let mut state = RendererResourceState::new(None);
+    state
+        .surfaces
+        .resources
+        .insert(7, test_dmabuf_resource(&identity, &handle, 1));
+    state.surfaces.resources.remove(&7);
+    state.dmabuf.test_insert_texture(
+        key,
+        glow::NativeTexture(std::num::NonZeroU32::new(2).unwrap()),
+        identity.downgrade(),
+        7,
+    );
+    let mut frame_stats = GlesSceneFrameStats::default();
+
+    state.publish_current_dmabuf_owner_metrics(&mut ResourceTelemetry::new(&mut frame_stats));
+
+    let owners = frame_stats.gpu_residency.client_import;
+    let cache = frame_stats.gpu_residency.renderer_import_cache;
+    assert_eq!(owners.active_count, 0);
+    assert_eq!(owners.active_bytes, 0);
+    assert_eq!(owners.external_mapping_count, 1);
+    assert_eq!(owners.reusable_count, 1);
+    assert_eq!(owners.reusable_bytes, bytes);
+    assert_eq!(cache.active_mapping_count, 0);
+    assert_eq!(cache.cached_mapping_count, 1);
+    assert_eq!(cache.cached_known_logical_bytes, bytes);
+}
+
+#[test]
+fn stable_owner_publication_matches_independent_event_ledger_totals() {
+    let mut ids = BufferIdAllocator::default();
+    let identity = ids.allocate().expect("test buffer identity");
+    let handle = test_dmabuf_handle(256, 144, 1024, DrmModifier::LINEAR);
+    let mut state = RendererResourceState::new(None);
+    state
+        .surfaces
+        .resources
+        .insert(7, test_dmabuf_resource(&identity, &handle, 1));
+    let mut frame_stats = GlesSceneFrameStats::default();
+    state.publish_current_dmabuf_owner_metrics(&mut ResourceTelemetry::new(&mut frame_stats));
+
+    // Model the independently observed stable event ledger without touching the process-global ledger.
+    let event_ledger = [(1_u64, Some(256_u64 * 144 * 4))];
+    let event_count = event_ledger.len() as u64;
+    let event_known_bytes = event_ledger
+        .iter()
+        .filter_map(|(_, bytes)| *bytes)
+        .sum::<u64>();
+    let owners = frame_stats.gpu_residency.client_import;
+
+    assert_eq!(owners.external_mapping_count, event_count);
+    assert_eq!(owners.external_mapping_bytes, event_known_bytes);
+}
 
 fn settle_dmabuf_import_result<T>(
     result: Result<T, Box<dyn std::error::Error>>,
@@ -576,12 +822,22 @@ fn test_dmabuf_handle(
     stride: u32,
     modifier: DrmModifier,
 ) -> DmabufBufferHandle {
+    test_dmabuf_handle_with_format(width, height, stride, modifier, DrmFormat::Xrgb8888)
+}
+
+fn test_dmabuf_handle_with_format(
+    width: u32,
+    height: u32,
+    stride: u32,
+    modifier: DrmModifier,
+    format: DrmFormat,
+) -> DmabufBufferHandle {
     let fd = std::fs::File::open("/dev/null")
         .expect("/dev/null exists for dmabuf identity tests")
         .into();
     DmabufBufferHandle::new(
         BufferSize::new(width, height).expect("test dmabuf size is non-zero"),
-        DrmFormat::Xrgb8888,
+        format,
         vec![DmabufPlane::new(
             fd,
             DmabufPlaneDescriptor {

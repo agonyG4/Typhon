@@ -8,7 +8,6 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import shutil
 import statistics
 import subprocess
 import sys
@@ -21,12 +20,31 @@ class QualificationError(RuntimeError):
     pass
 
 
+class InternalSampleFailure(QualificationError):
+    def __init__(self, reason: str, detail: str):
+        super().__init__(detail)
+        self.reason = reason
+
+
 class UnsupportedMemoryField(QualificationError):
     pass
 
 
-class IncoherentSnapshot(QualificationError):
+class IncoherentSnapshot(InternalSampleFailure):
+    def __init__(self, detail: str):
+        super().__init__("resource_telemetry_incoherent", detail)
+
+
+class ControlClientResolutionError(InternalSampleFailure):
     pass
+
+
+class ControlClient:
+    __slots__ = ("path", "identity")
+
+    def __init__(self, path: Path, identity: dict[str, str]):
+        self.path = path
+        self.identity = identity
 
 
 def parse_pmon_fb_mib(output: str, pid: int) -> float | None:
@@ -140,6 +158,78 @@ def find_typhon_pid() -> int:
     return matches[0]
 
 
+def _control_client_candidate(path: Path, resolution_source: str) -> ControlClient:
+    selected_path = path.expanduser()
+    if not selected_path.is_absolute():
+        selected_path = Path.cwd() / selected_path
+    selected_path = Path(os.path.abspath(selected_path))
+    try:
+        metadata = selected_path.stat()
+    except FileNotFoundError as error:
+        raise ControlClientResolutionError(
+            "astreactl_not_found", f"control client does not exist: {selected_path}"
+        ) from error
+    except OSError as error:
+        raise ControlClientResolutionError(
+            "astreactl_not_found", f"cannot inspect control client {selected_path}: {error}"
+        ) from error
+    if not selected_path.is_file():
+        raise ControlClientResolutionError(
+            "astreactl_not_found", f"control client is not a regular file: {selected_path}"
+        )
+    if not os.access(selected_path, os.X_OK):
+        raise ControlClientResolutionError(
+            "astreactl_not_executable", f"control client is not executable: {selected_path}"
+        )
+    digest = hashlib.sha256()
+    try:
+        with selected_path.open("rb") as binary:
+            for block in iter(lambda: binary.read(1024 * 1024), b""):
+                digest.update(block)
+    except OSError as error:
+        raise ControlClientResolutionError(
+            "astreactl_not_found", f"cannot read control client {selected_path}: {error}"
+        ) from error
+    identity = {
+        "path": str(selected_path),
+        "sha256": digest.hexdigest(),
+        "mtime_utc": datetime.fromtimestamp(metadata.st_mtime, timezone.utc).isoformat(),
+        "resolution_source": resolution_source,
+    }
+    return ControlClient(path=selected_path, identity=identity)
+
+
+def resolve_control_client(
+    explicit_path: Path | None,
+    expected_binary: Path | None,
+    running_binary: Path,
+) -> ControlClient:
+    if explicit_path is not None:
+        return _control_client_candidate(explicit_path, "explicit")
+
+    failures: list[ControlClientResolutionError] = []
+    candidates: list[tuple[Path, str]] = []
+    if expected_binary is not None:
+        candidates.append((expected_binary.expanduser().parent / "astreactl", "expected_binary_sibling"))
+    candidates.append((running_binary.expanduser().parent / "astreactl", "running_binary_sibling"))
+
+    for candidate, source in candidates:
+        try:
+            return _control_client_candidate(candidate, source)
+        except ControlClientResolutionError as error:
+            failures.append(error)
+
+    not_executable = next(
+        (error for error in failures if error.reason == "astreactl_not_executable"), None
+    )
+    if not_executable is not None:
+        raise not_executable
+    raise ControlClientResolutionError(
+        "astreactl_not_found",
+        "no exact astreactl exists next to the expected or running oblivion-one binary",
+    )
+
+
 def git_identity(repo: Path) -> dict[str, str]:
     def git(*args: str) -> str:
         result = subprocess.run(
@@ -178,8 +268,66 @@ def coherent_internal_sample(
         snapshot = fetch()
         residency = _find_gpu_residency(snapshot)
         if residency is None:
-            raise QualificationError("astreactl output has no gpuResidency object")
-        telemetry = residency.get("resource_telemetry", {})
+            raise InternalSampleFailure(
+                "astreactl_response_missing_gpu_residency",
+                "astreactl response has no gpuResidency object",
+            )
+        telemetry = residency.get("resource_telemetry")
+        if not isinstance(telemetry, dict):
+            raise InternalSampleFailure(
+                "resource_telemetry_missing",
+                "gpuResidency has no resource_telemetry object",
+            )
+        if not isinstance(telemetry.get("coherent"), bool) or not isinstance(
+            telemetry.get("classes"), list
+        ):
+            raise InternalSampleFailure(
+                "resource_telemetry_missing",
+                "resource_telemetry lacks coherent state or class rows",
+            )
+        if any(
+            not isinstance(row, dict) or "accounting_error_count" not in row
+            for row in telemetry["classes"]
+        ):
+            raise InternalSampleFailure(
+                "resource_telemetry_missing",
+                "resource_telemetry class rows lack accounting_error_count",
+            )
+        attribution = residency.get("attribution_summary")
+        required_attribution = {
+            "owned_storage_estimated_bytes",
+            "external_mapping_logical_bytes",
+            "unique_external_backing_bytes",
+            "physical_vram_claim",
+            "live_unresolved_class_count",
+            "live_unresolved_domain_count",
+        }
+        if not isinstance(attribution, dict) or not required_attribution.issubset(attribution):
+            raise InternalSampleFailure(
+                "stage2_3_attribution_missing",
+                "gpuResidency lacks the Stage 2.3 attribution summary fields",
+            )
+        if attribution["physical_vram_claim"] is not False:
+            raise InternalSampleFailure(
+                "stage2_3_attribution_invalid",
+                "gpuResidency must not claim physical VRAM attribution",
+            )
+        if not isinstance(residency.get("domains"), list):
+            raise InternalSampleFailure(
+                "stage2_3_attribution_missing", "gpuResidency lacks domain observations"
+            )
+        if not isinstance(residency.get("renderer_import_cache"), dict) or not isinstance(
+            residency.get("renderer_import_cache_available"), bool
+        ):
+            raise InternalSampleFailure(
+                "stage2_3_attribution_missing",
+                "gpuResidency lacks renderer import cache diagnostics",
+            )
+        if not isinstance(residency.get("direct_import_cache"), dict):
+            raise InternalSampleFailure(
+                "stage2_3_attribution_missing",
+                "gpuResidency lacks direct import cache diagnostics",
+            )
         last_residency = residency
         if telemetry.get("coherent") is True:
             return snapshot, residency, attempt - 1
@@ -259,8 +407,8 @@ def _driver_info() -> dict[str, str | None]:
     return {"driver_version": driver.strip(), "gpu_name": name.strip() if separator else None}
 
 
-def _internal_fetch() -> dict[str, Any]:
-    return _run_json(["astreactl", "--json", "performance"])
+def _internal_fetch(astreactl_path: Path) -> dict[str, Any]:
+    return _run_json([str(astreactl_path), "--json", "performance"])
 
 
 def _error_summary(error: BaseException) -> str:
@@ -269,6 +417,22 @@ def _error_summary(error: BaseException) -> str:
         suffix = f": {detail[-1][:240]}" if detail else ""
         return f"{error.cmd!r} exited with status {error.returncode}{suffix}"
     return str(error)
+
+
+def _internal_failure_reason(error: BaseException) -> str:
+    if isinstance(error, InternalSampleFailure):
+        return error.reason
+    if isinstance(error, FileNotFoundError):
+        return "astreactl_not_found"
+    if isinstance(error, PermissionError):
+        return "astreactl_not_executable"
+    if isinstance(error, json.JSONDecodeError):
+        return "astreactl_response_missing_gpu_residency"
+    if isinstance(error, (subprocess.CalledProcessError, subprocess.TimeoutExpired)):
+        return "astreactl_internal_command_failed"
+    if isinstance(error, OSError):
+        return "astreactl_internal_command_failed"
+    return "astreactl_internal_command_failed"
 
 
 def qualify(args: argparse.Namespace) -> dict[str, Any]:
@@ -285,32 +449,48 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
         expected_binary_sha256 = digest.hexdigest()
     git = git_identity(Path(args.repo).resolve())
     driver = _driver_info()
+    control_client: ControlClient | None = None
+    control_client_error: ControlClientResolutionError | None = None
+    try:
+        control_client = resolve_control_client(
+            getattr(args, "astreactl", None),
+            args.expected_binary,
+            Path(identity["exe"]),
+        )
+    except ControlClientResolutionError as error:
+        control_client_error = error
     pmon_samples: list[float | None] = []
     internal_samples: list[dict[str, Any]] = []
     failure: str | None = None
     process_verified = True
     if expected_binary_sha256 is not None and identity["binary_sha256"] != expected_binary_sha256:
-        failure = "running_binary_hash_does_not_match_expected_binary"
+        failure = "binary_hash_mismatch"
     for index in range(args.samples):
         try:
             before = process_identity(pid)
             if not same_process_identity(identity, before):
-                failure = "target_pid_identity_changed_before_sample"
+                failure = "target_pid_identity_changed"
                 process_verified = False
                 break
         except QualificationError as error:
-            failure = failure or str(error)
+            failure = failure or "target_pid_identity_changed"
             process_verified = False
             break
 
         try:
+            if control_client_error is not None:
+                raise control_client_error
+            if control_client is None:
+                raise ControlClientResolutionError(
+                    "astreactl_not_found", "no exact astreactl control client was selected"
+                )
             _internal, residency, retries = coherent_internal_sample(
-                _internal_fetch, args.coherence_retries
+                lambda: _internal_fetch(control_client.path), args.coherence_retries
             )
-            telemetry = residency.get("resource_telemetry", {})
+            telemetry = residency["resource_telemetry"]
             sample_accounting_errors = sum(
                 int(row.get("accounting_error_count", 0))
-                for row in telemetry.get("classes", [])
+                for row in telemetry["classes"]
             )
             internal_sample = {
                 "sample_index": index + 1,
@@ -319,22 +499,21 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
                 "snapshot_retries": telemetry.get("snapshot_retries"),
                 "accounting_error_count": sample_accounting_errors,
                 "tool_coherence_retries": retries,
-                "attribution_summary": residency.get("attribution_summary", {}),
+                "attribution_summary": residency["attribution_summary"],
                 "resource_telemetry": telemetry,
-                "renderer_import_cache": residency.get("renderer_import_cache", {}),
-                "renderer_import_cache_available": residency.get(
-                    "renderer_import_cache_available", False
-                ),
-                "direct_import_cache": residency.get("direct_import_cache", {}),
-                "domains": residency.get("domains", []),
+                "renderer_import_cache": residency["renderer_import_cache"],
+                "renderer_import_cache_available": residency["renderer_import_cache_available"],
+                "direct_import_cache": residency["direct_import_cache"],
+                "domains": residency["domains"],
             }
-            internal_error = None
+            internal_error_reason = None
         except (QualificationError, OSError, subprocess.SubprocessError, json.JSONDecodeError) as error:
-            internal_error = f"internal_sample_failed: {_error_summary(error)}"
+            internal_error_reason = _internal_failure_reason(error)
             internal_sample = {
                 "sample_index": index + 1,
                 "coherent": False,
-                "sample_error": internal_error,
+                "failure_reason": internal_error_reason,
+                "sample_error": _error_summary(error),
             }
             sample_accounting_errors = None
 
@@ -355,18 +534,18 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
         try:
             after = process_identity(pid)
             if not same_process_identity(identity, after):
-                failure = "target_pid_identity_changed_during_sample"
+                failure = "target_pid_identity_changed"
                 process_verified = False
                 break
         except QualificationError as error:
-            failure = str(error)
+            failure = "target_pid_identity_changed"
             process_verified = False
             break
 
         internal_samples.append(internal_sample)
         pmon_samples.append(fb_mib)
-        if failure is None and internal_error is not None:
-            failure = internal_error
+        if failure is None and internal_error_reason is not None:
+            failure = internal_error_reason
         if failure is None and pmon_error is not None:
             failure = pmon_error
         if failure is None and fb_mib is None:
@@ -382,35 +561,39 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
         final_identity = None
         process_verified = False
         if failure is None:
-            failure = "target_pid_unavailable_after_sampling"
+            failure = "target_pid_identity_changed"
     if final_identity is not None and not same_process_identity(identity, final_identity):
         process_verified = False
         if failure is None:
-            failure = "target_pid_identity_changed_after_sampling"
+            failure = "target_pid_identity_changed"
 
     last = internal_samples[-1] if internal_samples else {}
-    attribution = last.get("attribution_summary", {})
-    telemetry = last.get("resource_telemetry", {})
-    classes = telemetry.get("classes", [])
-    aliases = {
+    attribution = last.get("attribution_summary")
+    telemetry = last.get("resource_telemetry")
+    classes = telemetry["classes"] if isinstance(telemetry, dict) else None
+    aliases = None if classes is None else {
         row.get("class"): row.get("effective_live_count", row.get("live_count", 0))
         for row in classes
         if row.get("class") in ("imported_egl_image_view", "imported_gl_texture_view")
     }
-    driver_objects = {
+    driver_objects = None if classes is None else {
         row.get("class"): row.get("effective_live_count", row.get("live_count", 0))
         for row in classes
         if row.get("byte_semantics") == "driver_managed_unknown"
     }
-    accounting_errors = sum(int(row.get("accounting_error_count", 0)) for row in classes)
+    accounting_errors = (
+        sum(int(row.get("accounting_error_count", 0)) for row in classes)
+        if classes is not None
+        else None
+    )
     if failure is None and expected_binary_sha256 is None:
         failure = "expected_binary_sha256_not_supplied"
-    mismatches = [
+    mismatches = None if classes is None else [
         row.get("class")
         for row in classes
         if row.get("live_state_matches") is False
     ]
-    mismatch_details = [
+    mismatch_details = None if classes is None else [
         {
             "class": row.get("class"),
             "event_live_count": row.get("event_live_count"),
@@ -438,6 +621,7 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
         "invalid_reason": failure,
         "process_identity": identity,
         "current_git": git,
+        "control_client": control_client.identity if control_client is not None else None,
         "expected_binary_sha256": expected_binary_sha256,
         "binary_hash_matches_expected": (
             identity["binary_sha256"] == expected_binary_sha256
@@ -447,27 +631,25 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
         "process_identity_verified": process_verified,
         "driver": driver,
         "nvidia_process_fb_mib": summarize_mib(pmon_samples),
-        "owned_storage_estimated_bytes": attribution.get("owned_storage_estimated_bytes"),
-        "external_mapping_logical_bytes": attribution.get("external_mapping_logical_bytes"),
-        "unique_external_backing_bytes": attribution.get("unique_external_backing_bytes"),
-        "physical_vram_claim": attribution.get("physical_vram_claim", False),
+        "owned_storage_estimated_bytes": attribution.get("owned_storage_estimated_bytes") if attribution else None,
+        "external_mapping_logical_bytes": attribution.get("external_mapping_logical_bytes") if attribution else None,
+        "unique_external_backing_bytes": attribution.get("unique_external_backing_bytes") if attribution else None,
+        "physical_vram_claim": False,
         "alias_view_counts": aliases,
         "driver_managed_unknown_counts": driver_objects,
         "coverage_reconciliation_status": {
-            "coherent": telemetry.get("coherent") is True,
-            "event_sequence": telemetry.get("event_sequence"),
-            "snapshot_retries": telemetry.get("snapshot_retries"),
+            "coherent": telemetry.get("coherent") is True if telemetry else False,
+            "event_sequence": telemetry.get("event_sequence") if telemetry else None,
+            "snapshot_retries": telemetry.get("snapshot_retries") if telemetry else None,
             "accounting_error_count": accounting_errors,
             "reconciliation_mismatch_classes": mismatches,
             "reconciliation_mismatches": mismatch_details,
-            "live_unresolved_class_count": attribution.get("live_unresolved_class_count"),
-            "live_unresolved_domain_count": attribution.get("live_unresolved_domain_count"),
+            "live_unresolved_class_count": attribution.get("live_unresolved_class_count") if attribution else None,
+            "live_unresolved_domain_count": attribution.get("live_unresolved_domain_count") if attribution else None,
         },
-        "renderer_import_cache": last.get("renderer_import_cache", {}),
-        "renderer_import_cache_available": last.get(
-            "renderer_import_cache_available", False
-        ),
-        "direct_import_cache": last.get("direct_import_cache", {}),
+        "renderer_import_cache": last.get("renderer_import_cache"),
+        "renderer_import_cache_available": last.get("renderer_import_cache_available"),
+        "direct_import_cache": last.get("direct_import_cache"),
         "drm_fdinfo": drm_fdinfo_probe(pid),
         "internal_samples": internal_samples,
         "accounting_note": "These categories are not arithmetically additive into a physical-VRAM claim.",
@@ -475,7 +657,7 @@ def qualify(args: argparse.Namespace) -> dict[str, Any]:
     return report
 
 
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--pid", type=int, help="exact oblivion-one PID; defaults to unique matching process")
     parser.add_argument("--repo", default=str(Path(__file__).resolve().parents[1]))
@@ -483,12 +665,20 @@ def main() -> int:
     parser.add_argument("--interval", type=float, default=1.0)
     parser.add_argument("--coherence-retries", type=int, default=3)
     parser.add_argument("--expected-binary", type=Path, help="release binary that the running PID must match")
+    parser.add_argument(
+        "--astreactl",
+        type=Path,
+        help="exact control client path; defaults to a sibling of the expected or running binary",
+    )
     parser.add_argument("--output", type=Path, help="write the JSON report to this path")
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
     args = parser.parse_args()
     if args.samples < 1 or args.interval < 0 or args.coherence_retries < 1:
         parser.error("samples/retries must be positive and interval must be non-negative")
-    if shutil.which("astreactl") is None:
-        parser.error("astreactl is not available in PATH")
     try:
         report = qualify(args)
     except (QualificationError, OSError, subprocess.SubprocessError, json.JSONDecodeError) as error:

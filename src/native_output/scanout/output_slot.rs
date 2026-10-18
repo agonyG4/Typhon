@@ -217,12 +217,17 @@ pub(crate) fn add_explicit_framebuffer(
         .ok_or_else(|| io::Error::other("AddFB2 returned framebuffer ID zero"))
 }
 
-pub(crate) fn remove_explicit_framebuffer(drm: BorrowedFd<'_>, framebuffer: FramebufferId) {
+/// Remove a framebuffer and retire its event only after the kernel confirms `rm_fb`.
+/// A failed ioctl leaves the allocation live in telemetry rather than claiming cleanup.
+pub(crate) fn remove_explicit_framebuffer(drm: BorrowedFd<'_>, framebuffer: FramebufferId) -> bool {
     if drm_ffi::mode::rm_fb(drm, framebuffer.get()).is_ok() {
         crate::gpu_residency::record_gpu_resource_retirement(
             crate::gpu_residency::GpuResourceClass::DrmFramebuffer,
             None,
         );
+        true
+    } else {
+        false
     }
 }
 

@@ -56,6 +56,32 @@ pub(super) struct EglSurfaceResource {
     pub(super) shm_synced_commit: Option<SurfaceCommitCounter>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct ActiveDmabufResourceSummary {
+    pub(super) active_mapping_count: usize,
+    pub(super) known_logical_bytes: u64,
+    pub(super) unknown_size_mapping_count: usize,
+}
+
+pub(super) fn summarize_active_dmabuf_resources(
+    resources: &HashMap<u32, EglSurfaceResource>,
+) -> ActiveDmabufResourceSummary {
+    let mut summary = ActiveDmabufResourceSummary::default();
+    for resource in resources.values() {
+        let Some(key) = &resource.dmabuf_key else {
+            continue;
+        };
+        summary.active_mapping_count = summary.active_mapping_count.saturating_add(1);
+        if let Some(bytes) = key.logical_payload_bytes() {
+            summary.known_logical_bytes = summary.known_logical_bytes.saturating_add(bytes);
+        } else {
+            summary.unknown_size_mapping_count =
+                summary.unknown_size_mapping_count.saturating_add(1);
+        }
+    }
+    summary
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SurfaceResourceLifetimeAction {
     Keep,
@@ -193,6 +219,19 @@ fn destroy_surface_resource(
 }
 
 impl RendererResourceState {
+    pub(super) fn publish_current_dmabuf_owner_metrics(
+        &mut self,
+        telemetry: &mut ResourceTelemetry<'_>,
+    ) {
+        let summary = summarize_active_dmabuf_resources(&self.surfaces.resources);
+        self.dmabuf.publish_active_metrics(
+            summary.active_mapping_count,
+            summary.known_logical_bytes,
+            summary.unknown_size_mapping_count,
+        );
+        self.dmabuf.publish_metrics(telemetry);
+    }
+
     pub(in crate::egl_renderer) fn reconcile_surface_resource_lifetimes(
         &mut self,
         gl: &glow::Context,
@@ -247,11 +286,8 @@ impl RendererResourceState {
             }
         }
 
-        let mut active_dmabuf_count = 0;
-        let mut active_dmabuf_known_bytes = 0_u64;
-        let mut active_dmabuf_unknown_size_count = 0;
         let mut stale_ids = Vec::new();
-        for (&surface_id, resource) in &self.surfaces.resources {
+        for &surface_id in self.surfaces.resources.keys() {
             if self
                 .surfaces
                 .active_surface_ids
@@ -259,15 +295,6 @@ impl RendererResourceState {
                 .is_err()
             {
                 stale_ids.push(surface_id);
-                continue;
-            }
-            if let Some(key) = &resource.dmabuf_key {
-                active_dmabuf_count += 1;
-                if let Some(bytes) = key.logical_payload_bytes() {
-                    active_dmabuf_known_bytes = active_dmabuf_known_bytes.saturating_add(bytes);
-                } else {
-                    active_dmabuf_unknown_size_count += 1;
-                }
             }
         }
         for surface_id in stale_ids {
@@ -279,12 +306,7 @@ impl RendererResourceState {
             self.dmabuf.failed_surface_generations.remove(&surface_id);
         }
 
-        self.dmabuf.publish_active_metrics(
-            active_dmabuf_count,
-            active_dmabuf_known_bytes,
-            active_dmabuf_unknown_size_count,
-        );
-        self.dmabuf.publish_metrics(telemetry);
+        self.publish_current_dmabuf_owner_metrics(telemetry);
         Ok(())
     }
 
@@ -323,7 +345,7 @@ impl RendererResourceState {
                 });
             self.realize_surface_resource(gl, egl, egl_display, surface, sync_state, telemetry)?;
         }
-        self.dmabuf.publish_metrics(telemetry);
+        self.publish_current_dmabuf_owner_metrics(telemetry);
         Ok(())
     }
 
