@@ -27,7 +27,8 @@ pub enum XwaylandProfile {
 impl XwaylandMode {
     pub fn parse(value: Option<&str>) -> Self {
         match value {
-            None | Some("off") => Self::Off,
+            None => Self::ManagedLazy,
+            Some("off") => Self::Off,
             Some("base") => Self::BaseLazy,
             Some("lazy") => Self::ManagedLazy,
             Some("eager") => Self::ManagedEager,

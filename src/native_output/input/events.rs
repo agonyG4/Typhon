@@ -99,6 +99,7 @@ pub(crate) struct NativePointerButtonEvent {
 }
 
 impl NativePointerButtonEvent {
+    #[cfg(test)]
     pub(crate) const fn new_at(
         button: u32,
         pressed: bool,

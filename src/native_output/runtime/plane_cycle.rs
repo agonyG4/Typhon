@@ -830,7 +830,3 @@ pub(super) fn cursor_worker_opportunities(
         worker_mode && attachable_primary.is_some(),
     )
 }
-
-pub(super) fn output_refresh_interval(refresh_hz: u32) -> std::time::Duration {
-    std::time::Duration::from_nanos(1_000_000_000 / u64::from(refresh_hz.max(1)))
-}

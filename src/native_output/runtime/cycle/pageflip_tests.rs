@@ -3453,12 +3453,15 @@ fn direct_entry_waits_for_each_suspended_successor_fence_before_reconfiguration(
 
 #[test]
 fn suspended_output_recovery_advances_one_fence_at_a_time() {
-    let mut swapchain = AtomicOutputSwapchain::from_presented_slots(
-        explicit_slot_set(),
+    let slots = OutputSlotSet::new([
         OutputSlotId::new(0).unwrap(),
-        74,
-    )
+        OutputSlotId::new(1).unwrap(),
+        OutputSlotId::new(2).unwrap(),
+    ])
     .unwrap();
+    let mut swapchain =
+        AtomicOutputSwapchain::from_presented_slots(slots, OutputSlotId::new(0).unwrap(), 74)
+            .unwrap();
     let worker_slot = swapchain.acquire_render_slot().unwrap();
     let (worker_fence, worker_signal) = pageflip_test_controllable_render_fence();
     swapchain

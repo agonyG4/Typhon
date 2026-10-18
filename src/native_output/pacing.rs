@@ -3704,6 +3704,7 @@ impl NativeFramePacing {
         }
     }
 
+    #[allow(dead_code, reason = "Reserved for alternate runtime paths")]
     pub(crate) fn rebase_unsubmitted_physical_metadata(
         &mut self,
         old_identity: OutputFrameIdentitySnapshot,

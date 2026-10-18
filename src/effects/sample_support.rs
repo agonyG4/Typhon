@@ -83,6 +83,7 @@ pub struct EffectSampleSupportAnalysis {
     pub aggregate_checkpoint_dependency_count: usize,
     pub sample_support_checkpoint_dependency_count: usize,
     pub prunable_checkpoint_candidates: usize,
+    pub unresolved_checkpoint_dependency_count: usize,
 }
 
 /// Derive complete sampled source support for one ordinary compiled instance.
@@ -296,17 +297,20 @@ pub fn analyze_effect_sample_support(graph: &CompiledFrameGraph) -> EffectSample
     for later in &graph.instances {
         for earlier_id in &later.dependencies {
             analysis.aggregate_checkpoint_dependency_count += 1;
-            let Some(earlier) = graph
+            let matching_earlier = graph
                 .instances
                 .iter()
-                .find(|instance| instance.id == *earlier_id)
-            else {
+                .filter(|instance| instance.id == *earlier_id)
+                .collect::<Vec<_>>();
+            let [earlier] = matching_earlier.as_slice() else {
+                analysis.unresolved_checkpoint_dependency_count += 1;
                 continue;
             };
             if !earlier
                 .output_influence_region
                 .intersects(&later.capture_region)
             {
+                analysis.unresolved_checkpoint_dependency_count += 1;
                 continue;
             }
             let Some(later_support) = analysis
@@ -315,6 +319,7 @@ pub fn analyze_effect_sample_support(graph: &CompiledFrameGraph) -> EffectSample
                 .find(|entry| entry.instance_id == later.id)
                 .and_then(|entry| entry.result.as_ref().ok())
             else {
+                analysis.unresolved_checkpoint_dependency_count += 1;
                 continue;
             };
             if earlier

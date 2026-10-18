@@ -5,6 +5,7 @@ use glow::HasContext;
 use super::super::program::create_capture_copy_program;
 use super::super::*;
 use super::canonical_blur_semantics::CanonicalBlurSemanticsPolicy;
+use super::checkpoint_dependency_pruning::CheckpointDependencyPruningPolicy;
 use super::gpu_timing::EffectGpuProfiler;
 use super::precomputed_window_blur::PrecomputedWindowBlurPolicy;
 use super::resources::EffectResourceBudgetConfig;
@@ -30,6 +31,8 @@ pub(in crate::egl_renderer) struct EffectRuntime {
     pub(in crate::egl_renderer) effect_gpu_profiler: EffectGpuProfiler,
     pub(in crate::egl_renderer) precomputed_window_blur_policy: PrecomputedWindowBlurPolicy,
     pub(in crate::egl_renderer) terminal_blur_fusion_policy: TerminalBlurFusionPolicy,
+    pub(in crate::egl_renderer) checkpoint_dependency_pruning_policy:
+        CheckpointDependencyPruningPolicy,
     pub(in crate::egl_renderer) canonical_blur_semantics_policy: CanonicalBlurSemanticsPolicy,
     effect_clock_start: Instant,
     pub(in crate::egl_renderer) effect_time_seconds: f32,
@@ -125,6 +128,8 @@ impl EffectRuntime {
             EffectGlResourceCache::with_budget_config(EffectResourceBudgetConfig::from_env())?;
         let precomputed_window_blur_policy = PrecomputedWindowBlurPolicy::from_environment();
         let terminal_blur_fusion_policy = TerminalBlurFusionPolicy::from_environment();
+        let checkpoint_dependency_pruning_policy =
+            CheckpointDependencyPruningPolicy::from_environment();
         let canonical_blur_semantics_policy = CanonicalBlurSemanticsPolicy::from_environment();
 
         Ok(Self {
@@ -142,6 +147,7 @@ impl EffectRuntime {
             effect_gpu_profiler,
             precomputed_window_blur_policy,
             terminal_blur_fusion_policy,
+            checkpoint_dependency_pruning_policy,
             canonical_blur_semantics_policy,
             effect_clock_start: Instant::now(),
             effect_time_seconds: 0.0,

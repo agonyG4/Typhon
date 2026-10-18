@@ -166,8 +166,8 @@ pub struct CapturedSurfacePresentation {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum TearingPolicy {
-    #[default]
     Off,
+    #[default]
     Auto,
 }
 
@@ -216,7 +216,7 @@ pub type NativeTearingPreference = TearingPolicy;
 impl TearingPolicy {
     pub fn from_environment(value: Option<&str>) -> Self {
         match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
-            Some("auto") => Self::Auto,
+            None | Some("auto") => Self::Auto,
             _ => Self::Off,
         }
     }
@@ -828,11 +828,21 @@ mod vrr_phase1_regression_tests {
     }
 
     #[test]
-    fn environment_vrr_policy_keeps_auto_on_and_off_distinct() {
+    fn environment_presentation_policies_keep_defaults_and_overrides_distinct() {
         assert_eq!(VrrPolicy::from_environment(Some("auto")), VrrPolicy::Auto);
         assert_eq!(VrrPolicy::from_environment(Some("on")), VrrPolicy::On);
         assert_eq!(VrrPolicy::from_environment(Some("off")), VrrPolicy::Off);
         assert_eq!(VrrPolicy::from_environment(None), VrrPolicy::Auto);
+
+        assert_eq!(TearingPolicy::from_environment(None), TearingPolicy::Auto);
+        assert_eq!(
+            TearingPolicy::from_environment(Some("auto")),
+            TearingPolicy::Auto
+        );
+        assert_eq!(
+            TearingPolicy::from_environment(Some("off")),
+            TearingPolicy::Off
+        );
     }
 
     #[test]

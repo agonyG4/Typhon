@@ -62,6 +62,7 @@ pub(super) enum DiagnosticFullscreenShader {
     CanonicalMaterial,
     LegacyUp2AndFragment,
     TerminalUp2AndFragment,
+    #[allow(dead_code, reason = "Reserved for diagnostic tests")]
     MaterialOnly,
     MaterialOnlyQ2,
     MaterialRawBlueBits,

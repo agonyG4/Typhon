@@ -122,10 +122,6 @@ pub(crate) fn native_mode_startup_source(
 }
 
 impl NativeModePreference {
-    pub(crate) fn from_env() -> Self {
-        Self::from_env_override().unwrap_or(Self::Auto)
-    }
-
     pub(crate) fn from_env_override() -> Option<Self> {
         let Some(value) = std::env::var_os("OBLIVION_ONE_MODE") else {
             return None;

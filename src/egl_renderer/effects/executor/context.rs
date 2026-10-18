@@ -1018,6 +1018,7 @@ impl EffectExecutionContext<'_> {
         )
     }
 
+    #[allow(dead_code, reason = "Reserved for alternate runtime paths")]
     pub(in crate::egl_renderer) fn draw_command_batch_with_visibility(
         &mut self,
         scene: bool,

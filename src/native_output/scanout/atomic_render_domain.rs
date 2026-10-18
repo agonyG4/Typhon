@@ -386,6 +386,7 @@ impl AtomicRenderDomain {
         }
     }
 
+    #[allow(dead_code, reason = "Reserved for alternate runtime paths")]
     pub(super) fn pool_identities(&self) -> Vec<(OutputSlotId, u64)> {
         self.pool
             .as_ref()
@@ -398,12 +399,14 @@ impl AtomicRenderDomain {
         }
     }
 
+    #[allow(dead_code, reason = "Reserved for alternate runtime paths")]
     pub(super) fn lifecycle_animation_available(&self) -> bool {
         self.scene
             .as_ref()
             .is_some_and(GlesSceneRenderer::lifecycle_animation_available)
     }
 
+    #[allow(dead_code, reason = "Reserved for alternate runtime paths")]
     pub(super) fn squash_animation_available(&self) -> bool {
         self.scene
             .as_ref()

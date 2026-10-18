@@ -856,8 +856,8 @@ pub(crate) enum FullRepaintReason {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum PartialRepaintComplexityPolicy {
-    #[default]
     Legacy,
+    #[default]
     StructuredExperimental,
 }
 
@@ -1336,7 +1336,10 @@ fn parse_partial_repaint_complexity_policy(
             PartialRepaintComplexityPolicy::StructuredExperimental,
             false,
         ),
-        Err(VarError::NotPresent) => (PartialRepaintComplexityPolicy::Legacy, false),
+        Err(VarError::NotPresent) => (
+            PartialRepaintComplexityPolicy::StructuredExperimental,
+            false,
+        ),
         Ok(_) | Err(VarError::NotUnicode(_)) => (PartialRepaintComplexityPolicy::Legacy, true),
     }
 }
@@ -1658,7 +1661,10 @@ mod partial_repaint_complexity_tests {
         );
         assert_eq!(
             parse_partial_repaint_complexity_policy(Err(VarError::NotPresent)),
-            (PartialRepaintComplexityPolicy::Legacy, false)
+            (
+                PartialRepaintComplexityPolicy::StructuredExperimental,
+                false
+            )
         );
         assert_eq!(
             parse_partial_repaint_complexity_policy(Ok("structured".to_owned())),
@@ -1987,6 +1993,7 @@ mod partial_repaint_complexity_tests {
 }
 
 impl PartialRepaintPlanner {
+    #[cfg(test)]
     pub(crate) fn new(
         output_size: (u32, u32),
         capabilities: EglPartialRepaintCapabilities,
@@ -2025,6 +2032,7 @@ impl PartialRepaintPlanner {
         }
     }
 
+    #[cfg(test)]
     pub(crate) const fn complexity_policy(&self) -> PartialRepaintComplexityPolicy {
         self.complexity_policy
     }

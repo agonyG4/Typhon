@@ -388,6 +388,7 @@ fn release_precomputed_owned<T, E: Copy>(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code, reason = "Reserved for alternate runtime paths")]
 pub(crate) fn prepare_effect_graph_execution<'a>(
     context: &mut EffectExecutionContext<'_>,
     graph: &'a CompiledFrameGraph,

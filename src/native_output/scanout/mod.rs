@@ -724,6 +724,7 @@ impl NativeScanoutBackend {
         }
     }
 
+    #[allow(dead_code, reason = "Reserved for alternate runtime paths")]
     pub(crate) fn release_direct_after_synchronous_modeset(&mut self) -> io::Result<()> {
         match self {
             Self::AtomicEglGbm(scanout) => scanout.release_direct_after_synchronous_modeset(),

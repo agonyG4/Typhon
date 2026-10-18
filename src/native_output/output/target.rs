@@ -193,6 +193,7 @@ pub(crate) fn query_kms_resources(
     }))
 }
 
+#[allow(dead_code, reason = "Reserved for alternate runtime paths")]
 pub(crate) fn select_kms_target(
     file: &fs::File,
     mode_preference: NativeModePreference,
@@ -324,6 +325,7 @@ pub(crate) fn native_output_capabilities(
     }
 }
 
+#[allow(dead_code, reason = "Reserved for alternate runtime paths")]
 pub(crate) fn project_native_output_modes(
     modes: &[drm_sys::drm_mode_modeinfo],
 ) -> (Vec<OutputModeSnapshot>, bool) {
@@ -507,6 +509,7 @@ pub(crate) fn select_crtc_id(
         .map(|(_, crtc_id)| *crtc_id)
 }
 
+#[allow(dead_code, reason = "Reserved for alternate runtime paths")]
 pub(crate) fn drm_mode_name(mode: &drm_sys::drm_mode_modeinfo) -> String {
     let bytes = mode
         .name

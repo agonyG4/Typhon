@@ -16,6 +16,7 @@ pub(crate) enum TerminalBoundaryReplay {
     CanonicalTerminalQ1Q2,
     KawaseOnlyProbe,
     MaterialOnlyProbe,
+    #[allow(dead_code, reason = "Reserved for diagnostic tests")]
     FragmentBoundaryProbe,
     CaptureTerminalStages,
 }
@@ -91,6 +92,7 @@ struct DiagnosticTerminalTail {
     composite: CompiledRenderPass,
     retained_input: GraphTextureId,
     upsample_output: GraphTextureId,
+    #[allow(dead_code, reason = "Reserved for diagnostic tests")]
     fragment_output: GraphTextureId,
 }
 

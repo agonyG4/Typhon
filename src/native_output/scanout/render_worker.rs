@@ -43,7 +43,7 @@ pub(crate) enum AtomicRenderWorkerPolicy {
 
 impl Default for AtomicRenderWorkerPolicy {
     fn default() -> Self {
-        Self::Off
+        Self::Auto
     }
 }
 
@@ -65,7 +65,8 @@ impl Error for AtomicRenderWorkerPolicyError {}
 impl AtomicRenderWorkerPolicy {
     pub(crate) fn parse(value: Option<&str>) -> Result<Self, AtomicRenderWorkerPolicyError> {
         match value {
-            None | Some("off") => Ok(Self::Off),
+            None => Ok(Self::default()),
+            Some("off") => Ok(Self::Off),
             Some("auto") => Ok(Self::Auto),
             Some("force") => Ok(Self::Force),
             Some(value) => Err(AtomicRenderWorkerPolicyError(value.to_owned())),
@@ -176,11 +177,14 @@ pub(crate) enum AtomicRenderControl {
         frame: EglSceneFrameCommit,
     },
     InvalidatePresentedDamageHistory,
+    #[allow(dead_code, reason = "Reserved for alternate variants")]
     FrameSwapFailed,
     PublishMaterialEffectGeneration(EffectRegistryGeneration),
+    #[allow(dead_code, reason = "Reserved for alternate variants")]
     PublishEffectRegistryGeneration(EffectRegistryGeneration),
     SetCursorImage(Arc<CompositorCursorImage>),
     RebindPoolGeneration(u64),
+    #[allow(dead_code, reason = "Reserved for alternate variants")]
     FinishRenderWork,
 }
 
@@ -1166,7 +1170,7 @@ fn render_worker_loop(
                     output_epoch,
                     render_generation,
                     target,
-                    frozen_frame: mut frozen_frame,
+                    mut frozen_frame,
                     need_no_visual_release_fence,
                     dispatch_at_ns,
                     required_control_epoch,
@@ -2162,14 +2166,14 @@ mod tests {
     use std::num::NonZeroU64;
 
     #[test]
-    fn worker_policy_defaults_off_and_parses_explicit_modes() {
+    fn worker_policy_defaults_auto_and_parses_explicit_modes() {
         assert_eq!(
             AtomicRenderWorkerPolicy::default(),
-            AtomicRenderWorkerPolicy::Off
+            AtomicRenderWorkerPolicy::Auto
         );
         assert_eq!(
             AtomicRenderWorkerPolicy::parse(None),
-            Ok(AtomicRenderWorkerPolicy::Off)
+            Ok(AtomicRenderWorkerPolicy::Auto)
         );
         assert_eq!(
             AtomicRenderWorkerPolicy::parse(Some("off")),

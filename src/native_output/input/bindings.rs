@@ -216,6 +216,18 @@ pub(crate) fn default_astrea_binding_specs() -> Vec<BindingSpec> {
             reserved: true,
         },
         BindingSpec {
+            modifiers: ModifierMask::SHIFT,
+            trigger: BindingTrigger::Press,
+            input: BindingInput::PhysicalKey(KEY_SYSRQ),
+            action: BindingActionDefinition::EmitShortcut {
+                namespace: "astrea-shell".to_string(),
+                name: "screenshot_region_frozen".to_string(),
+            },
+            repeat: RepeatPolicy::Disabled,
+            inhibition: InhibitionPolicy::Bypass,
+            reserved: true,
+        },
+        BindingSpec {
             modifiers: ModifierMask::SUPER,
             trigger: BindingTrigger::Press,
             input: BindingInput::PhysicalKey(KEY_SYSRQ),

@@ -1177,6 +1177,7 @@ impl CompositorState {
         );
     }
 
+    #[allow(dead_code, reason = "Reserved for alternate runtime paths")]
     pub(in crate::compositor) fn begin_lifecycle_restore(
         &mut self,
         window_id: WindowId,

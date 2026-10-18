@@ -1500,6 +1500,7 @@ impl PresentationEngine {
     }
 
     #[cfg(test)]
+    #[allow(dead_code, reason = "Reserved for compositor test helpers")]
     pub(crate) fn transition_curve(&self, key: u32) -> Option<AnimationCurve> {
         self.track_curve(synthetic_scene_node_id_from_key(key))
     }

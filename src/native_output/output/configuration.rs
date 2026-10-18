@@ -133,6 +133,7 @@ pub(crate) struct PreparedOutputConfigurationTransaction {
 }
 
 impl PreparedOutputConfigurationTransaction {
+    #[cfg(test)]
     pub(crate) const fn id(&self) -> OutputConfigurationTransactionId {
         self.id
     }
@@ -438,6 +439,7 @@ impl OutputConfigurationTransactions {
         Some((transaction.id, transaction.previous))
     }
 
+    #[allow(dead_code, reason = "Reserved for alternate runtime paths")]
     pub(crate) fn complete_rollback(
         &mut self,
         id: OutputConfigurationTransactionId,

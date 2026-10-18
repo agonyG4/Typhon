@@ -112,11 +112,13 @@ impl ActiveSceneView {
     }
 
     #[cfg(test)]
+    #[allow(dead_code, reason = "Reserved for compositor test helpers")]
     pub(in crate::compositor) const fn rebuild_count(&self) -> u64 {
         self.rebuild_count
     }
 
     #[cfg(test)]
+    #[allow(dead_code, reason = "Reserved for compositor test helpers")]
     pub(in crate::compositor) const fn incremental_surface_update_count(&self) -> u64 {
         self.incremental_surface_update_count
     }
@@ -1503,11 +1505,13 @@ impl CompositorState {
     }
 
     #[cfg(test)]
+    #[allow(dead_code, reason = "Reserved for compositor test helpers")]
     pub(in crate::compositor) const fn active_scene_rebuild_count(&self) -> u64 {
         self.active_scene_view.rebuild_count()
     }
 
     #[cfg(test)]
+    #[allow(dead_code, reason = "Reserved for compositor test helpers")]
     pub(in crate::compositor) const fn active_scene_surface_update_count(&self) -> u64 {
         self.active_scene_view.incremental_surface_update_count()
     }

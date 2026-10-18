@@ -381,6 +381,7 @@ impl NativeCursorResponsivenessTrace {
         trace
     }
 
+    #[allow(dead_code, reason = "Reserved for alternate runtime paths")]
     fn new(enabled: bool, capacity: usize, sample_stride: u64) -> Self {
         Self::new_with_path(enabled, capacity, sample_stride, None)
     }
@@ -694,6 +695,7 @@ impl NativeCursorResponsivenessTrace {
         }
     }
 
+    #[allow(dead_code, reason = "Reserved for alternate runtime paths")]
     pub(crate) fn sample(&self, sample_id: u64) -> Option<&CursorResponsivenessSample> {
         let oldest_id = self.records.front()?.sample_id;
         let index = usize::try_from(sample_id.checked_sub(oldest_id)?).ok()?;
@@ -710,6 +712,7 @@ impl NativeCursorResponsivenessTrace {
             .filter(|sample| sample.sample_id == sample_id)
     }
 
+    #[allow(dead_code, reason = "Reserved for alternate runtime paths")]
     pub(crate) fn cursor_transaction_attribution(
         &self,
         sample_id: u64,

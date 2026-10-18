@@ -75,6 +75,7 @@ impl NativeRenderTelemetry {
         );
     }
 
+    #[allow(dead_code, reason = "Reserved for alternate runtime paths")]
     pub(super) fn record_atomic(
         &mut self,
         render_us: u64,

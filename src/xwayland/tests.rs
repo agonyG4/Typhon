@@ -40,8 +40,8 @@ mod stderr_tests;
 mod managed_startup_tests;
 
 #[test]
-fn xwayland_mode_parses_only_opt_in_values() {
-    assert_eq!(XwaylandMode::parse(None), XwaylandMode::Off);
+fn xwayland_mode_defaults_to_managed_lazy_and_parses_explicit_modes() {
+    assert_eq!(XwaylandMode::parse(None), XwaylandMode::ManagedLazy);
     assert_eq!(XwaylandMode::parse(Some("off")), XwaylandMode::Off);
     assert_eq!(XwaylandMode::parse(Some("base")), XwaylandMode::BaseLazy);
     assert_eq!(XwaylandMode::parse(Some("lazy")), XwaylandMode::ManagedLazy);

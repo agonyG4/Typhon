@@ -1091,6 +1091,7 @@ pub(in crate::egl_renderer::tests) fn read_effect_texture_pixels(
     pixels
 }
 
+#[allow(dead_code, reason = "Reserved for diagnostic tests")]
 pub(in crate::egl_renderer::tests) fn read_effect_texture_pixels_f32(
     harness: &mut GlesEffectTestHarness,
     target: &PooledEffectTexture,

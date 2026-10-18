@@ -571,6 +571,12 @@ fn native_input_screenshot_bindings_are_exact_press_only_reserved_actions() {
     let cases = [
         ("quick", ModifierMask::EMPTY, &[][..], "screenshot_quick"),
         (
+            "frozen_shift_print",
+            ModifierMask::SHIFT,
+            &[KEY_LEFTSHIFT][..],
+            "screenshot_region_frozen",
+        ),
+        (
             "frozen",
             ModifierMask::SUPER,
             &[KEY_LEFTMETA][..],

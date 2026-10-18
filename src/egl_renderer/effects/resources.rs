@@ -381,6 +381,7 @@ impl GraphTextureBinding {
         self.ownership == GraphTextureBindingOwnership::CheckpointCache
     }
 
+    #[cfg(test)]
     pub(crate) fn is_precomputed_backdrop_alias(&self) -> bool {
         self.ownership == GraphTextureBindingOwnership::PrecomputedBackdropAlias
     }
@@ -512,6 +513,7 @@ impl EffectResourcePool {
         })
     }
 
+    #[cfg(test)]
     pub fn checkout(
         &mut self,
         key: EffectTextureKey,

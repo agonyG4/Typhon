@@ -4,6 +4,8 @@ pub(crate) use canonical_blur_semantics::{
     CanonicalBlurSemanticsPolicy, fragment_shader_variant, upsample_shader_variant,
 };
 mod capture;
+mod checkpoint_dependency_pruning;
+pub(crate) use checkpoint_dependency_pruning::CheckpointDependencyPruningPolicy;
 mod executor;
 mod gpu_timing;
 mod metrics;

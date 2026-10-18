@@ -146,14 +146,22 @@ fn v3_drag_transfers_png_and_offers_uri_after_start_drag_before_target_enter() {
         .data_device_enter_serial
         .expect("destination must receive the DnD enter serial");
     offer.accept(enter_serial, Some("image/png".to_string()));
+    // Firefox/Zen may initially prefer Move even when a screenshot drag
+    // source only supports Copy. This is valid before ASK resolution: the
+    // compositor must negotiate Copy rather than disconnect the browser.
     offer.set_actions(
-        client_wl_data_device_manager::DndAction::Copy,
-        client_wl_data_device_manager::DndAction::Copy,
+        client_wl_data_device_manager::DndAction::Copy
+            | client_wl_data_device_manager::DndAction::Move,
+        client_wl_data_device_manager::DndAction::Move,
     );
     target_connection.flush().unwrap();
     wait_for_server_commands(&commands);
-    target_queue.roundtrip(&mut target_state).unwrap();
+    target_queue
+        .roundtrip(&mut target_state)
+        .expect("destination must survive a non-intersecting preferred action");
     source_queue.roundtrip(&mut source_state).unwrap();
+    assert_eq!(target_state.data_offer_actions.last().copied(), Some(1));
+    assert_eq!(source_state.data_source_actions.last().copied(), Some(1));
 
     commands
         .send(ServerCommand::PointerButton {

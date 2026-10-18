@@ -374,6 +374,7 @@ pub(super) fn lifecycle_transfer_assert_pixel(
 }
 
 mod checkpoint_causal_gles;
+mod checkpoint_pruning_gles;
 mod checkpoint_replay;
 mod dependency_free_replay_cache;
 mod effect_capture;

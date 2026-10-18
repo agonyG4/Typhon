@@ -994,6 +994,27 @@ impl EffectExecutionTrace {
         });
     }
 
+    pub(crate) fn checkpoint_dependency_pruning(
+        &self,
+        policy: &'static str,
+        stats: oblivion_one::effects::EffectCheckpointDependencyPruningStats,
+    ) {
+        self.event(|| {
+            format!(
+                "event=effect_checkpoint_dependency_pruning frame_id={} policy={policy} edges_before={} edges_retained_intersecting={} edges_pruned={} edges_ineligible={} edges_unresolved={} edges_after={} consumers_became_dependency_free={} edges_retained_without_analysis={}",
+                optional_u64(self.frame_id),
+                stats.edges_before,
+                stats.edges_retained_intersecting,
+                stats.edges_pruned,
+                stats.edges_ineligible,
+                stats.edges_unresolved,
+                stats.edges_after,
+                stats.consumers_became_dependency_free,
+                stats.edges_retained_without_analysis,
+            )
+        });
+    }
+
     pub(crate) fn visible_clip_fallback(
         &self,
         pass: &CompiledRenderPass,

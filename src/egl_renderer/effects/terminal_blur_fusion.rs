@@ -6,8 +6,8 @@ pub(crate) const TERMINAL_BLUR_FUSION_ENV: &str = "TYPHON_EFFECT_TERMINAL_BLUR_F
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum TerminalBlurFusionPolicy {
-    #[default]
     Off,
+    #[default]
     On,
 }
 
@@ -21,7 +21,7 @@ impl TerminalBlurFusionPolicy {
 
     pub(crate) fn from_environment() -> Self {
         let (policy, unknown) = match std::env::var_os(TERMINAL_BLUR_FUSION_ENV) {
-            None => (Self::Off, false),
+            None => (Self::On, false),
             Some(value) => match value.to_str() {
                 Some(value) => parse_terminal_blur_fusion_policy(Some(value)),
                 None => (Self::Off, true),
@@ -38,7 +38,7 @@ pub(crate) fn parse_terminal_blur_fusion_policy(
     value: Option<&str>,
 ) -> (TerminalBlurFusionPolicy, bool) {
     match value.map(str::trim) {
-        None => (TerminalBlurFusionPolicy::Off, false),
+        None => (TerminalBlurFusionPolicy::On, false),
         Some(value) if value.eq_ignore_ascii_case("off") => (TerminalBlurFusionPolicy::Off, false),
         Some(value) if value.eq_ignore_ascii_case("on") => (TerminalBlurFusionPolicy::On, false),
         Some(_) => (TerminalBlurFusionPolicy::Off, true),
@@ -78,10 +78,10 @@ mod tests {
     };
 
     #[test]
-    fn policy_parser_defaults_closed_and_accepts_only_off_and_on() {
+    fn policy_parser_defaults_on_and_accepts_only_off_and_on() {
         assert_eq!(
             parse_terminal_blur_fusion_policy(None),
-            (TerminalBlurFusionPolicy::Off, false)
+            (TerminalBlurFusionPolicy::On, false)
         );
         assert_eq!(
             parse_terminal_blur_fusion_policy(Some("off")),

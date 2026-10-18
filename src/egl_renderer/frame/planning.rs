@@ -472,9 +472,17 @@ impl FramePipeline<'_> {
                     precomputed_window_blur: self.effects.precomputed_window_blur_policy
                         == super::super::effects::PrecomputedWindowBlurPolicy::On,
                     terminal_kawase_fusion,
+                    checkpoint_dependency_pruning: self
+                        .effects
+                        .checkpoint_dependency_pruning_policy
+                        == super::super::effects::CheckpointDependencyPruningPolicy::On,
                 },
             ) {
                 Ok(variants) => {
+                    self.effects.effect_trace.checkpoint_dependency_pruning(
+                        self.effects.checkpoint_dependency_pruning_policy.as_str(),
+                        variants.checkpoint_dependency_pruning.stats,
+                    );
                     let has_precomputed = variants.precomputed_backdrop.is_some();
                     let execution_plan = variants
                         .precomputed_graph
@@ -494,6 +502,10 @@ impl FramePipeline<'_> {
                     }
                 }
                 Err(_) => {
+                    self.effects.effect_trace.checkpoint_dependency_pruning(
+                        self.effects.checkpoint_dependency_pruning_policy.as_str(),
+                        Default::default(),
+                    );
                     self.scene.frame_stats.effect_fallbacks =
                         self.scene.frame_stats.effect_fallbacks.saturating_add(1);
                     self.scene.frame_stats.effect_instances_failed =

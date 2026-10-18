@@ -632,6 +632,7 @@ fn footprint_change_preserves_builtin_terminal_fusion_topology() {
             FrameExecutionCompileOptions {
                 precomputed_window_blur: false,
                 terminal_kawase_fusion,
+                checkpoint_dependency_pruning: false,
             },
         )
         .unwrap();

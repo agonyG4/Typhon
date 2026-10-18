@@ -413,6 +413,7 @@ impl NativeRuntime {
         Ok(())
     }
 
+    #[allow(dead_code, reason = "Reserved for alternate runtime paths")]
     pub(super) fn expect_render_worker_completion(
         &mut self,
         identity: crate::native_output::scanout::AtomicRenderWorkerIdentity,

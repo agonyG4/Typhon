@@ -151,6 +151,7 @@ impl KmsPresentationTiming {
         }
     }
 
+    #[allow(dead_code, reason = "Reserved for alternate runtime paths")]
     pub(crate) const fn fixed_commit_complete_deadline_ns(self) -> Option<u64> {
         match self {
             Self::Fixed(window) => Some(window.commit_complete_deadline_ns()),
@@ -158,6 +159,7 @@ impl KmsPresentationTiming {
         }
     }
 
+    #[allow(dead_code, reason = "Reserved for alternate runtime paths")]
     pub(crate) const fn dispatch_budget_ns(self) -> Option<u64> {
         match self {
             Self::Fixed(window) => Some(window.dispatch_budget_ns()),
@@ -165,6 +167,7 @@ impl KmsPresentationTiming {
         }
     }
 
+    #[allow(dead_code, reason = "Reserved for alternate runtime paths")]
     pub(crate) const fn apply_guard_ns(self) -> Option<u64> {
         match self {
             Self::Fixed(window) => Some(window.apply_guard_ns()),
@@ -176,6 +179,7 @@ impl KmsPresentationTiming {
         now_ns >= self.earliest_submit_ns()
     }
 
+    #[cfg(test)]
     pub(crate) const fn fixed_deadline_miss_at(self, submit_returned_at_ns: u64) -> Option<bool> {
         match self {
             Self::Fixed(window) => Some(window.is_dispatch_miss_at(submit_returned_at_ns)),

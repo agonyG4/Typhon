@@ -234,6 +234,7 @@ impl CompositorState {
     }
 
     #[cfg(test)]
+    #[allow(dead_code, reason = "Reserved for compositor test helpers")]
     pub(in crate::compositor) fn assert_renderable_surface_index_invariant_for_test(&self) {
         self.assert_renderable_surface_index_invariant();
     }
@@ -411,6 +412,7 @@ impl CompositorState {
         SurfacePublicationDecision::Publish
     }
 
+    #[allow(dead_code, reason = "Reserved for alternate runtime paths")]
     pub(in crate::compositor) fn async_surface_publication_decision(
         &self,
         surface_id: u32,
@@ -1188,6 +1190,7 @@ impl CompositorState {
         true
     }
 
+    #[allow(dead_code, reason = "Reserved for alternate runtime paths")]
     pub(in crate::compositor) fn set_output_refresh_hz(&mut self, refresh_hz: u32) -> bool {
         self.set_output_refresh_rate(OutputRefreshRate::from_hz(refresh_hz))
     }

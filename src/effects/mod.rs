@@ -1,3 +1,4 @@
+pub mod checkpoint_pruning;
 pub mod config;
 pub mod damage;
 pub mod footprint;
@@ -9,6 +10,7 @@ pub mod render_graph_demand;
 pub mod sample_support;
 pub mod validation;
 
+pub use checkpoint_pruning::*;
 pub use config::*;
 pub use damage::*;
 pub use footprint::*;

@@ -495,10 +495,18 @@ impl Dispatch<wl_data_offer::WlDataOffer, DataOfferData> for CompositorState {
                     );
                     return;
                 }
+                // During ordinary drag negotiation, a destination may prefer
+                // an action the source does not offer; select_dnd_action()
+                // falls back to an action both sides support. Only the final
+                // resolution of an ASK drop must use a source-offered action.
+                let resolving_ask = matches!(
+                    dropped_drag_phase,
+                    Some(DragSessionPhase::DroppedAwaitingAskResolution)
+                );
                 if preferred != 0
                     && (preferred & !actions != 0
                         || preferred & (preferred - 1) != 0
-                        || preferred & !source_actions != 0)
+                        || (resolving_ask && preferred & !source_actions != 0))
                 {
                     state.post_protocol_error(
                         client,

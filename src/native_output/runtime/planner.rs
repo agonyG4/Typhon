@@ -28,6 +28,7 @@ pub(crate) struct CursorServiceOpportunity {
 /// Plan the earliest legal physical cursor opportunity. Timing budgets define
 /// the service deadline and worker wake, while exact physical ownership alone
 /// can move the target to a later refresh. This is the late-latch policy.
+#[allow(dead_code, reason = "Reserved for alternate runtime paths")]
 pub(crate) fn plan_cursor_service_opportunity(
     planner: &PresentationDeadlinePlanner,
     timing: &CursorTimingDomain,
@@ -138,6 +139,7 @@ fn cursor_submit_window(
 /// Plan the cursor opportunity from a scene prediction without borrowing the
 /// primary scene's render cost. Only the prediction's KMS dispatch estimate
 /// is relevant to an independent cursor plane commit.
+#[allow(dead_code, reason = "Reserved for alternate runtime paths")]
 pub(crate) fn plan_cursor_service_opportunity_with_scene_prediction(
     planner: &PresentationDeadlinePlanner,
     timing: &CursorTimingDomain,

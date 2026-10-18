@@ -131,6 +131,7 @@ impl LifecycleRenderState {
         self.visual_store.visual_sources = snapshot.visual_sources;
     }
 
+    #[allow(dead_code, reason = "Reserved for alternate runtime paths")]
     pub(super) fn texture_sources<'a>(
         &'a self,
         ordinary: ResourceTextureView<'a>,

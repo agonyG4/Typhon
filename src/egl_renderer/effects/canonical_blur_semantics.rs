@@ -4,8 +4,8 @@ pub(crate) const CANONICAL_BLUR_SEMANTICS_ENV: &str = "TYPHON_EFFECT_CANONICAL_B
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum CanonicalBlurSemanticsPolicy {
-    #[default]
     Legacy,
+    #[default]
     Canonical,
 }
 
@@ -19,7 +19,7 @@ impl CanonicalBlurSemanticsPolicy {
 
     pub(crate) fn from_environment() -> Self {
         let (policy, unknown) = match std::env::var_os(CANONICAL_BLUR_SEMANTICS_ENV) {
-            None => (Self::Legacy, false),
+            None => (Self::Canonical, false),
             Some(value) => match value.to_str() {
                 Some(value) => parse_canonical_blur_semantics_policy(Some(value)),
                 None => (Self::Legacy, true),
@@ -36,7 +36,7 @@ pub(crate) fn parse_canonical_blur_semantics_policy(
     value: Option<&str>,
 ) -> (CanonicalBlurSemanticsPolicy, bool) {
     match value.map(str::trim) {
-        None => (CanonicalBlurSemanticsPolicy::Legacy, false),
+        None => (CanonicalBlurSemanticsPolicy::Canonical, false),
         Some(value) if value.eq_ignore_ascii_case("legacy") => {
             (CanonicalBlurSemanticsPolicy::Legacy, false)
         }
@@ -94,10 +94,10 @@ mod tests {
     };
 
     #[test]
-    fn parser_defaults_to_legacy_and_accepts_trimmed_case_insensitive_values() {
+    fn parser_defaults_to_canonical_and_accepts_trimmed_case_insensitive_values() {
         assert_eq!(
             parse_canonical_blur_semantics_policy(None),
-            (CanonicalBlurSemanticsPolicy::Legacy, false)
+            (CanonicalBlurSemanticsPolicy::Canonical, false)
         );
         assert_eq!(
             parse_canonical_blur_semantics_policy(Some("legacy")),

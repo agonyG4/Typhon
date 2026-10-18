@@ -4,11 +4,13 @@ use super::*;
 pub(crate) enum EffectExecutionInvariantError {
     MissingPassOutput(GraphPassId),
     UnknownTexture(GraphTextureId),
+    #[allow(dead_code, reason = "Reserved for alternate variants")]
     UninitializedInputRegion {
         consumer: GraphPassId,
         input: GraphTextureId,
         missing: EffectRegion,
     },
+    #[allow(dead_code, reason = "Reserved for alternate variants")]
     InvalidCheckpointSource {
         pass: GraphPassId,
         missing: EffectRegion,

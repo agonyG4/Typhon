@@ -981,6 +981,7 @@ impl TimingState {
         }
     }
 
+    #[cfg(test)]
     fn begin_scope(&mut self, frame_id: Option<u64>) -> Option<GraphTimingScope> {
         self.begin_scope_with_role(frame_id, TimingScopeRole::EffectGraph)
     }

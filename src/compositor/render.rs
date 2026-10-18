@@ -3180,6 +3180,7 @@ pub fn surface_origin(index: usize, surface: &RenderableSurface) -> (i32, i32) {
     )
 }
 
+#[allow(dead_code, reason = "Reserved for alternate runtime paths")]
 pub fn surface_local_point_at_origin(
     surface: &RenderableSurface,
     origin: (i32, i32),

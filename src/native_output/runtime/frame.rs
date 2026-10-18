@@ -1145,6 +1145,7 @@ pub(crate) fn native_repaint_decision(inputs: NativeRepaintInputs) -> NativeRepa
     }
 }
 
+#[allow(dead_code, reason = "Reserved for alternate runtime paths")]
 pub(crate) fn normalize_refresh_hz(refresh_hz: u32) -> u32 {
     if refresh_hz == 0 {
         60
@@ -1545,6 +1546,7 @@ impl NativeCursorOutputArbitration {
         self.pending_since_ns.is_some()
     }
 
+    #[allow(dead_code, reason = "Reserved for alternate runtime paths")]
     pub(crate) const fn hardware_cursor_pending(&self) -> bool {
         self.hardware_cursor_pending
     }
@@ -2417,6 +2419,7 @@ pub(crate) struct FrozenNativeRenderFrame {
     pub(crate) surface_resource_sync_states: Vec<SurfaceResourceSyncState>,
     current_damage: Option<OutputDamage>,
     presentation_visual_signature: u64,
+    #[allow(dead_code, reason = "Reserved snapshot metadata")]
     pub(crate) identity: FrozenRenderSnapshotIdentity,
     projection_consumed: bool,
 }

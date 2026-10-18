@@ -27,12 +27,35 @@ pub(crate) enum SchedulingQosPolicy {
 
 impl SchedulingQosPolicy {
     pub(crate) fn parse(value: Option<&str>) -> Result<Self, String> {
-        match value.unwrap_or("off") {
+        match value.unwrap_or("auto") {
             "off" => Ok(Self::Off),
             "auto" => Ok(Self::Auto),
             "require" => Ok(Self::Require),
             other => Err(format!("invalid scheduling QoS policy `{other}`")),
         }
+    }
+}
+
+#[cfg(test)]
+mod scheduling_qos_policy_tests {
+    use super::SchedulingQosPolicy;
+
+    #[test]
+    fn policy_defaults_to_auto_and_preserves_explicit_rollback_modes() {
+        assert_eq!(SchedulingQosPolicy::parse(None), Ok(SchedulingQosPolicy::Auto));
+        assert_eq!(
+            SchedulingQosPolicy::parse(Some("off")),
+            Ok(SchedulingQosPolicy::Off)
+        );
+        assert_eq!(
+            SchedulingQosPolicy::parse(Some("auto")),
+            Ok(SchedulingQosPolicy::Auto)
+        );
+        assert_eq!(
+            SchedulingQosPolicy::parse(Some("require")),
+            Ok(SchedulingQosPolicy::Require)
+        );
+        assert!(SchedulingQosPolicy::parse(Some("invalid")).is_err());
     }
 }
 

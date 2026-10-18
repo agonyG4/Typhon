@@ -4,6 +4,10 @@ use crate::compositor::{
     EffectAnchor, EffectAnchorScope, ResolvedEffectInstance, ResolvedEffectScene, VisualGroupId,
 };
 
+use super::checkpoint_pruning::{
+    apply_checkpoint_dependency_pruning_plan, disabled_pruning_plan,
+    plan_effect_checkpoint_dependency_pruning, EffectCheckpointDependencyPruningPlan,
+};
 use super::registry::EffectRegistry;
 use super::render_graph_demand::{
     EffectDemandPlannerPolicy, EffectDemandRegionalFallbackReason,
@@ -493,12 +497,16 @@ pub struct CompiledFrameExecutionVariants {
     pub precomputed_graph: Option<CompiledFrameGraph>,
     pub precomputed_backdrop: Option<CompiledPrecomputedBackdropPlan>,
     pub eligible_instances: usize,
+    pub checkpoint_dependency_pruning: EffectCheckpointDependencyPruningPlan,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct FrameExecutionCompileOptions {
     pub precomputed_window_blur: bool,
     pub terminal_kawase_fusion: bool,
+    /// Apply exact-graph dependency pruning only after precomputed eligibility
+    /// and graph construction have completed on the conservative graph.
+    pub checkpoint_dependency_pruning: bool,
 }
 
 pub fn compile_precomputed_backdrop_build(
@@ -2400,6 +2408,7 @@ pub fn compile_frame_execution_variants(
         FrameExecutionCompileOptions {
             precomputed_window_blur: precomputed_window_blur_enabled,
             terminal_kawase_fusion: false,
+            checkpoint_dependency_pruning: false,
         },
     )
 }
@@ -2414,17 +2423,44 @@ pub fn compile_frame_execution_variants_with_options(
     registry: &EffectRegistry,
     options: FrameExecutionCompileOptions,
 ) -> Result<CompiledFrameExecutionVariants, RenderGraphCompileError> {
-    let exact = match compile_frame_execution_graph(
+    let mut variants = compile_frame_execution_variants_unpruned(
+        scene,
+        source_damage,
+        output_bounds,
+        registry,
+        options,
+    )?;
+    match &mut variants.exact {
+        FrameExecutionPlan::LegacyScene => {
+            variants.checkpoint_dependency_pruning = disabled_pruning_plan(None);
+        }
+        FrameExecutionPlan::EffectGraph(graph) if options.checkpoint_dependency_pruning => {
+            let plan = plan_effect_checkpoint_dependency_pruning(graph);
+            variants.checkpoint_dependency_pruning =
+                apply_checkpoint_dependency_pruning_plan(graph, plan);
+        }
+        FrameExecutionPlan::EffectGraph(graph) => {
+            variants.checkpoint_dependency_pruning = disabled_pruning_plan(Some(graph));
+        }
+    }
+    Ok(variants)
+}
+
+fn compile_frame_execution_variants_unpruned(
+    scene: &ResolvedEffectScene,
+    source_damage: &EffectRegion,
+    output_bounds: EffectRect,
+    registry: &EffectRegistry,
+    options: FrameExecutionCompileOptions,
+) -> Result<CompiledFrameExecutionVariants, RenderGraphCompileError> {
+    let exact = compile_frame_execution_graph(
         scene,
         source_damage,
         output_bounds,
         registry,
         &[],
         options.terminal_kawase_fusion,
-    )? {
-        plan @ FrameExecutionPlan::LegacyScene => plan,
-        FrameExecutionPlan::EffectGraph(graph) => FrameExecutionPlan::EffectGraph(graph),
-    };
+    )?;
     let mut eligible = scene
         .instances
         .iter()
@@ -2444,6 +2480,7 @@ pub fn compile_frame_execution_variants_with_options(
             precomputed_graph: None,
             precomputed_backdrop: None,
             eligible_instances,
+            checkpoint_dependency_pruning: EffectCheckpointDependencyPruningPlan::default(),
         });
     }
 
@@ -2462,6 +2499,7 @@ pub fn compile_frame_execution_variants_with_options(
             precomputed_graph: None,
             precomputed_backdrop: None,
             eligible_instances,
+            checkpoint_dependency_pruning: EffectCheckpointDependencyPruningPlan::default(),
         });
     }
     let candidates = eligible
@@ -2485,6 +2523,7 @@ pub fn compile_frame_execution_variants_with_options(
             precomputed_graph: None,
             precomputed_backdrop: None,
             eligible_instances,
+            checkpoint_dependency_pruning: EffectCheckpointDependencyPruningPlan::default(),
         });
     };
     let consumers = candidates
@@ -2511,6 +2550,7 @@ pub fn compile_frame_execution_variants_with_options(
             precomputed_graph: None,
             precomputed_backdrop: None,
             eligible_instances,
+            checkpoint_dependency_pruning: EffectCheckpointDependencyPruningPlan::default(),
         });
     }
     let build_passes = 1 + usize::from(blur.passes) * 2;
@@ -2530,6 +2570,7 @@ pub fn compile_frame_execution_variants_with_options(
             build_passes,
         }),
         eligible_instances,
+        checkpoint_dependency_pruning: EffectCheckpointDependencyPruningPlan::default(),
     })
 }
 
@@ -8883,6 +8924,7 @@ mod tests {
             FrameExecutionCompileOptions {
                 precomputed_window_blur: false,
                 terminal_kawase_fusion: enabled,
+                checkpoint_dependency_pruning: false,
             },
         )
         .expect("terminal-fusion graph compiles");
@@ -9275,6 +9317,7 @@ mod tests {
             let options = |enabled| FrameExecutionCompileOptions {
                 precomputed_window_blur: false,
                 terminal_kawase_fusion: enabled,
+                checkpoint_dependency_pruning: false,
             };
             let off = compile_frame_execution_variants_with_options(
                 &scene,

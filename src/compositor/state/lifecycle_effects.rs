@@ -6,6 +6,7 @@ use std::collections::HashMap;
 
 impl CompositorState {
     #[cfg(test)]
+    #[allow(dead_code, reason = "Reserved for compositor test helpers")]
     pub(in crate::compositor) fn resolved_effect_scene_for_composition_plan(
         &self,
         fullscreen_plan: &FullscreenCompositionPlan,

@@ -107,6 +107,14 @@ impl Dispatch<astrea_shortcut_v1::AstreaShortcutV1, ()> for BridgeState {
                 );
                 let _ = writeln!(stdout, "cancelled {serial}");
             }
+            astrea_shortcut_v1::Event::Registered { .. } => {}
+            astrea_shortcut_v1::Event::Rejected { serial, reason } => {
+                state.rejected = true;
+                let _ = writeln!(
+                    io::stderr().lock(),
+                    "rejected {serial}: shortcut registration failed (reason {reason})"
+                );
+            }
         }
         let _ = stdout.flush();
     }

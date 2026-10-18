@@ -363,6 +363,7 @@ fn terminal_graph_variant_with_source_damage(
         oblivion_one::effects::FrameExecutionCompileOptions {
             precomputed_window_blur: false,
             terminal_kawase_fusion: terminal_fusion,
+            checkpoint_dependency_pruning: false,
         },
     )
     .expect("terminal blur graph compiles");
@@ -513,6 +514,7 @@ struct Rgba16fDifferenceSample {
     logical_effect_local_coordinate: [i32; 2],
     legacy_rgba: [f32; 4],
     diagnostic_rgba: [f32; 4],
+    #[allow(dead_code, reason = "Reserved for diagnostic tests")]
     absolute_difference: [f32; 4],
     ulp_difference: [u32; 4],
 }
@@ -655,6 +657,7 @@ struct Rgba8DifferenceSample {
     logical_output_coordinate: [u32; 2],
     legacy_rgba: [u8; 4],
     candidate_rgba: [u8; 4],
+    #[allow(dead_code, reason = "Reserved for diagnostic tests")]
     absolute_difference: [u8; 4],
 }
 

@@ -74,6 +74,7 @@ fn material_graph_for(
         FrameExecutionCompileOptions {
             precomputed_window_blur: false,
             terminal_kawase_fusion,
+            checkpoint_dependency_pruning: false,
         },
     )
     .unwrap();
@@ -125,6 +126,7 @@ fn multi_material_graph(
         FrameExecutionCompileOptions {
             precomputed_window_blur: false,
             terminal_kawase_fusion: true,
+            checkpoint_dependency_pruning: false,
         },
     )
     .unwrap();
@@ -741,6 +743,7 @@ fn aggregate_checkpoint_edges_report_sample_support_pruning_candidates() {
     assert_eq!(analysis.aggregate_checkpoint_dependency_count, 1);
     assert_eq!(analysis.sample_support_checkpoint_dependency_count, 0);
     assert_eq!(analysis.prunable_checkpoint_candidates, 1);
+    assert_eq!(analysis.unresolved_checkpoint_dependency_count, 0);
 }
 
 #[test]

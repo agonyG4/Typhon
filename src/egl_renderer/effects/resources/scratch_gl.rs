@@ -79,7 +79,7 @@ mod tests {
 
     #[test]
     fn warm_and_cold_reclaim_delete_gl_textures_and_recreate_effect_fbos() {
-        let mut harness = crate::egl_renderer::tests::GlesEffectTestHarness::new(16, 16);
+        let harness = crate::egl_renderer::tests::GlesEffectTestHarness::new(16, 16);
         let mut cache = EffectGlResourceCache::new();
         let make_key = |size| {
             EffectTextureKey::new(
