@@ -517,11 +517,13 @@ host is still constructing or submitting Replay commands. Host CPU phase fields
 are provided specifically to distinguish that ambiguity; they do not prewarm,
 synchronize, or otherwise alter client textures or capture policy.
 
-The active profiler preallocates a fixed pool of 4,096 query objects (2,048
-timestamp-pair slots), sized from Typhon's 128-instance bound, the current
-six-pass built-in blur instance shape, and two expected in-flight graph
-scopes. Pool exhaustion drops only timing spans; it never changes effect
-execution or rendering. No query is allocated in the per-pass path.
+The active profiler preallocates a fixed pool of 4,608 query objects (2,304
+timestamp-pair slots). Its expected two-scope peak is 2,048 spans: one graph
+total plus 128 instances times six built-in blur pass spans and one Composite
+Scene Replay span, plus at most 127 Checkpoint Scene Replay spans per scope.
+The remaining 256 slots are a bounded backlog reserve. Pool exhaustion drops
+only timing spans; it never changes effect execution or rendering. No query is
+allocated in the per-pass path.
 
 ### Composite Scene Replay Attribution v1
 
@@ -614,12 +616,18 @@ strict `>` duration comparison, so equal-duration spans keep the first
 resolved physical winner and all static/execution metadata comes from that
 same span.
 
-Each eligible replay costs one additional timestamp pair from the existing
-2,048-span/4,096-query pool. The compile-time bound now proves two expected
-in-flight graph scopes times one graph-total span plus 128 instances times the
-current six built-in blur pass spans plus one Composite Scene Replay span per
-instance: `2 * (1 + 128 * 7) = 1,794`, which remains within the unchanged
-2,048-span pool. No second profiler or query pool is created.
+Each eligible replay costs one additional timestamp pair from the shared
+2,304-span/4,608-query pool. The compile-time capacity equation is
+`2 * (1 + 128 * (6 + 1) + 127) = 2,048` expected spans, plus a fixed 256-span
+backlog reserve. The 127 Checkpoint Scene Replay bound follows from the graph
+and executor invariants: capture passes for one effect instance share the
+instance's capture anchor and checkpoint dependencies; `scene_cursor` only
+advances, so repeated captures at the same position cannot issue another
+physical replay; and the first ordered instance cannot depend on an earlier
+effect checkpoint. The capacity test fills two scopes with every category in
+this equation, including 127 checkpoint replays each, and verifies that the
+reserve remains free and no timing span is dropped. The pool stays fixed and
+preallocated; there is no frame-critical dynamic query allocation.
 
 Composite Scene Replay spans have their own timing purpose and never enter
 effect-pass category durations, `timed_passes`, `max_effect_*`,
@@ -628,6 +636,84 @@ effect-pass category durations, `timed_passes`, `max_effect_*`,
 retain their prior meanings. In particular, the graph gap remains the largest
 space between existing individually timed effect-pass boundaries; replay timing
 is compared with that remainder and does not subtract from or redefine it.
+
+### Checkpoint Scene Replay Attribution
+
+Checkpoint Scene Replay measures only the ordinary scene range draw performed
+for `scene_advance_reason=checkpoint_dependency` immediately before a
+checkpoint-dependent `SceneCapture` or `SurfaceCapture`. It is eligible only
+when a graph timing scope exists, the capture has checkpoint dependencies,
+`draw_end > scene_cursor`, active work is non-empty, and capture is not in
+progress. The span starts immediately before the existing
+`draw_effect_scene_range()` call and ends immediately after it. Texture
+preparation, checkpoint allocation, the capture pass, cache updates, later
+effect passes, and tracing are outside the span. If no physical scene range
+draw occurs, no checkpoint replay span is allocated.
+
+Each resolved maximum record names its owning capture pass and instance, pass
+kind (`scene` or `surface`), checkpoint dependency count, scene command range,
+active work, region and scan pairs, pending checkpoint requirements, and the
+same host and frame-stat deltas used by Composite Scene Replay. Its complete
+metadata comes from one physical replay span. Equal GPU durations keep the
+first resolved physical span.
+
+The appended aggregate fields are:
+
+```text
+checkpoint_scene_replay_timing_available
+checkpoint_scene_replay_expected_spans checkpoint_scene_replay_resolved_spans
+checkpoint_scene_replay_gpu_ns checkpoint_scene_replay_host_cpu_ns
+checkpoint_scene_replay_scene_scan_pairs
+checkpoint_scene_replay_commands_executed checkpoint_scene_replay_draw_calls
+checkpoint_scene_replay_texture_binds
+```
+
+The `max_checkpoint_scene_replay_*` fields include the owner pass ID, instance
+ID, kind, checkpoint count, command range and count, scene command population,
+active work, command-region and scan pairs, pending checkpoint count, host
+time, considered and executed commands, draw calls, texture binds, and scene
+VBO upload counts and bytes.
+
+Checkpoint Scene Replay is a separate timing purpose, not an effect pass. It
+never contributes to `durations_ns`, pass categories, `timed_passes`,
+`max_effect_*`, `max_capture_*`, `TimedPassBoundary`, or
+`record_pass_interval()`. The pre-existing `pass_timed_ns`,
+`graph_unattributed_ns = total_ns - pass_timed_ns`, and Graph Gap Attribution
+retain their historical meanings. Graph gaps continue to describe the largest
+interval between the existing effect-pass timestamp boundaries; replay spans
+do not add boundaries.
+
+The new residual fields are available only when both Composite and Checkpoint
+Scene Replay summaries have complete span coverage and execution detail, and
+the scope has no dropped or invalid effect-pass spans (`dropped_passes=0`):
+
+```text
+graph_residual_attribution_available
+scene_replay_attributed_ns
+graph_residual_unattributed_ns
+```
+
+When available, `scene_replay_attributed_ns` is the saturating sum of the two
+replay GPU totals, and `graph_residual_unattributed_ns` is
+`total_ns.saturating_sub(pass_timed_ns).saturating_sub(scene_replay_attributed_ns)`.
+When either replay summary is incomplete or normal pass timing is incomplete,
+availability is zero and both residual values are zero; the independent replay
+totals remain diagnostic partial values. The subtraction is valid because both
+replay classes time only their ordinary scene draw, each ends before its owning
+effect pass begins, the
+checkpoint advance and Composite advance execute in separate ordered blocks,
+and the monotonic scene cursor prevents the same range from being replayed
+twice. Host CPU time is not part of this GPU-time subtraction.
+
+Timestamp queries remain asynchronous: no query-result read, fence, flush,
+finish, or readback is added for this measurement. Per-span allocation,
+timestamp, or execution-detail failures make only that replay summary
+unavailable and do not count as dropped effect passes. As in the existing
+profiler, a device-level `GL_EXT_disjoint_timer_query` event invalidates all
+outstanding timestamp evidence because the GPU clock interval itself is
+unreliable; that global condition is distinct from a failed Checkpoint replay
+span. GPU timestamps are diagnostic attribution and do not by themselves
+identify a rendering root cause or establish physical qualification.
 
 ### Pass-level tail attribution and graph coverage
 

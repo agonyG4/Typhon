@@ -619,6 +619,14 @@ pub(super) fn finalize_composite_scene_replay_timing(
     finish_timing: impl FnOnce() -> bool,
     build_detail: impl FnOnce() -> CompositeSceneReplayExecutionDetail,
 ) -> Option<CompositeSceneReplayExecutionDetail> {
+    finalize_scene_replay_timing(timing_allocated, finish_timing, build_detail)
+}
+
+pub(super) fn finalize_scene_replay_timing(
+    timing_allocated: bool,
+    finish_timing: impl FnOnce() -> bool,
+    build_detail: impl FnOnce() -> SceneReplayExecutionDetail,
+) -> Option<SceneReplayExecutionDetail> {
     if timing_allocated && finish_timing() {
         Some(build_detail())
     } else {

@@ -594,6 +594,7 @@ pub(super) fn execute_graph_passes_inner(
                     pass.anchor_scope,
                 );
                 if draw_end > scene_cursor {
+                    let active_work = scene_work_state.active_work();
                     if renderer.runtime.effect_trace.enabled() {
                         let metrics = scene_work_state.work_trace_metrics();
                         renderer.runtime.effect_trace.scene_replay_boundary(
@@ -609,15 +610,83 @@ pub(super) fn execute_graph_passes_inner(
                             metrics.4,
                         );
                     }
-                    renderer.draw_effect_scene_range(
-                        scene_work_state.active_work(),
+                    let checkpoint_scene_replay = if should_time_checkpoint_scene_replay(
+                        Some(scene_advance_reason),
+                        pass.kind,
+                        pass.checkpoint_dependencies.len(),
+                        graph_scope.is_some(),
+                        scene_cursor,
+                        draw_end,
+                        !active_work.is_empty(),
+                        renderer.runtime.capture_in_progress,
+                    ) {
+                        let work = scene_replay_work(
+                            scene_cursor,
+                            draw_end,
+                            renderer.scene.commands.len(),
+                            active_work,
+                            scene_work_state.pending_checkpoint_requirements(),
+                        );
+                        graph_scope.and_then(|scope| {
+                            renderer
+                                .runtime
+                                .effect_gpu_profiler
+                                .begin_checkpoint_scene_replay(
+                                    renderer.gl,
+                                    scope,
+                                    u64::from(pass.id.get()),
+                                    pass.instance.get(),
+                                    pass.kind,
+                                    pass.checkpoint_dependencies.len(),
+                                    work,
+                                )
+                        })
+                    } else {
+                        None
+                    };
+                    let replay_host_start =
+                        checkpoint_scene_replay.as_ref().map(|_| Instant::now());
+                    let replay_stats_before = checkpoint_scene_replay
+                        .as_ref()
+                        .map(|_| renderer.scene.frame_stats);
+                    let draw_result = renderer.draw_effect_scene_range(
+                        active_work,
                         scene_cursor,
                         draw_end,
                         framebuffer_origin,
                         targets.composition_draw,
-                    )?;
-                    scene_valid_region =
-                        scene_valid_region_after_scene_advance(scene_work_state.active_work());
+                    );
+                    if let Some(replay_span) = checkpoint_scene_replay {
+                        let host_cpu_ns = monotonic_elapsed_ns(replay_host_start);
+                        let detail = finalize_scene_replay_timing(
+                            true,
+                            || {
+                                renderer
+                                    .runtime
+                                    .effect_gpu_profiler
+                                    .end_checkpoint_scene_replay(renderer.gl, replay_span)
+                            },
+                            || {
+                                scene_replay_execution_detail(
+                                    replay_stats_before
+                                        .expect("Checkpoint replay timing captured before draw"),
+                                    renderer.scene.frame_stats,
+                                    host_cpu_ns,
+                                )
+                            },
+                        );
+                        if let Some(detail) = detail {
+                            renderer
+                                .runtime
+                                .effect_gpu_profiler
+                                .attach_checkpoint_scene_replay_execution_detail(
+                                    replay_span,
+                                    detail,
+                                );
+                        }
+                    }
+                    draw_result?;
+                    scene_valid_region = scene_valid_region_after_scene_advance(active_work);
                     if renderer.runtime.effect_trace.enabled() {
                         let metrics = scene_work_state.work_trace_metrics();
                         renderer.runtime.effect_trace.scene_replay_boundary(

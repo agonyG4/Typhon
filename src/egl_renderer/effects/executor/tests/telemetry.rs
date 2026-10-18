@@ -473,6 +473,279 @@ fn composite_scene_replay_execution_detail_uses_saturating_frame_stat_deltas() {
 }
 
 #[test]
+fn checkpoint_scene_replay_finalization_builds_detail_after_gpu_end() {
+    use std::cell::RefCell;
+
+    let events = RefCell::new(Vec::new());
+    events.borrow_mut().push("draw_returns");
+    let detail = finalize_scene_replay_timing(
+        true,
+        || {
+            events.borrow_mut().push("gpu_end");
+            true
+        },
+        || {
+            events.borrow_mut().push("detail_build");
+            SceneReplayExecutionDetail::default()
+        },
+    );
+    assert!(detail.is_some());
+    events.borrow_mut().push("detail_attach");
+
+    assert_eq!(
+        *events.borrow(),
+        ["draw_returns", "gpu_end", "detail_build", "detail_attach"]
+    );
+}
+
+#[test]
+fn checkpoint_scene_replay_finalization_skips_work_without_a_span() {
+    let detail = finalize_scene_replay_timing(
+        false,
+        || panic!("disabled profiler must not issue GPU END"),
+        || panic!("disabled profiler must not build execution detail"),
+    );
+    assert_eq!(detail, None);
+}
+
+#[test]
+fn checkpoint_scene_replay_eligibility_matches_physical_advance_contract() {
+    let cases = [
+        (
+            "SceneCapture with checkpoint dependency",
+            Some("checkpoint_dependency"),
+            RenderPassKind::SceneCapture,
+            1,
+            true,
+            10,
+            20,
+            true,
+            false,
+            true,
+        ),
+        (
+            "SurfaceCapture with checkpoint dependency",
+            Some("checkpoint_dependency"),
+            RenderPassKind::SurfaceCapture,
+            2,
+            true,
+            10,
+            20,
+            true,
+            false,
+            true,
+        ),
+        (
+            "dependency-free capture",
+            None,
+            RenderPassKind::SceneCapture,
+            0,
+            true,
+            10,
+            20,
+            true,
+            false,
+            false,
+        ),
+        (
+            "checkpoint reason without dependency metadata",
+            Some("checkpoint_dependency"),
+            RenderPassKind::SceneCapture,
+            0,
+            true,
+            10,
+            20,
+            true,
+            false,
+            false,
+        ),
+        (
+            "ordinary Composite advance",
+            Some("composite_advance"),
+            RenderPassKind::Composite,
+            1,
+            true,
+            10,
+            20,
+            true,
+            false,
+            false,
+        ),
+        (
+            "no graph timing scope",
+            Some("checkpoint_dependency"),
+            RenderPassKind::SceneCapture,
+            1,
+            false,
+            10,
+            20,
+            true,
+            false,
+            false,
+        ),
+        (
+            "same scene position",
+            Some("checkpoint_dependency"),
+            RenderPassKind::SceneCapture,
+            1,
+            true,
+            10,
+            10,
+            true,
+            false,
+            false,
+        ),
+        (
+            "draw end before cursor",
+            Some("checkpoint_dependency"),
+            RenderPassKind::SceneCapture,
+            1,
+            true,
+            10,
+            9,
+            true,
+            false,
+            false,
+        ),
+        (
+            "empty active work",
+            Some("checkpoint_dependency"),
+            RenderPassKind::SceneCapture,
+            1,
+            true,
+            10,
+            20,
+            false,
+            false,
+            false,
+        ),
+        (
+            "capture in progress",
+            Some("checkpoint_dependency"),
+            RenderPassKind::SceneCapture,
+            1,
+            true,
+            10,
+            20,
+            true,
+            true,
+            false,
+        ),
+        (
+            "framebuffer capture advance",
+            Some("framebuffer_capture"),
+            RenderPassKind::SceneCapture,
+            0,
+            true,
+            10,
+            20,
+            true,
+            false,
+            false,
+        ),
+    ];
+
+    for (
+        name,
+        reason,
+        pass_kind,
+        checkpoint_dependency_count,
+        graph_timing_active,
+        scene_cursor,
+        draw_end,
+        has_active_work,
+        capture_in_progress,
+        expected,
+    ) in cases
+    {
+        assert_eq!(
+            should_time_checkpoint_scene_replay(
+                reason,
+                pass_kind,
+                checkpoint_dependency_count,
+                graph_timing_active,
+                scene_cursor,
+                draw_end,
+                has_active_work,
+                capture_in_progress,
+            ),
+            expected,
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn repeated_capture_at_same_position_has_no_second_physical_replay() {
+    let first = should_time_checkpoint_scene_replay(
+        Some("checkpoint_dependency"),
+        RenderPassKind::SceneCapture,
+        1,
+        true,
+        0,
+        12,
+        true,
+        false,
+    );
+    let second_at_same_position = should_time_checkpoint_scene_replay(
+        Some("checkpoint_dependency"),
+        RenderPassKind::SurfaceCapture,
+        1,
+        true,
+        12,
+        12,
+        true,
+        false,
+    );
+
+    assert!(first);
+    assert!(!second_at_same_position);
+}
+
+#[test]
+fn scene_replay_execution_detail_uses_saturating_frame_stat_deltas() {
+    let mut before = GlesSceneFrameStats::default();
+    before.commands_considered = 10;
+    before.commands_executed = 8;
+    before.draw_calls = 7;
+    before.texture_binds = 6;
+    before.scene_vbo_uploads = 5;
+    before.scene_vbo_upload_bytes = 4_000;
+    let mut after = before;
+    after.commands_considered = 15;
+    after.commands_executed = 9;
+    after.draw_calls = 10;
+    after.texture_binds = 12;
+    after.scene_vbo_uploads = 6;
+    after.scene_vbo_upload_bytes = 5_024;
+
+    let detail = scene_replay_execution_detail(before, after, 123);
+
+    assert_eq!(detail.host_cpu_ns, 123);
+    assert_eq!(detail.commands_considered, 5);
+    assert_eq!(detail.commands_executed, 1);
+    assert_eq!(detail.draw_calls, 3);
+    assert_eq!(detail.texture_binds, 6);
+    assert_eq!(detail.scene_vbo_uploads, 1);
+    assert_eq!(detail.scene_vbo_upload_bytes, 1_024);
+
+    let mut before_reset = GlesSceneFrameStats::default();
+    before_reset.commands_considered = 1;
+    before_reset.commands_executed = 1;
+    before_reset.draw_calls = 1;
+    before_reset.texture_binds = 1;
+    before_reset.scene_vbo_uploads = 1;
+    before_reset.scene_vbo_upload_bytes = 1;
+    let reset = scene_replay_execution_detail(before_reset, GlesSceneFrameStats::default(), 0);
+    assert_eq!(reset.commands_considered, 0);
+    assert_eq!(reset.commands_executed, 0);
+    assert_eq!(reset.draw_calls, 0);
+    assert_eq!(reset.texture_binds, 0);
+    assert_eq!(reset.scene_vbo_uploads, 0);
+    assert_eq!(reset.scene_vbo_upload_bytes, 0);
+}
+
+#[test]
 fn replay_failure_does_not_aggregate_detail() {
     use std::cell::RefCell;
 

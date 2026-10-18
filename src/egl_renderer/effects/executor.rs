@@ -32,7 +32,7 @@ use super::super::{
 use super::gpu_timing::{
     CaptureExecutionTimingSummary, CaptureTimingMetadata, CaptureTimingMode,
     CompositeSceneReplayExecutionDetail, CompositeSceneReplayWork, PassTimingWork,
-    ReplayCaptureExecutionDetail,
+    ReplayCaptureExecutionDetail, SceneReplayExecutionDetail, SceneReplayWork,
 };
 use super::{CanonicalBlurSemanticsPolicy, fragment_shader_variant, upsample_shader_variant};
 use super::{

@@ -28,9 +28,25 @@ pub(super) fn composite_scene_replay_work(
     active_work: &[OutputRect],
     pending_checkpoint_requirements: usize,
 ) -> CompositeSceneReplayWork {
+    scene_replay_work(
+        command_start,
+        command_end,
+        scene_commands_total,
+        active_work,
+        pending_checkpoint_requirements,
+    )
+}
+
+pub(super) fn scene_replay_work(
+    command_start: usize,
+    command_end: usize,
+    scene_commands_total: usize,
+    active_work: &[OutputRect],
+    pending_checkpoint_requirements: usize,
+) -> SceneReplayWork {
     let command_count = command_end.saturating_sub(command_start);
     let active_work_rects = active_work.len();
-    CompositeSceneReplayWork {
+    SceneReplayWork {
         command_start,
         command_end,
         command_count,
@@ -58,6 +74,28 @@ pub(super) fn should_time_composite_scene_replay(
         && !capture_in_progress
 }
 
+pub(super) fn should_time_checkpoint_scene_replay(
+    scene_advance_reason: Option<&str>,
+    pass_kind: RenderPassKind,
+    checkpoint_dependency_count: usize,
+    graph_timing_active: bool,
+    scene_cursor: usize,
+    draw_end: usize,
+    has_active_work: bool,
+    capture_in_progress: bool,
+) -> bool {
+    scene_advance_reason == Some("checkpoint_dependency")
+        && matches!(
+            pass_kind,
+            RenderPassKind::SceneCapture | RenderPassKind::SurfaceCapture
+        )
+        && checkpoint_dependency_count > 0
+        && graph_timing_active
+        && draw_end > scene_cursor
+        && has_active_work
+        && !capture_in_progress
+}
+
 pub(super) fn monotonic_elapsed_ns(start: Option<Instant>) -> u64 {
     start.map_or(0, |start| {
         u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
@@ -69,7 +107,15 @@ pub(super) fn composite_scene_replay_execution_detail(
     after: GlesSceneFrameStats,
     host_cpu_ns: u64,
 ) -> CompositeSceneReplayExecutionDetail {
-    CompositeSceneReplayExecutionDetail {
+    scene_replay_execution_detail(before, after, host_cpu_ns)
+}
+
+pub(super) fn scene_replay_execution_detail(
+    before: GlesSceneFrameStats,
+    after: GlesSceneFrameStats,
+    host_cpu_ns: u64,
+) -> SceneReplayExecutionDetail {
+    SceneReplayExecutionDetail {
         host_cpu_ns,
         commands_considered: after
             .commands_considered
