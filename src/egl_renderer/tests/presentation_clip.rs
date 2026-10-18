@@ -242,7 +242,17 @@ fn real_gles_region_scene_draw_matches_legacy_inside_disjoint_repairs() {
 
 #[test]
 fn real_gles_effect_scene_replay_is_command_first_without_ordinary_occlusion() {
+    let diagnostics_env = crate::egl_renderer::effects::ProfilerEnvGuard::new();
+    diagnostics_env.set(Some("1"), Some("1"));
     let mut harness = GlesEffectTestHarness::new(4, 1);
+    assert!(
+        harness
+            .renderer
+            .effect_runtime
+            .effect_gpu_profiler
+            .stall_diagnostics_enabled(),
+        "real GLES context supports the configured effect timestamp profiler"
+    );
     harness.install_texture_backed_output();
     let red_pixel = rgba_to_pixel([255, 0, 0, 255]);
     let green_pixel = rgba_to_pixel([0, 128, 0, 128]);
@@ -290,8 +300,92 @@ fn real_gles_effect_scene_replay_is_command_first_without_ordinary_occlusion() {
         .effect_execution_context()
         .draw_effect_scene_range(&repairs, 0, 2, OutputFramebufferOrigin::BottomLeft, target)
         .expect("effect scene replay draws command-first");
+    let baseline_pixels = read_effect_test_pixels(&harness.gl, 4, 1);
+
+    unsafe {
+        harness.renderer.establish_ordinary_scene_state();
+        harness.gl.clear_color(0.0, 0.0, 1.0, 1.0);
+        harness.gl.clear(glow::COLOR_BUFFER_BIT);
+    }
+    harness.renderer.scene_state.frame_stats = Default::default();
+    let scope = harness
+        .renderer
+        .effect_runtime
+        .effect_gpu_profiler
+        .begin_graph(&harness.gl, Some(1))
+        .expect("real GLES effect graph timing scope");
+    let command_work = crate::egl_renderer::effects::SceneReplayWork {
+        command_start: 0,
+        command_end: 2,
+        command_count: 2,
+        scene_commands_total: 2,
+        active_work_rects: 2,
+        active_work_pixels: 2,
+        command_region_pairs: 4,
+        scene_scan_pairs: 4,
+        pending_checkpoint_requirements: 1,
+    };
+    let parent = harness
+        .renderer
+        .effect_runtime
+        .effect_gpu_profiler
+        .begin_checkpoint_scene_replay(
+            &harness.gl,
+            scope,
+            17,
+            1,
+            RenderPassKind::SceneCapture,
+            1,
+            command_work,
+        )
+        .expect("checkpoint replay parent span");
+    let mut command_timing = harness
+        .renderer
+        .effect_runtime
+        .effect_gpu_profiler
+        .reserve_checkpoint_replay_command_attribution(
+            scope,
+            parent,
+            17,
+            1,
+            RenderPassKind::SceneCapture,
+            1,
+            command_work.command_count,
+        )
+        .expect("complete command budget reservation");
+    harness
+        .renderer
+        .effect_execution_context()
+        .draw_effect_scene_range_with_command_attribution(
+            &repairs,
+            0,
+            2,
+            OutputFramebufferOrigin::BottomLeft,
+            target,
+            &mut command_timing,
+        )
+        .expect("instrumented effect scene replay draws command-first");
+    assert_eq!(command_timing.opened_command_count_for_test(), 2);
+    assert!(
+        harness
+            .renderer
+            .effect_runtime
+            .effect_gpu_profiler
+            .end_checkpoint_scene_replay(&harness.gl, parent)
+    );
+    assert!(
+        harness
+            .renderer
+            .effect_runtime
+            .effect_gpu_profiler
+            .end_graph(&harness.gl, Some(scope))
+    );
 
     let pixels = read_effect_test_pixels(&harness.gl, 4, 1);
+    assert_eq!(
+        pixels, baseline_pixels,
+        "diagnostic timing preserves pixels"
+    );
     for x in 1..=2 {
         assert_effect_test_pixel(&pixels, 4, x, 0, [127, 128, 0, 255]);
     }

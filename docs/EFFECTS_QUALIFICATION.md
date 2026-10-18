@@ -518,12 +518,16 @@ are provided specifically to distinguish that ambiguity; they do not prewarm,
 synchronize, or otherwise alter client textures or capture policy.
 
 The active profiler preallocates a fixed pool of 4,608 query objects (2,304
-timestamp-pair slots). Its expected two-scope peak is 2,048 spans: one graph
-total plus 128 instances times six built-in blur pass spans and one Composite
-Scene Replay span, plus at most 127 Checkpoint Scene Replay spans per scope.
-The remaining 256 slots are a bounded backlog reserve. Pool exhaustion drops
-only timing spans; it never changes effect execution or rendering. No query is
-allocated in the per-pass path.
+timestamp-pair slots) when only `TYPHON_EFFECT_GPU_TIMING=1` is enabled. Its
+expected two-scope peak is 2,048 spans: one graph total plus 128 instances
+times six built-in blur pass spans and one Composite Scene Replay span, plus
+at most 127 Checkpoint Scene Replay spans per scope. The remaining 256 slots
+are a bounded backlog reserve. With stall diagnostics also enabled, the pool
+is 5,120 query objects (2,560 timestamp-pair slots): the same 2,048 base
+spans, up to 256 checkpoint command spans for two scopes, and the same 256
+slot backlog reserve. Pool exhaustion drops only timing spans; it never
+changes effect execution or rendering. No query is allocated in the
+per-pass path.
 
 ### Composite Scene Replay Attribution v1
 
@@ -617,7 +621,7 @@ resolved physical winner and all static/execution metadata comes from that
 same span.
 
 Each eligible replay costs one additional timestamp pair from the shared
-2,304-span/4,608-query pool. The compile-time capacity equation is
+base pool. The compile-time capacity equation is
 `2 * (1 + 128 * (6 + 1) + 127) = 2,048` expected spans, plus a fixed 256-span
 backlog reserve. The 127 Checkpoint Scene Replay bound follows from the graph
 and executor invariants: capture passes for one effect instance share the
@@ -626,8 +630,10 @@ advances, so repeated captures at the same position cannot issue another
 physical replay; and the first ordered instance cannot depend on an earlier
 effect checkpoint. The capacity test fills two scopes with every category in
 this equation, including 127 checkpoint replays each, and verifies that the
-reserve remains free and no timing span is dropped. The pool stays fixed and
-preallocated; there is no frame-critical dynamic query allocation.
+reserve remains free and no timing span is dropped. Stall-diagnostic command
+capacity is added only in the diagnostic configuration, preserving the full
+base backlog reserve. The pool stays fixed and preallocated; there is no
+frame-critical dynamic query allocation.
 
 Composite Scene Replay spans have their own timing purpose and never enter
 effect-pass category durations, `timed_passes`, `max_effect_*`,
@@ -714,6 +720,74 @@ outstanding timestamp evidence because the GPU clock interval itself is
 unreliable; that global condition is distinct from a failed Checkpoint replay
 span. GPU timestamps are diagnostic attribution and do not by themselves
 identify a rendering root cause or establish physical qualification.
+
+### Checkpoint replay command attribution
+
+Per-command checkpoint replay attribution is a subordinate diagnostic layer
+inside the existing Checkpoint Scene Replay span. It is enabled only when both
+environment variables are exactly `1`:
+
+```bash
+TYPHON_EFFECT_GPU_TIMING=1
+TYPHON_EFFECT_GPU_STALL_DIAGNOSTICS=1
+```
+
+GPU timing alone retains the existing 4,608-query pool and does not build a
+surface diagnostic snapshot, take per-command host timings, or issue command
+timestamp queries. With stall diagnostics enabled, a graph scope reserves the
+whole `SceneReplayWork.command_count` upper bound before each eligible
+Checkpoint Dependency replay. The per-scope command budget is
+`MAX_CHECKPOINT_REPLAY_COMMAND_SPANS_PER_GRAPH_SCOPE = 128`; this is a
+diagnostic policy cap, not a bound on the renderer's physical scene command
+count. If a whole replay does not fit, no command spans start for that replay
+and command attribution for the entire scope becomes unavailable. If any
+later replay, span allocation, metadata, or timestamp fails, earlier buffered
+command measurements are also withheld. Command attribution is complete or
+unavailable; a prefix of commands is never reported as complete evidence.
+
+Each span encloses one physically executed `EglDrawCommand`, including its
+texture bind, filtering, presentation opacity, effective scissor changes, and
+all of its draw calls. Multiple clips still produce one command span. Rejected
+commands, commands outside active work, and commands without their required
+resource produce no span. A physically dispatched `LifecycleOverlay` is timed
+as one command across its clips. The emitted
+`event=checkpoint_replay_command_gpu_timing` records and the
+`max_checkpoint_replay_command_*` fields identify the same physical command;
+all max fields are copied from one exact winner. Equal command GPU durations
+keep the first resolved command. Per-command host fields separate the command
+work between query submissions from the host time spent submitting the query
+timestamps.
+
+The aggregate fields report whether command timing is enabled and complete,
+the reserved diagnostic budget, expected and resolved physical command spans,
+their GPU and host sums, and the checked parent-minus-children residual. The
+command spans have a separate timing purpose. They are not effect passes and
+never increment `timed_passes`, pass categories, or graph-gap boundaries.
+Their GPU durations are already contained in
+`checkpoint_scene_replay_gpu_ns`; do not subtract the command sum from
+`scene_replay_attributed_ns` or `graph_residual_unattributed_ns` again. If the
+command sum exceeds the complete parent replay duration, command attribution
+may remain complete but its command residual is unavailable.
+
+Surface command identity is copied once from the same frozen
+`EglSceneDrawRequest` frame snapshot that produced the renderer's commands.
+It includes the exact `surface_id`, `generation`, `commit_sequence`,
+`buffer_id`, source, buffer dimensions, backend, and available DMA-BUF format
+and plane metadata. The renderer resource view separately reports installed
+resource backing and the DMA-BUF key buffer ID; a mismatch is printed as a
+mismatch rather than rewriting either identity. Raw GL handles, EGLImage
+pointers, and file descriptors are not exposed. The optional
+`resource_shm_synced_commit` field is the renderer's SHM upload baseline; it is
+not acquire-fence provenance. `SurfaceResourceSyncState` describes damage and
+resource-sync authority, not explicit acquire-fence provenance. A
+`buffer_source=dmabuf` value alone does not prove implicit synchronization, and
+this telemetry makes no explicit-versus-implicit-sync claim.
+
+Command timestamps use the existing asynchronous GL timestamp query path.
+Collection waits only for query availability at the normal poll boundary;
+command attribution adds no finish, flush, fence, readback, or CPU wait. The
+command timing remains diagnostic evidence and does not change drawing,
+clipping, command order, checkpoint behavior, or scheduling.
 
 ### Pass-level tail attribution and graph coverage
 

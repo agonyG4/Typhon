@@ -11,6 +11,13 @@ use oblivion_one::effects::{MAX_EFFECT_INSTANCES_PER_OUTPUT, MAX_GRAPH_PASSES, R
 
 use super::resources::CheckpointCacheAdmissionStats;
 use super::trace::EffectExecutionTrace;
+use crate::egl_renderer::resources::{
+    ResourceSurfaceDiagnosticIdentity, SurfaceDrawDiagnosticIdentity,
+};
+#[cfg(test)]
+use crate::egl_renderer::resources::{
+    SurfaceBufferSourceDiagnostic, SurfaceRenderBackendDiagnostic,
+};
 
 const GPU_TIMING_ENV: &str = "TYPHON_EFFECT_GPU_TIMING";
 const GPU_STALL_DIAGNOSTICS_ENV: &str = "TYPHON_EFFECT_GPU_STALL_DIAGNOSTICS";
@@ -32,6 +39,9 @@ const COMPOSITE_SCENE_REPLAY_SPANS_PER_INSTANCE: usize = 1;
 // dependent instance. The first ordered instance has no prior checkpoint.
 const MAX_CHECKPOINT_SCENE_REPLAY_SPANS_PER_GRAPH_SCOPE: usize =
     MAX_EFFECT_INSTANCES_PER_OUTPUT.saturating_sub(1);
+// This diagnostic-only cap keeps command timestamp reservation bounded. It is
+// not a physical upper bound on scene commands.
+const MAX_CHECKPOINT_REPLAY_COMMAND_SPANS_PER_GRAPH_SCOPE: usize = 128;
 
 const EXPECTED_TIMING_SPANS_PER_GRAPH_SCOPE: usize = 1
     + MAX_EFFECT_INSTANCES_PER_OUTPUT
@@ -41,10 +51,31 @@ const EXPECTED_TIMING_SPANS: usize =
     EXPECTED_IN_FLIGHT_GRAPH_SCOPES * EXPECTED_TIMING_SPANS_PER_GRAPH_SCOPE;
 const TIMING_SPAN_BACKLOG_RESERVE: usize = 256;
 const TIMING_SPAN_POOL_CAPACITY: usize = EXPECTED_TIMING_SPANS + TIMING_SPAN_BACKLOG_RESERVE;
-const TIMING_QUERY_OBJECT_CAPACITY: usize = TIMING_SPAN_POOL_CAPACITY * 2;
+const TIMING_QUERY_OBJECT_CAPACITY: usize =
+    query_object_capacity(TIMING_SPAN_POOL_CAPACITY).unwrap();
+const DIAGNOSTIC_EXPECTED_TIMING_SPANS: usize = EXPECTED_TIMING_SPANS
+    + EXPECTED_IN_FLIGHT_GRAPH_SCOPES * MAX_CHECKPOINT_REPLAY_COMMAND_SPANS_PER_GRAPH_SCOPE;
+const DIAGNOSTIC_TIMING_SPAN_POOL_CAPACITY: usize =
+    DIAGNOSTIC_EXPECTED_TIMING_SPANS + TIMING_SPAN_BACKLOG_RESERVE;
+const DIAGNOSTIC_TIMING_QUERY_OBJECT_CAPACITY: usize =
+    query_object_capacity(DIAGNOSTIC_TIMING_SPAN_POOL_CAPACITY).unwrap();
+
+const fn query_object_capacity(span_capacity: usize) -> Option<usize> {
+    span_capacity.checked_mul(2)
+}
 
 const _: () = assert!(EXPECTED_TIMING_SPANS <= TIMING_SPAN_POOL_CAPACITY);
 const _: () = assert!(TIMING_SPAN_POOL_CAPACITY <= MAX_GRAPH_PASSES);
+const _: () = assert!(DIAGNOSTIC_EXPECTED_TIMING_SPANS <= DIAGNOSTIC_TIMING_SPAN_POOL_CAPACITY);
+const _: () = assert!(DIAGNOSTIC_TIMING_SPAN_POOL_CAPACITY <= MAX_GRAPH_PASSES);
+const _: () = assert!(DIAGNOSTIC_TIMING_SPAN_POOL_CAPACITY <= usize::MAX / 2);
+const _: () = assert!(
+    TIMING_QUERY_OBJECT_CAPACITY == query_object_capacity(TIMING_SPAN_POOL_CAPACITY).unwrap()
+);
+const _: () = assert!(
+    DIAGNOSTIC_TIMING_QUERY_OBJECT_CAPACITY
+        == query_object_capacity(DIAGNOSTIC_TIMING_SPAN_POOL_CAPACITY).unwrap()
+);
 
 fn gpu_timing_requested(value: Option<&OsStr>) -> bool {
     value == Some(OsStr::new("1"))
@@ -64,6 +95,14 @@ impl ProfilerConfig {
         Self {
             gpu_timing_enabled,
             stall_diagnostics_enabled,
+        }
+    }
+
+    const fn span_pool_capacity(self) -> usize {
+        if self.stall_diagnostics_enabled {
+            DIAGNOSTIC_TIMING_SPAN_POOL_CAPACITY
+        } else {
+            TIMING_SPAN_POOL_CAPACITY
         }
     }
 }
@@ -138,6 +177,7 @@ enum TimingSpanPurpose {
     Total,
     Pass,
     SceneReplay(SceneReplayTimingReason),
+    CheckpointReplayCommand,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -173,6 +213,168 @@ pub(crate) struct CompositeSceneReplayExecutionDetail {
 }
 
 pub(crate) type SceneReplayExecutionDetail = CompositeSceneReplayExecutionDetail;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReplayCommandLayerIdentity {
+    Surface,
+    Solid,
+    SolidRgba,
+    DecorationAsset,
+    LifecycleOverlay,
+    LifecycleResolvedVisual,
+    Cursor,
+}
+
+impl ReplayCommandLayerIdentity {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Surface => "surface",
+            Self::Solid => "solid",
+            Self::SolidRgba => "solid_rgba",
+            Self::DecorationAsset => "decoration_asset",
+            Self::LifecycleOverlay => "lifecycle_overlay",
+            Self::LifecycleResolvedVisual => "lifecycle_resolved_visual",
+            Self::Cursor => "cursor",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReplayCommandSampling {
+    ExactNearest,
+    ScaledLinear,
+}
+
+impl ReplayCommandSampling {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::ExactNearest => "exact_nearest",
+            Self::ScaledLinear => "scaled_linear",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReplayCommandBufferMatch {
+    NotApplicable,
+    Match,
+    Mismatch,
+}
+
+impl ReplayCommandBufferMatch {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotApplicable => "not_applicable",
+            Self::Match => "match",
+            Self::Mismatch => "mismatch",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CheckpointReplayCommandTimingMetadata {
+    pub(crate) owner_pass_id: u64,
+    pub(crate) owner_instance_id: u64,
+    pub(crate) owner_kind: RenderPassKind,
+    pub(crate) checkpoint_count: usize,
+    pub(crate) command_index: usize,
+    pub(crate) layer: ReplayCommandLayerIdentity,
+    pub(crate) layer_id: u64,
+    pub(crate) sampling: ReplayCommandSampling,
+    pub(crate) planned_clip_count: usize,
+    pub(crate) draw_calls: usize,
+    pub(crate) vertex_count: u32,
+    pub(crate) surface: Option<SurfaceDrawDiagnosticIdentity>,
+    pub(crate) resource: Option<ResourceSurfaceDiagnosticIdentity>,
+    pub(crate) surface_resource_buffer_match: ReplayCommandBufferMatch,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct CheckpointReplayCommandHostTiming {
+    total_host_cpu_ns: u64,
+    execute_host_cpu_ns: u64,
+    begin_query_submit_host_cpu_ns: u64,
+    end_query_submit_host_cpu_ns: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CheckpointReplayCommandGpuTimingEvent {
+    frame_id: Option<u64>,
+    scope_id: u64,
+    metadata: CheckpointReplayCommandTimingMetadata,
+    draw_calls: usize,
+    gpu_ns: u64,
+    host: CheckpointReplayCommandHostTiming,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MaxCheckpointReplayCommandTiming {
+    event: CheckpointReplayCommandGpuTimingEvent,
+}
+
+#[derive(Debug)]
+struct CheckpointReplayCommandTimingAggregate {
+    timing_available: bool,
+    budget_reserved: usize,
+    budget_exhausted: bool,
+    expected_spans: usize,
+    resolved_spans: usize,
+    gpu_ns: u64,
+    host_cpu_ns: u64,
+    max: Option<MaxCheckpointReplayCommandTiming>,
+    resolved_events: Vec<CheckpointReplayCommandGpuTimingEvent>,
+}
+
+impl CheckpointReplayCommandTimingAggregate {
+    fn enabled() -> Self {
+        Self {
+            timing_available: true,
+            budget_reserved: 0,
+            budget_exhausted: false,
+            expected_spans: 0,
+            resolved_spans: 0,
+            gpu_ns: 0,
+            host_cpu_ns: 0,
+            max: None,
+            resolved_events: Vec::with_capacity(
+                MAX_CHECKPOINT_REPLAY_COMMAND_SPANS_PER_GRAPH_SCOPE,
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CheckpointReplayCommandTimingSpan {
+    token: SpanToken,
+    host_start: Option<Instant>,
+    execute_host_start: Option<Instant>,
+    begin_query_submit_host_cpu_ns: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CheckpointReplayCommandTimingContext {
+    pub(crate) scope: GraphTimingScope,
+    parent: CheckpointSceneReplayTimingSpan,
+    pub(crate) owner_pass_id: u64,
+    pub(crate) owner_instance_id: u64,
+    pub(crate) owner_kind: RenderPassKind,
+    pub(crate) checkpoint_count: usize,
+    reserved_command_count: usize,
+    opened_command_count: usize,
+}
+
+impl CheckpointReplayCommandTimingContext {
+    #[cfg(test)]
+    pub(crate) const fn opened_command_count_for_test(&self) -> usize {
+        self.opened_command_count
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CheckpointReplayCommandExecutionSpan {
+    pub(crate) timing: CheckpointReplayCommandTimingSpan,
+    pub(crate) metadata: CheckpointReplayCommandTimingMetadata,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct SceneReplayTimingMetadata {
@@ -427,6 +629,7 @@ struct TimingSpanMetadata {
     host_timing: Option<EffectPassHostTiming>,
     scene_replay: Option<SceneReplayTimingMetadata>,
     scene_replay_execution: Option<SceneReplayExecutionDetail>,
+    checkpoint_command: Option<CheckpointReplayCommandTimingMetadata>,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -712,6 +915,18 @@ struct GpuTimingRecord {
     checkpoint_scene_replay_commands_executed: usize,
     checkpoint_scene_replay_draw_calls: usize,
     checkpoint_scene_replay_texture_binds: usize,
+    checkpoint_replay_command_timing_enabled: bool,
+    checkpoint_replay_command_timing_available: bool,
+    checkpoint_replay_command_budget_limit: usize,
+    checkpoint_replay_command_budget_reserved: usize,
+    checkpoint_replay_command_budget_exhausted: bool,
+    checkpoint_replay_command_expected_spans: usize,
+    checkpoint_replay_command_resolved_spans: usize,
+    checkpoint_replay_command_gpu_ns: u64,
+    checkpoint_replay_command_host_cpu_ns: u64,
+    checkpoint_replay_command_residual_available: bool,
+    checkpoint_replay_command_residual_ns: u64,
+    max_checkpoint_replay_command: Option<MaxCheckpointReplayCommandTiming>,
     graph_residual_attribution_available: bool,
     scene_replay_attributed_ns: u64,
     graph_residual_unattributed_ns: u64,
@@ -780,7 +995,7 @@ struct PendingSpan {
     metadata: TimingSpanMetadata,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug)]
 struct GraphAggregate {
     scope_id: u64,
     frame_id: Option<u64>,
@@ -815,6 +1030,7 @@ struct GraphAggregate {
     max_effect_pass: Option<MaxEffectPassTiming>,
     composite_scene_replay: SceneReplayTimingAggregate,
     checkpoint_scene_replay: SceneReplayTimingAggregate,
+    checkpoint_replay_commands: Option<CheckpointReplayCommandTimingAggregate>,
     diagnostics: GpuTimingDiagnosticsRecord,
     graph_gap_timeline_valid: bool,
     first_pass_start: Option<TimedPassEndpoint>,
@@ -927,6 +1143,8 @@ struct TimingState {
     high_water: usize,
     disjoint_invalidated_spans: usize,
     capture_gpu_timing_events: Vec<CaptureGpuTimingEvent>,
+    completed_checkpoint_replay_command_events:
+        VecDeque<Vec<CheckpointReplayCommandGpuTimingEvent>>,
     #[cfg(test)]
     read_count: usize,
 }
@@ -945,6 +1163,7 @@ impl TimingState {
             high_water: 0,
             disjoint_invalidated_spans: 0,
             capture_gpu_timing_events: Vec::new(),
+            completed_checkpoint_replay_command_events: VecDeque::new(),
             #[cfg(test)]
             read_count: 0,
         }
@@ -976,6 +1195,7 @@ impl TimingState {
             high_water: 0,
             disjoint_invalidated_spans: 0,
             capture_gpu_timing_events: Vec::new(),
+            completed_checkpoint_replay_command_events: VecDeque::new(),
             #[cfg(test)]
             read_count: 0,
         }
@@ -1009,6 +1229,7 @@ impl TimingState {
             host_timing: None,
             scene_replay: None,
             scene_replay_execution: None,
+            checkpoint_command: None,
         });
         let token = token?;
         self.aggregates.push(GraphAggregate {
@@ -1045,6 +1266,7 @@ impl TimingState {
             max_effect_pass: None,
             composite_scene_replay: SceneReplayTimingAggregate::default(),
             checkpoint_scene_replay: SceneReplayTimingAggregate::default(),
+            checkpoint_replay_commands: None,
             diagnostics: GpuTimingDiagnosticsRecord::default(),
             graph_gap_timeline_valid: true,
             first_pass_start: None,
@@ -1120,7 +1342,7 @@ impl TimingState {
             RenderPassKind::SceneCapture | RenderPassKind::SurfaceCapture
         ));
         debug_assert!(checkpoint_count > 0);
-        self.begin_scene_replay(
+        let token = self.begin_scene_replay(
             scope,
             owner_pass_id,
             owner_instance_id,
@@ -1128,7 +1350,11 @@ impl TimingState {
             owner_kind,
             checkpoint_count,
             work,
-        )
+        );
+        if token.is_none() {
+            self.invalidate_checkpoint_replay_command_attribution(scope.scope_id, false);
+        }
+        token
     }
 
     fn begin_scene_replay(
@@ -1171,6 +1397,7 @@ impl TimingState {
                 checkpoint_count,
             }),
             scene_replay_execution: None,
+            checkpoint_command: None,
         });
         if token.is_none()
             && let Some(aggregate) = self
@@ -1260,6 +1487,174 @@ impl TimingState {
             return false;
         };
         aggregate.diagnostics.enabled = enabled;
+        aggregate.checkpoint_replay_commands =
+            enabled.then(CheckpointReplayCommandTimingAggregate::enabled);
+        true
+    }
+
+    fn reserve_checkpoint_replay_command_budget(
+        &mut self,
+        scope: GraphTimingScope,
+        command_count: usize,
+    ) -> bool {
+        let Some((timing_available, budget_exhausted, reserved)) = self
+            .aggregates
+            .iter()
+            .find(|aggregate| aggregate.scope_id == scope.scope_id)
+            .and_then(|aggregate| aggregate.checkpoint_replay_commands.as_ref())
+            .map(|commands| {
+                (
+                    commands.timing_available,
+                    commands.budget_exhausted,
+                    commands.budget_reserved,
+                )
+            })
+        else {
+            return false;
+        };
+        if !timing_available || budget_exhausted {
+            return false;
+        }
+        let Some(next_reserved) = reserved.checked_add(command_count) else {
+            self.invalidate_checkpoint_replay_command_attribution(scope.scope_id, true);
+            return false;
+        };
+        if next_reserved > MAX_CHECKPOINT_REPLAY_COMMAND_SPANS_PER_GRAPH_SCOPE {
+            self.invalidate_checkpoint_replay_command_attribution(scope.scope_id, true);
+            return false;
+        }
+        let Some(commands) = self
+            .aggregates
+            .iter_mut()
+            .find(|aggregate| aggregate.scope_id == scope.scope_id)
+            .and_then(|aggregate| aggregate.checkpoint_replay_commands.as_mut())
+        else {
+            return false;
+        };
+        commands.budget_reserved = next_reserved;
+        true
+    }
+
+    fn invalidate_checkpoint_replay_command_attribution(
+        &mut self,
+        scope_id: u64,
+        budget_exhausted: bool,
+    ) {
+        if let Some(commands) = self
+            .aggregates
+            .iter_mut()
+            .find(|aggregate| aggregate.scope_id == scope_id)
+            .and_then(|aggregate| aggregate.checkpoint_replay_commands.as_mut())
+        {
+            commands.timing_available = false;
+            commands.budget_exhausted |= budget_exhausted;
+        }
+    }
+
+    fn begin_checkpoint_replay_command(
+        &mut self,
+        context: &mut CheckpointReplayCommandTimingContext,
+        metadata: CheckpointReplayCommandTimingMetadata,
+    ) -> Option<SpanToken> {
+        let scope_id = context.scope.scope_id;
+        let parent_is_open_checkpoint_replay = self
+            .slots
+            .get(context.parent.token.slot)
+            .is_some_and(|slot| {
+                slot.generation == context.parent.token.generation
+                    && slot.phase == SlotPhase::Open
+                    && slot.metadata.is_some_and(|metadata| {
+                        metadata.scope_id == scope_id
+                            && metadata.frame_id == context.scope.frame_id
+                            && metadata.pass_id == Some(context.owner_pass_id)
+                            && metadata.instance_id == Some(context.owner_instance_id)
+                            && metadata.purpose
+                                == TimingSpanPurpose::SceneReplay(
+                                    SceneReplayTimingReason::CheckpointDependency,
+                                )
+                            && metadata.scene_replay.is_some_and(|replay| {
+                                replay.owner_kind == context.owner_kind
+                                    && replay.checkpoint_count == context.checkpoint_count
+                            })
+                    })
+            });
+        if !parent_is_open_checkpoint_replay
+            || metadata.owner_pass_id != context.owner_pass_id
+            || metadata.owner_instance_id != context.owner_instance_id
+            || metadata.owner_kind != context.owner_kind
+            || metadata.checkpoint_count != context.checkpoint_count
+            || context.opened_command_count >= context.reserved_command_count
+            || (metadata.layer == ReplayCommandLayerIdentity::Surface
+                && (metadata.surface.is_none() || metadata.resource.is_none()))
+        {
+            self.invalidate_checkpoint_replay_command_attribution(scope_id, false);
+            return None;
+        }
+        let commands_available = self
+            .aggregates
+            .iter()
+            .find(|aggregate| aggregate.scope_id == scope_id)
+            .and_then(|aggregate| aggregate.checkpoint_replay_commands.as_ref())
+            .is_some_and(|commands| commands.timing_available);
+        if !commands_available {
+            return None;
+        }
+        let token = self.allocate_span(TimingSpanMetadata {
+            scope_id,
+            frame_id: context.scope.frame_id,
+            pass_id: Some(context.owner_pass_id),
+            instance_id: Some(context.owner_instance_id),
+            purpose: TimingSpanPurpose::CheckpointReplayCommand,
+            kind: None,
+            work: PassTimingWork::default(),
+            capture: None,
+            replay_execution: None,
+            host_timing: None,
+            scene_replay: None,
+            scene_replay_execution: None,
+            checkpoint_command: Some(metadata),
+        });
+        let Some(token) = token else {
+            self.invalidate_checkpoint_replay_command_attribution(scope_id, false);
+            return None;
+        };
+        if let Some(commands) = self
+            .aggregates
+            .iter_mut()
+            .find(|aggregate| aggregate.scope_id == scope_id)
+            .and_then(|aggregate| aggregate.checkpoint_replay_commands.as_mut())
+        {
+            commands.expected_spans = commands.expected_spans.saturating_add(1);
+        }
+        context.opened_command_count = context.opened_command_count.saturating_add(1);
+        Some(token)
+    }
+
+    fn attach_checkpoint_replay_command_execution_detail(
+        &mut self,
+        token: SpanToken,
+        draw_calls: usize,
+        host: CheckpointReplayCommandHostTiming,
+    ) -> bool {
+        let Some(index) = self.pending.iter().position(|pending| {
+            pending.token == token
+                && pending.metadata.purpose == TimingSpanPurpose::CheckpointReplayCommand
+        }) else {
+            return false;
+        };
+        let scope_id = self.pending[index].metadata.scope_id;
+        let Some(mut metadata) = self.pending[index].metadata.checkpoint_command else {
+            self.invalidate_checkpoint_replay_command_attribution(scope_id, false);
+            return false;
+        };
+        metadata.draw_calls = draw_calls;
+        self.pending[index].metadata.checkpoint_command = Some(metadata);
+        self.pending[index].metadata.host_timing = Some(EffectPassHostTiming {
+            total_host_ns: host.total_host_cpu_ns,
+            execute_host_ns: host.execute_host_cpu_ns,
+            begin_query_submit_host_ns: host.begin_query_submit_host_cpu_ns,
+            end_query_submit_host_ns: host.end_query_submit_host_cpu_ns,
+        });
         true
     }
 
@@ -1365,7 +1760,12 @@ impl TimingState {
         std::mem::take(&mut self.capture_gpu_timing_events)
     }
 
-    #[cfg(test)]
+    fn drain_checkpoint_replay_command_events(
+        &mut self,
+    ) -> VecDeque<Vec<CheckpointReplayCommandGpuTimingEvent>> {
+        std::mem::take(&mut self.completed_checkpoint_replay_command_events)
+    }
+
     fn query_slots(&self) -> usize {
         self.slots.len()
     }
@@ -1476,6 +1876,10 @@ impl TimingState {
                 self.finish_scene_replay(pending.metadata, reason, duration_ns);
                 None
             }
+            TimingSpanPurpose::CheckpointReplayCommand => {
+                self.finish_checkpoint_replay_command(pending.metadata, duration_ns);
+                None
+            }
         };
         PollOutcome::Ready {
             duration_ns: Some(duration_ns),
@@ -1517,6 +1921,63 @@ impl TimingState {
                     aggregate.scene_replay_mut(reason).timing_available = false;
                 }
             }
+            TimingSpanPurpose::CheckpointReplayCommand => {
+                self.invalidate_checkpoint_replay_command_attribution(metadata.scope_id, false);
+            }
+        }
+    }
+
+    fn finish_checkpoint_replay_command(&mut self, metadata: TimingSpanMetadata, duration_ns: u64) {
+        let Some(command_metadata) = metadata.checkpoint_command else {
+            self.invalidate_checkpoint_replay_command_attribution(metadata.scope_id, false);
+            return;
+        };
+        let Some(host) = metadata.host_timing else {
+            self.invalidate_checkpoint_replay_command_attribution(metadata.scope_id, false);
+            return;
+        };
+        let Some(commands) = self
+            .aggregates
+            .iter_mut()
+            .find(|aggregate| aggregate.scope_id == metadata.scope_id)
+            .and_then(|aggregate| aggregate.checkpoint_replay_commands.as_mut())
+        else {
+            return;
+        };
+        let Some(gpu_ns) = commands.gpu_ns.checked_add(duration_ns) else {
+            commands.timing_available = false;
+            return;
+        };
+        let Some(host_cpu_ns) = commands.host_cpu_ns.checked_add(host.total_host_ns) else {
+            commands.timing_available = false;
+            return;
+        };
+        let event = CheckpointReplayCommandGpuTimingEvent {
+            frame_id: metadata.frame_id,
+            scope_id: metadata.scope_id,
+            metadata: command_metadata,
+            draw_calls: command_metadata.draw_calls,
+            gpu_ns: duration_ns,
+            host: CheckpointReplayCommandHostTiming {
+                total_host_cpu_ns: host.total_host_ns,
+                execute_host_cpu_ns: host.execute_host_ns,
+                begin_query_submit_host_cpu_ns: host.begin_query_submit_host_ns,
+                end_query_submit_host_cpu_ns: host.end_query_submit_host_ns,
+            },
+        };
+        if commands.resolved_events.len() >= MAX_CHECKPOINT_REPLAY_COMMAND_SPANS_PER_GRAPH_SCOPE {
+            commands.timing_available = false;
+            return;
+        }
+        commands.gpu_ns = gpu_ns;
+        commands.host_cpu_ns = host_cpu_ns;
+        commands.resolved_spans = commands.resolved_spans.saturating_add(1);
+        commands.resolved_events.push(event);
+        if commands
+            .max
+            .is_none_or(|current| duration_ns > current.event.gpu_ns)
+        {
+            commands.max = Some(MaxCheckpointReplayCommandTiming { event });
         }
     }
 
@@ -1817,6 +2278,24 @@ impl TimingState {
             checkpoint_scene_replay.expected_spans,
             checkpoint_scene_replay.resolved_spans,
         );
+        let command_timing = aggregate.checkpoint_replay_commands.as_ref();
+        let command_timing_available = command_timing.is_some_and(|commands| {
+            commands.timing_available
+                && commands.expected_spans == commands.resolved_spans
+                && commands.resolved_events.len() == commands.resolved_spans
+                && checkpoint_scene_replay_timing_available
+        });
+        let command_residual = if command_timing_available {
+            checkpoint_scene_replay
+                .gpu_ns
+                .checked_sub(command_timing.map_or(0, |commands| commands.gpu_ns))
+        } else {
+            None
+        };
+        let command_timing_enabled = command_timing.is_some();
+        let command_events = command_timing
+            .filter(|_| command_timing_available)
+            .map(|commands| commands.resolved_events.clone());
         let graph_residual_attribution_available = composite_scene_replay_timing_available
             && checkpoint_scene_replay_timing_available
             && aggregate.dropped_passes == 0;
@@ -1839,6 +2318,12 @@ impl TimingState {
         } else {
             0
         };
+        if let Some(events) = command_events {
+            if !events.is_empty() {
+                self.completed_checkpoint_replay_command_events
+                    .push_back(events);
+            }
+        }
         Some(GpuTimingRecord {
             frame_id: aggregate.frame_id,
             scope_id: aggregate.scope_id,
@@ -2048,6 +2533,30 @@ impl TimingState {
             checkpoint_scene_replay_commands_executed: checkpoint_scene_replay.commands_executed,
             checkpoint_scene_replay_draw_calls: checkpoint_scene_replay.draw_calls,
             checkpoint_scene_replay_texture_binds: checkpoint_scene_replay.texture_binds,
+            checkpoint_replay_command_timing_enabled: command_timing_enabled,
+            checkpoint_replay_command_timing_available: command_timing_available,
+            checkpoint_replay_command_budget_limit:
+                MAX_CHECKPOINT_REPLAY_COMMAND_SPANS_PER_GRAPH_SCOPE,
+            checkpoint_replay_command_budget_reserved: command_timing
+                .map_or(0, |commands| commands.budget_reserved),
+            checkpoint_replay_command_budget_exhausted: command_timing
+                .is_some_and(|commands| commands.budget_exhausted),
+            checkpoint_replay_command_expected_spans: command_timing
+                .map_or(0, |commands| commands.expected_spans),
+            checkpoint_replay_command_resolved_spans: command_timing
+                .map_or(0, |commands| commands.resolved_spans),
+            checkpoint_replay_command_gpu_ns: command_timing_available
+                .then_some(command_timing.map_or(0, |commands| commands.gpu_ns))
+                .unwrap_or(0),
+            checkpoint_replay_command_host_cpu_ns: command_timing_available
+                .then_some(command_timing.map_or(0, |commands| commands.host_cpu_ns))
+                .unwrap_or(0),
+            checkpoint_replay_command_residual_available: command_residual.is_some(),
+            checkpoint_replay_command_residual_ns: command_residual.unwrap_or(0),
+            max_checkpoint_replay_command: command_timing_available
+                .then_some(command_timing)
+                .flatten()
+                .and_then(|commands| commands.max),
             graph_residual_attribution_available,
             scene_replay_attributed_ns,
             graph_residual_unattributed_ns,
@@ -2083,6 +2592,7 @@ impl TimingState {
             }
         }
         self.aggregates.clear();
+        self.completed_checkpoint_replay_command_events.clear();
         self.disjoint_invalidated_spans = self.disjoint_invalidated_spans.saturating_add(count);
         count
     }
@@ -2320,9 +2830,10 @@ fn delete_query_pairs(gl: &glow::Context, queries: &mut Vec<QueryPair>) {
     }
 }
 
-fn create_query_pairs(gl: &glow::Context) -> Result<Vec<QueryPair>, ()> {
-    let mut queries = Vec::with_capacity(TIMING_QUERY_OBJECT_CAPACITY / 2);
-    for _ in 0..TIMING_SPAN_POOL_CAPACITY {
+fn create_query_pairs(gl: &glow::Context, span_capacity: usize) -> Result<Vec<QueryPair>, ()> {
+    let query_capacity = query_object_capacity(span_capacity).ok_or(())?;
+    let mut queries = Vec::with_capacity(query_capacity / 2);
+    for _ in 0..span_capacity {
         let start = match unsafe { gl.create_query() } {
             Ok(start) => start,
             Err(_) => {
@@ -2385,6 +2896,59 @@ const fn render_pass_kind_name(kind: RenderPassKind) -> &'static str {
         RenderPassKind::Composite => "composite",
         RenderPassKind::OutputPostProcess => "postprocess",
     }
+}
+
+fn format_checkpoint_replay_command_event(event: CheckpointReplayCommandGpuTimingEvent) -> String {
+    let metadata = event.metadata;
+    let surface = metadata.surface;
+    let resource = metadata.resource;
+    format!(
+        "event=checkpoint_replay_command_gpu_timing frame_id={} scope={} owner_pass_id={} owner_instance_id={} owner_kind={} checkpoint_count={} command_index={} layer={} layer_id={} sampling={} planned_clips={} draw_calls={} vertex_count={} surface_id={} surface_generation={} commit_sequence={} buffer_id={} buffer_source={} buffer_width={} buffer_height={} render_backend={} dmabuf_fourcc={} dmabuf_plane_count={} dmabuf_plane0_modifier={} resource_present={} resource_egl_image_backed={} resource_generation={} resource_dmabuf_backed={} resource_dmabuf_buffer_id={} resource_shm_synced_commit={} surface_resource_buffer_match={} gpu_ns={} host_cpu_ns={} execute_host_cpu_ns={} begin_query_submit_host_cpu_ns={} end_query_submit_host_cpu_ns={}",
+        event
+            .frame_id
+            .map_or_else(|| "unknown".to_owned(), |id| id.to_string()),
+        event.scope_id,
+        metadata.owner_pass_id,
+        metadata.owner_instance_id,
+        render_pass_kind_name(metadata.owner_kind),
+        metadata.checkpoint_count,
+        metadata.command_index,
+        metadata.layer.as_str(),
+        metadata.layer_id,
+        metadata.sampling.as_str(),
+        metadata.planned_clip_count,
+        event.draw_calls,
+        metadata.vertex_count,
+        surface.map_or(0, |identity| identity.surface_id),
+        surface.map_or(0, |identity| identity.generation),
+        surface.map_or(0, |identity| identity.commit_sequence),
+        surface.map_or(0, |identity| identity.buffer_id),
+        surface.map_or("none", |identity| identity.buffer_source.as_str()),
+        surface.map_or(0, |identity| identity.buffer_width),
+        surface.map_or(0, |identity| identity.buffer_height),
+        surface.map_or("none", |identity| identity.render_backend.as_str()),
+        surface
+            .and_then(|identity| identity.dmabuf_fourcc)
+            .map_or_else(|| "none".to_owned(), |value| value.to_string()),
+        surface.map_or(0, |identity| identity.dmabuf_plane_count),
+        surface
+            .and_then(|identity| identity.dmabuf_plane0_modifier)
+            .map_or_else(|| "none".to_owned(), |value| value.to_string()),
+        usize::from(resource.is_some_and(|identity| identity.resource_present)),
+        usize::from(resource.is_some_and(|identity| identity.resource_egl_image_backed)),
+        resource.map_or(0, |identity| identity.resource_generation),
+        usize::from(resource.is_some_and(|identity| identity.resource_dmabuf_backed)),
+        resource.map_or(0, |identity| identity.resource_dmabuf_buffer_id),
+        resource
+            .and_then(|identity| identity.resource_shm_synced_commit)
+            .map_or_else(|| "none".to_owned(), |commit| commit.to_string()),
+        metadata.surface_resource_buffer_match.as_str(),
+        event.gpu_ns,
+        event.host.total_host_cpu_ns,
+        event.host.execute_host_cpu_ns,
+        event.host.begin_query_submit_host_cpu_ns,
+        event.host.end_query_submit_host_cpu_ns,
+    )
 }
 
 fn format_gpu_timing_line(record: &GpuTimingRecord) -> String {
@@ -2774,7 +3338,7 @@ fn format_gpu_timing_line(record: &GpuTimingRecord) -> String {
         usize::from(checkpoint_admission.additional_checkpoint_budget_needed_known),
     );
     let checkpoint_max = record.max_checkpoint_scene_replay;
-    format!(
+    let checkpoint_line = format!(
         "{line} checkpoint_scene_replay_timing_available={} checkpoint_scene_replay_expected_spans={} checkpoint_scene_replay_resolved_spans={} checkpoint_scene_replay_gpu_ns={} checkpoint_scene_replay_host_cpu_ns={} checkpoint_scene_replay_scene_scan_pairs={} checkpoint_scene_replay_commands_executed={} checkpoint_scene_replay_draw_calls={} checkpoint_scene_replay_texture_binds={} max_checkpoint_scene_replay_gpu_ns={} max_checkpoint_scene_replay_pass_id={} max_checkpoint_scene_replay_instance_id={} max_checkpoint_scene_replay_kind={} max_checkpoint_scene_replay_checkpoint_count={} max_checkpoint_scene_replay_command_start={} max_checkpoint_scene_replay_command_end={} max_checkpoint_scene_replay_command_count={} max_checkpoint_scene_replay_scene_commands={} max_checkpoint_scene_replay_active_work_rects={} max_checkpoint_scene_replay_active_work_pixels={} max_checkpoint_scene_replay_command_region_pairs={} max_checkpoint_scene_replay_scene_scan_pairs={} max_checkpoint_scene_replay_pending_checkpoints={} max_checkpoint_scene_replay_host_cpu_ns={} max_checkpoint_scene_replay_commands_considered={} max_checkpoint_scene_replay_commands_executed={} max_checkpoint_scene_replay_draw_calls={} max_checkpoint_scene_replay_texture_binds={} max_checkpoint_scene_replay_scene_vbo_uploads={} max_checkpoint_scene_replay_scene_vbo_upload_bytes={} graph_residual_attribution_available={} scene_replay_attributed_ns={} graph_residual_unattributed_ns={}",
         usize::from(record.checkpoint_scene_replay_timing_available),
         record.checkpoint_scene_replay_expected_spans,
@@ -2809,6 +3373,154 @@ fn format_gpu_timing_line(record: &GpuTimingRecord) -> String {
         usize::from(record.graph_residual_attribution_available),
         record.scene_replay_attributed_ns,
         record.graph_residual_unattributed_ns,
+    );
+    format!(
+        "{checkpoint_line} checkpoint_replay_command_timing_enabled={} checkpoint_replay_command_timing_available={} checkpoint_replay_command_budget_limit={} checkpoint_replay_command_budget_reserved={} checkpoint_replay_command_budget_exhausted={} checkpoint_replay_command_expected_spans={} checkpoint_replay_command_resolved_spans={} checkpoint_replay_command_gpu_ns={} checkpoint_replay_command_host_cpu_ns={} checkpoint_replay_command_residual_available={} checkpoint_replay_command_residual_ns={} max_checkpoint_replay_command_gpu_ns={} max_checkpoint_replay_command_host_cpu_ns={} max_checkpoint_replay_command_owner_pass_id={} max_checkpoint_replay_command_owner_instance_id={} max_checkpoint_replay_command_owner_kind={} max_checkpoint_replay_command_checkpoint_count={} max_checkpoint_replay_command_index={} max_checkpoint_replay_command_layer={} max_checkpoint_replay_command_layer_id={} max_checkpoint_replay_command_sampling={} max_checkpoint_replay_command_planned_clips={} max_checkpoint_replay_command_draw_calls={} max_checkpoint_replay_command_vertex_count={} max_checkpoint_replay_command_surface_id={} max_checkpoint_replay_command_surface_generation={} max_checkpoint_replay_command_commit_sequence={} max_checkpoint_replay_command_buffer_id={} max_checkpoint_replay_command_buffer_source={} max_checkpoint_replay_command_buffer_width={} max_checkpoint_replay_command_buffer_height={} max_checkpoint_replay_command_render_backend={} max_checkpoint_replay_command_dmabuf_fourcc={} max_checkpoint_replay_command_dmabuf_plane_count={} max_checkpoint_replay_command_dmabuf_plane0_modifier={} max_checkpoint_replay_command_resource_present={} max_checkpoint_replay_command_resource_egl_image_backed={} max_checkpoint_replay_command_resource_generation={} max_checkpoint_replay_command_resource_dmabuf_backed={} max_checkpoint_replay_command_resource_dmabuf_buffer_id={} max_checkpoint_replay_command_resource_shm_synced_commit={} max_checkpoint_replay_command_surface_resource_buffer_match={} max_checkpoint_replay_command_execute_host_cpu_ns={} max_checkpoint_replay_command_begin_query_host_cpu_ns={} max_checkpoint_replay_command_end_query_host_cpu_ns={}",
+        usize::from(record.checkpoint_replay_command_timing_enabled),
+        usize::from(record.checkpoint_replay_command_timing_available),
+        record.checkpoint_replay_command_budget_limit,
+        record.checkpoint_replay_command_budget_reserved,
+        usize::from(record.checkpoint_replay_command_budget_exhausted),
+        record.checkpoint_replay_command_expected_spans,
+        record.checkpoint_replay_command_resolved_spans,
+        record.checkpoint_replay_command_gpu_ns,
+        record.checkpoint_replay_command_host_cpu_ns,
+        usize::from(record.checkpoint_replay_command_residual_available),
+        record.checkpoint_replay_command_residual_ns,
+        record
+            .max_checkpoint_replay_command
+            .map_or(0, |max| max.event.gpu_ns),
+        record
+            .max_checkpoint_replay_command
+            .map_or(0, |max| max.event.host.total_host_cpu_ns),
+        record
+            .max_checkpoint_replay_command
+            .map_or(0, |max| max.event.metadata.owner_pass_id),
+        record
+            .max_checkpoint_replay_command
+            .map_or(0, |max| max.event.metadata.owner_instance_id),
+        record
+            .max_checkpoint_replay_command
+            .map_or("none", |max| render_pass_kind_name(
+                max.event.metadata.owner_kind
+            )),
+        record
+            .max_checkpoint_replay_command
+            .map_or(0, |max| max.event.metadata.checkpoint_count),
+        record
+            .max_checkpoint_replay_command
+            .map_or(0, |max| max.event.metadata.command_index),
+        record
+            .max_checkpoint_replay_command
+            .map_or("none", |max| max.event.metadata.layer.as_str()),
+        record
+            .max_checkpoint_replay_command
+            .map_or(0, |max| max.event.metadata.layer_id),
+        record
+            .max_checkpoint_replay_command
+            .map_or("none", |max| max.event.metadata.sampling.as_str()),
+        record
+            .max_checkpoint_replay_command
+            .map_or(0, |max| max.event.metadata.planned_clip_count),
+        record
+            .max_checkpoint_replay_command
+            .map_or(0, |max| max.event.draw_calls),
+        record
+            .max_checkpoint_replay_command
+            .map_or(0, |max| max.event.metadata.vertex_count),
+        record
+            .max_checkpoint_replay_command
+            .and_then(|max| max.event.metadata.surface)
+            .map_or(0, |surface| surface.surface_id),
+        record
+            .max_checkpoint_replay_command
+            .and_then(|max| max.event.metadata.surface)
+            .map_or(0, |surface| surface.generation),
+        record
+            .max_checkpoint_replay_command
+            .and_then(|max| max.event.metadata.surface)
+            .map_or(0, |surface| surface.commit_sequence),
+        record
+            .max_checkpoint_replay_command
+            .and_then(|max| max.event.metadata.surface)
+            .map_or(0, |surface| surface.buffer_id),
+        record
+            .max_checkpoint_replay_command
+            .and_then(|max| max.event.metadata.surface)
+            .map_or("none", |surface| surface.buffer_source.as_str()),
+        record
+            .max_checkpoint_replay_command
+            .and_then(|max| max.event.metadata.surface)
+            .map_or(0, |surface| surface.buffer_width),
+        record
+            .max_checkpoint_replay_command
+            .and_then(|max| max.event.metadata.surface)
+            .map_or(0, |surface| surface.buffer_height),
+        record
+            .max_checkpoint_replay_command
+            .and_then(|max| max.event.metadata.surface)
+            .map_or("none", |surface| surface.render_backend.as_str()),
+        record
+            .max_checkpoint_replay_command
+            .and_then(|max| max.event.metadata.surface)
+            .and_then(|surface| surface.dmabuf_fourcc)
+            .map_or_else(|| "none".to_owned(), |fourcc| fourcc.to_string()),
+        record
+            .max_checkpoint_replay_command
+            .and_then(|max| max.event.metadata.surface)
+            .map_or(0, |surface| surface.dmabuf_plane_count),
+        record
+            .max_checkpoint_replay_command
+            .and_then(|max| max.event.metadata.surface)
+            .and_then(|surface| surface.dmabuf_plane0_modifier)
+            .map_or_else(|| "none".to_owned(), |modifier| modifier.to_string()),
+        usize::from(
+            record
+                .max_checkpoint_replay_command
+                .and_then(|max| max.event.metadata.resource)
+                .is_some_and(|resource| resource.resource_present)
+        ),
+        usize::from(
+            record
+                .max_checkpoint_replay_command
+                .and_then(|max| max.event.metadata.resource)
+                .is_some_and(|resource| resource.resource_egl_image_backed)
+        ),
+        record
+            .max_checkpoint_replay_command
+            .and_then(|max| max.event.metadata.resource)
+            .map_or(0, |resource| resource.resource_generation),
+        usize::from(
+            record
+                .max_checkpoint_replay_command
+                .and_then(|max| max.event.metadata.resource)
+                .is_some_and(|resource| resource.resource_dmabuf_backed)
+        ),
+        record
+            .max_checkpoint_replay_command
+            .and_then(|max| max.event.metadata.resource)
+            .map_or(0, |resource| resource.resource_dmabuf_buffer_id),
+        record
+            .max_checkpoint_replay_command
+            .and_then(|max| max.event.metadata.resource)
+            .and_then(|resource| resource.resource_shm_synced_commit)
+            .map_or_else(|| "none".to_owned(), |commit| commit.to_string()),
+        record
+            .max_checkpoint_replay_command
+            .map_or("not_applicable", |max| max
+                .event
+                .metadata
+                .surface_resource_buffer_match
+                .as_str()),
+        record
+            .max_checkpoint_replay_command
+            .map_or(0, |max| max.event.host.execute_host_cpu_ns),
+        record
+            .max_checkpoint_replay_command
+            .map_or(0, |max| max.event.host.begin_query_submit_host_cpu_ns),
+        record
+            .max_checkpoint_replay_command
+            .map_or(0, |max| max.event.host.end_query_submit_host_cpu_ns),
     )
 }
 
@@ -2838,7 +3550,8 @@ impl EffectGpuProfiler {
                 gl.supported_extensions()
                     .contains(GPU_MEMORY_INFO_EXTENSION)
             });
-        let queries = match create_query_pairs(gl) {
+        let span_capacity = config.span_pool_capacity();
+        let queries = match create_query_pairs(gl, span_capacity) {
             Ok(queries) => queries,
             Err(()) => {
                 eprintln!(
@@ -2853,7 +3566,7 @@ impl EffectGpuProfiler {
             state: ProfilerState::Active(ActiveProfiler {
                 path,
                 queries,
-                timing: TimingState::active(TIMING_SPAN_POOL_CAPACITY),
+                timing: TimingState::active(span_capacity),
                 stall_diagnostics_enabled: config.stall_diagnostics_enabled,
                 gpu_memory_info_available,
                 gpu_memory_info: GpuMemoryInfoTracker::default(),
@@ -2870,6 +3583,13 @@ impl EffectGpuProfiler {
         matches!(&self.state, ProfilerState::Active(_))
     }
 
+    pub(crate) fn stall_diagnostics_enabled(&self) -> bool {
+        match &self.state {
+            ProfilerState::Active(active) => active.stall_diagnostics_enabled,
+            ProfilerState::Disabled | ProfilerState::Unsupported => false,
+        }
+    }
+
     pub(crate) fn collect(&mut self, gl: &glow::Context, trace: &EffectExecutionTrace) {
         let ProfilerState::Active(active) = &mut self.state else {
             return;
@@ -2877,7 +3597,7 @@ impl EffectGpuProfiler {
         let queries = &active.queries;
         let uses_disjoint = active.path.uses_disjoint();
         let (_, stopped_for_disjoint) = active.timing.collect_ready_with(
-            TIMING_SPAN_POOL_CAPACITY,
+            active.timing.query_slots(),
             |pending| {
                 let pair = queries[pending.token.slot];
                 let available =
@@ -2911,6 +3631,14 @@ impl EffectGpuProfiler {
                 event.pixels,
                 event.duration_ns,
             );
+        }
+        for scope_events in active.timing.drain_checkpoint_replay_command_events() {
+            for event in scope_events {
+                eprintln!(
+                    "typhon effect: {}",
+                    format_checkpoint_replay_command_event(event)
+                );
+            }
         }
     }
 
@@ -3027,6 +3755,7 @@ impl EffectGpuProfiler {
             host_timing: None,
             scene_replay: None,
             scene_replay_execution: None,
+            checkpoint_command: None,
         };
         let token = active.timing.begin_pass(scope, metadata)?;
         let query = active.queries[token.slot].start;
@@ -3138,6 +3867,106 @@ impl EffectGpuProfiler {
             checkpoint_count,
             work,
         )
+    }
+
+    pub(crate) fn reserve_checkpoint_replay_command_attribution(
+        &mut self,
+        scope: GraphTimingScope,
+        parent: CheckpointSceneReplayTimingSpan,
+        owner_pass_id: u64,
+        owner_instance_id: u64,
+        owner_kind: RenderPassKind,
+        checkpoint_count: usize,
+        command_count: usize,
+    ) -> Option<CheckpointReplayCommandTimingContext> {
+        let ProfilerState::Active(active) = &mut self.state else {
+            return None;
+        };
+        if !active.stall_diagnostics_enabled
+            || !active
+                .timing
+                .reserve_checkpoint_replay_command_budget(scope, command_count)
+        {
+            return None;
+        }
+        Some(CheckpointReplayCommandTimingContext {
+            scope,
+            parent,
+            owner_pass_id,
+            owner_instance_id,
+            owner_kind,
+            checkpoint_count,
+            reserved_command_count: command_count,
+            opened_command_count: 0,
+        })
+    }
+
+    pub(crate) fn invalidate_checkpoint_replay_command_attribution(
+        &mut self,
+        scope: GraphTimingScope,
+    ) {
+        if let ProfilerState::Active(active) = &mut self.state {
+            active
+                .timing
+                .invalidate_checkpoint_replay_command_attribution(scope.scope_id, false);
+        }
+    }
+
+    pub(crate) fn begin_checkpoint_replay_command(
+        &mut self,
+        gl: &glow::Context,
+        context: &mut CheckpointReplayCommandTimingContext,
+        metadata: CheckpointReplayCommandTimingMetadata,
+    ) -> Option<CheckpointReplayCommandTimingSpan> {
+        let ProfilerState::Active(active) = &mut self.state else {
+            return None;
+        };
+        let token = active
+            .timing
+            .begin_checkpoint_replay_command(context, metadata)?;
+        let host_start = active.stall_diagnostics_enabled.then(Instant::now);
+        unsafe { gl.query_counter(active.queries[token.slot].start, glow::TIMESTAMP) };
+        let begin_query_submit_host_cpu_ns = elapsed_ns(host_start);
+        let execute_host_start = active.stall_diagnostics_enabled.then(Instant::now);
+        Some(CheckpointReplayCommandTimingSpan {
+            token,
+            host_start,
+            execute_host_start,
+            begin_query_submit_host_cpu_ns,
+        })
+    }
+
+    pub(crate) fn end_checkpoint_replay_command(
+        &mut self,
+        gl: &glow::Context,
+        span: CheckpointReplayCommandTimingSpan,
+        draw_calls: usize,
+    ) {
+        let ProfilerState::Active(active) = &mut self.state else {
+            return;
+        };
+        if !active.timing.is_open(span.token) {
+            return;
+        }
+        let execute_host_cpu_ns = elapsed_ns(span.execute_host_start);
+        let end_query_start = span.host_start.map(|_| Instant::now());
+        unsafe { gl.query_counter(active.queries[span.token.slot].end, glow::TIMESTAMP) };
+        let end_query_submit_host_cpu_ns = elapsed_ns(end_query_start);
+        let total_host_cpu_ns = elapsed_ns(span.host_start);
+        if active.timing.finish(span.token) {
+            active
+                .timing
+                .attach_checkpoint_replay_command_execution_detail(
+                    span.token,
+                    draw_calls,
+                    CheckpointReplayCommandHostTiming {
+                        total_host_cpu_ns,
+                        execute_host_cpu_ns,
+                        begin_query_submit_host_cpu_ns: span.begin_query_submit_host_cpu_ns,
+                        end_query_submit_host_cpu_ns,
+                    },
+                );
+        }
     }
 
     fn begin_scene_replay(
@@ -3310,6 +4139,9 @@ impl EffectGpuProfiler {
 }
 
 #[cfg(test)]
+pub(crate) use tests::ProfilerEnvGuard;
+
+#[cfg(test)]
 mod tests {
     use std::collections::HashSet;
     use std::sync::{
@@ -3330,14 +4162,14 @@ mod tests {
     static QUERYIV_TEST_LOCK: Mutex<()> = Mutex::new(());
     static PROFILER_ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
 
-    struct ProfilerEnvGuard {
+    pub(crate) struct ProfilerEnvGuard {
         _lock: MutexGuard<'static, ()>,
         timing: Option<std::ffi::OsString>,
         diagnostics: Option<std::ffi::OsString>,
     }
 
     impl ProfilerEnvGuard {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             let lock = PROFILER_ENV_TEST_LOCK.lock().unwrap();
             Self {
                 _lock: lock,
@@ -3346,7 +4178,7 @@ mod tests {
             }
         }
 
-        fn set(&self, timing: Option<&str>, diagnostics: Option<&str>) {
+        pub(crate) fn set(&self, timing: Option<&str>, diagnostics: Option<&str>) {
             // SAFETY: profiler environment tests serialize mutations with PROFILER_ENV_TEST_LOCK.
             unsafe {
                 match timing {
@@ -3484,6 +4316,7 @@ mod tests {
             host_timing: None,
             scene_replay: None,
             scene_replay_execution: None,
+            checkpoint_command: None,
         }
     }
 
@@ -3560,6 +4393,70 @@ mod tests {
             scene_vbo_uploads: seed.saturating_add(16),
             scene_vbo_upload_bytes: seed.saturating_add(17),
         }
+    }
+
+    fn checkpoint_command_metadata(
+        command_index: usize,
+        layer: ReplayCommandLayerIdentity,
+    ) -> CheckpointReplayCommandTimingMetadata {
+        CheckpointReplayCommandTimingMetadata {
+            owner_pass_id: 8,
+            owner_instance_id: 80,
+            owner_kind: RenderPassKind::SceneCapture,
+            checkpoint_count: 1,
+            command_index,
+            layer,
+            layer_id: 0,
+            sampling: ReplayCommandSampling::ExactNearest,
+            planned_clip_count: 1,
+            draw_calls: 0,
+            vertex_count: 6,
+            surface: None,
+            resource: None,
+            surface_resource_buffer_match: ReplayCommandBufferMatch::NotApplicable,
+        }
+    }
+
+    fn command_timing_context(
+        scope: GraphTimingScope,
+        parent: CheckpointSceneReplayTimingSpan,
+        reserved_command_count: usize,
+    ) -> CheckpointReplayCommandTimingContext {
+        CheckpointReplayCommandTimingContext {
+            scope,
+            parent,
+            owner_pass_id: 8,
+            owner_instance_id: 80,
+            owner_kind: RenderPassKind::SceneCapture,
+            checkpoint_count: 1,
+            reserved_command_count,
+            opened_command_count: 0,
+        }
+    }
+
+    fn resolve_test_checkpoint_command(
+        state: &mut TimingState,
+        context: &mut CheckpointReplayCommandTimingContext,
+        metadata: CheckpointReplayCommandTimingMetadata,
+        timestamps: (u64, u64),
+        host: CheckpointReplayCommandHostTiming,
+    ) {
+        let command = state
+            .begin_checkpoint_replay_command(context, metadata)
+            .expect("command timing slot");
+        assert!(state.finish(command));
+        assert!(state.attach_checkpoint_replay_command_execution_detail(
+            command,
+            metadata.draw_calls,
+            host,
+        ));
+        assert!(matches!(
+            state.poll_front(true, Some(timestamps)),
+            PollOutcome::Ready {
+                duration_ns: Some(_),
+                record: None,
+            }
+        ));
     }
 
     fn resolve_test_composite_scene_replay(
@@ -4924,6 +5821,905 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_replay_command_capacity_preserves_the_base_backlog_reserve() {
+        assert_eq!(MAX_CHECKPOINT_REPLAY_COMMAND_SPANS_PER_GRAPH_SCOPE, 128);
+        let base_expected = EXPECTED_IN_FLIGHT_GRAPH_SCOPES * EXPECTED_TIMING_SPANS_PER_GRAPH_SCOPE;
+        let command_expected =
+            EXPECTED_IN_FLIGHT_GRAPH_SCOPES * MAX_CHECKPOINT_REPLAY_COMMAND_SPANS_PER_GRAPH_SCOPE;
+        let diagnostic_expected = base_expected + command_expected;
+
+        assert_eq!(base_expected, EXPECTED_TIMING_SPANS);
+        assert_eq!(command_expected, 256);
+        assert_eq!(diagnostic_expected, DIAGNOSTIC_EXPECTED_TIMING_SPANS);
+        assert_eq!(TIMING_SPAN_POOL_CAPACITY, 2304);
+        assert_eq!(TIMING_QUERY_OBJECT_CAPACITY, 4608);
+        assert_eq!(DIAGNOSTIC_TIMING_SPAN_POOL_CAPACITY, 2560);
+        assert_eq!(
+            query_object_capacity(DIAGNOSTIC_TIMING_SPAN_POOL_CAPACITY),
+            Some(5120)
+        );
+        assert_eq!(TIMING_SPAN_BACKLOG_RESERVE, 256);
+        assert!(
+            DIAGNOSTIC_TIMING_SPAN_POOL_CAPACITY - DIAGNOSTIC_EXPECTED_TIMING_SPANS
+                >= TIMING_SPAN_BACKLOG_RESERVE
+        );
+        assert_eq!(query_object_capacity(usize::MAX), None);
+    }
+
+    #[test]
+    fn checkpoint_replay_command_budget_is_bounded_and_scope_local() {
+        let mut state = TimingState::active_for_test(8);
+        let first_scope = state.begin_scope(Some(120)).expect("first scope");
+        let second_scope = state.begin_scope(Some(120)).expect("second scope");
+        assert!(state.set_stall_diagnostics_enabled(first_scope, true));
+        assert!(state.set_stall_diagnostics_enabled(second_scope, true));
+        let slots_before_reservation = state.free_slot_count();
+
+        assert!(state.reserve_checkpoint_replay_command_budget(
+            first_scope,
+            MAX_CHECKPOINT_REPLAY_COMMAND_SPANS_PER_GRAPH_SCOPE - 1,
+        ));
+        assert!(state.reserve_checkpoint_replay_command_budget(first_scope, 1));
+        assert!(!state.reserve_checkpoint_replay_command_budget(first_scope, 1));
+        assert!(state.reserve_checkpoint_replay_command_budget(
+            second_scope,
+            MAX_CHECKPOINT_REPLAY_COMMAND_SPANS_PER_GRAPH_SCOPE,
+        ));
+
+        let first = state
+            .aggregates
+            .iter()
+            .find(|aggregate| aggregate.scope_id == first_scope.scope_id)
+            .and_then(|aggregate| aggregate.checkpoint_replay_commands.as_ref())
+            .expect("first command aggregate");
+        assert!(!first.timing_available);
+        assert!(first.budget_exhausted);
+        assert_eq!(
+            first.budget_reserved,
+            MAX_CHECKPOINT_REPLAY_COMMAND_SPANS_PER_GRAPH_SCOPE
+        );
+        assert_eq!(first.expected_spans, 0);
+        let second = state
+            .aggregates
+            .iter()
+            .find(|aggregate| aggregate.scope_id == second_scope.scope_id)
+            .and_then(|aggregate| aggregate.checkpoint_replay_commands.as_ref())
+            .expect("second command aggregate");
+        assert!(second.timing_available);
+        assert!(!second.budget_exhausted);
+        assert_eq!(
+            second.budget_reserved,
+            MAX_CHECKPOINT_REPLAY_COMMAND_SPANS_PER_GRAPH_SCOPE
+        );
+        assert_eq!(state.free_slot_count(), slots_before_reservation);
+    }
+
+    #[test]
+    fn checkpoint_replay_command_group_sums_exactly_and_publishes_after_total() {
+        let mut state = TimingState::active_for_test(8);
+        let scope = state.begin_scope(Some(120)).expect("scope");
+        assert!(state.set_stall_diagnostics_enabled(scope, true));
+        let parent = state
+            .begin_checkpoint_scene_replay(
+                scope,
+                8,
+                80,
+                RenderPassKind::SceneCapture,
+                1,
+                checkpoint_scene_replay_work(1),
+            )
+            .expect("parent replay");
+        assert!(state.reserve_checkpoint_replay_command_budget(scope, 2));
+        let mut context = command_timing_context(scope, SceneReplayTimingSpan { token: parent }, 2);
+        let host_a = CheckpointReplayCommandHostTiming {
+            total_host_cpu_ns: 9,
+            execute_host_cpu_ns: 5,
+            begin_query_submit_host_cpu_ns: 2,
+            end_query_submit_host_cpu_ns: 2,
+        };
+        let host_b = CheckpointReplayCommandHostTiming {
+            total_host_cpu_ns: 10,
+            execute_host_cpu_ns: 6,
+            begin_query_submit_host_cpu_ns: 2,
+            end_query_submit_host_cpu_ns: 2,
+        };
+        let mut first = checkpoint_command_metadata(3, ReplayCommandLayerIdentity::Surface);
+        first.draw_calls = 2;
+        first.surface = Some(SurfaceDrawDiagnosticIdentity {
+            surface_id: 44,
+            generation: 7,
+            commit_sequence: 19,
+            buffer_id: 901,
+            buffer_source: SurfaceBufferSourceDiagnostic::Dmabuf,
+            buffer_width: 1920,
+            buffer_height: 1080,
+            render_backend: SurfaceRenderBackendDiagnostic::NativeWayland,
+            dmabuf_fourcc: Some(0x3432_5241),
+            dmabuf_plane_count: 1,
+            dmabuf_plane0_modifier: Some(0),
+        });
+        first.resource = Some(ResourceSurfaceDiagnosticIdentity {
+            resource_present: true,
+            resource_egl_image_backed: true,
+            resource_generation: 7,
+            resource_dmabuf_backed: true,
+            resource_dmabuf_buffer_id: 901,
+            resource_shm_synced_commit: None,
+        });
+        first.surface_resource_buffer_match = ReplayCommandBufferMatch::Match;
+        let mut second = checkpoint_command_metadata(4, ReplayCommandLayerIdentity::SolidRgba);
+        second.draw_calls = 1;
+        resolve_test_checkpoint_command(&mut state, &mut context, first, (100, 140), host_a);
+        assert!(state.completed_checkpoint_replay_command_events.is_empty());
+        resolve_test_checkpoint_command(&mut state, &mut context, second, (150, 190), host_b);
+        assert!(state.completed_checkpoint_replay_command_events.is_empty());
+
+        assert!(state.finish(parent));
+        assert!(state.attach_checkpoint_scene_replay_execution_detail(
+            parent,
+            Some(checkpoint_scene_replay_detail(1)),
+        ));
+        assert!(matches!(
+            state.poll_front(true, Some((50, 450))),
+            PollOutcome::Ready {
+                duration_ns: Some(400),
+                record: None,
+            }
+        ));
+        let record = resolve_test_total(&mut state, scope, 0, 1_000);
+
+        assert!(record.checkpoint_replay_command_timing_enabled);
+        assert!(record.checkpoint_replay_command_timing_available);
+        assert_eq!(record.checkpoint_replay_command_expected_spans, 2);
+        assert_eq!(record.checkpoint_replay_command_resolved_spans, 2);
+        assert_eq!(record.checkpoint_replay_command_gpu_ns, 80);
+        assert_eq!(record.checkpoint_replay_command_host_cpu_ns, 19);
+        assert!(record.checkpoint_replay_command_residual_available);
+        assert_eq!(record.checkpoint_replay_command_residual_ns, 320);
+        assert!(record.checkpoint_scene_replay_timing_available);
+        assert_eq!(record.scene_replay_attributed_ns, 400);
+        assert_eq!(record.graph_residual_unattributed_ns, 600);
+        assert_eq!(record.timed_passes, 0);
+        assert_eq!(record.pass_timed_ns(), 0);
+        let maximum = record
+            .max_checkpoint_replay_command
+            .expect("one exact maximum command");
+        assert_eq!(maximum.event.metadata.command_index, 3);
+        assert_eq!(maximum.event.metadata.surface, first.surface);
+        assert_eq!(maximum.event.metadata.resource, first.resource);
+        assert_eq!(maximum.event.draw_calls, 2);
+        let events = state
+            .completed_checkpoint_replay_command_events
+            .pop_front()
+            .expect("complete scope events");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].metadata.command_index, 3);
+        assert_eq!(events[1].metadata.command_index, 4);
+        let command_line = format_checkpoint_replay_command_event(events[0]);
+        for key in [
+            "event",
+            "frame_id",
+            "scope",
+            "owner_pass_id",
+            "owner_instance_id",
+            "owner_kind",
+            "checkpoint_count",
+            "command_index",
+            "layer",
+            "sampling",
+            "planned_clips",
+            "draw_calls",
+            "vertex_count",
+            "surface_id",
+            "surface_generation",
+            "commit_sequence",
+            "buffer_id",
+            "buffer_source",
+            "buffer_width",
+            "buffer_height",
+            "render_backend",
+            "dmabuf_fourcc",
+            "dmabuf_plane_count",
+            "dmabuf_plane0_modifier",
+            "resource_present",
+            "resource_egl_image_backed",
+            "resource_generation",
+            "resource_dmabuf_backed",
+            "resource_dmabuf_buffer_id",
+            "resource_shm_synced_commit",
+            "surface_resource_buffer_match",
+            "gpu_ns",
+            "host_cpu_ns",
+            "execute_host_cpu_ns",
+            "begin_query_submit_host_cpu_ns",
+            "end_query_submit_host_cpu_ns",
+        ] {
+            assert_eq!(
+                command_line
+                    .split_whitespace()
+                    .filter_map(|field| field.split_once('='))
+                    .filter(|(field_key, _)| *field_key == key)
+                    .count(),
+                1,
+                "{key}"
+            );
+        }
+        assert!(command_line.contains("layer=surface"));
+        assert!(command_line.contains("buffer_source=dmabuf"));
+        assert!(command_line.contains("resource_shm_synced_commit=none"));
+        assert!(command_line.contains("surface_resource_buffer_match=match"));
+    }
+
+    #[test]
+    fn checkpoint_replay_command_timing_disabled_without_stall_diagnostics() {
+        let mut state = TimingState::active_for_test(4);
+        let scope = state.begin_scope(Some(120)).expect("scope");
+        assert!(state.set_stall_diagnostics_enabled(scope, false));
+        let slots_before = state.free_slot_count();
+        assert!(!state.reserve_checkpoint_replay_command_budget(scope, 1));
+        assert_eq!(state.free_slot_count(), slots_before);
+        assert!(
+            state
+                .aggregates
+                .iter()
+                .find(|aggregate| aggregate.scope_id == scope.scope_id)
+                .unwrap()
+                .checkpoint_replay_commands
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn checkpoint_command_invalid_timestamp_keeps_parent_evidence_valid() {
+        let mut state = TimingState::active_for_test(5);
+        let scope = state.begin_scope(Some(120)).expect("scope");
+        assert!(state.set_stall_diagnostics_enabled(scope, true));
+        resolve_test_pass(
+            &mut state,
+            scope,
+            pass_metadata(7, RenderPassKind::Composite, 1, None),
+            50,
+            60,
+        );
+        let parent = state
+            .begin_checkpoint_scene_replay(
+                scope,
+                8,
+                80,
+                RenderPassKind::SceneCapture,
+                1,
+                checkpoint_scene_replay_work(1),
+            )
+            .expect("parent replay");
+        assert!(state.reserve_checkpoint_replay_command_budget(scope, 1));
+        let mut context = command_timing_context(scope, SceneReplayTimingSpan { token: parent }, 1);
+        let token = state
+            .begin_checkpoint_replay_command(
+                &mut context,
+                checkpoint_command_metadata(3, ReplayCommandLayerIdentity::Solid),
+            )
+            .expect("command slot");
+        assert!(state.finish(token));
+        assert!(state.attach_checkpoint_replay_command_execution_detail(
+            token,
+            1,
+            CheckpointReplayCommandHostTiming {
+                total_host_cpu_ns: 20,
+                execute_host_cpu_ns: 10,
+                begin_query_submit_host_cpu_ns: 5,
+                end_query_submit_host_cpu_ns: 5,
+            },
+        ));
+        assert_eq!(
+            state.poll_front(true, Some((400, 300))),
+            PollOutcome::Invalid
+        );
+        assert!(state.finish(parent));
+        assert!(state.attach_checkpoint_scene_replay_execution_detail(
+            parent,
+            Some(checkpoint_scene_replay_detail(1)),
+        ));
+        assert!(matches!(
+            state.poll_front(true, Some((100, 500))),
+            PollOutcome::Ready { record: None, .. }
+        ));
+        resolve_test_pass(
+            &mut state,
+            scope,
+            pass_metadata(9, RenderPassKind::Composite, 1, None),
+            600,
+            610,
+        );
+        let record = resolve_test_total(&mut state, scope, 0, 1_000);
+        assert!(record.checkpoint_scene_replay_timing_available);
+        assert!(!record.checkpoint_replay_command_timing_available);
+        assert_eq!(record.checkpoint_replay_command_resolved_spans, 0);
+        assert_eq!(record.timed_passes, 2);
+        assert!(record.graph_gap_attribution_available);
+    }
+
+    #[test]
+    fn checkpoint_command_child_sum_larger_than_parent_has_no_residual() {
+        let mut state = TimingState::active_for_test(5);
+        let scope = state.begin_scope(Some(120)).expect("scope");
+        assert!(state.set_stall_diagnostics_enabled(scope, true));
+        let parent = state
+            .begin_checkpoint_scene_replay(
+                scope,
+                8,
+                80,
+                RenderPassKind::SceneCapture,
+                1,
+                checkpoint_scene_replay_work(1),
+            )
+            .expect("parent replay");
+        assert!(state.reserve_checkpoint_replay_command_budget(scope, 1));
+        let mut context = command_timing_context(scope, SceneReplayTimingSpan { token: parent }, 1);
+        resolve_test_checkpoint_command(
+            &mut state,
+            &mut context,
+            checkpoint_command_metadata(3, ReplayCommandLayerIdentity::Solid),
+            (100, 300),
+            CheckpointReplayCommandHostTiming {
+                total_host_cpu_ns: 10,
+                execute_host_cpu_ns: 6,
+                begin_query_submit_host_cpu_ns: 2,
+                end_query_submit_host_cpu_ns: 2,
+            },
+        );
+        assert!(state.finish(parent));
+        assert!(state.attach_checkpoint_scene_replay_execution_detail(
+            parent,
+            Some(checkpoint_scene_replay_detail(1)),
+        ));
+        assert!(matches!(
+            state.poll_front(true, Some((50, 150))),
+            PollOutcome::Ready { record: None, .. }
+        ));
+        let record = resolve_test_total(&mut state, scope, 0, 500);
+        assert!(record.checkpoint_replay_command_timing_available);
+        assert!(!record.checkpoint_replay_command_residual_available);
+        assert_eq!(record.checkpoint_replay_command_residual_ns, 0);
+    }
+
+    #[test]
+    fn checkpoint_command_spans_do_not_create_pass_boundaries_or_double_subtract() {
+        let mut state = TimingState::active_for_test(7);
+        let scope = state.begin_scope(Some(120)).expect("scope");
+        assert!(state.set_stall_diagnostics_enabled(scope, true));
+        resolve_test_pass(
+            &mut state,
+            scope,
+            pass_metadata(7, RenderPassKind::Composite, 1, None),
+            100,
+            110,
+        );
+        let parent = state
+            .begin_checkpoint_scene_replay(
+                scope,
+                8,
+                80,
+                RenderPassKind::SceneCapture,
+                1,
+                checkpoint_scene_replay_work(1),
+            )
+            .expect("parent replay");
+        assert!(state.reserve_checkpoint_replay_command_budget(scope, 1));
+        let mut context = command_timing_context(scope, SceneReplayTimingSpan { token: parent }, 1);
+        resolve_test_checkpoint_command(
+            &mut state,
+            &mut context,
+            checkpoint_command_metadata(3, ReplayCommandLayerIdentity::Solid),
+            (120, 125),
+            CheckpointReplayCommandHostTiming {
+                total_host_cpu_ns: 10,
+                execute_host_cpu_ns: 6,
+                begin_query_submit_host_cpu_ns: 2,
+                end_query_submit_host_cpu_ns: 2,
+            },
+        );
+        assert!(state.finish(parent));
+        assert!(state.attach_checkpoint_scene_replay_execution_detail(
+            parent,
+            Some(checkpoint_scene_replay_detail(1)),
+        ));
+        assert!(matches!(
+            state.poll_front(true, Some((110, 140))),
+            PollOutcome::Ready { record: None, .. }
+        ));
+        resolve_test_pass(
+            &mut state,
+            scope,
+            pass_metadata(9, RenderPassKind::Composite, 1, None),
+            200,
+            210,
+        );
+        let record = resolve_test_total(&mut state, scope, 50, 220);
+
+        assert_eq!(record.timed_passes, 2);
+        assert_eq!(record.pass_timed_ns(), 20);
+        assert_eq!(record.checkpoint_scene_replay_gpu_ns, 30);
+        assert_eq!(record.checkpoint_replay_command_gpu_ns, 5);
+        assert_eq!(record.scene_replay_attributed_ns, 30);
+        assert_eq!(record.graph_residual_unattributed_ns, 120);
+        assert!(record.graph_gap_attribution_available);
+        assert_eq!(record.max_graph_gap.duration_ns, 90);
+        assert_eq!(
+            record.max_graph_gap.after.map(|boundary| boundary.pass_id),
+            Some(7)
+        );
+        assert_eq!(
+            record.max_graph_gap.before.map(|boundary| boundary.pass_id),
+            Some(9)
+        );
+    }
+
+    #[test]
+    fn incomplete_checkpoint_command_group_publishes_no_events() {
+        let mut state = TimingState::active_for_test(7);
+        let scope = state.begin_scope(Some(120)).expect("scope");
+        assert!(state.set_stall_diagnostics_enabled(scope, true));
+        let parent = state
+            .begin_checkpoint_scene_replay(
+                scope,
+                8,
+                80,
+                RenderPassKind::SceneCapture,
+                1,
+                checkpoint_scene_replay_work(1),
+            )
+            .expect("parent replay");
+        assert!(state.reserve_checkpoint_replay_command_budget(scope, 2));
+        let mut context = command_timing_context(scope, SceneReplayTimingSpan { token: parent }, 2);
+        resolve_test_checkpoint_command(
+            &mut state,
+            &mut context,
+            checkpoint_command_metadata(3, ReplayCommandLayerIdentity::Solid),
+            (100, 130),
+            CheckpointReplayCommandHostTiming {
+                total_host_cpu_ns: 10,
+                execute_host_cpu_ns: 6,
+                begin_query_submit_host_cpu_ns: 2,
+                end_query_submit_host_cpu_ns: 2,
+            },
+        );
+        let bad_command = state
+            .begin_checkpoint_replay_command(
+                &mut context,
+                checkpoint_command_metadata(4, ReplayCommandLayerIdentity::SolidRgba),
+            )
+            .expect("second command slot");
+        assert!(state.finish(bad_command));
+        assert!(state.attach_checkpoint_replay_command_execution_detail(
+            bad_command,
+            1,
+            CheckpointReplayCommandHostTiming {
+                total_host_cpu_ns: 10,
+                execute_host_cpu_ns: 6,
+                begin_query_submit_host_cpu_ns: 2,
+                end_query_submit_host_cpu_ns: 2,
+            },
+        ));
+        assert_eq!(
+            state.poll_front(true, Some((300, 200))),
+            PollOutcome::Invalid
+        );
+        assert!(state.completed_checkpoint_replay_command_events.is_empty());
+        assert!(state.finish(parent));
+        assert!(state.attach_checkpoint_scene_replay_execution_detail(
+            parent,
+            Some(checkpoint_scene_replay_detail(1)),
+        ));
+        assert!(matches!(
+            state.poll_front(true, Some((50, 450))),
+            PollOutcome::Ready { record: None, .. }
+        ));
+        let record = resolve_test_total(&mut state, scope, 0, 1_000);
+        assert!(record.checkpoint_scene_replay_timing_available);
+        assert!(!record.checkpoint_replay_command_timing_available);
+        assert_eq!(record.checkpoint_replay_command_expected_spans, 2);
+        assert_eq!(record.checkpoint_replay_command_resolved_spans, 1);
+        assert!(state.completed_checkpoint_replay_command_events.is_empty());
+    }
+
+    #[test]
+    fn later_checkpoint_command_budget_overflow_withholds_earlier_events() {
+        let mut state = TimingState::active_for_test(8);
+        let scope = state.begin_scope(Some(120)).expect("scope");
+        assert!(state.set_stall_diagnostics_enabled(scope, true));
+
+        let mut first_work = checkpoint_scene_replay_work(1);
+        first_work.command_count = MAX_CHECKPOINT_REPLAY_COMMAND_SPANS_PER_GRAPH_SCOPE - 1;
+        let first_parent = state
+            .begin_checkpoint_scene_replay(
+                scope,
+                8,
+                80,
+                RenderPassKind::SceneCapture,
+                1,
+                first_work,
+            )
+            .expect("first replay");
+        assert!(state.reserve_checkpoint_replay_command_budget(scope, first_work.command_count,));
+        let mut first_context = command_timing_context(
+            scope,
+            SceneReplayTimingSpan {
+                token: first_parent,
+            },
+            first_work.command_count,
+        );
+        resolve_test_checkpoint_command(
+            &mut state,
+            &mut first_context,
+            checkpoint_command_metadata(3, ReplayCommandLayerIdentity::Solid),
+            (100, 110),
+            CheckpointReplayCommandHostTiming::default(),
+        );
+        assert!(state.finish(first_parent));
+        assert!(state.attach_checkpoint_scene_replay_execution_detail(
+            first_parent,
+            Some(checkpoint_scene_replay_detail(1)),
+        ));
+        assert!(matches!(
+            state.poll_front(true, Some((50, 150))),
+            PollOutcome::Ready { record: None, .. }
+        ));
+
+        let mut second_work = checkpoint_scene_replay_work(2);
+        second_work.command_count = 2;
+        let second_parent = state
+            .begin_checkpoint_scene_replay(
+                scope,
+                8,
+                80,
+                RenderPassKind::SceneCapture,
+                1,
+                second_work,
+            )
+            .expect("second replay");
+        assert!(!state.reserve_checkpoint_replay_command_budget(scope, second_work.command_count,));
+        assert!(state.finish(second_parent));
+        assert!(state.attach_checkpoint_scene_replay_execution_detail(
+            second_parent,
+            Some(checkpoint_scene_replay_detail(2)),
+        ));
+        assert!(matches!(
+            state.poll_front(true, Some((160, 200))),
+            PollOutcome::Ready { record: None, .. }
+        ));
+        let record = resolve_test_total(&mut state, scope, 0, 500);
+
+        assert!(record.checkpoint_scene_replay_timing_available);
+        assert!(!record.checkpoint_replay_command_timing_available);
+        assert!(record.checkpoint_replay_command_budget_exhausted);
+        assert_eq!(record.checkpoint_replay_command_budget_reserved, 127);
+        assert_eq!(record.checkpoint_replay_command_expected_spans, 1);
+        assert_eq!(record.checkpoint_replay_command_resolved_spans, 1);
+        assert!(state.completed_checkpoint_replay_command_events.is_empty());
+    }
+
+    #[test]
+    fn checkpoint_replay_command_stale_token_cannot_attach_after_slot_reuse() {
+        let mut state = TimingState::active_for_test(4);
+        let scope = state.begin_scope(Some(120)).expect("scope");
+        assert!(state.set_stall_diagnostics_enabled(scope, true));
+        let parent = state
+            .begin_checkpoint_scene_replay(
+                scope,
+                8,
+                80,
+                RenderPassKind::SceneCapture,
+                1,
+                checkpoint_scene_replay_work(1),
+            )
+            .expect("parent replay");
+        assert!(state.reserve_checkpoint_replay_command_budget(scope, 2));
+        let mut context = command_timing_context(scope, SceneReplayTimingSpan { token: parent }, 2);
+        let first = state
+            .begin_checkpoint_replay_command(
+                &mut context,
+                checkpoint_command_metadata(11, ReplayCommandLayerIdentity::Solid),
+            )
+            .expect("first command");
+        assert!(state.finish(first));
+        assert!(state.attach_checkpoint_replay_command_execution_detail(
+            first,
+            1,
+            CheckpointReplayCommandHostTiming::default(),
+        ));
+        assert!(matches!(
+            state.poll_front(true, Some((100, 110))),
+            PollOutcome::Ready { record: None, .. }
+        ));
+        let second = state
+            .begin_checkpoint_replay_command(
+                &mut context,
+                checkpoint_command_metadata(12, ReplayCommandLayerIdentity::SolidRgba),
+            )
+            .expect("recycled command slot");
+        assert_eq!(first.slot, second.slot);
+        assert_ne!(first.generation, second.generation);
+        assert!(state.finish(second));
+        assert!(!state.attach_checkpoint_replay_command_execution_detail(
+            first,
+            99,
+            CheckpointReplayCommandHostTiming::default(),
+        ));
+        assert!(state.attach_checkpoint_replay_command_execution_detail(
+            second,
+            1,
+            CheckpointReplayCommandHostTiming::default(),
+        ));
+        assert!(matches!(
+            state.poll_front(true, Some((120, 140))),
+            PollOutcome::Ready { record: None, .. }
+        ));
+        assert!(state.finish(parent));
+        assert!(state.attach_checkpoint_scene_replay_execution_detail(
+            parent,
+            Some(checkpoint_scene_replay_detail(1)),
+        ));
+        assert!(matches!(
+            state.poll_front(true, Some((50, 250))),
+            PollOutcome::Ready { record: None, .. }
+        ));
+        let record = resolve_test_total(&mut state, scope, 0, 300);
+        assert!(record.checkpoint_replay_command_timing_available);
+        assert_eq!(record.checkpoint_replay_command_expected_spans, 2);
+        assert_eq!(record.checkpoint_replay_command_resolved_spans, 2);
+        assert_eq!(
+            record
+                .max_checkpoint_replay_command
+                .unwrap()
+                .event
+                .metadata
+                .command_index,
+            12
+        );
+    }
+
+    #[test]
+    fn checkpoint_replay_commands_with_same_frame_id_stay_in_separate_scopes() {
+        let mut state = TimingState::active_for_test(8);
+        let first_scope = state.begin_scope(Some(120)).expect("first scope");
+        let second_scope = state.begin_scope(Some(120)).expect("second scope");
+        assert!(state.set_stall_diagnostics_enabled(first_scope, true));
+        assert!(state.set_stall_diagnostics_enabled(second_scope, true));
+        let first_parent = state
+            .begin_checkpoint_scene_replay(
+                first_scope,
+                8,
+                80,
+                RenderPassKind::SceneCapture,
+                1,
+                checkpoint_scene_replay_work(1),
+            )
+            .expect("first parent");
+        let second_parent = state
+            .begin_checkpoint_scene_replay(
+                second_scope,
+                8,
+                80,
+                RenderPassKind::SceneCapture,
+                1,
+                checkpoint_scene_replay_work(1),
+            )
+            .expect("second parent");
+        assert!(state.reserve_checkpoint_replay_command_budget(first_scope, 1));
+        assert!(state.reserve_checkpoint_replay_command_budget(second_scope, 1));
+        let mut first_context = command_timing_context(
+            first_scope,
+            SceneReplayTimingSpan {
+                token: first_parent,
+            },
+            1,
+        );
+        let mut second_context = command_timing_context(
+            second_scope,
+            SceneReplayTimingSpan {
+                token: second_parent,
+            },
+            1,
+        );
+        resolve_test_checkpoint_command(
+            &mut state,
+            &mut first_context,
+            checkpoint_command_metadata(21, ReplayCommandLayerIdentity::Solid),
+            (100, 110),
+            CheckpointReplayCommandHostTiming::default(),
+        );
+        resolve_test_checkpoint_command(
+            &mut state,
+            &mut second_context,
+            checkpoint_command_metadata(22, ReplayCommandLayerIdentity::SolidRgba),
+            (200, 220),
+            CheckpointReplayCommandHostTiming::default(),
+        );
+        assert!(state.finish(first_parent));
+        assert!(state.attach_checkpoint_scene_replay_execution_detail(
+            first_parent,
+            Some(checkpoint_scene_replay_detail(1)),
+        ));
+        assert!(state.finish(second_parent));
+        assert!(state.attach_checkpoint_scene_replay_execution_detail(
+            second_parent,
+            Some(checkpoint_scene_replay_detail(1)),
+        ));
+        assert!(matches!(
+            state.poll_front(true, Some((50, 150))),
+            PollOutcome::Ready { record: None, .. }
+        ));
+        assert!(matches!(
+            state.poll_front(true, Some((150, 250))),
+            PollOutcome::Ready { record: None, .. }
+        ));
+        let first = resolve_test_total(&mut state, first_scope, 0, 300);
+        let second = resolve_test_total(&mut state, second_scope, 0, 300);
+        assert_ne!(first.scope_id, second.scope_id);
+        assert_eq!(first.frame_id, second.frame_id);
+        assert_eq!(first.checkpoint_replay_command_gpu_ns, 10);
+        assert_eq!(second.checkpoint_replay_command_gpu_ns, 20);
+        assert_eq!(
+            first
+                .max_checkpoint_replay_command
+                .unwrap()
+                .event
+                .metadata
+                .command_index,
+            21
+        );
+        assert_eq!(
+            second
+                .max_checkpoint_replay_command
+                .unwrap()
+                .event
+                .metadata
+                .command_index,
+            22
+        );
+    }
+
+    #[test]
+    fn checkpoint_command_missing_surface_metadata_and_allocation_fail_closed() {
+        let mut state = TimingState::active_for_test(5);
+        let scope = state.begin_scope(Some(120)).expect("scope");
+        assert!(state.set_stall_diagnostics_enabled(scope, true));
+        let parent = state
+            .begin_checkpoint_scene_replay(
+                scope,
+                8,
+                80,
+                RenderPassKind::SceneCapture,
+                1,
+                checkpoint_scene_replay_work(1),
+            )
+            .expect("parent replay");
+        assert!(state.reserve_checkpoint_replay_command_budget(scope, 1));
+        let mut context = command_timing_context(scope, SceneReplayTimingSpan { token: parent }, 1);
+        let slots_before = state.free_slot_count();
+        assert!(
+            state
+                .begin_checkpoint_replay_command(
+                    &mut context,
+                    checkpoint_command_metadata(3, ReplayCommandLayerIdentity::Surface),
+                )
+                .is_none()
+        );
+        assert_eq!(state.free_slot_count(), slots_before);
+        assert!(state.finish(parent));
+        assert!(state.attach_checkpoint_scene_replay_execution_detail(
+            parent,
+            Some(checkpoint_scene_replay_detail(1)),
+        ));
+        assert!(matches!(
+            state.poll_front(true, Some((100, 200))),
+            PollOutcome::Ready { record: None, .. }
+        ));
+        let record = resolve_test_total(&mut state, scope, 0, 300);
+        assert!(record.checkpoint_scene_replay_timing_available);
+        assert!(!record.checkpoint_replay_command_timing_available);
+        assert_eq!(record.checkpoint_replay_command_expected_spans, 0);
+        assert!(state.completed_checkpoint_replay_command_events.is_empty());
+
+        let mut exhausted = TimingState::active_for_test(2);
+        let scope = exhausted.begin_scope(Some(121)).expect("scope");
+        assert!(exhausted.set_stall_diagnostics_enabled(scope, true));
+        let parent = exhausted
+            .begin_checkpoint_scene_replay(
+                scope,
+                8,
+                80,
+                RenderPassKind::SceneCapture,
+                1,
+                checkpoint_scene_replay_work(1),
+            )
+            .expect("parent occupies second slot");
+        assert!(exhausted.reserve_checkpoint_replay_command_budget(scope, 1));
+        let mut context = command_timing_context(scope, SceneReplayTimingSpan { token: parent }, 1);
+        assert!(
+            exhausted
+                .begin_checkpoint_replay_command(
+                    &mut context,
+                    checkpoint_command_metadata(3, ReplayCommandLayerIdentity::Solid),
+                )
+                .is_none()
+        );
+        assert!(exhausted.finish(parent));
+        assert!(exhausted.attach_checkpoint_scene_replay_execution_detail(
+            parent,
+            Some(checkpoint_scene_replay_detail(1)),
+        ));
+        assert!(matches!(
+            exhausted.poll_front(true, Some((100, 200))),
+            PollOutcome::Ready { record: None, .. }
+        ));
+        let record = resolve_test_total(&mut exhausted, scope, 0, 300);
+        assert!(record.checkpoint_scene_replay_timing_available);
+        assert!(!record.checkpoint_replay_command_timing_available);
+        assert_eq!(record.dropped_passes, 0);
+    }
+
+    #[test]
+    fn checkpoint_command_missing_resolved_metadata_keeps_parent_evidence_valid() {
+        let mut state = TimingState::active_for_test(4);
+        let scope = state.begin_scope(Some(120)).expect("scope");
+        assert!(state.set_stall_diagnostics_enabled(scope, true));
+        let parent = state
+            .begin_checkpoint_scene_replay(
+                scope,
+                8,
+                80,
+                RenderPassKind::SceneCapture,
+                1,
+                checkpoint_scene_replay_work(1),
+            )
+            .expect("checkpoint replay");
+        assert!(state.reserve_checkpoint_replay_command_budget(scope, 1));
+        let mut context = command_timing_context(scope, SceneReplayTimingSpan { token: parent }, 1);
+        let command = state
+            .begin_checkpoint_replay_command(
+                &mut context,
+                checkpoint_command_metadata(3, ReplayCommandLayerIdentity::Solid),
+            )
+            .expect("command span");
+        assert!(state.finish(command));
+        assert!(state.attach_checkpoint_replay_command_execution_detail(
+            command,
+            1,
+            CheckpointReplayCommandHostTiming::default(),
+        ));
+        let pending = state
+            .pending
+            .iter_mut()
+            .find(|pending| pending.token == command)
+            .expect("pending command span");
+        pending.metadata.checkpoint_command = None;
+        assert!(state.finish(parent));
+        assert!(state.attach_checkpoint_scene_replay_execution_detail(
+            parent,
+            Some(checkpoint_scene_replay_detail(1)),
+        ));
+        assert!(matches!(
+            state.poll_front(true, Some((100, 110))),
+            PollOutcome::Ready {
+                duration_ns: Some(10),
+                record: None,
+            }
+        ));
+        assert!(matches!(
+            state.poll_front(true, Some((50, 150))),
+            PollOutcome::Ready { record: None, .. }
+        ));
+        let record = resolve_test_total(&mut state, scope, 0, 200);
+
+        assert!(record.checkpoint_scene_replay_timing_available);
+        assert!(!record.checkpoint_replay_command_timing_available);
+        assert_eq!(record.checkpoint_replay_command_expected_spans, 1);
+        assert_eq!(record.checkpoint_replay_command_resolved_spans, 0);
+        assert!(state.completed_checkpoint_replay_command_events.is_empty());
+    }
+
+    #[test]
     fn two_in_flight_maximal_scopes_fit_with_checkpoint_scene_replays() {
         let mut state = TimingState::active_for_test(TIMING_SPAN_POOL_CAPACITY);
         for frame in 0..EXPECTED_IN_FLIGHT_GRAPH_SCOPES {
@@ -5010,6 +6806,146 @@ mod tests {
         }));
         assert_eq!(state.dropped_spans(), 0);
         assert_eq!(state.free_slot_count(), TIMING_SPAN_POOL_CAPACITY);
+    }
+
+    #[test]
+    fn two_diagnostic_scopes_fit_base_and_full_command_budget() {
+        let mut state = TimingState::active_for_test(DIAGNOSTIC_TIMING_SPAN_POOL_CAPACITY);
+        for frame in 0..EXPECTED_IN_FLIGHT_GRAPH_SCOPES {
+            let scope = state.begin_scope(Some(frame as u64)).expect("scope slot");
+            assert!(state.set_stall_diagnostics_enabled(scope, true));
+            for instance in 0..MAX_EFFECT_INSTANCES_PER_OUTPUT {
+                for pass_index in 0..CURRENT_PASSES_PER_BLUR_INSTANCE {
+                    let pass_id =
+                        1 + (instance * CURRENT_PASSES_PER_BLUR_INSTANCE + pass_index) as u64;
+                    let pass = state
+                        .begin_pass(
+                            scope,
+                            pass_metadata(pass_id, RenderPassKind::Fragment, 1, None),
+                        )
+                        .expect("built-in pass slot");
+                    assert!(state.finish(pass));
+                }
+                let owner_pass_id = 10_000 + instance as u64;
+                let composite = state
+                    .begin_composite_scene_replay(
+                        scope,
+                        owner_pass_id,
+                        instance as u64 + 1,
+                        SceneReplayWork::default(),
+                    )
+                    .expect("composite replay slot");
+                assert!(state.finish(composite));
+                assert!(state.attach_composite_scene_replay_execution_detail(
+                    composite,
+                    Some(SceneReplayExecutionDetail::default())
+                ));
+                if instance > 0 {
+                    let mut work = SceneReplayWork::default();
+                    if instance == 1 {
+                        work.command_count = MAX_CHECKPOINT_REPLAY_COMMAND_SPANS_PER_GRAPH_SCOPE;
+                    }
+                    let checkpoint = state
+                        .begin_checkpoint_scene_replay(
+                            scope,
+                            owner_pass_id + 20_000,
+                            instance as u64 + 1,
+                            RenderPassKind::SceneCapture,
+                            1,
+                            work,
+                        )
+                        .expect("checkpoint replay slot");
+                    if instance == 1 {
+                        assert!(
+                            state.reserve_checkpoint_replay_command_budget(
+                                scope,
+                                work.command_count,
+                            )
+                        );
+                        let mut context = CheckpointReplayCommandTimingContext {
+                            scope,
+                            parent: SceneReplayTimingSpan { token: checkpoint },
+                            owner_pass_id: owner_pass_id + 20_000,
+                            owner_instance_id: instance as u64 + 1,
+                            owner_kind: RenderPassKind::SceneCapture,
+                            checkpoint_count: 1,
+                            reserved_command_count: work.command_count,
+                            opened_command_count: 0,
+                        };
+                        for command_index in 0..work.command_count {
+                            let mut metadata = checkpoint_command_metadata(
+                                command_index,
+                                ReplayCommandLayerIdentity::Solid,
+                            );
+                            metadata.owner_pass_id = context.owner_pass_id;
+                            metadata.owner_instance_id = context.owner_instance_id;
+                            metadata.owner_kind = context.owner_kind;
+                            metadata.checkpoint_count = context.checkpoint_count;
+                            let command = state
+                                .begin_checkpoint_replay_command(&mut context, metadata)
+                                .expect("diagnostic command query slot");
+                            assert!(state.finish(command));
+                            assert!(state.attach_checkpoint_replay_command_execution_detail(
+                                command,
+                                1,
+                                CheckpointReplayCommandHostTiming::default(),
+                            ));
+                        }
+                    }
+                    assert!(state.finish(checkpoint));
+                    assert!(state.attach_checkpoint_scene_replay_execution_detail(
+                        checkpoint,
+                        Some(SceneReplayExecutionDetail::default())
+                    ));
+                }
+            }
+            assert!(state.finish(scope.total));
+        }
+
+        assert_eq!(state.high_water, DIAGNOSTIC_EXPECTED_TIMING_SPANS);
+        assert_eq!(state.dropped_spans(), 0);
+        assert_eq!(
+            state.free_slot_count(),
+            DIAGNOSTIC_TIMING_SPAN_POOL_CAPACITY - DIAGNOSTIC_EXPECTED_TIMING_SPANS
+        );
+        let mut timestamp_ns = 100u64;
+        let mut records = Vec::new();
+        let (collected, stopped_for_disjoint) = state.collect_ready_with(
+            DIAGNOSTIC_TIMING_SPAN_POOL_CAPACITY,
+            |_| {
+                let start_ns = timestamp_ns;
+                timestamp_ns = timestamp_ns.saturating_add(2);
+                QueryResolution::Ready((start_ns, start_ns.saturating_add(1)))
+            },
+            |record| records.push(*record),
+        );
+        assert!(!stopped_for_disjoint);
+        assert_eq!(collected, DIAGNOSTIC_EXPECTED_TIMING_SPANS);
+        assert_eq!(records.len(), EXPECTED_IN_FLIGHT_GRAPH_SCOPES);
+        assert!(records.iter().all(|record| {
+            record.checkpoint_replay_command_timing_enabled
+                && record.checkpoint_replay_command_timing_available
+                && record.checkpoint_replay_command_expected_spans
+                    == MAX_CHECKPOINT_REPLAY_COMMAND_SPANS_PER_GRAPH_SCOPE
+                && record.checkpoint_replay_command_resolved_spans
+                    == MAX_CHECKPOINT_REPLAY_COMMAND_SPANS_PER_GRAPH_SCOPE
+                && record.checkpoint_replay_command_budget_reserved
+                    == MAX_CHECKPOINT_REPLAY_COMMAND_SPANS_PER_GRAPH_SCOPE
+                && record.checkpoint_scene_replay_timing_available
+                && record.composite_scene_replay_timing_available
+        }));
+        assert_eq!(state.dropped_spans(), 0);
+        assert_eq!(
+            state.free_slot_count(),
+            DIAGNOSTIC_TIMING_SPAN_POOL_CAPACITY
+        );
+        assert_eq!(state.completed_checkpoint_replay_command_events.len(), 2);
+        assert!(
+            state
+                .completed_checkpoint_replay_command_events
+                .iter()
+                .all(|events| events.len() == MAX_CHECKPOINT_REPLAY_COMMAND_SPANS_PER_GRAPH_SCOPE)
+        );
     }
 
     #[test]
@@ -6111,6 +8047,11 @@ mod tests {
         let timing_only = ProfilerConfig::from_environment();
         assert!(timing_only.gpu_timing_enabled);
         assert!(!timing_only.stall_diagnostics_enabled);
+        assert_eq!(timing_only.span_pool_capacity(), TIMING_SPAN_POOL_CAPACITY);
+        assert_eq!(
+            query_object_capacity(timing_only.span_pool_capacity()),
+            Some(TIMING_QUERY_OBJECT_CAPACITY)
+        );
         assert!(
             pass_metadata(1, RenderPassKind::Composite, 1, None)
                 .host_timing
@@ -6177,6 +8118,14 @@ mod tests {
         let both_enabled = ProfilerConfig::from_environment();
         assert!(both_enabled.gpu_timing_enabled);
         assert!(both_enabled.stall_diagnostics_enabled);
+        assert_eq!(
+            both_enabled.span_pool_capacity(),
+            DIAGNOSTIC_TIMING_SPAN_POOL_CAPACITY
+        );
+        assert_eq!(
+            query_object_capacity(both_enabled.span_pool_capacity()),
+            Some(DIAGNOSTIC_TIMING_QUERY_OBJECT_CAPACITY)
+        );
     }
 
     #[test]
@@ -7009,6 +8958,7 @@ mod tests {
     fn disjoint_invalidates_all_pending_measurements() {
         let mut state = TimingState::active_for_test(4);
         let scope = state.begin_scope(Some(120)).expect("scope slot");
+        assert!(state.set_stall_diagnostics_enabled(scope, true));
         let pass = state
             .begin_pass(scope, pass_metadata(7, RenderPassKind::Composite, 64, None))
             .expect("pass slot");
@@ -7023,14 +8973,29 @@ mod tests {
             )
             .expect("checkpoint replay slot");
         assert!(state.finish(pass));
+        assert!(state.reserve_checkpoint_replay_command_budget(scope, 1));
+        let mut context =
+            command_timing_context(scope, SceneReplayTimingSpan { token: checkpoint }, 1);
+        let command = state
+            .begin_checkpoint_replay_command(
+                &mut context,
+                checkpoint_command_metadata(3, ReplayCommandLayerIdentity::Solid),
+            )
+            .expect("command slot");
+        assert!(state.finish(command));
+        assert!(state.attach_checkpoint_replay_command_execution_detail(
+            command,
+            1,
+            CheckpointReplayCommandHostTiming::default(),
+        ));
         assert!(state.finish(checkpoint));
         assert!(state.attach_checkpoint_scene_replay_execution_detail(
             checkpoint,
             Some(checkpoint_scene_replay_detail(1))
         ));
         assert!(state.finish(scope.total));
-        assert_eq!(state.invalidate_pending_for_test(), 3);
-        assert_eq!(state.disjoint_invalidated_span_count(), 3);
+        assert_eq!(state.invalidate_pending_for_test(), 4);
+        assert_eq!(state.disjoint_invalidated_span_count(), 4);
         assert_eq!(state.pending_span_count(), 0);
         assert_eq!(state.free_slot_count(), 4);
     }
@@ -7114,6 +9079,19 @@ mod tests {
             checkpoint_scene_replay_commands_executed: 0,
             checkpoint_scene_replay_draw_calls: 0,
             checkpoint_scene_replay_texture_binds: 0,
+            checkpoint_replay_command_timing_enabled: false,
+            checkpoint_replay_command_timing_available: false,
+            checkpoint_replay_command_budget_limit:
+                MAX_CHECKPOINT_REPLAY_COMMAND_SPANS_PER_GRAPH_SCOPE,
+            checkpoint_replay_command_budget_reserved: 0,
+            checkpoint_replay_command_budget_exhausted: false,
+            checkpoint_replay_command_expected_spans: 0,
+            checkpoint_replay_command_resolved_spans: 0,
+            checkpoint_replay_command_gpu_ns: 0,
+            checkpoint_replay_command_host_cpu_ns: 0,
+            checkpoint_replay_command_residual_available: false,
+            checkpoint_replay_command_residual_ns: 0,
+            max_checkpoint_replay_command: None,
             graph_residual_attribution_available: false,
             scene_replay_attributed_ns: 0,
             graph_residual_unattributed_ns: 0,
@@ -7240,6 +9218,51 @@ mod tests {
             "max_composite_scene_replay_texture_binds",
             "max_composite_scene_replay_scene_vbo_uploads",
             "max_composite_scene_replay_scene_vbo_upload_bytes",
+            "checkpoint_replay_command_timing_enabled",
+            "checkpoint_replay_command_timing_available",
+            "checkpoint_replay_command_budget_limit",
+            "checkpoint_replay_command_budget_reserved",
+            "checkpoint_replay_command_budget_exhausted",
+            "checkpoint_replay_command_expected_spans",
+            "checkpoint_replay_command_resolved_spans",
+            "checkpoint_replay_command_gpu_ns",
+            "checkpoint_replay_command_host_cpu_ns",
+            "checkpoint_replay_command_residual_available",
+            "checkpoint_replay_command_residual_ns",
+            "max_checkpoint_replay_command_gpu_ns",
+            "max_checkpoint_replay_command_host_cpu_ns",
+            "max_checkpoint_replay_command_owner_pass_id",
+            "max_checkpoint_replay_command_owner_instance_id",
+            "max_checkpoint_replay_command_owner_kind",
+            "max_checkpoint_replay_command_checkpoint_count",
+            "max_checkpoint_replay_command_index",
+            "max_checkpoint_replay_command_layer",
+            "max_checkpoint_replay_command_layer_id",
+            "max_checkpoint_replay_command_sampling",
+            "max_checkpoint_replay_command_planned_clips",
+            "max_checkpoint_replay_command_draw_calls",
+            "max_checkpoint_replay_command_vertex_count",
+            "max_checkpoint_replay_command_surface_id",
+            "max_checkpoint_replay_command_surface_generation",
+            "max_checkpoint_replay_command_commit_sequence",
+            "max_checkpoint_replay_command_buffer_id",
+            "max_checkpoint_replay_command_buffer_source",
+            "max_checkpoint_replay_command_buffer_width",
+            "max_checkpoint_replay_command_buffer_height",
+            "max_checkpoint_replay_command_render_backend",
+            "max_checkpoint_replay_command_dmabuf_fourcc",
+            "max_checkpoint_replay_command_dmabuf_plane_count",
+            "max_checkpoint_replay_command_dmabuf_plane0_modifier",
+            "max_checkpoint_replay_command_resource_present",
+            "max_checkpoint_replay_command_resource_egl_image_backed",
+            "max_checkpoint_replay_command_resource_generation",
+            "max_checkpoint_replay_command_resource_dmabuf_backed",
+            "max_checkpoint_replay_command_resource_dmabuf_buffer_id",
+            "max_checkpoint_replay_command_resource_shm_synced_commit",
+            "max_checkpoint_replay_command_surface_resource_buffer_match",
+            "max_checkpoint_replay_command_execute_host_cpu_ns",
+            "max_checkpoint_replay_command_begin_query_host_cpu_ns",
+            "max_checkpoint_replay_command_end_query_host_cpu_ns",
             "checkpoint_cache_candidates",
             "checkpoint_cache_candidates_considered",
             "checkpoint_cache_resident_candidates",
@@ -7300,6 +9323,12 @@ mod tests {
         assert!(line.contains("max_effect_damage_bbox_pixels=0"));
         assert!(line.contains("max_effect_target_width=0"));
         assert!(line.contains("max_effect_target_height=0"));
+        assert!(line.contains("max_checkpoint_replay_command_surface_id=0"));
+        assert!(line.contains("max_checkpoint_replay_command_buffer_source=none"));
+        assert!(line.contains("max_checkpoint_replay_command_buffer_id=0"));
+        assert!(line.contains("max_checkpoint_replay_command_dmabuf_fourcc=none"));
+        assert!(line.contains("max_checkpoint_replay_command_dmabuf_plane0_modifier=none"));
+        assert!(line.contains("max_checkpoint_replay_command_resource_shm_synced_commit=none"));
         assert!(line.contains("graph_gap_attribution_available=0"));
         assert!(line.contains("max_graph_gap_ns=0"));
         assert!(line.contains("max_graph_gap_position=none"));

@@ -8,6 +8,8 @@ mod checkpoint_dependency_pruning;
 pub(crate) use checkpoint_dependency_pruning::CheckpointDependencyPruningPolicy;
 mod executor;
 mod gpu_timing;
+#[cfg(test)]
+pub(crate) use gpu_timing::{ProfilerEnvGuard, SceneReplayWork};
 mod metrics;
 mod precomputed_window_blur;
 pub(crate) use precomputed_window_blur::PrecomputedWindowBlurPolicy;

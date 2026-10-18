@@ -36,6 +36,61 @@ pub(in crate::egl_renderer) struct ResourceTextureView<'a> {
     cursor: Option<&'a EglImageResource>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SurfaceBufferSourceDiagnostic {
+    Shm,
+    Dmabuf,
+}
+
+impl SurfaceBufferSourceDiagnostic {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Shm => "shm",
+            Self::Dmabuf => "dmabuf",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SurfaceRenderBackendDiagnostic {
+    NativeWayland,
+    Xwayland,
+}
+
+impl SurfaceRenderBackendDiagnostic {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::NativeWayland => "native_wayland",
+            Self::Xwayland => "xwayland",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SurfaceDrawDiagnosticIdentity {
+    pub(crate) surface_id: u32,
+    pub(crate) generation: u64,
+    pub(crate) commit_sequence: u64,
+    pub(crate) buffer_id: u64,
+    pub(crate) buffer_source: SurfaceBufferSourceDiagnostic,
+    pub(crate) buffer_width: u32,
+    pub(crate) buffer_height: u32,
+    pub(crate) render_backend: SurfaceRenderBackendDiagnostic,
+    pub(crate) dmabuf_fourcc: Option<u32>,
+    pub(crate) dmabuf_plane_count: usize,
+    pub(crate) dmabuf_plane0_modifier: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ResourceSurfaceDiagnosticIdentity {
+    pub(crate) resource_present: bool,
+    pub(crate) resource_egl_image_backed: bool,
+    pub(crate) resource_generation: u64,
+    pub(crate) resource_dmabuf_backed: bool,
+    pub(crate) resource_dmabuf_buffer_id: u64,
+    pub(crate) resource_shm_synced_commit: Option<u64>,
+}
+
 impl ResourceTextureView<'_> {
     pub(in crate::egl_renderer) fn texture_for_surface(
         &self,
@@ -44,6 +99,37 @@ impl ResourceTextureView<'_> {
         match self.surfaces.get(&surface_id)? {
             EglSurfaceResource::Uploaded { image, .. } => Some(image.texture),
             EglSurfaceResource::Dmabuf { key } => self.dmabuf_registry.texture_for_key(key),
+        }
+    }
+
+    pub(crate) fn surface_diagnostic_identity(
+        &self,
+        surface_id: u32,
+    ) -> Option<ResourceSurfaceDiagnosticIdentity> {
+        match self.surfaces.get(&surface_id)? {
+            EglSurfaceResource::Uploaded {
+                image,
+                shm_synced_commit,
+            } => Some(ResourceSurfaceDiagnosticIdentity {
+                resource_present: true,
+                resource_egl_image_backed: image.egl_image.is_some(),
+                resource_generation: image.generation,
+                resource_dmabuf_backed: false,
+                resource_dmabuf_buffer_id: 0,
+                resource_shm_synced_commit: shm_synced_commit.map(|commit| commit.0),
+            }),
+            EglSurfaceResource::Dmabuf { key } => {
+                let (generation, egl_image_backed) =
+                    self.dmabuf_registry.diagnostic_identity(key)?;
+                Some(ResourceSurfaceDiagnosticIdentity {
+                    resource_present: true,
+                    resource_egl_image_backed: egl_image_backed,
+                    resource_generation: generation,
+                    resource_dmabuf_backed: true,
+                    resource_dmabuf_buffer_id: key.buffer_id().get(),
+                    resource_shm_synced_commit: None,
+                })
+            }
         }
     }
 

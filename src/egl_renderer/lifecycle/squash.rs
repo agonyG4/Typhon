@@ -434,6 +434,7 @@ impl SquashRenderState {
                         command.vertex_start as i32,
                         command.vertex_count as i32,
                     );
+                    context.note_diagnostic_draw_call();
                 }
                 draw_calls = draw_calls.saturating_add(1);
                 frame.evidence.record(LifecycleRenderEvidenceEntry {

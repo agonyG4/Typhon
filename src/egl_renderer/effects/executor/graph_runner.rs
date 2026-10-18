@@ -612,6 +612,7 @@ pub(super) fn execute_graph_passes_inner(
                             metrics.4,
                         );
                     }
+                    let mut checkpoint_command_upper_bound = 0;
                     let checkpoint_scene_replay = if should_time_checkpoint_scene_replay(
                         Some(scene_advance_reason),
                         pass.kind,
@@ -629,6 +630,7 @@ pub(super) fn execute_graph_passes_inner(
                             active_work,
                             scene_work_state.pending_checkpoint_requirements(),
                         );
+                        checkpoint_command_upper_bound = work.command_count;
                         graph_scope.and_then(|scope| {
                             renderer
                                 .runtime
@@ -646,18 +648,46 @@ pub(super) fn execute_graph_passes_inner(
                     } else {
                         None
                     };
+                    let mut checkpoint_command_timing = match (graph_scope, checkpoint_scene_replay)
+                    {
+                        (Some(scope), Some(parent)) => renderer
+                            .runtime
+                            .effect_gpu_profiler
+                            .reserve_checkpoint_replay_command_attribution(
+                                scope,
+                                parent,
+                                u64::from(pass.id.get()),
+                                pass.instance.get(),
+                                pass.kind,
+                                pass.checkpoint_dependencies.len(),
+                                checkpoint_command_upper_bound,
+                            ),
+                        _ => None,
+                    };
                     let replay_host_start =
                         checkpoint_scene_replay.as_ref().map(|_| Instant::now());
                     let replay_stats_before = checkpoint_scene_replay
                         .as_ref()
                         .map(|_| renderer.scene.frame_stats);
-                    let draw_result = renderer.draw_effect_scene_range(
-                        active_work,
-                        scene_cursor,
-                        draw_end,
-                        framebuffer_origin,
-                        targets.composition_draw,
-                    );
+                    let draw_result =
+                        if let Some(command_timing) = checkpoint_command_timing.as_mut() {
+                            renderer.draw_effect_scene_range_with_command_attribution(
+                                active_work,
+                                scene_cursor,
+                                draw_end,
+                                framebuffer_origin,
+                                targets.composition_draw,
+                                command_timing,
+                            )
+                        } else {
+                            renderer.draw_effect_scene_range(
+                                active_work,
+                                scene_cursor,
+                                draw_end,
+                                framebuffer_origin,
+                                targets.composition_draw,
+                            )
+                        };
                     if let Some(replay_span) = checkpoint_scene_replay {
                         let host_cpu_ns = monotonic_elapsed_ns(replay_host_start);
                         let detail = finalize_scene_replay_timing(

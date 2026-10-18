@@ -836,6 +836,7 @@ impl LampRenderState {
                     command.vertex_start as i32,
                     command.vertex_count as i32,
                 );
+                context.note_diagnostic_draw_call();
             }
             frame.evidence.record(LifecycleRenderEvidenceEntry {
                 window_id: sample.window_id,

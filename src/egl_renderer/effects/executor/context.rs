@@ -1,5 +1,8 @@
 use super::super::gpu_timing::{
-    CaptureTimingMetadata, GraphTimingScope, PassTimingSpan, PassTimingWork,
+    CaptureTimingMetadata, CheckpointReplayCommandExecutionSpan,
+    CheckpointReplayCommandTimingContext, CheckpointReplayCommandTimingMetadata, GraphTimingScope,
+    PassTimingSpan, PassTimingWork, ReplayCommandBufferMatch, ReplayCommandLayerIdentity,
+    ReplayCommandSampling,
 };
 use super::*;
 use glow::HasContext;
@@ -101,19 +104,22 @@ impl<'a> EffectExecutionContext<'a> {
         identity: oblivion_one::presentation_animation::PresentationRetainedVisualIdentity,
         scissor: Option<OutputRect>,
         target_space: crate::egl_renderer::lifecycle::LifecycleRenderTargetSpace,
-    ) -> RendererResult<()> {
+        count_diagnostic_draws: bool,
+    ) -> RendererResult<usize> {
         let Some(dispatcher) = self.lifecycle_dispatch.as_mut() else {
-            return Ok(());
+            return Ok(0);
         };
-        let result = {
-            let mut lifecycle_context = crate::egl_renderer::lifecycle::LifecycleRenderContext::new(
+        let (result, diagnostic_draw_calls) = {
+            let mut lifecycle_context = crate::egl_renderer::lifecycle::LifecycleRenderContext::new_with_diagnostic_draw_counter(
                 self.gl,
                 self.scene,
                 self.runtime,
                 self.sources.ordinary,
                 target_space,
+                count_diagnostic_draws,
             );
-            dispatcher.draw_marker(&mut lifecycle_context, identity, scissor)
+            let result = dispatcher.draw_marker(&mut lifecycle_context, identity, scissor);
+            (result, lifecycle_context.diagnostic_draw_calls)
         };
         let resume_program = match target_space {
             crate::egl_renderer::lifecycle::LifecycleRenderTargetSpace::Output { .. } => {
@@ -136,12 +142,127 @@ impl<'a> EffectExecutionContext<'a> {
                 glow::ONE_MINUS_SRC_ALPHA,
             );
         }
-        result
+        result.map(|()| diagnostic_draw_calls)
     }
 
     pub(super) fn texture_for_layer(&self, layer: EglDrawLayer) -> Option<glow::Texture> {
         self.sources
             .texture_for_layer(layer, &self.runtime.effect_resources)
+    }
+
+    fn begin_checkpoint_command_timing(
+        &mut self,
+        context: &mut CheckpointReplayCommandTimingContext,
+        command: &EglDrawCommand,
+        command_index: usize,
+        planned_clip_count: usize,
+    ) -> Option<CheckpointReplayCommandExecutionSpan> {
+        let (layer, layer_id) = match command.layer {
+            EglDrawLayer::Surface(surface_id) => {
+                (ReplayCommandLayerIdentity::Surface, u64::from(surface_id))
+            }
+            EglDrawLayer::Solid(color) => {
+                let id = match color {
+                    oblivion_one::compositor::ServerFrameColor::OutputBackground => 1,
+                    oblivion_one::compositor::ServerFrameColor::XwaylandBacking => 2,
+                    oblivion_one::compositor::ServerFrameColor::Border => 3,
+                    oblivion_one::compositor::ServerFrameColor::Titlebar => 4,
+                    oblivion_one::compositor::ServerFrameColor::Separator => 5,
+                };
+                (ReplayCommandLayerIdentity::Solid, id)
+            }
+            EglDrawLayer::SolidRgba(color) => {
+                (ReplayCommandLayerIdentity::SolidRgba, u64::from(color))
+            }
+            EglDrawLayer::DecorationAsset(asset_id) => {
+                (ReplayCommandLayerIdentity::DecorationAsset, asset_id)
+            }
+            EglDrawLayer::LifecycleOverlay(identity) => (
+                ReplayCommandLayerIdentity::LifecycleOverlay,
+                identity.scene_node_id().get(),
+            ),
+            EglDrawLayer::LifecycleResolvedVisual(payload_id) => (
+                ReplayCommandLayerIdentity::LifecycleResolvedVisual,
+                payload_id.get(),
+            ),
+            EglDrawLayer::Cursor => (ReplayCommandLayerIdentity::Cursor, 0),
+        };
+        let (surface, resource, buffer_match) = match command.layer {
+            EglDrawLayer::Surface(surface_id) => {
+                let Some(surface) = self
+                    .scene
+                    .checkpoint_command_surface_identities
+                    .get(&surface_id)
+                    .copied()
+                else {
+                    self.runtime
+                        .effect_gpu_profiler
+                        .invalidate_checkpoint_replay_command_attribution(context.scope);
+                    return None;
+                };
+                let Some(resource) = self
+                    .sources
+                    .ordinary
+                    .surface_diagnostic_identity(surface_id)
+                else {
+                    self.runtime
+                        .effect_gpu_profiler
+                        .invalidate_checkpoint_replay_command_attribution(context.scope);
+                    return None;
+                };
+                let buffer_match = if surface.buffer_source
+                    == crate::egl_renderer::resources::SurfaceBufferSourceDiagnostic::Dmabuf
+                {
+                    if resource.resource_dmabuf_backed
+                        && resource.resource_dmabuf_buffer_id == surface.buffer_id
+                    {
+                        ReplayCommandBufferMatch::Match
+                    } else {
+                        ReplayCommandBufferMatch::Mismatch
+                    }
+                } else if resource.resource_dmabuf_backed {
+                    ReplayCommandBufferMatch::Mismatch
+                } else {
+                    ReplayCommandBufferMatch::NotApplicable
+                };
+                (Some(surface), Some(resource), buffer_match)
+            }
+            _ => (None, None, ReplayCommandBufferMatch::NotApplicable),
+        };
+        let metadata = CheckpointReplayCommandTimingMetadata {
+            owner_pass_id: context.owner_pass_id,
+            owner_instance_id: context.owner_instance_id,
+            owner_kind: context.owner_kind,
+            checkpoint_count: context.checkpoint_count,
+            command_index,
+            layer,
+            layer_id,
+            sampling: match command.sampling {
+                SurfaceSampling::ExactNearest => ReplayCommandSampling::ExactNearest,
+                SurfaceSampling::ScaledLinear => ReplayCommandSampling::ScaledLinear,
+            },
+            planned_clip_count,
+            draw_calls: 0,
+            vertex_count: command.vertex_count,
+            surface,
+            resource,
+            surface_resource_buffer_match: buffer_match,
+        };
+        let timing = self
+            .runtime
+            .effect_gpu_profiler
+            .begin_checkpoint_replay_command(self.gl, context, metadata)?;
+        Some(CheckpointReplayCommandExecutionSpan { timing, metadata })
+    }
+
+    fn end_checkpoint_command_timing(
+        &mut self,
+        span: CheckpointReplayCommandExecutionSpan,
+        draw_calls: usize,
+    ) {
+        self.runtime
+            .effect_gpu_profiler
+            .end_checkpoint_replay_command(self.gl, span.timing, draw_calls);
     }
 
     pub(super) fn capture_uniform_location(&mut self, name: &str) -> Option<glow::UniformLocation> {
@@ -331,14 +452,20 @@ impl EffectExecutionContext<'_> {
         self.draw_command_region_plan(
             false,
             RegionPlanScissorMode::Framebuffer(self.output_target_space.framebuffer_origin()),
+            None,
         )
     }
 
     fn draw_effect_region_plan(
         &mut self,
         framebuffer_origin: OutputFramebufferOrigin,
+        command_timing: Option<&mut CheckpointReplayCommandTimingContext>,
     ) -> RendererResult<()> {
-        self.draw_command_region_plan(true, RegionPlanScissorMode::Framebuffer(framebuffer_origin))
+        self.draw_command_region_plan(
+            true,
+            RegionPlanScissorMode::Framebuffer(framebuffer_origin),
+            command_timing,
+        )
     }
 
     fn draw_capture_region_plan(
@@ -354,6 +481,7 @@ impl EffectExecutionContext<'_> {
                 target_domain,
                 target_size,
             },
+            None,
         )
     }
 
@@ -361,6 +489,7 @@ impl EffectExecutionContext<'_> {
         &mut self,
         effect_plan: bool,
         scissor_mode: RegionPlanScissorMode,
+        mut command_timing: Option<&mut CheckpointReplayCommandTimingContext>,
     ) -> RendererResult<()> {
         let capture_plan = matches!(scissor_mode, RegionPlanScissorMode::CaptureTarget { .. });
         let target_space = match scissor_mode {
@@ -581,6 +710,20 @@ impl EffectExecutionContext<'_> {
                 continue;
             }
             if let EglDrawLayer::LifecycleOverlay(identity) = command.layer {
+                let command_span = if self.lifecycle_dispatch.is_some() {
+                    command_timing.as_deref_mut().and_then(|context| {
+                        self.begin_checkpoint_command_timing(
+                            context,
+                            &command,
+                            planned.command_index,
+                            planned.clips_len,
+                        )
+                    })
+                } else {
+                    None
+                };
+                let mut lifecycle_draw_calls = 0usize;
+                let mut dispatch_error = None;
                 for clip_offset in 0..planned.clips_len {
                     let clip_index = planned.clips_start + clip_offset;
                     let repair = if effect_plan {
@@ -601,12 +744,28 @@ impl EffectExecutionContext<'_> {
                     };
                     self.set_scissor_for_target_space(Some(effective_scissor), target_space);
                     if command.bounds.intersects_output_rect(effective_scissor) {
-                        self.dispatch_lifecycle_overlay(
+                        match self.dispatch_lifecycle_overlay(
                             identity,
                             Some(effective_scissor),
                             target_space,
-                        )?;
+                            command_span.is_some(),
+                        ) {
+                            Ok(draw_calls) => {
+                                lifecycle_draw_calls =
+                                    lifecycle_draw_calls.saturating_add(draw_calls);
+                            }
+                            Err(error) => {
+                                dispatch_error = Some(error);
+                                break;
+                            }
+                        }
                     }
+                }
+                if let Some(command_span) = command_span {
+                    self.end_checkpoint_command_timing(command_span, lifecycle_draw_calls);
+                }
+                if let Some(error) = dispatch_error {
+                    return Err(error);
                 }
                 continue;
             }
@@ -616,6 +775,16 @@ impl EffectExecutionContext<'_> {
                 }
                 continue;
             };
+
+            let command_span = command_timing.as_deref_mut().and_then(|context| {
+                self.begin_checkpoint_command_timing(
+                    context,
+                    &command,
+                    planned.command_index,
+                    planned.clips_len,
+                )
+            });
+            let mut command_draw_calls = 0usize;
 
             unsafe {
                 self.gl.bind_texture(glow::TEXTURE_2D, Some(texture));
@@ -676,6 +845,10 @@ impl EffectExecutionContext<'_> {
                 }
                 commands_executed += 1;
                 draw_calls += 1;
+                command_draw_calls = command_draw_calls.saturating_add(1);
+            }
+            if let Some(command_span) = command_span {
+                self.end_checkpoint_command_timing(command_span, command_draw_calls);
             }
         }
         self.set_scissor_for_target_space(None, target_space);
@@ -856,6 +1029,44 @@ impl EffectExecutionContext<'_> {
         framebuffer_origin: OutputFramebufferOrigin,
         composition_draw: EffectFramebufferTarget,
     ) -> RendererResult<()> {
+        self.draw_effect_scene_range_internal(
+            rects,
+            start,
+            end,
+            framebuffer_origin,
+            composition_draw,
+            None,
+        )
+    }
+
+    pub(in crate::egl_renderer) fn draw_effect_scene_range_with_command_attribution(
+        &mut self,
+        rects: &[OutputRect],
+        start: usize,
+        end: usize,
+        framebuffer_origin: OutputFramebufferOrigin,
+        composition_draw: EffectFramebufferTarget,
+        command_timing: &mut CheckpointReplayCommandTimingContext,
+    ) -> RendererResult<()> {
+        self.draw_effect_scene_range_internal(
+            rects,
+            start,
+            end,
+            framebuffer_origin,
+            composition_draw,
+            Some(command_timing),
+        )
+    }
+
+    fn draw_effect_scene_range_internal(
+        &mut self,
+        rects: &[OutputRect],
+        start: usize,
+        end: usize,
+        framebuffer_origin: OutputFramebufferOrigin,
+        composition_draw: EffectFramebufferTarget,
+        command_timing: Option<&mut CheckpointReplayCommandTimingContext>,
+    ) -> RendererResult<()> {
         let end = end.min(self.scene.commands.len());
         let start = start.min(end);
         let force_legacy = crate::egl_renderer::geometry::scene_execution_mode()
@@ -896,7 +1107,12 @@ impl EffectExecutionContext<'_> {
             };
         if !plan_fallback && plan_executable {
             self.establish_effect_composition_state(composition_draw);
-            return self.draw_effect_region_plan(framebuffer_origin);
+            return self.draw_effect_region_plan(framebuffer_origin, command_timing);
+        }
+        if let Some(context) = command_timing.as_deref() {
+            self.runtime
+                .effect_gpu_profiler
+                .invalidate_checkpoint_replay_command_attribution(context.scope);
         }
         self.scene.frame_stats.effect_scene_replay_legacy_fallbacks = self
             .scene
@@ -1202,7 +1418,12 @@ impl EffectExecutionContext<'_> {
                 }
             }
             if let EglDrawLayer::LifecycleOverlay(identity) = command.layer {
-                self.dispatch_lifecycle_overlay(identity, effective_scissor, target_space)?;
+                let _ = self.dispatch_lifecycle_overlay(
+                    identity,
+                    effective_scissor,
+                    target_space,
+                    false,
+                )?;
                 continue;
             }
             let Some(texture) = self.texture_for_layer(command.layer) else {

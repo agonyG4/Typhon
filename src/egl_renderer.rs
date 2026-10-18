@@ -403,6 +403,7 @@ impl GlesSceneRenderer {
                 presentation_visual_group_clips: HashMap::new(),
                 presentation_visual_group_owners: HashMap::new(),
                 scene_visibility_plan: Vec::new(),
+                checkpoint_command_surface_identities: HashMap::new(),
                 scene_region_plan: geometry::SceneRegionPlan::default(),
                 effect_region_plan: geometry::SceneRegionPlan::default(),
                 scene_cache_key: None,

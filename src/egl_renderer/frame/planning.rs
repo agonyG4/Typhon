@@ -25,13 +25,48 @@ use super::super::{
         SceneExecutionMode, SurfaceConsumerPlan, add_surface_consumers_for_command_range,
         scene_execution_mode,
     },
-    resources::{ResourceTelemetry, surface::SurfaceResourceInputs},
+    resources::{
+        ResourceTelemetry, SurfaceBufferSourceDiagnostic, SurfaceDrawDiagnosticIdentity,
+        SurfaceRenderBackendDiagnostic, surface::SurfaceResourceInputs,
+    },
 };
 use super::{
     pipeline::FramePipeline,
     telemetry,
     types::{EglFrameOutcome, EglSceneDrawRequest, FrameSkipReason},
 };
+
+fn surface_draw_diagnostic_identity(surface: &RenderableSurface) -> SurfaceDrawDiagnosticIdentity {
+    let dmabuf = surface.dmabuf_handle();
+    let size = surface.buffer_size();
+    SurfaceDrawDiagnosticIdentity {
+        surface_id: surface.surface_id,
+        generation: surface.generation,
+        commit_sequence: surface.commit_sequence.get(),
+        buffer_id: surface.buffer_id().get(),
+        buffer_source: match surface.buffer_source() {
+            oblivion_one::render_backend::buffer::SurfaceBufferSource::Shm => {
+                SurfaceBufferSourceDiagnostic::Shm
+            }
+            oblivion_one::render_backend::buffer::SurfaceBufferSource::Dmabuf => {
+                SurfaceBufferSourceDiagnostic::Dmabuf
+            }
+        },
+        buffer_width: size.width,
+        buffer_height: size.height,
+        render_backend: match surface.render_backend {
+            compositor::SurfaceRenderBackend::NativeWayland => {
+                SurfaceRenderBackendDiagnostic::NativeWayland
+            }
+            compositor::SurfaceRenderBackend::Xwayland => SurfaceRenderBackendDiagnostic::Xwayland,
+        },
+        dmabuf_fourcc: dmabuf.map(|handle| handle.format().as_fourcc()),
+        dmabuf_plane_count: dmabuf.map_or(0, |handle| handle.planes().len()),
+        dmabuf_plane0_modifier: dmabuf
+            .and_then(|handle| handle.planes().first())
+            .map(|plane| plane.descriptor().modifier.0),
+    }
+}
 
 fn effect_demand_plan_begin_seed(
     plan: &RepaintPlan,
@@ -245,6 +280,20 @@ impl FramePipeline<'_> {
         frame: &FrameBeginState,
         framebuffer_origin: super::super::OutputFramebufferOrigin,
     ) -> PreparedSceneFrame {
+        if self.effects.effect_gpu_profiler.stall_diagnostics_enabled() {
+            self.scene.checkpoint_command_surface_identities = request
+                .surfaces
+                .iter()
+                .map(|surface| {
+                    (
+                        surface.surface_id,
+                        surface_draw_diagnostic_identity(surface),
+                    )
+                })
+                .collect();
+        } else {
+            self.scene.checkpoint_command_surface_identities.clear();
+        }
         let (base_surfaces, overlay_surfaces) = super::super::split_external_overlay_surfaces(
             request.surfaces,
             request.external_overlay_surface_ids,
@@ -971,5 +1020,33 @@ mod tests {
         let seed = effect_demand_plan_begin_seed(&plan, &graph);
 
         assert!(!seed.conservative_full);
+    }
+
+    #[test]
+    fn surface_command_diagnostic_identity_stays_frozen_after_live_surface_changes() {
+        let mut surface = crate::egl_renderer::tests::lifecycle_shm_surface(
+            oblivion_one::compositor::RenderableSurfaceDamage::Empty,
+        );
+        let frozen = surface_draw_diagnostic_identity(&surface);
+        assert_eq!(frozen.buffer_source, SurfaceBufferSourceDiagnostic::Shm);
+
+        surface.generation = surface.generation.saturating_add(1);
+        surface.commit_sequence = oblivion_one::compositor::SurfaceCommitSequence(88);
+        let mut buffer_ids = oblivion_one::render_backend::buffer::BufferIdAllocator::default();
+        let _first_id = buffer_ids.allocate().expect("first test buffer ID");
+        let replacement_id = buffer_ids.allocate().expect("replacement test buffer ID");
+        surface.buffer = oblivion_one::render_backend::buffer::CommittedSurfaceBuffer::shm_snapshot(
+            replacement_id,
+            oblivion_one::render_backend::buffer::BufferSize::new(2, 2).expect("test surface size"),
+            vec![0xff00_0000; 4],
+        );
+
+        assert_eq!(frozen.surface_id, 7);
+        assert_eq!(frozen.generation, 2);
+        assert_eq!(frozen.commit_sequence, 0);
+        assert_eq!(frozen.buffer_id, 1);
+        assert_ne!(surface.generation, frozen.generation);
+        assert_ne!(surface.commit_sequence.get(), frozen.commit_sequence);
+        assert_ne!(surface.buffer_id().get(), frozen.buffer_id);
     }
 }

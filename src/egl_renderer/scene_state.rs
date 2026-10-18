@@ -53,6 +53,8 @@ pub(crate) struct SceneRenderState {
     pub(in crate::egl_renderer) presentation_visual_group_clips: HashMap<VisualGroupId, EglRect>,
     pub(in crate::egl_renderer) presentation_visual_group_owners: HashMap<VisualGroupId, u32>,
     pub(in crate::egl_renderer) scene_visibility_plan: Vec<EglVisibilityDecision>,
+    pub(in crate::egl_renderer) checkpoint_command_surface_identities:
+        HashMap<u32, super::resources::SurfaceDrawDiagnosticIdentity>,
     pub(in crate::egl_renderer) scene_region_plan: geometry::SceneRegionPlan,
     pub(in crate::egl_renderer) effect_region_plan: geometry::SceneRegionPlan,
     pub(in crate::egl_renderer) scene_cache_key: Option<EglSceneCacheKey>,

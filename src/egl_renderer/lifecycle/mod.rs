@@ -452,6 +452,8 @@ pub(super) struct LifecycleRenderContext<'a> {
     pub(super) effect_runtime: &'a mut EffectRuntime,
     pub(super) resources: ResourceTextureView<'a>,
     pub(super) target_space: LifecycleRenderTargetSpace,
+    diagnostic_draw_counter_enabled: bool,
+    pub(super) diagnostic_draw_calls: usize,
 }
 
 impl<'a> LifecycleRenderContext<'a> {
@@ -462,12 +464,38 @@ impl<'a> LifecycleRenderContext<'a> {
         resources: ResourceTextureView<'a>,
         target_space: LifecycleRenderTargetSpace,
     ) -> Self {
+        Self::new_with_diagnostic_draw_counter(
+            gl,
+            scene_state,
+            effect_runtime,
+            resources,
+            target_space,
+            false,
+        )
+    }
+
+    pub(super) fn new_with_diagnostic_draw_counter(
+        gl: &'a glow::Context,
+        scene_state: &'a mut SceneRenderState,
+        effect_runtime: &'a mut EffectRuntime,
+        resources: ResourceTextureView<'a>,
+        target_space: LifecycleRenderTargetSpace,
+        enabled: bool,
+    ) -> Self {
         Self {
             gl,
             scene_state,
             effect_runtime,
             resources,
             target_space,
+            diagnostic_draw_counter_enabled: enabled,
+            diagnostic_draw_calls: 0,
+        }
+    }
+
+    pub(super) fn note_diagnostic_draw_call(&mut self) {
+        if self.diagnostic_draw_counter_enabled {
+            self.diagnostic_draw_calls = self.diagnostic_draw_calls.saturating_add(1);
         }
     }
 

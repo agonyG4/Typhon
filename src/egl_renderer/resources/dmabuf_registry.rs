@@ -197,6 +197,12 @@ impl DmabufResourceState {
         self.registry.get(key).map(|entry| entry.image.texture)
     }
 
+    pub(super) fn diagnostic_identity(&self, key: &DmabufImageKey) -> Option<(u64, bool)> {
+        self.registry
+            .get(key)
+            .map(|entry| (entry.image.generation, entry.image.egl_image.is_some()))
+    }
+
     fn note_registry_hit(&mut self, telemetry: &mut ResourceTelemetry<'_>) {
         self.registry_hits_total = self.registry_hits_total.saturating_add(1);
         telemetry.dmabuf_registry_hit();
