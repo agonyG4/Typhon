@@ -5,8 +5,8 @@ use crate::compositor::{
 };
 
 use super::checkpoint_pruning::{
-    apply_checkpoint_dependency_pruning_plan, disabled_pruning_plan,
-    plan_effect_checkpoint_dependency_pruning, EffectCheckpointDependencyPruningPlan,
+    EffectCheckpointDependencyPruningPlan, apply_checkpoint_dependency_pruning_plan,
+    disabled_pruning_plan, plan_effect_checkpoint_dependency_pruning,
 };
 use super::registry::EffectRegistry;
 use super::render_graph_demand::{

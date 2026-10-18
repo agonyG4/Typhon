@@ -60,7 +60,7 @@ fn warn_unknown_policy_once() {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_checkpoint_dependency_pruning_policy, CheckpointDependencyPruningPolicy as Policy,
+        CheckpointDependencyPruningPolicy as Policy, parse_checkpoint_dependency_pruning_policy,
     };
 
     #[test]

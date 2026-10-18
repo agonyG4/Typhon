@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use super::render_graph::{CompiledFrameGraph, CompiledRenderPass, GraphPassId, RenderPassKind};
-use super::sample_support::{derive_effect_sample_support, EffectSampleSupportError};
+use super::sample_support::{EffectSampleSupportError, derive_effect_sample_support};
 use super::{EffectFrameDemand, EffectInstanceId};
 
 /// Why an existing checkpoint dependency was kept or removed by G3a.

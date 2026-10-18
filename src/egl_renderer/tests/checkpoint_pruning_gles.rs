@@ -1,9 +1,9 @@
 use super::*;
 use oblivion_one::compositor::{EffectAnchorScope, ResolvedEffectScene};
 use oblivion_one::effects::{
-    builtin_background_material_program, compile_frame_execution_variants_with_options,
     EffectDemandPlannerPolicy, EffectInstanceId, EffectRect, EffectRegion, EffectRegistry,
     FrameExecutionCompileOptions, FrameExecutionPlan, RenderPassKind,
+    builtin_background_material_program, compile_frame_execution_variants_with_options,
 };
 use oblivion_one::material::MaterialConfiguration;
 
@@ -263,9 +263,11 @@ fn gles_cold_warm_and_dependency_identity_transition_match_full_reference() {
             .len(),
         1
     );
-    assert!(capture_pass(&pruned_graph, consumer)
-        .checkpoint_dependencies
-        .is_empty());
+    assert!(
+        capture_pass(&pruned_graph, consumer)
+            .checkpoint_dependencies
+            .is_empty()
+    );
     assert_eq!(
         raw_graph
             .instances
@@ -276,13 +278,15 @@ fn gles_cold_warm_and_dependency_identity_transition_match_full_reference() {
             .len(),
         1
     );
-    assert!(pruned_graph
-        .instances
-        .iter()
-        .find(|instance| instance.id == consumer)
-        .unwrap()
-        .dependencies
-        .is_empty());
+    assert!(
+        pruned_graph
+            .instances
+            .iter()
+            .find(|instance| instance.id == consumer)
+            .unwrap()
+            .dependencies
+            .is_empty()
+    );
 
     let (raw_pixels, raw_cold_stats) = {
         let mut harness = GlesEffectTestHarness::new(fixture.output_size.0, fixture.output_size.1);
@@ -336,18 +340,22 @@ fn gles_cold_warm_and_dependency_identity_transition_match_full_reference() {
         effects::checkpoint_capture_cache_key(&pruned_graph, capture_pass(&pruned_graph, consumer))
             .expect("dependency-free checkpoint has a semantic key");
     assert_ne!(old_key, new_key);
-    assert!(harness
-        .renderer
-        .effect_runtime
-        .effect_resources
-        .checkpoint_capture_texture(&old_key)
-        .is_some());
-    assert!(harness
-        .renderer
-        .effect_runtime
-        .effect_resources
-        .checkpoint_capture_texture(&new_key)
-        .is_none());
+    assert!(
+        harness
+            .renderer
+            .effect_runtime
+            .effect_resources
+            .checkpoint_capture_texture(&old_key)
+            .is_some()
+    );
+    assert!(
+        harness
+            .renderer
+            .effect_runtime
+            .effect_resources
+            .checkpoint_capture_texture(&new_key)
+            .is_none()
+    );
 
     let transition_stats = execute_frame(
         &mut harness,
@@ -362,12 +370,14 @@ fn gles_cold_warm_and_dependency_identity_transition_match_full_reference() {
     assert_eq!(transitioned_pixels, pruned_cold_pixels);
     assert!(transition_stats.replay_capture_cache_full_refreshes > 0);
     assert!(transition_stats.replay_capture_cache_update_pixels > 0);
-    assert!(harness
-        .renderer
-        .effect_runtime
-        .effect_resources
-        .checkpoint_capture_texture(&new_key)
-        .is_some());
+    assert!(
+        harness
+            .renderer
+            .effect_runtime
+            .effect_resources
+            .checkpoint_capture_texture(&new_key)
+            .is_some()
+    );
     assert_eq!(pruned_cold_stats.capture_downsample_fusion_candidates, 0);
     assert_eq!(pruned_cold_stats.capture_downsample_fusion_executed, 0);
     assert_eq!(

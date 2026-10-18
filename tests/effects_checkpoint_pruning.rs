@@ -3,11 +3,11 @@ use oblivion_one::compositor::{
     ResolvedEffectScene, VisualGroupId,
 };
 use oblivion_one::effects::{
+    EffectCheckpointDependencyDecisionKind, EffectFrameDemand, EffectInstanceId, EffectRect,
+    EffectRegion, EffectRegistry, FrameExecutionCompileOptions, FrameExecutionPlan, RenderPassKind,
     apply_effect_checkpoint_dependency_pruning, builtin_background_material_program,
     compile_frame_execution_plan, compile_frame_execution_variants_with_options,
     derive_effect_sample_support, plan_effect_checkpoint_dependency_pruning,
-    EffectCheckpointDependencyDecisionKind, EffectFrameDemand, EffectInstanceId, EffectRect,
-    EffectRegion, EffectRegistry, FrameExecutionCompileOptions, FrameExecutionPlan, RenderPassKind,
 };
 use oblivion_one::material::MaterialConfiguration;
 
@@ -137,9 +137,11 @@ fn sampled_support_disjointness_prunes_both_checkpoint_representations() {
     assert_eq!(scene_capture_dependencies(&graph, consumer).len(), 1);
 
     let support = derive_effect_sample_support(&graph, consumer).unwrap();
-    assert!(!graph.instances[0]
-        .output_influence_region
-        .intersects(&support.backdrop_region));
+    assert!(
+        !graph.instances[0]
+            .output_influence_region
+            .intersects(&support.backdrop_region)
+    );
 
     let plan = plan_effect_checkpoint_dependency_pruning(&graph);
     assert_eq!(plan.stats.edges_before, 1);
@@ -165,9 +167,11 @@ fn sampled_support_overlap_retains_the_checkpoint_edge() {
     let producer = graph.instances[0].id;
     let consumer = graph.instances[1].id;
     let support = derive_effect_sample_support(&graph, consumer).unwrap();
-    assert!(graph.instances[0]
-        .output_influence_region
-        .intersects(&support.backdrop_region));
+    assert!(
+        graph.instances[0]
+            .output_influence_region
+            .intersects(&support.backdrop_region)
+    );
 
     let plan = plan_effect_checkpoint_dependency_pruning(&graph);
     assert_eq!(plan.stats.edges_before, 1);
@@ -367,9 +371,11 @@ fn precomputed_eligibility_uses_the_raw_exact_graph_before_g3a_pruning() {
         vec![raw_graph.instances[0].id]
     );
     let raw_support = derive_effect_sample_support(raw_graph, raw_graph.instances[1].id).unwrap();
-    assert!(!raw_graph.instances[0]
-        .output_influence_region
-        .intersects(&raw_support.backdrop_region));
+    assert!(
+        !raw_graph.instances[0]
+            .output_influence_region
+            .intersects(&raw_support.backdrop_region)
+    );
     assert!(raw.precomputed_backdrop.is_none());
     assert!(raw.precomputed_graph.is_none());
 
