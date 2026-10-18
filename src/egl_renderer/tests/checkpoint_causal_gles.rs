@@ -132,23 +132,16 @@ fn fallback_checkpoint_pixels(
         .sum()
 }
 
-fn shift_checkpoint_capture_domains(graph: &mut oblivion_one::effects::CompiledFrameGraph) {
-    let outputs = graph
-        .passes
-        .iter()
-        .filter(|pass| {
-            pass.kind == RenderPassKind::SceneCapture && !pass.checkpoint_dependencies.is_empty()
-        })
-        .filter_map(|pass| pass.output)
-        .collect::<Vec<_>>();
-    for output in outputs {
-        let texture = graph
-            .textures
-            .iter_mut()
-            .find(|texture| texture.id == output)
-            .expect("checkpoint capture texture exists");
-        texture.domain.x -= 1;
-    }
+fn advance_checkpoint_consumer_semantic_signature(
+    graph: &mut oblivion_one::effects::CompiledFrameGraph,
+    consumer_id: EffectInstanceId,
+) {
+    let consumer = graph
+        .instances
+        .iter_mut()
+        .find(|instance| instance.id == consumer_id)
+        .expect("checkpoint consumer exists in the compiled graph");
+    consumer.semantic_signature = consumer.semantic_signature.wrapping_add(1);
 }
 
 fn render_checkpoint_test_frame(
@@ -1157,9 +1150,15 @@ fn churning_checkpoint_fusion_materializes_then_recovers_zero_copy_when_stable()
     let initial_signatures = signatures(fixture.scene, None);
     let seed_graph = compile_native_three_checkpoint_graph(fixture, &full_region);
     let mut first_churning_graph = compile_native_three_checkpoint_graph(fixture, &current_damage);
-    shift_checkpoint_capture_domains(&mut first_churning_graph);
+    advance_checkpoint_consumer_semantic_signature(
+        &mut first_churning_graph,
+        EffectInstanceId::new(33).unwrap(),
+    );
     let mut second_churning_graph = first_churning_graph.clone();
-    shift_checkpoint_capture_domains(&mut second_churning_graph);
+    advance_checkpoint_consumer_semantic_signature(
+        &mut second_churning_graph,
+        EffectInstanceId::new(33).unwrap(),
+    );
 
     let mut incremental = GlesEffectTestHarness::new(fixture.output_size.0, fixture.output_size.1);
     incremental.install_texture_backed_output();
@@ -1171,8 +1170,8 @@ fn churning_checkpoint_fusion_materializes_then_recovers_zero_copy_when_stable()
         [30, 50, 70, 255],
     );
 
-    // Seed each capture family with the preceding layout. The moved
-    // layout below creates new exact cache keys in those same families.
+    // Consumer semantic signatures create distinct exact cache keys while
+    // retaining the same capture family for fusion eligibility.
     render_checkpoint_test_frame(
         &mut incremental,
         &seed_graph,
@@ -1212,7 +1211,7 @@ fn churning_checkpoint_fusion_materializes_then_recovers_zero_copy_when_stable()
     assert_ne!(
         effects::checkpoint_capture_cache_key(&seed_graph, seed_capture_a),
         effects::checkpoint_capture_cache_key(&first_churning_graph, capture_a),
-        "movement changes the exact persistent cache key"
+        "consumer semantic signature changes the exact persistent cache key"
     );
     let key_a = effects::checkpoint_capture_cache_key(&first_churning_graph, capture_a)
         .expect("first churning identity has a persistent cache key");
@@ -1244,13 +1243,13 @@ fn churning_checkpoint_fusion_materializes_then_recovers_zero_copy_when_stable()
             .checkpoint_capture_needs_full_refresh(&key_a, frame_a_serial.saturating_add(1))
     );
 
-    // Move again before the first identity can stabilize. The new key
-    // in frame B must also fuse and remain unpublished.
+    // Advance the consumer signature again before frame A's identity can
+    // stabilize. The new key in frame B must also fuse and remain unpublished.
     let capture_b = second_churning_graph
         .passes
         .iter()
         .find(|pass| pass.id == capture_a.id)
-        .expect("same logical capture exists in the second layout");
+        .expect("same logical capture exists in the second compiled graph");
     let key_b = effects::checkpoint_capture_cache_key(&second_churning_graph, capture_b)
         .expect("second churning identity has a persistent cache key");
     assert_ne!(key_a, key_b);
@@ -1362,7 +1361,10 @@ fn fused_downsample_failure_keeps_checkpoint_invalid_and_restores_renderer_state
     let signatures = signatures(fixture.scene, None);
     let seed_graph = compile_native_three_checkpoint_graph(fixture, &full_region);
     let mut churning_graph = compile_native_three_checkpoint_graph(fixture, &current_damage);
-    shift_checkpoint_capture_domains(&mut churning_graph);
+    advance_checkpoint_consumer_semantic_signature(
+        &mut churning_graph,
+        EffectInstanceId::new(33).unwrap(),
+    );
 
     let capture = churning_graph
         .passes

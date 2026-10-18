@@ -233,6 +233,14 @@ mod tests {
         unsafe { std::env::remove_var(TERMINAL_BLUR_FUSION_ENV) };
         assert_eq!(
             TerminalBlurFusionPolicy::from_environment(),
+            TerminalBlurFusionPolicy::On
+        );
+        // SAFETY: this test holds ASTREA_ENV_LOCK for every environment mutation.
+        unsafe {
+            std::env::set_var(TERMINAL_BLUR_FUSION_ENV, " off ");
+        }
+        assert_eq!(
+            TerminalBlurFusionPolicy::from_environment(),
             TerminalBlurFusionPolicy::Off
         );
         // SAFETY: this test holds ASTREA_ENV_LOCK for every environment mutation.

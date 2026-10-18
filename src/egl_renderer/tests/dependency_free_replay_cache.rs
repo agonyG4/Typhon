@@ -38,6 +38,33 @@ fn root_domain_pixels(graph: &oblivion_one::effects::CompiledFrameGraph) -> u64 
     u64::from(texture.width).saturating_mul(u64::from(texture.height))
 }
 
+fn root_capture_domain(graph: &oblivion_one::effects::CompiledFrameGraph) -> EffectRect {
+    let output = root_capture(graph).output.unwrap();
+    graph
+        .textures
+        .iter()
+        .find(|texture| texture.id == output)
+        .expect("root capture texture plan exists")
+        .domain
+}
+
+fn capture_domain_is_within_output(domain: EffectRect, output: EffectRect) -> bool {
+    let domain_left = i64::from(domain.x);
+    let domain_top = i64::from(domain.y);
+    let domain_right = domain_left + i64::from(domain.width);
+    let domain_bottom = domain_top + i64::from(domain.height);
+    let output_left = i64::from(output.x);
+    let output_top = i64::from(output.y);
+    let output_right = output_left + i64::from(output.width);
+    let output_bottom = output_top + i64::from(output.height);
+    domain.width > 0
+        && domain.height > 0
+        && domain_left >= output_left
+        && domain_top >= output_top
+        && domain_right <= output_right
+        && domain_bottom <= output_bottom
+}
+
 fn root_capture_snapshot(
     harness: &mut GlesEffectTestHarness,
     graph: &oblivion_one::effects::CompiledFrameGraph,
@@ -411,11 +438,18 @@ fn dependency_free_replay_without_causal_baseline_refreshes_entire_domain() {
 
 #[test]
 fn dependency_free_replay_domain_change_requires_full_new_population() {
-    let fixture = native_three_checkpoint_fixture();
+    let mut fixture = native_three_checkpoint_fixture();
+    fixture.output_size = (320, 240);
+    fixture.output_bounds = EffectRect::new(0, 0, 320, 240).unwrap();
     let surface_signatures = signatures(fixture.scene, None);
     let mut harness = new_harness(fixture, [30, 50, 70, 255]);
     let full_region = EffectRegion::from_rect(fixture.output_bounds);
     let first_graph = compile_native_three_checkpoint_graph(fixture, &EffectRegion::empty());
+    let first_domain = root_capture_domain(&first_graph);
+    assert!(capture_domain_is_within_output(
+        first_domain,
+        fixture.output_bounds
+    ));
     render_root_frame(
         &mut harness,
         fixture,
@@ -430,6 +464,12 @@ fn dependency_free_replay_domain_change_requires_full_new_population() {
     changed_fixture.effect_a.target_bounds.x += 1;
     let changed_graph =
         compile_native_three_checkpoint_graph(changed_fixture, &EffectRegion::empty());
+    let changed_domain = root_capture_domain(&changed_graph);
+    assert!(capture_domain_is_within_output(
+        changed_domain,
+        changed_fixture.output_bounds
+    ));
+    assert_ne!(first_domain, changed_domain);
     assert_ne!(root_key(&first_graph), root_key(&changed_graph));
     let changed_region = EffectRegion::from_rect(changed_fixture.output_bounds);
     let stats = render_root_frame(
@@ -446,18 +486,26 @@ fn dependency_free_replay_domain_change_requires_full_new_population() {
         stats.replay_capture_execution_pixels,
         root_domain_pixels(&changed_graph)
     );
-    assert!(
-        root_cache_needs_full_refresh(
-            &harness,
-            &changed_graph,
-            harness
-                .renderer
-                .effect_runtime
-                .effect_resources
-                .checkpoint_frame_serial()
-                + 1
-        ) == false
-    );
+    assert!(stats.replay_capture_commands > 0);
+    let next_serial = harness
+        .renderer
+        .effect_runtime
+        .effect_resources
+        .checkpoint_frame_serial()
+        + 1;
+    assert!(!root_cache_needs_full_refresh(
+        &harness,
+        &changed_graph,
+        next_serial
+    ));
+
+    let actual_output = read_diagnostic_pixels(&harness);
+    let (_, actual_capture) = root_capture_snapshot(&mut harness, &changed_graph);
+    drop(harness);
+    let (reference_output, reference_capture) =
+        full_replay_reference(changed_fixture, [30, 50, 70, 255], &surface_signatures);
+    assert_pixel_buffers_match(&actual_output, &reference_output);
+    assert_pixel_buffers_match(&actual_capture, &reference_capture);
 }
 
 #[test]

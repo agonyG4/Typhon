@@ -3555,6 +3555,46 @@ mod tests {
         ))
     }
 
+    fn expected_conservative_capture_domain(
+        registry: &EffectRegistry,
+        program: EffectProgramId,
+        region: &EffectRegion,
+        output_bounds: EffectRect,
+    ) -> EffectRect {
+        let footprint = registry
+            .get(program)
+            .expect("blur program is registered")
+            .aggregate_footprint;
+        let effect_bounds = region.bounding_rect().expect("blur region is non-empty");
+        let output_left = i64::from(output_bounds.x);
+        let output_top = i64::from(output_bounds.y);
+        let output_right = output_left + i64::from(output_bounds.width);
+        let output_bottom = output_top + i64::from(output_bounds.height);
+        let left =
+            (i64::from(effect_bounds.x) - i64::from(footprint.sample_radius_x)).max(output_left);
+        let top =
+            (i64::from(effect_bounds.y) - i64::from(footprint.sample_radius_y)).max(output_top);
+        let right = (i64::from(effect_bounds.x)
+            + i64::from(effect_bounds.width)
+            + i64::from(footprint.sample_radius_x))
+        .min(output_right);
+        let bottom = (i64::from(effect_bounds.y)
+            + i64::from(effect_bounds.height)
+            + i64::from(footprint.sample_radius_y))
+        .min(output_bottom);
+        assert!(
+            right > left && bottom > top,
+            "capture intersects output bounds"
+        );
+        EffectRect::new(
+            i32::try_from(left).expect("capture x fits i32"),
+            i32::try_from(top).expect("capture y fits i32"),
+            u32::try_from(right - left).expect("capture width fits u32"),
+            u32::try_from(bottom - top).expect("capture height fits u32"),
+        )
+        .expect("capture domain is valid")
+    }
+
     fn blur_scene_with_region(region: EffectRegion) -> (ResolvedEffectScene, EffectRegistry) {
         blur_scene_with_region_and_scale(region, 1.0)
     }
@@ -5030,6 +5070,10 @@ mod tests {
     #[test]
     fn backdrop_capture_is_local_to_the_effect_dependency_domain() {
         let (scene, registry) = blur_scene();
+        let instance = &scene.instances[0];
+        let footprint = registry.get(instance.program).unwrap().aggregate_footprint;
+        assert_eq!(footprint.sample_radius_x, 88);
+        assert_eq!(footprint.sample_radius_y, 88);
         let plan = compile_frame_execution_plan(
             &scene,
             &EffectRegion::from_rect(EffectRect::new(100, 80, 320, 180).unwrap()),
@@ -5045,7 +5089,15 @@ mod tests {
             .iter()
             .find(|texture| texture.source == GraphTextureSource::CapturedScene)
             .unwrap();
-        assert_eq!(capture.domain, EffectRect::new(76, 56, 368, 228).unwrap());
+        assert_eq!(
+            capture.domain,
+            expected_conservative_capture_domain(
+                &registry,
+                instance.program,
+                &instance.region,
+                EffectRect::new(0, 0, 1920, 1080).unwrap(),
+            )
+        );
     }
 
     #[test]
@@ -5496,7 +5548,7 @@ mod tests {
         assert_metadata_issue(
             &graph,
             "pass_instance_missing_or_not_unique",
-            None,
+            Some(9),
             None,
             Some(1),
             None,
@@ -6161,7 +6213,12 @@ mod tests {
             .expect("higher child must capture its resolved backdrop");
         assert_eq!(
             higher_capture_texture.domain,
-            EffectRect::new(76, 56, 368, 228).unwrap()
+            expected_conservative_capture_domain(
+                &registry,
+                higher.program,
+                &higher.region,
+                EffectRect::new(0, 0, 1920, 1080).unwrap(),
+            )
         );
     }
 
@@ -6180,9 +6237,16 @@ mod tests {
         };
         let explanation = graph.explain();
         assert_eq!(explanation, graph.explain());
-        assert!(explanation.starts_with(
-            "effects graph: instances=1 passes=6 textures=6 peak_live=2 capture_px=83904 output_px=57600\n"
-        ));
+        let capture = graph
+            .textures
+            .iter()
+            .find(|texture| texture.source == GraphTextureSource::CapturedScene)
+            .expect("compiled graph has a captured-scene texture");
+        let capture_pixels = u64::from(capture.width).saturating_mul(u64::from(capture.height));
+        let output_pixels = region_pixels(&graph.instances[0].output_influence_region);
+        assert!(explanation.starts_with(&format!(
+            "effects graph: instances=1 passes=6 textures=6 peak_live=2 capture_px={capture_pixels} output_px={output_pixels}\n"
+        )));
         assert!(explanation.contains("capture_scene"));
         assert!(explanation.contains("kawase_down"));
         assert!(!explanation.contains("#version"));
@@ -7584,7 +7648,15 @@ mod tests {
             .union(&instance.output_influence_region)
             .intersect_rect(output_bounds);
 
-        assert_eq!(capture.domain, EffectRect::new(76, 56, 368, 228).unwrap());
+        assert_eq!(
+            capture.domain,
+            expected_conservative_capture_domain(
+                &registry,
+                scene.instances[0].program,
+                &scene.instances[0].region,
+                output_bounds,
+            )
+        );
         assert_eq!(
             instance.output_influence_region,
             EffectRegion::from_rect(EffectRect::new(100, 80, 320, 180).unwrap())
@@ -8188,11 +8260,11 @@ mod tests {
         first.target_bounds = first.region.bounding_rect().unwrap();
         let mut second = first.clone();
         second.id = EffectInstanceId::new(2).unwrap();
-        second.region = EffectRegion::from_rect(EffectRect::new(130, 80, 20, 180).unwrap());
+        second.region = EffectRegion::from_rect(EffectRect::new(190, 80, 20, 180).unwrap());
         second.target_bounds = second.region.bounding_rect().unwrap();
         let mut third = second.clone();
         third.id = EffectInstanceId::new(3).unwrap();
-        third.region = EffectRegion::from_rect(EffectRect::new(160, 80, 20, 180).unwrap());
+        third.region = EffectRegion::from_rect(EffectRect::new(280, 80, 20, 180).unwrap());
         third.target_bounds = third.region.bounding_rect().unwrap();
         let scene = ResolvedEffectScene::new(1, vec![first, second, third]);
         let FrameExecutionPlan::EffectGraph(graph) = compile_frame_execution_plan(
@@ -8205,24 +8277,15 @@ mod tests {
             panic!("visible effects must compile to an effect graph");
         };
 
-        assert!(
-            graph.instances[1]
-                .dependencies
-                .contains(&EffectInstanceId::new(1).unwrap())
-        );
-        assert!(
-            graph.instances[2]
-                .dependencies
-                .contains(&EffectInstanceId::new(2).unwrap())
-        );
-        assert!(
-            !graph.instances[2]
-                .dependencies
-                .contains(&EffectInstanceId::new(1).unwrap())
-        );
+        // The adjacent 70 px gaps are inside the 88 px conservative radius;
+        // C's capture starts 72 px beyond A's right edge.
+        let first_id = EffectInstanceId::new(1).unwrap();
+        let second_id = EffectInstanceId::new(2).unwrap();
+        assert_eq!(graph.instances[1].dependencies, vec![first_id]);
+        assert_eq!(graph.instances[2].dependencies, vec![second_id]);
         let demand = plan_effect_execution_demand(
             &graph,
-            &EffectRegion::from_rect(EffectRect::new(160, 80, 20, 180).unwrap()),
+            &EffectRegion::from_rect(EffectRect::new(280, 80, 20, 180).unwrap()),
             false,
         );
         assert_eq!(demand.instances.len(), 3);
@@ -8355,6 +8418,50 @@ mod tests {
 
     fn causal_blur_graph(regions: &[EffectRect]) -> CompiledFrameGraph {
         let (_, registry) = blur_scene();
+        let program_id = EffectProgramId::new(1).unwrap();
+        causal_blur_graph_with_programs(regions, &vec![program_id; regions.len()], &registry)
+    }
+
+    fn causal_blur_graph_with_radii(regions: &[EffectRect], radii: &[f32]) -> CompiledFrameGraph {
+        assert_eq!(regions.len(), radii.len());
+        let mut registry = EffectRegistry::empty();
+        for (index, radius) in radii.iter().copied().enumerate() {
+            let id = u64::try_from(index + 1).unwrap();
+            let source = EffectNodeId::new(1).unwrap();
+            let blur = EffectNodeId::new(2).unwrap();
+            let program = EffectProgram {
+                id: EffectProgramId::new(id).unwrap(),
+                nodes: vec![
+                    EffectNode::source(source, EffectSource::Backdrop),
+                    EffectNode::dual_kawase(
+                        blur,
+                        source,
+                        DualKawaseBlurSpec::new(radius, 2, 1.0).unwrap(),
+                    ),
+                ],
+                output: blur,
+                working_space: EffectWorkingSpace::LinearSrgb,
+                alpha_mode: EffectAlphaMode::Opaque,
+                outsets: EffectOutsets::ZERO,
+                frame_demand: EffectFrameDemand::OnDamage,
+                failure_policy: EffectFailurePolicy::Passthrough,
+            };
+            registry
+                .insert(validate_effect_program(program).unwrap())
+                .unwrap();
+        }
+        let program_ids = (1..=regions.len())
+            .map(|id| EffectProgramId::new(u64::try_from(id).unwrap()).unwrap())
+            .collect::<Vec<_>>();
+        causal_blur_graph_with_programs(regions, &program_ids, &registry)
+    }
+
+    fn causal_blur_graph_with_programs(
+        regions: &[EffectRect],
+        program_ids: &[EffectProgramId],
+        registry: &EffectRegistry,
+    ) -> CompiledFrameGraph {
+        assert_eq!(regions.len(), program_ids.len());
         let instances = regions
             .iter()
             .copied()
@@ -8364,7 +8471,7 @@ mod tests {
                 let surface = u32::try_from(index + 1).unwrap();
                 ResolvedEffectInstance {
                     id: EffectInstanceId::new(id).unwrap(),
-                    program: EffectProgramId::new(1).unwrap(),
+                    program: program_ids[index],
                     anchor: EffectAnchor::BeforeSurface(surface),
                     target_bounds: rect,
                     region: EffectRegion::from_rect(rect),
@@ -8388,7 +8495,7 @@ mod tests {
             &scene,
             &EffectRegion::empty(),
             EffectRect::new(0, 0, 1920, 1080).unwrap(),
-            &registry,
+            registry,
         )
         .unwrap() else {
             panic!("visible blur effects must compile to an effect graph");
@@ -8549,20 +8656,23 @@ mod tests {
 
     #[test]
     fn regional_transitive_checkpoint_demand_flows_in_reverse_pass_order() {
-        let graph = causal_blur_graph(&[
-            EffectRect::new(450, 300, 8, 30).unwrap(),
-            EffectRect::new(480, 300, 20, 40).unwrap(),
-            EffectRect::new(500, 300, 20, 60).unwrap(),
-        ]);
+        // C's radius-4 capture reaches 88 px left and only touches A, so the
+        // compiled graph has no direct C -> A edge. B uses a broader radius-8
+        // blur: C's sampled demand reaches B, then B's sampled demand reaches
+        // A. This keeps the Regional test about pass-order propagation rather
+        // than relying on aggregate captures to create a direct edge.
+        let a = EffectRect::new(100, 300, 20, 30).unwrap();
+        let b = EffectRect::new(170, 300, 20, 60).unwrap();
+        let c = EffectRect::new(208, 300, 20, 60).unwrap();
+        let graph = causal_blur_graph_with_radii(&[a, b, c], &[4.0, 8.0, 4.0]);
         let first = EffectInstanceId::new(1).unwrap();
         let second = EffectInstanceId::new(2).unwrap();
         let third = EffectInstanceId::new(3).unwrap();
-        assert!(graph.instances[1].dependencies.contains(&first));
-        assert!(graph.instances[2].dependencies.contains(&second));
-        assert!(!graph.instances[2].dependencies.contains(&first));
+        assert_eq!(graph.instances[1].dependencies, vec![first]);
+        assert_eq!(graph.instances[2].dependencies, vec![second]);
 
         let mut repair = EffectRegion::empty();
-        for (x, y) in [(502, 310), (506, 330), (510, 350)] {
+        for (x, y) in [(210, 310), (212, 330), (214, 350)] {
             repair.push(EffectRect::new(x, y, 2, 2).unwrap());
         }
         let (regional, diagnostics) = plan_effect_execution_demand_with_policy_and_diagnostics(
@@ -8578,6 +8688,16 @@ mod tests {
         assert!(regional.contains(third));
         assert_eq!(regional.plan_stats().causal_dependency_edges_considered, 2);
         assert_eq!(regional.plan_stats().causal_dependency_propagations, 2);
+        let first_capture = graph
+            .passes
+            .iter()
+            .find(|pass| pass.instance == first && pass.kind == RenderPassKind::SceneCapture)
+            .unwrap();
+        assert!(
+            regional
+                .pass_output_region(first_capture.id)
+                .is_some_and(|region| !region.intersect_rect(a).is_empty())
+        );
         let second_capture = graph
             .passes
             .iter()
