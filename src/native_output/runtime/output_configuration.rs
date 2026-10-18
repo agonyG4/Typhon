@@ -724,20 +724,176 @@ enum OutputConfigurationTransitionCandidate {
     },
 }
 
-fn same_storage_reuse_eligible(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SameStorageReuseRejection {
+    ScanoutBackend,
+    RenderWorkerInactive,
+    ConnectorChanged,
+    CrtcChanged,
+    WidthChanged,
+    HeightChanged,
+    ScaleChanged,
+    TransformChanged,
+}
+
+impl SameStorageReuseRejection {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::ScanoutBackend => "scanout_backend",
+            Self::RenderWorkerInactive => "render_worker_inactive",
+            Self::ConnectorChanged => "connector_changed",
+            Self::CrtcChanged => "crtc_changed",
+            Self::WidthChanged => "width_changed",
+            Self::HeightChanged => "height_changed",
+            Self::ScaleChanged => "scale_changed",
+            Self::TransformChanged => "transform_changed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SameStorageReuseDecision {
+    Eligible,
+    Rejected(SameStorageReuseRejection),
+}
+
+impl SameStorageReuseDecision {
+    const fn result(self) -> &'static str {
+        match self {
+            Self::Eligible => "eligible",
+            Self::Rejected(_) => "rejected",
+        }
+    }
+
+    const fn rejection(self) -> Option<SameStorageReuseRejection> {
+        match self {
+            Self::Eligible => None,
+            Self::Rejected(reason) => Some(reason),
+        }
+    }
+}
+
+fn same_storage_reuse_decision(
     current: &NativeAppliedOutputConfiguration,
     target: &NativeAppliedOutputConfiguration,
     scanout_kind: NativeScanoutKind,
     render_worker_active: bool,
-) -> bool {
-    scanout_kind == NativeScanoutKind::AtomicEglGbmExplicit
-        && render_worker_active
-        && current.connector_id == target.connector_id
-        && current.crtc_id == target.crtc_id
-        && current.width == target.width
-        && current.height == target.height
-        && current.scale_milli == target.scale_milli
-        && current.transform == target.transform
+) -> SameStorageReuseDecision {
+    let rejection = if scanout_kind != NativeScanoutKind::AtomicEglGbmExplicit {
+        Some(SameStorageReuseRejection::ScanoutBackend)
+    } else if !render_worker_active {
+        Some(SameStorageReuseRejection::RenderWorkerInactive)
+    } else if current.connector_id != target.connector_id {
+        Some(SameStorageReuseRejection::ConnectorChanged)
+    } else if current.crtc_id != target.crtc_id {
+        Some(SameStorageReuseRejection::CrtcChanged)
+    } else if current.width != target.width {
+        Some(SameStorageReuseRejection::WidthChanged)
+    } else if current.height != target.height {
+        Some(SameStorageReuseRejection::HeightChanged)
+    } else if current.scale_milli != target.scale_milli {
+        Some(SameStorageReuseRejection::ScaleChanged)
+    } else if current.transform != target.transform {
+        Some(SameStorageReuseRejection::TransformChanged)
+    } else {
+        None
+    };
+
+    match rejection {
+        Some(reason) => SameStorageReuseDecision::Rejected(reason),
+        None => SameStorageReuseDecision::Eligible,
+    }
+}
+
+fn same_storage_reuse_decision_diagnostic_line(
+    current: &NativeAppliedOutputConfiguration,
+    target: &NativeAppliedOutputConfiguration,
+    scanout_kind: NativeScanoutKind,
+    render_worker_active: bool,
+    decision: SameStorageReuseDecision,
+) -> String {
+    let current_refresh_millihz =
+        super::super::output::output_refresh_rate_for_mode(&current.mode).refresh_millihz();
+    let target_refresh_millihz =
+        super::super::output::output_refresh_rate_for_mode(&target.mode).refresh_millihz();
+    let reason = decision
+        .rejection()
+        .map(|reason| format!(" reason={}", reason.as_str()))
+        .unwrap_or_default();
+
+    format!(
+        "native output configuration: event=same_storage_reuse_decision result={}{} current_mode_id={} target_mode_id={} current_refresh_millihz={} target_refresh_millihz={} current_width={} current_height={} target_width={} target_height={} scanout_kind={} render_worker_active={} current_connector_id={} target_connector_id={} current_crtc_id={} target_crtc_id={} current_scale={} target_scale={} current_transform={:?} target_transform={:?}",
+        decision.result(),
+        reason,
+        current.mode_id,
+        target.mode_id,
+        current_refresh_millihz,
+        target_refresh_millihz,
+        current.width,
+        current.height,
+        target.width,
+        target.height,
+        scanout_kind.metric_name(),
+        render_worker_active,
+        current.connector_id,
+        target.connector_id,
+        current.crtc_id,
+        target.crtc_id,
+        current.scale_milli,
+        target.scale_milli,
+        current.transform,
+        target.transform,
+    )
+}
+
+fn reusable_framebuffer_success_diagnostic_line(
+    reusable: ReusableAtomicCompositorFramebuffer,
+) -> String {
+    let framebuffer_sidecar_id = reusable
+        .framebuffer_sidecar
+        .map(|framebuffer| framebuffer.get().to_string())
+        .unwrap_or_else(|| "none".to_owned());
+    format!(
+        "native output configuration: event=same_storage_reuse_storage result=success pool_generation={} swapchain_generation={} current_slot={} physical_framebuffer_id={} framebuffer_sidecar_id={} width={} height={}",
+        reusable.pool_generation,
+        reusable.swapchain_pool_generation,
+        reusable.slot.get(),
+        reusable.framebuffer.get(),
+        framebuffer_sidecar_id,
+        reusable.width,
+        reusable.height,
+    )
+}
+
+fn reusable_framebuffer_unavailable_diagnostic_line(
+    reason: ReusableStorageUnavailableReason,
+) -> String {
+    format!(
+        "native output configuration: event=same_storage_reuse_storage result=unavailable reason={}",
+        reason.as_str(),
+    )
+}
+
+fn candidate_route_diagnostic_line(
+    route: &str,
+    reason: Option<&str>,
+    unavailable_reason: Option<ReusableStorageUnavailableReason>,
+) -> String {
+    let reason_field = reason
+        .map(|reason| format!(" reason={reason}"))
+        .unwrap_or_default();
+    let unavailable_field = unavailable_reason
+        .map(|reason| format!(" unavailable_reason={}", reason.as_str()))
+        .unwrap_or_default();
+    format!(
+        "native output configuration: event=candidate_route route={route}{reason_field}{unavailable_field}"
+    )
+}
+
+fn reusable_framebuffer_invariant_error_diagnostic_line(error: &io::Error) -> String {
+    format!(
+        "native output configuration: event=same_storage_reuse_storage result=invariant_error reason=storage_invariant detail={error:?}"
+    )
 }
 
 /// Statically dispatched coordination port for the synchronous output
@@ -2233,63 +2389,139 @@ impl NativeRuntime {
         let cursor = self.candidate_cursor_state(target);
         let scanout_kind = self.scanout.kind();
         let render_worker_active = self.scanout.render_worker_active();
-        if same_storage_reuse_eligible(&self.target, target, scanout_kind, render_worker_active) {
-            let reusable = match &*self.scanout {
-                NativeScanoutBackend::AtomicEglGbm(explicit) => explicit
-                    .current_compositor_framebuffer_for_same_storage_modeset(
-                        self.target.width,
-                        self.target.height,
-                    )?,
-                _ => None,
-            };
-            if let Some(reusable) = reusable {
-                let NativeScanoutBackend::AtomicEglGbm(explicit) = &mut *self.scanout else {
-                    unreachable!("reuse eligibility requires explicit Atomic EGL/GBM scanout")
-                };
-                explicit.queue_presented_damage_history_invalidation()?;
-                let modeset = self
-                    .kms_backend
-                    .prepare_runtime_modeset_candidate(
-                        target.mode,
-                        target.width,
-                        target.height,
-                        reusable.framebuffer,
-                        cursor,
-                    )
-                    .map_err(io::Error::other)?;
-                let old_refresh_millihz =
-                    super::super::output::output_refresh_rate_for_mode(&self.target.mode)
-                        .refresh_millihz();
-                let new_refresh_millihz =
-                    super::super::output::output_refresh_rate_for_mode(&target.mode)
-                        .refresh_millihz();
-                self.perf
-                    .log("native.output_configuration_storage_reuse", || {
-                        vec![
-                            NativePerfField::u64("old_mode_id", u64::from(self.target.mode_id)),
-                            NativePerfField::u64("target_mode_id", u64::from(target.mode_id)),
-                            NativePerfField::u64(
-                                "old_refresh_millihz",
-                                u64::from(old_refresh_millihz),
-                            ),
-                            NativePerfField::u64(
-                                "target_refresh_millihz",
-                                u64::from(new_refresh_millihz),
-                            ),
-                            NativePerfField::u64("output_epoch", output_epoch.get()),
-                            NativePerfField::u64("pool_generation", reusable.pool_generation),
-                            NativePerfField::u64("slot_id", u64::from(reusable.slot.get())),
-                            NativePerfField::u64(
-                                "framebuffer_id",
-                                u64::from(reusable.framebuffer.get()),
-                            ),
-                            NativePerfField::u64("width", u64::from(target.width)),
-                            NativePerfField::u64("height", u64::from(target.height)),
-                        ]
-                    });
-                return Ok(CandidateScanoutState::ReuseReady { modeset, cursor });
+        let reuse_decision =
+            same_storage_reuse_decision(&self.target, target, scanout_kind, render_worker_active);
+        eprintln!(
+            "{}",
+            same_storage_reuse_decision_diagnostic_line(
+                &self.target,
+                target,
+                scanout_kind,
+                render_worker_active,
+                reuse_decision,
+            )
+        );
+
+        let mut replacement_reason = None;
+        let mut unavailable_reason = None;
+        let reusable = match reuse_decision {
+            SameStorageReuseDecision::Rejected(reason) => {
+                replacement_reason = Some(reason.as_str());
+                None
             }
+            SameStorageReuseDecision::Eligible => {
+                let lookup = match &*self.scanout {
+                    NativeScanoutBackend::AtomicEglGbm(explicit) => explicit
+                        .current_compositor_framebuffer_for_same_storage_modeset(
+                            self.target.width,
+                            self.target.height,
+                        ),
+                    _ => Ok(ReusableAtomicCompositorFramebufferLookup::Unavailable(
+                        ReusableStorageUnavailableReason::GenericStorageUnavailable,
+                    )),
+                };
+                match lookup {
+                    Ok(ReusableAtomicCompositorFramebufferLookup::Proven(reusable)) => {
+                        eprintln!("{}", reusable_framebuffer_success_diagnostic_line(reusable));
+                        Some(reusable)
+                    }
+                    Ok(ReusableAtomicCompositorFramebufferLookup::Unavailable(reason)) => {
+                        eprintln!(
+                            "{}",
+                            reusable_framebuffer_unavailable_diagnostic_line(reason)
+                        );
+                        replacement_reason = Some("reusable_storage_unavailable");
+                        unavailable_reason = Some(reason);
+                        None
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "{}",
+                            reusable_framebuffer_invariant_error_diagnostic_line(&error)
+                        );
+                        eprintln!(
+                            "{}",
+                            candidate_route_diagnostic_line(
+                                "error",
+                                Some("storage_invariant"),
+                                None,
+                            )
+                        );
+                        return Err(error);
+                    }
+                }
+            }
+        };
+
+        if let Some(reusable) = reusable {
+            let NativeScanoutBackend::AtomicEglGbm(explicit) = &mut *self.scanout else {
+                unreachable!("reuse eligibility requires explicit Atomic EGL/GBM scanout")
+            };
+            if let Err(error) = explicit.queue_presented_damage_history_invalidation() {
+                eprintln!(
+                    "{}",
+                    candidate_route_diagnostic_line("error", Some("reuse_candidate_prepare"), None)
+                );
+                return Err(error);
+            }
+            let modeset = match self
+                .kms_backend
+                .prepare_runtime_modeset_candidate(
+                    target.mode,
+                    target.width,
+                    target.height,
+                    reusable.framebuffer,
+                    cursor,
+                )
+                .map_err(io::Error::other)
+            {
+                Ok(modeset) => modeset,
+                Err(error) => {
+                    eprintln!(
+                        "{}",
+                        candidate_route_diagnostic_line(
+                            "error",
+                            Some("reuse_candidate_prepare"),
+                            None,
+                        )
+                    );
+                    return Err(error);
+                }
+            };
+            let old_refresh_millihz =
+                super::super::output::output_refresh_rate_for_mode(&self.target.mode)
+                    .refresh_millihz();
+            let new_refresh_millihz =
+                super::super::output::output_refresh_rate_for_mode(&target.mode).refresh_millihz();
+            self.perf
+                .log("native.output_configuration_storage_reuse", || {
+                    vec![
+                        NativePerfField::u64("old_mode_id", u64::from(self.target.mode_id)),
+                        NativePerfField::u64("target_mode_id", u64::from(target.mode_id)),
+                        NativePerfField::u64("old_refresh_millihz", u64::from(old_refresh_millihz)),
+                        NativePerfField::u64(
+                            "target_refresh_millihz",
+                            u64::from(new_refresh_millihz),
+                        ),
+                        NativePerfField::u64("output_epoch", output_epoch.get()),
+                        NativePerfField::u64("pool_generation", reusable.pool_generation),
+                        NativePerfField::u64("slot_id", u64::from(reusable.slot.get())),
+                        NativePerfField::u64(
+                            "framebuffer_id",
+                            u64::from(reusable.framebuffer.get()),
+                        ),
+                        NativePerfField::u64("width", u64::from(target.width)),
+                        NativePerfField::u64("height", u64::from(target.height)),
+                    ]
+                });
+            eprintln!("{}", candidate_route_diagnostic_line("reuse", None, None));
+            return Ok(CandidateScanoutState::ReuseReady { modeset, cursor });
         }
+
+        eprintln!(
+            "{}",
+            candidate_route_diagnostic_line("replacement", replacement_reason, unavailable_reason,)
+        );
 
         let pool_generation = match &*self.scanout {
             NativeScanoutBackend::AtomicEglGbm(explicit) => explicit.next_pool_generation()?,

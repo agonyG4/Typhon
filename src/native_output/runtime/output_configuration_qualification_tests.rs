@@ -161,12 +161,12 @@ impl FakeOutputRuntime {
         response: Option<u64>,
     ) -> OutputConfigurationAdvance {
         self.now_ns = now_ns;
-        let reuses_storage = same_storage_reuse_eligible(
+        let reuses_storage = same_storage_reuse_decision(
             &self.current,
             &target,
             NativeScanoutKind::AtomicEglGbmExplicit,
             true,
-        );
+        ) == SameStorageReuseDecision::Eligible;
         let candidate = FakeCandidate {
             id: self.scanout_id.wrapping_add(1).max(1),
             target,
@@ -577,16 +577,19 @@ fn refresh_only_mode_change_is_eligible_for_atomic_storage_reuse() {
     let target = configuration(1920, 1080, 60, 2);
     assert_ne!(current.mode.vrefresh, target.mode.vrefresh);
 
-    assert!(same_storage_reuse_eligible(
-        &current,
-        &target,
-        NativeScanoutKind::AtomicEglGbmExplicit,
-        true,
-    ));
+    assert_eq!(
+        same_storage_reuse_decision(
+            &current,
+            &target,
+            NativeScanoutKind::AtomicEglGbmExplicit,
+            true,
+        ),
+        SameStorageReuseDecision::Eligible,
+    );
 }
 
 #[test]
-fn same_storage_reuse_rejects_every_storage_topology_change() {
+fn same_storage_reuse_reports_each_storage_topology_rejection() {
     let current = configuration(1920, 1080, 165, 1);
     let refresh_target = configuration(1920, 1080, 60, 2);
     let changed_width = configuration(2560, 1080, 60, 2);
@@ -600,37 +603,269 @@ fn same_storage_reuse_rejects_every_storage_topology_change() {
     let mut changed_crtc = refresh_target;
     changed_crtc.crtc_id += 1;
 
-    for (name, target) in [
-        ("width", changed_width),
-        ("height", changed_height),
-        ("scale", changed_scale),
-        ("transform", changed_transform),
-        ("connector", changed_connector),
-        ("CRTC", changed_crtc),
+    for (target, reason, reason_name) in [
+        (
+            changed_connector,
+            SameStorageReuseRejection::ConnectorChanged,
+            "connector_changed",
+        ),
+        (
+            changed_crtc,
+            SameStorageReuseRejection::CrtcChanged,
+            "crtc_changed",
+        ),
+        (
+            changed_width,
+            SameStorageReuseRejection::WidthChanged,
+            "width_changed",
+        ),
+        (
+            changed_height,
+            SameStorageReuseRejection::HeightChanged,
+            "height_changed",
+        ),
+        (
+            changed_scale,
+            SameStorageReuseRejection::ScaleChanged,
+            "scale_changed",
+        ),
+        (
+            changed_transform,
+            SameStorageReuseRejection::TransformChanged,
+            "transform_changed",
+        ),
     ] {
-        assert!(
-            !same_storage_reuse_eligible(
+        assert_eq!(
+            same_storage_reuse_decision(
                 &current,
                 &target,
                 NativeScanoutKind::AtomicEglGbmExplicit,
                 true,
             ),
-            "same-storage reuse must reject a {name} change"
+            SameStorageReuseDecision::Rejected(reason),
         );
+        assert_eq!(reason.as_str(), reason_name);
     }
 
-    assert!(!same_storage_reuse_eligible(
+    assert_eq!(
+        SameStorageReuseRejection::ScanoutBackend.as_str(),
+        "scanout_backend"
+    );
+    assert_eq!(
+        SameStorageReuseRejection::RenderWorkerInactive.as_str(),
+        "render_worker_inactive"
+    );
+
+    assert_eq!(
+        same_storage_reuse_decision(
+            &current,
+            &refresh_target,
+            NativeScanoutKind::DumbFramebuffer,
+            true,
+        ),
+        SameStorageReuseDecision::Rejected(SameStorageReuseRejection::ScanoutBackend),
+    );
+    assert_eq!(
+        same_storage_reuse_decision(
+            &current,
+            &refresh_target,
+            NativeScanoutKind::AtomicEglGbmExplicit,
+            false,
+        ),
+        SameStorageReuseDecision::Rejected(SameStorageReuseRejection::RenderWorkerInactive),
+    );
+}
+
+#[test]
+fn same_storage_reuse_rejection_order_is_deterministic() {
+    let current = configuration(1920, 1080, 165, 1);
+    let mut target = configuration(2560, 1440, 60, 2);
+    target.connector_id += 1;
+    target.crtc_id += 1;
+    target.scale_milli += 250;
+    target.transform = OutputTransformSnapshot::Rotate90;
+
+    assert_eq!(
+        same_storage_reuse_decision(&current, &target, NativeScanoutKind::DumbFramebuffer, false,),
+        SameStorageReuseDecision::Rejected(SameStorageReuseRejection::ScanoutBackend),
+    );
+    assert_eq!(
+        same_storage_reuse_decision(
+            &current,
+            &target,
+            NativeScanoutKind::AtomicEglGbmExplicit,
+            false,
+        ),
+        SameStorageReuseDecision::Rejected(SameStorageReuseRejection::RenderWorkerInactive),
+    );
+    let expected = [
+        SameStorageReuseRejection::ConnectorChanged,
+        SameStorageReuseRejection::CrtcChanged,
+        SameStorageReuseRejection::WidthChanged,
+        SameStorageReuseRejection::HeightChanged,
+        SameStorageReuseRejection::ScaleChanged,
+        SameStorageReuseRejection::TransformChanged,
+    ];
+    let mut ordered_target = target;
+    for reason in expected {
+        assert_eq!(
+            same_storage_reuse_decision(
+                &current,
+                &ordered_target,
+                NativeScanoutKind::AtomicEglGbmExplicit,
+                true,
+            ),
+            SameStorageReuseDecision::Rejected(reason),
+        );
+        match reason {
+            SameStorageReuseRejection::ConnectorChanged => {
+                ordered_target.connector_id = current.connector_id
+            }
+            SameStorageReuseRejection::CrtcChanged => ordered_target.crtc_id = current.crtc_id,
+            SameStorageReuseRejection::WidthChanged => ordered_target.width = current.width,
+            SameStorageReuseRejection::HeightChanged => ordered_target.height = current.height,
+            SameStorageReuseRejection::ScaleChanged => {
+                ordered_target.scale_milli = current.scale_milli
+            }
+            SameStorageReuseRejection::TransformChanged => {
+                ordered_target.transform = current.transform
+            }
+            SameStorageReuseRejection::ScanoutBackend
+            | SameStorageReuseRejection::RenderWorkerInactive => unreachable!(),
+        }
+    }
+}
+
+#[test]
+fn same_storage_reuse_decision_diagnostic_contains_candidate_facts() {
+    let current = configuration(1920, 1080, 165, 1);
+    let target = configuration(1920, 1080, 60, 2);
+    let decision = SameStorageReuseDecision::Eligible;
+
+    let line = same_storage_reuse_decision_diagnostic_line(
         &current,
-        &refresh_target,
-        NativeScanoutKind::DumbFramebuffer,
-        true,
-    ));
-    assert!(!same_storage_reuse_eligible(
-        &current,
-        &refresh_target,
+        &target,
         NativeScanoutKind::AtomicEglGbmExplicit,
-        false,
-    ));
+        true,
+        decision,
+    );
+
+    for field in [
+        "event=same_storage_reuse_decision",
+        "result=eligible",
+        "current_mode_id=1",
+        "target_mode_id=2",
+        &format!(
+            "current_refresh_millihz={}",
+            output_rate(&current).refresh_millihz()
+        ),
+        &format!(
+            "target_refresh_millihz={}",
+            output_rate(&target).refresh_millihz()
+        ),
+        "current_width=1920",
+        "current_height=1080",
+        "target_width=1920",
+        "target_height=1080",
+        "scanout_kind=atomic-egl-gbm-explicit",
+        "render_worker_active=true",
+        "current_connector_id=11",
+        "target_connector_id=11",
+        "current_crtc_id=12",
+        "target_crtc_id=12",
+        "current_scale=1000",
+        "target_scale=1000",
+        "current_transform=Normal",
+        "target_transform=Normal",
+    ] {
+        assert!(line.contains(field), "missing {field:?} in {line:?}");
+    }
+    assert!(!line.starts_with("perf "));
+
+    let rejected = same_storage_reuse_decision_diagnostic_line(
+        &current,
+        &configuration(2560, 1080, 60, 2),
+        NativeScanoutKind::AtomicEglGbmExplicit,
+        true,
+        SameStorageReuseDecision::Rejected(SameStorageReuseRejection::WidthChanged),
+    );
+    assert!(rejected.contains("result=rejected reason=width_changed"));
+    assert!(
+        candidate_route_diagnostic_line(
+            "replacement",
+            Some(SameStorageReuseRejection::WidthChanged.as_str()),
+            None,
+        )
+        .contains("route=replacement reason=width_changed")
+    );
+}
+
+#[test]
+fn same_storage_reuse_diagnostics_are_available_when_perf_logging_is_disabled() {
+    let current = configuration(1920, 1080, 165, 1);
+    let target = configuration(1920, 1080, 60, 2);
+    let perf = NativePerfLogger { enabled: false };
+    assert!(!perf.enabled());
+
+    let line = same_storage_reuse_decision_diagnostic_line(
+        &current,
+        &target,
+        NativeScanoutKind::AtomicEglGbmExplicit,
+        true,
+        SameStorageReuseDecision::Eligible,
+    );
+
+    assert!(line.contains("event=same_storage_reuse_decision result=eligible"));
+    assert!(!line.starts_with("perf "));
+}
+
+#[test]
+fn reusable_storage_diagnostics_distinguish_success_unavailable_and_error() {
+    let framebuffer = FramebufferId::new(81).unwrap();
+    let reusable = ReusableAtomicCompositorFramebuffer {
+        framebuffer,
+        slot: OutputSlotId::new(1).unwrap(),
+        pool_generation: 7,
+        swapchain_pool_generation: 7,
+        framebuffer_sidecar: Some(framebuffer),
+        width: 1920,
+        height: 1080,
+    };
+    let success = reusable_framebuffer_success_diagnostic_line(reusable);
+    for field in [
+        "event=same_storage_reuse_storage",
+        "result=success",
+        "pool_generation=7",
+        "swapchain_generation=7",
+        "current_slot=1",
+        "physical_framebuffer_id=81",
+        "framebuffer_sidecar_id=81",
+        "width=1920",
+        "height=1080",
+    ] {
+        assert!(success.contains(field), "missing {field:?} in {success:?}");
+    }
+
+    let unavailable = reusable_framebuffer_unavailable_diagnostic_line(
+        ReusableStorageUnavailableReason::PhysicalPoolUnavailable,
+    );
+    assert!(unavailable.contains("result=unavailable reason=physical_pool_unavailable"));
+    let route = candidate_route_diagnostic_line(
+        "replacement",
+        Some("reusable_storage_unavailable"),
+        Some(ReusableStorageUnavailableReason::PhysicalPoolUnavailable),
+    );
+    assert!(route.contains("route=replacement reason=reusable_storage_unavailable"));
+    assert!(route.contains("unavailable_reason=physical_pool_unavailable"));
+
+    let error = io::Error::other("active Atomic swapchain and physical pool generations differ");
+    let error_line = reusable_framebuffer_invariant_error_diagnostic_line(&error);
+    assert!(error_line.contains("result=invariant_error reason=storage_invariant"));
+    assert!(error_line.contains("generations differ"));
+    assert!(
+        candidate_route_diagnostic_line("error", Some("storage_invariant"), None)
+            .contains("route=error reason=storage_invariant")
+    );
 }
 
 fn apply(runtime: &mut FakeOutputRuntime, target: NativeAppliedOutputConfiguration, now_ns: u64) {

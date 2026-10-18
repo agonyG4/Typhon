@@ -236,6 +236,12 @@ in the new `OutputEpoch` cannot rely on the old presentation history. This path
 advances `OutputEpoch` and output configuration generation without advancing
 `pool_generation`.
 
+Candidate preparation emits low-frequency same-storage decision and route
+diagnostics to the ordinary session log, independently of the optional native
+perf logger. They distinguish eligibility rejection, unavailable reusable
+storage, storage invariant failure, successful framebuffer proof, and the
+selected reuse or replacement route for hardware qualification.
+
 Changes that affect storage or logical geometry continue to use the existing
 replacement-candidate path pending the persistent-pool redesign. The reactor
 allocates candidate physical resources and retains them while the worker

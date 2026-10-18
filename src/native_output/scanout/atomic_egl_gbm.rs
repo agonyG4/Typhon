@@ -410,6 +410,57 @@ pub(crate) struct ReusableAtomicCompositorFramebuffer {
     pub(crate) framebuffer: FramebufferId,
     pub(crate) slot: OutputSlotId,
     pub(crate) pool_generation: u64,
+    pub(crate) swapchain_pool_generation: u64,
+    pub(crate) framebuffer_sidecar: Option<FramebufferId>,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReusableStorageUnavailableReason {
+    PhysicalPoolUnavailable,
+    SwapchainUnavailable,
+    GenericStorageUnavailable,
+}
+
+impl ReusableStorageUnavailableReason {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::PhysicalPoolUnavailable => "physical_pool_unavailable",
+            Self::SwapchainUnavailable => "swapchain_unavailable",
+            Self::GenericStorageUnavailable => "generic_storage_unavailable",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReusableAtomicCompositorFramebufferLookup {
+    Proven(ReusableAtomicCompositorFramebuffer),
+    Unavailable(ReusableStorageUnavailableReason),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReusableStorageAvailability {
+    Available,
+    Unavailable(ReusableStorageUnavailableReason),
+}
+
+fn reusable_storage_availability(
+    physical_pool_available: bool,
+    swapchain_available: bool,
+) -> io::Result<ReusableStorageAvailability> {
+    match (physical_pool_available, swapchain_available) {
+        (true, true) => Ok(ReusableStorageAvailability::Available),
+        (false, false) => Ok(ReusableStorageAvailability::Unavailable(
+            ReusableStorageUnavailableReason::PhysicalPoolUnavailable,
+        )),
+        (true, false) => Ok(ReusableStorageAvailability::Unavailable(
+            ReusableStorageUnavailableReason::SwapchainUnavailable,
+        )),
+        (false, true) => Err(io::Error::other(
+            "active Atomic swapchain has no physical output pool",
+        )),
+    }
 }
 
 fn prove_reusable_compositor_framebuffer(
@@ -421,6 +472,8 @@ fn prove_reusable_compositor_framebuffer(
     current_slot_is_owned: bool,
     framebuffer: FramebufferId,
     framebuffer_sidecar: Option<FramebufferId>,
+    width: u32,
+    height: u32,
 ) -> io::Result<ReusableAtomicCompositorFramebuffer> {
     if swapchain_pool_generation != pool_generation {
         return Err(io::Error::other(
@@ -451,6 +504,10 @@ fn prove_reusable_compositor_framebuffer(
         framebuffer,
         slot: current_slot,
         pool_generation,
+        swapchain_pool_generation,
+        framebuffer_sidecar,
+        width,
+        height,
     })
 }
 
@@ -1463,14 +1520,19 @@ impl AtomicEglGbmScanout {
         &self,
         expected_width: u32,
         expected_height: u32,
-    ) -> io::Result<Option<ReusableAtomicCompositorFramebuffer>> {
+    ) -> io::Result<ReusableAtomicCompositorFramebufferLookup> {
+        let availability =
+            reusable_storage_availability(self.physical_pool.is_some(), self.swapchain.is_some())?;
+        match availability {
+            ReusableStorageAvailability::Unavailable(reason) => {
+                return Ok(ReusableAtomicCompositorFramebufferLookup::Unavailable(
+                    reason,
+                ));
+            }
+            ReusableStorageAvailability::Available => {}
+        }
         let (Some(pool), Some(swapchain)) = (&self.physical_pool, &self.swapchain) else {
-            return match (&self.physical_pool, &self.swapchain) {
-                (None, Some(_)) => Err(io::Error::other(
-                    "active Atomic swapchain has no physical output pool",
-                )),
-                _ => Ok(None),
-            };
+            unreachable!("available reusable storage requires both active pool and swapchain")
         };
         let pool_generation = pool.pool_generation();
         if self.width != expected_width || self.height != expected_height {
@@ -1494,6 +1556,7 @@ impl AtomicEglGbmScanout {
             ));
         }
         let physical_slot = pool.physical_slot(current_slot)?;
+        let framebuffer_sidecar = swapchain.current_framebuffer_id();
         prove_reusable_compositor_framebuffer(
             &pool.identities(),
             &self.render_slot_identities,
@@ -1502,9 +1565,11 @@ impl AtomicEglGbmScanout {
             current_slot,
             swapchain.contains_slot(current_slot),
             physical_slot.framebuffer,
-            swapchain.current_framebuffer_id(),
+            framebuffer_sidecar,
+            self.width,
+            self.height,
         )
-        .map(Some)
+        .map(ReusableAtomicCompositorFramebufferLookup::Proven)
     }
 
     pub(crate) fn gpu_residency_domain_snapshot(
@@ -4234,12 +4299,18 @@ mod tests {
                 true,
                 framebuffer,
                 Some(framebuffer),
+                1920,
+                1080,
             )
             .unwrap(),
             ReusableAtomicCompositorFramebuffer {
                 framebuffer,
                 slot: current_slot,
                 pool_generation: 7,
+                swapchain_pool_generation: 7,
+                framebuffer_sidecar: Some(framebuffer),
+                width: 1920,
+                height: 1080,
             }
         );
         assert!(
@@ -4252,6 +4323,8 @@ mod tests {
                 true,
                 framebuffer,
                 None,
+                1920,
+                1080,
             )
             .is_err()
         );
@@ -4267,6 +4340,8 @@ mod tests {
                 true,
                 framebuffer,
                 None,
+                1920,
+                1080,
             )
             .is_err()
         );
@@ -4280,6 +4355,8 @@ mod tests {
                 true,
                 framebuffer,
                 Some(FramebufferId::new(82).unwrap()),
+                1920,
+                1080,
             )
             .is_err()
         );
@@ -4293,6 +4370,8 @@ mod tests {
                 true,
                 framebuffer,
                 None,
+                1920,
+                1080,
             )
             .is_err()
         );
@@ -4306,8 +4385,36 @@ mod tests {
                 false,
                 framebuffer,
                 None,
+                1920,
+                1080,
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn reusable_storage_unavailability_is_classified_without_becoming_an_error() {
+        assert_eq!(
+            reusable_storage_availability(false, false).unwrap(),
+            ReusableStorageAvailability::Unavailable(
+                ReusableStorageUnavailableReason::PhysicalPoolUnavailable
+            ),
+        );
+        assert_eq!(
+            reusable_storage_availability(true, false).unwrap(),
+            ReusableStorageAvailability::Unavailable(
+                ReusableStorageUnavailableReason::SwapchainUnavailable
+            ),
+        );
+        assert_eq!(
+            reusable_storage_availability(true, true).unwrap(),
+            ReusableStorageAvailability::Available,
+        );
+        assert_eq!(
+            reusable_storage_availability(false, true)
+                .unwrap_err()
+                .to_string(),
+            "active Atomic swapchain has no physical output pool",
         );
     }
 
