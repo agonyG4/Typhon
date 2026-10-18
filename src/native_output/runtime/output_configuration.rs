@@ -181,8 +181,12 @@ pub(super) enum CandidateScanoutState {
         scanout: NativeScanoutBackend,
         frame: AtomicRenderedFrameParts,
     },
-    Ready {
+    ReadyReplacement {
         scanout: NativeScanoutBackend,
+        modeset: PreparedAtomicRuntimeModeset<DrmModeBlobIo>,
+        cursor: Option<AtomicCursorVisualState>,
+    },
+    ReuseReady {
         modeset: PreparedAtomicRuntimeModeset<DrmModeBlobIo>,
         cursor: Option<AtomicCursorVisualState>,
     },
@@ -702,15 +706,38 @@ pub(crate) enum OutputConfigurationAdvance {
 /// A ready synchronous candidate crossing the single irreversible KMS commit
 /// boundary. Candidate construction and all KMS behavior stay in their owners.
 enum OutputConfigurationTransitionCandidate {
-    Ready {
+    ReadyReplacement {
         scanout: NativeScanoutBackend,
         modeset: PreparedAtomicRuntimeModeset<DrmModeBlobIo>,
         cursor: Option<AtomicCursorVisualState>,
     },
-    Adopted {
+    ReadyReuse {
+        modeset: PreparedAtomicRuntimeModeset<DrmModeBlobIo>,
+        cursor: Option<AtomicCursorVisualState>,
+    },
+    AdoptedReplacement {
         scanout: NativeScanoutBackend,
         cursor: Option<AtomicCursorVisualState>,
     },
+    AdoptedReuse {
+        cursor: Option<AtomicCursorVisualState>,
+    },
+}
+
+fn same_storage_reuse_eligible(
+    current: &NativeAppliedOutputConfiguration,
+    target: &NativeAppliedOutputConfiguration,
+    scanout_kind: NativeScanoutKind,
+    render_worker_active: bool,
+) -> bool {
+    scanout_kind == NativeScanoutKind::AtomicEglGbmExplicit
+        && render_worker_active
+        && current.connector_id == target.connector_id
+        && current.crtc_id == target.crtc_id
+        && current.width == target.width
+        && current.height == target.height
+        && current.scale_milli == target.scale_milli
+        && current.transform == target.transform
 }
 
 /// Statically dispatched coordination port for the synchronous output
@@ -1649,7 +1676,7 @@ impl NativeRuntime {
                     return Ok(OutputConfigurationAdvance::Completed);
                 }
             };
-            pending.candidate = Some(CandidateScanoutState::Ready {
+            pending.candidate = Some(CandidateScanoutState::ReadyReplacement {
                 scanout,
                 modeset,
                 cursor,
@@ -1737,14 +1764,24 @@ impl NativeRuntime {
             );
         }
 
-        let CandidateScanoutState::Ready {
-            scanout,
-            modeset,
-            cursor,
-        } = pending.candidate.take().expect("candidate prepared")
-        else {
-            self.pending_output_configuration = Some(pending);
-            return Ok(OutputConfigurationAdvance::Waiting);
+        let transition_candidate = match pending.candidate.take().expect("candidate prepared") {
+            CandidateScanoutState::ReadyReplacement {
+                scanout,
+                modeset,
+                cursor,
+            } => OutputConfigurationTransitionCandidate::ReadyReplacement {
+                scanout,
+                modeset,
+                cursor,
+            },
+            CandidateScanoutState::ReuseReady { modeset, cursor } => {
+                OutputConfigurationTransitionCandidate::ReadyReuse { modeset, cursor }
+            }
+            other => {
+                pending.candidate = Some(other);
+                self.pending_output_configuration = Some(pending);
+                return Ok(OutputConfigurationAdvance::Waiting);
+            }
         };
         debug_assert!(pending.prepared_transaction.is_none());
         advance_output_configuration_transition(
@@ -1753,11 +1790,7 @@ impl NativeRuntime {
             pending.target,
             pending.response,
             pending.failure_code,
-            OutputConfigurationTransitionCandidate::Ready {
-                scanout,
-                modeset,
-                cursor,
-            },
+            transition_candidate,
             now_ns,
             advance_started,
         )
@@ -1798,9 +1831,9 @@ impl NativeRuntime {
                 let _ = self.advance_output_configuration(now_ns)?;
                 Ok(true)
             }
-            CandidateScanoutState::RenderingFence { .. } | CandidateScanoutState::Ready { .. } => {
-                Ok(false)
-            }
+            CandidateScanoutState::RenderingFence { .. }
+            | CandidateScanoutState::ReadyReplacement { .. }
+            | CandidateScanoutState::ReuseReady { .. } => Ok(false),
         }
     }
 
@@ -2197,13 +2230,73 @@ impl NativeRuntime {
     ) -> io::Result<CandidateScanoutState> {
         let output_epoch = self.output_epoch.next();
         let generation = output_epoch.get();
+        let cursor = self.candidate_cursor_state(target);
+        let scanout_kind = self.scanout.kind();
+        let render_worker_active = self.scanout.render_worker_active();
+        if same_storage_reuse_eligible(&self.target, target, scanout_kind, render_worker_active) {
+            let reusable = match &*self.scanout {
+                NativeScanoutBackend::AtomicEglGbm(explicit) => explicit
+                    .current_compositor_framebuffer_for_same_storage_modeset(
+                        self.target.width,
+                        self.target.height,
+                    )?,
+                _ => None,
+            };
+            if let Some(reusable) = reusable {
+                let NativeScanoutBackend::AtomicEglGbm(explicit) = &mut *self.scanout else {
+                    unreachable!("reuse eligibility requires explicit Atomic EGL/GBM scanout")
+                };
+                explicit.queue_presented_damage_history_invalidation()?;
+                let modeset = self
+                    .kms_backend
+                    .prepare_runtime_modeset_candidate(
+                        target.mode,
+                        target.width,
+                        target.height,
+                        reusable.framebuffer,
+                        cursor,
+                    )
+                    .map_err(io::Error::other)?;
+                let old_refresh_millihz =
+                    super::super::output::output_refresh_rate_for_mode(&self.target.mode)
+                        .refresh_millihz();
+                let new_refresh_millihz =
+                    super::super::output::output_refresh_rate_for_mode(&target.mode)
+                        .refresh_millihz();
+                self.perf
+                    .log("native.output_configuration_storage_reuse", || {
+                        vec![
+                            NativePerfField::u64("old_mode_id", u64::from(self.target.mode_id)),
+                            NativePerfField::u64("target_mode_id", u64::from(target.mode_id)),
+                            NativePerfField::u64(
+                                "old_refresh_millihz",
+                                u64::from(old_refresh_millihz),
+                            ),
+                            NativePerfField::u64(
+                                "target_refresh_millihz",
+                                u64::from(new_refresh_millihz),
+                            ),
+                            NativePerfField::u64("output_epoch", output_epoch.get()),
+                            NativePerfField::u64("pool_generation", reusable.pool_generation),
+                            NativePerfField::u64("slot_id", u64::from(reusable.slot.get())),
+                            NativePerfField::u64(
+                                "framebuffer_id",
+                                u64::from(reusable.framebuffer.get()),
+                            ),
+                            NativePerfField::u64("width", u64::from(target.width)),
+                            NativePerfField::u64("height", u64::from(target.height)),
+                        ]
+                    });
+                return Ok(CandidateScanoutState::ReuseReady { modeset, cursor });
+            }
+        }
+
         let pool_generation = match &*self.scanout {
             NativeScanoutBackend::AtomicEglGbm(explicit) => explicit.next_pool_generation()?,
             _ => generation,
         };
         let output_id = self.output_id;
         let current_format = self.scanout.scanout_format();
-        let cursor = self.candidate_cursor_state(target);
         if let NativeScanoutBackend::AtomicEglGbm(explicit) = &mut *self.scanout
             && explicit.render_worker_active()
         {
@@ -2393,7 +2486,7 @@ impl NativeRuntime {
                             cursor,
                         )
                         .map_err(io::Error::other)?;
-                    Ok(CandidateScanoutState::Ready {
+                    Ok(CandidateScanoutState::ReadyReplacement {
                         scanout,
                         modeset,
                         cursor,
@@ -2692,8 +2785,10 @@ impl OutputConfigurationRuntime for NativeRuntime {
     type Response = Option<(ReactorToken, u64)>;
 
     fn test_candidate(&mut self, candidate: &mut Self::Candidate) -> Result<(), String> {
-        let OutputConfigurationTransitionCandidate::Ready { modeset, .. } = candidate else {
-            return Err("output candidate is not ready for TEST_ONLY".to_string());
+        let modeset = match candidate {
+            OutputConfigurationTransitionCandidate::ReadyReplacement { modeset, .. }
+            | OutputConfigurationTransitionCandidate::ReadyReuse { modeset, .. } => modeset,
+            _ => return Err("output candidate is not ready for TEST_ONLY".to_string()),
         };
         self.kms_backend
             .test_runtime_modeset_candidate(modeset)
@@ -2798,24 +2893,32 @@ impl OutputConfigurationRuntime for NativeRuntime {
         quiesced_epoch: QuiescedOutputEpoch,
         commit_started_at_ns: u64,
     ) -> Result<u64, String> {
-        let OutputConfigurationTransitionCandidate::Ready { modeset, .. } = candidate else {
-            return Err("output candidate is not ready for real commit".to_string());
+        let modeset = match candidate {
+            OutputConfigurationTransitionCandidate::ReadyReplacement { modeset, .. }
+            | OutputConfigurationTransitionCandidate::ReadyReuse { modeset, .. } => modeset,
+            _ => return Err("output candidate is not ready for real commit".to_string()),
         };
         self.commit_modeset_after_quiescence(modeset, quiesced_epoch, commit_started_at_ns)
     }
 
     fn adopt_committed_candidate(&mut self, candidate: Self::Candidate) -> Self::Candidate {
-        let OutputConfigurationTransitionCandidate::Ready {
-            scanout,
-            modeset,
-            cursor,
-        } = candidate
-        else {
-            unreachable!("only a tested synchronous candidate can be committed")
-        };
-        self.kms_backend
-            .adopt_committed_runtime_modeset_candidate(modeset);
-        OutputConfigurationTransitionCandidate::Adopted { scanout, cursor }
+        match candidate {
+            OutputConfigurationTransitionCandidate::ReadyReplacement {
+                scanout,
+                modeset,
+                cursor,
+            } => {
+                self.kms_backend
+                    .adopt_committed_runtime_modeset_candidate(modeset);
+                OutputConfigurationTransitionCandidate::AdoptedReplacement { scanout, cursor }
+            }
+            OutputConfigurationTransitionCandidate::ReadyReuse { modeset, cursor } => {
+                self.kms_backend
+                    .adopt_committed_runtime_modeset_candidate(modeset);
+                OutputConfigurationTransitionCandidate::AdoptedReuse { cursor }
+            }
+            _ => unreachable!("only a tested synchronous candidate can be committed"),
+        }
     }
 
     fn finalize_committed_transaction(
@@ -2851,14 +2954,24 @@ impl OutputConfigurationRuntime for NativeRuntime {
         candidate: Self::Candidate,
         committed_at_ns: u64,
     ) {
-        let OutputConfigurationTransitionCandidate::Adopted {
-            mut scanout,
-            cursor,
-        } = candidate
-        else {
-            unreachable!("KMS adoption precedes authoritative output publication")
-        };
-        self.publish_output_configuration(target, &mut scanout, cursor, committed_at_ns);
+        match candidate {
+            OutputConfigurationTransitionCandidate::AdoptedReplacement {
+                mut scanout,
+                cursor,
+            } => {
+                self.publish_output_configuration(target, &mut scanout, cursor, committed_at_ns);
+            }
+            OutputConfigurationTransitionCandidate::AdoptedReuse { cursor } => {
+                self.scanout.retire_direct_after_synchronous_modeset();
+                self.publish_new_output_epoch(
+                    target,
+                    self.output_epoch.next(),
+                    cursor,
+                    committed_at_ns,
+                );
+            }
+            _ => unreachable!("KMS adoption precedes authoritative output publication"),
+        }
         match operation {
             OutputConfigurationOperation::TemporaryApply { .. } => {
                 let transaction_id = self

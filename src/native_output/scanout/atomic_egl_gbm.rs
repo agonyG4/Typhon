@@ -405,6 +405,55 @@ pub(crate) use atomic_egl_gbm_transactions::{
     AtomicReadySubmissionOutcome, VariableRetryRejection,
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReusableAtomicCompositorFramebuffer {
+    pub(crate) framebuffer: FramebufferId,
+    pub(crate) slot: OutputSlotId,
+    pub(crate) pool_generation: u64,
+}
+
+fn prove_reusable_compositor_framebuffer(
+    physical_slot_identities: &[(OutputSlotId, u64)],
+    render_slot_identities: &[(OutputSlotId, u64)],
+    pool_generation: u64,
+    swapchain_pool_generation: u64,
+    current_slot: OutputSlotId,
+    current_slot_is_owned: bool,
+    framebuffer: FramebufferId,
+    framebuffer_sidecar: Option<FramebufferId>,
+) -> io::Result<ReusableAtomicCompositorFramebuffer> {
+    if swapchain_pool_generation != pool_generation {
+        return Err(io::Error::other(
+            "active Atomic swapchain and physical pool generations differ",
+        ));
+    }
+    if !current_slot_is_owned {
+        return Err(io::Error::other(
+            "active Atomic swapchain current slot is outside its slot set",
+        ));
+    }
+    validate_split_slot_pairing(
+        physical_slot_identities,
+        render_slot_identities,
+        pool_generation,
+    )?;
+    if !physical_slot_identities.contains(&(current_slot, pool_generation)) {
+        return Err(io::Error::other(
+            "current compositor slot is not present in the active physical pool",
+        ));
+    }
+    if framebuffer_sidecar.is_some_and(|sidecar| sidecar != framebuffer) {
+        return Err(io::Error::other(
+            "current compositor framebuffer disagrees with the swapchain sidecar",
+        ));
+    }
+    Ok(ReusableAtomicCompositorFramebuffer {
+        framebuffer,
+        slot: current_slot,
+        pool_generation,
+    })
+}
+
 pub(crate) struct AtomicEglGbmScanout {
     _physical_device: Option<gbm::Device<std::os::fd::OwnedFd>>,
     physical_pool: Option<AtomicPhysicalOutputPool>,
@@ -1189,6 +1238,11 @@ impl AtomicEglGbmScanout {
     pub(crate) fn invalidate_presented_damage_history(&mut self) {
         let _ = self.queue_render_control(AtomicRenderControl::InvalidatePresentedDamageHistory);
     }
+
+    pub(crate) fn queue_presented_damage_history_invalidation(&mut self) -> io::Result<()> {
+        self.queue_render_control(AtomicRenderControl::InvalidatePresentedDamageHistory)
+    }
+
     pub(crate) fn prepare_session_recovery(&self) -> io::Result<AtomicExplicitRecovery> {
         let swapchain = self.swapchain()?;
         let current = swapchain.current();
@@ -1403,6 +1457,54 @@ impl AtomicEglGbmScanout {
         self.physical_pool
             .as_ref()
             .map(AtomicPhysicalOutputPool::pool_generation)
+    }
+
+    pub(crate) fn current_compositor_framebuffer_for_same_storage_modeset(
+        &self,
+        expected_width: u32,
+        expected_height: u32,
+    ) -> io::Result<Option<ReusableAtomicCompositorFramebuffer>> {
+        let (Some(pool), Some(swapchain)) = (&self.physical_pool, &self.swapchain) else {
+            return match (&self.physical_pool, &self.swapchain) {
+                (None, Some(_)) => Err(io::Error::other(
+                    "active Atomic swapchain has no physical output pool",
+                )),
+                _ => Ok(None),
+            };
+        };
+        let pool_generation = pool.pool_generation();
+        if self.width != expected_width || self.height != expected_height {
+            return Err(io::Error::other(
+                "active Atomic scanout dimensions disagree with the authoritative output",
+            ));
+        }
+        if pool
+            .slots()
+            .iter()
+            .any(|slot| slot.bo.width() != self.width || slot.bo.height() != self.height)
+        {
+            return Err(io::Error::other(
+                "active Atomic physical pool dimensions disagree with the scanout",
+            ));
+        }
+        let current_slot = swapchain.current();
+        if !swapchain.contains_slot(current_slot) {
+            return Err(io::Error::other(
+                "active Atomic swapchain current slot is outside its slot set",
+            ));
+        }
+        let physical_slot = pool.physical_slot(current_slot)?;
+        prove_reusable_compositor_framebuffer(
+            &pool.identities(),
+            &self.render_slot_identities,
+            pool_generation,
+            swapchain.pool_generation(),
+            current_slot,
+            swapchain.contains_slot(current_slot),
+            physical_slot.framebuffer,
+            swapchain.current_framebuffer_id(),
+        )
+        .map(Some)
     }
 
     pub(crate) fn gpu_residency_domain_snapshot(
@@ -4113,6 +4215,102 @@ mod tests {
         generation
     }
 
+    #[test]
+    fn reusable_framebuffer_proof_checks_split_pool_and_framebuffer_identity() {
+        let physical = (0..EXPLICIT_OUTPUT_SLOT_CAPACITY)
+            .map(|index| (OutputSlotId::new(index as u8).unwrap(), 7))
+            .collect::<Vec<_>>();
+        let render = physical.clone();
+        let framebuffer = FramebufferId::new(81).unwrap();
+        let current_slot = OutputSlotId::new(1).unwrap();
+
+        assert_eq!(
+            prove_reusable_compositor_framebuffer(
+                &physical,
+                &render,
+                7,
+                7,
+                current_slot,
+                true,
+                framebuffer,
+                Some(framebuffer),
+            )
+            .unwrap(),
+            ReusableAtomicCompositorFramebuffer {
+                framebuffer,
+                slot: current_slot,
+                pool_generation: 7,
+            }
+        );
+        assert!(
+            prove_reusable_compositor_framebuffer(
+                &physical,
+                &render,
+                8,
+                8,
+                current_slot,
+                true,
+                framebuffer,
+                None,
+            )
+            .is_err()
+        );
+        let mut mismatched_render = render.clone();
+        mismatched_render[1].1 = 6;
+        assert!(
+            prove_reusable_compositor_framebuffer(
+                &physical,
+                &mismatched_render,
+                7,
+                7,
+                current_slot,
+                true,
+                framebuffer,
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            prove_reusable_compositor_framebuffer(
+                &physical,
+                &render,
+                7,
+                7,
+                current_slot,
+                true,
+                framebuffer,
+                Some(FramebufferId::new(82).unwrap()),
+            )
+            .is_err()
+        );
+        assert!(
+            prove_reusable_compositor_framebuffer(
+                &physical,
+                &render,
+                7,
+                6,
+                current_slot,
+                true,
+                framebuffer,
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            prove_reusable_compositor_framebuffer(
+                &physical,
+                &render,
+                7,
+                7,
+                current_slot,
+                false,
+                framebuffer,
+                None,
+            )
+            .is_err()
+        );
+    }
+
     fn queue_worker_control(
         transport: &mut AtomicRenderTransport,
         pending: &mut Vec<SequencedRenderControl>,
@@ -4218,6 +4416,32 @@ mod tests {
 
         assert!(!overflowed);
         assert_eq!(pending.len(), 1);
+        assert_eq!(epoch, 1);
+        assert!(matches!(
+            &pending[0].control,
+            AtomicRenderControl::InvalidatePresentedDamageHistory
+        ));
+    }
+
+    #[test]
+    fn reuse_damage_invalidation_is_queued_before_any_worker_acknowledgement() {
+        let mut transport = AtomicRenderTransport::Worker(AtomicRenderWorkerHandle::test_handle());
+        let mut pending = Vec::new();
+        let mut epoch = 0;
+        let mut overflowed = false;
+
+        queue_worker_control(
+            &mut transport,
+            &mut pending,
+            &mut epoch,
+            &mut overflowed,
+            AtomicRenderControl::InvalidatePresentedDamageHistory,
+        )
+        .expect("precommit damage invalidation is accepted into the ordered lane");
+
+        assert!(!overflowed);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].epoch, 1);
         assert_eq!(epoch, 1);
         assert!(matches!(
             &pending[0].control,

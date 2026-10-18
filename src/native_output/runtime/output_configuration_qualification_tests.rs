@@ -7,6 +7,7 @@ use oblivion_one::control_snapshots::OutputTransformSnapshot;
 enum TransitionEvent {
     SafeBoundaryChecked,
     TestOnlyPassed,
+    RendererHistoryInvalidationQueued,
     TransactionReserved,
     AcquireWatchesParked,
     KernelCommitted,
@@ -33,6 +34,7 @@ struct FakeCandidate {
     id: u64,
     target: NativeAppliedOutputConfiguration,
     rendered: bool,
+    reuses_storage: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -55,6 +57,7 @@ struct FakeOutputRuntime {
     generation: OutputConfigurationGeneration,
     output_epoch: OutputEpochId,
     scanout_id: u64,
+    pool_generation: u64,
     scanout_dimensions: (u32, u32),
     server_geometry: (u32, u32),
     server_refresh_millihz: u32,
@@ -103,6 +106,7 @@ impl FakeOutputRuntime {
             generation: OutputConfigurationGeneration::initial(),
             output_epoch: OutputEpochId::initial(),
             scanout_id: 1,
+            pool_generation: 1,
             scanout_dimensions: (1920, 1080),
             server_geometry: (1920, 1080),
             server_refresh_millihz: rate.refresh_millihz(),
@@ -157,10 +161,17 @@ impl FakeOutputRuntime {
         response: Option<u64>,
     ) -> OutputConfigurationAdvance {
         self.now_ns = now_ns;
+        let reuses_storage = same_storage_reuse_eligible(
+            &self.current,
+            &target,
+            NativeScanoutKind::AtomicEglGbmExplicit,
+            true,
+        );
         let candidate = FakeCandidate {
             id: self.scanout_id.wrapping_add(1).max(1),
             target,
             rendered: true,
+            reuses_storage,
         };
         self.events.push(TransitionEvent::SafeBoundaryChecked);
         let safe_boundary = OutputConfigurationSafeBoundary {
@@ -170,6 +181,11 @@ impl FakeOutputRuntime {
         };
         if !safe_boundary.is_safe() {
             return OutputConfigurationAdvance::Waiting;
+        }
+        if reuses_storage {
+            self.damage_history_generation = self.damage_history_generation.wrapping_add(1).max(1);
+            self.events
+                .push(TransitionEvent::RendererHistoryInvalidationQueued);
         }
         advance_output_configuration_transition(
             self,
@@ -418,7 +434,11 @@ impl OutputConfigurationRuntime for FakeOutputRuntime {
             self.events.push(TransitionEvent::DirectScanoutRetired);
         }
         self.current = target;
-        self.scanout_id = candidate.id;
+        if !candidate.reuses_storage {
+            self.scanout_id = candidate.id;
+            self.pool_generation = self.pool_generation.wrapping_add(1).max(1);
+            self.damage_history_generation = self.damage_history_generation.wrapping_add(1).max(1);
+        }
         self.scanout_dimensions = (target.width, target.height);
         self.generation.advance();
         self.output_epoch = self.output_epoch.next();
@@ -439,7 +459,6 @@ impl OutputConfigurationRuntime for FakeOutputRuntime {
         self.cursor_validation_proof_valid = false;
         self.scheduler_interval_ns = output_rate(&target).interval_ns();
         self.presentation_interval_ns = output_rate(&target).interval_ns();
-        self.damage_history_generation = self.damage_history_generation.wrapping_add(1).max(1);
         self.direct_validation_generation =
             self.direct_validation_generation.wrapping_add(1).max(1);
         self.direct_validation_valid = false;
@@ -552,6 +571,68 @@ fn configuration(
     }
 }
 
+#[test]
+fn refresh_only_mode_change_is_eligible_for_atomic_storage_reuse() {
+    let current = configuration(1920, 1080, 165, 1);
+    let target = configuration(1920, 1080, 60, 2);
+    assert_ne!(current.mode.vrefresh, target.mode.vrefresh);
+
+    assert!(same_storage_reuse_eligible(
+        &current,
+        &target,
+        NativeScanoutKind::AtomicEglGbmExplicit,
+        true,
+    ));
+}
+
+#[test]
+fn same_storage_reuse_rejects_every_storage_topology_change() {
+    let current = configuration(1920, 1080, 165, 1);
+    let refresh_target = configuration(1920, 1080, 60, 2);
+    let changed_width = configuration(2560, 1080, 60, 2);
+    let changed_height = configuration(1920, 1440, 60, 2);
+    let mut changed_scale = refresh_target;
+    changed_scale.scale_milli = 1250;
+    let mut changed_transform = refresh_target;
+    changed_transform.transform = OutputTransformSnapshot::Rotate90;
+    let mut changed_connector = refresh_target;
+    changed_connector.connector_id += 1;
+    let mut changed_crtc = refresh_target;
+    changed_crtc.crtc_id += 1;
+
+    for (name, target) in [
+        ("width", changed_width),
+        ("height", changed_height),
+        ("scale", changed_scale),
+        ("transform", changed_transform),
+        ("connector", changed_connector),
+        ("CRTC", changed_crtc),
+    ] {
+        assert!(
+            !same_storage_reuse_eligible(
+                &current,
+                &target,
+                NativeScanoutKind::AtomicEglGbmExplicit,
+                true,
+            ),
+            "same-storage reuse must reject a {name} change"
+        );
+    }
+
+    assert!(!same_storage_reuse_eligible(
+        &current,
+        &refresh_target,
+        NativeScanoutKind::DumbFramebuffer,
+        true,
+    ));
+    assert!(!same_storage_reuse_eligible(
+        &current,
+        &refresh_target,
+        NativeScanoutKind::AtomicEglGbmExplicit,
+        false,
+    ));
+}
+
 fn apply(runtime: &mut FakeOutputRuntime, target: NativeAppliedOutputConfiguration, now_ns: u64) {
     let operation = runtime.temporary_operation();
     assert_eq!(
@@ -602,13 +683,29 @@ fn refresh_change_and_timeout_rollback_publish_coordinated_state() {
     );
     assert_eq!(runtime.scanout_dimensions, (1920, 1080));
     assert_eq!(
-        runtime.scanout_id, 2,
-        "prepared candidate became authoritative"
+        runtime.scanout_id, 1,
+        "refresh-only modeset reuses scanout storage"
+    );
+    assert_eq!(
+        runtime.pool_generation, 1,
+        "storage identity remains unchanged"
     );
     assert!(!runtime.direct_validation_valid);
     assert_eq!(runtime.direct_validation_generation, 2);
     assert!(!runtime.cursor_validation_proof_valid);
     assert_eq!(runtime.damage_history_generation, 2);
+    assert!(
+        runtime
+            .events
+            .iter()
+            .position(|event| *event == TransitionEvent::RendererHistoryInvalidationQueued)
+            .expect("reuse queues renderer history invalidation")
+            < runtime
+                .events
+                .iter()
+                .position(|event| *event == TransitionEvent::KernelCommitted)
+                .expect("refresh mode committed")
+    );
     assert_eq!(runtime.acquire_obligations.len(), 1);
     assert!(!runtime.acquire_obligations[0].signaled);
     assert_eq!(runtime.acquire_obligations[0].rearmed_generation, Some(2));
@@ -627,6 +724,14 @@ fn refresh_change_and_timeout_rollback_publish_coordinated_state() {
     );
     assert_eq!(runtime.generation.get(), initial_generation + 2);
     assert_eq!(runtime.output_epoch, OutputEpochId::initial().next().next());
+    assert_eq!(
+        runtime.scanout_id, 1,
+        "timeout rollback reuses the same storage"
+    );
+    assert_eq!(
+        runtime.pool_generation, 1,
+        "rollback does not rebind storage identity"
+    );
     assert_eq!(runtime.rate().refresh_millihz(), 165_000);
     assert_eq!(runtime.server_refresh_millihz, 165_000);
     assert_eq!(runtime.scheduler_interval_ns, runtime.rate().interval_ns());
@@ -648,6 +753,14 @@ fn dimension_change_keep_updates_geometry_cursor_damage_and_persistence_together
     let generation_after_apply = runtime.generation.get();
 
     assert_eq!(runtime.scanout_dimensions, (1280, 720));
+    assert_eq!(
+        runtime.scanout_id, 2,
+        "dimension change uses replacement storage"
+    );
+    assert_eq!(
+        runtime.pool_generation, 2,
+        "replacement advances storage identity"
+    );
     assert_eq!((runtime.current.width, runtime.current.height), (1280, 720));
     assert_eq!(runtime.server_geometry, (1280, 720));
     assert_eq!(runtime.input_geometry, (1280, 720));
@@ -716,10 +829,20 @@ fn precommit_failures_preserve_old_authoritative_configuration() {
         assert_eq!(result, OutputConfigurationAdvance::Completed, "{failure:?}");
         assert_eq!(runtime.current.mode_id, previous.mode_id, "{failure:?}");
         assert_eq!(runtime.scanout_id, old_scanout_id, "{failure:?}");
+        assert_eq!(runtime.pool_generation, 1, "{failure:?}");
+        assert_eq!(
+            runtime.output_epoch,
+            OutputEpochId::initial(),
+            "{failure:?}"
+        );
         assert_eq!(runtime.generation.get(), 1, "{failure:?}");
         assert!(runtime.transactions.active().is_none(), "{failure:?}");
         assert!(runtime.success_responses.is_empty(), "{failure:?}");
         assert_eq!(runtime.failure_responses.len(), 1, "{failure:?}");
+        assert!(
+            !runtime.events.contains(&TransitionEvent::RuntimePublished),
+            "failed precommit transition cannot publish the requested mode: {failure:?}"
+        );
         assert!(runtime.parked_acquire_obligations.is_empty(), "{failure:?}");
         assert!(
             runtime.transactions.can_begin(),
@@ -761,6 +884,7 @@ fn direct_scanout_primary_survives_sync_modeset_and_retires_exactly_once() {
     assert_eq!(runtime.direct_scanout_retire_count, 1);
     let ordered = [
         TransitionEvent::SafeBoundaryChecked,
+        TransitionEvent::RendererHistoryInvalidationQueued,
         TransitionEvent::TestOnlyPassed,
         TransitionEvent::TransactionReserved,
         TransitionEvent::AcquireWatchesParked,

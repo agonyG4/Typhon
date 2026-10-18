@@ -1834,6 +1834,10 @@ impl AtomicOutputSwapchain {
         self.current
     }
 
+    pub(crate) const fn contains_slot(&self, slot: OutputSlotId) -> bool {
+        self.slots.contains(slot)
+    }
+
     pub(crate) const fn presentation_serial(&self) -> u64 {
         self.presentation_serial
     }

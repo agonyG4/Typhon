@@ -216,14 +216,35 @@ frame is also drawn by that worker through one bounded startup reply before
 the realtime loop begins. Normal reactor-to-worker admission remains
 nonblocking.
 
-Output configuration uses one asynchronous candidate on the existing worker.
-The reactor allocates candidate physical resources and retains them while the
-worker imports descriptors, builds a candidate render domain, and renders the
-initial full-damage frame. KMS modesets only after its fence is ready. After a
-successful modeset, the worker destroys the old render domain and acknowledges
-before the reactor releases the old physical pool. Failure and suspend paths
-likewise wait for candidate destruction acknowledgement before releasing its
-BOs. There is no second candidate or prepared frame job.
+Output configuration separates two lifetimes:
+
+- `OutputEpoch` is the lifetime of configuration authority. A successful
+  synchronous modeset advances it so frames, cursor state, presentation timing,
+  and validation proofs are rebased for the new mode.
+- `pool_generation` is the identity of the physical and render storage. It
+  changes only when those buffers are replaced or rebound after a DRM-session
+  transition. `DrmSessionGeneration` tracks that separate session lifetime and
+  does not change for a mode-only modeset.
+
+A same-storage mode change reuses the active Atomic EGL/GBM render domain,
+physical pool, render pool, and current compositor-owned framebuffer when the
+connector, CRTC, dimensions, scale, and transform remain identical. The
+requested native mode still goes through TEST_ONLY and the shared synchronous
+modeset transaction. Renderer presented-damage history is invalidated through
+an ordered worker control before the real commit, so the first ordinary frame
+in the new `OutputEpoch` cannot rely on the old presentation history. This path
+advances `OutputEpoch` and output configuration generation without advancing
+`pool_generation`.
+
+Changes that affect storage or logical geometry continue to use the existing
+replacement-candidate path pending the persistent-pool redesign. The reactor
+allocates candidate physical resources and retains them while the worker
+imports descriptors, builds a candidate render domain, and renders the initial
+full-damage frame. KMS modesets only after its fence is ready. After a
+successful replacement modeset, the worker destroys the old render domain and
+acknowledges before the reactor releases the old physical pool. Failure and
+suspend paths likewise wait for candidate destruction acknowledgement before
+releasing its BOs. There is no second candidate or prepared frame job.
 When startup selected the synchronous transport, later output replacement
 keeps that transport and does not create a render thread from the event loop.
 
