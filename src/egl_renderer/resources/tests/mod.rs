@@ -1,11 +1,9 @@
-use super::dmabuf_cache::{
-    CachedDmabufResource, MAX_CACHED_DMABUF_RESOURCES_PER_SURFACE, dead_cached_dmabuf_keys,
-};
 use super::dmabuf_import::{
-    DmabufImportCacheState, DmabufImportDiagnosticContext, DmabufImportFailureClass,
-    DmabufImportGlStage, DmabufImportPath, DmabufTextureImportError, first_drained_gl_error,
+    DmabufImportDiagnosticContext, DmabufImportFailureClass, DmabufImportGlStage, DmabufImportPath,
+    DmabufImportRegistryState, DmabufTextureImportError, first_drained_gl_error,
     settle_dmabuf_import_result,
 };
+use super::dmabuf_registry::DmabufImportRegistry;
 use super::image::{EglImageResource, EglImageResourceTelemetry};
 use super::surface::{
     EglSurfaceResource, EglSurfaceResourceUpdate, SurfaceResourceLifetimeAction,
@@ -42,11 +40,6 @@ impl Drop for DropProbe {
     }
 }
 
-pub(super) fn fake_egl_image() -> egl::Image {
-    // SAFETY: the fake handle is only used by deterministic ownership tests.
-    unsafe { egl::Image::from_ptr(std::ptr::NonNull::<std::ffi::c_void>::dangling().as_ptr()) }
-}
-
 pub(super) fn test_shm_surface(damage: RenderableSurfaceDamage) -> RenderableSurface {
     let identity = BufferIdAllocator::default()
         .allocate()
@@ -79,7 +72,7 @@ pub(super) fn test_shm_surface(damage: RenderableSurfaceDamage) -> RenderableSur
 }
 
 pub(super) fn test_shm_resource(synced_commit: Option<SurfaceCommitCounter>) -> EglSurfaceResource {
-    EglSurfaceResource {
+    EglSurfaceResource::Uploaded {
         image: EglImageResource {
             texture: glow::NativeTexture(std::num::NonZeroU32::new(1).unwrap()),
             size: (2, 2),
@@ -87,8 +80,10 @@ pub(super) fn test_shm_resource(synced_commit: Option<SurfaceCommitCounter>) -> 
             egl_image: None,
             telemetry: EglImageResourceTelemetry::Untracked,
         },
-        dmabuf_key: None,
-        buffer_lifetime: None,
         shm_synced_commit: synced_commit,
     }
+}
+
+pub(super) fn test_dmabuf_binding(key: DmabufImageKey, _generation: u64) -> EglSurfaceResource {
+    EglSurfaceResource::Dmabuf { key }
 }

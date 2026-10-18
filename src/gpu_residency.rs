@@ -323,11 +323,15 @@ pub struct GpuResidencyRendererSummary {
     pub lifecycle_retained_visual: GpuResidencyDomainSnapshot,
     pub capture: GpuResidencyDomainSnapshot,
     pub client_import: GpuResidencyDomainSnapshot,
+    /// Legacy per-surface cache diagnostics retained for serialized compatibility.
+    /// The buffer-lifetime registry publishes through `renderer_dmabuf_registry`.
     pub renderer_import_cache: RendererImportCacheDiagnostics,
+    pub renderer_dmabuf_registry: RendererDmabufRegistryDiagnostics,
     pub client_import_observation_available: bool,
 }
 
-/// Durable renderer DMA-BUF cache counters copied from the cache owner.
+/// Deprecated compatibility fields for the removed per-surface DMA-BUF cache.
+/// These remain zero because they no longer describe a live owner.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RendererImportCacheDiagnostics {
     pub active_mapping_count: u64,
@@ -351,6 +355,31 @@ pub struct RendererImportCacheDiagnostics {
     pub import_failures_total: u64,
     pub max_entries_for_one_surface: u64,
     pub per_surface_entry_limit: u64,
+}
+
+/// Durable diagnostics for the renderer-global buffer-lifetime DMA-BUF registry.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RendererDmabufRegistryDiagnostics {
+    pub active_surface_binding_count: u64,
+    pub resident_mapping_count: u64,
+    pub resident_known_logical_bytes: u64,
+    pub resident_unknown_size_count: u64,
+    pub active_registry_mapping_count: u64,
+    pub active_registry_known_logical_bytes: u64,
+    pub active_registry_unknown_size_count: u64,
+    pub warm_registry_mapping_count: u64,
+    pub warm_registry_known_logical_bytes: u64,
+    pub warm_registry_unknown_size_count: u64,
+    pub registry_peak_mapping_count: u64,
+    pub registry_peak_known_logical_bytes: u64,
+    pub registry_hits_total: u64,
+    pub registry_misses_total: u64,
+    pub registry_insertions_total: u64,
+    pub registry_retirements_total: u64,
+    pub dead_lifetime_evictions_total: u64,
+    pub imports_total: u64,
+    pub current_resource_reuses_total: u64,
+    pub import_failures_total: u64,
 }
 
 /// Direct-import cache diagnostics copied from the output owner.
@@ -445,6 +474,7 @@ impl Default for GpuResidencyRendererSummary {
                 ResourceCoverage::Instrumented,
             ),
             renderer_import_cache: RendererImportCacheDiagnostics::default(),
+            renderer_dmabuf_registry: RendererDmabufRegistryDiagnostics::default(),
             client_import_observation_available: false,
         }
     }
@@ -461,9 +491,15 @@ pub struct GpuResidencySnapshot {
     #[serde(default)]
     pub attribution_summary: GpuMemoryAttributionSummary,
     #[serde(default)]
+    /// Deprecated compatibility diagnostics; intentionally left at zero.
     pub renderer_import_cache: RendererImportCacheDiagnostics,
     #[serde(default)]
+    /// Deprecated compatibility flag; false because old cache counters are not populated.
     pub renderer_import_cache_available: bool,
+    #[serde(default)]
+    pub renderer_dmabuf_registry: RendererDmabufRegistryDiagnostics,
+    #[serde(default)]
+    pub renderer_dmabuf_registry_available: bool,
     #[serde(default)]
     pub direct_import_cache: DirectImportCacheDiagnostics,
     #[serde(default)]
@@ -500,6 +536,8 @@ impl Default for GpuResidencySnapshot {
             attribution_summary: GpuMemoryAttributionSummary::default(),
             renderer_import_cache: RendererImportCacheDiagnostics::default(),
             renderer_import_cache_available: false,
+            renderer_dmabuf_registry: RendererDmabufRegistryDiagnostics::default(),
+            renderer_dmabuf_registry_available: false,
             direct_import_cache: DirectImportCacheDiagnostics::default(),
             live_unresolved_class_count: 0,
             live_unresolved_domain_count: 0,
@@ -586,8 +624,8 @@ impl Default for GpuResidencySnapshot {
 impl GpuResidencySnapshot {
     pub fn from_renderer(summary: GpuResidencyRendererSummary) -> Self {
         let mut snapshot = Self::default();
-        snapshot.renderer_import_cache = summary.renderer_import_cache;
-        snapshot.renderer_import_cache_available = summary.client_import_observation_available;
+        snapshot.renderer_dmabuf_registry = summary.renderer_dmabuf_registry;
+        snapshot.renderer_dmabuf_registry_available = summary.client_import_observation_available;
         snapshot.set_domain(summary.effects_scratch);
         snapshot.set_domain(summary.effects_checkpoint);
         snapshot.set_domain(summary.lifecycle_retained_visual);
@@ -1199,6 +1237,8 @@ mod tests {
             "attribution_summary",
             "renderer_import_cache",
             "renderer_import_cache_available",
+            "renderer_dmabuf_registry",
+            "renderer_dmabuf_registry_available",
             "direct_import_cache",
             "live_unresolved_class_count",
             "live_unresolved_domain_count",
@@ -1215,9 +1255,48 @@ mod tests {
         );
         assert_eq!(restored.renderer_import_cache.imports_total, 0);
         assert!(!restored.renderer_import_cache_available);
+        assert_eq!(restored.renderer_dmabuf_registry.resident_mapping_count, 0);
+        assert!(!restored.renderer_dmabuf_registry_available);
         assert_eq!(restored.direct_import_cache.current_entries, 0);
         assert_eq!(restored.live_unresolved_class_count, 0);
         assert_eq!(restored.live_unresolved_domain_count, 0);
+    }
+
+    #[test]
+    fn registry_diagnostics_do_not_reuse_deprecated_surface_cache_fields() {
+        let registry = RendererDmabufRegistryDiagnostics {
+            active_surface_binding_count: 2,
+            resident_mapping_count: 1,
+            resident_known_logical_bytes: 4096,
+            registry_hits_total: 7,
+            registry_insertions_total: 1,
+            ..RendererDmabufRegistryDiagnostics::default()
+        };
+        let summary = GpuResidencyRendererSummary {
+            renderer_dmabuf_registry: registry,
+            client_import_observation_available: true,
+            ..GpuResidencyRendererSummary::default()
+        };
+
+        let snapshot = GpuResidencySnapshot::from_renderer(summary);
+
+        assert!(snapshot.renderer_dmabuf_registry_available);
+        assert_eq!(snapshot.renderer_dmabuf_registry, registry);
+        assert_eq!(
+            snapshot.renderer_import_cache,
+            RendererImportCacheDiagnostics::default()
+        );
+        assert!(!snapshot.renderer_import_cache_available);
+        let json = serde_json::to_value(snapshot).expect("snapshot serializes");
+        assert_eq!(
+            json["renderer_dmabuf_registry"]["active_surface_binding_count"],
+            2
+        );
+        assert_eq!(
+            json["renderer_dmabuf_registry"]["resident_mapping_count"],
+            1
+        );
+        assert_eq!(json["renderer_import_cache"]["cache_hits_total"], 0);
     }
 
     #[test]

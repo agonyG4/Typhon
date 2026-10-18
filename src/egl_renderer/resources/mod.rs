@@ -1,5 +1,5 @@
-mod dmabuf_cache;
 mod dmabuf_import;
+mod dmabuf_registry;
 mod image;
 pub(in crate::egl_renderer) mod surface;
 #[cfg(test)]
@@ -17,7 +17,7 @@ use oblivion_one::{compositor, cursor_theme::CompositorCursorImage};
 #[cfg(test)]
 use super::EglDrawLayer;
 use super::{EglInstance, GlEglImageTargetTexture2DOes, GlesSceneFrameStats, RendererResult};
-use dmabuf_cache::DmabufResourceState;
+use dmabuf_registry::DmabufResourceState;
 use image::EglImageResource;
 use surface::EglSurfaceResource;
 use surface::SurfaceResourceStore;
@@ -30,6 +30,7 @@ use upload::UploadScratch;
 #[derive(Clone, Copy)]
 pub(in crate::egl_renderer) struct ResourceTextureView<'a> {
     surfaces: &'a HashMap<u32, EglSurfaceResource>,
+    dmabuf_registry: &'a DmabufResourceState,
     frames: &'a HashMap<compositor::ServerFrameColor, EglImageResource>,
     decorations: &'a HashMap<DecorationResourceKey, EglImageResource>,
     cursor: Option<&'a EglImageResource>,
@@ -40,9 +41,10 @@ impl ResourceTextureView<'_> {
         &self,
         surface_id: u32,
     ) -> Option<glow::Texture> {
-        self.surfaces
-            .get(&surface_id)
-            .map(|resource| resource.image.texture)
+        match self.surfaces.get(&surface_id)? {
+            EglSurfaceResource::Uploaded { image, .. } => Some(image.texture),
+            EglSurfaceResource::Dmabuf { key } => self.dmabuf_registry.texture_for_key(key),
+        }
     }
 
     pub(in crate::egl_renderer) fn texture_for_frame(
@@ -101,6 +103,7 @@ impl RendererResourceState {
     pub(in crate::egl_renderer) fn texture_view(&self) -> ResourceTextureView<'_> {
         ResourceTextureView {
             surfaces: &self.surfaces.resources,
+            dmabuf_registry: &self.dmabuf,
             frames: &self.ui.frames,
             decorations: &self.ui.decorations,
             cursor: self.ui.cursor.as_ref(),
@@ -172,7 +175,7 @@ impl RendererResourceState {
     pub(super) fn test_install_surface_texture(&mut self, surface_id: u32, texture: glow::Texture) {
         self.surfaces.resources.insert(
             surface_id,
-            EglSurfaceResource {
+            EglSurfaceResource::Uploaded {
                 image: image::EglImageResource {
                     texture,
                     size: (1, 1),
@@ -180,8 +183,6 @@ impl RendererResourceState {
                     egl_image: None,
                     telemetry: image::EglImageResourceTelemetry::Untracked,
                 },
-                dmabuf_key: None,
-                buffer_lifetime: None,
                 shm_synced_commit: None,
             },
         );
@@ -191,10 +192,8 @@ impl RendererResourceState {
     fn test_install_surface_image(&mut self, surface_id: u32, image: EglImageResource) {
         self.surfaces.resources.insert(
             surface_id,
-            EglSurfaceResource {
+            EglSurfaceResource::Uploaded {
                 image,
-                dmabuf_key: None,
-                buffer_lifetime: None,
                 shm_synced_commit: None,
             },
         );
@@ -283,7 +282,10 @@ impl RendererResourceState {
             .resources
             .get(&surface_id)
             .expect("test surface texture exists");
-        image::write_rgba_bytes_to_resource(gl, &resource.image, rect, rgba)
+        let EglSurfaceResource::Uploaded { image, .. } = resource else {
+            panic!("test surface resource is an uploaded image");
+        };
+        image::write_rgba_bytes_to_resource(gl, image, rect, rgba)
     }
 
     #[cfg(test)]
@@ -325,20 +327,19 @@ impl RendererResourceState {
     }
 
     #[cfg(test)]
-    pub(super) fn test_insert_cached_dmabuf_texture(
+    pub(super) fn test_insert_dmabuf_registry_texture(
         &mut self,
         key: oblivion_one::render_backend::buffer::DmabufImageKey,
         texture: glow::Texture,
         buffer_lifetime: oblivion_one::render_backend::buffer::WeakBufferIdentity,
-        surface_id: u32,
     ) {
         self.dmabuf
-            .test_insert_texture(key, texture, buffer_lifetime, surface_id);
+            .test_insert_texture(key, texture, buffer_lifetime);
     }
 
     #[cfg(test)]
-    pub(super) fn test_dmabuf_cache_entry_count(&self) -> usize {
-        self.dmabuf.cache_entry_count()
+    pub(super) fn test_dmabuf_registry_entry_count(&self) -> usize {
+        self.dmabuf.registry_entry_count()
     }
 
     #[cfg(test)]
@@ -391,56 +392,39 @@ impl<'a> ResourceTelemetry<'a> {
             self.frame_stats.dmabuf_import_failures.saturating_add(1);
     }
 
-    pub(super) fn dmabuf_cache_hit(&mut self) {
-        self.frame_stats.dmabuf_cache_hits = self.frame_stats.dmabuf_cache_hits.saturating_add(1);
+    pub(super) fn dmabuf_registry_hit(&mut self) {
+        self.frame_stats.dmabuf_registry_hits =
+            self.frame_stats.dmabuf_registry_hits.saturating_add(1);
     }
 
-    pub(super) fn dmabuf_cache_miss(&mut self) {
-        self.frame_stats.dmabuf_cache_misses =
-            self.frame_stats.dmabuf_cache_misses.saturating_add(1);
+    pub(super) fn dmabuf_registry_miss(&mut self) {
+        self.frame_stats.dmabuf_registry_misses =
+            self.frame_stats.dmabuf_registry_misses.saturating_add(1);
     }
 
-    pub(super) fn dmabuf_cache_insertion(&mut self) {
-        self.frame_stats.dmabuf_cache_insertions =
-            self.frame_stats.dmabuf_cache_insertions.saturating_add(1);
-    }
-
-    pub(super) fn dmabuf_cache_evicted_dead(&mut self) {
-        self.frame_stats.dmabuf_cache_evictions =
-            self.frame_stats.dmabuf_cache_evictions.saturating_add(1);
-        self.frame_stats.dmabuf_cache_evictions_dead = self
+    pub(super) fn dmabuf_registry_insertion(&mut self) {
+        self.frame_stats.dmabuf_registry_insertions = self
             .frame_stats
-            .dmabuf_cache_evictions_dead
+            .dmabuf_registry_insertions
             .saturating_add(1);
     }
 
-    pub(super) fn dmabuf_cache_evicted_surface_bound(&mut self) {
-        self.frame_stats.dmabuf_cache_evictions =
-            self.frame_stats.dmabuf_cache_evictions.saturating_add(1);
-        self.frame_stats.dmabuf_cache_evictions_surface_bound = self
+    pub(super) fn dmabuf_registry_dead_lifetime_eviction(&mut self) {
+        self.frame_stats.dmabuf_registry_dead_lifetime_evictions = self
             .frame_stats
-            .dmabuf_cache_evictions_surface_bound
+            .dmabuf_registry_dead_lifetime_evictions
             .saturating_add(1);
     }
 
-    pub(super) fn dmabuf_cache_evicted_surface_destroyed(&mut self) {
-        self.frame_stats.dmabuf_cache_evictions =
-            self.frame_stats.dmabuf_cache_evictions.saturating_add(1);
-        self.frame_stats.dmabuf_cache_evictions_surface_destroyed = self
-            .frame_stats
-            .dmabuf_cache_evictions_surface_destroyed
-            .saturating_add(1);
-    }
-
-    pub(super) fn publish_dmabuf_cache_metrics(
+    pub(super) fn publish_dmabuf_registry_metrics(
         &mut self,
-        entries: usize,
-        peak_entries: usize,
-        max_entries_for_one_surface: usize,
+        active_surface_bindings: usize,
+        registry_entries: usize,
+        resident_known_logical_bytes: u64,
     ) {
-        self.frame_stats.dmabuf_cache_entries = entries;
-        self.frame_stats.dmabuf_cache_peak_entries = peak_entries;
-        self.frame_stats.dmabuf_cache_max_entries_for_one_surface = max_entries_for_one_surface;
+        self.frame_stats.dmabuf_active_surface_bindings = active_surface_bindings;
+        self.frame_stats.dmabuf_registry_entries = registry_entries;
+        self.frame_stats.dmabuf_registry_known_logical_bytes = resident_known_logical_bytes;
     }
 
     pub(super) fn publish_client_import_residency(
@@ -453,11 +437,11 @@ impl<'a> ResourceTelemetry<'a> {
             .client_import_observation_available = true;
     }
 
-    pub(super) fn publish_renderer_import_cache_diagnostics(
+    pub(super) fn publish_renderer_dmabuf_registry_diagnostics(
         &mut self,
-        diagnostics: crate::gpu_residency::RendererImportCacheDiagnostics,
+        diagnostics: crate::gpu_residency::RendererDmabufRegistryDiagnostics,
     ) {
-        self.frame_stats.gpu_residency.renderer_import_cache = diagnostics;
+        self.frame_stats.gpu_residency.renderer_dmabuf_registry = diagnostics;
         self.frame_stats
             .gpu_residency
             .client_import_observation_available = true;

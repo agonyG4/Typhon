@@ -7,9 +7,8 @@ use std::io;
 fn active_dmabuf_summary_is_empty_for_an_empty_surface_store() {
     let summary = summarize_active_dmabuf_resources(&HashMap::new());
 
-    assert_eq!(summary.active_mapping_count, 0);
-    assert_eq!(summary.known_logical_bytes, 0);
-    assert_eq!(summary.unknown_size_mapping_count, 0);
+    assert_eq!(summary.active_surface_binding_count, 0);
+    assert!(summary.active_keys.is_empty());
 }
 
 #[test]
@@ -18,9 +17,8 @@ fn active_dmabuf_summary_ignores_shm_and_uploaded_resources() {
 
     let summary = summarize_active_dmabuf_resources(&resources);
 
-    assert_eq!(summary.active_mapping_count, 0);
-    assert_eq!(summary.known_logical_bytes, 0);
-    assert_eq!(summary.unknown_size_mapping_count, 0);
+    assert_eq!(summary.active_surface_binding_count, 0);
+    assert!(summary.active_keys.is_empty());
 }
 
 #[test]
@@ -33,12 +31,9 @@ fn one_imported_active_resource_reports_its_logical_payload_bytes() {
 
     let summary = summarize_active_dmabuf_resources(&resources);
 
-    assert_eq!(summary.active_mapping_count, 1);
-    assert_eq!(
-        summary.known_logical_bytes,
-        key.logical_payload_bytes().unwrap()
-    );
-    assert_eq!(summary.unknown_size_mapping_count, 0);
+    assert_eq!(summary.active_surface_binding_count, 1);
+    assert_eq!(summary.active_keys.len(), 1);
+    assert!(summary.active_keys.contains(&key));
 }
 
 #[test]
@@ -56,9 +51,8 @@ fn unknown_format_import_remains_unknown_without_invented_bytes() {
 
     let summary = summarize_active_dmabuf_resources(&resources);
 
-    assert_eq!(summary.active_mapping_count, 1);
-    assert_eq!(summary.known_logical_bytes, 0);
-    assert_eq!(summary.unknown_size_mapping_count, 1);
+    assert_eq!(summary.active_surface_binding_count, 1);
+    assert_eq!(summary.active_keys.len(), 1);
 }
 
 #[test]
@@ -80,15 +74,10 @@ fn replacing_the_active_imported_resource_updates_the_owner_bytes() {
     );
 
     let summary = summarize_active_dmabuf_resources(&resources);
-    assert_eq!(summary.active_mapping_count, 1);
-    assert_eq!(
-        summary.known_logical_bytes,
-        replacement_key.logical_payload_bytes().unwrap()
-    );
-    assert_ne!(
-        summary.known_logical_bytes,
-        first_key.logical_payload_bytes().unwrap()
-    );
+    assert_eq!(summary.active_surface_binding_count, 1);
+    assert_eq!(summary.active_keys.len(), 1);
+    assert!(summary.active_keys.contains(&replacement_key));
+    assert!(!summary.active_keys.contains(&first_key));
 }
 
 #[test]
@@ -101,13 +90,12 @@ fn removing_an_active_imported_resource_returns_owner_inventory_to_zero() {
     resources.remove(&7);
 
     let summary = summarize_active_dmabuf_resources(&resources);
-    assert_eq!(summary.active_mapping_count, 0);
-    assert_eq!(summary.known_logical_bytes, 0);
-    assert_eq!(summary.unknown_size_mapping_count, 0);
+    assert_eq!(summary.active_surface_binding_count, 0);
+    assert!(summary.active_keys.is_empty());
 }
 
 #[test]
-fn publication_excludes_cached_imports_from_active_owners_but_reports_cache_separately() {
+fn publication_counts_shared_registry_mappings_once_and_separates_bindings() {
     let mut ids = BufferIdAllocator::default();
     let active_identity = ids.allocate().expect("active test buffer identity");
     let cached_identity = ids.allocate().expect("cached test buffer identity");
@@ -123,10 +111,14 @@ fn publication_excludes_cached_imports_from_active_owners_but_reports_cache_sepa
         .resources
         .insert(7, test_dmabuf_resource(&active_identity, &active_handle, 1));
     state.dmabuf.test_insert_texture(
+        active_key,
+        glow::NativeTexture(std::num::NonZeroU32::new(1).unwrap()),
+        active_identity.downgrade(),
+    );
+    state.dmabuf.test_insert_texture(
         cached_key,
         glow::NativeTexture(std::num::NonZeroU32::new(2).unwrap()),
         cached_identity.downgrade(),
-        8,
     );
     let mut frame_stats = GlesSceneFrameStats::default();
     let mut telemetry = ResourceTelemetry::new(&mut frame_stats);
@@ -134,16 +126,59 @@ fn publication_excludes_cached_imports_from_active_owners_but_reports_cache_sepa
     state.publish_current_dmabuf_owner_metrics(&mut telemetry);
 
     let owners = frame_stats.gpu_residency.client_import;
-    let cache = frame_stats.gpu_residency.renderer_import_cache;
+    let registry = frame_stats.gpu_residency.renderer_dmabuf_registry;
     assert_eq!(owners.active_count, 1);
     assert_eq!(owners.active_bytes, active_bytes);
     assert_eq!(owners.reusable_count, 1);
     assert_eq!(owners.reusable_bytes, cached_bytes);
     assert_eq!(owners.external_mapping_count, 2);
-    assert_eq!(cache.active_mapping_count, 1);
-    assert_eq!(cache.active_known_logical_bytes, active_bytes);
-    assert_eq!(cache.cached_mapping_count, 1);
-    assert_eq!(cache.cached_known_logical_bytes, cached_bytes);
+    assert_eq!(registry.active_surface_binding_count, 1);
+    assert_eq!(registry.resident_mapping_count, 2);
+    assert_eq!(
+        registry.resident_known_logical_bytes,
+        active_bytes + cached_bytes
+    );
+    assert_eq!(registry.active_registry_mapping_count, 1);
+    assert_eq!(registry.active_registry_known_logical_bytes, active_bytes);
+    assert_eq!(registry.warm_registry_mapping_count, 1);
+    assert_eq!(registry.warm_registry_known_logical_bytes, cached_bytes);
+}
+
+#[test]
+fn two_surface_bindings_resolve_one_registry_mapping_and_count_external_bytes_once() {
+    let mut ids = BufferIdAllocator::default();
+    let identity = ids.allocate().expect("shared test buffer identity");
+    let handle = test_dmabuf_handle(256, 144, 1024, DrmModifier::LINEAR);
+    let key = DmabufImageKey::from_handle(identity.id(), &handle);
+    let bytes = key.logical_payload_bytes().expect("known logical size");
+    let texture = glow::NativeTexture(std::num::NonZeroU32::new(19).unwrap());
+    let mut state = RendererResourceState::new(None);
+    state
+        .dmabuf
+        .test_insert_texture(key.clone(), texture, identity.downgrade());
+    state
+        .surfaces
+        .resources
+        .insert(7, test_dmabuf_binding(key.clone(), 1));
+    state
+        .surfaces
+        .resources
+        .insert(8, test_dmabuf_binding(key, 4));
+
+    let view = state.texture_view();
+    assert_eq!(view.texture_for_surface(7), Some(texture));
+    assert_eq!(view.texture_for_surface(8), Some(texture));
+
+    let mut frame_stats = GlesSceneFrameStats::default();
+    state.publish_current_dmabuf_owner_metrics(&mut ResourceTelemetry::new(&mut frame_stats));
+    let registry = frame_stats.gpu_residency.renderer_dmabuf_registry;
+    let owners = frame_stats.gpu_residency.client_import;
+    assert_eq!(registry.active_surface_binding_count, 2);
+    assert_eq!(registry.resident_mapping_count, 1);
+    assert_eq!(registry.resident_known_logical_bytes, bytes);
+    assert_eq!(registry.active_registry_mapping_count, 1);
+    assert_eq!(owners.external_mapping_count, 1);
+    assert_eq!(owners.external_mapping_bytes, bytes);
 }
 
 #[test]
@@ -168,6 +203,11 @@ fn publication_after_realization_insertion_observes_the_new_active_resource() {
         .surfaces
         .resources
         .insert(7, test_dmabuf_resource(&identity, &handle, 1));
+    state.dmabuf.test_insert_texture(
+        key.clone(),
+        glow::NativeTexture(std::num::NonZeroU32::new(1).unwrap()),
+        identity.downgrade(),
+    );
     let mut after_stats = GlesSceneFrameStats::default();
     state.publish_current_dmabuf_owner_metrics(&mut ResourceTelemetry::new(&mut after_stats));
 
@@ -185,10 +225,17 @@ fn publication_after_realization_insertion_observes_the_new_active_resource() {
             .external_mapping_bytes,
         key.logical_payload_bytes().unwrap()
     );
+    assert_eq!(
+        after_stats
+            .gpu_residency
+            .renderer_dmabuf_registry
+            .active_surface_binding_count,
+        1
+    );
 }
 
 #[test]
-fn publication_after_demotion_reports_zero_active_and_one_cached_mapping() {
+fn publication_after_surface_detach_reports_one_warm_registry_mapping() {
     let mut ids = BufferIdAllocator::default();
     let identity = ids.allocate().expect("test buffer identity");
     let handle = test_dmabuf_handle(256, 144, 1024, DrmModifier::LINEAR);
@@ -199,27 +246,29 @@ fn publication_after_demotion_reports_zero_active_and_one_cached_mapping() {
         .surfaces
         .resources
         .insert(7, test_dmabuf_resource(&identity, &handle, 1));
-    state.surfaces.resources.remove(&7);
     state.dmabuf.test_insert_texture(
         key,
         glow::NativeTexture(std::num::NonZeroU32::new(2).unwrap()),
         identity.downgrade(),
-        7,
     );
+    state.surfaces.resources.remove(&7);
     let mut frame_stats = GlesSceneFrameStats::default();
 
     state.publish_current_dmabuf_owner_metrics(&mut ResourceTelemetry::new(&mut frame_stats));
 
     let owners = frame_stats.gpu_residency.client_import;
-    let cache = frame_stats.gpu_residency.renderer_import_cache;
+    let registry = frame_stats.gpu_residency.renderer_dmabuf_registry;
     assert_eq!(owners.active_count, 0);
     assert_eq!(owners.active_bytes, 0);
     assert_eq!(owners.external_mapping_count, 1);
     assert_eq!(owners.reusable_count, 1);
     assert_eq!(owners.reusable_bytes, bytes);
-    assert_eq!(cache.active_mapping_count, 0);
-    assert_eq!(cache.cached_mapping_count, 1);
-    assert_eq!(cache.cached_known_logical_bytes, bytes);
+    assert_eq!(registry.active_surface_binding_count, 0);
+    assert_eq!(registry.resident_mapping_count, 1);
+    assert_eq!(registry.resident_known_logical_bytes, bytes);
+    assert_eq!(registry.active_registry_mapping_count, 0);
+    assert_eq!(registry.warm_registry_mapping_count, 1);
+    assert_eq!(registry.warm_registry_known_logical_bytes, bytes);
 }
 
 #[test]
@@ -232,6 +281,11 @@ fn stable_owner_publication_matches_independent_event_ledger_totals() {
         .surfaces
         .resources
         .insert(7, test_dmabuf_resource(&identity, &handle, 1));
+    state.dmabuf.test_insert_texture(
+        DmabufImageKey::from_handle(identity.id(), &handle),
+        glow::NativeTexture(std::num::NonZeroU32::new(1).unwrap()),
+        identity.downgrade(),
+    );
     let mut frame_stats = GlesSceneFrameStats::default();
     state.publish_current_dmabuf_owner_metrics(&mut ResourceTelemetry::new(&mut frame_stats));
 
@@ -258,58 +312,246 @@ fn settle_dmabuf_import_result<T>(
     super::settle_dmabuf_import_result(result, context, &mut telemetry, failed_surface_generations)
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
+#[test]
+fn five_buffer_ring_reuses_every_import_after_warmup() {
+    let mut ids = BufferIdAllocator::default();
+    let ring = (0..5)
+        .map(|_| {
+            let identity = ids.allocate().expect("test buffer identity");
+            let handle = test_dmabuf_handle(256, 144, 1024, DrmModifier::LINEAR);
+            let key = DmabufImageKey::from_handle(identity.id(), &handle);
+            (identity, key)
+        })
+        .collect::<Vec<_>>();
+    let drops = std::rc::Rc::new(std::cell::Cell::new(0));
+    let mut registry = DmabufImportRegistry::default();
+    let mut imports = 0;
+    let mut hits = 0;
+    let mut misses = 0;
+    let mut second_a_was_registry_hit = false;
 
-struct DmabufRingQualification {
-    imports: usize,
-    current_resource_reuses: usize,
-    cache_hits: usize,
-    cache_misses: usize,
-    surface_bound_evictions: usize,
-    peak_entries: usize,
-}
-
-fn qualify_dmabuf_ring(ring_len: usize, cycles: usize) -> DmabufRingQualification {
-    let mut current = None;
-    let mut cache = std::collections::BTreeSet::new();
-    let mut result = DmabufRingQualification::default();
-    for buffer in (0..ring_len).cycle().take(ring_len.saturating_mul(cycles)) {
-        if current == Some(buffer) {
-            result.current_resource_reuses += 1;
-            continue;
-        }
-        if cache.remove(&buffer) {
-            result.cache_hits += 1;
-        } else {
-            result.cache_misses += 1;
-            result.imports += 1;
-        }
-        if let Some(previous) = current {
-            if cache.len() >= MAX_CACHED_DMABUF_RESOURCES_PER_SURFACE {
-                let oldest = *cache.iter().next().expect("full cache is non-empty");
-                cache.remove(&oldest);
-                result.surface_bound_evictions += 1;
+    for (visit, slot) in (0..ring.len()).cycle().take(ring.len() * 8).enumerate() {
+        let (identity, key) = &ring[slot];
+        if registry.get(key).is_some() {
+            hits += 1;
+            if visit == ring.len() {
+                second_a_was_registry_hit = true;
             }
-            cache.insert(previous);
+        } else {
+            misses += 1;
+            imports += 1;
+            registry.insert(
+                key.clone(),
+                DropProbe(std::rc::Rc::clone(&drops)),
+                identity.downgrade(),
+            );
         }
-        current = Some(buffer);
-        result.peak_entries = result.peak_entries.max(cache.len());
     }
-    result
+
+    assert_eq!(imports, 5);
+    assert_eq!(misses, 5);
+    assert_eq!(hits, 35);
+    assert!(
+        second_a_was_registry_hit,
+        "the second A reuses its live mapping"
+    );
+    assert_eq!(registry.len(), 5);
+    assert_eq!(drops.get(), 0);
 }
 
 #[test]
-fn dmabuf_ring_qualification_exposes_capacity_behavior_without_egl() {
-    for ring_len in 2..=5 {
-        let result = qualify_dmabuf_ring(ring_len, 2);
-        assert_eq!(result.imports, ring_len);
-        assert_eq!(result.cache_misses, ring_len);
-        assert_eq!(result.cache_hits, ring_len);
-        assert_eq!(result.current_resource_reuses, 0);
-        assert_eq!(result.surface_bound_evictions, 0);
-        assert_eq!(result.peak_entries, ring_len - 1);
+fn six_buffer_ring_stays_stable_beyond_the_removed_surface_cache_limit() {
+    let mut ids = BufferIdAllocator::default();
+    let ring = (0..6)
+        .map(|_| {
+            let identity = ids.allocate().expect("test buffer identity");
+            let handle = test_dmabuf_handle(256, 144, 1024, DrmModifier::LINEAR);
+            let key = DmabufImageKey::from_handle(identity.id(), &handle);
+            (identity, key)
+        })
+        .collect::<Vec<_>>();
+    let mut registry = DmabufImportRegistry::default();
+    let mut imports = 0;
+    let mut hits = 0;
+
+    for slot in (0..ring.len()).cycle().take(ring.len() * 8) {
+        let (identity, key) = &ring[slot];
+        if registry.get(key).is_some() {
+            hits += 1;
+        } else {
+            imports += 1;
+            registry.insert(key.clone(), slot, identity.downgrade());
+        }
     }
-    assert!(qualify_dmabuf_ring(6, 2).surface_bound_evictions > 0);
+
+    assert_eq!(imports, 6);
+    assert_eq!(hits, 42);
+    assert_eq!(registry.len(), 6);
+}
+
+#[test]
+fn failed_import_publishes_no_binding_or_registry_entry_then_valid_generation_recovers() {
+    let mut ids = BufferIdAllocator::default();
+    let identity = ids.allocate().expect("test buffer identity");
+    let handle = test_dmabuf_handle(256, 144, 1024, DrmModifier::LINEAR);
+    let surface = test_dmabuf_surface(7, identity.clone(), handle.clone(), 9);
+    let key = DmabufImageKey::from_handle(identity.id(), &handle);
+    let mut state = RendererResourceState::new(None);
+    let mut frame_stats = GlesSceneFrameStats::default();
+    let failed_context = DmabufImportDiagnosticContext::from_surface(
+        &surface,
+        DmabufImportPath::Replacement,
+        DmabufImportRegistryState::Miss,
+    )
+    .expect("test surface has DMA-BUF import metadata");
+    let failed = state
+        .dmabuf
+        .settle_import_result::<u8>(
+            Err(Box::new(DmabufTextureImportError::EglImageCreation(
+                egl::Error::BadMatch,
+            ))),
+            failed_context,
+            &mut ResourceTelemetry::new(&mut frame_stats),
+        )
+        .expect("buffer-local import failure is isolated");
+
+    assert!(failed.is_none());
+    assert_eq!(state.dmabuf.registry_entry_count(), 0);
+    assert!(!state.surfaces.resources.contains_key(&surface.surface_id));
+
+    let valid_surface = test_dmabuf_surface(7, identity.clone(), handle, 10);
+    let valid_context = DmabufImportDiagnosticContext::from_surface(
+        &valid_surface,
+        DmabufImportPath::Replacement,
+        DmabufImportRegistryState::Miss,
+    )
+    .expect("valid generation has DMA-BUF import metadata");
+    let imported = state
+        .dmabuf
+        .settle_import_result(
+            Ok(23_u8),
+            valid_context,
+            &mut ResourceTelemetry::new(&mut frame_stats),
+        )
+        .expect("later generation remains valid");
+    assert_eq!(imported, Some(23));
+    state.dmabuf.test_insert_texture(
+        key.clone(),
+        glow::NativeTexture(std::num::NonZeroU32::new(23).unwrap()),
+        identity.downgrade(),
+    );
+    state.surfaces.resources.insert(
+        7,
+        test_dmabuf_binding(key.clone(), valid_surface.generation),
+    );
+
+    assert_eq!(state.dmabuf.registry_entry_count(), 1);
+    assert_eq!(
+        state.texture_view().texture_for_surface(7),
+        Some(glow::NativeTexture(std::num::NonZeroU32::new(23).unwrap()))
+    );
+    assert_eq!(frame_stats.dmabuf_import_failures, 1);
+}
+
+#[test]
+fn surface_detachment_keeps_a_shared_live_registry_entry() {
+    let mut ids = BufferIdAllocator::default();
+    let identity = ids.allocate().expect("test buffer identity");
+    let handle = test_dmabuf_handle(256, 144, 1024, DrmModifier::LINEAR);
+    let key = DmabufImageKey::from_handle(identity.id(), &handle);
+    let drops = std::rc::Rc::new(std::cell::Cell::new(0));
+    let mut registry = DmabufImportRegistry::default();
+    registry.insert(
+        key.clone(),
+        DropProbe(std::rc::Rc::clone(&drops)),
+        identity.downgrade(),
+    );
+    let mut surface_a_binding = Some(key.clone());
+    let surface_b_binding = Some(key.clone());
+
+    let first = registry.get(surface_a_binding.as_ref().unwrap());
+    let second = registry.get(surface_b_binding.as_ref().unwrap());
+    assert!(std::ptr::eq(&first.unwrap().image, &second.unwrap().image));
+    assert_eq!(registry.len(), 1);
+
+    surface_a_binding.take();
+    assert_eq!(registry.len(), 1);
+    assert!(registry.get(surface_b_binding.as_ref().unwrap()).is_some());
+    assert_eq!(drops.get(), 0);
+}
+
+#[test]
+fn changing_surface_from_a_to_b_and_then_to_shm_keeps_unrelated_live_imports() {
+    let mut ids = BufferIdAllocator::default();
+    let identity_a = ids.allocate().expect("first live buffer identity");
+    let identity_b = ids.allocate().expect("second live buffer identity");
+    let unrelated_identity = ids.allocate().expect("unrelated live buffer identity");
+    let handle_a = test_dmabuf_handle(256, 144, 1024, DrmModifier::LINEAR);
+    let handle_b = test_dmabuf_handle(256, 144, 1024, DrmModifier::LINEAR);
+    let unrelated_handle = test_dmabuf_handle(128, 72, 512, DrmModifier::LINEAR);
+    let key_a = DmabufImageKey::from_handle(identity_a.id(), &handle_a);
+    let key_b = DmabufImageKey::from_handle(identity_b.id(), &handle_b);
+    let unrelated_key = DmabufImageKey::from_handle(unrelated_identity.id(), &unrelated_handle);
+    let texture_a = glow::NativeTexture(std::num::NonZeroU32::new(1).unwrap());
+    let texture_b = glow::NativeTexture(std::num::NonZeroU32::new(2).unwrap());
+    let unrelated_texture = glow::NativeTexture(std::num::NonZeroU32::new(3).unwrap());
+    let mut state = RendererResourceState::new(None);
+    state
+        .dmabuf
+        .test_insert_texture(key_a.clone(), texture_a, identity_a.downgrade());
+    state
+        .dmabuf
+        .test_insert_texture(key_b.clone(), texture_b, identity_b.downgrade());
+    state.dmabuf.test_insert_texture(
+        unrelated_key.clone(),
+        unrelated_texture,
+        unrelated_identity.downgrade(),
+    );
+    state
+        .surfaces
+        .resources
+        .insert(8, test_shm_resource(Some(SurfaceCommitCounter(1))));
+
+    let surface_b_for_shm = test_dmabuf_surface(8, identity_b.clone(), handle_b.clone(), 2);
+    let (action, destroyed_shm) =
+        reconcile_surface_resource_backing(&mut state.surfaces.resources, &surface_b_for_shm)
+            .expect("SHM storage is discarded before a DMA-BUF consumer realizes B");
+    assert_eq!(action, SurfaceResourceLifetimeAction::Destroy);
+    assert!(matches!(destroyed_shm, EglSurfaceResource::Uploaded { .. }));
+    assert_eq!(state.dmabuf.registry_entry_count(), 3);
+    assert_eq!(state.texture_view().texture_for_surface(8), None);
+
+    state
+        .surfaces
+        .resources
+        .insert(7, test_dmabuf_binding(key_a.clone(), 1));
+
+    let surface_b = test_dmabuf_surface(7, identity_b.clone(), handle_b, 2);
+    let (action, detached_a) =
+        reconcile_surface_resource_backing(&mut state.surfaces.resources, &surface_b)
+            .expect("the surface binding to A is detached");
+    assert_eq!(action, SurfaceResourceLifetimeAction::DetachDmabuf);
+    assert!(matches!(detached_a, EglSurfaceResource::Dmabuf { .. }));
+    state
+        .surfaces
+        .resources
+        .insert(7, test_dmabuf_binding(key_b.clone(), 2));
+    assert_eq!(state.texture_view().texture_for_surface(7), Some(texture_b));
+    assert_eq!(state.dmabuf.registry_entry_count(), 3);
+    assert_eq!(state.dmabuf.texture_for_key(&key_a), Some(texture_a));
+
+    let surface_shm = test_shm_surface(RenderableSurfaceDamage::Empty);
+    let (action, detached_b) =
+        reconcile_surface_resource_backing(&mut state.surfaces.resources, &surface_shm)
+            .expect("the surface binding to B is detached for SHM");
+    assert_eq!(action, SurfaceResourceLifetimeAction::DetachDmabuf);
+    assert!(matches!(detached_b, EglSurfaceResource::Dmabuf { .. }));
+    assert_eq!(state.dmabuf.registry_entry_count(), 3);
+    assert_eq!(
+        state.dmabuf.texture_for_key(&unrelated_key),
+        Some(unrelated_texture)
+    );
+    assert_eq!(state.texture_view().texture_for_surface(7), None);
 }
 
 #[test]
@@ -367,7 +609,7 @@ fn dmabuf_replacement_incompatibility_is_surface_local() {
             modifier: 0,
             planes: 1,
             path: DmabufImportPath::Replacement,
-            cache: DmabufImportCacheState::Miss,
+            registry: DmabufImportRegistryState::Miss,
         },
         &mut frame_stats,
         &mut failed_surface_generations,
@@ -401,7 +643,7 @@ fn dmabuf_renderer_fatal_failure_still_escapes_surface_local_boundary() {
             modifier: 0,
             planes: 1,
             path: DmabufImportPath::Replacement,
-            cache: DmabufImportCacheState::Miss,
+            registry: DmabufImportRegistryState::Miss,
         },
         &mut frame_stats,
         &mut failed_surface_generations,
@@ -428,7 +670,7 @@ fn unclassified_dmabuf_import_error_still_escapes_surface_local_boundary() {
             modifier: 0,
             planes: 1,
             path: DmabufImportPath::Initial,
-            cache: DmabufImportCacheState::NotChecked,
+            registry: DmabufImportRegistryState::Miss,
         },
         &mut frame_stats,
         &mut failed_surface_generations,
@@ -454,7 +696,7 @@ fn dmabuf_rejected_replacement_does_not_install_or_cache_failed_generation() {
         modifier: 0,
         planes: 1,
         path: DmabufImportPath::Replacement,
-        cache: DmabufImportCacheState::Miss,
+        registry: DmabufImportRegistryState::Miss,
     };
 
     let result = settle_dmabuf_import_result::<u8>(
@@ -489,7 +731,7 @@ fn dmabuf_rejected_generation_can_be_followed_by_a_valid_import() {
         modifier: 0,
         planes: 1,
         path: DmabufImportPath::Replacement,
-        cache: DmabufImportCacheState::Miss,
+        registry: DmabufImportRegistryState::Miss,
     };
 
     assert!(
@@ -535,10 +777,22 @@ fn dmabuf_resource_key_separates_buffer_ids_when_raw_fd_is_identical() {
     let second = ids.allocate().expect("second test buffer identity");
     let handle = test_dmabuf_handle(256, 144, 1024, DrmModifier::LINEAR);
 
-    assert_ne!(
-        DmabufImageKey::from_handle(first.id(), &handle),
-        DmabufImageKey::from_handle(second.id(), &handle)
+    let first_key = DmabufImageKey::from_handle(first.id(), &handle);
+    let second_key = DmabufImageKey::from_handle(second.id(), &handle);
+    assert_ne!(first_key, second_key);
+
+    let mut registry = DmabufImportRegistry::default();
+    registry.insert(
+        first_key,
+        DropProbe(std::rc::Rc::new(std::cell::Cell::new(0))),
+        first.downgrade(),
     );
+    registry.insert(
+        second_key,
+        DropProbe(std::rc::Rc::new(std::cell::Cell::new(0))),
+        second.downgrade(),
+    );
+    assert_eq!(registry.len(), 2);
 }
 
 #[test]
@@ -548,60 +802,152 @@ fn dmabuf_resource_key_separates_plane_layout_for_same_buffer_id() {
     let first = test_dmabuf_handle(256, 144, 1024, DrmModifier::LINEAR);
     let second = test_dmabuf_handle(256, 144, 2048, DrmModifier::LINEAR);
 
-    assert_ne!(
-        DmabufImageKey::from_handle(identity.id(), &first),
-        DmabufImageKey::from_handle(identity.id(), &second)
+    let first_key = DmabufImageKey::from_handle(identity.id(), &first);
+    let second_key = DmabufImageKey::from_handle(identity.id(), &second);
+    assert_ne!(first_key, second_key);
+
+    let mut registry = DmabufImportRegistry::default();
+    registry.insert(
+        first_key,
+        DropProbe(std::rc::Rc::new(std::cell::Cell::new(0))),
+        identity.downgrade(),
     );
+    registry.insert(
+        second_key,
+        DropProbe(std::rc::Rc::new(std::cell::Cell::new(0))),
+        identity.downgrade(),
+    );
+    assert_eq!(registry.len(), 2);
 }
 
 #[test]
-fn dead_buffer_cache_entry_is_evicted_exactly_once() {
+fn dead_buffer_registry_entry_is_evicted_exactly_once() {
     let mut ids = BufferIdAllocator::default();
     let identity = ids.allocate().expect("test buffer identity");
     let handle = test_dmabuf_handle(256, 144, 1024, DrmModifier::LINEAR);
     let key = DmabufImageKey::from_handle(identity.id(), &handle);
     let drops = std::rc::Rc::new(std::cell::Cell::new(0));
-    let mut cache = HashMap::from([(
+    let mut registry = DmabufImportRegistry::default();
+    registry.insert(
         key.clone(),
-        CachedDmabufResource {
-            image: DropProbe(std::rc::Rc::clone(&drops)),
-            buffer_lifetime: identity.downgrade(),
-            surface_id: 7,
-        },
-    )]);
+        DropProbe(std::rc::Rc::clone(&drops)),
+        identity.downgrade(),
+    );
 
     drop(identity);
-    for dead in dead_cached_dmabuf_keys(&cache) {
-        drop(cache.remove(&dead));
-    }
-    assert!(dead_cached_dmabuf_keys(&cache).is_empty());
+    let dead = registry.remove_dead();
+    assert_eq!(dead.len(), 1);
+    drop(dead);
+    assert!(registry.remove_dead().is_empty());
+    assert_eq!(registry.len(), 0);
     assert_eq!(drops.get(), 1);
 
-    drop(cache.remove(&key));
+    drop(registry.remove(&key));
     assert_eq!(drops.get(), 1);
 }
 
 #[test]
-fn renderer_cache_recreation_drops_all_previous_generation_entries() {
+fn renderer_teardown_drains_each_registry_entry_once() {
     let mut ids = BufferIdAllocator::default();
     let handle = test_dmabuf_handle(256, 144, 1024, DrmModifier::LINEAR);
     let drops = std::rc::Rc::new(std::cell::Cell::new(0));
-    let mut cache = HashMap::new();
-    for surface_id in 1..=3 {
+    let mut registry = DmabufImportRegistry::default();
+    for _ in 1..=3 {
         let identity = ids.allocate().expect("test buffer identity");
-        cache.insert(
+        registry.insert(
             DmabufImageKey::from_handle(identity.id(), &handle),
-            CachedDmabufResource {
-                image: DropProbe(std::rc::Rc::clone(&drops)),
-                buffer_lifetime: identity.downgrade(),
-                surface_id,
-            },
+            DropProbe(std::rc::Rc::clone(&drops)),
+            identity.downgrade(),
         );
     }
 
-    drop(cache);
+    let drained = registry.drain();
+    assert_eq!(drained.len(), 3);
+    assert_eq!(registry.len(), 0);
+    drop(drained);
+    assert!(registry.drain().is_empty());
 
     assert_eq!(drops.get(), 3);
+}
+
+#[test]
+fn registry_accounting_stays_coherent_across_detach_dead_eviction_and_teardown() {
+    let mut ids = BufferIdAllocator::default();
+    let identity = ids.allocate().expect("first registry buffer identity");
+    let handle = test_dmabuf_handle(256, 144, 1024, DrmModifier::LINEAR);
+    let key = DmabufImageKey::from_handle(identity.id(), &handle);
+    let mut state = RendererResourceState::new(None);
+    state.dmabuf.test_insert_texture(
+        key.clone(),
+        glow::NativeTexture(std::num::NonZeroU32::new(1).unwrap()),
+        identity.downgrade(),
+    );
+    state
+        .surfaces
+        .resources
+        .insert(7, test_dmabuf_binding(key.clone(), 1));
+
+    let mut active_stats = GlesSceneFrameStats::default();
+    state.publish_current_dmabuf_owner_metrics(&mut ResourceTelemetry::new(&mut active_stats));
+    assert_eq!(
+        active_stats
+            .gpu_residency
+            .renderer_dmabuf_registry
+            .active_surface_binding_count,
+        1
+    );
+    assert_eq!(
+        active_stats
+            .gpu_residency
+            .renderer_dmabuf_registry
+            .registry_insertions_total,
+        1
+    );
+
+    state.surfaces.resources.remove(&7);
+    let mut detached_stats = GlesSceneFrameStats::default();
+    state.publish_current_dmabuf_owner_metrics(&mut ResourceTelemetry::new(&mut detached_stats));
+    let detached = detached_stats.gpu_residency.renderer_dmabuf_registry;
+    assert_eq!(detached.active_surface_binding_count, 0);
+    assert_eq!(detached.resident_mapping_count, 1);
+    assert_eq!(detached.warm_registry_mapping_count, 1);
+
+    drop(identity);
+    let retired_dead = state.dmabuf.test_remove_dead_entries();
+    assert_eq!(retired_dead.len(), 1);
+    drop(retired_dead);
+    assert!(state.dmabuf.test_remove_dead_entries().is_empty());
+    let mut dead_stats = GlesSceneFrameStats::default();
+    state.publish_current_dmabuf_owner_metrics(&mut ResourceTelemetry::new(&mut dead_stats));
+    let dead = dead_stats.gpu_residency.renderer_dmabuf_registry;
+    assert_eq!(dead.resident_mapping_count, 0);
+    assert_eq!(dead.resident_known_logical_bytes, 0);
+    assert_eq!(dead.dead_lifetime_evictions_total, 1);
+    assert_eq!(dead.registry_retirements_total, 1);
+
+    let teardown_identity = ids.allocate().expect("teardown buffer identity");
+    let teardown_key = DmabufImageKey::from_handle(teardown_identity.id(), &handle);
+    state.dmabuf.test_insert_texture(
+        teardown_key.clone(),
+        glow::NativeTexture(std::num::NonZeroU32::new(2).unwrap()),
+        teardown_identity.downgrade(),
+    );
+    state
+        .surfaces
+        .resources
+        .insert(8, test_dmabuf_binding(teardown_key, 2));
+    state.surfaces.resources.clear();
+    let retired_at_teardown = state.dmabuf.test_drain_registry_entries();
+    assert_eq!(retired_at_teardown.len(), 1);
+    drop(retired_at_teardown);
+    assert!(state.dmabuf.test_drain_registry_entries().is_empty());
+    let mut teardown_stats = GlesSceneFrameStats::default();
+    state.publish_current_dmabuf_owner_metrics(&mut ResourceTelemetry::new(&mut teardown_stats));
+    let teardown = teardown_stats.gpu_residency.renderer_dmabuf_registry;
+    assert_eq!(teardown.active_surface_binding_count, 0);
+    assert_eq!(teardown.resident_mapping_count, 0);
+    assert_eq!(teardown.resident_known_logical_bytes, 0);
+    assert_eq!(teardown.registry_retirements_total, 2);
 }
 
 #[test]
@@ -617,7 +963,7 @@ fn obsolete_dmabuf_resource_is_removed_when_current_backing_changes() {
     let (action, _resource) = reconcile_surface_resource_backing(&mut resources, &surface)
         .expect("obsolete resource must be reconciled");
 
-    assert_eq!(action, SurfaceResourceLifetimeAction::DemoteDmabuf);
+    assert_eq!(action, SurfaceResourceLifetimeAction::DetachDmabuf);
     assert!(!resources.contains_key(&surface.surface_id));
 }
 
@@ -640,22 +986,41 @@ fn exact_current_dmabuf_resource_is_kept_across_render_generation_change() {
 #[test]
 fn repeated_hidden_dmabuf_rotations_do_not_create_replacement_resources() {
     let mut ids = BufferIdAllocator::default();
-    let identity_a = ids.allocate().expect("initial test buffer identity");
+    let ring = (0..5)
+        .map(|_| ids.allocate().expect("hidden rotation buffer identity"))
+        .collect::<Vec<_>>();
+    let identity_a = ring[0].clone();
     let handle_a = test_dmabuf_handle(256, 144, 1024, DrmModifier::LINEAR);
     let mut resources = HashMap::from([(7, test_dmabuf_resource(&identity_a, &handle_a, 1))]);
+    let key_a = DmabufImageKey::from_handle(identity_a.id(), &handle_a);
+    let mut registry = DmabufImportRegistry::default();
+    registry.insert(
+        key_a.clone(),
+        DropProbe(std::rc::Rc::new(std::cell::Cell::new(0))),
+        identity_a.downgrade(),
+    );
 
     for generation in 2..=5 {
-        let identity = ids.allocate().expect("rotated test buffer identity");
         let handle = test_dmabuf_handle(256, 144, 1024, DrmModifier::LINEAR);
-        let surface = test_dmabuf_surface(7, identity, handle, generation);
+        let surface =
+            test_dmabuf_surface(7, ring[generation as usize - 1].clone(), handle, generation);
         let action =
             reconcile_surface_resource_backing(&mut resources, &surface).map(|(action, _)| action);
         if generation == 2 {
-            assert_eq!(action, Some(SurfaceResourceLifetimeAction::DemoteDmabuf));
+            assert_eq!(action, Some(SurfaceResourceLifetimeAction::DetachDmabuf));
         } else {
             assert_eq!(action, None);
         }
         assert!(resources.is_empty());
+        assert_eq!(
+            registry.len(),
+            1,
+            "hidden commits do not import replacements"
+        );
+        assert!(
+            registry.get(&key_a).is_some(),
+            "the live A import stays resident"
+        );
     }
 }
 
@@ -673,13 +1038,8 @@ fn dead_obsolete_dmabuf_resource_is_not_cacheable() {
     let (action, resource) = reconcile_surface_resource_backing(&mut resources, &surface)
         .expect("obsolete resource must be reconciled");
 
-    assert_eq!(action, SurfaceResourceLifetimeAction::DemoteDmabuf);
-    assert!(
-        !resource
-            .buffer_lifetime
-            .expect("dmabuf resource lifetime")
-            .is_alive()
-    );
+    assert_eq!(action, SurfaceResourceLifetimeAction::DetachDmabuf);
+    assert!(matches!(resource, EglSurfaceResource::Dmabuf { .. }));
     assert!(resources.is_empty());
 }
 
@@ -694,7 +1054,7 @@ fn dmabuf_to_shm_retires_dmabuf_without_creating_shm_resource() {
     let (action, _resource) = reconcile_surface_resource_backing(&mut resources, &surface)
         .expect("obsolete dmabuf resource must be reconciled");
 
-    assert_eq!(action, SurfaceResourceLifetimeAction::DemoteDmabuf);
+    assert_eq!(action, SurfaceResourceLifetimeAction::DetachDmabuf);
     assert!(resources.is_empty());
 }
 
@@ -725,7 +1085,13 @@ fn compatible_hidden_shm_update_keeps_stale_texture_and_commit_baseline() {
     let mut resources = HashMap::from([(7, test_shm_resource(synced_commit))]);
 
     assert!(reconcile_surface_resource_backing(&mut resources, &surface).is_none());
-    assert_eq!(resources[&7].shm_synced_commit, synced_commit);
+    assert!(matches!(
+        &resources[&7],
+        EglSurfaceResource::Uploaded {
+            shm_synced_commit: Some(commit),
+            ..
+        } if Some(*commit) == synced_commit
+    ));
 }
 
 #[test]
@@ -761,7 +1127,7 @@ fn obsolete_resource_is_absent_before_hidden_replacement_can_be_realized() {
     let (action, _resource) = reconcile_surface_resource_backing(&mut resources, &surface_b)
         .expect("obsolete resource must be reconciled");
 
-    assert_eq!(action, SurfaceResourceLifetimeAction::DemoteDmabuf);
+    assert_eq!(action, SurfaceResourceLifetimeAction::DetachDmabuf);
     assert!(!resources.contains_key(&surface_b.surface_id));
     assert!(reconcile_surface_resource_backing(&mut resources, &surface_b).is_none());
 }
@@ -799,20 +1165,10 @@ fn test_dmabuf_surface(
 fn test_dmabuf_resource(
     identity: &BufferIdentity,
     handle: &DmabufBufferHandle,
-    generation: u64,
+    _generation: u64,
 ) -> EglSurfaceResource {
-    let size = handle.size();
-    EglSurfaceResource {
-        image: EglImageResource {
-            texture: glow::NativeTexture(std::num::NonZeroU32::new(1).unwrap()),
-            size: (size.width, size.height),
-            generation,
-            egl_image: Some(fake_egl_image()),
-            telemetry: EglImageResourceTelemetry::Untracked,
-        },
-        dmabuf_key: Some(DmabufImageKey::from_handle(identity.id(), handle)),
-        buffer_lifetime: Some(identity.downgrade()),
-        shm_synced_commit: None,
+    EglSurfaceResource::Dmabuf {
+        key: DmabufImageKey::from_handle(identity.id(), handle),
     }
 }
 

@@ -142,5 +142,11 @@ fn shm_resource_update_advances_empty_damage_baseline_without_upload() {
     );
 
     resource.advance_shm_sync_baseline(current_commit);
-    assert_eq!(resource.shm_synced_commit, Some(current_commit));
+    assert!(matches!(
+        resource,
+        EglSurfaceResource::Uploaded {
+            shm_synced_commit: Some(commit),
+            ..
+        } if commit == current_commit
+    ));
 }

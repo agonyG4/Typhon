@@ -2,11 +2,11 @@ use std::collections::HashMap;
 
 use khronos_egl as egl;
 use oblivion_one::compositor::{RenderableSurface, SurfaceCommitCounter, SurfaceResourceSyncState};
-use oblivion_one::render_backend::buffer::{DmabufImageKey, WeakBufferIdentity};
+use oblivion_one::render_backend::buffer::DmabufImageKey;
 
 use super::super::{EglInstance, RendererResult, SurfaceConsumerPlan, native_egl_debug_enabled};
 use super::dmabuf_import::{
-    DmabufImportCacheState, DmabufImportDiagnosticContext, DmabufImportPath,
+    DmabufImportDiagnosticContext, DmabufImportPath, DmabufImportRegistryState,
     log_dmabuf_import_context,
 };
 use super::image::{
@@ -49,18 +49,20 @@ impl SurfaceResourceStore {
     }
 }
 
-pub(super) struct EglSurfaceResource {
-    pub(super) image: EglImageResource,
-    pub(super) dmabuf_key: Option<DmabufImageKey>,
-    pub(super) buffer_lifetime: Option<WeakBufferIdentity>,
-    pub(super) shm_synced_commit: Option<SurfaceCommitCounter>,
+pub(super) enum EglSurfaceResource {
+    Uploaded {
+        image: EglImageResource,
+        shm_synced_commit: Option<SurfaceCommitCounter>,
+    },
+    Dmabuf {
+        key: DmabufImageKey,
+    },
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct ActiveDmabufResourceSummary {
-    pub(super) active_mapping_count: usize,
-    pub(super) known_logical_bytes: u64,
-    pub(super) unknown_size_mapping_count: usize,
+    pub(super) active_surface_binding_count: usize,
+    pub(super) active_keys: std::collections::HashSet<DmabufImageKey>,
 }
 
 pub(super) fn summarize_active_dmabuf_resources(
@@ -68,16 +70,12 @@ pub(super) fn summarize_active_dmabuf_resources(
 ) -> ActiveDmabufResourceSummary {
     let mut summary = ActiveDmabufResourceSummary::default();
     for resource in resources.values() {
-        let Some(key) = &resource.dmabuf_key else {
+        let EglSurfaceResource::Dmabuf { key } = resource else {
             continue;
         };
-        summary.active_mapping_count = summary.active_mapping_count.saturating_add(1);
-        if let Some(bytes) = key.logical_payload_bytes() {
-            summary.known_logical_bytes = summary.known_logical_bytes.saturating_add(bytes);
-        } else {
-            summary.unknown_size_mapping_count =
-                summary.unknown_size_mapping_count.saturating_add(1);
-        }
+        summary.active_surface_binding_count =
+            summary.active_surface_binding_count.saturating_add(1);
+        summary.active_keys.insert(key.clone());
     }
     summary
 }
@@ -85,13 +83,18 @@ pub(super) fn summarize_active_dmabuf_resources(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SurfaceResourceLifetimeAction {
     Keep,
-    DemoteDmabuf,
+    DetachDmabuf,
     Destroy,
 }
 
 impl EglSurfaceResource {
     pub(super) fn advance_shm_sync_baseline(&mut self, synced_commit: SurfaceCommitCounter) {
-        self.shm_synced_commit = Some(synced_commit);
+        if let Self::Uploaded {
+            shm_synced_commit, ..
+        } = self
+        {
+            *shm_synced_commit = Some(synced_commit);
+        }
     }
 
     pub(super) fn update_for(
@@ -99,49 +102,62 @@ impl EglSurfaceResource {
         surface: &RenderableSurface,
         sync_state: SurfaceResourceSyncState,
     ) -> EglSurfaceResourceUpdate {
-        let buffer_size = surface.buffer_size();
-        if self.image.size != (buffer_size.width, buffer_size.height) {
-            return EglSurfaceResourceUpdate::Recreate;
-        }
-        if surface.cpu_pixels().is_some() {
-            if self.image.egl_image.is_some() {
-                return EglSurfaceResourceUpdate::Recreate;
+        match self {
+            Self::Uploaded {
+                image,
+                shm_synced_commit,
+            } => {
+                let buffer_size = surface.buffer_size();
+                if image.size != (buffer_size.width, buffer_size.height) {
+                    return EglSurfaceResourceUpdate::Recreate;
+                }
+                if surface.cpu_pixels().is_none() {
+                    return if surface.dmabuf_handle().is_some() {
+                        EglSurfaceResourceUpdate::Recreate
+                    } else {
+                        EglSurfaceResourceUpdate::UnsupportedBuffer
+                    };
+                }
+                if image.egl_image.is_some() {
+                    return EglSurfaceResourceUpdate::Recreate;
+                }
+                if !sync_state.authoritative {
+                    return EglSurfaceResourceUpdate::FullShmResync;
+                }
+                if *shm_synced_commit == Some(sync_state.current_commit) {
+                    return EglSurfaceResourceUpdate::Reuse;
+                }
+                if surface.damage.is_history_lost() {
+                    return EglSurfaceResourceUpdate::FullShmResync;
+                }
+                if sync_state.complete_since.is_some_and(|complete_since| {
+                    shm_synced_commit.is_some_and(|synced| synced >= complete_since)
+                }) {
+                    return if surface.damage.is_empty() {
+                        EglSurfaceResourceUpdate::ReuseShm
+                    } else {
+                        EglSurfaceResourceUpdate::UploadDamage
+                    };
+                }
+                EglSurfaceResourceUpdate::FullShmResync
             }
-            if !sync_state.authoritative {
-                return EglSurfaceResourceUpdate::FullShmResync;
-            }
-            if self.shm_synced_commit == Some(sync_state.current_commit) {
-                return EglSurfaceResourceUpdate::Reuse;
-            }
-            if surface.damage.is_history_lost() {
-                return EglSurfaceResourceUpdate::FullShmResync;
-            }
-            if sync_state.complete_since.is_some_and(|complete_since| {
-                self.shm_synced_commit
-                    .is_some_and(|synced| synced >= complete_since)
-            }) {
-                return if surface.damage.is_empty() {
-                    EglSurfaceResourceUpdate::ReuseShm
+            Self::Dmabuf { key } => {
+                if surface.cpu_pixels().is_some() {
+                    return EglSurfaceResourceUpdate::Recreate;
+                }
+                if surface
+                    .dmabuf_handle()
+                    .map(|handle| DmabufImageKey::from_handle(surface.buffer_id(), handle))
+                    .is_some_and(|current_key| &current_key == key)
+                {
+                    EglSurfaceResourceUpdate::ReuseDmabuf
+                } else if surface.dmabuf_handle().is_some() {
+                    EglSurfaceResourceUpdate::Recreate
                 } else {
-                    EglSurfaceResourceUpdate::UploadDamage
-                };
+                    EglSurfaceResourceUpdate::UnsupportedBuffer
+                }
             }
-            return EglSurfaceResourceUpdate::FullShmResync;
         }
-        if self.image.generation == surface.generation {
-            return EglSurfaceResourceUpdate::Reuse;
-        }
-        if surface
-            .dmabuf_handle()
-            .map(|handle| DmabufImageKey::from_handle(surface.buffer_id(), handle))
-            .is_some_and(|key| self.dmabuf_key.as_ref() == Some(&key))
-        {
-            return EglSurfaceResourceUpdate::ReuseDmabuf;
-        }
-        if surface.dmabuf_handle().is_some() {
-            return EglSurfaceResourceUpdate::Recreate;
-        }
-        EglSurfaceResourceUpdate::UnsupportedBuffer
     }
 
     fn write_shm_damage(
@@ -152,10 +168,17 @@ impl EglSurfaceResource {
         synced_commit: SurfaceCommitCounter,
         upload: &mut UploadScratch,
     ) -> usize {
+        let Self::Uploaded {
+            image,
+            shm_synced_commit,
+        } = self
+        else {
+            unreachable!("only uploaded surface resources can receive SHM damage")
+        };
         let upload_bytes =
-            write_surface_pixels_to_resource(gl, &self.image, surface, force_full_upload, upload);
-        self.image.generation = surface.generation;
-        self.shm_synced_commit = Some(synced_commit);
+            write_surface_pixels_to_resource(gl, image, surface, force_full_upload, upload);
+        image.generation = surface.generation;
+        *shm_synced_commit = Some(synced_commit);
         upload_bytes
     }
 }
@@ -175,22 +198,25 @@ pub(super) fn classify_surface_resource_lifetime(
     resource: &EglSurfaceResource,
     surface: &RenderableSurface,
 ) -> SurfaceResourceLifetimeAction {
-    if let Some(installed_key) = resource.dmabuf_key.as_ref() {
-        let current_key = surface
-            .dmabuf_handle()
-            .map(|handle| DmabufImageKey::from_handle(surface.buffer_id(), handle));
-        return if current_key.as_ref() == Some(installed_key) {
-            SurfaceResourceLifetimeAction::Keep
-        } else {
-            SurfaceResourceLifetimeAction::DemoteDmabuf
-        };
-    }
-
-    let size = surface.buffer_size();
-    if surface.cpu_pixels().is_some() && resource.image.size == (size.width, size.height) {
-        SurfaceResourceLifetimeAction::Keep
-    } else {
-        SurfaceResourceLifetimeAction::Destroy
+    match resource {
+        EglSurfaceResource::Dmabuf { key } => {
+            let current_key = surface
+                .dmabuf_handle()
+                .map(|handle| DmabufImageKey::from_handle(surface.buffer_id(), handle));
+            if current_key.as_ref() == Some(key) {
+                SurfaceResourceLifetimeAction::Keep
+            } else {
+                SurfaceResourceLifetimeAction::DetachDmabuf
+            }
+        }
+        EglSurfaceResource::Uploaded { image, .. } => {
+            let size = surface.buffer_size();
+            if surface.cpu_pixels().is_some() && image.size == (size.width, size.height) {
+                SurfaceResourceLifetimeAction::Keep
+            } else {
+                SurfaceResourceLifetimeAction::Destroy
+            }
+        }
     }
 }
 
@@ -215,7 +241,9 @@ fn destroy_surface_resource(
     egl_display: egl::Display,
     resource: EglSurfaceResource,
 ) {
-    destroy_image_resource(gl, egl, egl_display, resource.image);
+    if let EglSurfaceResource::Uploaded { image, .. } = resource {
+        destroy_image_resource(gl, egl, egl_display, image);
+    }
 }
 
 impl RendererResourceState {
@@ -224,12 +252,11 @@ impl RendererResourceState {
         telemetry: &mut ResourceTelemetry<'_>,
     ) {
         let summary = summarize_active_dmabuf_resources(&self.surfaces.resources);
-        self.dmabuf.publish_active_metrics(
-            summary.active_mapping_count,
-            summary.known_logical_bytes,
-            summary.unknown_size_mapping_count,
+        self.dmabuf.publish_metrics(
+            summary.active_surface_binding_count,
+            &summary.active_keys,
+            telemetry,
         );
-        self.dmabuf.publish_metrics(telemetry);
     }
 
     pub(in crate::egl_renderer) fn reconcile_surface_resource_lifetimes(
@@ -267,16 +294,7 @@ impl RendererResourceState {
                 continue;
             };
             match action {
-                SurfaceResourceLifetimeAction::DemoteDmabuf => {
-                    self.cache_or_destroy_dmabuf_resource(
-                        gl,
-                        egl,
-                        egl_display,
-                        surface.surface_id,
-                        resource,
-                        telemetry,
-                    );
-                }
+                SurfaceResourceLifetimeAction::DetachDmabuf => {}
                 SurfaceResourceLifetimeAction::Destroy => {
                     destroy_surface_resource(gl, egl, egl_display, resource);
                 }
@@ -301,8 +319,6 @@ impl RendererResourceState {
             if let Some(resource) = self.surfaces.resources.remove(&surface_id) {
                 destroy_surface_resource(gl, egl, egl_display, resource);
             }
-            self.dmabuf
-                .destroy_cached_for_surface(gl, egl, egl_display, surface_id, telemetry);
             self.dmabuf.failed_surface_generations.remove(&surface_id);
         }
 
@@ -374,10 +390,17 @@ impl RendererResourceState {
                 return Ok(());
             }
             EglSurfaceResourceUpdate::ReuseDmabuf => {
-                if let Some(resource) = self.surfaces.resources.get_mut(&surface.surface_id) {
-                    resource.image.generation = surface.generation;
+                let key = surface
+                    .dmabuf_handle()
+                    .map(|handle| DmabufImageKey::from_handle(surface.buffer_id(), handle));
+                if key
+                    .as_ref()
+                    .is_some_and(|key| self.dmabuf.contains_live_key(key))
+                {
+                    self.dmabuf.note_current_resource_reuse(telemetry);
+                    return Ok(());
                 }
-                self.dmabuf.note_current_resource_reuse(telemetry);
+                self.switch_dmabuf_surface_resource(gl, egl, egl_display, surface, telemetry)?;
                 return Ok(());
             }
             EglSurfaceResourceUpdate::UploadDamage | EglSurfaceResourceUpdate::FullShmResync => {
@@ -405,13 +428,6 @@ impl RendererResourceState {
                 if let Some(resource) = self.surfaces.resources.remove(&surface.surface_id) {
                     destroy_surface_resource(gl, egl, egl_display, resource);
                 }
-                self.dmabuf.destroy_cached_for_surface(
-                    gl,
-                    egl,
-                    egl_display,
-                    surface.surface_id,
-                    telemetry,
-                );
                 return Ok(());
             }
         }
@@ -419,53 +435,26 @@ impl RendererResourceState {
         if let Some(old) = self.surfaces.resources.remove(&surface.surface_id) {
             destroy_surface_resource(gl, egl, egl_display, old);
         }
-        if surface.dmabuf_handle().is_none() {
-            self.dmabuf.destroy_cached_for_surface(
-                gl,
-                egl,
-                egl_display,
-                surface.surface_id,
-                telemetry,
-            );
-        }
-
         let result = create_surface_resource(
             gl,
-            egl,
-            egl_display,
-            self.dmabuf.importer(),
             surface,
             (surface.cpu_pixels().is_some() && sync_state.authoritative)
                 .then_some(sync_state.current_commit),
             &mut self.upload,
         );
-        if let Some(context) = DmabufImportDiagnosticContext::from_surface(
-            surface,
-            DmabufImportPath::Initial,
-            DmabufImportCacheState::NotChecked,
-        ) {
-            if let Some(resource) = self
-                .dmabuf
-                .settle_import_result(result, context, telemetry)?
-            {
-                self.dmabuf.note_import_success(telemetry);
+        match result {
+            Ok(resource) => {
+                telemetry.shm_upload_bytes(surface_upload_byte_len(surface));
+                self.dmabuf
+                    .failed_surface_generations
+                    .remove(&surface.surface_id);
                 self.surfaces.resources.insert(surface.surface_id, resource);
             }
-        } else {
-            match result {
-                Ok(resource) => {
-                    telemetry.shm_upload_bytes(surface_upload_byte_len(surface));
-                    self.dmabuf
-                        .failed_surface_generations
-                        .remove(&surface.surface_id);
-                    self.surfaces.resources.insert(surface.surface_id, resource);
-                }
-                Err(error) => {
-                    eprintln!(
-                        "oblivion-one compositor: failed to realize surface {} on EGL/GLES: {error}",
-                        surface.surface_id
-                    );
-                }
+            Err(error) => {
+                eprintln!(
+                    "oblivion-one compositor: failed to realize surface {} on EGL/GLES: {error}",
+                    surface.surface_id
+                );
             }
         }
         Ok(())
@@ -483,187 +472,103 @@ impl RendererResourceState {
             return Ok(());
         };
         let key = DmabufImageKey::from_handle(surface.buffer_id(), handle);
+        self.dmabuf.evict_dead(gl, egl, egl_display, telemetry);
+        let previous = self.surfaces.resources.remove(&surface.surface_id);
+        let path = if previous.is_some() {
+            DmabufImportPath::Replacement
+        } else {
+            DmabufImportPath::Initial
+        };
 
-        if let Some(mut cached) = self.dmabuf.take_cached(&key) {
-            if native_egl_debug_enabled() {
-                eprintln!(
-                    "oblivion-one compositor: dmabuf cache=hit surface={} key={key:?} texture={:?} egl_image={:?}",
-                    surface.surface_id,
-                    cached.image.texture,
-                    cached.image.egl_image.map(|image| image.as_ptr()),
-                );
-                if let Some(context) = DmabufImportDiagnosticContext::from_surface(
+        if self.dmabuf.lookup_texture(&key, telemetry).is_some() {
+            if native_egl_debug_enabled()
+                && let Some(context) = DmabufImportDiagnosticContext::from_surface(
                     surface,
-                    DmabufImportPath::Replacement,
-                    DmabufImportCacheState::Hit,
-                ) {
-                    log_dmabuf_import_context(
-                        context,
-                        "resource_selected",
-                        "cache",
-                        cached.image.egl_image.is_some(),
-                        None,
-                        "success",
-                    );
-                }
-            }
-            cached.image.generation = surface.generation;
-            self.dmabuf.note_cache_hit(telemetry);
-            if let Some(old) = self.surfaces.resources.insert(
-                surface.surface_id,
-                EglSurfaceResource {
-                    image: cached.image,
-                    dmabuf_key: Some(key),
-                    buffer_lifetime: Some(surface.buffer_identity().downgrade()),
-                    shm_synced_commit: None,
-                },
-            ) {
-                self.cache_or_destroy_dmabuf_resource(
-                    gl,
-                    egl,
-                    egl_display,
-                    surface.surface_id,
-                    old,
-                    telemetry,
+                    path,
+                    DmabufImportRegistryState::Hit,
+                )
+            {
+                log_dmabuf_import_context(
+                    context,
+                    "resource_selected",
+                    "registry",
+                    true,
+                    None,
+                    "success",
                 );
+            }
+            let old = self
+                .surfaces
+                .resources
+                .insert(surface.surface_id, EglSurfaceResource::Dmabuf { key });
+            if let Some(old) = old.or(previous) {
+                destroy_surface_resource(gl, egl, egl_display, old);
             }
             return Ok(());
         }
 
         if native_egl_debug_enabled() {
             eprintln!(
-                "oblivion-one compositor: dmabuf cache=miss surface={} key={key:?} layout={:?}",
+                "oblivion-one compositor: dmabuf registry=miss surface={} key={key:?} layout={:?}",
                 surface.surface_id,
                 surface.dmabuf_handle(),
             );
         }
-        self.dmabuf.note_cache_miss(telemetry);
+        if let Some(old) = previous {
+            destroy_surface_resource(gl, egl, egl_display, old);
+        }
 
-        let Some(old) = self.surfaces.resources.remove(&surface.surface_id) else {
-            let result = create_surface_resource(
-                gl,
-                egl,
-                egl_display,
-                self.dmabuf.importer(),
-                surface,
-                None,
-                &mut self.upload,
-            );
-            let context = DmabufImportDiagnosticContext::from_surface(
-                surface,
-                DmabufImportPath::Initial,
-                DmabufImportCacheState::Miss,
-            )
-            .expect("switching a DMA-BUF resource requires a DMA-BUF surface");
-            if let Some(resource) = self
-                .dmabuf
-                .settle_import_result(result, context, telemetry)?
-            {
-                self.dmabuf.note_import_success(telemetry);
-                self.surfaces.resources.insert(surface.surface_id, resource);
-            }
-            return Ok(());
-        };
-        self.cache_or_destroy_dmabuf_resource(
-            gl,
-            egl,
-            egl_display,
-            surface.surface_id,
-            old,
-            telemetry,
-        );
-
-        let result = create_surface_resource(
-            gl,
-            egl,
-            egl_display,
-            self.dmabuf.importer(),
-            surface,
-            None,
-            &mut self.upload,
-        );
+        let result = self
+            .dmabuf
+            .importer()
+            .create_resource(gl, egl, egl_display, handle);
         let context = DmabufImportDiagnosticContext::from_surface(
             surface,
-            DmabufImportPath::Replacement,
-            DmabufImportCacheState::Miss,
+            path,
+            DmabufImportRegistryState::Miss,
         )
         .expect("switching a DMA-BUF resource requires a DMA-BUF surface");
-        if let Some(resource) = self
+        if let Some(image) = self
             .dmabuf
             .settle_import_result(result, context, telemetry)?
         {
             self.dmabuf.note_import_success(telemetry);
-            self.surfaces.resources.insert(surface.surface_id, resource);
+            self.dmabuf.insert_import(
+                key.clone(),
+                surface.buffer_identity().downgrade(),
+                image,
+                telemetry,
+            );
+            self.surfaces
+                .resources
+                .insert(surface.surface_id, EglSurfaceResource::Dmabuf { key });
         }
         Ok(())
-    }
-
-    fn cache_or_destroy_dmabuf_resource(
-        &mut self,
-        gl: &glow::Context,
-        egl: &EglInstance,
-        egl_display: egl::Display,
-        surface_id: u32,
-        resource: EglSurfaceResource,
-        telemetry: &mut ResourceTelemetry<'_>,
-    ) {
-        self.dmabuf.cache_or_destroy_resource(
-            gl,
-            egl,
-            egl_display,
-            surface_id,
-            resource.dmabuf_key,
-            resource.buffer_lifetime,
-            resource.image,
-            telemetry,
-        );
     }
 }
 
 fn create_surface_resource(
     gl: &glow::Context,
-    egl: &EglInstance,
-    egl_display: egl::Display,
-    importer: &super::dmabuf_import::DmabufImporter,
     surface: &RenderableSurface,
     shm_synced_commit: Option<SurfaceCommitCounter>,
     upload: &mut UploadScratch,
 ) -> RendererResult<EglSurfaceResource> {
-    let image = if surface.cpu_pixels().is_some() {
-        let buffer_size = surface.buffer_size();
-        let mut resource = create_uploaded_resource(
-            gl,
-            buffer_size.width,
-            buffer_size.height,
-            crate::gpu_residency::GpuResourceClass::ShmUploadTextureBacking,
-        )?;
-        write_surface_pixels_to_resource(gl, &resource, surface, true, upload);
-        resource.generation = surface.generation;
-        resource
-    } else if let Some(handle) = surface.dmabuf_handle() {
-        importer.create_resource(gl, egl, egl_display, handle, surface.generation)?
-    } else {
+    if surface.cpu_pixels().is_none() {
         return Err(std::io::Error::other("surface has no importable buffer").into());
-    };
-
-    if native_egl_debug_enabled() && surface.dmabuf_handle().is_some() {
-        eprintln!(
-            "oblivion-one compositor: dmabuf cache=create surface={} buffer_id={} texture={:?} egl_image={:?}",
-            surface.surface_id,
-            surface.buffer_id().get(),
-            image.texture,
-            image.egl_image.map(|egl_image| egl_image.as_ptr()),
-        );
     }
 
-    Ok(EglSurfaceResource {
+    let buffer_size = surface.buffer_size();
+    let mut image = create_uploaded_resource(
+        gl,
+        buffer_size.width,
+        buffer_size.height,
+        crate::gpu_residency::GpuResourceClass::ShmUploadTextureBacking,
+    )?;
+    write_surface_pixels_to_resource(gl, &image, surface, true, upload);
+    image.generation = surface.generation;
+
+    Ok(EglSurfaceResource::Uploaded {
         image,
-        dmabuf_key: surface
-            .dmabuf_handle()
-            .map(|handle| DmabufImageKey::from_handle(surface.buffer_id(), handle)),
-        buffer_lifetime: surface
-            .dmabuf_handle()
-            .map(|_| surface.buffer_identity().downgrade()),
         shm_synced_commit,
     })
 }

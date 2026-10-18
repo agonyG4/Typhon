@@ -322,11 +322,10 @@ fn renderer_capture_restores_only_transient_resource_diagnostics() {
     )
     .expect("cache test DMA-BUF metadata");
     let key = DmabufImageKey::from_handle(identity.id(), &handle);
-    renderer.resources.test_insert_cached_dmabuf_texture(
+    renderer.resources.test_insert_dmabuf_registry_texture(
         key,
         test_texture(22),
         identity.downgrade(),
-        91,
     );
     renderer.resources.test_set_failed_surface_generation(91, 8);
 
@@ -336,7 +335,7 @@ fn renderer_capture_restores_only_transient_resource_diagnostics() {
         renderer.resources.test_failed_surface_generation(91),
         Some(7)
     );
-    assert_eq!(renderer.resources.test_dmabuf_cache_entry_count(), 1);
+    assert_eq!(renderer.resources.test_dmabuf_registry_entry_count(), 1);
     assert_eq!(
         renderer.resources.test_surface_resource_identity(91),
         Some(resource_identity),

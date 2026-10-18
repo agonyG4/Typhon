@@ -39,8 +39,7 @@ pub(super) enum DmabufImportPath {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum DmabufImportCacheState {
-    NotChecked,
+pub(super) enum DmabufImportRegistryState {
     Miss,
     Hit,
 }
@@ -129,14 +128,14 @@ pub(super) struct DmabufImportDiagnosticContext {
     pub(super) modifier: u64,
     pub(super) planes: usize,
     pub(super) path: DmabufImportPath,
-    pub(super) cache: DmabufImportCacheState,
+    pub(super) registry: DmabufImportRegistryState,
 }
 
 impl DmabufImportDiagnosticContext {
     pub(super) fn from_surface(
         surface: &RenderableSurface,
         path: DmabufImportPath,
-        cache: DmabufImportCacheState,
+        registry: DmabufImportRegistryState,
     ) -> Option<Self> {
         let handle = surface.dmabuf_handle()?;
         let modifier = handle
@@ -154,7 +153,7 @@ impl DmabufImportDiagnosticContext {
             modifier,
             planes: handle.planes().len(),
             path,
-            cache,
+            registry,
         })
     }
 }
@@ -169,7 +168,7 @@ pub(super) fn log_dmabuf_import_context(
 ) {
     let error_code = error_code.map_or_else(|| "none".to_owned(), |code| format!("0x{code:04x}"));
     eprintln!(
-        "oblivion-one compositor: dmabuf {event}: surface={} generation={} buffer_id={} size={}x{} fourcc=0x{:08x} modifier=0x{:016x} implicit={} planes={} path={:?} cache={:?} egl_image={} stage={} gl_or_egl_error={} classification={classification}",
+        "oblivion-one compositor: dmabuf {event}: surface={} generation={} buffer_id={} size={}x{} fourcc=0x{:08x} modifier=0x{:016x} implicit={} planes={} path={:?} registry={:?} egl_image={} stage={} gl_or_egl_error={} classification={classification}",
         context.surface_id,
         context.generation,
         context.buffer_id,
@@ -180,7 +179,7 @@ pub(super) fn log_dmabuf_import_context(
         context.modifier == DrmModifier::INVALID.0,
         context.planes,
         context.path,
-        context.cache,
+        context.registry,
         egl_image_created,
         stage,
         error_code,
@@ -282,7 +281,6 @@ impl DmabufImporter {
         egl: &EglInstance,
         egl_display: egl::Display,
         handle: &oblivion_one::render_backend::buffer::DmabufBufferHandle,
-        generation: u64,
     ) -> RendererResult<EglImageResource> {
         let preexisting_gl_error = drain_gl_errors(gl);
         if native_egl_debug_enabled()
@@ -349,7 +347,7 @@ impl DmabufImporter {
         Ok(EglImageResource {
             texture: texture.disarm(),
             size: (size.width, size.height),
-            generation,
+            generation: 0,
             egl_image: Some(image_guard.disarm()),
             telemetry: EglImageResourceTelemetry::Imported { logical_bytes },
         })
