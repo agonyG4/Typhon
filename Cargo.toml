@@ -46,6 +46,12 @@ x11rb-protocol = "0.13.2"
 zbus = { version = "5.16.0", default-features = false, features = ["async-io"] }
 xcursor = "=0.3.10"
 
+[profile.release]
+lto = "thin"
+debug = "line-tables-only"
+# Do not set panic = "abort": the native runtime relies on unwinding for
+# Drop-based DRM/KMS cleanup and panic recording (native_output/runtime/termination.rs).
+
 [workspace]
 members = ["."]
 resolver = "3"
