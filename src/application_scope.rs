@@ -313,7 +313,10 @@ pub fn application_scope_launch_plan(
 ) -> ApplicationScopeLaunchPlan {
     let policy = ApplicationScopePolicy::from_env();
     let executable = if eligible && policy != ApplicationScopePolicy::Off {
-        env::current_exe()
+        // current_exe() gains a " (deleted)" suffix once the binary on disk
+        // is replaced, which made every scoped launch fail with ENOENT. The
+        // magic link still executes the running image.
+        Ok(std::path::PathBuf::from("/proc/self/exe"))
     } else {
         Ok(std::path::PathBuf::new())
     };

@@ -1919,7 +1919,9 @@ pub(crate) fn apply_native_input_effect(
                     });
                     application.fallback_spawn_failed = Some(*kind);
                 } else {
-                    return Err(error);
+                    // A binding that cannot start its program must not end
+                    // the session.
+                    eprintln!("native input: binding launch failed: {error}");
                 }
             }
         }
