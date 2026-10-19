@@ -277,7 +277,25 @@ fn native_protocol_names() -> Vec<&'static str> {
     .collect()
 }
 
+const LOG_PIPE_CAPACITY: libc::c_int = 1 << 20;
+
+// The reactor thread runs SCHED_RR and must not block in `eprintln!` behind a
+// starved nice-0 log relay, so give a FIFO stdio pipe room to absorb bursts.
+// Best effort: unprivileged callers may be capped by pipe-max-size.
+fn enlarge_stdio_pipe(fd: std::os::fd::RawFd) {
+    // SAFETY: `stat` is a plain C struct that is valid when zeroed, and fstat
+    // only writes into it.
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut stat) } != 0 || stat.st_mode & libc::S_IFMT != libc::S_IFIFO {
+        return;
+    }
+    // SAFETY: F_SETPIPE_SZ takes an integer argument and has no memory effects.
+    let _ = unsafe { libc::fcntl(fd, libc::F_SETPIPE_SZ, LOG_PIPE_CAPACITY) };
+}
+
 fn own_compositor(options: CompositorCliOptions) -> AppResult<()> {
+    enlarge_stdio_pipe(libc::STDOUT_FILENO);
+    enlarge_stdio_pipe(libc::STDERR_FILENO);
     if !options.check_only {
         // Block process-directed child and termination signals before
         // constructing the Wayland server or entering native initialization.
@@ -502,6 +520,23 @@ mod tests {
             };
         }
         error
+    }
+
+    #[test]
+    fn enlarge_stdio_pipe_grows_fifo_and_ignores_regular_files() {
+        let mut fds = [0 as libc::c_int; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        enlarge_stdio_pipe(fds[1]);
+        let size = unsafe { libc::fcntl(fds[1], libc::F_GETPIPE_SZ) };
+        assert!(size > 65536, "pipe size {size} was not enlarged");
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+
+        let file = std::fs::File::open(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"))
+            .expect("open manifest");
+        enlarge_stdio_pipe(std::os::fd::AsRawFd::as_raw_fd(&file));
     }
 
     #[test]

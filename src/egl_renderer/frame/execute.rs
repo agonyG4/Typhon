@@ -803,7 +803,8 @@ impl FramePipeline<'_> {
         } else {
             (0, 0, 0, 0, 0, 0)
         };
-        eprintln!(
+        // Preformat so stderr receives one write instead of one per argument.
+        let line = format!(
             "typhon effect: event=precomputed_window_blur precomputed_window_blur_frame_id={} precomputed_window_blur_policy={} precomputed_window_blur_eligible_instances={} precomputed_window_blur_consumers={} precomputed_window_blur_built={} precomputed_window_blur_fallback={} precomputed_window_blur_fallback_reason={} precomputed_window_blur_baseline_instance={} precomputed_window_blur_build_passes={} precomputed_window_blur_saved_scene_captures={} precomputed_window_blur_saved_kawase_downsamples={} precomputed_window_blur_saved_kawase_upsamples={} precomputed_window_blur_capture_pixels={} precomputed_window_blur_downsample_pixels={} precomputed_window_blur_upsample_pixels={} precomputed_window_blur_saved_capture_pixels={} precomputed_window_blur_saved_downsample_pixels={} precomputed_window_blur_saved_upsample_pixels={}",
             frame_id,
             policy,
@@ -824,6 +825,7 @@ impl FramePipeline<'_> {
             saved_downsample_pixels,
             saved_upsample_pixels,
         );
+        eprintln!("{line}");
     }
 
     fn draw_textured_layers(
