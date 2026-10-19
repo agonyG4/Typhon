@@ -25,7 +25,11 @@ fn fixed_target(
         .expect("test job has a fixed reservation")
 }
 
-fn test_sidecar(job: &KmsCommitJob, id: u64, coupling: CursorSidecarCoupling) -> CursorSidecar {
+pub(super) fn test_sidecar(
+    job: &KmsCommitJob,
+    id: u64,
+    coupling: CursorSidecarCoupling,
+) -> CursorSidecar {
     let transaction_id = crate::native_output::OutputTransactionId::new(
         std::num::NonZeroU64::new(id.saturating_mul(100)).unwrap(),
     );

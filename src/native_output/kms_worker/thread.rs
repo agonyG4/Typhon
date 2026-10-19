@@ -1717,11 +1717,17 @@ fn wait_for_pageflip_or_quiesce(
     }
 }
 
+// Sleeps until `deadline_ns` or a lifecycle exit. It waits on the dedicated
+// `deadline_wakeup` condvar, so queue traffic, cursor sidecar offers and
+// pageflip notifications (all on `work_wakeup`) cannot wake it. Every writer
+// of the exit lifecycles notifies `deadline_wakeup`: `request_quiesce`,
+// `begin_shutdown_quiesce` and `force_shutdown_abandon` in queue.rs.
 fn wait_until_or_quiesce(shared: &Arc<WorkerShared>, deadline_ns: u64) -> Option<u64> {
     let mut state = shared
         .state
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut resumed = false;
     loop {
         if matches!(
             state.lifecycle,
@@ -1735,12 +1741,21 @@ fn wait_until_or_quiesce(shared: &Arc<WorkerShared>, deadline_ns: u64) -> Option
         if now >= deadline_ns {
             return Some(now);
         }
+        if resumed {
+            // Woke before the deadline without a lifecycle exit (for example a
+            // spurious condvar return or a Fatal notification): sleep again.
+            shared
+                .metrics
+                .deadline_wait_spurious_wakeups
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         let wait = Duration::from_nanos(deadline_ns - now);
         let (next, _) = shared
-            .work_wakeup
+            .deadline_wakeup
             .wait_timeout(state, wait)
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state = next;
+        resumed = true;
     }
 }
 
@@ -1811,6 +1826,10 @@ fn mark_fatal(shared: &Arc<WorkerShared>, reason: KmsWorkerFatalReason, uncertai
     state.primary_geometry_probe_executing = false;
     state.lifecycle = KmsWorkerLifecycle::Fatal;
     drop(state);
+    // Fatal is not a deadline-sleep exit (wait_until_or_quiesce keeps its
+    // quiescing-only exit set), so this only keeps the notification invariant
+    // for every lifecycle writer.
+    shared.deadline_wakeup.notify_all();
     if let Some(probe) = pending_probe {
         let _ = probe.response.send(Err(AtomicKmsError::new(
             AtomicKmsErrorKind::DeviceLost,

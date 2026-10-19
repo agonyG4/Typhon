@@ -33,6 +33,7 @@ pub(crate) struct WorkerMetrics {
     pub(crate) busy_retries: AtomicU64,
     pub(crate) busy_exhausted: AtomicU64,
     pub(crate) late_wakeups: AtomicU64,
+    pub(crate) deadline_wait_spurious_wakeups: AtomicU64,
     pub(crate) submit_duration_ns_total: AtomicU64,
     pub(crate) submit_duration_ns_max: AtomicU64,
     pub(crate) queue_wait_ns_total: AtomicU64,
@@ -89,6 +90,7 @@ pub(crate) struct WorkerMetricsSnapshot {
     pub(crate) busy_retries: u64,
     pub(crate) busy_exhausted: u64,
     pub(crate) late_wakeups: u64,
+    pub(crate) deadline_wait_spurious_wakeups: u64,
     pub(crate) submit_duration_ns_total: u64,
     pub(crate) submit_duration_ns_max: u64,
     pub(crate) queue_wait_ns_total: u64,
@@ -151,6 +153,7 @@ impl WorkerMetrics {
             busy_retries: read!(busy_retries),
             busy_exhausted: read!(busy_exhausted),
             late_wakeups: read!(late_wakeups),
+            deadline_wait_spurious_wakeups: read!(deadline_wait_spurious_wakeups),
             submit_duration_ns_total: read!(submit_duration_ns_total),
             submit_duration_ns_max: read!(submit_duration_ns_max),
             queue_wait_ns_total: read!(queue_wait_ns_total),
@@ -340,6 +343,9 @@ pub(crate) struct WorkerShared {
     // transition: successful ioctl return through WorkerInFlight publication.
     pub(crate) submit_gate: Mutex<()>,
     pub(crate) work_wakeup: Condvar,
+    // Used only by the worker's planned-submit deadline sleep. Cursor offers,
+    // queue traffic and pageflip acks never wake it; only lifecycle exits do.
+    pub(crate) deadline_wakeup: Condvar,
     pub(crate) results: Mutex<VecDeque<KmsWorkerEvent>>,
     pub(crate) fatal_jobs: Mutex<Vec<KmsWorkerFatalJob>>,
     pub(crate) result_fd: OwnedFd,
@@ -593,6 +599,7 @@ impl WorkerShared {
             }),
             submit_gate: Mutex::new(()),
             work_wakeup: Condvar::new(),
+            deadline_wakeup: Condvar::new(),
             results: Mutex::new(VecDeque::new()),
             fatal_jobs: Mutex::new(Vec::new()),
             result_fd,
@@ -956,6 +963,7 @@ impl WorkerShared {
             state.lifecycle = KmsWorkerLifecycle::Quiescing;
         }
         self.work_wakeup.notify_all();
+        self.deadline_wakeup.notify_all();
         self.metrics.quiesce_count.fetch_add(1, Ordering::Relaxed);
         self.metrics.quiesce_ns_total.fetch_add(
             u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
@@ -998,6 +1006,7 @@ impl WorkerShared {
         let inflight = state.inflight;
         drop(state);
         self.work_wakeup.notify_all();
+        self.deadline_wakeup.notify_all();
         self.metrics
             .shutdown_admission_stops
             .fetch_add(1, Ordering::Relaxed);
@@ -1059,6 +1068,7 @@ impl WorkerShared {
         let inflight = state.inflight.take();
         drop(state);
         self.work_wakeup.notify_all();
+        self.deadline_wakeup.notify_all();
         if inflight.is_some() {
             self.metrics
                 .shutdown_inflight_abandons

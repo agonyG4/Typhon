@@ -1,9 +1,11 @@
+use super::task4_tests::test_sidecar;
 use super::tests::{
     ScriptedExecutor, reserve_for_test, test_job, wait_for_fence_event, wait_for_inflight,
 };
 use super::thread::{KmsCommitExecutor, KmsWorkerSubmission, KmsWorkerSubmitFailure};
 use super::{
-    KmsCommitJob, KmsCommitWorkerHandle, KmsTestOnlyPolicy, KmsValidationBase, KmsWorkerEvent,
+    CursorSidecarCoupling, KmsCommitJob, KmsCommitWorkerHandle, KmsTestOnlyPolicy,
+    KmsValidationBase, KmsWorkerEvent,
 };
 use crate::native_output::pacing::NativeFramePacing;
 use crate::native_output::presentation::kms_timing::{KmsPresentationTiming, KmsSubmitWindow};
@@ -19,7 +21,7 @@ use oblivion_one::native::presentation_timing::PresentationTiming;
 use oblivion_one::native::scheduler::NativeOutputPacingMode;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 fn monotonic_now_ns_for_test() -> u64 {
     let mut time = libc::timespec {
@@ -547,6 +549,110 @@ fn worker_rejection_cancels_old_ticket_without_touching_same_logical_successor()
         .expect("successor ticket");
     assert!(pacing.cancel_worker_submission(Some(successor_ticket)));
     assert!(pacing.reserve_worker_submission(true).unwrap().is_none());
+
+    handle.request_quiesce();
+    handle.join().unwrap();
+}
+
+// Parks the worker in its planned-submit deadline sleep: a variable job whose
+// earliest submit is far in the future, then waits until the queue is drained
+// so the worker has dequeued it and entered the sleep.
+fn enqueue_far_deadline_variable_job(handle: &KmsCommitWorkerHandle, token: u64) {
+    let queued_at = monotonic_now_ns_for_test();
+    let earliest_submit_ns = queued_at.saturating_add(10_000_000_000);
+    let opportunity = PresentationOpportunity::new(
+        oblivion_one::native::buffering::PresentationOpportunityId::new(1, token),
+        PresentationTiming::VrrWindow {
+            anchor: MonotonicTimestampNs::new(queued_at),
+            earliest_present: MonotonicTimestampNs::new(earliest_submit_ns + 5_000_000),
+            presentation_not_before: None,
+            preferred_present: MonotonicTimestampNs::new(earliest_submit_ns + 8_000_000),
+            service_deadline: None,
+            shortest_interval: Duration::from_millis(6),
+            longest_interval: Some(Duration::from_millis(20)),
+        },
+    );
+    let mut job = test_job(token);
+    job.reservation = FramePresentationReservation::Variable(
+        VariablePresentationReservation::try_new(
+            opportunity,
+            PresentationTargetReason::CommitTiming,
+        )
+        .expect("test opportunity is variable refresh"),
+    );
+    job.presentation_timing = KmsPresentationTiming::variable(earliest_submit_ns);
+    job.queued_at = MonotonicTimestampNs::new(queued_at);
+    reserve_for_test(handle, job.kind).enqueue(job).unwrap();
+    for _ in 0..5_000 {
+        if handle.queue_depth() == 0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(handle.queue_depth(), 0, "worker dequeued the deadline job");
+    // Give the worker a moment to pass from dequeue into the deadline sleep.
+    std::thread::sleep(Duration::from_millis(50));
+}
+
+#[test]
+fn quiesce_interrupts_worker_deadline_sleep_promptly() {
+    let executor = Arc::new(WorkerPacingTestExecutor {
+        reject_test_only: false,
+    });
+    let handle = KmsCommitWorkerHandle::start(executor).unwrap();
+    enqueue_far_deadline_variable_job(&handle, 81_000);
+
+    let quiesce_started = Instant::now();
+    handle.request_quiesce();
+    handle.join().unwrap();
+    // The submit deadline is ~10 s away; a lifecycle exit must not wait for it.
+    assert!(
+        quiesce_started.elapsed() < Duration::from_secs(5),
+        "quiesce waited for the planned submit deadline: {:?}",
+        quiesce_started.elapsed()
+    );
+    assert_eq!(
+        handle.metrics_snapshot().deadline_wait_spurious_wakeups,
+        0,
+        "quiesce is a lifecycle exit, not a spurious deadline wakeup"
+    );
+}
+
+#[test]
+fn cursor_sidecar_offers_do_not_wake_worker_deadline_sleep() {
+    let executor = Arc::new(WorkerPacingTestExecutor {
+        reject_test_only: false,
+    });
+    let handle = KmsCommitWorkerHandle::start(executor).unwrap();
+    enqueue_far_deadline_variable_job(&handle, 82_000);
+    let before = handle.metrics_snapshot().deadline_wait_spurious_wakeups;
+
+    for id in 1..=64 {
+        let mut sidecar = test_sidecar(
+            &test_job(82_100 + id),
+            900 + id,
+            CursorSidecarCoupling::Independent,
+        );
+        loop {
+            match handle.offer_cursor_sidecar(sidecar) {
+                Ok(_) => break,
+                Err(error)
+                    if error.reason == super::KmsWorkerAdmissionError::AdmissionContention =>
+                {
+                    sidecar = *error.sidecar;
+                    std::thread::yield_now();
+                }
+                Err(error) => panic!("sidecar offer failed: {:?}", error.reason),
+            }
+        }
+    }
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(
+        handle.metrics_snapshot().deadline_wait_spurious_wakeups - before,
+        0,
+        "cursor sidecar offers woke the worker's deadline sleep"
+    );
+    assert_eq!(handle.metrics_snapshot().jobs_submitted, 0);
 
     handle.request_quiesce();
     handle.join().unwrap();
