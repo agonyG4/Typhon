@@ -1505,6 +1505,7 @@ pub fn observe_rt_worker_budget_events() {
                 .as_ref()
                 .map_or_else(String::as_str, |()| "applied"),
         );
+        manager.rearm_rt_budget_after_worker_overrun();
     }
 }
 
@@ -2042,6 +2043,27 @@ impl QosManager {
             ));
         }
         Ok(())
+    }
+
+    /// After delivering SIGXCPU the kernel raises the process-wide soft
+    /// RLIMIT_RTTIME by one second. Once a worker overran, restore the guarded
+    /// soft budget so the reactor and the remaining RR worker keep 100 ms.
+    fn rearm_rt_budget_after_worker_overrun(&self) {
+        if !self.budget_active.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(original_rt_limit) = self.original_rt_limit else {
+            return;
+        };
+        let Ok(guarded) = guarded_rt_limit(original_rt_limit, RT_BUDGET_US) else {
+            return;
+        };
+        if unsafe { libc::setrlimit(libc::RLIMIT_RTTIME, &guarded) } != 0 {
+            eprintln!(
+                "scheduling QoS: cannot re-arm RLIMIT_RTTIME after worker overrun: {}",
+                io::Error::last_os_error()
+            );
+        }
     }
 
     /// Returns true only for the call that retired an active budget.
