@@ -1137,13 +1137,27 @@ impl NativeRuntime {
                         PacingField::u64("render_generation", render_generation),
                     ],
                 );
-                return Err(io::Error::other(format!(
-                    "RenderAhead visual ownership invariant violated: scheduler_visual_work={scheduler_visual_work} pacing_active={pacing_active} worker_reservation_present={} active_worker_owned={} queued_redraw_requested={} render_generation={render_generation}",
+                // A broken pairing used to end the session. Re-pair both
+                // owners through the canonical path; if a render-worker owner
+                // still prevents that, retry the visual work next cycle.
+                eprintln!(
+                    "typhon pacing: event=render_admission_ownership_recovery scheduler_visual_work={scheduler_visual_work} pacing_active={pacing_active} worker_reservation_present={} active_worker_owned={} queued_redraw_requested={} render_generation={render_generation}",
                     frame_pacing.worker_reservation_present(),
                     frame_pacing.active_worker_owned(),
                     *queued_redraw_requested,
-                ))
-                .into());
+                );
+                if queue_visual_work(
+                    frame_pacing,
+                    frame_scheduler,
+                    pacing_now_ns,
+                    render_generation,
+                    NativeVisualWorkQueueReason::OwnershipRecovery,
+                )
+                .is_err()
+                {
+                    *queued_redraw_requested = true;
+                    return Ok(());
+                }
             }
         }
         if matches!(

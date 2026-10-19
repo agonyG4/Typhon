@@ -17,6 +17,7 @@ pub(crate) enum NativeVisualWorkQueueReason {
     QueuedRedrawRetry,
     WorkerRequeue,
     CursorSoftwareFallback,
+    OwnershipRecovery,
 }
 
 impl NativeVisualWorkQueueReason {
@@ -26,6 +27,7 @@ impl NativeVisualWorkQueueReason {
             Self::QueuedRedrawRetry => "queued_redraw_retry",
             Self::WorkerRequeue => "worker_requeue",
             Self::CursorSoftwareFallback => "cursor_software_fallback",
+            Self::OwnershipRecovery => "ownership_recovery",
         }
     }
 }
