@@ -45,10 +45,10 @@ back to a safer path when a capability or check is missing.
 | Buffering | `auto` | Starts double-buffered. Moves to triple buffering only when the deadline predictor or a proven readiness miss asks for it and every capability check passes. |
 | Direct scanout | `auto` | Eligible candidates are validated with `TEST_ONLY` on the primary plane. A rejected candidate returns to composition. Needs the Atomic EGL/GBM path with a healthy KMS worker. |
 | VRR | `auto` | Requests Adaptive Sync only for eligible solitary-fullscreen candidates. |
-| Tearing | `off` | Async page-flip is opt-in. |
+| Tearing | `auto` | Async page-flip is requested only for eligible fullscreen clients that ask for tearing and clear every async blocker. `off` disables it. |
 | Cursor | `auto` | Hardware cursor when it can be established safely, software otherwise. |
 | XWayland | `lazy` | The managed XWM starts on demand. `off`, `base`, and `eager` are also accepted. |
-| Scheduling QoS | `off` | No scheduler changes unless requested. |
+| Scheduling QoS | `auto` | Tries `SCHED_RR` for the reactor, then high-priority FAIR, then normal scheduling. `off` makes no scheduler changes. |
 
 The effects engine ships canonical blur semantics and terminal Kawase fusion
 enabled. Checkpoint dependency pruning, precomputed window blur, and the
@@ -62,7 +62,8 @@ for presentation and runtime policies: [Native session configuration](docs/NATIV
 
 Common controls:
 
-- `OBLIVION_ONE_MODE` selects the KMS mode.
+- `OBLIVION_ONE_MODE` selects the display mode (`auto`, `preferred`, `highres`, `highrr`, or `WIDTHxHEIGHT[@HZ]`).
+- `OBLIVION_ONE_KMS_MODE` selects the KMS API (`auto`, `atomic`, `legacy`).
 - `OBLIVION_ONE_NATIVE_APP_GPU` selects the GPU policy for launched clients.
 - `OBLIVION_ONE_SHELL_COMMAND` starts the session shell.
 - `OBLIVION_ONE_PERF_LOG=1` enables structured native performance logs.

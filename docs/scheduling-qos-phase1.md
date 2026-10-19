@@ -1,14 +1,15 @@
 # Scheduling QoS Phase 1 and the Phase 2 Render Boundary
 
-Phase 1 keeps the native runtime's current rendering ownership. The opt-in
+Phase 1 keeps the native runtime's current rendering ownership. The
 `OBLIVION_ONE_SCHEDULING_QOS=auto` policy protects the native reactor with
 verified `SCHED_RR` priority 1 and `SCHED_RESET_ON_FORK` when direct setup and a
 finite soft `RLIMIT_RTTIME` guard are available. It falls back to RTKit
 high-priority FAIR, direct negative nice, and ordinary `SCHED_OTHER` in that
 order. RTKit realtime grants are intentionally excluded while Typhon's child
 limit restoration is not proven for that path. KMS remains a `SCHED_OTHER`
-worker and may receive high-priority FAIR scheduling. The default remains
-`off` pending hardware qualification.
+worker and may receive high-priority FAIR scheduling. The parser default is
+`auto` (`src/native/scheduling_qos.rs`); `off` disables all scheduler changes and
+`require` fails startup unless the reactor's `SCHED_RR` state verifies.
 
 QoS setup runs at lifecycle boundaries. The reactor does not call D-Bus from
 its cycle. Audited helper creation temporarily changes an RT creator to

@@ -89,6 +89,33 @@ previous rendered cache state, including unpresented renders. Existing
 dependency-bearing framebuffer checkpoint candidates retain admission priority
 under the checkpoint soft budget.
 
+## Runtime policy switches
+
+Effect behavior is controlled by environment variables read at startup. The
+policy variables accept case-insensitive values; an unrecognized value emits a
+warning once and uses the fallback named below. Defaults are the values taken
+when the variable is unset.
+
+| Variable | Values | Default | Notes |
+| --- | --- | --- | --- |
+| `TYPHON_EFFECT_CANONICAL_BLUR_SEMANTICS` | `canonical`, `legacy` | `canonical` | Unrecognized values fall back to `legacy`. |
+| `TYPHON_EFFECT_TERMINAL_BLUR_FUSION` | `on`, `off` | `on` | Fuses the terminal Kawase passes. Unrecognized values fall back to `off`. Disabled while `TYPHON_EFFECT_DEBUG_KAWASE_MODE=full`. |
+| `TYPHON_EFFECT_CHECKPOINT_DEPENDENCY_PRUNING` | `on`, `off` | `off` | Newer path, off by default. Unrecognized values fall back to `off`. |
+| `TYPHON_EFFECT_DEMAND_PLANNER` | `legacy`, `regional` | `legacy` | Unrecognized values fall back to `legacy`. |
+| `TYPHON_EFFECT_PRECOMPUTED_WINDOW_BLUR` | `off`, `on` | `off` | See [Experimental shared window blur](#experimental-shared-window-blur). |
+| `TYPHON_EFFECT_RESOURCE_BUDGET_MIB`, `TYPHON_EFFECT_CHECKPOINT_CACHE_BUDGET_MIB` | positive integer MiB | built-in budgets | See [Resource limits and diagnostics](#resource-limits-and-diagnostics). |
+
+Diagnostic switches, all off unless set: `TYPHON_EFFECT_EXEC_TRACE=1`,
+`TYPHON_EFFECT_OWNER_DIAGNOSTICS=1`, `TYPHON_EFFECT_GPU_TIMING=1`,
+`TYPHON_EFFECT_GPU_STALL_DIAGNOSTICS=1`,
+`TYPHON_EFFECT_DEBUG_CAPTURE_MODE=replay|framebuffer` (default `replay`),
+`TYPHON_EFFECT_DEBUG_KAWASE_MODE=partial|full` (default `partial`), and
+`TYPHON_EFFECT_DEBUG_CHECKPOINT_CAPTURE_PATH` (default is the framebuffer
+shader copy; `blit` forces the framebuffer blit). Two renderer switches live
+outside the effects engine: `TYPHON_PARTIAL_REPAINT_COMPLEXITY_POLICY` and
+`OBLIVION_ONE_DISABLE_BUFFER_AGE=1`, which disables buffer-age based partial
+repaint.
+
 ## Experimental shared window blur
 
 `TYPHON_EFFECT_PRECOMPUTED_WINDOW_BLUR=off|on` selects an opt-in diagnostic

@@ -54,11 +54,39 @@ there is no alternate runtime to hide that failure.
   Its `FramePipeline` is a short-lived borrow over those persistent owners; it
   owns no renderer state between frames.
 - `src/session/` describes native seat, input, output, and SDDM prerequisites.
-- `src/core/geometry.rs` contains reusable geometry shared by the window
-  manager and native-independent tests.
+- `src/core/` contains reusable geometry and the typed identifiers
+  (`WindowId`, `OutputId`, scene node ids) shared by the window manager and
+  native-independent tests.
+- `src/effects/` owns the trusted effect registry, parameter and validation
+  model, and the effect render graph with its damage, sampling-footprint,
+  demand-planning, and checkpoint-pruning logic. `src/egl_renderer/effects/`
+  is the GLES executor for that graph.
+- `src/blur_policy/`, `src/material/`, and `src/material_program/` own the blur
+  assignment rules, the persisted global material configuration, and the
+  material program catalog. `src/gpu_residency/` holds GPU resource and scratch
+  telemetry.
+- `src/xwayland/` owns the managed XWayland service and the pure-Rust XWM
+  (`xwm/`): window management, selection and XDND bridges, and the private
+  display, authentication, and readiness lifecycle.
+- `src/wm/` is the window-manager model (workspaces, special workspaces, window
+  management state, and the dwindle layout under `wm/layout/`).
+- `src/animation_control/` and `src/presentation_animation/` own persisted
+  animation configuration and the presentation animation engine.
+- `src/render_backend/` defines the render backend kind and buffer identity
+  types, with EGL/GLES and native EGL/GBM backend modules.
+- `src/control.rs`, `src/control_snapshots.rs`, and the `astrea_*` modules
+  implement the `astrea.control` transport and Typhon's private Wayland
+  protocols (effects, background-effect coverage, screen capture, shell auth,
+  shell control, shortcuts, and toplevel management); their XML lives in
+  `protocols/`. `src/astreactl/` is the command-line client.
+- `src/cursor_*.rs` and `src/keyboard_persistence.rs` own the compositor cursor
+  and persisted keyboard state.
+- `src/bin/` holds the `astreactl` client and the helper executables
+  `typhon-launch`, `astrea-shell-control-bridge`, and `astrea-shortcut-bridge`.
 
 The source-layout check requires every retained Rust file to be connected to
-the module tree and keeps production modules below the configured size limits.
+the module tree and enforces production size limits (see
+[Source Layout](SOURCE_LAYOUT.md) for the limits and the current status).
 
 ## Pointer constraint runtime authority
 
@@ -368,9 +396,10 @@ optional external fallback. If that fallback cannot spawn, Typhon records and
 logs `fallback_spawn_failed`, consumes the binding, and continues running.
 
 Client launch policy removes host activation/display routes and sets Typhon's
-Wayland socket. The opt-in managed XWayland service supplies its own private
-display environment; clients do not inherit a host X11 display. XWayland stays
-off by default through `TYPHON_XWAYLAND=off`. This policy affects child
+Wayland socket. The managed XWayland service supplies its own private
+display environment; clients do not inherit a host X11 display. With
+`TYPHON_XWAYLAND` unset the managed service runs in the lazy profile (started on
+demand); `TYPHON_XWAYLAND=off` disables it. This policy affects child
 environments only; it never chooses the compositor runtime.
 
 ## Session boundary

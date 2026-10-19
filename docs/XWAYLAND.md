@@ -5,6 +5,12 @@ owns the displayfd, private Wayland socket, XWM socket, stderr ring, and all
 retirement tokens. X11 setup and replies are progressed incrementally with
 x11rb protocol types over a nonblocking stream.
 
+XWayland is enabled by default: with `TYPHON_XWAYLAND` unset, the managed
+profile starts lazily on the first local display connection. `TYPHON_XWAYLAND`
+accepts `off`, `base`, `lazy`, and `eager`; the full list, the launch
+environment, and the security model are in
+[the modern XWayland profile](xwayland-modern-profile.md).
+
 The supported X11 window contract is:
 
 - normal managed windows map after bounded property discovery and MapNotify;

@@ -11,6 +11,7 @@ reads an unbounded stream or waits for server EOF after a complete frame.
 astreactl version
 astreactl status
 astreactl doctor
+astreactl performance
 astreactl outputs
 astreactl windows
 astreactl activewindow
@@ -27,6 +28,18 @@ astreactl cursor set-theme THEME
 astreactl cursor set-size PIXELS
 astreactl cursor set --theme THEME --size PIXELS
 astreactl cursor reload
+astreactl decoration status
+astreactl decoration list
+astreactl decoration reload
+astreactl decoration set-theme THEME
+astreactl effects reload
+astreactl blur status
+astreactl blur reload
+astreactl animation get
+astreactl animation set 'JSON_OBJECT'
+astreactl [--fit cover|contain|stretch|center|tile] wallpaper set PATH_OR_astrea://wallpaper/ID
+astreactl [--fit FIT] wallpaper import PATH
+astreactl wallpaper get|list|reset|default
 ```
 
 `astreactl --version` reports the client build. `astreactl version` queries the
@@ -38,6 +51,13 @@ decoration or `client-preference` to restore the window's normal preference.
 The result names the window ID, requested policy, and effective decoration
 mode. The `windows` listing retains the strict protocol version-one snapshot
 shape and does not include decoration-policy fields.
+
+`animation set` takes one JSON object as a single argument and rejects anything
+else. `wallpaper` commands do not talk to the Typhon control socket: they use
+the secure Paper endpoint (`wallpaper.sock` in the shell runtime directory),
+reject `--instance`/`--socket` and cursor options, and default to a six-second
+timeout unless `--timeout` is given. `wallpaper set` and `import` default to
+`--fit cover`; a path or an `astrea://wallpaper/` ID is accepted by `set`.
 
 ## Options
 
@@ -201,7 +221,8 @@ keymap/repeat/modifier events.
 ## Scope
 
 Window commands remain read-only except for the narrow per-window decoration
-policy setter: they do not activate, minimize, restore, or close windows, or
+policy setter (the decoration, effects, blur, animation, cursor, keyboard, and
+wallpaper commands above are separate configuration commands): they do not activate, minimize, restore, or close windows, or
 provide subscriptions, remote access, DBus, or Dock integration. Runtime
 keyboard layout control remains available for ephemeral locked-layout changes,
 while v3 adds typed transactional RMLVO/repeat configuration. It does not add

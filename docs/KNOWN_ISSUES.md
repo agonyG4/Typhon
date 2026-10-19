@@ -73,17 +73,38 @@ diagnostics but do not provide the same performance envelope as the normal
 GPU path. Hardware cursor policy can similarly fall back to software unless
 hardware cursor use was explicitly required.
 
-## XWayland is opt-in and not broadly real-application-qualified
+## XWayland is enabled by default but not broadly real-application-qualified
 
-The managed XWayland/XWM path is implemented but defaults off;
-`TYPHON_XWAYLAND=off` is the default, with managed lazy and eager modes
-available by opt-in. The managed XWM lifecycle, bidirectional CLIPBOARD and
+The managed XWayland/XWM path is implemented and enabled by default: with
+`TYPHON_XWAYLAND` unset it runs in managed lazy mode and starts on the first
+local display connection. `TYPHON_XWAYLAND=off` disables it, `base` arms only
+the foundation service, and `eager` starts the managed profile during
+bootstrap. The managed XWM lifecycle, bidirectional CLIPBOARD and
 PRIMARY transfer, and XDND in both directions are implemented. Runtime RandR
 output publication and X11 cursor ownership integration remain incomplete,
 and broad real-application interoperability qualification is still pending.
 See [XWayland](XWAYLAND.md) and
 [XWayland interoperability qualification](XWAYLAND_INTEROP_QUALIFICATION.md)
 for the implemented scope and qualification boundary.
+
+## Single output and sRGB-only color
+
+Typhon is a single-output compositor. A typed `OutputId` foundation is in
+place, but there is no collection of independent output runtimes, no hotplug
+lifecycle, and no multi-output desktop layout. Color management is advertised
+through `wp_color_manager_v1` with sRGB primaries and the sRGB/gamma 2.2
+transfer functions only; HDR is not supported.
+
+## Protocol and input scope
+
+The Wayland protocols below are not implemented and not advertised, so clients
+that depend on them fall back or lose that feature: tablet input
+(`zwp_tablet_v2`), text input and input-method protocols, pointer gestures,
+`ext-session-lock`, `xdg-output`, and the wlroots/ext screencopy and foreign
+toplevel protocols. Screen capture and toplevel management are provided by
+Typhon's own `astrea-screen-capture-v1` and `astrea-toplevel-management-v1`
+protocols instead. See [the protocol source manifest](wayland/PROTOCOL_SOURCE_MANIFEST.md)
+for the advertised set.
 
 ## Application-specific graphics warnings
 

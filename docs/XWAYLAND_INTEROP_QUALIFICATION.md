@@ -2,6 +2,8 @@
 
 **Status: PARTIALLY QUALIFIED — native Typhon session unavailable.** No real-client interoperability case was run or counted as a pass. The active display belongs to Hyprland, so it cannot qualify Typhon's XWayland bridge.
 
+> Status note (2026-10-19): this record is historical. Where it says that the repository parses an unset `TYPHON_XWAYLAND` as `off`, that was true on 2026-10-05; the current parser (`src/xwayland/config.rs`) treats an unset value as the managed `lazy` profile. The qualification outcomes below have not been re-run.
+
 ## Qualification record
 
 - Date: 2026-10-05
