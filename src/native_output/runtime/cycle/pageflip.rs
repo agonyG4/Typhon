@@ -2066,6 +2066,20 @@ impl NativeRuntime {
         self.termination.set_phase(RuntimePhase::ReactorWait);
         let wakeup = self.event_loop.wait()?;
         self.termination.set_phase(RuntimePhase::RuntimeCycle);
+        if let Some(report) = self.busy_loop.observe(
+            monotonic_now_ns()?,
+            wakeup.blocked_ns,
+            wakeup.reasons.bits(),
+            wakeup.continuation.bits(),
+        ) {
+            eprintln!(
+                "typhon wake: event=busy_loop cycles={} duration_ms={} wake=[{}] continuation=[{}]",
+                report.cycles,
+                report.duration_ns / 1_000_000,
+                super::busy_loop::wake_reason_names(report.wake_reasons),
+                super::busy_loop::continuation_reason_names(report.continuation_reasons),
+            );
+        }
         let slow_cycle_start_ns = if self.slow_cycle_trace.enabled() {
             let start_ns = monotonic_now_ns()?;
             let xwayland_totals = self.xwayland.slow_cycle_totals();

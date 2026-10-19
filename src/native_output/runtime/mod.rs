@@ -123,6 +123,7 @@ mod atomic_commit;
 mod bootstrap;
 #[cfg(test)]
 mod bootstrap_runtime_capabilities_tests;
+mod busy_loop;
 mod commit_timing;
 mod controller_io;
 mod cursor_cycle;
@@ -885,6 +886,7 @@ pub(crate) struct NativeRuntime {
     render_telemetry: NativeRenderTelemetry,
     scaled_primary_probe: crate::native_output::scanout::ScaledPrimaryProbeCache,
     slow_cycle_trace: NativeSlowCycleTrace,
+    busy_loop: busy_loop::BusyLoopDetector,
 }
 
 pub(super) fn reload_trusted_effects_from_disk(

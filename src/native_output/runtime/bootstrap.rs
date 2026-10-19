@@ -839,6 +839,7 @@ impl NativeRuntime {
             render_telemetry: NativeRenderTelemetry::default(),
             scaled_primary_probe: ScaledPrimaryProbeCache::default(),
             slow_cycle_trace: NativeSlowCycleTrace::from_env(),
+            busy_loop: super::busy_loop::BusyLoopDetector::default(),
         };
         let finish_result: NativeResult<()> = (|| {
             if xwayland_environment_materialized {
