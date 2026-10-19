@@ -44,6 +44,7 @@ Environment:
   OBLIVION_ONE_BINARY    optional release binary path (default: repo target/release/oblivion-one)
   OBLIVION_ONE_PERF_LOG  set to 1/true/debug to emit structured native perf logs
   OBLIVION_ONE_LOG_FILE  native-session log path (default: ~/.local/state/oblivion-one/session.log)
+  OBLIVION_ONE_LOG_ROTATE_BYTES  move the log to <log>.1 at launch when larger than N bytes (default: 33554432; 0 disables)
 
 Examples:
   start-oblivion-one
@@ -140,6 +141,17 @@ if [[ "$profile" == "release" && ! -x "${command[0]}" ]]; then
 fi
 
 mkdir -p -- "$(dirname -- "$log_file")"
+log_rotate_bytes="${OBLIVION_ONE_LOG_ROTATE_BYTES:-33554432}"
+if [[ ! "$log_rotate_bytes" =~ ^[0-9]+$ ]]; then
+    echo "start-oblivion-one: OBLIVION_ONE_LOG_ROTATE_BYTES must be a non-negative integer, got '$log_rotate_bytes'" >&2
+    exit 1
+fi
+if (( 10#$log_rotate_bytes > 0 )) && [[ -f "$log_file" ]]; then
+    log_size="$(stat -c %s -- "$log_file" 2>/dev/null || echo 0)"
+    if (( 10#$log_size > 10#$log_rotate_bytes )); then
+        mv -f -- "$log_file" "$log_file.1"
+    fi
+fi
 {
     printf '\n[%s] start-oblivion-one runtime=native profile=%s socket=%s\n' "$(date --iso-8601=seconds)" "$profile" "$socket"
     printf '[%s] native launch broker=typhon-shell-control display=unset-before-compositor\n' "$(date --iso-8601=seconds)"

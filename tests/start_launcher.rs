@@ -411,3 +411,53 @@ fn start_launcher_log_relay_outlives_session_group_signals() {
         "cleanup output after session signals was lost; log:\n{log}"
     );
 }
+
+#[test]
+fn start_launcher_rotates_oversized_session_log_at_launch() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let repo_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let test_dir = repo_dir
+        .join("target")
+        .join("start-launcher-tests")
+        .join(format!("log-rotate-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&test_dir);
+    fs::create_dir_all(&test_dir).expect("test directory should be created");
+    let fake_binary = test_dir.join("fake-oblivion-one");
+    fs::write(&fake_binary, "#!/usr/bin/env bash\nexit 0\n")
+        .expect("fake compositor should be written");
+    fs::set_permissions(&fake_binary, fs::Permissions::from_mode(0o755))
+        .expect("fake compositor should be executable");
+    let log_file = test_dir.join("session.log");
+    let rotated_log = test_dir.join("session.log.1");
+    let old_content = "old session content that exceeds the rotation threshold\n";
+    fs::write(&log_file, old_content).expect("old session log should be written");
+
+    let output = Command::new(repo_dir.join("bin/start-oblivion-one"))
+        .env("OBLIVION_ONE_BINARY", &fake_binary)
+        .env("OBLIVION_ONE_STATE_DIR", &test_dir)
+        .env("OBLIVION_ONE_LOG_FILE", &log_file)
+        .env("OBLIVION_ONE_SKIP_INPUT_GROUP_CHECK", "1")
+        .env("OBLIVION_ONE_LOG_ROTATE_BYTES", "16")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("start launcher should run");
+    let rotated = fs::read_to_string(&rotated_log).unwrap_or_default();
+    let current = fs::read_to_string(&log_file).unwrap_or_default();
+    let _ = fs::remove_dir_all(&test_dir);
+
+    assert!(
+        output.status.success(),
+        "launcher failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        rotated.contains(old_content),
+        "old log content should move to session.log.1; rotated log:\n{rotated}"
+    );
+    assert!(
+        !current.contains(old_content),
+        "new session.log should not keep old content; log:\n{current}"
+    );
+}
