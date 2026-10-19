@@ -13,7 +13,10 @@ use std::time::Duration;
 mod credit;
 mod simulator;
 
-pub use credit::{ElasticFuturePrimaryCredit, O1CreditDemandController, O1CreditDemandReason};
+pub use credit::{
+    ElasticFuturePrimaryCredit, O1CreditDemandController, O1CreditDemandReason,
+    RELEASE_BAND_PERCENT,
+};
 pub use simulator::{
     SimulatedO1Config, SimulatedO1Event, SimulatedO1EventKind, SimulatedO1EventModel,
     SimulatedO1Result, SimulatedO1State, simulate_o1, simulate_o1_with_render_services,
@@ -277,6 +280,18 @@ impl PipelineServiceEstimate {
                 .get(),
         )
     }
+
+    /// How much later than the predecessor's presentation the successor could
+    /// still start rendering.  Zero whenever overlap is required.
+    pub fn successor_slack_ns(
+        self,
+        predecessor_presentation: MonotonicTimestampNs,
+        successor_presentation: MonotonicTimestampNs,
+    ) -> u64 {
+        self.latest_successor_render_start(successor_presentation)
+            .get()
+            .saturating_sub(predecessor_presentation.get())
+    }
 }
 
 #[cfg(test)]
@@ -360,6 +375,21 @@ mod tests {
                 MonotonicTimestampNs::new(108_000),
             ),
             0
+        );
+    }
+
+    #[test]
+    fn successor_slack_is_zero_when_overlap_is_required() {
+        let estimate = PipelineServiceEstimate::new(1_000, 3_000, 500, 500);
+        let predecessor = MonotonicTimestampNs::new(100_000);
+
+        assert_eq!(
+            estimate.successor_slack_ns(predecessor, MonotonicTimestampNs::new(104_000)),
+            0
+        );
+        assert_eq!(
+            estimate.successor_slack_ns(predecessor, MonotonicTimestampNs::new(108_000)),
+            3_000
         );
     }
 

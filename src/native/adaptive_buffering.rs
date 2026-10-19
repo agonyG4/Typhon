@@ -1127,6 +1127,18 @@ impl AdaptiveBufferingController {
         predecessor: Option<PresentationTarget>,
         overlap_required_ns: u64,
     ) {
+        self.observe_overlap_for_target_with_slack(predecessor, overlap_required_ns, u64::MAX, 0);
+    }
+
+    /// Same as `observe_overlap_for_target`, with the successor's slack and the
+    /// release band used to hold credit 2 through marginal clean opportunities.
+    pub fn observe_overlap_for_target_with_slack(
+        &mut self,
+        predecessor: Option<PresentationTarget>,
+        overlap_required_ns: u64,
+        slack_ns: u64,
+        release_band_ns: u64,
+    ) {
         let target_identity = predecessor.map(|target| target.physical_claim().opportunity_id());
         if self.last_overlap_target == target_identity {
             return;
@@ -1154,8 +1166,12 @@ impl AdaptiveBufferingController {
                 if self.capability == TripleCapability::Capable {
                     let before = self.o1_credit.effective();
                     if let Some(target_identity) = target_identity {
-                        self.o1_credit
-                            .observe_opportunity(target_identity, overlap_required_ns);
+                        self.o1_credit.observe_opportunity_with_slack(
+                            target_identity,
+                            overlap_required_ns,
+                            slack_ns,
+                            release_band_ns,
+                        );
                     } else {
                         self.o1_credit.observe_overlap(overlap_required_ns);
                     }

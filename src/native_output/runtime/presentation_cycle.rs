@@ -28,6 +28,7 @@ use super::presentation_metrics::{
 use super::presentation_o1::{
     admission_observation_for_frame, observe_current_o1_opportunity,
     overlap_required_for_current_opportunity, pipeline_service_estimate_for_prediction,
+    slack_for_current_opportunity,
 };
 use super::presentation_pipeline::build_output_pipeline_snapshot_with_presented;
 use super::presentation_protocol::{
@@ -653,8 +654,14 @@ impl NativeRuntime {
         let estimate = pipeline_service_estimate_for_prediction(&prediction);
         let overlap_required_ns =
             overlap_required_for_current_opportunity(pending_target, refresh_interval, estimate);
-        let o1_demand =
-            observe_current_o1_opportunity(adaptive_buffering, pending_target, overlap_required_ns);
+        let slack_ns = slack_for_current_opportunity(pending_target, refresh_interval, estimate);
+        let o1_demand = observe_current_o1_opportunity(
+            adaptive_buffering,
+            pending_target,
+            overlap_required_ns,
+            slack_ns,
+            refresh_interval,
+        );
         let desired_credit = phase1_desired_primary_credit(
             reactive_presentation_candidate,
             o1_demand.desired_credit_after,

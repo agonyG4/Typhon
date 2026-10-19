@@ -1,6 +1,9 @@
 use super::PresentationOpportunityId;
 
 pub const CLEAN_RELEASE_OPPORTUNITIES: u8 = 10;
+/// Clean opportunities whose slack is below this share of the refresh interval
+/// are treated as marginal and keep credit held (KWin uses 0.95 of vblank).
+pub const RELEASE_BAND_PERCENT: u64 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum O1CreditDemandReason {
@@ -85,10 +88,28 @@ impl O1CreditDemandController {
         opportunity: PresentationOpportunityId,
         overlap_required_ns: u64,
     ) {
+        self.observe_opportunity_with_slack(opportunity, overlap_required_ns, u64::MAX, 0);
+    }
+
+    /// Like `observe_opportunity`, but a clean opportunity at credit 2 whose
+    /// slack is inside the release band is marginal: it neither counts toward
+    /// release nor grants anything, so a workload hovering at the refresh
+    /// boundary does not flap between double and triple buffering.
+    pub fn observe_opportunity_with_slack(
+        &mut self,
+        opportunity: PresentationOpportunityId,
+        overlap_required_ns: u64,
+        slack_ns: u64,
+        release_band_ns: u64,
+    ) {
         if self.last_observed_opportunity == Some(opportunity) {
             return;
         }
         self.last_observed_opportunity = Some(opportunity);
+        if overlap_required_ns == 0 && self.desired_credit == 2 && slack_ns < release_band_ns {
+            self.clean_release_streak = 0;
+            return;
+        }
         self.observe_slack(
             overlap_required_ns,
             Some(O1CreditDemandReason::PredictedOverlap),
@@ -258,6 +279,74 @@ mod tests {
         controller.observe_opportunity(PresentationOpportunityId::new(4, 18), 0);
         assert_eq!(controller.desired_credit(), 1);
         assert_eq!(controller.revokes(), 1);
+    }
+
+    #[test]
+    fn marginal_slack_keeps_credit_two_indefinitely() {
+        let mut controller = O1CreditDemandController::new();
+        controller.observe_opportunity(PresentationOpportunityId::new(4, 1), 1);
+        for sequence in 2..=51 {
+            controller.observe_opportunity_with_slack(
+                PresentationOpportunityId::new(4, sequence),
+                0,
+                10,
+                100,
+            );
+        }
+
+        assert_eq!(controller.desired_credit(), 2);
+        assert_eq!(controller.revokes(), 0);
+        assert_eq!(controller.clean_release_progress(), 0);
+    }
+
+    #[test]
+    fn clean_slack_after_marginal_run_revokes_after_full_horizon() {
+        let mut controller = O1CreditDemandController::new();
+        controller.observe_opportunity(PresentationOpportunityId::new(4, 1), 1);
+        for sequence in 2..=20 {
+            controller.observe_opportunity_with_slack(
+                PresentationOpportunityId::new(4, sequence),
+                0,
+                10,
+                100,
+            );
+        }
+        for sequence in 21..=29 {
+            controller.observe_opportunity_with_slack(
+                PresentationOpportunityId::new(4, sequence),
+                0,
+                100,
+                100,
+            );
+        }
+        assert_eq!(controller.desired_credit(), 2);
+        assert_eq!(controller.revokes(), 0);
+
+        controller.observe_opportunity_with_slack(
+            PresentationOpportunityId::new(4, 30),
+            0,
+            100,
+            100,
+        );
+        assert_eq!(controller.desired_credit(), 1);
+        assert_eq!(controller.revokes(), 1);
+    }
+
+    #[test]
+    fn marginal_slack_at_credit_one_does_not_grant() {
+        let mut controller = O1CreditDemandController::new();
+        for sequence in 1..=5 {
+            controller.observe_opportunity_with_slack(
+                PresentationOpportunityId::new(4, sequence),
+                0,
+                10,
+                100,
+            );
+        }
+
+        assert_eq!(controller.desired_credit(), 1);
+        assert_eq!(controller.grants(), 0);
+        assert_eq!(controller.revokes(), 0);
     }
 
     #[test]

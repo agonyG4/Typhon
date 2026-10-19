@@ -1,5 +1,7 @@
 use oblivion_one::native::adaptive_buffering::{AdaptiveBufferingController, RenderPrediction};
-use oblivion_one::native::buffering::{O1AdmissionObservation, PipelineServiceEstimate};
+use oblivion_one::native::buffering::{
+    O1AdmissionObservation, PipelineServiceEstimate, RELEASE_BAND_PERCENT,
+};
 use oblivion_one::native::presentation_deadline::{MonotonicTimestampNs, PresentationTarget};
 use std::time::Duration;
 
@@ -16,9 +18,18 @@ pub(super) fn observe_current_o1_opportunity(
     adaptive_buffering: &mut AdaptiveBufferingController,
     predecessor: Option<PresentationTarget>,
     overlap_required_ns: u64,
+    slack_ns: u64,
+    refresh_interval: Duration,
 ) -> O1CycleDemandDecision {
+    let refresh_ns = u64::try_from(refresh_interval.as_nanos()).unwrap_or(0);
+    let release_band_ns = refresh_ns.saturating_mul(RELEASE_BAND_PERCENT) / 100;
     let desired_credit_before = adaptive_buffering.desired_credit();
-    adaptive_buffering.observe_overlap_for_target(predecessor, overlap_required_ns);
+    adaptive_buffering.observe_overlap_for_target_with_slack(
+        predecessor,
+        overlap_required_ns,
+        slack_ns,
+        release_band_ns,
+    );
     let desired_credit_after = adaptive_buffering.desired_credit();
     O1CycleDemandDecision {
         overlap_required_ns,
@@ -70,6 +81,35 @@ pub(super) fn overlap_required_for_current_opportunity(
     )
 }
 
+/// Slack the successor opportunity has beyond the predecessor's presentation,
+/// mirroring `overlap_required_for_current_opportunity`.  `u64::MAX` means the
+/// slack is unbounded (no predecessor or arithmetic overflow), so it is never
+/// treated as marginal.
+pub(super) fn slack_for_current_opportunity(
+    predecessor: Option<PresentationTarget>,
+    refresh_interval: Duration,
+    estimate: PipelineServiceEstimate,
+) -> u64 {
+    let Some(predecessor) = predecessor else {
+        return u64::MAX;
+    };
+    let Ok(refresh_ns) = u64::try_from(refresh_interval.as_nanos()) else {
+        return u64::MAX;
+    };
+    let Some(successor_ns) = predecessor
+        .physical_claim()
+        .presentation_time
+        .get()
+        .checked_add(refresh_ns)
+    else {
+        return u64::MAX;
+    };
+    estimate.successor_slack_ns(
+        predecessor.presentation_time,
+        MonotonicTimestampNs::new(successor_ns),
+    )
+}
+
 pub(super) fn pipeline_service_estimate_for_prediction(
     prediction: &RenderPrediction,
 ) -> PipelineServiceEstimate {
@@ -84,7 +124,10 @@ pub(super) fn pipeline_service_estimate_for_prediction(
 
 #[cfg(test)]
 mod tests {
-    use super::{observe_current_o1_opportunity, overlap_required_for_current_opportunity};
+    use super::{
+        observe_current_o1_opportunity, overlap_required_for_current_opportunity,
+        slack_for_current_opportunity,
+    };
     use oblivion_one::native::adaptive_buffering::{
         AdaptiveBufferingController, AdaptiveTripleBufferPolicy, PredictionEstimatorMode,
         RenderPrediction, TripleCapability,
@@ -119,8 +162,13 @@ mod tests {
         let mut adaptive = AdaptiveBufferingController::new(AdaptiveTripleBufferPolicy::Auto);
         adaptive.apply_capability(TripleCapability::Capable);
 
-        let decision =
-            observe_current_o1_opportunity(&mut adaptive, Some(predecessor()), 1_200_000);
+        let decision = observe_current_o1_opportunity(
+            &mut adaptive,
+            Some(predecessor()),
+            1_200_000,
+            0,
+            Duration::from_nanos(8_333_333),
+        );
 
         assert_eq!(decision.desired_credit_before, 1);
         assert_eq!(decision.desired_credit_after, 2);
@@ -130,11 +178,54 @@ mod tests {
             "RenderAhead must be allowed in this decision"
         );
 
-        let retry = observe_current_o1_opportunity(&mut adaptive, Some(predecessor()), 0);
+        let retry = observe_current_o1_opportunity(
+            &mut adaptive,
+            Some(predecessor()),
+            0,
+            u64::MAX,
+            Duration::from_nanos(8_333_333),
+        );
         assert_eq!(retry.desired_credit_before, 2);
         assert_eq!(retry.desired_credit_after, 2);
         assert!(!retry.granted_extra_credit);
         assert_eq!(adaptive.extra_credit_grants(), 1);
+    }
+
+    #[test]
+    fn marginal_clean_opportunity_keeps_credit_two() {
+        let mut adaptive = AdaptiveBufferingController::new(AdaptiveTripleBufferPolicy::Auto);
+        adaptive.apply_capability(TripleCapability::Capable);
+        // 6.8 ms refresh: successor slack is 300us, below the 5% band (340us).
+        let refresh = Duration::from_micros(6_800);
+        let estimate = super::pipeline_service_estimate_for_prediction(&selected_prediction());
+        let overlap_required_ns =
+            overlap_required_for_current_opportunity(Some(predecessor()), refresh, estimate);
+        let slack_ns = slack_for_current_opportunity(Some(predecessor()), refresh, estimate);
+        assert_eq!(overlap_required_ns, 0);
+        assert_eq!(slack_ns, 300_000);
+
+        observe_current_o1_opportunity(
+            &mut adaptive,
+            Some(predecessor()),
+            1_200_000,
+            0,
+            Duration::from_nanos(8_333_333),
+        );
+        let mut next = predecessor();
+        next.sequence = 42;
+        next.physical_claim.sequence = 42;
+        let decision = observe_current_o1_opportunity(
+            &mut adaptive,
+            Some(next),
+            overlap_required_ns,
+            slack_ns,
+            refresh,
+        );
+
+        assert_eq!(decision.desired_credit_before, 2);
+        assert_eq!(decision.desired_credit_after, 2);
+        assert!(!decision.revoked_extra_credit);
+        assert_eq!(adaptive.extra_credit_revokes(), 0);
     }
 
     fn selected_prediction() -> RenderPrediction {
