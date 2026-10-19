@@ -354,6 +354,10 @@ impl EffectRegion {
         let mut disjoint = Vec::with_capacity(self.rects.len());
         let mut duplicate_rects_removed: usize = 0;
         let mut overlap_fragments_generated: usize = 0;
+        // Reused across sources: this runs per frame over up to
+        // MAX_EFFECT_REGION_RECTS rects, so per-pair allocation dominated.
+        let mut fragments = Vec::with_capacity(4);
+        let mut next = Vec::with_capacity(4);
 
         for source in &self.rects {
             if disjoint.contains(source) {
@@ -361,19 +365,21 @@ impl EffectRegion {
                 continue;
             }
 
-            let mut fragments = vec![*source];
+            fragments.clear();
+            fragments.push(*source);
             for represented in &disjoint {
                 if fragments.is_empty() {
                     break;
                 }
-                let mut next = Vec::with_capacity(fragments.len().min(4));
-                for fragment in fragments {
+                next.clear();
+                for &fragment in &fragments {
                     let pieces = subtract_effect_rect(fragment, *represented);
+                    let pieces = pieces.as_slice();
                     if pieces.len() != 1 || pieces.first() != Some(&fragment) {
                         overlap_fragments_generated =
                             overlap_fragments_generated.saturating_add(pieces.len());
                     }
-                    for piece in pieces {
+                    for &piece in pieces {
                         if next.len() == MAX_EFFECT_REGION_RECTS {
                             return BoundedRegionDisjointification {
                                 region: Self::empty(),
@@ -385,10 +391,10 @@ impl EffectRegion {
                         next.push(piece);
                     }
                 }
-                fragments = next;
+                std::mem::swap(&mut fragments, &mut next);
             }
 
-            for fragment in fragments {
+            for &fragment in &fragments {
                 if disjoint.len() == MAX_EFFECT_REGION_RECTS {
                     return BoundedRegionDisjointification {
                         region: Self::empty(),
@@ -428,7 +434,7 @@ impl EffectRegion {
                 }
                 let mut next = Self::empty();
                 for candidate in remaining.rects() {
-                    for piece in subtract_effect_rect(*candidate, *excluded_rect) {
+                    for &piece in subtract_effect_rect(*candidate, *excluded_rect).as_slice() {
                         next.push(piece);
                     }
                 }
@@ -471,11 +477,42 @@ impl EffectRegion {
     }
 }
 
-fn subtract_effect_rect(source: EffectRect, excluded: EffectRect) -> Vec<EffectRect> {
+/// At most four pieces remain after subtracting one rect from another.
+struct SubtractedRects {
+    rects: [EffectRect; 4],
+    len: usize,
+}
+
+impl SubtractedRects {
+    const fn new() -> Self {
+        let empty = EffectRect {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+        };
+        Self {
+            rects: [empty; 4],
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, rect: EffectRect) {
+        self.rects[self.len] = rect;
+        self.len += 1;
+    }
+
+    fn as_slice(&self) -> &[EffectRect] {
+        &self.rects[..self.len]
+    }
+}
+
+fn subtract_effect_rect(source: EffectRect, excluded: EffectRect) -> SubtractedRects {
+    let mut result = SubtractedRects::new();
     let Some(overlap) = source.intersect(excluded) else {
-        return vec![source];
+        result.push(source);
+        return result;
     };
-    let mut result = Vec::with_capacity(4);
     let source_right = source.right();
     let source_bottom = source.bottom();
     let overlap_right = overlap.right();
