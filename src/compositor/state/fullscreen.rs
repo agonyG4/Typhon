@@ -364,8 +364,11 @@ impl CompositorState {
             && !self
                 .toplevel_window_state(owner_root_surface_id)
                 .is_some_and(WindowState::is_minimized);
-        let transition_pending =
-            self.presentation_animation_pending_for_root(owner_root_surface_id);
+        // A workspace slide composes both participating workspaces; dominant
+        // culling would drop the other workspace's windows mid-slide.
+        let transition_pending = self
+            .presentation_animation_pending_for_root(owner_root_surface_id)
+            || self.workspace_presentation.transition().is_some();
         let mode = if owner_present
             && owner_visible
             && eligibility.exactly_covers_output

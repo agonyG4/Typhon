@@ -135,8 +135,10 @@ Regular workspace content moves by the full logical output width. Layer-shell,
 wallpaper, the visible special workspace, and global overlays stay stationary.
 Input continues to target the semantic active workspace throughout the
 non-interactive transition. Phase 1 declines the slide and performs the
-immediate switch when the traversed path contains a true fullscreen owner, a
-visible retained lifecycle or WindowExit visual, or a held/DND interaction.
+immediate switch when a visible retained lifecycle or WindowExit visual or a
+held/DND interaction is active. A fullscreen owner on the path slides like any
+other window: an active slide demotes dominant fullscreen composition to
+Transitioning so neither participating workspace is culled.
 Active slides use conservative full-output damage and block Direct Scanout.
 
 This implementation is not hardware-qualified until the real TTY compositor

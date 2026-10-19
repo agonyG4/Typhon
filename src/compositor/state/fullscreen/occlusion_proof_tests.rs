@@ -605,3 +605,34 @@ fn fullscreen_occlusion_proof_rejects_preserve_alpha_replacement_effect() {
         &crate::compositor::direct_scanout::DirectScanoutSceneRejection::FullscreenUnderlayVisible
     ));
 }
+
+#[test]
+fn workspace_slide_suspends_dominant_fullscreen_culling() {
+    let (mut state, _, _, _) = fullscreen_owner_fixture();
+    assert_eq!(
+        state.fullscreen_composition_plan().mode,
+        FullscreenCompositionMode::Dominant
+    );
+
+    let mut workspaces = crate::wm::WorkspaceManager::new(2).expect("workspace manager");
+    let outcome = workspaces.activate(crate::wm::WorkspaceId::new(2).expect("workspace id"));
+    let curve = crate::presentation_animation::AnimationCurve::spring(
+        crate::presentation_animation::SpringSpec::new(300.0, 38.1051),
+    );
+    state.workspace_presentation.activate_for_switch(
+        outcome,
+        &workspaces,
+        AnimationTime::from_nanos(0),
+        curve,
+    );
+
+    let plan = state.fullscreen_composition_plan();
+    assert_eq!(plan.mode, FullscreenCompositionMode::Transitioning);
+    assert!(plan.allows_composition_root(UNDERLAY_ROOT));
+
+    state.workspace_presentation.clear();
+    assert_eq!(
+        state.fullscreen_composition_plan().mode,
+        FullscreenCompositionMode::Dominant
+    );
+}

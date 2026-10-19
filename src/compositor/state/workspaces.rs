@@ -32,7 +32,6 @@ impl CompositorState {
         &self,
         previous: WorkspaceId,
         target: WorkspaceId,
-        sampled_at: AnimationTime,
     ) -> Option<&'static str> {
         if !self.animation_control.enabled()
             || self.animation_control.effective_effect(
@@ -43,44 +42,16 @@ impl CompositorState {
             return Some("effect_disabled");
         }
 
-        let Some(previous_position) = self.workspace_manager.workspace_axis_position(previous)
-        else {
+        if self
+            .workspace_manager
+            .workspace_axis_position(previous)
+            .is_none()
+            || self
+                .workspace_manager
+                .workspace_axis_position(target)
+                .is_none()
+        {
             return Some("invalid_workspace_axis");
-        };
-        let Some(target_position) = self.workspace_manager.workspace_axis_position(target) else {
-            return Some("invalid_workspace_axis");
-        };
-        let start_position = self
-            .workspace_presentation
-            .transition()
-            .and_then(|_| {
-                self.workspace_presentation
-                    .sample_at(&self.workspace_manager, sampled_at, 1.0, 1.0)
-            })
-            .map_or(previous_position, |sample| sample.position);
-        let path_start = start_position.min(target_position);
-        let path_end = start_position.max(target_position);
-        let traverses_fullscreen = self.desktop_windows.keys().copied().any(|window_id| {
-            let Some(owner_id) = self.workspace_owner_window_id(window_id) else {
-                return false;
-            };
-            let Some(window) = self.window(owner_id) else {
-                return false;
-            };
-            if window.state.is_minimized() || window.state.mode() != ToplevelMode::Fullscreen {
-                return false;
-            }
-            let Some(WorkspaceLocation::Regular(workspace)) =
-                window.management.map(|management| management.location())
-            else {
-                return false;
-            };
-            self.workspace_manager
-                .workspace_axis_position(workspace)
-                .is_some_and(|position| position >= path_start && position <= path_end)
-        });
-        if traverses_fullscreen {
-            return Some("fullscreen_path");
         }
         if self.lifecycle_animation_has_pending_visible() {
             return Some("retained_lifecycle_active");
@@ -106,8 +77,7 @@ impl CompositorState {
         let WorkspaceSwitchOutcome::Changed { previous, current } = outcome else {
             return;
         };
-        if let Some(reason) = self.workspace_slide_admission_fallback(previous, current, sampled_at)
-        {
+        if let Some(reason) = self.workspace_slide_admission_fallback(previous, current) {
             let transition_id = self
                 .workspace_presentation
                 .transition()
