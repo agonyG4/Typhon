@@ -46,6 +46,28 @@ holds the registry during a doctor request, the response samples the reactor's
 kernel state directly and returns a registry-busy reason; worker rows are
 omitted for that response instead of waiting on the worker.
 
+## Opt-in realtime KMS and render workers
+
+`OBLIVION_ONE_RT_WORKERS` is opt-in and defaults to `off`. `kms` raises the KMS
+commit worker to verified `SCHED_RR` priority 1 with `SCHED_RESET_ON_FORK`, and
+`all` also raises the render worker. It applies only when
+`OBLIVION_ONE_SCHEDULING_QOS` is `auto` or `require`; with QoS `off` no worker
+is changed. Under load, FAIR workers can wait for CPU for a large fraction of
+each second while the RR reactor waits almost not at all, which is why the
+workers can be promoted.
+
+Workers use the reactor's RT budget and SIGXCPU fail-safe. The reactor arms
+the budget first and applies worker RR only after its own RR state verifies.
+Each worker is addressed by its registered TID, and the SIGXCPU handler demotes
+the overrunning worker itself to `SCHED_OTHER | SCHED_RESET_ON_FORK`. The
+cycle boundary then logs the overrun and sets the worker to nice -10.
+
+A worker never remains RR while the budget is inactive. Budget retirement,
+session suspend, and shutdown each demote RR workers to high-priority FAIR
+before the process-wide `RLIMIT_RTTIME` is restored. Workers that overrun are
+not re-promoted until restart. Workers registered after the reactor is promoted
+stay FAIR until the next reactor RR acquisition.
+
 ## Phase 2 render-worker boundary
 
 The next refactor should split the current `AtomicEglGbmScanout` ownership

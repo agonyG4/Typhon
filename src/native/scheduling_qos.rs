@@ -36,9 +36,39 @@ impl SchedulingQosPolicy {
     }
 }
 
+/// Opt-in realtime scheduling for the KMS commit and render workers. Both
+/// reuse the reactor's RT budget and SIGXCPU fail-safe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RtWorkerPolicy {
+    Off,
+    Kms,
+    All,
+}
+
+impl RtWorkerPolicy {
+    pub(crate) fn parse(value: Option<&str>) -> Result<Self, String> {
+        match value.unwrap_or("off") {
+            "off" => Ok(Self::Off),
+            "kms" => Ok(Self::Kms),
+            "all" => Ok(Self::All),
+            other => Err(format!("invalid realtime worker policy `{other}`")),
+        }
+    }
+}
+
 #[cfg(test)]
 mod scheduling_qos_policy_tests {
-    use super::SchedulingQosPolicy;
+    use super::{RtWorkerPolicy, SchedulingQosPolicy};
+
+    #[test]
+    fn rt_worker_policy_defaults_to_off_and_accepts_only_known_values() {
+        assert_eq!(RtWorkerPolicy::parse(None), Ok(RtWorkerPolicy::Off));
+        assert_eq!(RtWorkerPolicy::parse(Some("off")), Ok(RtWorkerPolicy::Off));
+        assert_eq!(RtWorkerPolicy::parse(Some("kms")), Ok(RtWorkerPolicy::Kms));
+        assert_eq!(RtWorkerPolicy::parse(Some("all")), Ok(RtWorkerPolicy::All));
+        assert!(RtWorkerPolicy::parse(Some("render")).is_err());
+        assert!(RtWorkerPolicy::parse(Some("")).is_err());
+    }
 
     #[test]
     fn policy_defaults_to_auto_and_preserves_explicit_rollback_modes() {
@@ -958,6 +988,7 @@ fn join_reasons(reasons: &[String], terminal: &str) -> String {
 }
 
 const QOS_ENV: &str = "OBLIVION_ONE_SCHEDULING_QOS";
+const RT_WORKERS_ENV: &str = "OBLIVION_ONE_RT_WORKERS";
 const RT_BUDGET_US: u64 = 100_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1000,6 +1031,21 @@ static RT_DEMOTION_COUNT: AtomicU64 = AtomicU64::new(0);
 static SIGXCPU_HANDLER_INSTALLED: AtomicBool = AtomicBool::new(false);
 const SIGXCPU_DEMOTION_POLICY: libc::c_int = libc::SCHED_OTHER | libc::SCHED_RESET_ON_FORK;
 
+// Indexed by position in RT_WORKER_ROLES: 0 is KmsCommit, 1 is Render.
+// RT_WORKER_TIDS holds the registered TID of each worker. RT_WORKER_ACTIVE holds
+// that TID only while the worker is SCHED_RR, so a SIGXCPU claim and the
+// reactor's budget retirement can each take the slot exactly once.
+const RT_WORKER_ROLES: [SchedulingThreadRole; 2] = [
+    SchedulingThreadRole::KmsCommit,
+    SchedulingThreadRole::Render,
+];
+static RT_WORKER_TIDS: [AtomicI32; 2] = [AtomicI32::new(0), AtomicI32::new(0)];
+static RT_WORKER_ACTIVE: [AtomicI32; 2] = [AtomicI32::new(0), AtomicI32::new(0)];
+static RT_WORKER_OVERRUN: [AtomicBool; 2] = [AtomicBool::new(false), AtomicBool::new(false)];
+static RT_WORKER_OVERRUN_REPORTED: [AtomicBool; 2] =
+    [AtomicBool::new(false), AtomicBool::new(false)];
+static RT_WORKER_DEMOTION_COUNT: AtomicU64 = AtomicU64::new(0);
+
 struct BrokerRequest {
     tid: i32,
     requested_nice: i32,
@@ -1008,6 +1054,7 @@ struct BrokerRequest {
 
 struct QosManager {
     policy: SchedulingQosPolicy,
+    rt_workers: RtWorkerPolicy,
     baseline_nice: i32,
     original_rt_limit: Option<libc::rlimit>,
     broker: Mutex<Option<SyncSender<BrokerRequest>>>,
@@ -1024,6 +1071,8 @@ pub fn initialize_from_environment() -> Result<(), String> {
     }
     let value = std::env::var(QOS_ENV).ok();
     let policy = SchedulingQosPolicy::parse(value.as_deref())?;
+    let rt_workers_value = std::env::var(RT_WORKERS_ENV).ok();
+    let rt_workers = RtWorkerPolicy::parse(rt_workers_value.as_deref())?;
     let baseline_nice = current_nice(unsafe { libc::gettid() }).unwrap_or(0);
     let original_rt_limit = if policy == SchedulingQosPolicy::Off {
         None
@@ -1040,6 +1089,7 @@ pub fn initialize_from_environment() -> Result<(), String> {
     MANAGER
         .set(QosManager {
             policy,
+            rt_workers,
             baseline_nice,
             original_rt_limit,
             broker: Mutex::new(None),
@@ -1081,16 +1131,16 @@ pub fn promote_current_reactor() -> Result<SchedulingDiagnosticSnapshot, Box<dyn
         configure_reactor_policy(manager.policy, tid, manager.baseline_nice, &mut operations);
     match configured {
         Ok(snapshot) => {
-            if !matches!(
-                snapshot.effective_class,
-                EffectiveSchedulingClass::RealtimeRoundRobin {
-                    priority: REACTOR_RR_PRIORITY
-                }
-            ) || !snapshot.reset_on_fork_effective
-            {
+            let reactor_rr = snapshot
+                .effective_class
+                .is_expected_reactor_rr(snapshot.reset_on_fork_effective);
+            if !reactor_rr {
                 manager.restore_rt_budget_for_reactor(tid);
             }
             snapshots.insert((snapshot.role, snapshot.tid), snapshot.clone());
+            if reactor_rr && manager.budget_active.load(Ordering::Acquire) {
+                promote_rt_workers(manager, &mut snapshots);
+            }
             Ok(snapshot)
         }
         Err(error) => {
@@ -1143,13 +1193,16 @@ pub fn reacquire_current_reactor_after_session_resume()
         &mut operations,
     )
     .map_err(|error| Box::new(error) as Box<dyn std::error::Error>)?;
-    if !snapshot
+    let reactor_rr = snapshot
         .effective_class
-        .is_expected_reactor_rr(snapshot.reset_on_fork_effective)
-    {
+        .is_expected_reactor_rr(snapshot.reset_on_fork_effective);
+    if !reactor_rr {
         manager.restore_rt_budget_for_reactor(tid);
     }
     snapshots.insert((snapshot.role, snapshot.tid), snapshot.clone());
+    if reactor_rr && manager.budget_active.load(Ordering::Acquire) {
+        promote_rt_workers(manager, &mut snapshots);
+    }
     Ok(snapshot)
 }
 
@@ -1162,6 +1215,9 @@ pub fn prepare_current_reactor_for_session_suspend() -> Result<(), String> {
         return Ok(());
     }
     let tid = unsafe { libc::gettid() };
+    // Workers leave RR before the blocking DRM/session boundary, even if the
+    // reactor's own normalization below fails.
+    demote_rt_workers(manager);
     let mut operations = LinuxSchedulingOperations { manager };
     let previous = try_reactor_snapshot(manager, tid);
     prepare_reactor_for_session_suspend(tid, manager.baseline_nice, &mut operations)?;
@@ -1177,6 +1233,7 @@ pub fn demote_current_reactor() {
     if manager.policy == SchedulingQosPolicy::Off {
         return;
     }
+    demote_rt_workers(manager);
     let tid = unsafe { libc::gettid() };
     let mut operations = LinuxSchedulingOperations { manager };
     let previous = try_reactor_snapshot(manager, tid);
@@ -1256,6 +1313,221 @@ pub fn observe_rt_budget_event() -> bool {
     true
 }
 
+fn rt_worker_index(role: SchedulingThreadRole) -> Option<usize> {
+    RT_WORKER_ROLES
+        .iter()
+        .position(|candidate| *candidate == role)
+}
+
+fn set_requested_class(snapshot: &mut SchedulingDiagnosticSnapshot, class: SchedulingClass) {
+    snapshot.requested_class = class;
+    snapshot.requested_priority = class.requested_priority();
+    snapshot.requested_nice = class.requested_nice();
+}
+
+fn refresh_rt_worker_snapshot(snapshot: &mut SchedulingDiagnosticSnapshot) {
+    if let Ok(state) = inspect_kernel_state(snapshot.tid) {
+        snapshot.effective_class = EffectiveSchedulingClass::from_kernel(state);
+        snapshot.effective_priority = state.priority;
+        snapshot.effective_nice = state.nice;
+        snapshot.reset_on_fork_effective = state.reset_on_fork;
+    }
+    snapshot.demotion_count = RT_WORKER_DEMOTION_COUNT.load(Ordering::Relaxed);
+    snapshot.rt_budget_overrun = rt_worker_index(snapshot.role)
+        .is_some_and(|index| RT_WORKER_OVERRUN[index].load(Ordering::Relaxed));
+}
+
+/// Move enabled KMS/render workers to the reactor's RR class. Callers hold the
+/// registry lock and have just verified an armed RT budget for the reactor.
+fn promote_rt_workers(
+    manager: &QosManager,
+    snapshots: &mut BTreeMap<(SchedulingThreadRole, i32), SchedulingDiagnosticSnapshot>,
+) {
+    if RT_BUDGET_OVERRUN.load(Ordering::Acquire) {
+        return;
+    }
+    for (index, role) in RT_WORKER_ROLES.into_iter().enumerate() {
+        if !manager.rt_worker_enabled(role) || RT_WORKER_OVERRUN[index].load(Ordering::Acquire) {
+            continue;
+        }
+        let tid = RT_WORKER_TIDS[index].load(Ordering::Acquire);
+        if tid <= 0 {
+            continue;
+        }
+        let result = request_rt_worker_round_robin(index, tid);
+        let Some(snapshot) = snapshots.get_mut(&(role, tid)) else {
+            continue;
+        };
+        match result {
+            Ok(()) => {
+                set_requested_class(
+                    snapshot,
+                    SchedulingClass::RealtimeRoundRobin {
+                        priority: REACTOR_RR_PRIORITY,
+                    },
+                );
+                snapshot.backend = SchedulingBackend::Direct;
+                snapshot.degradation_reason = None;
+            }
+            Err(error) => {
+                snapshot.degradation_reason = Some(format!(
+                    "SCHED_RR request failed: {error}; using high-priority FAIR"
+                ));
+            }
+        }
+        refresh_rt_worker_snapshot(snapshot);
+    }
+}
+
+fn request_rt_worker_round_robin(index: usize, tid: i32) -> Result<(), String> {
+    // Publish the slot before the policy change so a SIGXCPU claim can always
+    // find a worker that has just become RR.
+    RT_WORKER_ACTIVE[index].store(tid, Ordering::SeqCst);
+    let minimum = unsafe { libc::sched_get_priority_min(libc::SCHED_RR) };
+    if minimum != REACTOR_RR_PRIORITY {
+        RT_WORKER_ACTIVE[index].store(0, Ordering::SeqCst);
+        return Err(format!(
+            "SCHED_RR priority {REACTOR_RR_PRIORITY} is not kernel minimum {minimum}"
+        ));
+    }
+    let parameter = libc::sched_param {
+        sched_priority: REACTOR_RR_PRIORITY,
+    };
+    let policy = libc::SCHED_RR | libc::SCHED_RESET_ON_FORK;
+    if unsafe { libc::sched_setscheduler(tid, policy, &parameter) } != 0 {
+        let error = io::Error::last_os_error().to_string();
+        let _ =
+            RT_WORKER_ACTIVE[index].compare_exchange(tid, 0, Ordering::SeqCst, Ordering::Relaxed);
+        return Err(error);
+    }
+    match inspect_kernel_state(tid) {
+        Ok(state)
+            if EffectiveSchedulingClass::from_kernel(state)
+                .is_expected_reactor_rr(state.reset_on_fork) =>
+        {
+            Ok(())
+        }
+        Ok(state) => {
+            // An RR thread without a slot would escape the budget teardown, so
+            // remove it before reporting the failed request.
+            let _ = set_scheduler_other_preserving_flags(tid);
+            let _ = RT_WORKER_ACTIVE[index].compare_exchange(
+                tid,
+                0,
+                Ordering::SeqCst,
+                Ordering::Relaxed,
+            );
+            Err(format!(
+                "SCHED_RR request did not verify (policy={} reset_on_fork={})",
+                EffectiveSchedulingClass::from_kernel(state).as_str(),
+                state.reset_on_fork
+            ))
+        }
+        Err(error) => {
+            let _ = set_scheduler_other_preserving_flags(tid);
+            let _ = RT_WORKER_ACTIVE[index].compare_exchange(
+                tid,
+                0,
+                Ordering::SeqCst,
+                Ordering::Relaxed,
+            );
+            Err(format!("SCHED_RR verification failed: {error}"))
+        }
+    }
+}
+
+/// Return every worker that holds RR to high-priority FAIR. Each slot is taken
+/// once, so repeated calls and a racing SIGXCPU claim cannot both demote it.
+fn demote_rt_workers(manager: &QosManager) {
+    for (index, role) in RT_WORKER_ROLES.into_iter().enumerate() {
+        let tid = RT_WORKER_ACTIVE[index].swap(0, Ordering::SeqCst);
+        if tid <= 0 {
+            continue;
+        }
+        let policy = set_scheduler_other_preserving_flags(tid);
+        let nice = set_nice(tid, HIGH_PRIORITY_NICE);
+        let degradation = policy
+            .err()
+            .or(nice.err())
+            .map(|error| format!("worker demotion failed: {error}"));
+        // The reactor may already hold the registry (for example during
+        // promotion), so a busy lock leaves the diagnostic row to be refreshed
+        // on the next read.
+        if let Ok(mut snapshots) = manager.snapshots.try_lock()
+            && let Some(snapshot) = snapshots.get_mut(&(role, tid))
+        {
+            set_requested_class(
+                snapshot,
+                SchedulingClass::requested_for(role, manager.baseline_nice),
+            );
+            refresh_rt_worker_snapshot(snapshot);
+            snapshot.degradation_reason = degradation;
+        }
+    }
+}
+
+/// Cycle-boundary follow-up for workers demoted by the SIGXCPU handler. The
+/// signal path only sets atomics; logging and registry updates happen here.
+pub fn observe_rt_worker_budget_events() {
+    let Some(manager) = MANAGER.get() else {
+        return;
+    };
+    for (index, role) in RT_WORKER_ROLES.into_iter().enumerate() {
+        if !RT_WORKER_OVERRUN[index].load(Ordering::Relaxed)
+            || RT_WORKER_OVERRUN_REPORTED[index].swap(true, Ordering::Relaxed)
+        {
+            continue;
+        }
+        let tid = RT_WORKER_TIDS[index].load(Ordering::Acquire);
+        let fallback = if tid > 0 {
+            set_nice(tid, HIGH_PRIORITY_NICE)
+        } else {
+            Err("worker TID is no longer registered".to_owned())
+        };
+        if tid > 0
+            && let Ok(mut snapshots) = manager.snapshots.try_lock()
+            && let Some(snapshot) = snapshots.get_mut(&(role, tid))
+        {
+            set_requested_class(
+                snapshot,
+                SchedulingClass::requested_for(role, manager.baseline_nice),
+            );
+            refresh_rt_worker_snapshot(snapshot);
+            snapshot.degradation_reason =
+                Some("demoted by SIGXCPU after RLIMIT_RTTIME budget".to_owned());
+        }
+        eprintln!(
+            "scheduling QoS: {} worker exceeded its {RT_BUDGET_US}us RT budget at monotonic_ns={}; demoted to SCHED_OTHER nice {} ({})",
+            role.as_str(),
+            crate::native::event_loop::monotonic_now_ns().unwrap_or(0),
+            HIGH_PRIORITY_NICE,
+            fallback
+                .as_ref()
+                .map_or_else(String::as_str, |()| "applied"),
+        );
+    }
+}
+
+fn unblock_sigxcpu_for_current_thread() {
+    let mut signal_set = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+    if unsafe { libc::sigemptyset(&mut signal_set) } != 0
+        || unsafe { libc::sigaddset(&mut signal_set, libc::SIGXCPU) } != 0
+    {
+        return;
+    }
+    // Workers inherit the creating thread's mask, which may block SIGXCPU
+    // while the reactor is mid-budget. A worker needs the signal so that an
+    // RR overrun is delivered to the overrunning thread.
+    let result =
+        unsafe { libc::pthread_sigmask(libc::SIG_UNBLOCK, &signal_set, std::ptr::null_mut()) };
+    if result != 0 {
+        eprintln!(
+            "scheduling QoS: cannot unblock SIGXCPU for realtime worker: {}",
+            io::Error::from_raw_os_error(result)
+        );
+    }
+}
+
 pub struct RoleRegistration {
     role: SchedulingThreadRole,
     tid: i32,
@@ -1263,6 +1535,20 @@ pub struct RoleRegistration {
 
 impl Drop for RoleRegistration {
     fn drop(&mut self) {
+        if let Some(index) = rt_worker_index(self.role) {
+            let _ = RT_WORKER_ACTIVE[index].compare_exchange(
+                self.tid,
+                0,
+                Ordering::SeqCst,
+                Ordering::Relaxed,
+            );
+            let _ = RT_WORKER_TIDS[index].compare_exchange(
+                self.tid,
+                0,
+                Ordering::SeqCst,
+                Ordering::Relaxed,
+            );
+        }
         if let Some(manager) = MANAGER.get()
             && let Ok(mut snapshots) = manager.snapshots.lock()
         {
@@ -1280,6 +1566,9 @@ pub fn register_current_thread_role(role: SchedulingThreadRole) -> RoleRegistrat
     );
     let tid = unsafe { libc::gettid() };
     if let Some(manager) = MANAGER.get() {
+        if rt_worker_index(role).is_some() && manager.rt_worker_enabled(role) {
+            unblock_sigxcpu_for_current_thread();
+        }
         let mut operations = LinuxSchedulingOperations { manager };
         let snapshot = configure_worker_policy(
             role,
@@ -1289,6 +1578,11 @@ pub fn register_current_thread_role(role: SchedulingThreadRole) -> RoleRegistrat
             &mut operations,
         );
         manager.record(snapshot);
+        // Publish the TID only after FAIR configuration. Reactor promotion may
+        // only see a worker whose own policy writes have finished.
+        if let Some(index) = rt_worker_index(role) {
+            RT_WORKER_TIDS[index].store(tid, Ordering::Release);
+        }
     }
     RoleRegistration { role, tid }
 }
@@ -1594,6 +1888,32 @@ pub fn diagnostic_snapshots() -> Vec<SchedulingDiagnosticSnapshot> {
         } else {
             snapshot.degradation_reason = Some("thread ended before diagnostic query".to_owned());
         }
+        if let Some(index) = rt_worker_index(snapshot.role) {
+            snapshot.demotion_count = RT_WORKER_DEMOTION_COUNT.load(Ordering::Relaxed);
+            snapshot.rt_budget_overrun = RT_WORKER_OVERRUN[index].load(Ordering::Relaxed);
+            if snapshot.rt_budget_overrun {
+                snapshot.degradation_reason =
+                    Some("demoted by SIGXCPU after RLIMIT_RTTIME budget".to_owned());
+            }
+            // The live slot decides whether a worker is still requested as RR,
+            // so a row written while the registry was busy cannot go stale.
+            let active = RT_WORKER_ACTIVE[index].load(Ordering::Relaxed) != 0;
+            let is_rr = matches!(
+                snapshot.requested_class,
+                SchedulingClass::RealtimeRoundRobin { .. }
+            );
+            if manager.policy != SchedulingQosPolicy::Off && active != is_rr {
+                let role = snapshot.role;
+                let class = if active {
+                    SchedulingClass::RealtimeRoundRobin {
+                        priority: REACTOR_RR_PRIORITY,
+                    }
+                } else {
+                    SchedulingClass::requested_for(role, manager.baseline_nice)
+                };
+                set_requested_class(snapshot, class);
+            }
+        }
         if snapshot.role == SchedulingThreadRole::NativeReactor {
             snapshot.demotion_count = RT_DEMOTION_COUNT.load(Ordering::Relaxed);
             snapshot.rt_budget_overrun = RT_BUDGET_OVERRUN.load(Ordering::Relaxed);
@@ -1628,6 +1948,20 @@ impl QosManager {
         if let Ok(mut snapshots) = self.snapshots.lock() {
             snapshots.insert((snapshot.role, snapshot.tid), snapshot);
         }
+    }
+
+    fn rt_worker_enabled(&self, role: SchedulingThreadRole) -> bool {
+        if self.policy == SchedulingQosPolicy::Off {
+            return false;
+        }
+        matches!(
+            (self.rt_workers, role),
+            (RtWorkerPolicy::Kms, SchedulingThreadRole::KmsCommit)
+                | (
+                    RtWorkerPolicy::All,
+                    SchedulingThreadRole::KmsCommit | SchedulingThreadRole::Render
+                )
+        )
     }
 
     fn prepare_rt_budget(&self, tid: i32) -> Result<(), String> {
@@ -1719,6 +2053,9 @@ impl QosManager {
         if !self.budget_active.swap(false, Ordering::AcqRel) {
             return false;
         }
+        // Workers may hold RR only under an armed budget. Demote them before the
+        // process-wide RLIMIT_RTTIME is restored below.
+        demote_rt_workers(self);
         RT_BUDGET_REACTOR_TID.store(0, Ordering::SeqCst);
         let mut signal_set = unsafe { std::mem::zeroed::<libc::sigset_t>() };
         if unsafe { libc::sigemptyset(&mut signal_set) } == 0
@@ -1956,7 +2293,47 @@ fn claim_reactor_for_sigxcpu(
         .ok()
 }
 
+/// Claim a worker whose RT budget overran. Like `claim_reactor_for_sigxcpu`, it
+/// publishes the sticky role overrun before clearing the target slot.
+fn claim_rt_worker_for_sigxcpu(
+    active: &[AtomicI32; 2],
+    overrun: &[AtomicBool; 2],
+    current_tid: i32,
+) -> Option<usize> {
+    if current_tid <= 0 {
+        return None;
+    }
+    let index = active
+        .iter()
+        .position(|slot| slot.load(Ordering::SeqCst) == current_tid)?;
+    overrun[index].store(true, Ordering::SeqCst);
+    active[index]
+        .compare_exchange(current_tid, 0, Ordering::SeqCst, Ordering::Relaxed)
+        .ok()
+        .map(|_| index)
+}
+
 extern "C" fn sigxcpu_demote(_signal: libc::c_int) {
+    // SAFETY: SYS_gettid is a side-effect-free raw syscall, safe in a handler.
+    let current_tid = unsafe { libc::syscall(libc::SYS_gettid) } as i32;
+    if claim_rt_worker_for_sigxcpu(&RT_WORKER_ACTIVE, &RT_WORKER_OVERRUN, current_tid).is_some() {
+        let parameter = libc::sched_param { sched_priority: 0 };
+        // SAFETY: Same raw scheduler syscall as the reactor path, applied only
+        // to the worker this handler just claimed.
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_sched_setscheduler,
+                current_tid,
+                SIGXCPU_DEMOTION_POLICY,
+                &parameter,
+            )
+        };
+        if result < 0 {
+            unsafe { libc::_exit(128 + libc::SIGXCPU) };
+        }
+        RT_WORKER_DEMOTION_COUNT.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
     let Some(tid) = claim_reactor_for_sigxcpu(&ACTIVE_REACTOR_TID, &RT_BUDGET_OVERRUN) else {
         return;
     };
@@ -2760,6 +3137,78 @@ mod tests {
             None
         );
         assert!(!budget_overrun.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn rt_worker_sigxcpu_claim_is_role_scoped_sticky_and_single_shot() {
+        let active = [AtomicI32::new(801), AtomicI32::new(0)];
+        let overrun = [AtomicBool::new(false), AtomicBool::new(false)];
+
+        assert_eq!(claim_rt_worker_for_sigxcpu(&active, &overrun, 801), Some(0));
+        assert!(overrun[0].load(Ordering::Acquire));
+        assert!(!overrun[1].load(Ordering::Acquire));
+        assert_eq!(active[0].load(Ordering::Acquire), 0);
+        assert_eq!(claim_rt_worker_for_sigxcpu(&active, &overrun, 801), None);
+
+        let active = [AtomicI32::new(0), AtomicI32::new(805)];
+        let overrun = [AtomicBool::new(false), AtomicBool::new(false)];
+        assert_eq!(claim_rt_worker_for_sigxcpu(&active, &overrun, 805), Some(1));
+        assert!(!overrun[0].load(Ordering::Acquire));
+        assert!(overrun[1].load(Ordering::Acquire));
+        assert_eq!(active[1].load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn rt_worker_claim_ignores_unknown_tids_and_empty_slots() {
+        let active = [AtomicI32::new(0), AtomicI32::new(0)];
+        let overrun = [AtomicBool::new(false), AtomicBool::new(false)];
+        assert_eq!(claim_rt_worker_for_sigxcpu(&active, &overrun, 806), None);
+        assert_eq!(claim_rt_worker_for_sigxcpu(&active, &overrun, 0), None);
+        assert!(!overrun[0].load(Ordering::Acquire));
+        assert!(!overrun[1].load(Ordering::Acquire));
+
+        let active = [AtomicI32::new(807), AtomicI32::new(808)];
+        assert_eq!(claim_rt_worker_for_sigxcpu(&active, &overrun, 809), None);
+        assert!(!overrun[0].load(Ordering::Acquire));
+        assert!(!overrun[1].load(Ordering::Acquire));
+        assert_eq!(active[0].load(Ordering::Acquire), 807);
+        assert_eq!(active[1].load(Ordering::Acquire), 808);
+    }
+
+    #[test]
+    fn rt_worker_overrun_is_sticky_before_its_slot_is_cleared() {
+        let source = include_str!("scheduling_qos.rs");
+        let claim = source
+            .split_once("fn claim_rt_worker_for_sigxcpu(")
+            .expect("worker claim helper exists")
+            .1
+            .split_once("extern \"C\" fn sigxcpu_demote")
+            .expect("worker claim helper precedes the handler")
+            .0;
+        let overrun = claim
+            .find("overrun[index].store(true")
+            .expect("worker overrun is published");
+        let slot_clear = claim
+            .find("active[index]")
+            .and_then(|start| claim[start..].find(".compare_exchange").map(|o| start + o))
+            .expect("worker slot is cleared atomically");
+        assert!(overrun < slot_clear);
+    }
+
+    #[test]
+    fn rt_workers_are_demoted_before_the_process_rt_limit_is_restored() {
+        let source = include_str!("scheduling_qos.rs");
+        let cleanup = source
+            .split_once("fn restore_rt_budget_for_reactor(&self, tid: i32)")
+            .expect("RT budget cleanup exists")
+            .1;
+        let demote = cleanup
+            .find("demote_rt_workers(self)")
+            .expect("workers are demoted during budget retirement");
+        let limit_restore = cleanup
+            .find("setrlimit(libc::RLIMIT_RTTIME, &original_rt_limit)")
+            .expect("process RT limit is restored");
+        assert!(demote < limit_restore);
     }
 
     #[test]

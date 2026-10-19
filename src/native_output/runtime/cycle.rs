@@ -476,6 +476,7 @@ impl NativeRuntime {
         while !self.shutdown.is_complete() {
             self.termination.set_phase(RuntimePhase::RuntimeCycle);
             oblivion_one::native::scheduling_qos::observe_rt_budget_event();
+            oblivion_one::native::scheduling_qos::observe_rt_worker_budget_events();
             self.run_cycle()?;
         }
         oblivion_one::native::scheduling_qos::demote_current_reactor();
