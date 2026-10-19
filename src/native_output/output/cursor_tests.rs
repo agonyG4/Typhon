@@ -10,6 +10,7 @@ use oblivion_one::native::kms::{
     AtomicPlaneProperties, DrmFormatModifierPair, PlanePropertyId, PropertyId,
 };
 use oblivion_one::native::scheduler::NativeFrameScheduler;
+use std::collections::VecDeque;
 
 fn property(id: u32) -> PlanePropertyId {
     PlanePropertyId(PropertyId::new(id).expect("test property id is nonzero"))
@@ -51,7 +52,8 @@ fn test_cursor() -> NativeAtomicCursor {
             }),
             retired: Vec::new(),
             theme_cache: None,
-            client_cache: None,
+            client_cache: VecDeque::new(),
+            free: Vec::new(),
         },
         plane: AtomicCursorPlaneProperties {
             plane_id: 4,
@@ -970,7 +972,10 @@ fn hardware_client_cursor_replacement_uses_new_commit_key_with_cached_buffer() {
         .current
         .take()
         .expect("test cursor owns a cached buffer");
-    cursor.resources.client_cache = Some((source_key, cached_buffer));
+    cursor
+        .resources
+        .client_cache
+        .push_front((source_key, cached_buffer));
 
     let image = Arc::new(
         CompositorCursorImage::from_argb8888(vec![0xff00_ff00; 64 * 64], 64, 64, 0, 0)
@@ -985,6 +990,203 @@ fn hardware_client_cursor_replacement_uses_new_commit_key_with_cached_buffer() {
     assert!(Arc::ptr_eq(&cursor.image, &image));
     assert_eq!(cursor.counters.image_cache_hits, 1);
     assert_eq!(cursor.counters.client_image_uploads, 0);
+}
+
+fn cursor_image_key(commit_sequence: u64) -> NativeCursorImageKey {
+    NativeCursorImageKey {
+        output_id: OutputId::from_raw(1).expect("nonzero output id"),
+        surface_id: 7,
+        buffer_id: 11,
+        commit_sequence,
+        hotspot_x: 0,
+        hotspot_y: 0,
+        width: 64,
+        height: 64,
+        buffer_scale: 1,
+        buffer_transform: 0,
+        output_scale_milli: 1_000,
+    }
+}
+
+/// Moves `current` to `to`, as `replace_image_with_source` does, without any
+/// DRM allocation. Returns whether the image came from a cache or the pool.
+fn switch_client_image(
+    resources: &mut AtomicCursorResources,
+    current_key: &mut NativeCursorSourceKey,
+    to: NativeCursorImageKey,
+    next_framebuffer: u32,
+) -> bool {
+    let to = NativeCursorSourceKey::Client(to);
+    let hit = resources.take_cached(to);
+    let reused = hit.is_some();
+    let next = hit.unwrap_or_else(|| fake_cursor_buffer(next_framebuffer, 64, 64));
+    if let Some(previous) = resources.current.replace(next) {
+        resources.cache_current(*current_key, previous);
+    }
+    *current_key = to;
+    reused
+}
+
+#[test]
+fn safe_retired_cursor_buffer_is_reused_for_the_next_same_size_image() {
+    let mut cursor = test_cursor();
+    cursor
+        .resources
+        .retired
+        .push(fake_cursor_buffer(92, 64, 64));
+
+    cursor.resources.retire_safe(&[Some(91)]);
+
+    assert!(cursor.resources.retired.is_empty());
+    assert_eq!(cursor.resources.free.len(), 1);
+    let image = Arc::new(
+        CompositorCursorImage::from_argb8888(vec![0xff00_ff00; 64 * 64], 64, 64, 0, 0)
+            .expect("test cursor image is valid"),
+    );
+    let key = cursor_image_key(200);
+    // /dev/null cannot create a DRM buffer, so a miss would fail this replacement.
+    let file = std::fs::File::open("/dev/null").expect("test file is available");
+    cursor
+        .replace_image(&file, image, key)
+        .expect("pooled buffer replaces the cursor image without DRM allocation");
+
+    assert_eq!(
+        cursor.resources.current.as_ref().unwrap().framebuffer.get(),
+        92
+    );
+    assert!(cursor.resources.free.is_empty());
+    assert_eq!(cursor.counters.image_uploads, 1);
+    assert_eq!(cursor.counters.pool_reuses, 1);
+    assert_eq!(cursor.counters.image_cache_hits, 0);
+}
+
+#[test]
+fn leased_or_kept_retired_cursor_buffers_are_not_pooled() {
+    let mut cursor = test_cursor();
+    let state = AtomicCursorVisualState {
+        framebuffer_id: Some(93),
+        visible: true,
+        ..AtomicCursorVisualState::hidden(64, 64)
+    };
+    cursor
+        .resources
+        .retired
+        .push(fake_cursor_buffer(93, 64, 64));
+    cursor
+        .resources
+        .retired
+        .push(fake_cursor_buffer(94, 64, 64));
+    let pin = cursor.pin_framebuffer_for(&state).unwrap();
+
+    cursor.resources.retire_safe(&[Some(94)]);
+    assert_eq!(cursor.resources.retired.len(), 2);
+    assert!(cursor.resources.free.is_empty());
+
+    drop(pin);
+    cursor.resources.retire_safe(&[Some(94)]);
+    assert_eq!(cursor.resources.retired.len(), 1);
+    assert_eq!(cursor.resources.retired[0].framebuffer.get(), 94);
+    assert_eq!(cursor.resources.free.len(), 1);
+    assert_eq!(cursor.resources.free[0].framebuffer.get(), 93);
+}
+
+#[test]
+fn client_cursor_cache_serves_a_cycle_of_three_images_after_the_first_round() {
+    let mut resources = AtomicCursorResources {
+        current: Some(fake_cursor_buffer(1, 64, 64)),
+        ..AtomicCursorResources::default()
+    };
+    let mut current_key = NativeCursorSourceKey::Client(cursor_image_key(0));
+    let keys = [
+        cursor_image_key(1),
+        cursor_image_key(2),
+        cursor_image_key(3),
+    ];
+
+    let first_round: Vec<bool> = keys
+        .iter()
+        .map(|key| switch_client_image(&mut resources, &mut current_key, *key, 10))
+        .collect();
+    let second_round: Vec<bool> = keys
+        .iter()
+        .map(|key| switch_client_image(&mut resources, &mut current_key, *key, 20))
+        .collect();
+
+    assert_eq!(first_round, [false, false, false]);
+    assert_eq!(second_round, [true, true, true]);
+    assert!(resources.retired.is_empty());
+}
+
+#[test]
+fn client_cursor_cache_evicts_least_recent_entry_into_retired() {
+    let mut resources = AtomicCursorResources {
+        current: Some(fake_cursor_buffer(1, 64, 64)),
+        ..AtomicCursorResources::default()
+    };
+    let mut current_key = NativeCursorSourceKey::Client(cursor_image_key(0));
+    for (index, framebuffer) in (1..=4_u64).zip(2_u32..) {
+        switch_client_image(
+            &mut resources,
+            &mut current_key,
+            cursor_image_key(index),
+            framebuffer,
+        );
+    }
+
+    // Keys 0..=3 fill the LRU and key 4 is current.
+    assert_eq!(resources.client_cache.len(), CLIENT_CURSOR_CACHE_CAPACITY);
+    assert!(resources.retired.is_empty());
+
+    switch_client_image(&mut resources, &mut current_key, cursor_image_key(5), 99);
+
+    assert_eq!(resources.client_cache.len(), CLIENT_CURSOR_CACHE_CAPACITY);
+    assert_eq!(resources.retired.len(), 1);
+    assert_eq!(resources.retired[0].framebuffer.get(), 1);
+    assert!(
+        resources
+            .client_cache
+            .iter()
+            .all(|(key, _)| *key != cursor_image_key(0))
+    );
+}
+
+#[test]
+fn cursor_buffer_cap_trims_only_the_pool() {
+    let mut resources = AtomicCursorResources {
+        current: Some(fake_cursor_buffer(1, 64, 64)),
+        ..AtomicCursorResources::default()
+    };
+    resources
+        .client_cache
+        .push_front((cursor_image_key(1), fake_cursor_buffer(2, 64, 64)));
+    resources
+        .client_cache
+        .push_front((cursor_image_key(2), fake_cursor_buffer(3, 64, 64)));
+    for framebuffer in 10..30 {
+        resources
+            .retired
+            .push(fake_cursor_buffer(framebuffer, 64, 64));
+    }
+
+    resources.retire_safe(&[Some(1), Some(2), Some(3)]);
+    assert_eq!(resources.retired.len(), 0);
+    assert_eq!(resources.free.len(), MAX_CURSOR_BUFFERS - 3);
+    assert_eq!(resources.client_cache.len(), 2);
+    assert!(resources.current.is_some());
+    // The newest five pooled buffers (25..=29) survive the trim.
+    assert_eq!(resources.free[0].framebuffer.get(), 25);
+}
+
+#[test]
+fn pinning_never_resolves_a_pooled_cursor_buffer() {
+    let mut resources = AtomicCursorResources::default();
+    resources.free.push(fake_cursor_buffer(77, 64, 64));
+
+    assert!(
+        resources
+            .pin_framebuffer(FramebufferId::new(77).unwrap())
+            .is_none()
+    );
 }
 
 #[test]

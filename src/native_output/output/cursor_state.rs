@@ -20,6 +20,9 @@ pub(crate) struct AtomicCursorDirty {
 pub(crate) struct AtomicCursorCounters {
     pub(crate) image_uploads: u64,
     pub(crate) client_image_uploads: u64,
+    /// Subset of `image_uploads` satisfied by recycling a pooled buffer
+    /// instead of a DRM allocation.
+    pub(crate) pool_reuses: u64,
     pub(crate) image_cache_hits: u64,
     pub(crate) position_submissions: u64,
     pub(crate) primary_submissions: u64,

@@ -1384,6 +1384,7 @@ impl NativeRuntime {
                         "atomic_cursor_image_uploads",
                         cursor.counters.image_uploads,
                     ),
+                    NativePerfField::u64("atomic_cursor_pool_reuses", cursor.counters.pool_reuses),
                     NativePerfField::u64(
                         "client_cursor_hw_image_uploads",
                         cursor.counters.client_image_uploads,

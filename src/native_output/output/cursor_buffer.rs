@@ -2,6 +2,7 @@
 
 use super::*;
 use oblivion_one::cursor_theme::CompositorCursorImage;
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -383,12 +384,23 @@ impl Drop for AtomicCursorBuffer {
     }
 }
 
+/// Upper bound on DRM cursor buffers owned by one output's resources. Only the
+/// recycle pool is trimmed to it: the other lists are bounded by construction
+/// and may hold buffers that are still on screen.
+pub(super) const MAX_CURSOR_BUFFERS: usize = 8;
+pub(super) const CLIENT_CURSOR_CACHE_CAPACITY: usize = 4;
+const CURSOR_POOL_PREWARM_COUNT: usize = 2;
+
 #[derive(Debug, Default)]
 pub(super) struct AtomicCursorResources {
     pub(super) current: Option<AtomicCursorBuffer>,
     pub(super) retired: Vec<AtomicCursorBuffer>,
     pub(super) theme_cache: Option<AtomicCursorBuffer>,
-    pub(super) client_cache: Option<(NativeCursorImageKey, AtomicCursorBuffer)>,
+    /// Most recently cached client image first.
+    pub(super) client_cache: VecDeque<(NativeCursorImageKey, AtomicCursorBuffer)>,
+    /// Buffers no KMS state or queued job references, oldest first. Same-size
+    /// images reuse these so a cursor image change is a memcpy.
+    pub(super) free: Vec<AtomicCursorBuffer>,
 }
 
 impl AtomicCursorResources {
@@ -398,10 +410,13 @@ impl AtomicCursorResources {
     ) -> Option<AtomicCursorBuffer> {
         match source_key {
             NativeCursorSourceKey::Theme => self.theme_cache.take(),
-            NativeCursorSourceKey::Client(key) => self
-                .client_cache
-                .take()
-                .and_then(|(cached_key, buffer)| (cached_key == key).then_some(buffer)),
+            NativeCursorSourceKey::Client(key) => {
+                let index = self
+                    .client_cache
+                    .iter()
+                    .position(|(cached_key, _)| *cached_key == key)?;
+                self.client_cache.remove(index).map(|(_, buffer)| buffer)
+            }
         }
     }
 
@@ -417,24 +432,23 @@ impl AtomicCursorResources {
                 }
             }
             NativeCursorSourceKey::Client(key) => {
-                if let Some((previous_key, previous)) = self.client_cache.replace((key, buffer))
-                    && previous_key != key
+                // Evicted buffers may still be on screen, so they only move to
+                // `retired`; retirement decides when they become reusable.
+                if let Some(index) = self
+                    .client_cache
+                    .iter()
+                    .position(|(cached_key, _)| *cached_key == key)
+                    && let Some((_, stale)) = self.client_cache.remove(index)
                 {
-                    self.retired.push(previous);
+                    self.retired.push(stale);
+                }
+                self.client_cache.push_front((key, buffer));
+                while self.client_cache.len() > CLIENT_CURSOR_CACHE_CAPACITY {
+                    if let Some((_, evicted)) = self.client_cache.pop_back() {
+                        self.retired.push(evicted);
+                    }
                 }
             }
-        }
-    }
-
-    pub(super) fn retire_cached_mismatch(&mut self, source_key: NativeCursorSourceKey) {
-        if let NativeCursorSourceKey::Client(key) = source_key
-            && self
-                .client_cache
-                .as_ref()
-                .is_some_and(|(cached_key, _)| *cached_key != key)
-            && let Some((_, buffer)) = self.client_cache.take()
-        {
-            self.retired.push(buffer);
         }
     }
 
@@ -444,14 +458,58 @@ impl AtomicCursorResources {
         }
     }
 
+    /// Takes a pooled buffer of the requested size. Pooled buffers are never
+    /// presented or leased, so the caller may overwrite them.
+    pub(super) fn take_free(&mut self, width: u32, height: u32) -> Option<AtomicCursorBuffer> {
+        let index = self
+            .free
+            .iter()
+            .rposition(|buffer| buffer.width == width && buffer.height == height)?;
+        let buffer = self.free.remove(index);
+        debug_assert_eq!(Arc::strong_count(&buffer.lease), 1);
+        Some(buffer)
+    }
+
+    /// Moves retired buffers that KMS and queued jobs no longer reference into
+    /// the pool. Each buffer keeps its DRM framebuffer, so moving it is not a
+    /// DRM allocation or retirement.
     pub(super) fn retire_safe(&mut self, keep: &[Option<u32>]) {
-        self.retired.retain(|buffer| {
-            Arc::strong_count(&buffer.lease) > 1
-                || keep
-                    .iter()
-                    .flatten()
-                    .any(|framebuffer| *framebuffer == buffer.framebuffer.get())
-        });
+        let (safe, pending): (Vec<_>, Vec<_>) = std::mem::take(&mut self.retired)
+            .into_iter()
+            .partition(|buffer| {
+                !(Arc::strong_count(&buffer.lease) > 1
+                    || keep
+                        .iter()
+                        .flatten()
+                        .any(|framebuffer| *framebuffer == buffer.framebuffer.get()))
+            });
+        self.retired = pending;
+        self.free.extend(safe);
+        self.trim_free_pool();
+    }
+
+    /// Drops the oldest pooled buffers so the owned total stays within the cap.
+    pub(super) fn trim_free_pool(&mut self) {
+        let owned_outside_pool = usize::from(self.current.is_some())
+            + usize::from(self.theme_cache.is_some())
+            + self.client_cache.len()
+            + self.retired.len();
+        let allowed = MAX_CURSOR_BUFFERS.saturating_sub(owned_outside_pool);
+        if self.free.len() > allowed {
+            let excess = self.free.len() - allowed;
+            self.free.drain(..excess);
+        }
+    }
+
+    /// Best effort: spare buffers let the first image changes after startup
+    /// avoid DRM allocation on the reactor.
+    pub(super) fn prewarm_free(&mut self, file: &fs::File, width: u32, height: u32) {
+        for _ in 0..CURSOR_POOL_PREWARM_COUNT {
+            let Ok(buffer) = AtomicCursorBuffer::create(file, width, height) else {
+                break;
+            };
+            self.free.push(buffer);
+        }
     }
 
     pub(super) fn pin_framebuffer(
@@ -465,9 +523,9 @@ impl AtomicCursorResources {
             .or_else(|| self.theme_cache.as_ref().filter(|buffer| matches(buffer)))
             .or_else(|| {
                 self.client_cache
-                    .as_ref()
+                    .iter()
                     .map(|(_, buffer)| buffer)
-                    .filter(|buffer| matches(buffer))
+                    .find(|buffer| matches(buffer))
             })
             .or_else(|| self.retired.iter().find(|buffer| matches(buffer)))
             .map(|buffer| CursorFramebufferPin {
@@ -483,11 +541,41 @@ impl AtomicCursorResources {
         if let Some(theme) = self.theme_cache.as_mut() {
             theme.disarm_drm_cleanup();
         }
-        if let Some((_, client)) = self.client_cache.as_mut() {
+        for (_, client) in &mut self.client_cache {
             client.disarm_drm_cleanup();
         }
-        for retired in &mut self.retired {
-            retired.disarm_drm_cleanup();
+        for buffer in self.retired.iter_mut().chain(self.free.iter_mut()) {
+            buffer.disarm_drm_cleanup();
         }
+    }
+}
+
+#[cfg(test)]
+pub(super) fn fake_cursor_buffer(framebuffer: u32, width: u32, height: u32) -> AtomicCursorBuffer {
+    let pitch = width * 4;
+    let size = pitch as usize * height as usize;
+    let mapping = unsafe {
+        libc::mmap(
+            ptr::null_mut(),
+            size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    assert_ne!(mapping, libc::MAP_FAILED);
+    AtomicCursorBuffer {
+        fd: -1,
+        handle: 1,
+        framebuffer: FramebufferId::new(framebuffer).expect("test framebuffer is nonzero"),
+        width,
+        height,
+        pitch,
+        size,
+        mapping,
+        drm_cleanup_armed: false,
+        image_owner: None,
+        lease: Arc::new(()),
     }
 }

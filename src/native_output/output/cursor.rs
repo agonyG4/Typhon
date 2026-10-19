@@ -163,6 +163,11 @@ impl NativeAtomicCursor {
             return Err(error);
         }
         let state = atomic_cursor_state_for_image(&image, Some(buffer.framebuffer.get()));
+        let mut resources = AtomicCursorResources {
+            current: Some(buffer),
+            ..AtomicCursorResources::default()
+        };
+        resources.prewarm_free(file, width, height);
         Ok(Self {
             image: image.clone(),
             theme_image: image,
@@ -170,12 +175,7 @@ impl NativeAtomicCursor {
             desired: state.clone(),
             submitted: state.clone(),
             current: state,
-            resources: AtomicCursorResources {
-                current: Some(buffer),
-                retired: Vec::new(),
-                theme_cache: None,
-                client_cache: None,
-            },
+            resources,
             plane,
             generation,
             output_id: output.output_id,
@@ -794,34 +794,42 @@ impl NativeAtomicCursor {
         image: Arc<CompositorCursorImage>,
         source_key: NativeCursorSourceKey,
     ) -> io::Result<()> {
-        self.resources.retire_cached_mismatch(source_key);
         let mut replacement = self.resources.take_cached(source_key);
         let cache_hit = replacement.is_some();
+        let mut reused_from_pool = false;
         if replacement.is_none() {
-            replacement = Some(AtomicCursorBuffer::create(
-                file,
-                self.resources
-                    .current
-                    .as_ref()
-                    .map_or(self.image.width, |buffer| buffer.width),
-                self.resources
-                    .current
-                    .as_ref()
-                    .map_or(self.image.height, |buffer| buffer.height),
-            )?);
-            if let Err(error) = replacement
-                .as_mut()
-                .expect("new cursor buffer is present")
-                .upload_image(&image)
-            {
-                drop(replacement);
+            let width = self
+                .resources
+                .current
+                .as_ref()
+                .map_or(self.image.width, |buffer| buffer.width);
+            let height = self
+                .resources
+                .current
+                .as_ref()
+                .map_or(self.image.height, |buffer| buffer.height);
+            let mut buffer = match self.resources.take_free(width, height) {
+                Some(buffer) => {
+                    reused_from_pool = true;
+                    buffer
+                }
+                None => AtomicCursorBuffer::create(file, width, height)?,
+            };
+            if let Err(error) = buffer.upload_image(&image) {
+                if reused_from_pool {
+                    self.resources.free.push(buffer);
+                } else {
+                    drop(buffer);
+                }
                 return Err(error);
             }
+            replacement = Some(buffer);
         }
         if let Some(previous) = self.resources.current.take() {
             self.resources.cache_current(self.source_key, previous);
         }
         self.resources.current = replacement;
+        self.resources.trim_free_pool();
         let framebuffer_id = self
             .resources
             .current
@@ -832,6 +840,9 @@ impl NativeAtomicCursor {
             self.counters.image_cache_hits = self.counters.image_cache_hits.saturating_add(1);
         } else {
             self.counters.image_uploads = self.counters.image_uploads.saturating_add(1);
+            if reused_from_pool {
+                self.counters.pool_reuses = self.counters.pool_reuses.saturating_add(1);
+            }
             if matches!(source_key, NativeCursorSourceKey::Client(_)) {
                 self.counters.client_image_uploads =
                     self.counters.client_image_uploads.saturating_add(1);
