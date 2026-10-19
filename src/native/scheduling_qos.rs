@@ -47,7 +47,7 @@ pub(crate) enum RtWorkerPolicy {
 
 impl RtWorkerPolicy {
     pub(crate) fn parse(value: Option<&str>) -> Result<Self, String> {
-        match value.unwrap_or("off") {
+        match value.unwrap_or("kms") {
             "off" => Ok(Self::Off),
             "kms" => Ok(Self::Kms),
             "all" => Ok(Self::All),
@@ -61,8 +61,8 @@ mod scheduling_qos_policy_tests {
     use super::{RtWorkerPolicy, SchedulingQosPolicy};
 
     #[test]
-    fn rt_worker_policy_defaults_to_off_and_accepts_only_known_values() {
-        assert_eq!(RtWorkerPolicy::parse(None), Ok(RtWorkerPolicy::Off));
+    fn rt_worker_policy_defaults_to_kms_and_accepts_only_known_values() {
+        assert_eq!(RtWorkerPolicy::parse(None), Ok(RtWorkerPolicy::Kms));
         assert_eq!(RtWorkerPolicy::parse(Some("off")), Ok(RtWorkerPolicy::Off));
         assert_eq!(RtWorkerPolicy::parse(Some("kms")), Ok(RtWorkerPolicy::Kms));
         assert_eq!(RtWorkerPolicy::parse(Some("all")), Ok(RtWorkerPolicy::All));

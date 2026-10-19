@@ -40,7 +40,7 @@ Environment:
   OBLIVION_ONE_CURSOR_SCHEDULING cursor output scheduling: auto, piggyback, or software
   OBLIVION_ONE_SCANOUT_BACKEND native scanout: auto, gpu/native-egl-gbm (explicit Atomic), native-egl-gbm-opaque (rollback), gbm-cpu-write/cpu, or dumb
   OBLIVION_ONE_NATIVE_APP_GPU  native apps: auto, gpu, or cpu
-  OBLIVION_ONE_RT_WORKERS off (default), kms, or all; opt-in SCHED_RR for KMS commit/render workers
+  OBLIVION_ONE_RT_WORKERS kms (default), all, or off rollback; SCHED_RR for KMS commit/render workers
   OBLIVION_ONE_PROFILE   auto, debug, or release (default: auto; native uses release)
   OBLIVION_ONE_BINARY    optional release binary path (default: repo target/release/oblivion-one)
   OBLIVION_ONE_PERF_LOG  set to 1/true/debug to emit structured native perf logs

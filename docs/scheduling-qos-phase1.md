@@ -46,15 +46,18 @@ holds the registry during a doctor request, the response samples the reactor's
 kernel state directly and returns a registry-busy reason; worker rows are
 omitted for that response instead of waiting on the worker.
 
-## Opt-in realtime KMS and render workers
+## Realtime KMS and render workers
 
-`OBLIVION_ONE_RT_WORKERS` is opt-in and defaults to `off`. `kms` raises the KMS
+`OBLIVION_ONE_RT_WORKERS` defaults to `kms`; `off` is the rollback. `kms` raises the KMS
 commit worker to verified `SCHED_RR` priority 1 with `SCHED_RESET_ON_FORK`, and
 `all` also raises the render worker. It applies only when
 `OBLIVION_ONE_SCHEDULING_QOS` is `auto` or `require`; with QoS `off` no worker
 is changed. Under load, FAIR workers can wait for CPU for a large fraction of
 each second while the RR reactor waits almost not at all, which is why the
-workers can be promoted.
+workers can be promoted. Measured under 24 stress-ng CPU workers on 12 cores,
+`kms` cut the KMS worker's run-queue wait from about 61 ms/s to 0.5 ms/s at p95.
+`all` stays opt-in until reactor RT-budget overruns are fixed, because an
+overrun retires the budget and demotes every worker with it.
 
 Workers use the reactor's RT budget and SIGXCPU fail-safe. The reactor arms
 the budget first and applies worker RR only after its own RR state verifies.
