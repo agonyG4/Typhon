@@ -1,4 +1,5 @@
 mod child_signal;
+mod child_stdio;
 
 pub use child_signal::prepare_child_signal_mask;
 
@@ -505,6 +506,7 @@ impl ChildSupervisor {
         }
         let id = self.allocate_process_id()?;
         child_signal::prepare_child_signal_mask(command);
+        child_stdio::isolate_child_stdio_pipes(command);
         crate::native::scheduling_qos::prepare_child_scheduling(command);
         let mut child = command.spawn()?;
         let stderr = child.stderr.take().map(|stderr| {
