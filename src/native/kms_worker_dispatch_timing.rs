@@ -5,6 +5,7 @@
 use std::collections::VecDeque;
 
 const SAMPLE_CAPACITY: usize = 120;
+const WARM_PAIRED_SAMPLES: usize = 20;
 pub const DISPATCH_GUARD_NS: u64 = 50_000;
 const DISPATCH_TAIL_SAFETY_QUANTUM_NS: u64 = 50_000;
 const DISPATCH_TAIL_CLEAN_STREAK: u32 = 32;
@@ -49,6 +50,8 @@ pub struct KmsWorkerDispatchModel {
     pre_submit_ns: VecDeque<u64>,
     ioctl_duration_ns: VecDeque<u64>,
     dispatch_duration_ns: VecDeque<u64>,
+    wake_plus_dispatch_ns: VecDeque<u64>,
+    pending_wake_lateness_ns: Option<u64>,
     adaptive_tail_guard_ns: u64,
     clean_completion_streak: u32,
     clean_streak_limit: u32,
@@ -65,6 +68,8 @@ impl Default for KmsWorkerDispatchModel {
             pre_submit_ns: VecDeque::with_capacity(SAMPLE_CAPACITY),
             ioctl_duration_ns: VecDeque::with_capacity(SAMPLE_CAPACITY),
             dispatch_duration_ns: VecDeque::with_capacity(SAMPLE_CAPACITY),
+            wake_plus_dispatch_ns: VecDeque::with_capacity(SAMPLE_CAPACITY),
+            pending_wake_lateness_ns: None,
             adaptive_tail_guard_ns: 0,
             clean_completion_streak: 0,
             clean_streak_limit: DISPATCH_TAIL_CLEAN_STREAK,
@@ -91,6 +96,8 @@ impl KmsWorkerDispatchModel {
         self.pre_submit_ns.clear();
         self.ioctl_duration_ns.clear();
         self.dispatch_duration_ns.clear();
+        self.wake_plus_dispatch_ns.clear();
+        self.pending_wake_lateness_ns = None;
         self.adaptive_tail_guard_ns = 0;
         self.clean_completion_streak = 0;
         self.clean_streak_limit = CURSOR_DISPATCH_TAIL_CLEAN_STREAK;
@@ -136,18 +143,35 @@ impl KmsWorkerDispatchModel {
         push_bounded(&mut self.pre_submit_ns, pre_submit_ns);
         push_bounded(&mut self.ioctl_duration_ns, ioctl_duration_ns);
         push_bounded(&mut self.dispatch_duration_ns, dispatch_duration_ns);
+        // A timed wake is recorded immediately before its own job's service, so
+        // the pending wake is the same job's; the combined sample pairs them.
+        if let Some(wake_lateness_ns) = self.pending_wake_lateness_ns.take() {
+            push_bounded(
+                &mut self.wake_plus_dispatch_ns,
+                wake_lateness_ns.saturating_add(dispatch_duration_ns),
+            );
+        }
     }
 
     pub fn record_fixed_timed_wake(&mut self, lateness_ns: u64) {
         push_bounded(&mut self.wake_lateness_ns, lateness_ns);
+        self.pending_wake_lateness_ns = Some(lateness_ns);
     }
 
     pub fn budget(&self) -> KmsWorkerDispatchBudget {
         let wake_lateness_ns = nearest_rank(&self.wake_lateness_ns, 95);
         let pre_submit_ns = nearest_rank(&self.pre_submit_ns, 95);
         let ioctl_duration_ns = nearest_rank(&self.ioctl_duration_ns, 95);
-        let dispatch_budget_ns = wake_lateness_ns
-            .saturating_add(nearest_rank(&self.dispatch_duration_ns, 95))
+        let dispatch_p95_ns = nearest_rank(&self.dispatch_duration_ns, 95);
+        // Warm: the p95 of the paired wake+dispatch sum, not the sum of two
+        // independent p95s (their tails rarely coincide). Cold: keep the
+        // conservative sum until enough paired samples exist.
+        let dispatch_tail_ns = if self.wake_plus_dispatch_ns.len() >= WARM_PAIRED_SAMPLES {
+            nearest_rank(&self.wake_plus_dispatch_ns, 95).max(dispatch_p95_ns)
+        } else {
+            wake_lateness_ns.saturating_add(dispatch_p95_ns)
+        };
+        let dispatch_budget_ns = dispatch_tail_ns
             .saturating_add(DISPATCH_GUARD_NS)
             .saturating_add(self.adaptive_tail_guard_ns);
         KmsWorkerDispatchBudget {
@@ -225,10 +249,12 @@ impl KmsWorkerDispatchModel {
         let pre_submit_floor = self.pre_submit_ns.back().copied().unwrap_or(0);
         let ioctl_floor = self.ioctl_duration_ns.back().copied().unwrap_or(0);
         let dispatch_floor = self.dispatch_duration_ns.back().copied().unwrap_or(0);
+        let wake_plus_dispatch_floor = self.wake_plus_dispatch_ns.back().copied().unwrap_or(0);
         decay_samples_toward(&mut self.wake_lateness_ns, wake_floor);
         decay_samples_toward(&mut self.pre_submit_ns, pre_submit_floor);
         decay_samples_toward(&mut self.ioctl_duration_ns, ioctl_floor);
         decay_samples_toward(&mut self.dispatch_duration_ns, dispatch_floor);
+        decay_samples_toward(&mut self.wake_plus_dispatch_ns, wake_plus_dispatch_floor);
     }
 }
 
@@ -387,7 +413,7 @@ mod tests {
             first_binding_fixed_budget.wake_lateness_ns,
             fixed_wake_lateness
         );
-        assert_eq!(first_binding_fixed_budget.dispatch_budget_ns, 475_000);
+        assert_eq!(first_binding_fixed_budget.dispatch_budget_ns, 500_000);
     }
 
     #[test]
@@ -471,5 +497,62 @@ mod tests {
         assert!(observation.dequeued_before_planned_wake);
         assert!(!observation.fair_dispatch_chance);
         assert!(!observation.increased);
+    }
+
+    #[test]
+    fn cold_paired_history_keeps_the_sum_of_percentiles_budget() {
+        let mut model = KmsWorkerDispatchModel::default();
+        for _ in 0..(WARM_PAIRED_SAMPLES - 1) {
+            model.record_fixed_timed_wake(1_000_000);
+            model.record_worker_service(0, 0, 100_000);
+        }
+
+        // Cold: fewer than WARM_PAIRED_SAMPLES combined samples keeps the old sum.
+        assert_eq!(
+            model.budget().dispatch_budget_ns,
+            1_000_000 + 100_000 + DISPATCH_GUARD_NS
+        );
+    }
+
+    #[test]
+    fn warm_budget_uses_p95_of_paired_sums_when_tails_are_on_different_jobs() {
+        let mut model = KmsWorkerDispatchModel::default();
+        for job in 0..100u64 {
+            // Six wake tails on jobs 0..6, six dispatch tails on jobs 50..56.
+            let wake = if job < 6 { 1_000_000 } else { 10_000 };
+            let dispatch = if (50..56).contains(&job) {
+                1_000_000
+            } else {
+                100_000
+            };
+            model.record_fixed_timed_wake(wake);
+            model.record_worker_service(0, 0, dispatch);
+        }
+
+        let budget = model.budget();
+        let sum_of_p95 = budget.wake_lateness_ns + 1_000_000 + DISPATCH_GUARD_NS;
+        // Paired sums: 88 at 110 us, 6 at 1.01 ms (dispatch tail), 6 at 1.1 ms
+        // (wake tail); the p95 rank lands on 1.1 ms.
+        assert_eq!(budget.dispatch_budget_ns, 1_100_000 + DISPATCH_GUARD_NS);
+        assert!(budget.dispatch_budget_ns < sum_of_p95);
+        assert!(budget.dispatch_budget_ns >= 1_000_000 + DISPATCH_GUARD_NS);
+    }
+
+    #[test]
+    fn warm_budget_matches_combined_p95_when_tails_coincide() {
+        let mut model = KmsWorkerDispatchModel::default();
+        for job in 0..100u64 {
+            let tail = job < 6;
+            let wake = if tail { 1_000_000 } else { 10_000 };
+            let dispatch = if tail { 1_000_000 } else { 100_000 };
+            model.record_fixed_timed_wake(wake);
+            model.record_worker_service(0, 0, dispatch);
+        }
+
+        // Six jobs at 2 ms combined, the rest at 110 us: p95 of sums is 2 ms.
+        assert_eq!(
+            model.budget().dispatch_budget_ns,
+            2_000_000 + DISPATCH_GUARD_NS
+        );
     }
 }
