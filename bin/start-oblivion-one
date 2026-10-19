@@ -147,7 +147,11 @@ mkdir -p -- "$(dirname -- "$log_file")"
     printf ' %q' "${command[@]}"
     printf '\n'
 } >>"$log_file"
-exec >> >(tee -a "$log_file") 2>&1
+# Session teardown signals the whole process group. The log relay must outlive
+# the compositor's cleanup: once it dies, stderr writes fail with EPIPE, which
+# Rust print macros turn into a panic during native teardown. The relay still
+# exits at EOF after the compositor and its children close the pipe.
+exec >> >(trap '' HUP INT TERM; exec tee -a "$log_file") 2>&1
 
 observer_script="$script_dir/observe-compositor-exit.py"
 if command -v python3 >/dev/null 2>&1 && [[ -r "$observer_script" ]]; then

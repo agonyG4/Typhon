@@ -336,3 +336,78 @@ fn install_launcher_adds_tty_start_symlink_for_user_install() {
     assert!(tty_link_exists);
     assert!(String::from_utf8_lossy(&output.stdout).contains("start-oblivion-one-tty"));
 }
+
+#[test]
+fn start_launcher_log_relay_outlives_session_group_signals() {
+    use std::os::unix::{fs::PermissionsExt, process::CommandExt};
+    use std::time::{Duration, Instant};
+
+    let repo_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let test_dir = repo_dir
+        .join("target")
+        .join("start-launcher-tests")
+        .join(format!("log-relay-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&test_dir);
+    fs::create_dir_all(&test_dir).expect("test directory should be created");
+    let fake_binary = test_dir.join("fake-oblivion-one");
+    let log_file = test_dir.join("session.log");
+    fs::write(
+        &fake_binary,
+        "#!/usr/bin/env bash\n\
+         stop=0\n\
+         trap 'stop=1' TERM HUP\n\
+         echo 'fake compositor: running' >&2\n\
+         while [[ $stop == 0 ]]; do sleep 0.05; done\n\
+         sleep 0.2\n\
+         echo 'fake compositor: cleanup summary' >&2\n",
+    )
+    .expect("fake compositor should be written");
+    fs::set_permissions(&fake_binary, fs::Permissions::from_mode(0o755))
+        .expect("fake compositor should be executable");
+
+    let mut launcher = Command::new(repo_dir.join("bin/start-oblivion-one"))
+        .env("OBLIVION_ONE_BINARY", &fake_binary)
+        .env("OBLIVION_ONE_STATE_DIR", &test_dir)
+        .env("OBLIVION_ONE_LOG_FILE", &log_file)
+        .env("OBLIVION_ONE_SKIP_INPUT_GROUP_CHECK", "1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .expect("start launcher should run");
+    let process_group = launcher.id() as libc::pid_t;
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !fs::read_to_string(&log_file)
+        .unwrap_or_default()
+        .contains("fake compositor: running")
+    {
+        assert!(Instant::now() < deadline, "fake compositor did not start");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // Session scope teardown delivers SIGTERM and SIGHUP to every member.
+    unsafe {
+        libc::kill(-process_group, libc::SIGTERM);
+        libc::kill(-process_group, libc::SIGHUP);
+    }
+    let status = launcher.wait().expect("launcher should exit");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut log = String::new();
+    while Instant::now() < deadline {
+        log = fs::read_to_string(&log_file).unwrap_or_default();
+        if log.contains("fake compositor: cleanup summary") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let _ = fs::remove_dir_all(&test_dir);
+
+    assert!(
+        status.success(),
+        "launcher exited with {status}; log:\n{log}"
+    );
+    assert!(
+        log.contains("fake compositor: cleanup summary"),
+        "cleanup output after session signals was lost; log:\n{log}"
+    );
+}
