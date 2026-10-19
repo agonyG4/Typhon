@@ -1223,9 +1223,25 @@ pub fn observe_rt_budget_event() -> bool {
     if !RT_BUDGET_OVERRUN.load(Ordering::Relaxed) {
         return false;
     }
-    manager.restore_rt_budget_for_reactor(current_tid().unwrap_or(0));
-    if let Ok(tid) = current_tid()
-        && let Ok(state) = inspect_kernel_state(tid)
+    let Ok(tid) = current_tid() else {
+        return false;
+    };
+    if !manager.restore_rt_budget_for_reactor(tid) {
+        return false;
+    }
+    // The signal path can only drop to plain SCHED_OTHER. Land on the
+    // high-priority FAIR step of the reactor fallback ladder so input and
+    // cursor service do not compete with ordinary application threads.
+    let fallback = set_nice(tid, HIGH_PRIORITY_NICE);
+    eprintln!(
+        "scheduling QoS: reactor exceeded its {RT_BUDGET_US}us RT budget at monotonic_ns={}; demoted to SCHED_OTHER nice {} ({})",
+        crate::native::event_loop::monotonic_now_ns().unwrap_or(0),
+        HIGH_PRIORITY_NICE,
+        fallback
+            .as_ref()
+            .map_or_else(String::as_str, |()| "applied"),
+    );
+    if let Ok(state) = inspect_kernel_state(tid)
         && let Ok(mut snapshots) = manager.snapshots.try_lock()
         && let Some(snapshot) = snapshots.get_mut(&(SchedulingThreadRole::NativeReactor, tid))
     {
@@ -1694,13 +1710,14 @@ impl QosManager {
         Ok(())
     }
 
-    fn restore_rt_budget_for_reactor(&self, tid: i32) {
+    /// Returns true only for the call that retired an active budget.
+    fn restore_rt_budget_for_reactor(&self, tid: i32) -> bool {
         if tid <= 0 || RT_BUDGET_REACTOR_TID.load(Ordering::Acquire) != tid {
-            return;
+            return false;
         }
         let _ = ACTIVE_REACTOR_TID.compare_exchange(tid, 0, Ordering::SeqCst, Ordering::Relaxed);
         if !self.budget_active.swap(false, Ordering::AcqRel) {
-            return;
+            return false;
         }
         RT_BUDGET_REACTOR_TID.store(0, Ordering::SeqCst);
         let mut signal_set = unsafe { std::mem::zeroed::<libc::sigset_t>() };
@@ -1740,6 +1757,7 @@ impl QosManager {
                 );
             }
         }
+        true
     }
 }
 
