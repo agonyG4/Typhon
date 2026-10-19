@@ -1,5 +1,14 @@
 use super::*;
 
+pub(super) const fn scene_visual_debt_has_external_wake_owner(
+    page_flip_pending: bool,
+    atomic_commit_pending: bool,
+    output_render_fence_pending: bool,
+    render_worker_busy: bool,
+) -> bool {
+    page_flip_pending || atomic_commit_pending || output_render_fence_pending || render_worker_busy
+}
+
 impl NativeRuntime {
     pub(super) fn arm_runtime_deadline(&mut self) -> NativeResult<()> {
         let now_ns = monotonic_now_ns()?;
@@ -38,9 +47,16 @@ impl NativeRuntime {
             self.last_rendered_scene_generation,
             self.server.scene_render_generation(),
         );
-        let scene_visual_debt_has_external_wake_owner = self.scanout.page_flip_pending()
-            || self.atomic_commit_arbiter.atomic_commit_pending()
-            || self.output_render_fence_token.is_some();
+        // An in-flight render-worker job wakes the reactor through its event
+        // fd when it completes. Without counting it, every cycle during a
+        // render re-requested an immediate continuation and the reactor spun
+        // for the whole render, up to ~1 s while a game saturated the GPU.
+        let scene_visual_debt_has_external_wake_owner = scene_visual_debt_has_external_wake_owner(
+            self.scanout.page_flip_pending(),
+            self.atomic_commit_arbiter.atomic_commit_pending(),
+            self.output_render_fence_token.is_some(),
+            self.scanout.render_worker_busy(),
+        );
         let scene_visual_debt_continuation = visual_scene_debt
             && scheduler_wake_requirement.is_none()
             && !scene_visual_debt_has_external_wake_owner;
@@ -141,6 +157,8 @@ impl NativeRuntime {
                     "external:pageflip"
                 } else if self.atomic_commit_arbiter.atomic_commit_pending() {
                     "external:atomic_commit"
+                } else if self.scanout.render_worker_busy() {
+                    "external:render_worker"
                 } else {
                     "external:render_fence"
                 }
@@ -194,5 +212,23 @@ mod output_configuration_scheduler_tests {
             gate_scheduler_for_output_configuration(false, scheduler),
             scheduler
         );
+    }
+}
+
+#[cfg(test)]
+mod scene_visual_debt_wake_owner_tests {
+    use super::scene_visual_debt_has_external_wake_owner;
+
+    #[test]
+    fn busy_render_worker_owns_the_scene_debt_wake() {
+        assert!(scene_visual_debt_has_external_wake_owner(
+            false, false, false, true
+        ));
+        assert!(!scene_visual_debt_has_external_wake_owner(
+            false, false, false, false
+        ));
+        assert!(scene_visual_debt_has_external_wake_owner(
+            true, false, false, false
+        ));
     }
 }
