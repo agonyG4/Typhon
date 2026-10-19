@@ -9,6 +9,7 @@ use crate::native::buffering::{
 };
 use crate::native::presentation_deadline::{MonotonicTimestampNs, PresentationTarget};
 use crate::native::scheduler::NativeOutputPacingMode;
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::time::Duration;
 
@@ -292,7 +293,7 @@ pub struct RenderPrediction {
 
 #[derive(Debug)]
 struct BranchRiskHistory {
-    samples_ns: VecDeque<u64>,
+    samples_ns: RankedHistory<95>,
     ewma_ns: u64,
     upper_positive_deviation_ns: u64,
     last_sample_at: Option<MonotonicTimestampNs>,
@@ -308,7 +309,7 @@ struct BranchRiskSelection {
 impl Default for BranchRiskHistory {
     fn default() -> Self {
         Self {
-            samples_ns: VecDeque::with_capacity(SAMPLE_CAPACITY),
+            samples_ns: RankedHistory::new(),
             ewma_ns: 0,
             upper_positive_deviation_ns: 0,
             last_sample_at: None,
@@ -335,12 +336,12 @@ impl BranchRiskHistory {
             self.ewma_ns = sample_ns;
             self.upper_positive_deviation_ns = 0;
         }
-        push_bounded(&mut self.samples_ns, sample_ns);
+        self.samples_ns.push(sample_ns);
         self.last_sample_at = Some(at);
     }
 
     fn selection(&self) -> BranchRiskSelection {
-        let recent_p95_ns = nearest_rank(&self.samples_ns, 95);
+        let recent_p95_ns = self.samples_ns.rank();
         let recent_max_ns = self.samples_ns.iter().copied().max().unwrap_or(0);
         let central_risk_ns = self
             .ewma_ns
@@ -369,7 +370,7 @@ impl BranchRiskHistory {
     }
 
     fn diagnostics(&self, refresh_interval_ns: u64) -> BranchRiskDiagnostics {
-        let window = sample_window_diagnostics(&self.samples_ns, refresh_interval_ns);
+        let window = sample_window_diagnostics(&self.samples_ns.samples, refresh_interval_ns);
         let selection = self.selection();
 
         BranchRiskDiagnostics {
@@ -682,15 +683,15 @@ fn warm_parallel_total_cost_ns(
 #[doc(hidden)]
 #[derive(Debug)]
 pub struct AdaptiveRenderJournal {
-    render_samples_ns: VecDeque<u64>,
-    wake_lateness_samples_ns: VecDeque<u64>,
-    atomic_submit_samples_ns: VecDeque<u64>,
-    worker_queue_residency_samples_ns: VecDeque<u64>,
-    worker_submit_wake_lateness_samples_ns: VecDeque<u64>,
-    worker_pre_submit_samples_ns: VecDeque<u64>,
-    worker_dispatch_samples_ns: VecDeque<u64>,
+    render_samples_ns: RankedHistory<90>,
+    wake_lateness_samples_ns: RankedHistory<95>,
+    atomic_submit_samples_ns: RankedHistory<95>,
+    worker_queue_residency_samples_ns: RankedHistory<95>,
+    worker_submit_wake_lateness_samples_ns: RankedHistory<95>,
+    worker_pre_submit_samples_ns: RankedHistory<95>,
+    worker_dispatch_samples_ns: RankedHistory<95>,
     fixed_submission_budget_samples_ns: VecDeque<u64>,
-    target_slip_samples_ns: VecDeque<u64>,
+    target_slip_samples_ns: RankedHistory<95>,
     exact_parallel: ExactParallelRiskJournal,
     ewma_render_ns: u64,
     upper_render_deviation_ns: u64,
@@ -702,15 +703,15 @@ pub struct AdaptiveRenderJournal {
 impl Default for AdaptiveRenderJournal {
     fn default() -> Self {
         Self {
-            render_samples_ns: VecDeque::with_capacity(SAMPLE_CAPACITY),
-            wake_lateness_samples_ns: VecDeque::with_capacity(SAMPLE_CAPACITY),
-            atomic_submit_samples_ns: VecDeque::with_capacity(SAMPLE_CAPACITY),
-            worker_queue_residency_samples_ns: VecDeque::with_capacity(SAMPLE_CAPACITY),
-            worker_submit_wake_lateness_samples_ns: VecDeque::with_capacity(SAMPLE_CAPACITY),
-            worker_pre_submit_samples_ns: VecDeque::with_capacity(SAMPLE_CAPACITY),
-            worker_dispatch_samples_ns: VecDeque::with_capacity(SAMPLE_CAPACITY),
+            render_samples_ns: RankedHistory::new(),
+            wake_lateness_samples_ns: RankedHistory::new(),
+            atomic_submit_samples_ns: RankedHistory::new(),
+            worker_queue_residency_samples_ns: RankedHistory::new(),
+            worker_submit_wake_lateness_samples_ns: RankedHistory::new(),
+            worker_pre_submit_samples_ns: RankedHistory::new(),
+            worker_dispatch_samples_ns: RankedHistory::new(),
             fixed_submission_budget_samples_ns: VecDeque::with_capacity(SAMPLE_CAPACITY),
-            target_slip_samples_ns: VecDeque::with_capacity(SAMPLE_CAPACITY),
+            target_slip_samples_ns: RankedHistory::new(),
             exact_parallel: ExactParallelRiskJournal::default(),
             ewma_render_ns: 0,
             upper_render_deviation_ns: 0,
@@ -742,29 +743,29 @@ impl AdaptiveRenderJournal {
             self.ewma_render_ns = sample_ns;
             self.upper_render_deviation_ns = 0;
         }
-        push_bounded(&mut self.render_samples_ns, sample_ns);
+        self.render_samples_ns.push(sample_ns);
         self.last_sample_at = Some(at);
     }
 
     pub fn record_wake_lateness(&mut self, sample_ns: u64) {
-        push_bounded(&mut self.wake_lateness_samples_ns, sample_ns);
+        self.wake_lateness_samples_ns.push(sample_ns);
     }
 
     pub fn record_atomic_submit(&mut self, sample_ns: u64) {
-        push_bounded(&mut self.atomic_submit_samples_ns, sample_ns);
+        self.atomic_submit_samples_ns.push(sample_ns);
     }
 
     pub fn record_worker_queue_residency(&mut self, sample_ns: u64) {
-        push_bounded(&mut self.worker_queue_residency_samples_ns, sample_ns);
+        self.worker_queue_residency_samples_ns.push(sample_ns);
     }
 
     pub fn record_fixed_timed_wake(&mut self, sample_ns: u64) {
-        push_bounded(&mut self.worker_submit_wake_lateness_samples_ns, sample_ns);
+        self.worker_submit_wake_lateness_samples_ns.push(sample_ns);
     }
 
     pub fn record_worker_service(&mut self, pre_submit_ns: u64, dispatch_ns: u64) {
-        push_bounded(&mut self.worker_pre_submit_samples_ns, pre_submit_ns);
-        push_bounded(&mut self.worker_dispatch_samples_ns, dispatch_ns);
+        self.worker_pre_submit_samples_ns.push(pre_submit_ns);
+        self.worker_dispatch_samples_ns.push(dispatch_ns);
     }
 
     pub fn record_fixed_submission_budget(&mut self, sample_ns: u64) {
@@ -774,7 +775,7 @@ impl AdaptiveRenderJournal {
     }
 
     pub fn record_target_slip(&mut self, sample_ns: u64) {
-        push_bounded(&mut self.target_slip_samples_ns, sample_ns);
+        self.target_slip_samples_ns.push(sample_ns);
     }
 
     pub fn record_frame_service_observation(&mut self, observation: FrameTimingObservation) {
@@ -900,7 +901,7 @@ impl AdaptiveRenderJournal {
     }
 
     pub(crate) fn p90_recent_render_ns(&self) -> u64 {
-        nearest_rank(&self.render_samples_ns, 90)
+        self.render_samples_ns.rank()
     }
 
     pub fn reset(&mut self) {
@@ -928,12 +929,12 @@ impl AdaptiveRenderJournal {
             render_risk =
                 render_risk.max(self.render_samples_ns.iter().copied().max().unwrap_or(0));
         }
-        let p95_wake = nearest_rank(&self.wake_lateness_samples_ns, 95);
-        let p95_worker_submit_wake = nearest_rank(&self.worker_submit_wake_lateness_samples_ns, 95);
-        let p95_ioctl = nearest_rank(&self.atomic_submit_samples_ns, 95);
-        let p95_worker_pre_submit = nearest_rank(&self.worker_pre_submit_samples_ns, 95);
-        let p95_worker_dispatch = nearest_rank(&self.worker_dispatch_samples_ns, 95);
-        let p95_queue_residency = nearest_rank(&self.worker_queue_residency_samples_ns, 95);
+        let p95_wake = self.wake_lateness_samples_ns.rank();
+        let p95_worker_submit_wake = self.worker_submit_wake_lateness_samples_ns.rank();
+        let p95_ioctl = self.atomic_submit_samples_ns.rank();
+        let p95_worker_pre_submit = self.worker_pre_submit_samples_ns.rank();
+        let p95_worker_dispatch = self.worker_dispatch_samples_ns.rank();
+        let p95_queue_residency = self.worker_queue_residency_samples_ns.rank();
         let kms_dispatch_budget = if self.fixed_submission_budget_samples_ns.is_empty() {
             250_000
         } else {
@@ -1001,7 +1002,7 @@ impl AdaptiveRenderJournal {
             kms_dispatch_budget_ns: kms_dispatch_budget,
             kms_apply_guard_ns,
             kms_total_lead_ns: kms_total_lead,
-            p95_target_slip_ns: nearest_rank(&self.target_slip_samples_ns, 95),
+            p95_target_slip_ns: self.target_slip_samples_ns.rank(),
             exact_render_ready_risk_ns,
             exact_queue_ready_risk_ns,
             parallel_service_ns,
@@ -1304,6 +1305,49 @@ pub fn approximate_observation_is_late(
     observed_ns > target_ns.saturating_add(p95_wake_lateness_ns.max(500_000))
 }
 
+/// Bounded sample history whose nearest-rank percentile is cached until the
+/// next sample. Predictions are queried many times per cycle between samples.
+#[derive(Debug)]
+struct RankedHistory<const PERCENTILE: usize> {
+    samples: VecDeque<u64>,
+    rank: Cell<Option<u64>>,
+}
+
+impl<const PERCENTILE: usize> RankedHistory<PERCENTILE> {
+    fn new() -> Self {
+        Self {
+            samples: VecDeque::with_capacity(SAMPLE_CAPACITY),
+            rank: Cell::new(None),
+        }
+    }
+
+    fn push(&mut self, value: u64) {
+        push_bounded(&mut self.samples, value);
+        self.rank.set(None);
+    }
+
+    fn rank(&self) -> u64 {
+        if let Some(rank) = self.rank.get() {
+            return rank;
+        }
+        let rank = nearest_rank(&self.samples, PERCENTILE);
+        self.rank.set(Some(rank));
+        rank
+    }
+
+    fn len(&self) -> usize {
+        self.samples.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.samples.is_empty()
+    }
+
+    fn iter(&self) -> std::collections::vec_deque::Iter<'_, u64> {
+        self.samples.iter()
+    }
+}
+
 fn push_bounded(samples: &mut VecDeque<u64>, value: u64) {
     if samples.len() == SAMPLE_CAPACITY {
         samples.pop_front();
@@ -1365,7 +1409,7 @@ fn branch_history_with_window_and_model(
 ) -> BranchRiskHistory {
     let mut history = BranchRiskHistory::default();
     for sample_ns in samples {
-        push_bounded(&mut history.samples_ns, sample_ns);
+        history.samples_ns.push(sample_ns);
     }
     history.ewma_ns = ewma_ns;
     history.upper_positive_deviation_ns = upper_positive_deviation_ns;
