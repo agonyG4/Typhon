@@ -23,6 +23,33 @@ fn root_capture(
         .expect("A is the dependency-free root SceneCapture")
 }
 
+fn checkpoint_capture_for_instance(
+    graph: &oblivion_one::effects::CompiledFrameGraph,
+    instance_id: u64,
+) -> &oblivion_one::effects::CompiledRenderPass {
+    let instance = EffectInstanceId::new(instance_id).expect("checkpoint instance id");
+    graph
+        .passes
+        .iter()
+        .find(|pass| pass.kind == RenderPassKind::SceneCapture && pass.instance == instance)
+        .expect("checkpoint SceneCapture exists for instance")
+}
+
+fn checkpoint_dependency_pass<'a>(
+    graph: &'a oblivion_one::effects::CompiledFrameGraph,
+    capture: &oblivion_one::effects::CompiledRenderPass,
+) -> &'a oblivion_one::effects::CompiledRenderPass {
+    let dependency = capture
+        .checkpoint_dependencies
+        .first()
+        .expect("dependent checkpoint has a producer pass");
+    graph
+        .passes
+        .iter()
+        .find(|pass| pass.id == *dependency)
+        .expect("checkpoint dependency pass exists")
+}
+
 fn root_key(graph: &oblivion_one::effects::CompiledFrameGraph) -> impl std::fmt::Debug + PartialEq {
     effects::checkpoint_capture_cache_key(graph, root_capture(graph))
         .expect("root Replay capture has a semantic cache key")
@@ -45,6 +72,21 @@ fn root_capture_domain(graph: &oblivion_one::effects::CompiledFrameGraph) -> Eff
         .iter()
         .find(|texture| texture.id == output)
         .expect("root capture texture plan exists")
+        .domain
+}
+
+fn checkpoint_capture_domain(
+    graph: &oblivion_one::effects::CompiledFrameGraph,
+    instance_id: u64,
+) -> EffectRect {
+    let output = checkpoint_capture_for_instance(graph, instance_id)
+        .output
+        .expect("checkpoint capture output exists");
+    graph
+        .textures
+        .iter()
+        .find(|texture| texture.id == output)
+        .expect("checkpoint capture texture plan exists")
         .domain
 }
 
@@ -84,6 +126,28 @@ fn root_capture_snapshot(
         .expect("dependency-free Replay cache entry exists");
     let pixels = read_effect_texture_pixels(harness, &texture, plan.width, plan.height);
     (texture.id, pixels)
+}
+
+fn checkpoint_capture_snapshot(
+    harness: &mut GlesEffectTestHarness,
+    graph: &oblivion_one::effects::CompiledFrameGraph,
+    instance_id: u64,
+) -> Vec<u8> {
+    let pass = checkpoint_capture_for_instance(graph, instance_id);
+    let key = effects::checkpoint_capture_cache_key(graph, pass)
+        .expect("checkpoint capture has a semantic cache key");
+    let plan = graph
+        .textures
+        .iter()
+        .find(|texture| Some(texture.id) == pass.output)
+        .expect("checkpoint capture texture plan exists");
+    let texture = harness
+        .renderer
+        .effect_runtime
+        .effect_resources
+        .checkpoint_capture_texture(&key)
+        .expect("checkpoint capture cache entry exists");
+    read_effect_texture_pixels(harness, &texture, plan.width, plan.height)
 }
 
 fn root_cache_needs_full_refresh(
@@ -192,6 +256,25 @@ fn render_root_frame(
     )
 }
 
+fn compile_two_checkpoint_graph(
+    fixture: NativeThreeCheckpointFixture,
+    source_damage: &EffectRegion,
+) -> oblivion_one::effects::CompiledFrameGraph {
+    let (scene, registry) =
+        native_stacked_backdrop_scene(fixture.effect_a, fixture.effect_c, 4.0, 2, 1.0);
+    let plan = oblivion_one::effects::compile_frame_execution_plan(
+        &scene,
+        source_damage,
+        fixture.output_bounds,
+        &registry,
+    )
+    .expect("two-checkpoint Replay graph compiles from scene geometry");
+    let oblivion_one::effects::FrameExecutionPlan::EffectGraph(graph) = plan else {
+        panic!("two-checkpoint Replay fixture must compile as an effect graph");
+    };
+    graph
+}
+
 fn new_harness(
     fixture: NativeThreeCheckpointFixture,
     background_color: [u8; 4],
@@ -214,6 +297,29 @@ fn full_replay_reference(
     surface_signatures: &[EglSceneSurfaceSignature],
 ) -> (Vec<u8>, Vec<u8>) {
     full_replay_reference_with_patch(fixture, background_color, None, surface_signatures)
+}
+
+fn full_two_checkpoint_replay_reference(
+    fixture: NativeThreeCheckpointFixture,
+    background_color: [u8; 4],
+    surface_signatures: &[EglSceneSurfaceSignature],
+) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let mut reference = new_harness(fixture, background_color);
+    let full_region = EffectRegion::from_rect(fixture.output_bounds);
+    let graph = compile_two_checkpoint_graph(fixture, &EffectRegion::empty());
+    render_root_frame(
+        &mut reference,
+        fixture,
+        &graph,
+        surface_signatures,
+        &full_region,
+        true,
+    )
+    .expect("fresh two-checkpoint Replay reference renders");
+    let output = read_diagnostic_pixels(&reference);
+    let root_capture = checkpoint_capture_snapshot(&mut reference, &graph, 31);
+    let dependent_capture = checkpoint_capture_snapshot(&mut reference, &graph, 32);
+    (output, root_capture, dependent_capture)
 }
 
 fn full_replay_reference_with_patch(
@@ -444,12 +550,30 @@ fn dependency_free_replay_domain_change_requires_full_new_population() {
     let surface_signatures = signatures(fixture.scene, None);
     let mut harness = new_harness(fixture, [30, 50, 70, 255]);
     let full_region = EffectRegion::from_rect(fixture.output_bounds);
-    let first_graph = compile_native_three_checkpoint_graph(fixture, &EffectRegion::empty());
+    let first_graph = compile_two_checkpoint_graph(fixture, &EffectRegion::empty());
     let first_domain = root_capture_domain(&first_graph);
     assert!(capture_domain_is_within_output(
         first_domain,
         fixture.output_bounds
     ));
+    assert!(first_domain.width < fixture.output_bounds.width);
+    let first_dependent_domain = checkpoint_capture_domain(&first_graph, 32);
+    assert!(capture_domain_is_within_output(
+        first_dependent_domain,
+        fixture.output_bounds
+    ));
+    assert!(
+        root_capture(&first_graph)
+            .checkpoint_dependencies
+            .is_empty()
+    );
+    let first_dependent_capture = checkpoint_capture_for_instance(&first_graph, 32);
+    let first_dependency = checkpoint_dependency_pass(&first_graph, first_dependent_capture);
+    assert_eq!(
+        first_dependency.instance,
+        root_capture(&first_graph).instance
+    );
+    assert_eq!(first_dependency.kind, RenderPassKind::Composite);
     render_root_frame(
         &mut harness,
         fixture,
@@ -462,15 +586,33 @@ fn dependency_free_replay_domain_change_requires_full_new_population() {
 
     let mut changed_fixture = fixture;
     changed_fixture.effect_a.target_bounds.x += 1;
-    let changed_graph =
-        compile_native_three_checkpoint_graph(changed_fixture, &EffectRegion::empty());
+    let changed_graph = compile_two_checkpoint_graph(changed_fixture, &EffectRegion::empty());
     let changed_domain = root_capture_domain(&changed_graph);
     assert!(capture_domain_is_within_output(
         changed_domain,
         changed_fixture.output_bounds
     ));
+    assert!(changed_domain.width < changed_fixture.output_bounds.width);
+    let changed_dependent_domain = checkpoint_capture_domain(&changed_graph, 32);
+    assert!(capture_domain_is_within_output(
+        changed_dependent_domain,
+        changed_fixture.output_bounds
+    ));
     assert_ne!(first_domain, changed_domain);
     assert_ne!(root_key(&first_graph), root_key(&changed_graph));
+    assert_eq!(first_dependent_domain, changed_dependent_domain);
+    let changed_dependent_capture = checkpoint_capture_for_instance(&changed_graph, 32);
+    let changed_dependency = checkpoint_dependency_pass(&changed_graph, changed_dependent_capture);
+    assert_eq!(
+        changed_dependency.instance,
+        root_capture(&changed_graph).instance
+    );
+    assert_eq!(changed_dependency.kind, RenderPassKind::Composite);
+    assert_ne!(
+        effects::checkpoint_capture_cache_key(&first_graph, first_dependent_capture),
+        effects::checkpoint_capture_cache_key(&changed_graph, changed_dependent_capture),
+        "the dependent cache identity includes its producer's capture layout"
+    );
     let changed_region = EffectRegion::from_rect(changed_fixture.output_bounds);
     let stats = render_root_frame(
         &mut harness,
@@ -500,12 +642,18 @@ fn dependency_free_replay_domain_change_requires_full_new_population() {
     ));
 
     let actual_output = read_diagnostic_pixels(&harness);
-    let (_, actual_capture) = root_capture_snapshot(&mut harness, &changed_graph);
+    let actual_root_capture = checkpoint_capture_snapshot(&mut harness, &changed_graph, 31);
+    let actual_dependent_capture = checkpoint_capture_snapshot(&mut harness, &changed_graph, 32);
     drop(harness);
-    let (reference_output, reference_capture) =
-        full_replay_reference(changed_fixture, [30, 50, 70, 255], &surface_signatures);
+    let (reference_output, reference_root_capture, reference_dependent_capture) =
+        full_two_checkpoint_replay_reference(
+            changed_fixture,
+            [30, 50, 70, 255],
+            &surface_signatures,
+        );
+    assert_pixel_buffers_match(&actual_dependent_capture, &reference_dependent_capture);
+    assert_pixel_buffers_match(&actual_root_capture, &reference_root_capture);
     assert_pixel_buffers_match(&actual_output, &reference_output);
-    assert_pixel_buffers_match(&actual_capture, &reference_capture);
 }
 
 #[test]

@@ -125,6 +125,7 @@ struct CheckpointDependencySemanticIdentity {
     instance: EffectInstanceId,
     semantic_signature: u64,
     composition: CheckpointCompositionIdentity,
+    capture_layout: CheckpointCaptureLayoutIdentity,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -140,6 +141,12 @@ struct CheckpointCompositionIdentity {
     anchor: CheckpointAnchorIdentity,
     anchor_scope: EffectAnchorScope,
     visual_group: Option<VisualGroupId>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct CheckpointCaptureLayoutIdentity {
+    domain: (i32, i32, u32, u32),
+    texture: EffectTextureKey,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -238,10 +245,28 @@ pub(crate) fn checkpoint_capture_cache_key(
             .instances
             .iter()
             .find(|instance| instance.id == producer.instance)?;
+        let producer_capture = graph.passes.iter().find(|candidate| {
+            candidate.instance == producer_instance.id
+                && candidate.kind == RenderPassKind::SceneCapture
+        })?;
+        let producer_capture_output = producer_capture.output?;
+        let producer_capture_texture = graph
+            .textures
+            .iter()
+            .find(|texture| texture.id == producer_capture_output)?;
         dependencies.push(CheckpointDependencySemanticIdentity {
             instance: producer_instance.id,
             semantic_signature: producer_instance.semantic_signature,
             composition: checkpoint_composition_identity(producer),
+            capture_layout: CheckpointCaptureLayoutIdentity {
+                domain: (
+                    producer_capture_texture.domain.x,
+                    producer_capture_texture.domain.y,
+                    producer_capture_texture.domain.width,
+                    producer_capture_texture.domain.height,
+                ),
+                texture: texture_key(producer_capture_texture),
+            },
         });
     }
     Some(CheckpointCaptureCacheKey {
