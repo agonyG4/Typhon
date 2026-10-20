@@ -1,0 +1,6 @@
+{
+    "rules": [
+        { "pattern": { "feature": "procname", "matches": "oblivion-one" }, "profile": "No VidMem Reuse" },
+        { "pattern": { "feature": "procname", "matches": "astrea-shell" }, "profile": "No VidMem Reuse" }
+    ]
+}

@@ -5,6 +5,7 @@ script_dir="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 source_script="$script_dir/start-oblivion-one"
 source_tty_script="$script_dir/start-oblivion-one-tty"
 source_observer_script="$script_dir/observe-compositor-exit.py"
+source_nvidia_profile="$script_dir/../resources/nvidia/oblivion-one.json"
 
 usage() {
     cat <<EOF
@@ -19,6 +20,8 @@ Usage:
   ./bin/install-start-oblivion-one --sddm-session --target-dir DIR
   ./bin/install-start-oblivion-one --sddm-session --perf-log
   ./bin/install-start-oblivion-one --input-permissions # grants native input access
+  ./bin/install-start-oblivion-one --nvidia-profile    # stops NVIDIA GL from pooling freed VRAM
+  ./bin/install-start-oblivion-one --nvidia-profile --target-dir DIR
 EOF
 }
 
@@ -80,6 +83,43 @@ EOF
     echo "Installed SDDM session: $desktop_file"
 }
 
+install_nvidia_profile() {
+    local target_dir="/etc/nvidia/nvidia-application-profiles-rc.d"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --target-dir)
+                shift
+                if [[ $# -eq 0 ]]; then
+                    echo "install-start-oblivion-one: --target-dir needs a directory" >&2
+                    exit 1
+                fi
+                target_dir="$1"
+                ;;
+            *)
+                echo "install-start-oblivion-one: unknown --nvidia-profile option '$1'" >&2
+                exit 1
+                ;;
+        esac
+        shift
+    done
+
+    # The driver only ships "No VidMem Reuse" rules for known compositors
+    # (Hyprland, KWin, mutter, wlroots...); without one, freed GL buffers stay
+    # in a per-process pool and VRAM climbs for the whole session.
+    local profile_file="$target_dir/50-oblivion-one.json"
+    if [[ "$target_dir" == /usr/* || "$target_dir" == /etc/* ]]; then
+        if [[ "${EUID:-$(id -u)}" == "0" ]]; then
+            exec install -Dm644 "$source_nvidia_profile" "$profile_file"
+        elif command -v pkexec >/dev/null 2>&1; then
+            exec pkexec install -Dm644 "$source_nvidia_profile" "$profile_file"
+        fi
+        exec sudo install -Dm644 "$source_nvidia_profile" "$profile_file"
+    fi
+
+    install -Dm644 "$source_nvidia_profile" "$profile_file"
+    echo "Installed NVIDIA application profile: $profile_file"
+}
+
 case "${1:-}" in
     -h|--help|help)
         usage
@@ -96,6 +136,10 @@ case "${1:-}" in
     --sddm-session)
         shift
         install_sddm_session "$@"
+        ;;
+    --nvidia-profile)
+        shift
+        install_nvidia_profile "$@"
         ;;
     --input-permissions)
         user_name="${2:-${SUDO_USER:-${USER:-$(id -un)}}}"

@@ -13,6 +13,15 @@ binary and may enable `OBLIVION_ONE_PERF_LOG=1` for diagnostics. The TTY
 launcher defaults to a release build, the `oblivion-one-tty` socket, and
 `OBLIVION_ONE_MODE=1920x1080@165`.
 
+On NVIDIA, also run `./bin/install-start-oblivion-one --nvidia-profile`. It
+installs `/etc/nvidia/nvidia-application-profiles-rc.d/50-oblivion-one.json`,
+which applies the driver's own `No VidMem Reuse` profile
+(`GLVidHeapReuseRatio = 0`) to `oblivion-one` and `astrea-shell`. The driver
+ships that rule for Hyprland, KWin, mutter and wlroots but cannot match
+Typhon, so without it freed GL buffers stay pooled and VRAM climbs for the
+whole session. The profile is read at process start; restart the session
+after installing it.
+
 ## Startup requirements
 
 Native bootstrap needs:

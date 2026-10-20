@@ -308,6 +308,37 @@ fn install_launcher_can_enable_sddm_perf_log_entry() {
 }
 
 #[test]
+fn install_launcher_writes_nvidia_vram_profile_to_target_dir() {
+    let repo_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let profile_dir = repo_dir
+        .join("target")
+        .join("start-launcher-tests")
+        .join(format!("nvidia-profile-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&profile_dir);
+
+    let output = Command::new(repo_dir.join("bin/install-start-oblivion-one"))
+        .arg("--nvidia-profile")
+        .arg("--target-dir")
+        .arg(&profile_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("installer should run");
+
+    assert!(
+        output.status.success(),
+        "installer failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let profile = fs::read_to_string(profile_dir.join("50-oblivion-one.json"))
+        .expect("nvidia profile should be written");
+    let _ = fs::remove_dir_all(&profile_dir);
+
+    assert!(profile.contains(r#""matches": "oblivion-one""#));
+    assert!(profile.contains(r#""profile": "No VidMem Reuse""#));
+}
+
+#[test]
 fn install_launcher_adds_tty_start_symlink_for_user_install() {
     let repo_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let home_dir = repo_dir
