@@ -195,10 +195,10 @@ fn terminal_composite_shader_preserves_kawase_material_and_presentation_order() 
             "missing terminal uniform {uniform}"
         );
     }
-    for weight in ["0.40", "0.15"] {
+    for tap in ["vec2(-offset.x * 2.0, 0.0)", "result /= 12.0;"] {
         assert!(
-            shader.contains(weight),
-            "missing legacy Kawase weight {weight}"
+            shader.contains(tap),
+            "missing legacy Kawase tap {tap}"
         );
     }
     assert!(shader.contains("floor(output_position - u_effect_input_domain.xy)"));

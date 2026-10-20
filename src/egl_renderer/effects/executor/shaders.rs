@@ -309,12 +309,17 @@ void main() {
 
     // Match the legacy final Dual Kawase upsample in retained-input texels.
     vec2 sample_uv = typhon_effect_sample_uv(effect_local_uv);
-    vec2 offset = u_effect_texel_size * u_effect_blur_radius;
-    vec4 result = texture(u_effect_input, sample_uv) * 0.40;
-    result += texture(u_effect_input, sample_uv + vec2(offset.x, 0.0)) * 0.15;
-    result += texture(u_effect_input, sample_uv - vec2(offset.x, 0.0)) * 0.15;
-    result += texture(u_effect_input, sample_uv + vec2(0.0, offset.y)) * 0.15;
-    result += texture(u_effect_input, sample_uv - vec2(0.0, offset.y)) * 0.15;
+    vec2 halfpixel = u_effect_texel_size * 0.5;
+    vec2 offset = halfpixel * u_effect_blur_radius;
+    vec4 result = texture(u_effect_input, sample_uv + vec2(-offset.x * 2.0, 0.0));
+    result += texture(u_effect_input, sample_uv + vec2(-offset.x, offset.y)) * 2.0;
+    result += texture(u_effect_input, sample_uv + vec2(0.0, offset.y * 2.0));
+    result += texture(u_effect_input, sample_uv + vec2(offset.x, offset.y)) * 2.0;
+    result += texture(u_effect_input, sample_uv + vec2(offset.x * 2.0, 0.0));
+    result += texture(u_effect_input, sample_uv + vec2(offset.x, -offset.y)) * 2.0;
+    result += texture(u_effect_input, sample_uv + vec2(0.0, -offset.y * 2.0));
+    result += texture(u_effect_input, sample_uv + vec2(-offset.x, -offset.y)) * 2.0;
+    result /= 12.0;
     result = u_effect_color_matrix * result + u_effect_color_bias;
     result.rgb = mix(result.rgb, result.rgb * u_effect_tint_color.rgb, clamp(u_effect_tint_amount, 0.0, 1.0));
     float noise = fract(sin(dot(effect_local_uv, vec2(12.9898, 78.233))) * 43758.5453) - 0.5;
@@ -701,12 +706,17 @@ void main() {
 
     vec2 canonical_local_uv = typhon_canonical_effect_local_uv();
     vec2 sample_uv = typhon_effect_sample_uv(canonical_local_uv);
-    vec2 offset = u_effect_texel_size * u_effect_blur_radius;
-    vec4 result = texture(u_effect_input, sample_uv) * 0.40;
-    result += texture(u_effect_input, sample_uv + vec2(offset.x, 0.0)) * 0.15;
-    result += texture(u_effect_input, sample_uv - vec2(offset.x, 0.0)) * 0.15;
-    result += texture(u_effect_input, sample_uv + vec2(0.0, offset.y)) * 0.15;
-    result += texture(u_effect_input, sample_uv - vec2(0.0, offset.y)) * 0.15;
+    vec2 halfpixel = u_effect_texel_size * 0.5;
+    vec2 offset = halfpixel * u_effect_blur_radius;
+    vec4 result = texture(u_effect_input, sample_uv + vec2(-offset.x * 2.0, 0.0));
+    result += texture(u_effect_input, sample_uv + vec2(-offset.x, offset.y)) * 2.0;
+    result += texture(u_effect_input, sample_uv + vec2(0.0, offset.y * 2.0));
+    result += texture(u_effect_input, sample_uv + vec2(offset.x, offset.y)) * 2.0;
+    result += texture(u_effect_input, sample_uv + vec2(offset.x * 2.0, 0.0));
+    result += texture(u_effect_input, sample_uv + vec2(offset.x, -offset.y)) * 2.0;
+    result += texture(u_effect_input, sample_uv + vec2(0.0, -offset.y * 2.0));
+    result += texture(u_effect_input, sample_uv + vec2(-offset.x, -offset.y)) * 2.0;
+    result /= 12.0;
     result = typhon_virtual_rgba16f_rtz(result);
     result = u_effect_color_matrix * result + u_effect_color_bias;
     result.rgb = mix(result.rgb, result.rgb * u_effect_tint_color.rgb, clamp(u_effect_tint_amount, 0.0, 1.0));
@@ -884,12 +894,17 @@ void main() {
     vec2 local_pixel = logical_output_pixel - u_effect_input_domain.xy;
     vec2 local_uv = (local_pixel + vec2(0.5)) / u_effect_input_domain.zw;
     vec2 sample_uv = typhon_effect_sample_uv(local_uv);
-    vec2 offset = u_effect_texel_size * u_effect_blur_radius;
-    vec4 result = texture(u_effect_input, sample_uv) * 0.40;
-    result += texture(u_effect_input, sample_uv + vec2(offset.x, 0.0)) * 0.15;
-    result += texture(u_effect_input, sample_uv - vec2(offset.x, 0.0)) * 0.15;
-    result += texture(u_effect_input, sample_uv + vec2(0.0, offset.y)) * 0.15;
-    result += texture(u_effect_input, sample_uv - vec2(0.0, offset.y)) * 0.15;
+    vec2 halfpixel = u_effect_texel_size * 0.5;
+    vec2 offset = halfpixel * u_effect_blur_radius;
+    vec4 result = texture(u_effect_input, sample_uv + vec2(-offset.x * 2.0, 0.0));
+    result += texture(u_effect_input, sample_uv + vec2(-offset.x, offset.y)) * 2.0;
+    result += texture(u_effect_input, sample_uv + vec2(0.0, offset.y * 2.0));
+    result += texture(u_effect_input, sample_uv + vec2(offset.x, offset.y)) * 2.0;
+    result += texture(u_effect_input, sample_uv + vec2(offset.x * 2.0, 0.0));
+    result += texture(u_effect_input, sample_uv + vec2(offset.x, -offset.y)) * 2.0;
+    result += texture(u_effect_input, sample_uv + vec2(0.0, -offset.y * 2.0));
+    result += texture(u_effect_input, sample_uv + vec2(-offset.x, -offset.y)) * 2.0;
+    result /= 12.0;
     out_color = result;
 }
 "#;
@@ -938,12 +953,17 @@ void main() {
     vec2 local_pixel = vec2(float(storage_pixel.x), float(logical_y));
     vec2 local_uv = (local_pixel + vec2(0.5)) / u_effect_output_size;
     vec2 sample_uv = typhon_effect_sample_uv(local_uv);
-    vec2 offset = u_effect_texel_size * u_effect_blur_radius;
-    vec4 result = texture(u_effect_input, sample_uv) * 0.40;
-    result += texture(u_effect_input, sample_uv + vec2(offset.x, 0.0)) * 0.15;
-    result += texture(u_effect_input, sample_uv - vec2(offset.x, 0.0)) * 0.15;
-    result += texture(u_effect_input, sample_uv + vec2(0.0, offset.y)) * 0.15;
-    result += texture(u_effect_input, sample_uv - vec2(0.0, offset.y)) * 0.15;
+    vec2 halfpixel = u_effect_texel_size * 0.5;
+    vec2 offset = halfpixel * u_effect_blur_radius;
+    vec4 result = texture(u_effect_input, sample_uv + vec2(-offset.x * 2.0, 0.0));
+    result += texture(u_effect_input, sample_uv + vec2(-offset.x, offset.y)) * 2.0;
+    result += texture(u_effect_input, sample_uv + vec2(0.0, offset.y * 2.0));
+    result += texture(u_effect_input, sample_uv + vec2(offset.x, offset.y)) * 2.0;
+    result += texture(u_effect_input, sample_uv + vec2(offset.x * 2.0, 0.0));
+    result += texture(u_effect_input, sample_uv + vec2(offset.x, -offset.y)) * 2.0;
+    result += texture(u_effect_input, sample_uv + vec2(0.0, -offset.y * 2.0));
+    result += texture(u_effect_input, sample_uv + vec2(-offset.x, -offset.y)) * 2.0;
+    result /= 12.0;
     result = typhon_virtual_rgba16f_boundary(result);
     result = u_effect_color_matrix * result + u_effect_color_bias;
     result.rgb = mix(result.rgb, result.rgb * u_effect_tint_color.rgb, clamp(u_effect_tint_amount, 0.0, 1.0));
@@ -1003,12 +1023,17 @@ void main() {
     vec2 canonical_uv =
         (canonical_local_pixel + vec2(0.5)) / u_effect_input_domain.zw;
     vec2 sample_uv = typhon_effect_sample_uv(canonical_uv);
-    vec2 offset = u_effect_texel_size * u_effect_blur_radius;
-    vec4 result = texture(u_effect_input, sample_uv) * 0.40;
-    result += texture(u_effect_input, sample_uv + vec2(offset.x, 0.0)) * 0.15;
-    result += texture(u_effect_input, sample_uv - vec2(offset.x, 0.0)) * 0.15;
-    result += texture(u_effect_input, sample_uv + vec2(0.0, offset.y)) * 0.15;
-    result += texture(u_effect_input, sample_uv - vec2(0.0, offset.y)) * 0.15;
+    vec2 halfpixel = u_effect_texel_size * 0.5;
+    vec2 offset = halfpixel * u_effect_blur_radius;
+    vec4 result = texture(u_effect_input, sample_uv + vec2(-offset.x * 2.0, 0.0));
+    result += texture(u_effect_input, sample_uv + vec2(-offset.x, offset.y)) * 2.0;
+    result += texture(u_effect_input, sample_uv + vec2(0.0, offset.y * 2.0));
+    result += texture(u_effect_input, sample_uv + vec2(offset.x, offset.y)) * 2.0;
+    result += texture(u_effect_input, sample_uv + vec2(offset.x * 2.0, 0.0));
+    result += texture(u_effect_input, sample_uv + vec2(offset.x, -offset.y)) * 2.0;
+    result += texture(u_effect_input, sample_uv + vec2(0.0, -offset.y * 2.0));
+    result += texture(u_effect_input, sample_uv + vec2(-offset.x, -offset.y)) * 2.0;
+    result /= 12.0;
     result = typhon_virtual_rgba16f_boundary(result);
     result = u_effect_color_matrix * result + u_effect_color_bias;
     result.rgb = mix(result.rgb, result.rgb * u_effect_tint_color.rgb, clamp(u_effect_tint_amount, 0.0, 1.0));
@@ -1183,8 +1208,8 @@ pub(crate) fn diagnostic_kawase_only_channel_bits_shader(
         replace_diagnostic_shader_once(&mut source, "void main() {", &main);
         replace_diagnostic_shader_once(
             &mut source,
-            "    result += texture(u_effect_input, sample_uv - vec2(0.0, offset.y)) * 0.15;\n    out_color = result;",
-            "    result += texture(u_effect_input, sample_uv - vec2(0.0, offset.y)) * 0.15;\n    result = typhon_virtual_rgba16f_rtz(result);\n    out_color = result;",
+            "    result /= 12.0;\n    out_color = result;",
+            "    result /= 12.0;\n    result = typhon_virtual_rgba16f_rtz(result);\n    out_color = result;",
         );
     }
     if let Some(channel) = encode_channel {

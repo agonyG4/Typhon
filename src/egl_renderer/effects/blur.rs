@@ -42,18 +42,21 @@ vec4 typhon_decode_premultiplied_srgb(vec4 value) {
 }
 
 void main() {
-    vec2 offset = u_effect_texel_size * u_effect_blur_radius;
+    vec2 halfpixel = u_effect_texel_size * 0.5;
+    vec2 offset = halfpixel * u_effect_blur_radius;
     vec2 sample_uv = typhon_effect_sample_uv(v_uv);
+    vec4 sample_center = texture(u_effect_input, sample_uv);
     vec4 sample_a = texture(u_effect_input, sample_uv + offset);
     vec4 sample_b = texture(u_effect_input, sample_uv - offset);
     vec4 sample_c = texture(u_effect_input, sample_uv + vec2(offset.x, -offset.y));
     vec4 sample_d = texture(u_effect_input, sample_uv + vec2(-offset.x, offset.y));
     vec4 result = (
+        typhon_decode_premultiplied_srgb(sample_center) * 4.0 +
         typhon_decode_premultiplied_srgb(sample_a) +
         typhon_decode_premultiplied_srgb(sample_b) +
         typhon_decode_premultiplied_srgb(sample_c) +
         typhon_decode_premultiplied_srgb(sample_d)
-    ) * 0.25;
+    ) * 0.125;
     if (any(isnan(result)) || any(isinf(result))) result = vec4(0.0);
     result.a = clamp(result.a, 0.0, 1.0);
     result.rgb = clamp(result.rgb, vec3(0.0), vec3(result.a));
@@ -129,18 +132,21 @@ vec4 typhon_decode_premultiplied_srgb(vec4 value) {
 }
 
 void main() {
-    vec2 offset = u_effect_texel_size * u_effect_blur_radius;
+    vec2 halfpixel = u_effect_texel_size * 0.5;
+    vec2 offset = halfpixel * u_effect_blur_radius;
     vec2 sample_uv = typhon_effect_sample_uv(v_uv);
+    vec4 sample_center = typhon_virtual_capture_sample(sample_uv);
     vec4 sample_a = typhon_virtual_capture_sample(sample_uv + offset);
     vec4 sample_b = typhon_virtual_capture_sample(sample_uv - offset);
     vec4 sample_c = typhon_virtual_capture_sample(sample_uv + vec2(offset.x, -offset.y));
     vec4 sample_d = typhon_virtual_capture_sample(sample_uv + vec2(-offset.x, offset.y));
     vec4 result = (
+        typhon_decode_premultiplied_srgb(sample_center) * 4.0 +
         typhon_decode_premultiplied_srgb(sample_a) +
         typhon_decode_premultiplied_srgb(sample_b) +
         typhon_decode_premultiplied_srgb(sample_c) +
         typhon_decode_premultiplied_srgb(sample_d)
-    ) * 0.25;
+    ) * 0.125;
     if (any(isnan(result)) || any(isinf(result))) result = vec4(0.0);
     result.a = clamp(result.a, 0.0, 1.0);
     result.rgb = clamp(result.rgb, vec3(0.0), vec3(result.a));
@@ -164,13 +170,15 @@ vec2 typhon_effect_sample_uv(vec2 logical_uv) {
 }
 
 void main() {
-    vec2 offset = u_effect_texel_size * u_effect_blur_radius;
+    vec2 halfpixel = u_effect_texel_size * 0.5;
+    vec2 offset = halfpixel * u_effect_blur_radius;
     vec2 sample_uv = typhon_effect_sample_uv(v_uv);
+    vec4 sample_center = texture(u_effect_input, sample_uv);
     vec4 sample_a = texture(u_effect_input, sample_uv + offset);
     vec4 sample_b = texture(u_effect_input, sample_uv - offset);
     vec4 sample_c = texture(u_effect_input, sample_uv + vec2(offset.x, -offset.y));
     vec4 sample_d = texture(u_effect_input, sample_uv + vec2(-offset.x, offset.y));
-    out_color = (sample_a + sample_b + sample_c + sample_d) * 0.25;
+    out_color = (sample_center * 4.0 + sample_a + sample_b + sample_c + sample_d) * 0.125;
 }
 "#;
 
@@ -190,13 +198,18 @@ vec2 typhon_effect_sample_uv(vec2 logical_uv) {
 }
 
 void main() {
-    vec2 offset = u_effect_texel_size * u_effect_blur_radius;
+    vec2 halfpixel = u_effect_texel_size * 0.5;
+    vec2 offset = halfpixel * u_effect_blur_radius;
     vec2 sample_uv = typhon_effect_sample_uv(v_uv);
-    vec4 result = texture(u_effect_input, sample_uv) * 0.4;
-    result += texture(u_effect_input, sample_uv + vec2(offset.x, 0.0)) * 0.15;
-    result += texture(u_effect_input, sample_uv - vec2(offset.x, 0.0)) * 0.15;
-    result += texture(u_effect_input, sample_uv + vec2(0.0, offset.y)) * 0.15;
-    result += texture(u_effect_input, sample_uv - vec2(0.0, offset.y)) * 0.15;
+    vec4 result = texture(u_effect_input, sample_uv + vec2(-offset.x * 2.0, 0.0));
+    result += texture(u_effect_input, sample_uv + vec2(-offset.x, offset.y)) * 2.0;
+    result += texture(u_effect_input, sample_uv + vec2(0.0, offset.y * 2.0));
+    result += texture(u_effect_input, sample_uv + vec2(offset.x, offset.y)) * 2.0;
+    result += texture(u_effect_input, sample_uv + vec2(offset.x * 2.0, 0.0));
+    result += texture(u_effect_input, sample_uv + vec2(offset.x, -offset.y)) * 2.0;
+    result += texture(u_effect_input, sample_uv + vec2(0.0, -offset.y * 2.0));
+    result += texture(u_effect_input, sample_uv + vec2(-offset.x, -offset.y)) * 2.0;
+    result /= 12.0;
     out_color = result;
 }
 "#;
@@ -226,12 +239,17 @@ void main() {
     vec2 local_pixel = vec2(float(storage_pixel.x), float(logical_y));
     vec2 local_uv = (local_pixel + vec2(0.5)) / u_effect_output_size;
     vec2 sample_uv = typhon_effect_sample_uv(local_uv);
-    vec2 offset = u_effect_texel_size * u_effect_blur_radius;
-    vec4 result = texture(u_effect_input, sample_uv) * 0.40;
-    result += texture(u_effect_input, sample_uv + vec2(offset.x, 0.0)) * 0.15;
-    result += texture(u_effect_input, sample_uv - vec2(offset.x, 0.0)) * 0.15;
-    result += texture(u_effect_input, sample_uv + vec2(0.0, offset.y)) * 0.15;
-    result += texture(u_effect_input, sample_uv - vec2(0.0, offset.y)) * 0.15;
+    vec2 halfpixel = u_effect_texel_size * 0.5;
+    vec2 offset = halfpixel * u_effect_blur_radius;
+    vec4 result = texture(u_effect_input, sample_uv + vec2(-offset.x * 2.0, 0.0));
+    result += texture(u_effect_input, sample_uv + vec2(-offset.x, offset.y)) * 2.0;
+    result += texture(u_effect_input, sample_uv + vec2(0.0, offset.y * 2.0));
+    result += texture(u_effect_input, sample_uv + vec2(offset.x, offset.y)) * 2.0;
+    result += texture(u_effect_input, sample_uv + vec2(offset.x * 2.0, 0.0));
+    result += texture(u_effect_input, sample_uv + vec2(offset.x, -offset.y)) * 2.0;
+    result += texture(u_effect_input, sample_uv + vec2(0.0, -offset.y * 2.0));
+    result += texture(u_effect_input, sample_uv + vec2(-offset.x, -offset.y)) * 2.0;
+    result /= 12.0;
     out_color = result;
 }
 "#;

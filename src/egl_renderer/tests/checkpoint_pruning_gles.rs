@@ -504,7 +504,10 @@ fn gles_partial_source_changes_match_under_both_planners_for_disjoint_and_overla
         EffectDemandPlannerPolicy::Legacy,
         EffectDemandPlannerPolicy::Regional,
     ] {
-        for (second_x, should_prune) in [(270, true), (260, false)] {
+        // The overlap case sits closer to A than before: the half-texel radius
+        // shrinks the sampling reach (about 76px instead of 108px), so 260 no
+        // longer reaches A's content. 220 keeps the reach-overlap classification.
+        for (second_x, should_prune) in [(270, true), (220, false)] {
             let fixture = pruning_fixture(second_x);
             let (raw_seed, raw_after, raw_stats) =
                 render_partial_source_change(fixture, planner, false);

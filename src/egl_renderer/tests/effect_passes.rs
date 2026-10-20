@@ -2,9 +2,10 @@ use super::*;
 
 #[test]
 fn fused_downsample_matches_materialized_rgba8_capture_for_edges_origins_and_damage() {
-    // The Mesa GL_LINEAR path differs by 11 RGBA16F ULPs at the worst
-    // observed sample; allow one ULP of comparison headroom.
-    const MAX_RGBA16F_SAMPLER_DIFFERENCE: f32 = 12.0 / 8192.0;
+    // The Mesa GL_LINEAR path differs by 16 RGBA16F ULPs at the worst
+    // observed sample (quarter-texel Dual Kawase taps); allow one ULP of
+    // comparison headroom.
+    const MAX_RGBA16F_SAMPLER_DIFFERENCE: f32 = 17.0 / 8192.0;
     let mut harness = GlesEffectTestHarness::new(19, 17);
     harness.install_texture_backed_output();
     let gl = &harness.gl;
@@ -426,10 +427,18 @@ fn fused_downsample_matches_materialized_rgba8_capture_for_edges_origins_and_dam
                         && blur_radius == 1.0
                         && !partial
                     {
+                        // The half-texel 2x2 downsample covers whole input texel
+                        // pairs, so the edge between encoded 0 and 255 falls on an
+                        // output boundary: each output texel is exactly its own half.
                         assert!(
-                            (0.10..0.115).contains(&fused[0]),
-                            "fused output must bilinear-filter encoded 0/1 before sRGB decode: {}",
+                            fused[0].abs() <= 1.0e-6,
+                            "fused black half must stay exactly 0: {}",
                             fused[0]
+                        );
+                        assert!(
+                            (fused[4] - 1.0).abs() <= 1.0e-6,
+                            "fused white half must stay exactly 1: {}",
+                            fused[4]
                         );
                     }
                 }
