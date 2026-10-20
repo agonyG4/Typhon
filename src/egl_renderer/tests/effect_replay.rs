@@ -3069,14 +3069,16 @@ fn shared_build_has_five_physical_stages_and_external_demand_stays_local() {
 fn precomputed_baseline_only_scene_content_matches_exact_gles_pixels() {
     const PIXEL_TOLERANCE: u8 = 2;
 
-    let mut harness = GlesEffectTestHarness::new(160, 120);
+    let mut harness = GlesEffectTestHarness::new(320, 240);
     harness.install_texture_backed_output();
-    let output_bounds = EffectRect::new(0, 0, 160, 120).expect("output bounds");
+    let output_bounds = EffectRect::new(0, 0, 320, 240).expect("output bounds");
     let full_damage = EffectRegion::from_rect(output_bounds);
     let a_group = oblivion_one::compositor::VisualGroupId::new(1).expect("A visual group");
     let b_group = oblivion_one::compositor::VisualGroupId::new(2).expect("B visual group");
     let a_bounds = EffectRect::new(12, 12, 32, 24).expect("A bounds");
-    let b_bounds = EffectRect::new(112, 78, 32, 24).expect("B bounds");
+    // With the 88 px Dual Kawase reach, B at (112,78) overlaps A's expanded
+    // influence and gains a checkpoint dependency. Move B clear of A's domain.
+    let b_bounds = EffectRect::new(232, 112, 32, 24).expect("B bounds");
     install_native_stacked_diagnostic_scene(
         &mut harness,
         NativeStackedBackdropSceneSpec {
@@ -3151,7 +3153,7 @@ fn precomputed_baseline_only_scene_content_matches_exact_gles_pixels() {
             .expect("candidate has an exact baseline capture");
         assert!(capture.checkpoint_dependencies.is_empty());
     }
-    let repaint = diagnostic_repaint_plan_for_repairs_in_size(&[], true, (160, 120));
+    let repaint = diagnostic_repaint_plan_for_repairs_in_size(&[], true, (320, 240));
 
     let exact_demand = plan_effect_execution_demand(exact_graph, &full_damage, true);
     let exact_selection = effects::select_effect_execution(exact_graph, &exact_demand);
@@ -3220,7 +3222,7 @@ fn precomputed_baseline_only_scene_content_matches_exact_gles_pixels() {
     let capture_result = {
         let mut context = harness.renderer.effect_execution_context();
         context.draw_effect_scene_range(
-            &[OutputRect::new(0, 0, 160, 120)],
+            &[OutputRect::new(0, 0, 320, 240)],
             0,
             prefix_end,
             OutputFramebufferOrigin::BottomLeft,
@@ -3309,7 +3311,7 @@ fn precomputed_baseline_only_scene_content_matches_exact_gles_pixels() {
     for rect in [a_bounds, b_bounds] {
         for y in rect.y..rect.y + rect.height as i32 {
             for x in rect.x..rect.x + rect.width as i32 {
-                let offset = ((y as usize * 160 + x as usize) * 4) as usize;
+                let offset = ((y as usize * 320 + x as usize) * 4) as usize;
                 for channel in 0..4 {
                     let difference =
                         exact_pixels[offset + channel].abs_diff(optimized_pixels[offset + channel]);
@@ -3730,7 +3732,9 @@ fn replay_partial_fragmented_capture_materialization_is_a_non_regression() {
 fn replay_partial_translated_capture_domain_reuses_pool_without_stale_content() {
     let output_bounds = EffectRect::new(0, 0, 256, 192).expect("diagnostic output bounds");
     let rect_a = EffectRect::new(96, 72, 64, 48).expect("first blur bounds");
-    let rect_b = EffectRect::new(112, 80, 64, 48).expect("translated blur bounds");
+    // An 88 px Dual Kawase reach clips the translated domain at the right
+    // edge when x=112; x=104 keeps both expanded domains the same width.
+    let rect_b = EffectRect::new(104, 80, 64, 48).expect("translated blur bounds");
     let repairs = [
         OutputRect::new(rect_a.x, rect_a.y, rect_a.width, rect_a.height),
         OutputRect::new(rect_b.x, rect_b.y, rect_b.width, rect_b.height),
@@ -3837,7 +3841,6 @@ fn moving_blur_domain_reuses_real_gles_resources() {
     let mut warm_checkpoint_entries = None;
     let mut warm_checkpoint_bytes_max = 0;
     let mut warm_pool_bytes_max = 0;
-    let mut capture_radii = None;
     let mut positions = Vec::with_capacity(512);
     for step in 0..512 {
         let phase = step % 16;
@@ -3907,15 +3910,10 @@ fn moving_blur_domain_reuses_real_gles_resources() {
         }
         assert_eq!(first_gl_error, None, "step {step} left a GLES error");
 
-        let capture = graph
-            .textures
-            .iter()
-            .find(|texture| texture.source == GraphTextureSource::CapturedScene)
-            .expect("moving blur capture texture");
-        let (capture_radius_x, capture_radius_y) = *capture_radii.get_or_insert((
-            x.saturating_sub(capture.domain.x).max(0),
-            y.saturating_sub(capture.domain.y).max(0),
-        ));
+        // Dual Kawase reach for radius 4, 2 passes, scale 1 is
+        // 3*3*(4+5) + 2 + 2 + 3 = 88 px. Deriving it from the first capture
+        // domain is wrong once that domain is clipped at the output edge.
+        let (capture_radius_x, capture_radius_y) = (88, 88);
         let expected_left = (x - capture_radius_x).max(0);
         let expected_top = (y - capture_radius_y).max(0);
         let expected_right = (x + 32 + capture_radius_x).min(256);
@@ -4002,7 +4000,9 @@ fn moving_blur_domain_reuses_real_gles_resources() {
             );
         }
         assert_eq!(metrics.eviction_count, 0, "translation evicted a resource");
-        assert!(metrics.cached_texture_count <= 16);
+        // Clipped domains at the output edges produce more distinct texture
+        // sizes than the old 24 px reach; the pool saturates at 40 by step 12.
+        assert!(metrics.cached_texture_count <= 40);
     }
 
     let effect_resources = &mut harness.renderer.effect_runtime.effect_resources;
@@ -4089,7 +4089,6 @@ fn moving_visual_group_blur_replays_only_background_below_target() {
     let mut warm_checkpoint_entries = None;
     let mut warm_checkpoint_bytes_max = 0;
     let mut warm_pool_bytes_max = 0;
-    let mut capture_radii = None;
 
     for (step, (x, y)) in positions.iter().copied().cycle().take(512).enumerate() {
         let rect = EffectRect::new(x, y, 32, 24).expect("moving target rectangle");
@@ -4170,10 +4169,10 @@ fn moving_visual_group_blur_replays_only_background_below_target() {
             .find(|texture| texture.source == GraphTextureSource::CapturedScene)
             .expect("visual-group blur capture texture");
         assert!(capture.domain.width > 0 && capture.domain.height > 0);
-        let (capture_radius_x, capture_radius_y) = *capture_radii.get_or_insert((
-            x.saturating_sub(capture.domain.x).max(0),
-            y.saturating_sub(capture.domain.y).max(0),
-        ));
+        // Dual Kawase reach for radius 4, 2 passes, scale 1 is
+        // 3*3*(4+5) + 2 + 2 + 3 = 88 px. Deriving it from the first capture
+        // domain is wrong once that domain is clipped at the output edge.
+        let (capture_radius_x, capture_radius_y) = (88, 88);
         let expected_left = (x - capture_radius_x).max(0);
         let expected_top = (y - capture_radius_y).max(0);
         let expected_right = (x + 32 + capture_radius_x).min(256);
@@ -4255,7 +4254,8 @@ fn moving_visual_group_blur_replays_only_background_below_target() {
             );
         }
         assert_eq!(metrics.eviction_count, 0, "translation evicted a resource");
-        assert!(metrics.cached_texture_count <= 32);
+        // Steady state is 48 cached textures with the 88 px Dual Kawase reach.
+        assert!(metrics.cached_texture_count <= 48);
     }
 
     let effect_resources = &mut harness.renderer.effect_runtime.effect_resources;

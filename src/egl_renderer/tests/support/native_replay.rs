@@ -196,20 +196,25 @@ pub(in crate::egl_renderer::tests) fn render_native_stacked_candidate_with_mode(
         .iter()
         .find(|texture| Some(texture.id) == b_capture.output)
         .expect("native B capture texture");
+    // Capture domains are the effect rect expanded by the Dual Kawase sampling
+    // reach (radius 4, 2 passes, scale 1 => 88 px), clipped to the 1920x1080
+    // output. Dock A (90,144,952,889): x 2..1130, y 56..1080 (clipped).
     if fixture.effect_b.id == 2 {
         assert_eq!(
             a_texture.domain,
-            EffectRect::new(66, 120, 1000, 937).expect("native A capture domain")
+            EffectRect::new(2, 56, 1128, 1024).expect("native A capture domain")
         );
+        // Dock B (786,1000,348,56): x 698..1222, y 912..1080 (clipped).
         assert_eq!(
             b_texture.domain,
-            EffectRect::new(762, 976, 396, 104).expect("native B capture domain")
+            EffectRect::new(698, 912, 524, 168).expect("native B capture domain")
         );
     }
+    // TopBar B (24,24,72,17): x 0..184 and y 0..129 after left/top clipping.
     if fixture.effect_b.id == 12 {
         assert_eq!(
             b_texture.domain,
-            EffectRect::new(0, 0, 120, 65).expect("native TopBar capture domain")
+            EffectRect::new(0, 0, 184, 129).expect("native TopBar capture domain")
         );
     }
     let a_instance = graph
