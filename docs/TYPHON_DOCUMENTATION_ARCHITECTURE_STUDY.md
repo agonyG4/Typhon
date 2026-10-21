@@ -5,6 +5,13 @@
 > source of truth for current runtime defaults, feature maturity, or
 > qualification status.
 
+> Status note (2026-10-19): several defaults quoted below ("default Off") were
+> superseded by the code. Current parser defaults are: `OBLIVION_ONE_KMS_COMMIT_WORKER=auto`,
+> `OBLIVION_ONE_DIRECT_SCANOUT=auto` (primary plane, `TEST_ONLY`-validated),
+> `OBLIVION_ONE_TEARING=auto` when unset, `OBLIVION_ONE_SCHEDULING_QOS=auto`, and
+> `TYPHON_XWAYLAND` unset = managed lazy (enabled). Use `README.md` and
+> `docs/NATIVE_SESSION.md` for current values.
+
 **Study date:** 2026-09-24  
 **Authoritative source snapshot:** `Typhon-source(20260923-213927).zip`  
 **Historical supporting baseline:** `TYPHON_ARCHITECTURE_FEATURES_READINESS_AUDIT_2026-09-14(1).md`  

@@ -1,5 +1,9 @@
 # AstreaOS M7 Qualification Status
 
+> Status note (2026-10-19): this ledger records the M7 state at the time it was
+> written. The "NOT RUN" and "PENDING" entries have not been updated since and
+> do not reflect later work; treat them as historical, not as current results.
+
 This ledger separates deterministic repository qualification from the deferred
 native TTY/DRM qualification. `DEFERRED` is not a passing status.
 

@@ -50,7 +50,9 @@ in the sampled tree.
 ## Policy and effective mode
 
 The native tearing policy is `OBLIVION_ONE_TEARING=off|auto`, defaulting to
-`off`. Unknown values also resolve to `off`. Adaptive Sync has its separate
+`auto` when the variable is unset; `auto` still requires the surface hint,
+fullscreen, and the other async blockers to clear before any async page-flip is
+requested. Unrecognized values resolve to `off`. Adaptive Sync has its separate
 compatibility setting `OBLIVION_ONE_VRR=off|auto|on`, defaulting to `auto`.
 These settings describe policy; neither one is proof that KMS accepted a
 request or that a monitor varied its refresh rate.
