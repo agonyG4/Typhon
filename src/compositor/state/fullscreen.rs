@@ -926,29 +926,63 @@ impl CompositorState {
             presentation_owner_root_surface_ids.len(),
             "presentation owner roots must remain aligned with native frame surfaces"
         );
-        if sample.transforms.is_empty() {
+        let mut window_transforms = sample
+            .transforms
+            .iter()
+            .map(|transform| {
+                (
+                    transform.root_surface_id,
+                    transform.canonical_rect,
+                    transform.presented_rect,
+                )
+            })
+            .collect::<Vec<_>>();
+        // Animation retirement and client content convergence are independent.
+        // A slow client still needs its old buffer mapped into the final window
+        // box after the endpoint has been physically presented and acknowledged.
+        for (&root_surface_id, visual) in &self.toplevel_visual_geometries {
+            if !visual.mode_transition
+                || visual.active_resize.is_some()
+                || !presentation_owner_root_surface_ids.contains(&root_surface_id)
+                || sample.transform_for_root(root_surface_id).is_some()
+            {
+                continue;
+            }
+            if let Some(rect) = self.presentation_rect_for_geometry_for_surfaces(
+                surfaces.as_ref(),
+                root_surface_id,
+                visual.window_geometry(),
+            ) {
+                window_transforms.push((root_surface_id, rect, rect));
+            }
+        }
+        if window_transforms.is_empty() {
             return surfaces;
         }
 
         let mut transformed = surfaces.to_vec();
         let canonical_origins = render::surface_origins(surfaces.as_ref());
         let mut presented_origins = HashMap::new();
-        for transform in &sample.transforms {
+        for (root_surface_id, window_rect, presented_window_rect) in window_transforms {
+            let transform = crate::presentation_animation::PresentationGeometryTransform::new(
+                window_rect,
+                presented_window_rect,
+            );
             let committed_window_extent = self
-                .current_root_window_geometry(transform.root_surface_id)
+                .current_root_window_geometry(root_surface_id)
                 .map(|geometry| (geometry.width, geometry.height))
                 .or_else(|| {
                     surfaces
                         .iter()
-                        .find(|surface| surface.surface_id == transform.root_surface_id)
+                        .find(|surface| surface.surface_id == root_surface_id)
                         .map(|surface| (surface.width, surface.height))
                 });
             let (scale_x, scale_y) = committed_window_extent
                 .filter(|(width, height)| *width > 0 && *height > 0)
                 .map_or((1.0, 1.0), |(width, height)| {
                     (
-                        transform.canonical_rect.width() / f64::from(width),
-                        transform.canonical_rect.height() / f64::from(height),
+                        window_rect.width() / f64::from(width),
+                        window_rect.height() / f64::from(height),
                     )
                 });
             for (index, (surface, owner_root_surface_id)) in surfaces
@@ -956,7 +990,7 @@ impl CompositorState {
                 .zip(presentation_owner_root_surface_ids.iter().copied())
                 .enumerate()
             {
-                if owner_root_surface_id != transform.root_surface_id {
+                if owner_root_surface_id != root_surface_id {
                     continue;
                 }
                 let Some(origin) = canonical_origins.get(index).copied() else {
@@ -970,10 +1004,8 @@ impl CompositorState {
                 // client-owned committed extent; only the render target below
                 // is projected.
                 let Some(canonical_rect) = PresentationRect::new(
-                    transform.canonical_rect.x()
-                        + (f64::from(origin.0) - transform.canonical_rect.x()) * scale_x,
-                    transform.canonical_rect.y()
-                        + (f64::from(origin.1) - transform.canonical_rect.y()) * scale_y,
+                    window_rect.x() + (f64::from(origin.0) - window_rect.x()) * scale_x,
+                    window_rect.y() + (f64::from(origin.1) - window_rect.y()) * scale_y,
                     f64::from(surface.width) * scale_x,
                     f64::from(surface.height) * scale_y,
                 ) else {

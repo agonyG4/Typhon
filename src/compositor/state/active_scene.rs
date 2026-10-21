@@ -1126,8 +1126,21 @@ impl CompositorState {
             self.presentation_animator.cancel_geometry(scene_node_id);
             return;
         }
-        let Some(previous) =
-            self.presentation_rect_for_geometry(root_surface_id, previous_geometry)
+        let raises_root = matches!(
+            kind,
+            PresentationAnimationKind::FullscreenEnter
+                | PresentationAnimationKind::FullscreenExit
+                | PresentationAnimationKind::MaximizeEnter
+                | PresentationAnimationKind::MaximizeExit
+        );
+        // A canonical placement may belong to a frame that has not pageflipped
+        // yet. Mode changes must begin where the user last saw the window.
+        let physical_source = self
+            .presented_window_geometry(root_surface_id)
+            .filter(|_| raises_root)
+            .map(PresentedWindowGeometry::presented_rect);
+        let Some(previous) = physical_source
+            .or_else(|| self.presentation_rect_for_geometry(root_surface_id, previous_geometry))
         else {
             self.presentation_animator.cancel_geometry(scene_node_id);
             return;
@@ -1147,13 +1160,6 @@ impl CompositorState {
             previous,
             target,
             curve,
-        );
-        let raises_root = matches!(
-            kind,
-            PresentationAnimationKind::FullscreenEnter
-                | PresentationAnimationKind::FullscreenExit
-                | PresentationAnimationKind::MaximizeEnter
-                | PresentationAnimationKind::MaximizeExit
         );
         if self.layout_batch_depth > 0 {
             if let Some(pending) = self.pending_presentation_geometry_transaction.as_mut() {

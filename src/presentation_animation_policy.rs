@@ -100,10 +100,12 @@ impl PresentationAnimationPolicy {
                 AnimationCurve::easing(Duration::from_millis(200), EasingCurve::EaseOutCubic)
             }
             (PresentationAnimationStyle::Kde, PresentationAnimationKind::MaximizeEnter)
-            | (PresentationAnimationStyle::Kde, PresentationAnimationKind::MaximizeExit)
-            | (PresentationAnimationStyle::Kde, PresentationAnimationKind::FullscreenEnter)
-            | (PresentationAnimationStyle::Kde, PresentationAnimationKind::FullscreenExit) => {
+            | (PresentationAnimationStyle::Kde, PresentationAnimationKind::MaximizeExit) => {
                 AnimationCurve::easing(Duration::from_millis(250), EasingCurve::EaseOutCubic)
+            }
+            (PresentationAnimationStyle::Kde, PresentationAnimationKind::FullscreenEnter)
+            | (PresentationAnimationStyle::Kde, PresentationAnimationKind::FullscreenExit) => {
+                AnimationCurve::easing(Duration::from_millis(250), EasingCurve::EaseOutExpo)
             }
         }
     }
@@ -134,6 +136,26 @@ mod tests {
     use crate::presentation_animation::{
         PresentationRect, PresentationVelocity, PresentationWindowTarget,
     };
+
+    #[test]
+    fn fullscreen_follows_hyprland_windows_move_bezier() {
+        for kind in [
+            PresentationAnimationKind::FullscreenEnter,
+            PresentationAnimationKind::FullscreenExit,
+        ] {
+            let curve = PresentationAnimationPolicy::kde().curve_for(kind);
+            // At Bezier parameter 0.5, (0.16, 1, 0.3, 1) gives
+            // time=0.2975 and distance=0.875. speed=2.5 lasts 250 ms.
+            let (value, velocity, settled) = curve.sample_scalar(0.0, 1000.0, 0.0, 0.074375, false);
+            assert!((value - 875.0).abs() < 1e-6, "{kind:?}: {value}");
+            assert!(velocity > 0.0);
+            assert!(!settled);
+            assert_eq!(
+                curve.sample_scalar(0.0, 1000.0, 0.0, 0.25, false),
+                (1000.0, 0.0, true)
+            );
+        }
+    }
 
     #[test]
     fn macos_policy_resolves_the_expected_curve_for_each_geometry_kind() {
@@ -321,8 +343,6 @@ mod tests {
             (PresentationAnimationKind::LayoutReflow, 200),
             (PresentationAnimationKind::MaximizeEnter, 250),
             (PresentationAnimationKind::MaximizeExit, 250),
-            (PresentationAnimationKind::FullscreenEnter, 250),
-            (PresentationAnimationKind::FullscreenExit, 250),
         ];
 
         for (kind, duration_ms) in expected {

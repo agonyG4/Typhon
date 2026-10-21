@@ -4825,6 +4825,149 @@ fn mode_transition_visual_geometry_stays_coherent_until_client_commit() {
 }
 
 #[test]
+fn fullscreen_entry_starts_from_the_last_physical_frame() {
+    let surface_id = 152;
+    let mut state = xdg_state(
+        test_surface(surface_id),
+        DecorationPreference::ClientSide,
+        ToplevelMode::Normal,
+    );
+    state.set_test_effective_xdg_window_geometry(
+        surface_id,
+        XdgWindowGeometry::new(0, 0, SURFACE_WIDTH as i32, SURFACE_HEIGHT as i32),
+    );
+    state.xdg_surface_lifecycles.entry(surface_id).or_default();
+    let (_display, _client) = install_test_toplevel_role(&mut state, surface_id);
+    // A position update has been accepted but its frame has not pageflipped.
+    state.set_surface_placement(surface_id, SurfacePlacement::absolute_root_at(360, 250));
+    let source = PresentationRect::new(320.0, 230.0, 300.0, 200.0).unwrap();
+    state.publish_presented_window_geometry(1, PresentedWindowGeometry::new(surface_id, source));
+    state.presentation_animator.set_enabled(true);
+    assert!(state.set_root_window_mode(surface_id, ToplevelMode::Fullscreen));
+    let scene_node = state
+        .presentation_scene_node_id_for_root(surface_id)
+        .unwrap();
+    let start = state
+        .presentation_animator
+        .sample_at_transition_start_for_scene_node(scene_node)
+        .unwrap();
+    assert_eq!(
+        start.rect, source,
+        "fullscreen must start at the last pageflipped position"
+    );
+}
+
+#[test]
+fn fullscreen_delayed_client_keeps_content_geometry_after_animation_ack() {
+    let surface_id = 151;
+    let mut state = xdg_state(
+        test_surface(surface_id),
+        DecorationPreference::ClientSide,
+        ToplevelMode::Normal,
+    );
+    state.set_test_effective_xdg_window_geometry(
+        surface_id,
+        XdgWindowGeometry::new(0, 0, SURFACE_WIDTH as i32, SURFACE_HEIGHT as i32),
+    );
+    state.xdg_surface_lifecycles.entry(surface_id).or_default();
+    let (_display, _client) = install_test_toplevel_role(&mut state, surface_id);
+    state.presentation_animator.set_enabled(true);
+    let source = state
+        .current_presentation_rect_for_root(surface_id)
+        .unwrap();
+    state.publish_presented_window_geometry(1, PresentedWindowGeometry::new(surface_id, source));
+    for entering in [true, false] {
+        if entering {
+            assert!(state.set_root_window_mode(surface_id, ToplevelMode::Fullscreen));
+        } else {
+            assert!(state.restore_normal_root_window(surface_id));
+        }
+        let scene = state.canonical_presentation_scene();
+        let targets = state.native_frame_presentation_targets_for_scene(&scene);
+        let at = AnimationTime::from_nanos(u64::MAX);
+        let endpoint = state.presentation_scene_sample_for_targets_at_with_source(
+            at,
+            crate::presentation_animation::PresentationSampleTimeSource::ScheduledTarget,
+            &targets,
+        );
+        let before_ack = state
+            .apply_presentation_to_native_frame_surfaces(
+                Cow::Borrowed(scene.surfaces.as_ref()),
+                scene.presentation_owner_root_surface_ids.as_ref(),
+                &endpoint,
+            )
+            .into_owned();
+        let snapshot = crate::presentation_animation::PresentationFrameSnapshot::from_sample_with_presented_windows(
+            &endpoint, state.presented_window_geometries_for_targets(&endpoint, &targets),
+        );
+        state.publish_presented_presentation(2, &snapshot);
+        let scene = state.canonical_presentation_scene();
+        let targets = state.native_frame_presentation_targets_for_scene(&scene);
+        let after = state.presentation_scene_sample_for_targets_at_with_source(
+            at,
+            crate::presentation_animation::PresentationSampleTimeSource::ScheduledTarget,
+            &targets,
+        );
+        assert!(
+            after.transforms.is_empty(),
+            "the animation was physically acknowledged"
+        );
+        assert!(
+            state.toplevel_visual_geometries.contains_key(&surface_id),
+            "client response remains pending"
+        );
+        let after_ack = state.apply_presentation_to_native_frame_surfaces(
+            Cow::Borrowed(scene.surfaces.as_ref()),
+            scene.presentation_owner_root_surface_ids.as_ref(),
+            &after,
+        );
+        assert_eq!(
+            after_ack[0].render_target_size, before_ack[0].render_target_size,
+            "retiring the animation must not snap back to the old client buffer size"
+        );
+        assert_eq!(
+            after_ack[0].render_placement,
+            before_ack[0].render_placement
+        );
+        // The eventual matching client buffer must preserve the same output box.
+        let expected_size = after_ack[0]
+            .render_target_size
+            .expect("projected target size");
+        let expected_origin = render::surface_origins(after_ack.as_ref())[0];
+        let visual = state.toplevel_visual_geometries[&surface_id];
+        let serial = visual.xdg_mode_transition_fence.unwrap().configure_serial;
+        acknowledge_test_xdg_configure(&mut state, surface_id, serial);
+        let commit = state.allocate_surface_commit_sequence();
+        let mut committed = test_surface_with_size(surface_id, visual.width, visual.height);
+        committed.placement = visual.placement;
+        committed.commit_sequence = commit;
+        state.renderable_surfaces[0] = committed;
+        state.set_test_effective_xdg_window_geometry(
+            surface_id,
+            XdgWindowGeometry::new(0, 0, visual.width as i32, visual.height as i32),
+        );
+        state.update_toplevel_visual_render_assignment_after_root_commit(surface_id, commit);
+        state.rebuild_active_scene_view();
+        assert!(!state.toplevel_visual_geometries.contains_key(&surface_id));
+        let scene = state.canonical_presentation_scene();
+        let projected = state.apply_presentation_to_native_frame_surfaces(
+            Cow::Borrowed(scene.surfaces.as_ref()),
+            scene.presentation_owner_root_surface_ids.as_ref(),
+            &after,
+        );
+        let committed_size = projected[0].render_target_size.unwrap_or(BufferSize {
+            width: projected[0].width,
+            height: projected[0].height,
+        });
+        assert_eq!(committed_size, expected_size);
+        assert_eq!(
+            render::surface_origins(projected.as_ref())[0],
+            expected_origin
+        );
+    }
+}
+
+#[test]
 fn zero_sized_xdg_mode_visual_survives_animation_endpoint_without_client_response() {
     let surface_id = 53;
     let mut state = xdg_state(

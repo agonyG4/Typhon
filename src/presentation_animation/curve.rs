@@ -8,6 +8,8 @@ pub enum EasingCurve {
     EaseInOut,
     EaseInCubic,
     EaseOutCubic,
+    /// The easeOutExpo cubic Bezier (0.16, 1, 0.3, 1).
+    EaseOutExpo,
     EaseInOutCubic,
 }
 
@@ -34,6 +36,39 @@ impl EasingCurve {
                 (
                     1.0 - remaining * remaining * remaining,
                     3.0 * remaining * remaining,
+                )
+            }
+            Self::EaseOutExpo => {
+                // Time is the Bezier's X coordinate, not its parameter.
+                // X is strictly increasing for these control points.
+                let mut low = 0.0;
+                let mut high = 1.0;
+                for _ in 0..40 {
+                    let t = (low + high) * 0.5;
+                    let remaining = 1.0 - t;
+                    let x = 3.0 * remaining * remaining * t * 0.16
+                        + 3.0 * remaining * t * t * 0.3
+                        + t * t * t;
+                    if x < progress {
+                        low = t;
+                    } else {
+                        high = t;
+                    }
+                }
+                let t = if progress <= 0.0 {
+                    0.0
+                } else if progress >= 1.0 {
+                    1.0
+                } else {
+                    (low + high) * 0.5
+                };
+                let remaining = 1.0 - t;
+                let dx = 3.0 * remaining * remaining * 0.16
+                    + 6.0 * remaining * t * (0.3 - 0.16)
+                    + 3.0 * t * t * (1.0 - 0.3);
+                (
+                    1.0 - remaining * remaining * remaining,
+                    3.0 * remaining * remaining / dx,
                 )
             }
             Self::EaseInOutCubic => {
