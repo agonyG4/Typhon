@@ -1608,6 +1608,12 @@ impl OwnCompositorServer {
             .presentation_scene_sample_for_targets_at(at, targets)
     }
 
+    pub fn anchor_unrendered_presentation_transactions(&mut self, first_frame_origin: AnimationTime) {
+        self.state
+            .presentation_animator
+            .anchor_unrendered_transactions(first_frame_origin);
+    }
+
     pub fn presentation_scene_sample_for_targets_at_with_source(
         &self,
         at: AnimationTime,

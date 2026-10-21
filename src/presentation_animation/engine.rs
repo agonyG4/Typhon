@@ -2,7 +2,7 @@
 
 use std::{
     cell::Cell,
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     num::NonZeroU64,
 };
 
@@ -298,6 +298,9 @@ pub struct PresentationEngine {
     opacity_tracks: BTreeMap<SceneNodeId, OpacityTrack>,
     clip_tracks: BTreeMap<SceneNodeId, ClipTrack>,
     pub(super) transactions: BTreeMap<PresentationTransactionId, PresentationTransactionRecord>,
+    /// Transactions no rendered frame has sampled yet. Their clocks restart
+    /// at the first frame so a late first frame cannot skip the opening.
+    unanchored_transactions: BTreeSet<PresentationTransactionId>,
     pub(super) retained_visuals: PresentationRetainedVisualRegistry,
     next_transaction_id: NonZeroU64,
     next_revision_id: NonZeroU64,
@@ -347,6 +350,7 @@ impl PresentationEngine {
             opacity_tracks: BTreeMap::new(),
             clip_tracks: BTreeMap::new(),
             transactions: BTreeMap::new(),
+            unanchored_transactions: BTreeSet::new(),
             retained_visuals: PresentationRetainedVisualRegistry::default(),
             next_transaction_id: NonZeroU64::MIN,
             next_revision_id: NonZeroU64::MIN,
@@ -675,6 +679,11 @@ impl PresentationEngine {
             }
         }
         self.transactions.insert(transaction_id, record.clone());
+        // Headless states never render, so drop transactions already retired.
+        let transactions = &self.transactions;
+        self.unanchored_transactions
+            .retain(|id| transactions.contains_key(id));
+        self.unanchored_transactions.insert(transaction_id);
         self.metrics.transactions_committed = self.metrics.transactions_committed.saturating_add(1);
         self.metrics.transaction_members = self
             .metrics
@@ -682,6 +691,34 @@ impl PresentationEngine {
             .saturating_add(record.members().len() as u64);
         self.metrics.active_tracks = self.active_count() as u64;
         Ok(record)
+    }
+
+    /// Starts every transaction no rendered frame has sampled yet at
+    /// `first_frame_origin`, the time one refresh before the first frame that
+    /// will show it. A transaction committed while the output idles would
+    /// otherwise spend its first frame's render latency off-screen, which a
+    /// front-loaded curve shows as a jump. Clocks only move forward.
+    pub fn anchor_unrendered_transactions(&mut self, first_frame_origin: AnimationTime) {
+        if self.unanchored_transactions.is_empty() {
+            return;
+        }
+        let pending = std::mem::take(&mut self.unanchored_transactions);
+        for track in self.geometry_tracks.values_mut() {
+            let transition = &mut track.transition;
+            if pending.contains(&transition.transaction_id) {
+                transition.started_at = transition.started_at.max(first_frame_origin);
+            }
+        }
+        for track in self.opacity_tracks.values_mut() {
+            if pending.contains(&track.transaction_id) {
+                track.started_at = track.started_at.max(first_frame_origin);
+            }
+        }
+        for track in self.clip_tracks.values_mut() {
+            if pending.contains(&track.transaction_id) {
+                track.started_at = track.started_at.max(first_frame_origin);
+            }
+        }
     }
 
     pub fn transaction_record(
