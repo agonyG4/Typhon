@@ -1984,3 +1984,236 @@ fn xwayland_state_kind_uses_exhaustive_stable_names() {
         assert_eq!(state.as_str(), expected);
     }
 }
+
+#[test]
+fn satellite_mode_parses_as_lazy_foundation_profile_without_managed_xwm() {
+    let mode = XwaylandMode::parse(Some("satellite"));
+    assert_eq!(mode, XwaylandMode::Satellite);
+    assert!(mode.is_enabled());
+    assert!(mode.is_satellite());
+    assert!(!mode.is_managed());
+    assert!(!mode.is_eager());
+    assert_eq!(
+        mode.start_policy(),
+        super::config::XwaylandStartPolicy::Lazy
+    );
+    assert_eq!(mode.profile(), super::config::XwaylandProfile::Foundation);
+}
+
+/// Fake `xwayland-satellite`: records argv, WAYLAND_DISPLAY and whether
+/// DISPLAY/XAUTHORITY leaked through, then blocks until the test releases it
+/// and exits with the code the test wrote.
+fn satellite_service_at_root(
+    label: &str,
+    wayland_display: Option<&str>,
+) -> (PathBuf, XwaylandService, ChildSupervisor, PathBuf) {
+    let root = test_root(label);
+    let binary = root.join("xwayland-satellite-test-binary");
+    let record = root.join("satellite-record");
+    let release = root.join("satellite-release");
+    let exit_code = root.join("satellite-exit-code");
+    fs::write(
+        &binary,
+        format!(
+            "#!/bin/sh\n\
+             {{ printf '%s\\n' \"$@\"; printf 'wayland=%s\\n' \"$WAYLAND_DISPLAY\"; \
+             printf 'display=%s\\n' \"${{DISPLAY-unset}}\"; \
+             printf 'xauthority=%s\\n' \"${{XAUTHORITY-unset}}\"; }} > '{record}.tmp' && mv '{record}.tmp' '{record}'\n\
+             while [ ! -e '{release}' ]; do /bin/sleep 0.01; done\n\
+             exit \"$(cat '{exit_code}' 2>/dev/null || echo 0)\"\n",
+            record = record.display(),
+            release = release.display(),
+            exit_code = exit_code.display(),
+        ),
+    )
+    .expect("write satellite test binary");
+    let mut permissions = fs::metadata(&binary)
+        .expect("stat satellite test binary")
+        .permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&binary, permissions).expect("make satellite test binary executable");
+    let mut config = XwaylandConfig::for_tests_at_root(
+        XwaylandMode::Satellite,
+        root.join("unused-xwayland"),
+        root.clone(),
+    );
+    config.satellite_binary = binary;
+    config.display_min = 1;
+    let mut service = XwaylandService::bootstrap_with_config(config).expect("bootstrap service");
+    if let Some(name) = wayland_display {
+        service.set_satellite_wayland_display(name);
+    }
+    (root, service, ChildSupervisor::new(), record)
+}
+
+fn wait_for_satellite_record(record: &std::path::Path) -> Vec<String> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !record.exists() {
+        assert!(Instant::now() < deadline, "satellite did not start");
+        thread::sleep(Duration::from_millis(10));
+    }
+    fs::read_to_string(record)
+        .expect("read satellite record")
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+fn release_satellite(root: &std::path::Path, exit_code: u8) {
+    fs::write(root.join("satellite-exit-code"), exit_code.to_string()).expect("write exit code");
+    fs::write(root.join("satellite-release"), b"").expect("release satellite");
+}
+
+#[test]
+fn satellite_bootstrap_arms_listeners_and_exposes_display_without_xauthority() {
+    let _lock = display_test_lock();
+    let (root, mut service, mut supervisor, _record) =
+        satellite_service_at_root("satellite-armed", Some("wayland-typhon-test"));
+    assert_eq!(service.state_kind(), XwaylandStateKind::Armed);
+    let purposes = service
+        .reactor_registrations()
+        .map(|registration| registration.purpose)
+        .collect::<Vec<_>>();
+    assert!(purposes.contains(&XwaylandReactorPurpose::ListenFilesystem));
+    assert!(purposes.contains(&XwaylandReactorPurpose::ListenAbstract));
+    let display = service.display_number().expect("display number");
+    let environment = service
+        .normal_app_environment()
+        .expect("satellite exposes app environment while armed");
+    assert_eq!(environment.display, format!(":{display}"));
+    assert!(environment.xauthority.as_os_str().is_empty());
+    service.emergency_cleanup(&mut supervisor).expect("cleanup");
+    drop(service);
+    drop(supervisor);
+    fs::remove_dir_all(root).expect("remove test root");
+}
+
+#[test]
+fn satellite_listener_readiness_launches_satellite_with_listener_fds() {
+    let _lock = display_test_lock();
+    let (root, mut service, mut supervisor, record) =
+        satellite_service_at_root("satellite-launch", Some("wayland-typhon-test"));
+    assert!(
+        service
+            .handle_listener_readiness(&mut supervisor)
+            .expect("launch satellite")
+    );
+    assert_eq!(service.state_kind(), XwaylandStateKind::Satellite);
+    assert_eq!(service.reactor_registrations().count(), 0);
+    assert_eq!(supervisor.active_count(), 1);
+    assert!(
+        !service
+            .handle_listener_readiness(&mut supervisor)
+            .expect("second readiness is coalesced")
+    );
+
+    let display = service.display_number().expect("display number");
+    let lines = wait_for_satellite_record(&record);
+    assert_eq!(
+        lines,
+        vec![
+            format!(":{display}"),
+            "-listenfd".to_owned(),
+            "6".to_owned(),
+            "-listenfd".to_owned(),
+            "7".to_owned(),
+            "wayland=wayland-typhon-test".to_owned(),
+            "display=unset".to_owned(),
+            "xauthority=unset".to_owned(),
+        ]
+    );
+
+    service.begin_shutdown(&mut supervisor).expect("shutdown");
+    reap_one(&mut supervisor);
+    drop(service);
+    drop(supervisor);
+    fs::remove_dir_all(root).expect("remove test root");
+}
+
+#[test]
+fn satellite_launch_without_wayland_display_enters_backoff() {
+    let _lock = display_test_lock();
+    let (root, mut service, mut supervisor, _record) =
+        satellite_service_at_root("satellite-no-display", None);
+    assert!(service.handle_listener_readiness(&mut supervisor).is_err());
+    assert_eq!(service.state_kind(), XwaylandStateKind::Backoff);
+    assert_eq!(supervisor.active_count(), 0);
+    drop(service);
+    drop(supervisor);
+    fs::remove_dir_all(root).expect("remove test root");
+}
+
+#[test]
+fn satellite_clean_exit_rearms_and_next_x11_client_relaunches() {
+    let _lock = display_test_lock();
+    let (root, mut service, mut supervisor, record) =
+        satellite_service_at_root("satellite-clean-exit", Some("wayland-typhon-test"));
+    service
+        .handle_listener_readiness(&mut supervisor)
+        .expect("launch satellite");
+    wait_for_satellite_record(&record);
+    release_satellite(&root, 0);
+    let exit = reap_one(&mut supervisor);
+    assert!(service.handle_process_exit(&exit).expect("handle exit"));
+    assert_eq!(service.state_kind(), XwaylandStateKind::Armed);
+    assert_eq!(service.reactor_registrations().count(), 2);
+
+    fs::remove_file(root.join("satellite-release")).expect("reset release");
+    fs::remove_file(&record).expect("reset record");
+    assert!(
+        service
+            .handle_listener_readiness(&mut supervisor)
+            .expect("relaunch satellite")
+    );
+    assert_eq!(service.state_kind(), XwaylandStateKind::Satellite);
+    wait_for_satellite_record(&record);
+
+    service.begin_shutdown(&mut supervisor).expect("shutdown");
+    reap_one(&mut supervisor);
+    drop(service);
+    drop(supervisor);
+    fs::remove_dir_all(root).expect("remove test root");
+}
+
+#[test]
+fn satellite_crash_enters_backoff_then_returns_to_armed() {
+    let _lock = display_test_lock();
+    let (root, mut service, mut supervisor, record) =
+        satellite_service_at_root("satellite-crash", Some("wayland-typhon-test"));
+    service
+        .handle_listener_readiness(&mut supervisor)
+        .expect("launch satellite");
+    wait_for_satellite_record(&record);
+    release_satellite(&root, 3);
+    let exit = reap_one(&mut supervisor);
+    assert!(service.handle_process_exit(&exit).expect("handle crash"));
+    assert_eq!(service.state_kind(), XwaylandStateKind::Backoff);
+    assert!(service.next_deadline_ns().is_some());
+    assert!(service.handle_deadline(u64::MAX, &mut supervisor).is_ok());
+    assert_eq!(service.state_kind(), XwaylandStateKind::Armed);
+    drop(service);
+    drop(supervisor);
+    fs::remove_dir_all(root).expect("remove test root");
+}
+
+#[test]
+fn satellite_shutdown_terminates_running_satellite() {
+    let _lock = display_test_lock();
+    let (root, mut service, mut supervisor, record) =
+        satellite_service_at_root("satellite-shutdown", Some("wayland-typhon-test"));
+    service
+        .handle_listener_readiness(&mut supervisor)
+        .expect("launch satellite");
+    wait_for_satellite_record(&record);
+    assert_eq!(supervisor.active_count(), 1);
+
+    service.begin_shutdown(&mut supervisor).expect("shutdown");
+    assert_eq!(service.state_kind(), XwaylandStateKind::Disabled);
+    let exit = reap_one(&mut supervisor);
+    assert_eq!(supervisor.active_count(), 0);
+    assert!(!service.handle_process_exit(&exit).expect("late exit"));
+    assert_eq!(service.state_kind(), XwaylandStateKind::Disabled);
+    drop(service);
+    drop(supervisor);
+    fs::remove_dir_all(root).expect("remove test root");
+}

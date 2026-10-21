@@ -10,6 +10,7 @@ impl XwaylandStateKind {
             Self::Running => "running",
             Self::Backoff => "backoff",
             Self::Failed => "failed",
+            Self::Satellite => "satellite",
         }
     }
 }
@@ -18,7 +19,7 @@ impl XwaylandService {
     pub(crate) fn reactor_state_label(&self) -> &'static str {
         match self.state {
             ServiceState::Starting(_) => "Starting",
-            ServiceState::Running(_) => "Running",
+            ServiceState::Running(_) | ServiceState::Satellite(_) => "Running",
             ServiceState::Disabled
             | ServiceState::Armed
             | ServiceState::RunningBase(_)
@@ -40,6 +41,7 @@ impl XwaylandService {
             ServiceState::Disabled
             | ServiceState::Armed
             | ServiceState::RunningBase(_)
+            | ServiceState::Satellite(_)
             | ServiceState::Failed => None,
         }
     }
@@ -49,7 +51,10 @@ impl XwaylandService {
             ServiceState::Starting(ref resources) => Some(resources.generation),
             ServiceState::RunningBase(ref resources) => Some(resources.generation),
             ServiceState::Running(ref resources) => Some(resources.generation),
-            ServiceState::Disabled
+            // Satellite mode has no managed generation: the generation accessor
+            // drives Xwayland-specific compositor paths that do not apply here.
+            ServiceState::Satellite(_)
+            | ServiceState::Disabled
             | ServiceState::Armed
             | ServiceState::Backoff { .. }
             | ServiceState::Failed => None,

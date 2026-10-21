@@ -303,6 +303,7 @@ impl XwaylandService {
             }
             ServiceState::Disabled
             | ServiceState::Armed
+            | ServiceState::Satellite(_)
             | ServiceState::Backoff { .. }
             | ServiceState::Failed => {}
         }

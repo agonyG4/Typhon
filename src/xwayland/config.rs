@@ -9,6 +9,11 @@ pub enum XwaylandMode {
     BaseEager,
     ManagedLazy,
     ManagedEager,
+    /// External `xwayland-satellite` serves the X11 protocol as an ordinary
+    /// Wayland client. Typhon keeps the display lease and listening sockets,
+    /// launches the satellite lazily on the first X11 connection, and runs no
+    /// XWM of its own.
+    Satellite,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,6 +37,7 @@ impl XwaylandMode {
             Some("base") => Self::BaseLazy,
             Some("lazy") => Self::ManagedLazy,
             Some("eager") => Self::ManagedEager,
+            Some("satellite") => Self::Satellite,
             Some(value) => {
                 eprintln!("xwayland: unknown TYPHON_XWAYLAND value {value:?}; using off");
                 Self::Off
@@ -51,6 +57,10 @@ impl XwaylandMode {
         matches!(self, Self::ManagedLazy | Self::ManagedEager)
     }
 
+    pub const fn is_satellite(self) -> bool {
+        matches!(self, Self::Satellite)
+    }
+
     pub const fn profile(self) -> XwaylandProfile {
         if self.is_managed() {
             XwaylandProfile::Managed
@@ -62,7 +72,7 @@ impl XwaylandMode {
     pub const fn start_policy(self) -> XwaylandStartPolicy {
         match self {
             Self::Off => XwaylandStartPolicy::Off,
-            Self::BaseLazy | Self::ManagedLazy => XwaylandStartPolicy::Lazy,
+            Self::BaseLazy | Self::ManagedLazy | Self::Satellite => XwaylandStartPolicy::Lazy,
             Self::BaseEager | Self::ManagedEager => XwaylandStartPolicy::Eager,
         }
     }
@@ -73,6 +83,7 @@ pub struct XwaylandConfig {
     pub mode: XwaylandMode,
     pub profile: XwaylandProfile,
     pub binary: PathBuf,
+    pub satellite_binary: PathBuf,
     pub log_stderr: bool,
     pub display_min: u32,
     pub display_max: u32,
@@ -96,6 +107,9 @@ impl XwaylandConfig {
             binary: env::var_os("TYPHON_XWAYLAND_BINARY")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("Xwayland")),
+            satellite_binary: env::var_os("TYPHON_XWAYLAND_SATELLITE_BINARY")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("xwayland-satellite")),
             log_stderr: env::var_os("TYPHON_XWAYLAND_LOG").is_some_and(|value| value == "1"),
             display_min: 1,
             display_max: 63,
@@ -110,6 +124,7 @@ impl XwaylandConfig {
             mode,
             profile: mode.profile(),
             binary,
+            satellite_binary: PathBuf::from("xwayland-satellite"),
             log_stderr: false,
             display_min: 0,
             display_max: 63,
@@ -123,6 +138,7 @@ impl XwaylandConfig {
             mode,
             profile: mode.profile(),
             binary,
+            satellite_binary: PathBuf::from("xwayland-satellite"),
             log_stderr: false,
             display_min: 0,
             display_max: 63,

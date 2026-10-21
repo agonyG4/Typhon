@@ -451,6 +451,7 @@ impl NativeRuntime {
                 })
                 .transpose()?;
         let mut xwayland = XwaylandService::bootstrap()?;
+        xwayland.set_satellite_wayland_display(server.socket_name());
         let mut xwayland_reactor_tokens = Vec::new();
         sync_xwayland_bootstrap_sources(
             &mut event_loop,

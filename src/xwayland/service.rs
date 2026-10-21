@@ -4,6 +4,7 @@ use std::{
     num::NonZeroU64,
     os::fd::{AsRawFd, OwnedFd, RawFd},
     os::unix::net::UnixStream,
+    path::PathBuf,
 };
 use wayland_server::backend::ClientId;
 
@@ -22,7 +23,7 @@ use super::{
     diagnostics::{StderrRing, XwaylandFailure, XwaylandFailureStage},
     display::DisplayLease,
     displayfd,
-    launch::{ChildFdTarget, build_command},
+    launch::{ChildFdTarget, build_command, build_satellite_command},
     metrics::XwaylandMetrics,
     readiness::XwaylandReadinessSnapshot,
     xwm::{SelectionPayloadTransferId, Xwm, XwmCommand, XwmCommandOutcome, startup::XwmStartup},
@@ -56,6 +57,7 @@ pub enum XwaylandStateKind {
     Running,
     Backoff,
     Failed,
+    Satellite,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,6 +135,15 @@ struct RunningResources {
     stderr: Option<StderrPipe>,
 }
 
+/// Satellite mode owns no listener registrations and no XWM; it holds only the
+/// managed `xwayland-satellite` process and its launch identity.
+#[derive(Debug)]
+struct SatelliteResources {
+    generation: XwaylandGeneration,
+    process: SpawnedProcess,
+    started_ns: u64,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct PendingTermination {
     process_id: ManagedProcessId,
@@ -148,6 +159,7 @@ enum ServiceState {
     Starting(StartingResources),
     RunningBase(RunningBaseResources),
     Running(Box<RunningResources>),
+    Satellite(SatelliteResources),
     Backoff { deadline_ns: u64 },
     Failed,
 }
@@ -210,6 +222,7 @@ pub struct XwaylandService {
     pending_termination: Option<PendingTermination>,
     latest_failed_stderr: StderrRing,
     latest_failure: Option<XwaylandFailure>,
+    satellite_wayland_display: Option<String>,
 }
 
 impl XwaylandService {
@@ -246,9 +259,16 @@ impl XwaylandService {
         } else {
             ServiceState::Disabled
         };
+        let satellite = mode.is_satellite();
         let app_environment = lease.as_ref().map(|lease| XwaylandAppEnvironment {
             display: lease.display().to_string(),
-            xauthority: lease.xauthority_path().to_owned(),
+            // Satellite mode runs its Xwayland without -auth, so apps get no
+            // XAUTHORITY.
+            xauthority: if satellite {
+                PathBuf::new()
+            } else {
+                lease.xauthority_path().to_owned()
+            },
         });
         let mut metrics = XwaylandMetrics::default();
         if app_environment.is_some() {
@@ -273,7 +293,14 @@ impl XwaylandService {
             pending_termination: None,
             latest_failed_stderr: StderrRing::default(),
             latest_failure: None,
+            satellite_wayland_display: None,
         })
+    }
+
+    /// Name of the compositor's Wayland socket, which the satellite connects
+    /// to as `WAYLAND_DISPLAY`.
+    pub fn set_satellite_wayland_display(&mut self, name: impl Into<String>) {
+        self.satellite_wayland_display = Some(name.into());
     }
 
     pub fn bootstrap_with_supervisor(
@@ -295,6 +322,7 @@ impl XwaylandService {
             ServiceState::Starting(_) => XwaylandStateKind::Starting,
             ServiceState::RunningBase(_) => XwaylandStateKind::RunningBase,
             ServiceState::Running(_) => XwaylandStateKind::Running,
+            ServiceState::Satellite(_) => XwaylandStateKind::Satellite,
             ServiceState::Backoff { .. } => XwaylandStateKind::Backoff,
             ServiceState::Failed => XwaylandStateKind::Failed,
         }
@@ -314,6 +342,7 @@ impl XwaylandService {
             ServiceState::RunningBase(_) | ServiceState::Running(_) => self.last_readiness,
             ServiceState::Disabled
             | ServiceState::Armed
+            | ServiceState::Satellite(_)
             | ServiceState::Backoff { .. }
             | ServiceState::Failed => self.last_readiness,
         }
@@ -330,12 +359,13 @@ impl XwaylandService {
             | ServiceState::Starting(_)
             | ServiceState::RunningBase(_)
             | ServiceState::Running(_)
+            | ServiceState::Satellite(_)
             | ServiceState::Backoff { .. } => self.app_environment.as_ref(),
         }
     }
 
     pub fn normal_app_environment(&self) -> Option<&XwaylandAppEnvironment> {
-        if !self.mode.is_managed()
+        if !(self.mode.is_managed() || self.mode.is_satellite())
             || matches!(self.state, ServiceState::Disabled | ServiceState::Failed)
         {
             return None;
@@ -625,6 +655,7 @@ impl XwaylandService {
             ServiceState::Starting(resources) => Some(resources.process.id),
             ServiceState::RunningBase(resources) => Some(resources.process.id),
             ServiceState::Running(resources) => Some(resources.process.id),
+            ServiceState::Satellite(resources) => Some(resources.process.id),
             _ => None,
         };
         if let Some(process_id) = process_id {
@@ -644,11 +675,16 @@ impl XwaylandService {
         }
         if matches!(
             self.mode,
-            XwaylandMode::BaseLazy | XwaylandMode::ManagedLazy
+            XwaylandMode::BaseLazy | XwaylandMode::ManagedLazy | XwaylandMode::Satellite
         ) {
             self.metrics.lazy_triggers = self.metrics.lazy_triggers.saturating_add(1);
         }
-        match self.start_generation(supervisor) {
+        let started = if self.mode.is_satellite() {
+            self.start_satellite(supervisor)
+        } else {
+            self.start_generation(supervisor)
+        };
+        match started {
             Ok(()) => Ok(true),
             Err(error) => {
                 self.enter_failure_backoff(now_ns()?);
@@ -990,6 +1026,54 @@ impl XwaylandService {
         Ok(false)
     }
 
+    fn start_satellite(&mut self, supervisor: &mut ChildSupervisor) -> io::Result<()> {
+        let wayland_display = self.satellite_wayland_display.clone().ok_or_else(|| {
+            io::Error::other(
+                "XWayland satellite start requested without a compositor WAYLAND_DISPLAY",
+            )
+        })?;
+        let generation = self.allocate_generation()?;
+        let started_ns = now_ns()?;
+        let lease = self.lease.as_ref().ok_or_else(|| {
+            io::Error::other("XWayland satellite start requested without a display lease")
+        })?;
+        let mut launch = SpawnCommand::new(build_satellite_command(
+            &self.config.satellite_binary,
+            lease,
+            &wayland_display,
+        ));
+        let (filesystem_listener, abstract_listener) = lease.listener_fds();
+        launch.map_fd(
+            duplicate_fd(filesystem_listener)?,
+            ChildFdTarget::FilesystemListen.raw_fd(),
+        )?;
+        launch.map_fd(
+            duplicate_fd(abstract_listener)?,
+            ChildFdTarget::AbstractListen.raw_fd(),
+        )?;
+        let options = ProcessOptions::new(ProcessKind::Xwayland)
+            .session_owned(true)
+            .with_process_group_policy(ProcessGroupPolicy::Dedicated);
+        let process = launch.spawn(supervisor, options)?;
+        eprintln!(
+            "oblivion-one xwayland: event=satellite_started generation={generation:?} display={} process_id={} pid={}",
+            lease.display(),
+            process.id.get(),
+            process.pid,
+        );
+        // Listener registrations belong to the Armed state; the satellite now
+        // owns accept, so the reactor must drop them.
+        self.bump_reactor_registration_generation();
+        self.state = ServiceState::Satellite(SatelliteResources {
+            generation,
+            process,
+            started_ns,
+        });
+        self.metrics.state_transitions = self.metrics.state_transitions.saturating_add(1);
+        self.log_state_transition();
+        Ok(())
+    }
+
     fn start_generation(&mut self, supervisor: &mut ChildSupervisor) -> io::Result<()> {
         let generation = self.allocate_generation()?;
         let started_ns = now_ns()?;
@@ -1275,14 +1359,17 @@ impl XwaylandService {
         if compositor_requested {
             self.pending_termination = None;
         }
+        // A satellite is a running process: a clean exit re-arms it so the next
+        // X11 connection relaunches it, and a crash enters failure backoff.
         let ready = matches!(
             self.state,
-            ServiceState::RunningBase(_) | ServiceState::Running(_)
+            ServiceState::RunningBase(_) | ServiceState::Running(_) | ServiceState::Satellite(_)
         );
         let process = match &self.state {
             ServiceState::Starting(resources) => resources.process,
             ServiceState::RunningBase(resources) => resources.process,
             ServiceState::Running(resources) => resources.process,
+            ServiceState::Satellite(resources) => resources.process,
             _ => return Ok(false),
         };
         let exit_class = classify_exit(ready, compositor_requested, exit.status.success());
@@ -1293,6 +1380,15 @@ impl XwaylandService {
         if process.id != exit.id {
             self.metrics.stale_events = self.metrics.stale_events.saturating_add(1);
             return Ok(false);
+        }
+        if let ServiceState::Satellite(resources) = &self.state {
+            eprintln!(
+                "oblivion-one xwayland: event=satellite_exit generation={:?} process_id={} uptime_ns={} success={}",
+                resources.generation,
+                exit.id.get(),
+                now_ns()?.saturating_sub(resources.started_ns),
+                exit.status.success(),
+            );
         }
         if let Some(mut readiness) = self.readiness_snapshot() {
             readiness.process_alive = false;
@@ -1948,6 +2044,7 @@ impl XwaylandService {
             ServiceState::Starting(resources) => Some(resources.process.id),
             ServiceState::RunningBase(resources) => Some(resources.process.id),
             ServiceState::Running(resources) => Some(resources.process.id),
+            ServiceState::Satellite(resources) => Some(resources.process.id),
             ServiceState::Disabled
             | ServiceState::Armed
             | ServiceState::Backoff { .. }
@@ -2155,6 +2252,7 @@ impl XwaylandService {
             }
             ServiceState::Disabled
             | ServiceState::Armed
+            | ServiceState::Satellite(_)
             | ServiceState::Backoff { .. }
             | ServiceState::Failed => {}
         }

@@ -137,3 +137,27 @@ Hyprland-managed Xwayland, with no native Typhon XWM available. No real-client
 case was qualified. F11-D remains partially qualified pending a managed native
 Typhon session; the installed-client inventory and blocked matrix are recorded
 in [XWAYLAND_INTEROP_QUALIFICATION.md](XWAYLAND_INTEROP_QUALIFICATION.md).
+
+## Satellite mode (`TYPHON_XWAYLAND=satellite`)
+
+`TYPHON_XWAYLAND=satellite` replaces Typhon's own Xwayland and XWM with the
+external [`xwayland-satellite`](https://github.com/Supreeeme/xwayland-satellite)
+binary. It is opt-in; the default managed and base modes are unchanged.
+
+- `TYPHON_XWAYLAND_SATELLITE_BINARY` selects the satellite executable
+  (default `xwayland-satellite` from `PATH`).
+- Typhon still allocates the X display number, its `/tmp/.X<N>-lock`, the
+  filesystem and abstract listening sockets, and the xauthority path. Apps get
+  `DISPLAY=:N` with no `XAUTHORITY`, because the satellite's Xwayland runs
+  without `-auth`.
+- The satellite launches lazily on the first X11 connection. Typhon hands it
+  the two listening sockets as `xwayland-satellite :N -listenfd 6 -listenfd 7`
+  with `WAYLAND_DISPLAY` set to Typhon's own Wayland socket, so the satellite
+  is an ordinary Wayland client that presents X windows as `xdg_toplevel`s and
+  spawns Xwayland itself.
+- A clean satellite exit re-arms the listeners so the next X11 client relaunches
+  it. A crash enters the usual failure backoff; repeated crashes end in the
+  failed state.
+- Typhon's XWM features are not used in this mode: the selection bridge, the
+  XDND bridge, and the X11 geometry policy are all inactive. The satellite
+  provides its own X11 integration.

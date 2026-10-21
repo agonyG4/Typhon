@@ -51,3 +51,26 @@ pub(crate) fn build_command(binary: &Path, lease: &DisplayLease) -> Command {
         );
     command
 }
+
+/// Builds the `xwayland-satellite` command. The satellite is an ordinary
+/// Wayland client of the compositor; it receives the same listening sockets
+/// Typhon would hand Xwayland, and spawns Xwayland itself.
+pub(crate) fn build_satellite_command(
+    binary: &Path,
+    lease: &DisplayLease,
+    wayland_display: &str,
+) -> Command {
+    let mut command = Command::new(binary);
+    command
+        .arg(lease.display())
+        .arg("-listenfd")
+        .arg(ChildFdTarget::FilesystemListen.raw_fd().to_string())
+        .arg("-listenfd")
+        .arg(ChildFdTarget::AbstractListen.raw_fd().to_string())
+        .env("WAYLAND_DISPLAY", wayland_display)
+        .env_remove("DISPLAY")
+        .env_remove("XAUTHORITY")
+        .env_remove("WAYLAND_SOCKET")
+        .env_remove("OBLIVION_ONE_XWAYLAND_DISPLAY");
+    command
+}
