@@ -130,7 +130,8 @@ impl CompositorState {
         mode: ToplevelMode,
     ) -> WindowGeometry {
         if mode == ToplevelMode::Maximized
-            && self.surface_uses_server_side_decorations(surface_id, mode)
+            && self.target_decoration_mode_for_surface(surface_id, mode)
+                == crate::compositor::decoration::types::DecorationMode::ServerSide
         {
             let usable = self.usable_output_geometry();
             let titlebar = self.decoration_theme.metrics().titlebar_height as f64;

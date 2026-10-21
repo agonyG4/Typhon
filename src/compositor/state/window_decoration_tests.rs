@@ -5646,6 +5646,27 @@ fn maximized_ssd_outer_frame_matches_usable_output_across_repeated_cycles() {
 }
 
 #[test]
+fn maximized_ssd_target_from_fullscreen_reserves_the_titlebar() {
+    // Fullscreen applies `None`; the exit target must still leave room for
+    // the titlebar the restored maximized window will draw.
+    let state = xdg_state(
+        test_surface(46),
+        DecorationPreference::ServerSide,
+        ToplevelMode::Fullscreen,
+    );
+    let usable = state.usable_output_geometry();
+    let titlebar = state.decoration_theme.metrics().titlebar_height;
+
+    let geometry = state.window_geometry_for_surface_mode(46, ToplevelMode::Maximized);
+
+    assert_eq!(
+        geometry.placement.local_y,
+        usable.y as i32 + titlebar as i32
+    );
+    assert_eq!(geometry.height, usable.height as u32 - titlebar);
+}
+
+#[test]
 fn titlebar_double_click_requires_spatial_proximity() {
     const LEFT_BUTTON: u32 = 0x110;
     let mut state = xdg_state(

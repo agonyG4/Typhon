@@ -222,6 +222,20 @@ impl WindowDecorationState {
     }
 }
 
+fn xdg_configured_decoration_mode(
+    window: &DesktopWindow,
+    decoration_state: &WindowDecorationState,
+    mode: ToplevelMode,
+) -> DecorationMode {
+    if mode == ToplevelMode::Fullscreen {
+        DecorationMode::None
+    } else if window.decoration_policy == WindowDecorationPolicy::Server {
+        DecorationMode::ServerSide
+    } else {
+        decoration_state.requested_mode(false)
+    }
+}
+
 fn effective_decoration_mode(
     window: &DesktopWindow,
     xdg_state: Option<&WindowDecorationState>,
@@ -510,15 +524,34 @@ impl super::super::CompositorState {
         let window = self
             .window_id_for_surface(surface_id)
             .and_then(|window_id| self.window(window_id))?;
-        let fullscreen = window.state.mode() == ToplevelMode::Fullscreen;
-        let mode = if fullscreen {
-            DecorationMode::None
-        } else if window.decoration_policy == WindowDecorationPolicy::Server {
-            DecorationMode::ServerSide
-        } else {
-            decoration_state.requested_mode(false)
-        };
+        let mode = xdg_configured_decoration_mode(window, decoration_state, window.state.mode());
         Some(ConfiguredXdgDecorationState { generation, mode })
+    }
+
+    /// Decoration mode the window settles on once `mode` is configured and
+    /// acked. Geometry for a target mode must use this rather than the
+    /// applied mode: leaving fullscreen still has `None` applied until the
+    /// client acks, which would place a maximized SSD window without room
+    /// for its titlebar.
+    pub(in crate::compositor) fn target_decoration_mode_for_surface(
+        &self,
+        surface_id: u32,
+        mode: ToplevelMode,
+    ) -> DecorationMode {
+        let Some(window) = self
+            .window_id_for_surface(surface_id)
+            .and_then(|window_id| self.window(window_id))
+        else {
+            return DecorationMode::None;
+        };
+        if window.kind == DesktopWindowKind::Managed
+            && matches!(window.backend, WindowBackend::Xdg(_))
+            && let Some(decoration_state) = self.xdg_decoration_states.get(&surface_id)
+            && decoration_state.current_generation().is_some()
+        {
+            return xdg_configured_decoration_mode(window, decoration_state, mode);
+        }
+        self.effective_decoration_mode_for_window(window, mode)
     }
 
     pub(in crate::compositor) fn xdg_decoration_configure_event_needed(
