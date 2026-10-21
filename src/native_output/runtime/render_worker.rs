@@ -786,7 +786,32 @@ impl NativeRuntime {
                         .worker_started_at_ns
                         .map(|started| started.saturating_sub(completion.dispatch_at_ns));
                     self.perf.log("native.render_worker.completion", || {
+                        // Worker frames never reach the GLES repaint fields of
+                        // `native.frame`, so effect pool churn rides here next
+                        // to the scene drawing time it may cost.
+                        let effect_stats = match &completion.result {
+                            Ok(AtomicSlotRenderOutcome::Rendered(parts)) => Some(&parts.stats),
+                            _ => None,
+                        };
+                        let effect_field = |key, value: fn(&GlesSceneFrameStats) -> usize| {
+                            NativePerfField::str(
+                                key,
+                                effect_stats.map_or_else(
+                                    || "unavailable".to_owned(),
+                                    |stats| value(stats).to_string(),
+                                ),
+                            )
+                        };
                         vec![
+                            effect_field("effect_instances_executed", |stats| {
+                                stats.effect_instances_executed
+                            }),
+                            effect_field("effect_resource_allocations_total", |stats| {
+                                stats.effect_resource_allocations_total
+                            }),
+                            effect_field("effect_resource_reuses_total", |stats| {
+                                stats.effect_resource_reuses_total
+                            }),
                             NativePerfField::u64("job_id", completion.job_id.get()),
                             NativePerfField::u64("frame_id", completion.frame_id),
                             NativePerfField::u64("transaction_id", completion.transaction_id.get()),
