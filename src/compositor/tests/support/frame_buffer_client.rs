@@ -104,6 +104,7 @@ impl Drop for TestShmBuffer {
 
 type InitialXdgTestBuffer = (
     wayland_client::backend::Backend,
+    wayland_client::backend::ObjectId,
     client_wl_surface::WlSurface,
     TestShmBuffer,
     i32,
@@ -116,18 +117,24 @@ thread_local! {
 }
 
 fn register_initial_xdg_test_buffer(
+    xdg_surface: &client_xdg_surface::XdgSurface,
     surface: &client_wl_surface::WlSurface,
     buffer: TestShmBuffer,
     width: i32,
     height: i32,
 ) {
-    let Some(backend) = surface.backend().upgrade() else {
+    let Some(backend) = xdg_surface.backend().upgrade() else {
         return;
     };
     INITIAL_XDG_TEST_BUFFERS.with(|buffers| {
-        buffers
-            .borrow_mut()
-            .push((backend, surface.clone(), buffer, width, height));
+        buffers.borrow_mut().push((
+            backend,
+            xdg_surface.id(),
+            surface.clone(),
+            buffer,
+            width,
+            height,
+        ));
     });
 }
 
@@ -137,14 +144,17 @@ pub(in crate::compositor::tests) fn commit_registered_initial_xdg_test_buffer(
     let Some(backend) = xdg_surface.backend().upgrade() else {
         return;
     };
+    let xdg_surface_id = xdg_surface.id();
     let pending = INITIAL_XDG_TEST_BUFFERS.with(|buffers| {
         let mut buffers = buffers.borrow_mut();
         buffers
             .iter()
-            .position(|(candidate, _, _, _, _)| candidate == &backend)
+            .position(|(candidate_backend, candidate, _, _, _, _)| {
+                candidate_backend == &backend && candidate == &xdg_surface_id
+            })
             .map(|index| buffers.remove(index))
     });
-    let Some((_, surface, buffer, width, height)) = pending else {
+    let Some((_, _, surface, buffer, width, height)) = pending else {
         return;
     };
     buffer.attach(&surface, width as usize, height as usize);
@@ -2005,7 +2015,7 @@ pub(in crate::compositor::tests) fn create_test_buffered_toplevel(
     let xdg_surface = wm_base.get_xdg_surface(&surface, qh, ());
     let toplevel = xdg_surface.get_toplevel(qh, ());
     let buffer = TestShmBuffer::new(shm, qh, width, height)?;
-    register_initial_xdg_test_buffer(&surface, buffer, width as i32, height as i32);
+    register_initial_xdg_test_buffer(&xdg_surface, &surface, buffer, width as i32, height as i32);
     Ok((surface, xdg_surface, toplevel))
 }
 

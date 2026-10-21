@@ -1449,12 +1449,28 @@ impl CompositorState {
         }
 
         self.send_wm_capabilities_if_needed(surface_id);
+        let activated = self.focused_window_id == Some(toplevel.window_id);
+        let mut latest_states = [None; 3];
+        let mut sent_states = Vec::with_capacity(states.len() + 1);
+        for state in states
+            .iter()
+            .copied()
+            .filter(|state| *state != xdg_toplevel::State::Activated)
+        {
+            if let Some(slot) = latest_states.iter_mut().find(|slot| slot.is_none()) {
+                *slot = Some(state);
+            }
+            sent_states.push(state);
+        }
+        if activated {
+            sent_states.push(xdg_toplevel::State::Activated);
+        }
         if let Err(error) = toplevel
             .toplevel
             .send_event(xdg_toplevel::Event::Configure {
                 width: width as i32,
                 height: height as i32,
-                states: xdg_toplevel_state_bytes(states),
+                states: xdg_toplevel_state_bytes(&sent_states),
             })
             && compositor_debug_surface_logging_enabled()
         {
@@ -1463,7 +1479,54 @@ impl CompositorState {
 
         let serial =
             self.send_xdg_surface_configure(surface_id, &toplevel.xdg_surface, decoration_mode);
+        let serial_state = self.xdg_configure_serials.entry(surface_id).or_default();
+        serial_state.latest_size = Some((width, height));
+        serial_state.latest_states = latest_states;
+        serial_state.latest_activated = activated;
         Some(serial)
+    }
+
+    /// Resends the last toplevel configure to every mapped XDG toplevel whose
+    /// activated state no longer matches keyboard focus. Chromium/Electron
+    /// keep treating a window as minimized until a configure carries
+    /// `activated`, so restore and focus changes must reach the client.
+    ///
+    /// Runs at the client flush boundary rather than inside request
+    /// handling: an unmap commit drops focus before the xdg lifecycle
+    /// resets, and a configure sent in between would be acked after the
+    /// reset as an unknown serial.
+    pub(in crate::compositor) fn sync_xdg_toplevel_activation(&mut self) {
+        if !std::mem::take(&mut self.xdg_activation_sync_pending) {
+            return;
+        }
+        let focused_window_id = self.focused_window_id;
+        let stale = self
+            .toplevel_surfaces
+            .iter()
+            .filter_map(|(surface_id, toplevel)| {
+                if !toplevel.toplevel.is_alive()
+                    || !self
+                        .xdg_surface_lifecycle(*surface_id)
+                        .is_some_and(|lifecycle| lifecycle.currently_mapped)
+                {
+                    return None;
+                }
+                let serial_state = self.xdg_configure_serials.get(surface_id)?;
+                let size = serial_state.latest_size?;
+                let activated = focused_window_id == Some(toplevel.window_id);
+                (activated != serial_state.latest_activated).then_some((
+                    *surface_id,
+                    toplevel.clone(),
+                    size,
+                    serial_state.latest_states,
+                ))
+            })
+            .collect::<Vec<_>>();
+        for (surface_id, toplevel, (width, height), latest_states) in stale {
+            let states = latest_states.into_iter().flatten().collect::<Vec<_>>();
+            let _ =
+                self.send_toplevel_configure(surface_id, &toplevel, width, height, &states, false);
+        }
     }
 
     fn send_xdg_surface_configure(
@@ -3286,6 +3349,7 @@ impl CompositorState {
 
     pub(in crate::compositor) fn focus_topmost_renderable_toplevel(&mut self) -> bool {
         let Some(window_id) = self.topmost_renderable_toplevel_window_id() else {
+            self.xdg_activation_sync_pending = true;
             return false;
         };
         let Some(surface) = self
@@ -3297,6 +3361,7 @@ impl CompositorState {
             })
             .and_then(|window| self.surface_resource_by_id(window.root_surface_id))
         else {
+            self.xdg_activation_sync_pending = true;
             return false;
         };
         self.focus_surface(surface);

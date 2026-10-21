@@ -86,6 +86,7 @@ impl CompositorState {
             window.last_focus_serial = focus_generation;
         }
         if desktop_window_changed {
+            self.xdg_activation_sync_pending = true;
             if let Some(window_id) = old_window_id {
                 self.mark_astrea_toplevel_dirty(window_id);
             }

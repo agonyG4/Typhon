@@ -794,7 +794,8 @@ fn initial_map_has_one_coherent_decoration_transaction() {
     )
     .expect("connect decoration client");
     assert_eq!(capture_renderable_surface_snapshot(&commands).len(), 1);
-    assert_eq!(client.state.surface_configure_count, 1);
+    // The second configure only adds `activated`; decoration stays one transaction.
+    assert_eq!(client.state.surface_configure_count, 2);
     assert_eq!(client.state.decoration_configure_count, 1);
     assert_eq!(client.state.decoration_configure_modes, vec![2]);
     let relevant = client
@@ -813,6 +814,8 @@ fn initial_map_has_one_coherent_decoration_transaction() {
         relevant,
         vec![
             "decoration_configure",
+            "toplevel_configure",
+            "xdg_surface_configure",
             "toplevel_configure",
             "xdg_surface_configure"
         ]
@@ -872,7 +875,8 @@ fn v2_server_preference_before_initial_commit_uses_one_coherent_transaction() {
 
     assert_eq!(capture_renderable_surface_snapshot(&commands).len(), 1);
     assert_eq!(capture_native_decoration_count(&commands), 1);
-    assert_eq!(client.state.surface_configure_count, 1);
+    // The second configure only adds `activated`; decoration stays one transaction.
+    assert_eq!(client.state.surface_configure_count, 2);
     assert_eq!(client.state.decoration_configure_count, 1);
     drop(client);
     stop_server(commands, server_thread);

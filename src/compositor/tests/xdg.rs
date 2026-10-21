@@ -549,9 +549,10 @@ fn sober_style_toplevel_reassociation_on_same_wl_surface_is_supported() {
     assert!(!snapshot.toplevel_has_title);
     assert!(!snapshot.toplevel_has_non_default_constraints);
     assert_eq!(snapshot.toplevel_mode, Some(ToplevelMode::Normal));
-    assert_eq!(state.surface_configure_count, 2);
-    assert_eq!(state.toplevel_configure_count, 2);
-    assert_eq!(state.surface_configure_serials.len(), 2);
+    // Each role gets its initial configure plus the activation resend on map.
+    assert_eq!(state.surface_configure_count, 4);
+    assert_eq!(state.toplevel_configure_count, 4);
+    assert_eq!(state.surface_configure_serials.len(), 4);
     assert_ne!(
         state.surface_configure_serials[0],
         state.surface_configure_serials[1]
@@ -2929,4 +2930,42 @@ fn xdg_fullscreen_return_mode_tracks_maximize_changes_without_exiting_fullscreen
     assert!(!state.toplevel_has_state(client_xdg_toplevel::State::Fullscreen));
 
     stop_controllable_test_server(commands, server_thread);
+}
+
+#[test]
+fn focused_toplevel_is_activated_and_minimize_round_trip_toggles_it() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    let connection = Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let (surface, _xdg_surface, toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 300, 200).unwrap();
+    surface.commit();
+    connection.flush().unwrap();
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state).unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    assert!(state.toplevel_has_state(client_xdg_toplevel::State::Activated));
+
+    toplevel.set_minimized();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    assert!(!state.toplevel_has_state(client_xdg_toplevel::State::Activated));
+
+    let configures_before_restore = state.toplevel_configure_count;
+    commands.send(ServerCommand::RestoreNextMinimized).unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    assert!(state.toplevel_configure_count > configures_before_restore);
+    assert!(state.toplevel_has_state(client_xdg_toplevel::State::Activated));
+
+    let _ = stop_controllable_test_server(commands, server_thread);
 }

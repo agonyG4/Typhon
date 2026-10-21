@@ -602,6 +602,11 @@ struct ActiveToplevelResize {
 struct XdgConfigureSerialState {
     latest_sent: u32,
     latest_acked: u32,
+    // Last toplevel configure payload, kept so focus changes can resend it
+    // with only the activated state flipped.
+    latest_size: Option<(u32, u32)>,
+    latest_states: [Option<xdg_toplevel::State>; 3],
+    latest_activated: bool,
 }
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum RenderGenerationCause {
@@ -892,6 +897,7 @@ pub struct CompositorState {
     commit_debug: CommitDebugState,
     resize_flow_metrics: ResizeFlowMetrics,
     xdg_configure_serials: HashMap<u32, XdgConfigureSerialState>,
+    xdg_activation_sync_pending: bool,
     last_pointer_x: f64,
     last_pointer_y: f64,
     last_pointer_motion_usec: Option<u64>,

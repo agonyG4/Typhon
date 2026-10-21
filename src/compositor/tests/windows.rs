@@ -2023,7 +2023,8 @@ fn resize_drag_end_clears_resizing_state() {
     let server = stop_controllable_test_server(commands, server_thread);
 
     let state = state.unwrap();
-    assert_eq!(state.toplevel_configure_count, 3);
+    // Includes the activation resend after the initial map.
+    assert_eq!(state.toplevel_configure_count, 4);
     assert_eq!(state.toplevel_width, 340);
     assert_eq!(state.toplevel_height, 230);
     assert!(!state.toplevel_has_state(client_xdg_toplevel::State::Resizing));
@@ -2073,7 +2074,8 @@ fn csd_buffer_margin_resize_release_keeps_configure_at_window_geometry() {
     let _server = stop_controllable_test_server(commands, server_thread);
 
     let state = state.unwrap();
-    assert_eq!(state.toplevel_configure_count, 3);
+    // Includes the activation resend after the initial map.
+    assert_eq!(state.toplevel_configure_count, 4);
     assert_eq!(state.toplevel_width, 340);
     assert_eq!(state.toplevel_height, 230);
     assert!(!state.toplevel_has_state(client_xdg_toplevel::State::Resizing));
@@ -2386,7 +2388,8 @@ fn frame_corner_resize_click_with_tiny_motion_does_not_resize_window() {
     .unwrap();
     let _server = stop_controllable_test_server(commands, server_thread);
 
-    assert_eq!(state.toplevel_configure_count, 1);
+    // Initial configure plus the activation resend once the window is focused.
+    assert_eq!(state.toplevel_configure_count, 2);
 }
 
 #[test]

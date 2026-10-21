@@ -114,6 +114,7 @@ impl OwnCompositorServer {
         {
             self.wayland_flush_count = self.wayland_flush_count.saturating_add(1);
         }
+        self.state.sync_xdg_toplevel_activation();
         self.display.flush_clients()?;
         Ok(())
     }
