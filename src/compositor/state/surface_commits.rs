@@ -330,7 +330,6 @@ impl CompositorState {
             .filter(|surface_id| surface_ids.contains(surface_id))
             .collect::<Vec<_>>();
         for surface_id in visual_ids {
-            self.held_mode_animations.remove(&surface_id);
             self.toplevel_visual_geometries.remove(&surface_id);
             self.clear_toplevel_visual_render_assignment(surface_id);
         }

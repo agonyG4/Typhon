@@ -1065,7 +1065,6 @@ impl CompositorState {
         &mut self,
         root_surface_id: u32,
     ) {
-        self.held_mode_animations.remove(&root_surface_id);
         if let Some(scene_node_id) = self.presentation_scene_node_id_for_root(root_surface_id) {
             self.presentation_animator.cancel_geometry(scene_node_id);
         }
@@ -1092,26 +1091,6 @@ impl CompositorState {
         target_geometry: WindowGeometry,
         kind: PresentationAnimationKind,
     ) {
-        self.animate_toplevel_visual_geometry_with_response_hold(
-            root_surface_id,
-            previous_geometry,
-            target_geometry,
-            kind,
-            None,
-        );
-    }
-
-    /// `response_hold` delays the transition start by that duration and records a
-    /// held entry so a client commit can restart it from the source rect.
-    pub(in crate::compositor) fn animate_toplevel_visual_geometry_with_response_hold(
-        &mut self,
-        root_surface_id: u32,
-        previous_geometry: WindowGeometry,
-        target_geometry: WindowGeometry,
-        kind: PresentationAnimationKind,
-        response_hold: Option<Duration>,
-    ) {
-        self.held_mode_animations.remove(&root_surface_id);
         let interaction_active = self.active_toplevel_resizes.contains_key(&root_surface_id)
             || self.window_interaction.is_some_and(|interaction| {
                 interaction.root_surface_id == root_surface_id
@@ -1166,114 +1145,12 @@ impl CompositorState {
             }
             return;
         }
-        // Only a transition that starts from rest waits for the client. A reversal
-        // or retarget keeps its track so velocity continuity is preserved.
-        let hold = response_hold.filter(|hold| {
-            !hold.is_zero() && !self.presentation_animator.has_geometry_track(scene_node_id)
-        });
-        let Some(hold) = hold else {
-            let _ = self.presentation_animator.commit(
-                crate::presentation_animation::PresentationTransactionRequest::geometry(
-                    now,
-                    vec![mutation],
-                ),
-            );
-            return;
-        };
-        let held_until = AnimationTime::from_nanos(
-            now.as_nanos()
-                .saturating_add(u64::try_from(hold.as_nanos()).unwrap_or(u64::MAX)),
-        );
-        let committed = self
-            .presentation_animator
-            .commit(
-                crate::presentation_animation::PresentationTransactionRequest::geometry(
-                    held_until,
-                    vec![mutation],
-                ),
-            )
-            .is_ok();
-        if !committed {
-            return;
-        }
-        self.held_mode_animations.insert(
-            root_surface_id,
-            HeldModeAnimation {
-                scene_node_id,
-                previous,
-                target,
-                curve,
-                held_until,
-            },
-        );
-        if compositor_debug_surface_logging_enabled() {
-            eprintln!(
-                "oblivion-one compositor: event=mode_transition_response_hold_start root_surface_id={root_surface_id} hold_ms={} held_until_ns={}",
-                hold.as_millis(),
-                held_until.as_nanos(),
-            );
-        }
-    }
-
-    /// Restarts a held mode transition from its source rect once the client has
-    /// committed a response to the mode configure. A hold that already expired is
-    /// dropped: its transition started at `held_until` on its own.
-    pub(in crate::compositor) fn release_held_mode_animation_for_client_response(
-        &mut self,
-        root_surface_id: u32,
-        root_commit_sequence: Option<SurfaceCommitSequence>,
-    ) {
-        let Some(held) = self.held_mode_animations.get(&root_surface_id).copied() else {
-            return;
-        };
-        let client_response_committed = self
-            .toplevel_visual_geometries
-            .get(&root_surface_id)
-            .and_then(|visual| visual.xdg_mode_transition_fence)
-            .and_then(|fence| fence.ack_commit_sequence_floor)
-            .is_some_and(|ack_commit_floor| {
-                root_commit_sequence
-                    .is_some_and(|commit_sequence| commit_sequence.get() > ack_commit_floor.get())
-            });
-        if !client_response_committed {
-            return;
-        }
-        self.held_mode_animations.remove(&root_surface_id);
-        let now = self
-            .layout_animation_epoch
-            .or_else(AnimationTime::monotonic_now);
-        let debug = compositor_debug_surface_logging_enabled();
-        let Some(now) = now.filter(|now| *now < held.held_until) else {
-            if debug {
-                eprintln!(
-                    "oblivion-one compositor: event=mode_transition_response_hold_timeout root_surface_id={root_surface_id} now_ns={:?} held_until_ns={}",
-                    now.map(AnimationTime::as_nanos),
-                    held.held_until.as_nanos(),
-                );
-            }
-            return;
-        };
-        self.presentation_animator
-            .cancel_geometry(held.scene_node_id);
         let _ = self.presentation_animator.commit(
             crate::presentation_animation::PresentationTransactionRequest::geometry(
                 now,
-                vec![
-                    crate::presentation_animation::PresentationGeometryMutation::new(
-                        held.scene_node_id,
-                        held.previous,
-                        held.target,
-                        held.curve,
-                    ),
-                ],
+                vec![mutation],
             ),
         );
-        if debug {
-            eprintln!(
-                "oblivion-one compositor: event=mode_transition_response_hold_release root_surface_id={root_surface_id} restart_ns={}",
-                now.as_nanos(),
-            );
-        }
     }
 
     fn active_scene_renderable_surfaces(&self) -> Vec<RenderableSurface> {

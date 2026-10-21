@@ -894,8 +894,6 @@ impl CompositorState {
             );
         let mut state = Self {
             native_output_id: None,
-            mode_transition_client_response_hold:
-                super::window_resize::MODE_TRANSITION_CLIENT_RESPONSE_HOLD,
             output_id_allocator: OutputIdAllocator::default(),
             frame_clock_start: Some(Instant::now()),
             next_window_id: 1,

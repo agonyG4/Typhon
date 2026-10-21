@@ -1,10 +1,4 @@
-use super::windows::is_mode_transition_animation_kind;
 use super::*;
-use std::time::Duration;
-
-/// Longest a mode-transition geometry animation waits for the XDG client's commit.
-pub(in crate::compositor) const MODE_TRANSITION_CLIENT_RESPONSE_HOLD: Duration =
-    Duration::from_millis(120);
 
 /// Describes whether a new visual geometry is installed immediately or
 /// animated from an explicitly captured pre-mutation source.
@@ -432,7 +426,6 @@ impl CompositorState {
         root_surface_id: u32,
         root_commit_sequence: Option<SurfaceCommitSequence>,
     ) {
-        self.release_held_mode_animation_for_client_response(root_surface_id, root_commit_sequence);
         let converged_mode_geometry = self
             .toplevel_visual_geometries
             .get(&root_surface_id)
@@ -636,7 +629,6 @@ impl CompositorState {
             .find(|surface| surface.surface_id == root_surface_id)
             .and_then(|surface| surface.render_target_size.take())
             .is_some();
-        let xdg_fence_present = xdg_mode_transition_fence.is_some();
         let visual = ToplevelVisualGeometry {
             placement: geometry.placement,
             width: geometry.width,
@@ -660,18 +652,7 @@ impl CompositorState {
                     self.cancel_presentation_geometry_for_root(root_surface_id);
                 }
                 VisualGeometryTransition::Animated { source, kind } => {
-                    // Only XDG mode transitions wait for a client commit; other
-                    // fenced or unfenced animations start immediately.
-                    let response_hold = (xdg_fence_present
-                        && is_mode_transition_animation_kind(kind))
-                    .then_some(self.mode_transition_client_response_hold);
-                    self.animate_toplevel_visual_geometry_with_response_hold(
-                        root_surface_id,
-                        source,
-                        geometry,
-                        kind,
-                        response_hold,
-                    );
+                    self.animate_toplevel_visual_geometry(root_surface_id, source, geometry, kind);
                 }
             }
         }
