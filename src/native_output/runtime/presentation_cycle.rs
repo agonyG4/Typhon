@@ -1284,18 +1284,6 @@ impl NativeRuntime {
                 return Ok(());
             }
             let render_ahead = scheduler_decision == SchedulerDecision::RenderAhead;
-            // New animations start one refresh before this frame's target, so
-            // the first frame that shows them advances by exactly one refresh.
-            let first_frame_sample_ns = match *scheduled_presentation_target {
-                Some(target) => target.presentation_time.get(),
-                None => monotonic_now_ns()?,
-            };
-            server.anchor_unrendered_presentation_transactions(
-                oblivion_one::compositor::AnimationTime::from_nanos(
-                    first_frame_sample_ns
-                        .saturating_sub(u64::try_from(refresh_interval.as_nanos()).unwrap_or(0)),
-                ),
-            );
             let mut direct_submitted = false;
             let mut direct_suppressed = false;
             let preadmitted_explicit_render = if pending_interactive_visual_work && explicit_output
