@@ -106,6 +106,11 @@ impl ScratchResidencyState {
         }
     }
 
+    pub fn arm_warm_trim_now(&mut self, now: Instant) {
+        self.warm_dirty = true;
+        self.warm_deadline = Some(self.warm_deadline.map_or(now, |deadline| deadline.min(now)));
+    }
+
     pub fn next_deadline(&self) -> Option<Instant> {
         match (self.warm_deadline, self.cold_deadline) {
             (Some(warm), Some(cold)) => Some(warm.min(cold)),
@@ -220,6 +225,55 @@ mod tests {
         let returned = texture.clone();
         return_at(pool, texture, now);
         returned
+    }
+
+    #[test]
+    fn resize_churn_pulls_warm_trim_in_instead_of_filling_budget() {
+        let base = Instant::now();
+        let mut pool = pool();
+        let mut previous = None;
+        for frame in 0..64_u32 {
+            let now = base + Duration::from_millis(u64::from(frame) * 6);
+            let texture = allocate_and_return_scratch(&mut pool, 400 + frame, 300, now);
+            if frame >= 2 {
+                let deadline = pool
+                    .next_scratch_maintenance_deadline()
+                    .expect("a miss with stale scratch arms maintenance");
+                assert!(deadline < now + Duration::from_secs(2));
+                pool.reclaim_scratch_batch(ScratchTrimKind::Warm, deadline);
+            }
+            assert!(
+                pool.metrics().cached_texture_count <= 2,
+                "frame {frame} kept {} scratch textures",
+                pool.metrics().cached_texture_count
+            );
+            if let Some(previous) = previous {
+                assert!(
+                    pool.contains_texture(previous),
+                    "previous frame's scratch stays protected"
+                );
+            }
+            previous = Some(texture.id);
+        }
+
+        let metrics = pool.metrics();
+        assert_eq!(metrics.allocation_count, 64);
+        assert_eq!(metrics.scratch_residency.warm_reclaimed_texture_count, 62);
+        assert_eq!(metrics.scratch_residency.pressure_eviction_count, 0);
+    }
+
+    #[test]
+    fn exact_reuse_does_not_pull_warm_trim_in() {
+        let base = Instant::now();
+        let mut pool = pool();
+        for frame in 0..8_u64 {
+            allocate_and_return_scratch(&mut pool, 400, 300, base + Duration::from_millis(frame));
+        }
+
+        assert_eq!(
+            pool.next_scratch_maintenance_deadline(),
+            Some(base + Duration::from_secs(2))
+        );
     }
 
     #[test]

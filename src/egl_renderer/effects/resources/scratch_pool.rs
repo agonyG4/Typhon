@@ -50,6 +50,12 @@ impl EffectResourcePool {
             return Ok(checked_out);
         }
 
+        if purpose == EffectTexturePurpose::Scratch {
+            // Advance to this frame's epoch first so only the previous frame's
+            // working set stays protected.
+            self.record_scratch_checkout(activity_time);
+            self.request_stale_scratch_trim();
+        }
         self.evict_until_fits(bytes);
         let new_current = self
             .current_bytes
@@ -99,6 +105,23 @@ impl EffectResourcePool {
             Ok(checked_out)
         } else {
             Ok(texture)
+        }
+    }
+
+    /// Exact-size keys mean a resize or animation misses on almost every frame.
+    /// Without this, idle scratch from earlier frames piles up to the hard
+    /// budget until the 2 s warm trim. Pulling the warm deadline in lets the
+    /// next idle maintenance pass (which also drops the effect FBOs that may
+    /// still reference those textures) retire it between frames.
+    fn request_stale_scratch_trim(&mut self) {
+        let residency = &self.scratch_residency;
+        let stale_scratch_exists = self.textures.values().flatten().any(|texture| {
+            texture.purpose == EffectTexturePurpose::Scratch
+                && !texture.checked_out
+                && !residency.protects_epoch(texture.scratch_epoch)
+        });
+        if stale_scratch_exists {
+            self.scratch_residency.arm_warm_trim_now(Instant::now());
         }
     }
 

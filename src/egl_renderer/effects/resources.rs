@@ -608,6 +608,14 @@ impl EffectResourcePool {
             .any(|texture| texture.id == id && texture.checked_out)
     }
 
+    #[cfg(test)]
+    pub(super) fn contains_texture(&self, id: u64) -> bool {
+        self.textures
+            .values()
+            .flatten()
+            .any(|texture| texture.id == id)
+    }
+
     #[allow(dead_code)]
     pub fn evicted_texture_ids(&self) -> Vec<u64> {
         self.pending_evicted_ids.iter().copied().collect()
