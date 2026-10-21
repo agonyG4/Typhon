@@ -201,6 +201,11 @@ impl CompositorState {
         } else {
             self.clear_fullscreen_presentation_owner(root_surface_id);
         }
+        if mode_changed
+            && (mode == ToplevelMode::Fullscreen || current_mode == ToplevelMode::Fullscreen)
+        {
+            self.restack_for_window_raise_change();
+        }
         self.queue_backend_state(window_id);
         self.mark_astrea_toplevel_dirty(window_id);
         if interaction_target.is_some()

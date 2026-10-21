@@ -1,6 +1,18 @@
 use super::*;
 use crate::wm::WorkspaceLocation;
 
+// Scene bands, bottom to top. Band numbers are compared before the layer and
+// stack keys, so the order here is the stacking order.
+const SCENE_BAND_TOP_LAYER: u8 = 6;
+// Windows of the fullscreen owner family, and windows whose maximize or
+// fullscreen mode-transition animation is in flight, stack above Top layers.
+const SCENE_BAND_RAISED_WINDOW: u8 = 7;
+// Application surfaces the fullscreen plan allows above the owner (special
+// workspace, notifications, overlays) stay above the raised owner family.
+const SCENE_BAND_FULLSCREEN_ALLOWED_WINDOW: u8 = 8;
+const SCENE_BAND_OVERLAY_LAYER: u8 = 9;
+const SCENE_BAND_DRAG_ICON: u8 = 10;
+
 impl CompositorState {
     pub(in crate::compositor) fn reorder_renderable_surfaces_by_committed_stack(&mut self) -> bool {
         if self.defer_render_stack_reorder() {
@@ -99,15 +111,15 @@ impl CompositorState {
         original_position: usize,
     ) -> (u8, u8, u64, usize) {
         if self.surface_role(root_id) == SurfaceRole::DragIcon {
-            return (8, 0, 0, original_position);
+            return (SCENE_BAND_DRAG_ICON, 0, 0, original_position);
         }
 
         if let Some(role) = self.layer_surfaces.get(&root_id) {
             let band = match role.committed.layer.scene_rank() {
                 0 => 0,
                 1 => 1,
-                3 => 6,
-                4 => 7,
+                3 => SCENE_BAND_TOP_LAYER,
+                4 => SCENE_BAND_OVERLAY_LAYER,
                 rank => rank,
             };
             return (
@@ -155,7 +167,14 @@ impl CompositorState {
                         }
                     }
                 })
-                .unwrap_or(6);
+                .unwrap_or(SCENE_BAND_TOP_LAYER);
+            let scene_band = if self.window_raised_above_top_layers(root_id) {
+                SCENE_BAND_RAISED_WINDOW
+            } else if self.window_allowed_above_fullscreen_owner(root_id) {
+                SCENE_BAND_FULLSCREEN_ALLOWED_WINDOW
+            } else {
+                scene_band
+            };
             let stack_position = self
                 .window_stacking
                 .iter()
@@ -165,6 +184,60 @@ impl CompositorState {
         }
 
         (2, 0, 0, original_position)
+    }
+
+    /// True while the window belongs to the fullscreen owner family or its
+    /// mode-transition geometry animation is still in flight.
+    fn window_raised_above_top_layers(&self, root_id: u32) -> bool {
+        if self.mode_transition_raise_active(root_id) {
+            return true;
+        }
+        self.fullscreen_presentation.is_some_and(|owner| {
+            self.root_belongs_to_fullscreen_owner_family(owner.owner_root_surface_id, root_id)
+        })
+    }
+
+    fn window_allowed_above_fullscreen_owner(&self, root_id: u32) -> bool {
+        self.fullscreen_presentation.is_some_and(|owner| {
+            matches!(
+                self.fullscreen_root_classification(owner.owner_root_surface_id, root_id),
+                FullscreenRootClassification::AllowedAboveFullscreen(_)
+            )
+        })
+    }
+
+    /// A raise marker only counts while its root still has the geometry track
+    /// it was recorded for; the settled track is the source of truth.
+    fn mode_transition_raise_active(&self, root_id: u32) -> bool {
+        self.mode_transition_raise_roots.contains(&root_id)
+            && self
+                .presentation_scene_node_id_for_root(root_id)
+                .is_some_and(|scene_node_id| {
+                    self.presentation_animator.has_geometry_track(scene_node_id)
+                })
+    }
+
+    /// Drops raise markers whose geometry track has settled or was cancelled.
+    /// Returns true when a marker was dropped, so the caller restacks.
+    pub(in crate::compositor) fn sync_mode_transition_raise_roots(&mut self) -> bool {
+        // Pending layout transactions have not committed their tracks yet, so
+        // their markers must survive until the batch finishes.
+        if self.layout_batch_depth > 0 {
+            return false;
+        }
+        let before = self.mode_transition_raise_roots.len();
+        self.mode_transition_raise_roots = self
+            .mode_transition_raise_roots
+            .iter()
+            .copied()
+            .filter(|root_id| self.mode_transition_raise_active(*root_id))
+            .collect();
+        self.mode_transition_raise_roots.len() != before
+    }
+
+    pub(in crate::compositor) fn restack_for_window_raise_change(&mut self) {
+        self.reorder_renderable_surfaces_by_window_stack();
+        self.advance_pointer_hit_generation();
     }
 
     pub(in crate::compositor) fn canonical_scene_owner_window_id(

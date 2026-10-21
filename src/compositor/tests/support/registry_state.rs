@@ -429,6 +429,8 @@ pub(in crate::compositor::tests) struct RenderableSurfaceSnapshot {
     pub(in crate::compositor::tests) origin_y: i32,
     pub(in crate::compositor::tests) active_scene_origin: Option<(i32, i32)>,
     pub(in crate::compositor::tests) active_scene_size: Option<(u32, u32)>,
+    /// Stacking index in the active scene, which is what the frame renders.
+    pub(in crate::compositor::tests) active_scene_index: Option<usize>,
     pub(in crate::compositor::tests) commit_sequence: u64,
     pub(in crate::compositor::tests) buffer_id: u64,
     pub(in crate::compositor::tests) pixel_checksum: Option<u64>,

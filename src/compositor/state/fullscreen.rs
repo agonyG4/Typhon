@@ -431,9 +431,13 @@ impl CompositorState {
                 if !seen_underlay_roots.insert(root_surface_id) {
                     continue;
                 }
+                // Top-layer shell surfaces stack below a raised fullscreen owner,
+                // but a settled fullscreen still hides them rather than showing
+                // them through a translucent owner.
                 if matches!(
                     self.fullscreen_root_classification(owner_root_surface_id, root_surface_id),
-                    FullscreenRootClassification::CulledByFullscreen(_)
+                    FullscreenRootClassification::CulledByFullscreen(reason)
+                        if reason != FullscreenCulledRootReason::LayerTop
                 ) {
                     plan.composition_underlay_roots.push(root_surface_id);
                 }
@@ -662,7 +666,7 @@ impl CompositorState {
         true
     }
 
-    fn fullscreen_root_classification(
+    pub(in crate::compositor) fn fullscreen_root_classification(
         &self,
         owner_root_surface_id: u32,
         root_surface_id: u32,
@@ -729,7 +733,7 @@ impl CompositorState {
         }
     }
 
-    fn root_belongs_to_fullscreen_owner_family(
+    pub(in crate::compositor) fn root_belongs_to_fullscreen_owner_family(
         &self,
         owner_root_surface_id: u32,
         root_surface_id: u32,

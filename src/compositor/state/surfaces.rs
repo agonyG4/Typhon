@@ -1139,6 +1139,11 @@ impl CompositorState {
             );
         }
         self.layout_animation_epoch = None;
+        // Raise markers recorded inside the batch commit with its tracks.
+        let raises_pruned = self.sync_mode_transition_raise_roots();
+        if raises_pruned || !self.mode_transition_raise_roots.is_empty() {
+            self.restack_for_window_raise_change();
+        }
         if scene_effect {
             self.advance_render_generation_with_scene_effect(
                 RenderGenerationCause::LayoutReflow,

@@ -257,6 +257,13 @@ fn transitioning_fullscreen_keeps_raw_scene_content_and_does_not_gain_scanout() 
         ],
         Some(370),
     );
+    // The fullscreen owner family stacks above ordinary windows, so the
+    // visible content above it must be an application the plan allows above.
+    state
+        .window_mut(WindowId::from_raw(74).expect("visible window id"))
+        .expect("visible window")
+        .stack_layer = DesktopStackLayer::Overlay;
+    let _ = state.rebuild_active_scene_view();
     state.surface_presentation_generations.insert(370, 1);
     state.surface_presentation_generations.insert(371, 1);
     state.start_test_presentation_transition(

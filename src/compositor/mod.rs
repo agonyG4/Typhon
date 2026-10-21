@@ -55,12 +55,12 @@ use wayland_protocols::wp::{
     tearing_control::v1::server::{wp_tearing_control_manager_v1, wp_tearing_control_v1},
     viewporter::server::{wp_viewport, wp_viewporter},
 };
+use wayland_protocols::xdg::xdg_output::zv1::server::zxdg_output_v1;
 use wayland_protocols::xdg::{
     activation::v1::server::{xdg_activation_token_v1, xdg_activation_v1},
     decoration::zv1::server::{zxdg_decoration_manager_v1, zxdg_toplevel_decoration_v1},
     shell::server::{xdg_popup, xdg_positioner, xdg_surface, xdg_toplevel, xdg_wm_base},
 };
-use wayland_protocols::xdg::xdg_output::zv1::server::zxdg_output_v1;
 use wayland_protocols_wlr::layer_shell::v1::server::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
 use wayland_server::{
     Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource, WEnum,
@@ -756,6 +756,9 @@ pub struct CompositorState {
     pub(in crate::compositor) layout_animation_epoch: Option<AnimationTime>,
     pub(in crate::compositor) pending_presentation_geometry_transaction:
         Option<state::PendingPresentationGeometryTransaction>,
+    /// Roots whose mode-transition geometry animation (maximize or fullscreen
+    /// enter/exit) lifts them above Top-layer surfaces until it settles.
+    pub(in crate::compositor) mode_transition_raise_roots: HashSet<u32>,
     tiled_layout_dirty: HashSet<WorkspaceLocation>,
     tiled_floating_restores: HashMap<WindowId, WindowGeometry>,
     next_surface_id: u32,

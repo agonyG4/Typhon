@@ -1019,6 +1019,9 @@ impl CompositorState {
                     .acknowledge_presented_clip(expected_output_id, ack);
             }
         }
+        if self.sync_mode_transition_raise_roots() {
+            self.restack_for_window_raise_change();
+        }
         if input_projection_changed {
             self.advance_pointer_hit_generation();
         }
@@ -1036,6 +1039,9 @@ impl CompositorState {
             && let Some(scene_node_id) = self.scene_node_id_for_window_group(window_id)
         {
             self.presentation_animator.cancel_all(scene_node_id);
+            if self.sync_mode_transition_raise_roots() {
+                self.restack_for_window_raise_change();
+            }
         }
         let input_projection_changed = self.presented_presentation_frame_id != 0
             && self.presented_window_geometry(root_surface_id).is_some();
@@ -1067,6 +1073,9 @@ impl CompositorState {
     ) {
         if let Some(scene_node_id) = self.presentation_scene_node_id_for_root(root_surface_id) {
             self.presentation_animator.cancel_geometry(scene_node_id);
+            if self.sync_mode_transition_raise_roots() {
+                self.restack_for_window_raise_change();
+            }
         }
     }
 
@@ -1139,9 +1148,21 @@ impl CompositorState {
             target,
             curve,
         );
+        let raises_root = matches!(
+            kind,
+            PresentationAnimationKind::FullscreenEnter
+                | PresentationAnimationKind::FullscreenExit
+                | PresentationAnimationKind::MaximizeEnter
+                | PresentationAnimationKind::MaximizeExit
+        );
         if self.layout_batch_depth > 0 {
             if let Some(pending) = self.pending_presentation_geometry_transaction.as_mut() {
                 pending.upsert_geometry_mutation(mutation);
+            }
+            // The track is committed when the batch finishes, which syncs the
+            // markers and restacks.
+            if raises_root {
+                self.mode_transition_raise_roots.insert(root_surface_id);
             }
             return;
         }
@@ -1151,6 +1172,10 @@ impl CompositorState {
                 vec![mutation],
             ),
         );
+        if raises_root && self.presentation_animator.has_geometry_track(scene_node_id) {
+            self.mode_transition_raise_roots.insert(root_surface_id);
+            self.restack_for_window_raise_change();
+        }
     }
 
     fn active_scene_renderable_surfaces(&self) -> Vec<RenderableSurface> {

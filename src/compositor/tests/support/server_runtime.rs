@@ -1306,6 +1306,9 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                                             .iter()
                                             .find(|active| active.surface_id == surface.surface_id)
                                             .map(|active| (active.width, active.height)),
+                                        active_scene_index: active_surfaces.iter().position(
+                                            |active| active.surface_id == surface.surface_id,
+                                        ),
                                         commit_sequence: surface.commit_sequence.get(),
                                         buffer_id: surface.buffer_id().get(),
                                         pixel_checksum: surface.cpu_pixels().map(|pixels| {

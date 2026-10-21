@@ -224,6 +224,47 @@ fn active_drag_icon_orders_above_application_and_layer_overlay() {
 }
 
 #[test]
+fn fullscreen_owner_stacks_below_overlay_and_drag_icon() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let _drag = begin_source_less_wire_drag(&socket_path, &commands).unwrap();
+    let _overlay = create_overlay_layer_client(&socket_path).unwrap();
+    let _fullscreen =
+        create_fullscreen_identity_viewport_xrgb_dmabuf(&socket_path, &commands).unwrap();
+    settle_fullscreen_presentation(&commands);
+    let owner_id = capture_fullscreen_render_plan_metrics(&commands)
+        .owner_root_surface_id
+        .expect("fullscreen owner should be registered");
+    let surfaces = capture_renderable_surface_snapshot(&commands);
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    let active_index = |predicate: &dyn Fn(&RenderableSurfaceSnapshot) -> bool| {
+        surfaces
+            .iter()
+            .find(|surface| predicate(surface))
+            .and_then(|surface| surface.active_scene_index)
+    };
+    let owner_position = active_index(&|surface| surface.surface_id == owner_id)
+        .expect("fullscreen owner should be in the active scene");
+    let overlay_position = active_index(&|surface| (surface.width, surface.height) == (100, 100))
+        .expect("overlay should be in the active scene");
+    let icon_position = active_index(&|surface| (surface.width, surface.height) == (21, 15))
+        .expect("active DragIcon should be in the active scene");
+
+    assert!(
+        owner_position < overlay_position,
+        "a fullscreen owner must stay below a layer-shell Overlay: {surfaces:?}"
+    );
+    assert!(
+        owner_position < icon_position && overlay_position < icon_position,
+        "the active DragIcon must stay above the fullscreen owner and the Overlay: {surfaces:?}"
+    );
+}
+
+#[test]
 fn active_drag_icon_survives_dominant_fullscreen_composition() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();

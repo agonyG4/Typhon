@@ -2888,6 +2888,9 @@ impl CompositorState {
         } else {
             self.clear_fullscreen_presentation_owner(surface_id);
         }
+        if mode == ToplevelMode::Fullscreen || previous_mode == ToplevelMode::Fullscreen {
+            self.restack_for_window_raise_change();
+        }
         self.set_surface_placement_with_cause(
             surface_id,
             geometry.placement,

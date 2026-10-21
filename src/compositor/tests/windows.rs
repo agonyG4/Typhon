@@ -82,6 +82,267 @@ fn map_exclusive_top_panel(
     (connection, queue, surface, panel)
 }
 
+fn map_overlay_layer_surface(
+    socket_path: &PathBuf,
+) -> (
+    Connection,
+    client_wl_surface::WlSurface,
+    client_zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
+) {
+    let stream = UnixStream::connect(socket_path).unwrap();
+    let connection = Connection::from_socket(stream).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let layer_shell: client_zwlr_layer_shell_v1::ZwlrLayerShellV1 =
+        globals.bind(&qh, 4..=4, ()).unwrap();
+    let surface = compositor.create_surface(&qh, ());
+    let overlay = layer_shell.get_layer_surface(
+        &surface,
+        None,
+        client_zwlr_layer_shell_v1::Layer::Overlay,
+        "mode-raise-overlay".to_string(),
+        &qh,
+        (),
+    );
+    overlay.set_anchor(
+        client_zwlr_layer_surface_v1::Anchor::Top | client_zwlr_layer_surface_v1::Anchor::Left,
+    );
+    overlay.set_size(100, 100);
+    overlay.set_exclusive_zone(-1);
+    surface.commit();
+    connection.flush().unwrap();
+
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state).unwrap();
+    commit_test_buffered_surface(&surface, &shm, &qh, 100, 100).unwrap();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    (connection, surface, overlay)
+}
+
+/// Stacking index in the active scene, which the frame renders and the
+/// pointer hit-tests, rather than the raw renderable list.
+fn stack_index_of_root(surfaces: &[RenderableSurfaceSnapshot], root_surface_id: u32) -> usize {
+    surfaces
+        .iter()
+        .find(|surface| surface.surface_id == root_surface_id)
+        .and_then(|surface| surface.active_scene_index)
+        .expect("root surface should be in the active scene")
+}
+
+fn stack_index_of_root_with_size(
+    surfaces: &[RenderableSurfaceSnapshot],
+    width: u32,
+    height: u32,
+) -> usize {
+    surfaces
+        .iter()
+        .find(|surface| {
+            surface.parent_surface_id.is_none()
+                && (surface.width, surface.height) == (width, height)
+        })
+        .and_then(|surface| surface.active_scene_index)
+        .unwrap_or_else(|| {
+            panic!("root {width}x{height} should be in the active scene: {surfaces:?}")
+        })
+}
+
+/// Connection, surface and layer surface kept alive for a mapped layer test surface.
+type LayerSurfaceHandles = (
+    Connection,
+    client_wl_surface::WlSurface,
+    client_zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
+);
+
+/// Sets up a normal window at a non-output rect with a Top panel and an
+/// Overlay surface mapped above it, and settles the presentation baseline.
+fn mode_raise_fixture(
+    socket_path: &PathBuf,
+    commands: &Sender<ServerCommand>,
+) -> (
+    RegistryTestState,
+    u32,
+    LayerSurfaceHandles,
+    LayerSurfaceHandles,
+) {
+    let state = create_buffered_toplevel_then_window_commands(
+        socket_path,
+        commands,
+        &[
+            ServerCommand::CancelFocusedPresentationTransition,
+            ServerCommand::DropFocusedToplevelVisualGeometry,
+            ServerCommand::SetFocusedRootVisualGeometry {
+                placement: SurfacePlacement::absolute_root_at(640, 320),
+                width: 800,
+                height: 600,
+            },
+            ServerCommand::PublishTestPresentationAt {
+                frame_id: 1,
+                at: crate::presentation_animation::AnimationTime::from_nanos(u64::MAX),
+            },
+        ],
+    )
+    .unwrap();
+    let root_surface_id = capture_renderable_surface_snapshot(commands)
+        .into_iter()
+        .find(|surface| surface.parent_surface_id.is_none())
+        .expect("window root should remain renderable")
+        .surface_id;
+    let panel = map_exclusive_top_panel(socket_path);
+    let overlay = map_overlay_layer_surface(socket_path);
+    wait_for_server_commands(commands);
+    let surfaces = capture_renderable_surface_snapshot(commands);
+    let window_index = stack_index_of_root(&surfaces, root_surface_id);
+    let top_index = stack_index_of_root_with_size(&surfaces, 1280, 32);
+    let overlay_index = stack_index_of_root_with_size(&surfaces, 100, 100);
+    assert!(
+        window_index < top_index && top_index < overlay_index,
+        "a normal window must stack below the Top panel and Overlay: {surfaces:?}"
+    );
+    (state, root_surface_id, (panel.0, panel.2, panel.3), overlay)
+}
+
+fn assert_window_raised_above_top_and_below_overlay(
+    commands: &Sender<ServerCommand>,
+    root_surface_id: u32,
+    context: &str,
+) {
+    let surfaces = capture_renderable_surface_snapshot(commands);
+    let window_index = stack_index_of_root(&surfaces, root_surface_id);
+    let top_index = stack_index_of_root_with_size(&surfaces, 1280, 32);
+    let overlay_index = stack_index_of_root_with_size(&surfaces, 100, 100);
+    assert!(
+        top_index < window_index && window_index < overlay_index,
+        "{context}: the window must stack above the Top panel and below Overlay: {surfaces:?}"
+    );
+}
+
+fn assert_window_below_top(commands: &Sender<ServerCommand>, root_surface_id: u32, context: &str) {
+    let surfaces = capture_renderable_surface_snapshot(commands);
+    let window_index = stack_index_of_root(&surfaces, root_surface_id);
+    let top_index = stack_index_of_root_with_size(&surfaces, 1280, 32);
+    assert!(
+        window_index < top_index,
+        "{context}: the window must return below the Top panel: {surfaces:?}"
+    );
+}
+
+#[test]
+fn fullscreen_enter_raises_window_above_top_panel_and_below_overlay() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let (_state, root_surface_id, _panel, _overlay) = mode_raise_fixture(&socket_path, &commands);
+    commands
+        .send(ServerCommand::ToggleFullscreenFocused)
+        .unwrap();
+    wait_for_server_commands(&commands);
+    assert!(
+        capture_presentation_transition_start(&commands, root_surface_id).is_some(),
+        "fullscreen enter animation should be in flight"
+    );
+    assert_window_raised_above_top_and_below_overlay(
+        &commands,
+        root_surface_id,
+        "during fullscreen enter",
+    );
+
+    commands
+        .send(ServerCommand::PublishTestPresentationAt {
+            frame_id: 2,
+            at: crate::presentation_animation::AnimationTime::from_nanos(u64::MAX),
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    assert_window_raised_above_top_and_below_overlay(
+        &commands,
+        root_surface_id,
+        "after fullscreen enter settles",
+    );
+    let _server = stop_controllable_test_server(commands, server_thread);
+}
+
+#[test]
+fn fullscreen_exit_keeps_window_above_top_panel_until_its_animation_settles() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let (_state, root_surface_id, _panel, _overlay) = mode_raise_fixture(&socket_path, &commands);
+    commands
+        .send(ServerCommand::ToggleFullscreenFocused)
+        .unwrap();
+    commands
+        .send(ServerCommand::PublishTestPresentationAt {
+            frame_id: 2,
+            at: crate::presentation_animation::AnimationTime::from_nanos(u64::MAX),
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    commands
+        .send(ServerCommand::ToggleFullscreenFocused)
+        .unwrap();
+    wait_for_server_commands(&commands);
+    assert!(
+        capture_presentation_transition_start(&commands, root_surface_id).is_some(),
+        "fullscreen exit animation should be in flight"
+    );
+    assert_window_raised_above_top_and_below_overlay(
+        &commands,
+        root_surface_id,
+        "during fullscreen exit",
+    );
+
+    commands
+        .send(ServerCommand::PublishTestPresentationAt {
+            frame_id: 3,
+            at: crate::presentation_animation::AnimationTime::from_nanos(u64::MAX),
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    assert_window_below_top(&commands, root_surface_id, "after fullscreen exit settles");
+    let _server = stop_controllable_test_server(commands, server_thread);
+}
+
+#[test]
+fn maximize_enter_raises_window_above_top_panel_until_its_animation_settles() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let (_state, root_surface_id, _panel, _overlay) = mode_raise_fixture(&socket_path, &commands);
+    commands.send(ServerCommand::ToggleMaximizeFocused).unwrap();
+    wait_for_server_commands(&commands);
+    assert!(
+        capture_presentation_transition_start(&commands, root_surface_id).is_some(),
+        "maximize enter animation should be in flight"
+    );
+    let surfaces = capture_renderable_surface_snapshot(&commands);
+    let window_index = stack_index_of_root(&surfaces, root_surface_id);
+    let top_index = stack_index_of_root_with_size(&surfaces, 1280, 32);
+    assert!(
+        top_index < window_index,
+        "during maximize enter the window must stack above the Top panel: {surfaces:?}"
+    );
+
+    commands
+        .send(ServerCommand::PublishTestPresentationAt {
+            frame_id: 2,
+            at: crate::presentation_animation::AnimationTime::from_nanos(u64::MAX),
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    assert_window_below_top(&commands, root_surface_id, "after maximize enter settles");
+    let _server = stop_controllable_test_server(commands, server_thread);
+}
+
 #[test]
 fn window_drag_moves_root_surface_without_moving_children_independently() {
     let socket_name = unique_socket_name();
@@ -801,9 +1062,23 @@ fn fullscreen_presentation_ignores_restacked_application_and_top_shell() {
     assert_eq!(metrics.owner_root_surface_id, Some(surface_ids[2]));
     assert!(metrics.fullscreen_composition_active);
     assert!(!metrics.solitary_tree_active);
+    // The fullscreen owner family stacks above every ordinary window, so the
+    // raised application stays below the owner. It is then an underlay of the
+    // unproven owner, like the unraised application, rather than culled. The
+    // Top panel also stacks below the owner but a settled fullscreen hides it.
+    let stacked = capture_renderable_surface_snapshot(&commands);
+    let stack_index = |id: u32| {
+        stacked
+            .iter()
+            .find(|surface| surface.surface_id == id)
+            .and_then(|surface| surface.active_scene_index)
+            .expect("root should be in the active scene")
+    };
+    assert!(stack_index(surface_ids[1]) < stack_index(surface_ids[2]));
+    assert!(stack_index(panel_surface_id) < stack_index(surface_ids[2]));
     assert!(presented.contains(&surface_ids[0]));
+    assert!(presented.contains(&surface_ids[1]));
     assert!(presented.contains(&surface_ids[2]));
-    assert!(!presented.contains(&surface_ids[1]));
     assert!(!presented.contains(&panel_surface_id));
     commands
         .send(ServerCommand::PointerMotion { x: 100.0, y: 16.0 })
