@@ -801,28 +801,24 @@ impl<'a> ResolvedNativeFrameScene<'a> {
         let effect_registry_generation = server.trusted_effect_registry().current();
         let effect_scene_started = crate::pointer_debug::cursor_responsiveness_trace_enabled()
             .then(std::time::Instant::now);
-        let canonical_effects =
-            if let Some(workspace_sample) = workspace_presentation_sample.as_ref() {
-                let frame_effect_source = FrameEffectSceneInput {
-                    surfaces: frame_surfaces.as_ref(),
-                    popup_surface_ids: popup_surface_ids.as_ref(),
-                    presentation_owner_roots: frame_owner_roots.as_ref(),
-                    workspace_by_owner_root: &workspace_by_owner_root,
-                    workspace_sample,
-                };
-                server.resolved_effect_scene_for_workspace_frame_with_lifecycle(
-                    &frame_effect_source,
-                    &presentation,
-                    &fullscreen_plan,
-                    &lifecycle,
-                )
-            } else {
-                server.resolved_effect_scene_for_presentation_with_lifecycle(
-                    &presentation,
-                    &fullscreen_plan,
-                    &lifecycle,
-                )
-            };
+        // Resolve effects against the surfaces this frame actually draws.
+        // Visual-group order is an index into that list; resolving against the
+        // full scene and filtering afterwards numbered a dominant fullscreen
+        // owner's blur by the unculled scene, so it sorted after the owner and
+        // drew over it once the Super+F animation settled.
+        let frame_effect_source = FrameEffectSceneInput {
+            surfaces: frame_surfaces.as_ref(),
+            popup_surface_ids: popup_surface_ids.as_ref(),
+            presentation_owner_roots: frame_owner_roots.as_ref(),
+            workspace_by_owner_root: &workspace_by_owner_root,
+            workspace_sample: workspace_presentation_sample.as_ref(),
+        };
+        let canonical_effects = server.resolved_effect_scene_for_workspace_frame_with_lifecycle(
+            &frame_effect_source,
+            &presentation,
+            &fullscreen_plan,
+            &lifecycle,
+        );
         let effect_scene_resolution_ns = effect_scene_started
             .map(|started| started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64);
         let effect_scene_visible_instances = canonical_effects.instances.len();

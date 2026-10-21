@@ -168,9 +168,9 @@ impl CompositorState {
                     instance.signature.wrapping_mul(0x0000_0100_0000_01b3) ^ transform.signature();
             }
 
-            if let Some(workspace) = frame_source.workspace_by_owner_root.get(&owner_root)
-                && let Some(participant) = frame_source
-                    .workspace_sample
+            if let Some(workspace_sample) = frame_source.workspace_sample
+                && let Some(workspace) = frame_source.workspace_by_owner_root.get(&owner_root)
+                && let Some(participant) = workspace_sample
                     .participants
                     .iter()
                     .find(|participant| participant.workspace == *workspace)
@@ -220,15 +220,17 @@ impl CompositorState {
                         coverage.translated(f64::from(translation_x), f64::from(translation_y));
                 }
                 instance.signature = instance.signature.wrapping_mul(0x0000_0100_0000_01b3)
-                    ^ frame_source.workspace_sample.signature
+                    ^ workspace_sample.signature
                     ^ participant.workspace_index as u64;
             }
             instances.push(instance);
         }
 
         let mut resolved = ResolvedEffectScene::new(scene.generation, instances);
-        resolved.signature = resolved.signature.wrapping_mul(0x0000_0100_0000_01b3)
-            ^ frame_source.workspace_sample.signature;
+        if let Some(workspace_sample) = frame_source.workspace_sample {
+            resolved.signature =
+                resolved.signature.wrapping_mul(0x0000_0100_0000_01b3) ^ workspace_sample.signature;
+        }
         resolved
     }
 }

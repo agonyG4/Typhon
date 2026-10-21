@@ -179,7 +179,8 @@ pub struct FrameEffectSceneInput<'a> {
     pub popup_surface_ids: &'a [u32],
     pub presentation_owner_roots: &'a [u32],
     pub workspace_by_owner_root: &'a HashMap<u32, crate::wm::WorkspaceId>,
-    pub workspace_sample: &'a super::WorkspacePresentationSample,
+    /// Set only while a workspace slide composes this frame.
+    pub workspace_sample: Option<&'a super::WorkspacePresentationSample>,
 }
 
 impl Default for ResolvedEffectScene {
@@ -1607,7 +1608,7 @@ mod tests {
             popup_surface_ids: &[],
             presentation_owner_roots: &selected_owner_roots,
             workspace_by_owner_root: &workspace_by_owner_root,
-            workspace_sample: &workspace_sample,
+            workspace_sample: Some(&workspace_sample),
         };
         let scene = state.resolved_effect_scene_with_frame_presentation(
             &frame_source,
@@ -1638,7 +1639,7 @@ mod tests {
             .logical_cell_clip
             .width = 576.0;
         let next_frame_source = FrameEffectSceneInput {
-            workspace_sample: &next_workspace_sample,
+            workspace_sample: Some(&next_workspace_sample),
             ..frame_source
         };
         let next_scene = state.resolved_effect_scene_with_frame_presentation(

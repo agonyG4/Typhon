@@ -306,6 +306,7 @@ impl super::super::CompositorState {
             })
     }
 
+    #[cfg(test)]
     pub(in crate::compositor) fn effective_window_decoration_mode_for_surface(
         &self,
         surface_id: u32,
@@ -462,6 +463,7 @@ impl super::super::CompositorState {
         }
     }
 
+    #[cfg(test)]
     pub(in crate::compositor) fn surface_uses_server_side_decorations(
         &self,
         surface_id: u32,
