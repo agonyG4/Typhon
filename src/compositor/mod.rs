@@ -585,6 +585,16 @@ struct XdgModeTransitionResponseFence {
     configure_serial: u32,
     ack_commit_sequence_floor: Option<SurfaceCommitSequence>,
 }
+/// A mode-transition geometry animation whose start is held until the XDG client
+/// answers the mode configure with a commit, or until `held_until` passes.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct HeldModeAnimation {
+    scene_node_id: SceneNodeId,
+    previous: PresentationRect,
+    target: PresentationRect,
+    curve: AnimationCurve,
+    held_until: AnimationTime,
+}
 impl ToplevelVisualGeometry {
     const fn window_geometry(self) -> WindowGeometry {
         WindowGeometry::new(self.placement, self.width, self.height)
@@ -875,6 +885,8 @@ pub struct CompositorState {
     resize_configure_flows: HashMap<u32, ResizeConfigureFlow>,
     toplevel_visual_geometries: HashMap<u32, ToplevelVisualGeometry>,
     pending_normal_restores: HashMap<u32, PendingNormalRestore>,
+    held_mode_animations: HashMap<u32, HeldModeAnimation>,
+    mode_transition_client_response_hold: std::time::Duration,
     active_toplevel_resizes: HashMap<u32, ActiveToplevelResize>,
     pending_xwayland_visual_content: HashSet<u32>,
     next_window_interaction_id: u64,

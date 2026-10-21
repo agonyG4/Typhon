@@ -47,9 +47,11 @@ pub(in crate::compositor::tests) fn create_test_shm_file(
         .create_new(true)
         .open(&path)?;
     fs::remove_file(path)?;
-    for pixel in pixels {
-        file.write_all(&pixel.to_ne_bytes())?;
-    }
+    let bytes = pixels
+        .iter()
+        .flat_map(|pixel| pixel.to_ne_bytes())
+        .collect::<Vec<u8>>();
+    file.write_all(&bytes)?;
     file.flush()?;
     Ok(file)
 }
@@ -339,6 +341,16 @@ pub(in crate::compositor::tests) enum ServerCommand {
     CaptureFocusedPresentationAfter {
         elapsed_nanos: u64,
         reply: Sender<Option<PresentationWindowSample>>,
+    },
+    CaptureFocusedPresentationAt {
+        at_nanos: u64,
+        reply: Sender<Option<PresentationWindowSample>>,
+    },
+    CaptureFocusedTransitionStartedAt {
+        reply: Sender<Option<AnimationTime>>,
+    },
+    SetModeTransitionClientResponseHold {
+        hold: std::time::Duration,
     },
     CapturePresentedPresentation {
         root_surface_id: u32,
@@ -1627,6 +1639,41 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                                         })
                                 });
                         let _ = reply.send(sample);
+                    }
+                    ServerCommand::CaptureFocusedPresentationAt { at_nanos, reply } => {
+                        let sample =
+                            server
+                                .state
+                                .focused_root_surface_id()
+                                .and_then(|root_surface_id| {
+                                    let scene_node_id = server
+                                        .state
+                                        .presentation_scene_node_id_for_root(root_surface_id)?;
+                                    server.state.presentation_animator.sample_for_scene_node(
+                                        scene_node_id,
+                                        AnimationTime::from_nanos(at_nanos),
+                                    )
+                                });
+                        let _ = reply.send(sample);
+                    }
+                    ServerCommand::SetModeTransitionClientResponseHold { hold } => {
+                        server.state.mode_transition_client_response_hold = hold;
+                    }
+                    ServerCommand::CaptureFocusedTransitionStartedAt { reply } => {
+                        let started_at =
+                            server
+                                .state
+                                .focused_root_surface_id()
+                                .and_then(|root_surface_id| {
+                                    let scene_node_id = server
+                                        .state
+                                        .presentation_scene_node_id_for_root(root_surface_id)?;
+                                    server
+                                        .state
+                                        .presentation_animator
+                                        .transition_started_at_for_scene_node(scene_node_id)
+                                });
+                        let _ = reply.send(started_at);
                     }
                     ServerCommand::CaptureFocusedPresentationEffectSceneAfter {
                         elapsed_nanos,
@@ -3379,6 +3426,34 @@ pub(in crate::compositor::tests) fn capture_focused_presentation_after(
     receiver
         .recv_timeout(Duration::from_secs(1))
         .expect("server should report presentation sample")
+}
+
+pub(in crate::compositor::tests) fn capture_focused_presentation_at(
+    commands: &Sender<ServerCommand>,
+    at: AnimationTime,
+) -> Option<PresentationWindowSample> {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureFocusedPresentationAt {
+            at_nanos: at.as_nanos(),
+            reply,
+        })
+        .unwrap();
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("server should report presentation sample")
+}
+
+pub(in crate::compositor::tests) fn capture_focused_transition_started_at(
+    commands: &Sender<ServerCommand>,
+) -> Option<AnimationTime> {
+    let (reply, receiver) = mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureFocusedTransitionStartedAt { reply })
+        .unwrap();
+    receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("server should report transition start time")
 }
 
 pub(in crate::compositor::tests) fn capture_focused_presentation_effect_scene_after(

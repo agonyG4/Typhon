@@ -3402,6 +3402,18 @@ pub(in crate::compositor) fn mode_visual_transition(
     }
 }
 
+pub(in crate::compositor) fn is_mode_transition_animation_kind(
+    kind: PresentationAnimationKind,
+) -> bool {
+    matches!(
+        kind,
+        PresentationAnimationKind::MaximizeEnter
+            | PresentationAnimationKind::MaximizeExit
+            | PresentationAnimationKind::FullscreenEnter
+            | PresentationAnimationKind::FullscreenExit
+    )
+}
+
 pub(in crate::compositor) fn mode_transition_animation_kind(
     previous: ToplevelMode,
     target: ToplevelMode,

@@ -2180,16 +2180,17 @@ fn xdg_maximize_exit_first_frame_maps_the_committed_root_to_the_physical_source(
         ),
         "after the matching client commit, the physical surface follows the same frame-local window transform"
     );
+    // The matching client commit restarts the transition on purpose, so the
+    // transaction and revision may change. The restarted transition must still
+    // start from the same physical source rect and target the same rect.
+    let restarted_start = state
+        .presentation_animator
+        .sample_at_transition_start_for_scene_node(scene_node_id)
+        .expect("restarted transition should have a start sample");
+    assert_eq!(restarted_start.rect, last_physical);
     assert_eq!(
-        fast_response_sample
-            .transform_for_root(surface_id)
-            .expect("post-ACK transition transform")
-            .revision_id,
-        transform.revision_id,
-    );
-    assert_eq!(
-        fast_response_transform.transaction_id,
-        transform.transaction_id
+        fast_response_transform.canonical_rect,
+        transform.canonical_rect
     );
     assert_eq!(
         fast_response_snapshot.sample_time_source,

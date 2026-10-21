@@ -138,6 +138,7 @@ impl CompositorState {
         {
             visual.xdg_mode_transition_fence = None;
         }
+        self.held_mode_animations.remove(&root_surface_id);
         if compositor_debug_surface_logging_enabled() {
             eprintln!(
                 "oblivion-one compositor: event=normal_restore_cancelled root_surface_id={root_surface_id} window_id={} configure_serial={} reason={reason}",

@@ -1,4 +1,5 @@
 use super::*;
+use crate::presentation_animation::AnimationTime;
 
 fn logical_visual_clip(surface: &RenderableSurface) -> Option<render::SurfaceTargetRect> {
     surface
@@ -460,6 +461,185 @@ fn restore_transition_starts_from_previous_mode_geometry_when_visual_history_is_
         start.rect,
         PresentationRect::new(0.0, 0.0, 1280.0, 800.0).expect("maximized source rect")
     );
+}
+
+/// Mode transitions wait this long for the client's commit before animating.
+const MODE_TRANSITION_CLIENT_RESPONSE_HOLD_NANOS: u64 = 120_000_000;
+
+fn mode_transition_root_surface_id(commands: &Sender<ServerCommand>) -> u32 {
+    capture_renderable_surface_snapshot(commands)
+        .into_iter()
+        .find(|surface| surface.parent_surface_id.is_none())
+        .expect("mode-transition root should remain renderable")
+        .surface_id
+}
+
+fn target_presentation_rect(
+    commands: &Sender<ServerCommand>,
+    root_surface_id: u32,
+) -> PresentationRect {
+    let geometry = capture_root_window_geometry(commands, root_surface_id)
+        .expect("mode-transition target geometry should be installed");
+    PresentationRect::new(
+        f64::from(geometry.placement.local_x),
+        f64::from(geometry.placement.local_y),
+        f64::from(geometry.width),
+        f64::from(geometry.height),
+    )
+    .expect("target rect")
+}
+
+fn assert_presented_rect_near(
+    sample: Option<PresentationWindowSample>,
+    expected: PresentationRect,
+    context: &str,
+) {
+    let rect = sample
+        .unwrap_or_else(|| panic!("{context}: presentation sample should exist"))
+        .rect;
+    let close = |actual: f64, wanted: f64| (actual - wanted).abs() < 0.5;
+    assert!(
+        close(rect.x(), expected.x())
+            && close(rect.y(), expected.y())
+            && close(rect.width(), expected.width())
+            && close(rect.height(), expected.height()),
+        "{context}: presented {rect:?}, expected {expected:?}"
+    );
+}
+
+#[test]
+fn fullscreen_holds_source_rect_when_client_never_recommits() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let mut client = create_recommittable_buffered_toplevel(&socket_path).unwrap();
+    client
+        .run_window_commands(
+            &commands,
+            &[ServerCommand::PublishTestPresentationAt {
+                frame_id: 1,
+                at: AnimationTime::from_nanos(u64::MAX),
+            }],
+        )
+        .unwrap();
+    client
+        .run_window_commands(
+            &commands,
+            &[ServerCommand::SetModeTransitionClientResponseHold {
+                hold: std::time::Duration::from_nanos(MODE_TRANSITION_CLIENT_RESPONSE_HOLD_NANOS),
+            }],
+        )
+        .unwrap();
+    let requested_at = AnimationTime::monotonic_now().expect("monotonic clock");
+    client
+        .run_window_commands(&commands, &[ServerCommand::ToggleFullscreenFocused])
+        .unwrap();
+    let root_surface_id = mode_transition_root_surface_id(&commands);
+    let source = capture_presentation_transition_start(&commands, root_surface_id)
+        .expect("fullscreen transition should be active")
+        .rect;
+    let started_at = capture_focused_transition_started_at(&commands)
+        .expect("held fullscreen transition should have a start time");
+    let target = target_presentation_rect(&commands, root_surface_id);
+    let presented_at_request = capture_focused_presentation_at(&commands, requested_at);
+    let presented_before_cap = capture_focused_presentation_at(
+        &commands,
+        AnimationTime::from_nanos(
+            requested_at.as_nanos() + MODE_TRANSITION_CLIENT_RESPONSE_HOLD_NANOS - 20_000_000,
+        ),
+    );
+    let settled = capture_focused_presentation_after(&commands, 1_000_000_000);
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    assert!(
+        client
+            .state
+            .toplevel_has_state(client_xdg_toplevel::State::Fullscreen)
+    );
+    assert!(
+        started_at.as_nanos()
+            >= requested_at.as_nanos() + MODE_TRANSITION_CLIENT_RESPONSE_HOLD_NANOS,
+        "transition should not start before the client-response hold"
+    );
+    assert_presented_rect_near(presented_at_request, source, "request time");
+    assert_presented_rect_near(presented_before_cap, source, "just before hold cap");
+    assert_presented_rect_near(settled, target, "after hold and duration");
+}
+
+/// Long enough that a parallel-loaded test client always commits before the cap.
+const RESTART_TEST_CLIENT_RESPONSE_HOLD_NANOS: u64 = 5_000_000_000;
+
+fn assert_mode_transition_restarts_when_client_recommits(toggle: ServerCommand) {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let mut client = create_recommittable_buffered_toplevel(&socket_path).unwrap();
+    client
+        .run_window_commands(
+            &commands,
+            &[ServerCommand::PublishTestPresentationAt {
+                frame_id: 1,
+                at: AnimationTime::from_nanos(u64::MAX),
+            }],
+        )
+        .unwrap();
+    client
+        .run_window_commands(
+            &commands,
+            &[ServerCommand::SetModeTransitionClientResponseHold {
+                hold: std::time::Duration::from_nanos(RESTART_TEST_CLIENT_RESPONSE_HOLD_NANOS),
+            }],
+        )
+        .unwrap();
+    let requested_at = AnimationTime::monotonic_now().expect("monotonic clock");
+    client.run_window_commands(&commands, &[toggle]).unwrap();
+    let root_surface_id = mode_transition_root_surface_id(&commands);
+    let source = capture_presentation_transition_start(&commands, root_surface_id)
+        .expect("mode transition should be active")
+        .rect;
+    let held_started_at = capture_focused_transition_started_at(&commands)
+        .expect("held mode transition should have a start time");
+    assert!(
+        held_started_at.as_nanos()
+            >= requested_at.as_nanos() + RESTART_TEST_CLIENT_RESPONSE_HOLD_NANOS,
+        "transition should be held before the client answers"
+    );
+
+    client.commit_at_configured_size().unwrap();
+
+    let restarted_at = capture_focused_transition_started_at(&commands)
+        .expect("restarted mode transition should have a start time");
+    let restart_start = capture_focused_presentation_after(&commands, 0);
+    let midway = capture_focused_presentation_after(&commands, 125_000_000);
+    let target = target_presentation_rect(&commands, root_surface_id);
+    let settled = capture_focused_presentation_after(&commands, 1_000_000_000);
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    assert!(
+        restarted_at.as_nanos() < held_started_at.as_nanos(),
+        "client commit should restart the transition before the hold expires"
+    );
+    assert_presented_rect_near(restart_start, source, "restart start");
+    let midway = midway.expect("midway sample should exist").rect;
+    assert!(
+        midway.width() > source.width(),
+        "transition should be animating at the midpoint, got {midway:?}"
+    );
+    assert_presented_rect_near(settled, target, "restarted transition settles");
+}
+
+#[test]
+fn fullscreen_restarts_from_source_when_client_recommits_after_configure() {
+    assert_mode_transition_restarts_when_client_recommits(ServerCommand::ToggleFullscreenFocused);
+}
+
+#[test]
+fn maximize_restarts_from_source_when_client_recommits_after_configure() {
+    assert_mode_transition_restarts_when_client_recommits(ServerCommand::ToggleMaximizeFocused);
 }
 
 #[test]

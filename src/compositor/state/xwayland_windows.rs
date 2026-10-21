@@ -186,6 +186,7 @@ impl CompositorState {
             self.pending_xwayland_visual_content
                 .insert(replacement_surface_id);
         }
+        self.held_mode_animations.remove(&old_surface_id);
         if let Some(visual) = self.toplevel_visual_geometries.remove(&old_surface_id) {
             self.toplevel_visual_geometries
                 .insert(replacement_surface_id, visual);
