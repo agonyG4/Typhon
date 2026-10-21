@@ -94,7 +94,11 @@ pub struct FullscreenPresentationState {
 }
 
 pub(in crate::compositor) fn fullscreen_trace_enabled() -> bool {
-    std::env::var_os("OBLIVION_ONE_DEBUG_FULLSCREEN").is_some_and(|value| value != "0")
+    // Read once: frame publication checks it on every presented frame.
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("OBLIVION_ONE_DEBUG_FULLSCREEN").is_some_and(|value| value != "0")
+    })
 }
 
 // Kept private to this module for the existing unit tests. The scene-level

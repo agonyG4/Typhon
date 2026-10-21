@@ -978,6 +978,21 @@ impl CompositorState {
         }
         let input_projection_changed =
             self.presented_input_projection_changed(frame_id != 0, &presentation.presented_windows);
+        if crate::compositor::fullscreen::fullscreen_trace_enabled()
+            && !presentation.transforms.is_empty()
+        {
+            let now_ns = AnimationTime::monotonic_now().map_or(0, AnimationTime::as_nanos);
+            for transform in &presentation.transforms {
+                eprintln!(
+                    "oblivion-one fullscreen: event=geometry_presented frame_id={frame_id} now_ns={now_ns} root_surface_id={} transaction_id={:?} canonical={:?} presented={:?} settled={}",
+                    transform.root_surface_id,
+                    transform.transaction_id,
+                    transform.canonical_rect,
+                    transform.presented_rect,
+                    transform.mathematically_settled,
+                );
+            }
+        }
         self.presented_presentation_frame_id = frame_id;
         self.presented_presentation = Some(presentation.clone());
         self.presented_window_geometries = presentation.presented_windows.clone();
@@ -1155,6 +1170,13 @@ impl CompositorState {
             self.presentation_animator.cancel_geometry(scene_node_id);
             return;
         };
+        if crate::compositor::fullscreen::fullscreen_trace_enabled() {
+            eprintln!(
+                "oblivion-one fullscreen: event=geometry_animation root_surface_id={root_surface_id} kind={kind:?} now_ns={} batched={} physical_source={physical_source:?} previous_geometry={previous_geometry:?} target_geometry={target_geometry:?} start={previous:?} target={target:?}",
+                now.as_nanos(),
+                self.layout_batch_depth > 0,
+            );
+        }
         let mutation = crate::presentation_animation::PresentationGeometryMutation::new(
             scene_node_id,
             previous,

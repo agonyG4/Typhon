@@ -318,6 +318,13 @@ impl Default for PresentationEngine {
     }
 }
 
+fn geometry_trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("OBLIVION_ONE_DEBUG_FULLSCREEN").is_some_and(|value| value != "0")
+    })
+}
+
 pub fn animation_policy_enabled(value: Option<&str>) -> bool {
     match value {
         None | Some("on") => true,
@@ -559,6 +566,19 @@ impl PresentationEngine {
         }
         let record =
             PresentationTransactionRecord::new(transaction_id, request.started_at, members);
+        if geometry_trace_enabled() {
+            for mutation in &prepared_geometry {
+                eprintln!(
+                    "oblivion-one fullscreen: event=geometry_commit transaction_id={transaction_id:?} scene_node_id={:?} started_at_ns={} retarget={} start={:?} target={:?} curve={:?}",
+                    mutation.scene_node_id,
+                    request.started_at.as_nanos(),
+                    self.geometry_tracks.contains_key(&mutation.scene_node_id),
+                    mutation.start,
+                    mutation.target,
+                    mutation.curve,
+                );
+            }
+        }
 
         for (mutation, revision_id) in prepared_geometry
             .into_iter()
