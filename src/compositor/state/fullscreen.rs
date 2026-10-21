@@ -432,13 +432,18 @@ impl CompositorState {
                 if !seen_underlay_roots.insert(root_surface_id) {
                     continue;
                 }
-                // Top-layer shell surfaces stack below a raised fullscreen owner,
-                // but a settled fullscreen still hides them rather than showing
-                // them through a translucent owner.
+                // A translucent fullscreen owner shows only the desktop
+                // backdrop through it, like Hyprland: other application
+                // windows and Top-layer shell surfaces stay hidden. Drawing
+                // them as underlays made background blur smear their text
+                // behind the owner.
                 if matches!(
                     self.fullscreen_root_classification(owner_root_surface_id, root_surface_id),
-                    FullscreenRootClassification::CulledByFullscreen(reason)
-                        if reason != FullscreenCulledRootReason::LayerTop
+                    FullscreenRootClassification::CulledByFullscreen(
+                        FullscreenCulledRootReason::LayerBackground
+                            | FullscreenCulledRootReason::LayerBottom
+                            | FullscreenCulledRootReason::GlobalContent
+                    )
                 ) {
                     plan.composition_underlay_roots.push(root_surface_id);
                 }

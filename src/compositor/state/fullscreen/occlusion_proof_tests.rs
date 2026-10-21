@@ -597,13 +597,12 @@ fn fullscreen_occlusion_proof_rejects_preserve_alpha_replacement_effect() {
 
     let plan = state.fullscreen_composition_plan();
     assert!(!plan.owner_occludes_underlays);
-    assert!(plan.allows_composition_root(UNDERLAY_ROOT));
+    // Only desktop backdrop layers show through a translucent owner; other
+    // application windows stay culled.
+    assert!(!plan.allows_composition_root(UNDERLAY_ROOT));
     assert!(!plan.allows_interaction_root(UNDERLAY_ROOT));
     let scanout = state.direct_scanout_scene_analysis();
     assert!(scanout.candidate.is_none());
-    assert!(scanout.blockers.reasons().contains(
-        &crate::compositor::direct_scanout::DirectScanoutSceneRejection::FullscreenUnderlayVisible
-    ));
 }
 
 #[test]

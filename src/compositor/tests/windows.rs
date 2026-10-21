@@ -959,8 +959,10 @@ fn special_workspace_visibility_controls_fullscreen_composition() {
     let hidden_native_ids = capture_native_frame_surface_ids(&commands);
     assert_eq!(hidden_metrics.owner_root_surface_id, Some(surface_ids[2]));
     assert!(hidden_metrics.fullscreen_composition_active);
-    assert!(!hidden_metrics.solitary_tree_active);
-    assert!(hidden_native_ids.contains(&surface_ids[0]));
+    // Ordinary windows behind a translucent owner stay culled; only desktop
+    // backdrop layers show through it.
+    assert!(hidden_metrics.solitary_tree_active);
+    assert!(!hidden_native_ids.contains(&surface_ids[0]));
     assert!(hidden_native_ids.contains(&surface_ids[2]));
     assert!(!hidden_native_ids.contains(&surface_ids[1]));
 
@@ -980,11 +982,11 @@ fn special_workspace_visibility_controls_fullscreen_composition() {
     assert_eq!(opened_metrics.owner_root_surface_id, Some(surface_ids[2]));
     assert!(opened_metrics.fullscreen_composition_active);
     assert!(!opened_metrics.solitary_tree_active);
-    assert!(opened_native_ids.contains(&surface_ids[0]));
+    assert!(!opened_native_ids.contains(&surface_ids[0]));
     assert!(opened_native_ids.contains(&surface_ids[1]));
     assert!(opened_native_ids.contains(&surface_ids[2]));
     assert_eq!(opened_metrics.fullscreen_allowed_application_roots, 1);
-    assert_eq!(opened_metrics.fullscreen_culled_application_roots, 0);
+    assert_eq!(opened_metrics.fullscreen_culled_application_roots, 1);
     assert_eq!(opened_metrics.fullscreen_culled_layer_roots, 1);
     assert_eq!(
         capture_configure_serial(&commands),
@@ -994,10 +996,7 @@ fn special_workspace_visibility_controls_fullscreen_composition() {
         capture_pointer_input_metrics(&commands).pointer_scene_hit_calls,
         pointer_hits_before_open + 1
     );
-    assert_eq!(
-        capture_direct_scanout_candidate(&commands),
-        Err(DirectScanoutSceneRejection::FullscreenUnderlayVisible)
-    );
+    assert!(capture_direct_scanout_candidate(&commands).is_err());
 
     let pointer_hits_before_close =
         capture_pointer_input_metrics(&commands).pointer_scene_hit_calls;
@@ -1007,9 +1006,9 @@ fn special_workspace_visibility_controls_fullscreen_composition() {
     wait_for_server_commands(&commands);
     let closed_metrics = capture_fullscreen_render_plan_metrics(&commands);
     assert!(closed_metrics.fullscreen_composition_active);
-    assert!(!closed_metrics.solitary_tree_active);
+    assert!(closed_metrics.solitary_tree_active);
     let closed_native_ids = capture_native_frame_surface_ids(&commands);
-    assert!(closed_native_ids.contains(&surface_ids[0]));
+    assert!(!closed_native_ids.contains(&surface_ids[0]));
     assert!(closed_native_ids.contains(&surface_ids[2]));
     assert_eq!(capture_focused_surface_id(&commands), Some(surface_ids[2]));
     assert_eq!(
@@ -1061,11 +1060,12 @@ fn fullscreen_presentation_ignores_restacked_application_and_top_shell() {
     );
     assert_eq!(metrics.owner_root_surface_id, Some(surface_ids[2]));
     assert!(metrics.fullscreen_composition_active);
-    assert!(!metrics.solitary_tree_active);
+    assert!(metrics.solitary_tree_active);
     // The fullscreen owner family stacks above every ordinary window, so the
-    // raised application stays below the owner. It is then an underlay of the
-    // unproven owner, like the unraised application, rather than culled. The
-    // Top panel also stacks below the owner but a settled fullscreen hides it.
+    // raised application stays below the owner. Like the unraised one, it is
+    // culled even though the owner is unproven: only desktop backdrop layers
+    // show through a translucent fullscreen. The Top panel also stacks below
+    // the owner and a settled fullscreen hides it.
     let stacked = capture_renderable_surface_snapshot(&commands);
     let stack_index = |id: u32| {
         stacked
@@ -1076,8 +1076,8 @@ fn fullscreen_presentation_ignores_restacked_application_and_top_shell() {
     };
     assert!(stack_index(surface_ids[1]) < stack_index(surface_ids[2]));
     assert!(stack_index(panel_surface_id) < stack_index(surface_ids[2]));
-    assert!(presented.contains(&surface_ids[0]));
-    assert!(presented.contains(&surface_ids[1]));
+    assert!(!presented.contains(&surface_ids[0]));
+    assert!(!presented.contains(&surface_ids[1]));
     assert!(presented.contains(&surface_ids[2]));
     assert!(!presented.contains(&panel_surface_id));
     commands
