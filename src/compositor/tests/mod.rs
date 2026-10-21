@@ -180,5 +180,6 @@ mod windows_resize_liveness;
 mod workspace;
 mod xdg;
 mod xdg_decoration;
+mod xdg_output;
 mod xwayland;
 mod xwayland_selection;

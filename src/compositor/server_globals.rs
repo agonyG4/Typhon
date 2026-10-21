@@ -12,6 +12,7 @@ use wayland_protocols::wp::{
     keyboard_shortcuts_inhibit::zv1::server::zwp_keyboard_shortcuts_inhibit_manager_v1,
     tearing_control::v1::server::wp_tearing_control_manager_v1,
 };
+use wayland_protocols::xdg::xdg_output::zv1::server::zxdg_output_manager_v1;
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn register_minimum_globals(
@@ -60,6 +61,10 @@ pub(super) fn register_minimum_globals(
     );
     display.create_global::<CompositorState, zwlr_layer_shell_v1::ZwlrLayerShellV1, _>(
         versions::ZWLR_LAYER_SHELL_V1,
+        (),
+    );
+    display.create_global::<CompositorState, zxdg_output_manager_v1::ZxdgOutputManagerV1, _>(
+        versions::ZXDG_OUTPUT_MANAGER_V1,
         (),
     );
     if renderer_capabilities.color_management {

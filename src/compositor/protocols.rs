@@ -27,4 +27,5 @@ pub(crate) mod versions;
 mod viewport;
 mod workspace;
 mod xdg;
+mod xdg_output;
 mod xwayland;

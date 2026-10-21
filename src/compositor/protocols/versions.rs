@@ -574,6 +574,7 @@ pub(crate) const ASTREA_BACKGROUND_EFFECT_COVERAGE_MANAGER_V1: u32 = 1;
 pub(crate) const ASTREA_TOPLEVEL_MANAGER_V1: u32 = 3;
 pub(crate) const XDG_WM_BASE: u32 = 6;
 pub(crate) const WL_OUTPUT: u32 = 4;
+pub(crate) const ZXDG_OUTPUT_MANAGER_V1: u32 = 3;
 // Wayland 1.26 adds wl_pointer.warp at wl_pointer/wl_seat version 11. All
 // explicit compositor repositions are delivered through the constraint-aware
 // reposition path before this version is advertised.
@@ -648,6 +649,7 @@ pub(crate) const ALL_GLOBALS: &[GlobalAdvertisement] = &[
     GlobalAdvertisement::new("astrea_toplevel_manager_v1", ASTREA_TOPLEVEL_MANAGER_V1),
     GlobalAdvertisement::new("xdg_wm_base", XDG_WM_BASE),
     GlobalAdvertisement::new("wl_output", WL_OUTPUT),
+    GlobalAdvertisement::new("zxdg_output_manager_v1", ZXDG_OUTPUT_MANAGER_V1),
     GlobalAdvertisement::new("wl_seat", WL_SEAT),
     GlobalAdvertisement::new("ext_workspace_manager_v1", EXT_WORKSPACE_MANAGER_V1),
     GlobalAdvertisement::new("xwayland_shell_v1", XWAYLAND_SHELL_V1),

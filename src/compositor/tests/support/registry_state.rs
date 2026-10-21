@@ -19,6 +19,10 @@ use wayland_protocols::xdg::decoration::zv1::client::{
     zxdg_decoration_manager_v1 as client_zxdg_decoration_manager_v1,
     zxdg_toplevel_decoration_v1 as client_zxdg_toplevel_decoration_v1,
 };
+use wayland_protocols::xdg::xdg_output::zv1::client::{
+    zxdg_output_manager_v1 as client_zxdg_output_manager_v1,
+    zxdg_output_v1 as client_zxdg_output_v1,
+};
 use wayland_protocols::xwayland::shell::v1::client::xwayland_shell_v1 as client_xwayland_shell_v1;
 use wayland_protocols::xwayland::shell::v1::client::xwayland_surface_v1 as client_xwayland_surface_v1;
 
@@ -141,6 +145,11 @@ pub(in crate::compositor::tests) struct RegistryTestState {
     pub(in crate::compositor::tests) surface_event_log: Vec<&'static str>,
     pub(in crate::compositor::tests) seat_has_keyboard: bool,
     pub(in crate::compositor::tests) output_done: bool,
+    pub(in crate::compositor::tests) output_event_log: Vec<&'static str>,
+    pub(in crate::compositor::tests) xdg_logical_position: Option<(i32, i32)>,
+    pub(in crate::compositor::tests) xdg_logical_size: Option<(i32, i32)>,
+    pub(in crate::compositor::tests) xdg_name: Option<String>,
+    pub(in crate::compositor::tests) xdg_description: Option<String>,
     pub(in crate::compositor::tests) output_mode_count: usize,
     pub(in crate::compositor::tests) output_scale_count: usize,
     pub(in crate::compositor::tests) output_name: bool,
@@ -1295,6 +1304,7 @@ impl Dispatch<client_wl_output::WlOutput, ()> for RegistryTestState {
         match event {
             client_wl_output::Event::Done => {
                 state.output_done = true;
+                state.output_event_log.push("wl_output.done");
             }
             client_wl_output::Event::Mode {
                 width,
@@ -1315,6 +1325,52 @@ impl Dispatch<client_wl_output::WlOutput, ()> for RegistryTestState {
             }
             client_wl_output::Event::Description { .. } => {
                 state.output_description = true;
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<client_zxdg_output_manager_v1::ZxdgOutputManagerV1, ()> for RegistryTestState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &client_zxdg_output_manager_v1::ZxdgOutputManagerV1,
+        _event: client_zxdg_output_manager_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<client_zxdg_output_v1::ZxdgOutputV1, ()> for RegistryTestState {
+    fn event(
+        state: &mut Self,
+        _proxy: &client_zxdg_output_v1::ZxdgOutputV1,
+        event: client_zxdg_output_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        match event {
+            client_zxdg_output_v1::Event::LogicalPosition { x, y } => {
+                state.output_event_log.push("logical_position");
+                state.xdg_logical_position = Some((x, y));
+            }
+            client_zxdg_output_v1::Event::LogicalSize { width, height } => {
+                state.output_event_log.push("logical_size");
+                state.xdg_logical_size = Some((width, height));
+            }
+            client_zxdg_output_v1::Event::Name { name } => {
+                state.output_event_log.push("xdg_name");
+                state.xdg_name = Some(name);
+            }
+            client_zxdg_output_v1::Event::Description { description } => {
+                state.output_event_log.push("xdg_description");
+                state.xdg_description = Some(description);
+            }
+            client_zxdg_output_v1::Event::Done => {
+                state.output_event_log.push("xdg_done");
             }
             _ => {}
         }

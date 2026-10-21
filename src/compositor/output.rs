@@ -1,5 +1,9 @@
 use wayland_server::{Resource, WEnum, protocol::wl_output};
 
+pub(super) const OUTPUT_LOGICAL_POSITION: (i32, i32) = (0, 0);
+pub(super) const OUTPUT_TRANSFORM: wl_output::Transform = wl_output::Transform::Normal;
+pub(super) const OUTPUT_NAME: &str = "Oblivion-1";
+pub(super) const OUTPUT_DESCRIPTION: &str = "Typhon native output";
 const DEFAULT_OUTPUT_WIDTH: u32 = 1280;
 const DEFAULT_OUTPUT_HEIGHT: u32 = 800;
 const WL_OUTPUT_DONE_SINCE: u32 = 2;
@@ -57,6 +61,15 @@ impl OutputScale {
         self.preferred_scale
             .div_ceil(FRACTIONAL_SCALE_DENOMINATOR)
             .max(1) as i32
+    }
+
+    /// Logical extent along one axis, using the true (possibly fractional)
+    /// scale rather than the integer `wl_output.scale` that is advertised.
+    pub(super) fn logical_extent(self, physical: u32) -> u32 {
+        let scale = u64::from(self.preferred_scale);
+        let scaled =
+            (u64::from(physical) * u64::from(FRACTIONAL_SCALE_DENOMINATOR) + scale / 2) / scale;
+        scaled.clamp(1, u64::from(i32::MAX as u32)) as u32
     }
 }
 
@@ -130,32 +143,52 @@ fn normalize_refresh_hz(refresh_hz: u32) -> u32 {
     }
 }
 
+/// Logical (xdg_output) size of the output after scale and transform.
+pub(super) fn logical_output_size(
+    size: OutputSize,
+    scale: OutputScale,
+    transform: wl_output::Transform,
+) -> (i32, i32) {
+    let (width, height) = match transform {
+        wl_output::Transform::_90
+        | wl_output::Transform::_270
+        | wl_output::Transform::Flipped90
+        | wl_output::Transform::Flipped270 => (size.height, size.width),
+        _ => (size.width, size.height),
+    };
+    (
+        scale.logical_extent(width) as i32,
+        scale.logical_extent(height) as i32,
+    )
+}
+
 pub(super) fn send_output_description(
     output: &wl_output::WlOutput,
     output_size: OutputSize,
     output_scale: OutputScale,
     output_refresh: OutputRefreshRate,
 ) {
+    let (x, y) = OUTPUT_LOGICAL_POSITION;
     let _ = output.send_event(wl_output::Event::Geometry {
-        x: 0,
-        y: 0,
+        x,
+        y,
         physical_width: 344,
         physical_height: 215,
         subpixel: WEnum::Value(wl_output::Subpixel::Unknown),
         make: "Oblivion".to_string(),
         model: "Native Output".to_string(),
-        transform: WEnum::Value(wl_output::Transform::Normal),
+        transform: WEnum::Value(OUTPUT_TRANSFORM),
     });
     send_output_mode(output, output_size, output_refresh);
     send_output_scale(output, output_scale);
     if output.version() >= WL_OUTPUT_NAME_SINCE {
         let _ = output.send_event(wl_output::Event::Name {
-            name: "Oblivion-1".to_string(),
+            name: OUTPUT_NAME.to_string(),
         });
     }
     if output.version() >= WL_OUTPUT_DESCRIPTION_SINCE {
         let _ = output.send_event(wl_output::Event::Description {
-            description: "Typhon native output".to_string(),
+            description: OUTPUT_DESCRIPTION.to_string(),
         });
     }
     send_output_done_if_supported(output);
@@ -238,5 +271,29 @@ mod tests {
 
         assert_eq!(refresh.wl_output_millihertz(), 1_000_000);
         assert_eq!(refresh.presentation_refresh_nsec(), 1_000_000);
+    }
+
+    #[test]
+    fn logical_output_size_divides_by_scale_and_swaps_for_quarter_turns() {
+        let size = OutputSize::new(1280, 800);
+        let scale2 = OutputScale::from_factor(2.0);
+        let scale_1_5 = OutputScale::from_factor(1.5);
+
+        assert_eq!(
+            logical_output_size(size, scale2, wl_output::Transform::Normal),
+            (640, 400)
+        );
+        assert_eq!(
+            logical_output_size(size, scale_1_5, wl_output::Transform::Normal),
+            (853, 533)
+        );
+        assert_eq!(
+            logical_output_size(size, scale2, wl_output::Transform::_90),
+            (400, 640)
+        );
+        assert_eq!(
+            logical_output_size(size, scale2, wl_output::Transform::Flipped270),
+            (400, 640)
+        );
     }
 }

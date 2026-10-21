@@ -262,6 +262,7 @@ impl CompositorState {
             send_output_mode(&binding.resource, self.output_size, self.output_refresh);
             send_output_done_if_supported(&binding.resource);
         }
+        self.send_xdg_output_geometry_to_bound_outputs();
     }
 
     pub(in crate::compositor) fn send_output_scale_to_bound_outputs(&self) {
@@ -269,6 +270,7 @@ impl CompositorState {
             send_output_scale(&binding.resource, self.output_scale);
             send_output_done_if_supported(&binding.resource);
         }
+        self.send_xdg_output_geometry_to_bound_outputs();
     }
 
     fn send_surface_output_event(

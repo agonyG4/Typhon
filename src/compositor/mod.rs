@@ -60,6 +60,7 @@ use wayland_protocols::xdg::{
     decoration::zv1::server::{zxdg_decoration_manager_v1, zxdg_toplevel_decoration_v1},
     shell::server::{xdg_popup, xdg_positioner, xdg_surface, xdg_toplevel, xdg_wm_base},
 };
+use wayland_protocols::xdg::xdg_output::zv1::server::zxdg_output_v1;
 use wayland_protocols_wlr::layer_shell::v1::server::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
 use wayland_server::{
     Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource, WEnum,
@@ -778,6 +779,7 @@ pub struct CompositorState {
     commit_timing_planning_signature: u64,
     surface_pacing_metrics: SurfacePacingMetrics,
     output_resources: Vec<OutputBinding>,
+    xdg_output_resources: Vec<zxdg_output_v1::ZxdgOutputV1>,
     workspace_protocol: WorkspaceProtocolState,
     fractional_scale_resources: HashMap<u32, Vec<wp_fractional_scale_v1::WpFractionalScaleV1>>,
     keyboard_resources: Vec<wl_keyboard::WlKeyboard>,

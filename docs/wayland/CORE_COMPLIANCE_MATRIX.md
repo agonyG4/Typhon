@@ -63,6 +63,7 @@ Core/XDG request matrix, but they must remain synchronized with
 | `ext_workspace_manager_v1` | 1 | Partial |
 | `xdg_wm_base` | 6 | Implemented |
 | `wl_output` | 4 | Implemented |
+| `zxdg_output_manager_v1` | 3 | Implemented |
 | `wl_seat` | 11 | Implemented |
 | `wp_cursor_shape_manager_v1` | 2 | Implemented (pointer capability gated) |
 | `xwayland_shell_v1` | 1 | Implemented for the active private XWayland client |
@@ -215,6 +216,14 @@ contract until the bound is upgraded, which this milestone forbids.
 | `wl_output` | 4 | request `release` | 3 | `protocols/input.rs` | DestroyedResourceNoFurtherDispatch | Partial |
 | `wl_output` | 4 | event `name` | 4 | output bindings | Implemented | Implemented |
 | `wl_output` | 4 | event `description` | 4 | output bindings | Implemented | Implemented |
+| `zxdg_output_manager_v1` | 3 | request `destroy` | 1 | `protocols/xdg_output.rs` | DestroyedResourceNoFurtherDispatch | Implemented |
+| `zxdg_output_manager_v1` | 3 | request `get_xdg_output` | 1 | `protocols/xdg_output.rs` | Implemented | Implemented; logical geometry re-sent on mode and scale changes |
+| `zxdg_output_v1` | 3 | request `destroy` | 1 | `protocols/xdg_output.rs` | DestroyedResourceNoFurtherDispatch | Implemented |
+| `zxdg_output_v1` | 3 | event `logical_position` | 1 | output bindings | Implemented | Implemented |
+| `zxdg_output_v1` | 3 | event `logical_size` | 1 | output bindings | Implemented | Implemented |
+| `zxdg_output_v1` | 3 | event `name` | 2 | output bindings | Implemented | Implemented |
+| `zxdg_output_v1` | 3 | event `description` | 2 | output bindings | Implemented | Implemented |
+| `zxdg_output_v1` | 3 | event `done` | 1 | output bindings | Implemented | Implemented; deprecated at v3, sent only when wl_output is below v2 |
 | `wl_region` | n/a | request `destroy` | 1 | `protocols/core.rs` | DestroyedResourceNoFurtherDispatch | Implemented |
 | `wl_region` | n/a | request `add` | 1 | `protocols/core.rs` | Implemented | Partial |
 | `wl_region` | n/a | request `subtract` | 1 | `protocols/core.rs` | Implemented | Partial |
