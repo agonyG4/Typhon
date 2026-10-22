@@ -150,6 +150,11 @@ impl CompositorState {
         self.next_activation_token_serial = self.next_activation_token_serial.saturating_add(1);
         let generation = self.next_activation_token_serial;
         let token = format!("typhon-activation-{generation}");
+        let issuer_focused = self
+            .focused_surface
+            .as_ref()
+            .and_then(Resource::client)
+            .is_none_or(|focused| focused.id() == client_id);
         self.activation_tokens.insert(
             token.clone(),
             ActivationTokenState {
@@ -159,6 +164,7 @@ impl CompositorState {
                 app_id: pending.app_id,
                 generation,
                 used: false,
+                issuer_focused,
             },
         );
         resource.done(token.clone());
@@ -205,6 +211,19 @@ impl CompositorState {
         }
 
         if self.toplevel_surfaces.contains_key(&surface_id) {
+            // A token without an input serial proves no user intent. Honouring
+            // it from an unfocused client lets background apps steal focus
+            // (Steam's _NET_ACTIVE_WINDOW via xwayland-satellite made fullscreen
+            // Wine games lose foreground and minimize themselves).
+            if token_state.serial.is_none() && !token_state.issuer_focused {
+                activation_debug_log(|| {
+                    format!(
+                        "activation_reject token={token} target={surface_id} reason=no_serial_unfocused_issuer generation={}",
+                        token_state.generation
+                    )
+                });
+                return false;
+            }
             if let Some(window_id) = self.window_id_for_surface(surface_id)
                 && let Some(owner_id) = self.workspace_owner_window_id(window_id)
                 && let Some(special) = self

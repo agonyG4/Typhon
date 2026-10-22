@@ -422,6 +422,9 @@ pub(super) struct ActivationTokenState {
     pub(super) app_id: Option<String>,
     pub(super) generation: u64,
     pub(super) used: bool,
+    /// Whether the issuing client owned the focused surface (or nothing was focused) when it
+    /// committed the token. Serial-less tokens may only move focus then.
+    pub(super) issuer_focused: bool,
 }
 
 #[derive(Debug, Clone)]

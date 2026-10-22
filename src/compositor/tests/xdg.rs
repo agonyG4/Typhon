@@ -463,6 +463,79 @@ fn xdg_activation_token_focuses_requested_toplevel_once() {
 }
 
 #[test]
+fn serial_less_activation_from_unfocused_client_does_not_steal_focus() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let background_connection =
+        Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (background_globals, mut background_queue) =
+        registry_queue_init::<RegistryTestState>(&background_connection).unwrap();
+    let background_qh = background_queue.handle();
+    let background_compositor: client_wl_compositor::WlCompositor =
+        background_globals.bind(&background_qh, 1..=6, ()).unwrap();
+    let background_wm_base: client_xdg_wm_base::XdgWmBase =
+        background_globals.bind(&background_qh, 1..=6, ()).unwrap();
+    let background_shm: client_wl_shm::WlShm =
+        background_globals.bind(&background_qh, 1..=1, ()).unwrap();
+    let background_activation: client_xdg_activation_v1::XdgActivationV1 =
+        background_globals.bind(&background_qh, 1..=1, ()).unwrap();
+    let background_surface = background_compositor.create_surface(&background_qh, ());
+    let background_xdg =
+        background_wm_base.get_xdg_surface(&background_surface, &background_qh, ());
+    let _background_toplevel = background_xdg.get_toplevel(&background_qh, ());
+    background_surface.commit();
+    background_connection.flush().unwrap();
+    let mut background_state = RegistryTestState::default();
+    background_queue.roundtrip(&mut background_state).unwrap();
+    commit_test_buffered_surface(&background_surface, &background_shm, &background_qh, 32, 32)
+        .unwrap();
+    background_connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+
+    let game_connection =
+        Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (game_globals, mut game_queue) =
+        registry_queue_init::<RegistryTestState>(&game_connection).unwrap();
+    let game_qh = game_queue.handle();
+    let game_compositor: client_wl_compositor::WlCompositor =
+        game_globals.bind(&game_qh, 1..=6, ()).unwrap();
+    let game_wm_base: client_xdg_wm_base::XdgWmBase =
+        game_globals.bind(&game_qh, 1..=6, ()).unwrap();
+    let game_shm: client_wl_shm::WlShm = game_globals.bind(&game_qh, 1..=1, ()).unwrap();
+    let game_surface = game_compositor.create_surface(&game_qh, ());
+    let game_xdg = game_wm_base.get_xdg_surface(&game_surface, &game_qh, ());
+    let _game_toplevel = game_xdg.get_toplevel(&game_qh, ());
+    game_surface.commit();
+    game_connection.flush().unwrap();
+    let mut game_state = RegistryTestState::default();
+    game_queue.roundtrip(&mut game_state).unwrap();
+    commit_test_buffered_surface(&game_surface, &game_shm, &game_qh, 32, 32).unwrap();
+    game_connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    game_queue.roundtrip(&mut game_state).unwrap();
+    let game_focus = capture_focused_surface_id(&commands).expect("game toplevel focused");
+
+    let activation_token = background_activation.get_activation_token(&background_qh, ());
+    activation_token.commit();
+    background_connection.flush().unwrap();
+    background_queue.roundtrip(&mut background_state).unwrap();
+    let token = background_state
+        .activation_token_done
+        .take()
+        .expect("activation token should be committed");
+
+    background_activation.activate(token, &background_surface);
+    background_connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    assert_eq!(capture_focused_surface_id(&commands), Some(game_focus));
+
+    let _server = stop_controllable_test_server(commands, server_thread);
+}
+
+#[test]
 fn xdg_toplevel_configure_waits_for_initial_empty_commit() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();
