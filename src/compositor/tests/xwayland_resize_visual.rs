@@ -1633,9 +1633,11 @@ fn xwayland_fullscreen_transition_starts_from_pre_mutation_frame_geometry() {
         .presentation_animator
         .sample_at_transition_start_for_scene_node(scene_node_id)
         .expect("XWayland fullscreen transition should be active");
+    // The pre-mutation frame's client box, grown by the 26 px titlebar that
+    // fullscreen drops at once.
     assert_eq!(
         start.rect,
-        crate::presentation_animation::PresentationRect::new(100.0, 100.0, 640.0, 480.0)
+        crate::presentation_animation::PresentationRect::new(100.0, 74.0, 640.0, 506.0)
             .expect("XWayland source frame")
     );
     assert_eq!(

@@ -1160,6 +1160,13 @@ impl CompositorState {
             self.presentation_animator.cancel_geometry(scene_node_id);
             return;
         };
+        // Fullscreen drops the titlebar at once, so the content starts from
+        // the whole decorated box and the window's top edge never jumps.
+        let previous = if kind == PresentationAnimationKind::FullscreenEnter {
+            self.server_decoration_outer_rect(root_surface_id, previous)
+        } else {
+            previous
+        };
         let Some(target) = self.presentation_rect_for_geometry(root_surface_id, target_geometry)
         else {
             self.presentation_animator.cancel_geometry(scene_node_id);

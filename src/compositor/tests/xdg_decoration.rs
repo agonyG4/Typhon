@@ -951,7 +951,7 @@ fn stale_server_side_decoration_ack_cannot_override_destroy_commit() {
 }
 
 #[test]
-fn fullscreen_decoration_visibility_follows_the_applied_mode() {
+fn fullscreen_decoration_visibility_follows_the_requested_mode() {
     let (socket_path, commands, server_thread) = start_server();
     let mut client = DecorationClient::connect(
         &socket_path,
@@ -965,7 +965,8 @@ fn fullscreen_decoration_visibility_follows_the_applied_mode() {
         .send(ServerCommand::ToggleFullscreenFocused)
         .unwrap();
     client.pump(&commands).unwrap();
-    assert_eq!(client.decoration_count(&commands), 1);
+    // Fullscreen drops the titlebar before the client acknowledges.
+    assert_eq!(client.decoration_count(&commands), 0);
     assert_eq!(client.state.decoration_configure_modes.last(), Some(&2));
     let serial = *client.state.surface_configure_serials.last().unwrap();
     client.commit_configure(&commands, serial).unwrap();
@@ -975,7 +976,8 @@ fn fullscreen_decoration_visibility_follows_the_applied_mode() {
         .send(ServerCommand::ToggleFullscreenFocused)
         .unwrap();
     client.pump(&commands).unwrap();
-    assert_eq!(client.decoration_count(&commands), 0);
+    // Leaving fullscreen shows the titlebar before the client acknowledges.
+    assert_eq!(client.decoration_count(&commands), 1);
     let serial = *client.state.surface_configure_serials.last().unwrap();
     client.commit_configure(&commands, serial).unwrap();
     assert_eq!(client.decoration_count(&commands), 1);

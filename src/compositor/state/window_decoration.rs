@@ -1,4 +1,5 @@
 use std::time::Instant;
+use crate::presentation_animation::PresentationRect;
 
 use super::super::decoration::{
     layout::DecorationLayout,
@@ -294,6 +295,78 @@ impl super::super::CompositorState {
             .then(|| self.xdg_decoration_states.get(&window.root_surface_id))
             .flatten();
         effective_decoration_mode(window, xdg_state, mode)
+    }
+
+    /// The decoration mode to draw for a window. While a mode transition
+    /// animates, an XDG window shows the chrome it is moving to instead of
+    /// waiting for the client to acknowledge the decoration configure, so a
+    /// fullscreen exit has its titlebar from the first frame.
+    fn mode_transition_decoration_mode(
+        &self,
+        window: &DesktopWindow,
+        mode: ToplevelMode,
+    ) -> DecorationMode {
+        let applied = self.effective_decoration_mode_for_window(window, mode);
+        if applied == DecorationMode::ServerSide
+            || !matches!(window.backend, WindowBackend::Xdg(_))
+            || !self
+                .toplevel_visual_geometries
+                .get(&window.root_surface_id)
+                .is_some_and(|visual| visual.mode_transition)
+        {
+            return applied;
+        }
+        self.xdg_decoration_states
+            .get(&window.root_surface_id)
+            .map_or(applied, |state| {
+                state.requested_mode(mode == ToplevelMode::Fullscreen)
+            })
+    }
+
+    /// Grows a client box by the server chrome the window shows around it.
+    pub(in crate::compositor) fn server_decoration_outer_rect(
+        &self,
+        root_surface_id: u32,
+        client: PresentationRect,
+    ) -> PresentationRect {
+        let Some(window) = self
+            .window_id_for_surface(root_surface_id)
+            .and_then(|window_id| self.window(window_id))
+        else {
+            return client;
+        };
+        if self.effective_decoration_mode_for_window(window, ToplevelMode::Normal)
+            != DecorationMode::ServerSide
+        {
+            return client;
+        }
+        let chrome_policy = window
+            .management
+            .map_or(crate::wm::WindowChromePolicy::Full, |management| {
+                management.chrome_policy()
+            });
+        let Some(layout) = DecorationLayout::for_window_with_chrome_policy(
+            client.width().round().max(1.0) as u32,
+            client.height().round().max(1.0) as u32,
+            DecorationMode::ServerSide,
+            false,
+            false,
+            chrome_policy,
+            self.decoration_theme.metrics(),
+        ) else {
+            return client;
+        };
+        let left = f64::from(layout.client.x);
+        let top = f64::from(layout.client.y);
+        let right = f64::from(layout.outer.width) - left - f64::from(layout.client.width);
+        let bottom = f64::from(layout.outer.height) - top - f64::from(layout.client.height);
+        PresentationRect::new(
+            client.x() - left,
+            client.y() - top,
+            client.width() + left + right,
+            client.height() + top + bottom,
+        )
+        .unwrap_or(client)
     }
 
     pub(in crate::compositor) fn effective_window_decoration_mode(
@@ -1075,9 +1148,12 @@ impl super::super::CompositorState {
                 let window_id = self.window_id_for_surface(surface.surface_id)?;
                 let window = self.window(window_id)?;
                 let mode = window.state.mode();
-                let fullscreen = mode == ToplevelMode::Fullscreen;
-                let decoration_mode = self.effective_decoration_mode_for_window(window, mode);
-                let decoration_fullscreen = fullscreen && decoration_mode == DecorationMode::None;
+                // Fullscreen never shows server chrome, including the frames
+                // before the client acknowledges the configure that drops it.
+                if mode == ToplevelMode::Fullscreen {
+                    return None;
+                }
+                let decoration_mode = self.mode_transition_decoration_mode(window, mode);
                 if decoration_mode != DecorationMode::ServerSide {
                     return None;
                 }
@@ -1093,7 +1169,7 @@ impl super::super::CompositorState {
                     visual_geometry.height,
                     decoration_mode,
                     mode == ToplevelMode::Maximized,
-                    decoration_fullscreen,
+                    false,
                     chrome_policy,
                     metrics,
                 )?;

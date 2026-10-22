@@ -6110,3 +6110,64 @@ fn animated_decoration_keeps_titlebar_and_border_thickness() {
         "titlebar and bottom border keep their height"
     );
 }
+
+#[test]
+fn fullscreen_transitions_ignore_the_titlebar_without_waiting_for_the_client() {
+    let surface_id = 166;
+    let mut state = xdg_state(
+        test_surface(surface_id),
+        DecorationPreference::ServerSide,
+        ToplevelMode::Normal,
+    );
+    state.set_test_effective_xdg_window_geometry(
+        surface_id,
+        XdgWindowGeometry::new(0, 0, SURFACE_WIDTH as i32, SURFACE_HEIGHT as i32),
+    );
+    state.xdg_surface_lifecycles.entry(surface_id).or_default();
+    let (_display, _client) = install_test_toplevel_role(&mut state, surface_id);
+    state.set_surface_placement(surface_id, SurfacePlacement::absolute_root_at(360, 250));
+    state.rebuild_active_scene_view();
+    state.presentation_animator.set_enabled(true);
+    let titlebar = f64::from(state.decoration_theme.metrics().titlebar_height);
+    let source = state.current_presentation_rect_for_root(surface_id).unwrap();
+    state.publish_presented_window_geometry(1, PresentedWindowGeometry::new(surface_id, source));
+    let decorations = |state: &CompositorState| {
+        state
+            .native_decoration_render_instances_for_scale(&state.renderable_surfaces, 1.0)
+            .len()
+    };
+    assert_eq!(decorations(&state), 1);
+
+    // Entering: the client has not acknowledged dropping SSD yet.
+    assert!(state.set_root_window_mode(surface_id, ToplevelMode::Fullscreen));
+    assert_eq!(decorations(&state), 0, "fullscreen never draws the titlebar");
+    let scene_node = state.presentation_scene_node_id_for_root(surface_id).unwrap();
+    let start = state
+        .presentation_animator
+        .sample_at_transition_start_for_scene_node(scene_node)
+        .unwrap();
+    assert_eq!(
+        start.rect,
+        PresentationRect::new(
+            source.x(),
+            source.y() - titlebar,
+            source.width(),
+            source.height() + titlebar,
+        )
+        .unwrap(),
+        "the content starts from the whole decorated box"
+    );
+
+    // The client drops SSD while fullscreen, then the window leaves it.
+    state
+        .xdg_decoration_states
+        .get_mut(&surface_id)
+        .unwrap()
+        .apply_configured_mode(DecorationMode::None);
+    assert!(state.restore_normal_root_window(surface_id));
+    assert_eq!(
+        decorations(&state),
+        1,
+        "the exit draws its titlebar before the client acknowledges SSD"
+    );
+}
