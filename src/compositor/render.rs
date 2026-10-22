@@ -248,7 +248,7 @@ impl DecorationRenderInstance {
         &self,
         transform: PresentationGroupTransform,
     ) -> Option<Self> {
-        let mapped_origin = map_presentation_point(
+        let mapped_origin = map_decoration_point(
             transform,
             (f64::from(self.origin_x), f64::from(self.origin_y)),
         );
@@ -302,11 +302,18 @@ fn map_decoration_rect(
         f64::from(rect.width),
         f64::from(rect.height),
     )?;
-    let mapped = transform.map_rect(canonical)?;
-    let left = mapped.x().floor();
-    let top = mapped.y().floor();
-    let right = (mapped.x() + mapped.width()).ceil();
-    let bottom = (mapped.y() + mapped.height()).ceil();
+    let (left, top) = map_decoration_point(transform, (canonical.x(), canonical.y()));
+    let (right, bottom) = map_decoration_point(
+        transform,
+        (
+            canonical.x() + canonical.width(),
+            canonical.y() + canonical.height(),
+        ),
+    );
+    let left = left.floor();
+    let top = top.floor();
+    let right = right.ceil().max(left);
+    let bottom = bottom.ceil().max(top);
     let width = (right - left).max(1.0).min(f64::from(u32::MAX));
     let height = (bottom - top).max(1.0).min(f64::from(u32::MAX));
     Some(DecorationRect::new(
@@ -317,9 +324,44 @@ fn map_decoration_rect(
     ))
 }
 
+/// Maps a decoration point onto the animated window box without scaling
+/// decoration thickness. Each coordinate keeps its distance to the nearer
+/// edge of the window box, so titlebars and borders keep their real size
+/// and only stretch along the edge they follow.
 #[allow(dead_code)] // Used by the native-output presentation projection.
-fn map_presentation_point(transform: PresentationGroupTransform, point: (f64, f64)) -> (f64, f64) {
-    transform.map_point(point)
+fn map_decoration_point(transform: PresentationGroupTransform, point: (f64, f64)) -> (f64, f64) {
+    let canonical = transform.canonical_rect;
+    let presented = transform.presented_rect;
+    (
+        map_edge_anchored(
+            point.0,
+            canonical.x(),
+            canonical.width(),
+            presented.x(),
+            presented.width(),
+        ),
+        map_edge_anchored(
+            point.1,
+            canonical.y(),
+            canonical.height(),
+            presented.y(),
+            presented.height(),
+        ),
+    )
+}
+
+fn map_edge_anchored(
+    value: f64,
+    canonical_start: f64,
+    canonical_length: f64,
+    presented_start: f64,
+    presented_length: f64,
+) -> f64 {
+    if value <= canonical_start + canonical_length / 2.0 {
+        presented_start + (value - canonical_start)
+    } else {
+        presented_start + presented_length - (canonical_start + canonical_length - value)
+    }
 }
 
 #[allow(dead_code)] // Used by the native-output presentation projection.
@@ -5612,28 +5654,38 @@ mod tests {
     }
 
     #[test]
-    fn decoration_projection_uses_the_shared_group_transform() {
+    fn decoration_projection_follows_the_group_box_at_real_thickness() {
         let instance = test_decoration_instance(100, 100);
         let transform = PresentationGroupTransform::new(
             1,
             crate::presentation_animation::TransitionId::new(
                 std::num::NonZeroU64::new(3).expect("non-zero transition id"),
             ),
-            PresentationRect::new(100.0, 100.0, 20.0, 20.0).expect("canonical group"),
-            PresentationRect::new(200.0, 200.0, 40.0, 40.0).expect("presented group"),
+            PresentationRect::new(100.0, 126.0, 20.0, 20.0).expect("canonical client box"),
+            PresentationRect::new(200.0, 226.0, 40.0, 40.0).expect("presented client box"),
             false,
         );
         let projected = instance
             .with_presentation_transform(transform)
             .expect("decoration projection");
         assert_eq!(projected.origin(), (200, 200));
+        // The window box doubles from 20x20 to 40x40. Borders and the
+        // titlebar keep their thickness, so the outer box grows by 20.
         assert_eq!(
             projected.plan.layout.outer.width,
-            instance.plan.layout.outer.width.saturating_mul(2)
+            instance.plan.layout.outer.width + 20
         );
         assert_eq!(
             projected.plan.layout.outer.height,
-            instance.plan.layout.outer.height.saturating_mul(2)
+            instance.plan.layout.outer.height + 20
+        );
+        assert_eq!(
+            projected.plan.layout.outer.x,
+            instance.plan.layout.outer.x
+        );
+        assert_eq!(
+            projected.plan.layout.outer.y,
+            instance.plan.layout.outer.y
         );
     }
 
@@ -5645,23 +5697,23 @@ mod tests {
             crate::presentation_animation::TransitionId::new(
                 std::num::NonZeroU64::new(4).expect("non-zero transition id"),
             ),
-            PresentationRect::new(100.0, 100.0, 20.0, 20.0).expect("canonical group"),
-            PresentationRect::new(160.0, 130.0, 30.0, 30.0).expect("presented group"),
+            PresentationRect::new(100.0, 126.0, 20.0, 20.0).expect("canonical client box"),
+            PresentationRect::new(160.0, 156.0, 30.0, 30.0).expect("presented client box"),
             false,
         );
         let projected = instance
             .with_presentation_transform(transform)
             .expect("decoration projection");
 
-        let client = PresentationRect::new(100.0, 120.0, 20.0, 20.0).expect("client rect");
-        let subsurface = PresentationRect::new(104.0, 124.0, 6.0, 6.0).expect("subsurface rect");
+        let client = PresentationRect::new(100.0, 126.0, 20.0, 20.0).expect("client rect");
+        let subsurface = PresentationRect::new(104.0, 130.0, 6.0, 6.0).expect("subsurface rect");
         assert_eq!(
             transform.map_rect(client),
-            Some(PresentationRect::new(160.0, 160.0, 30.0, 30.0).expect("mapped client"))
+            Some(PresentationRect::new(160.0, 156.0, 30.0, 30.0).expect("mapped client"))
         );
         assert_eq!(
             transform.map_rect(subsurface),
-            Some(PresentationRect::new(166.0, 166.0, 9.0, 9.0).expect("mapped subsurface"))
+            Some(PresentationRect::new(166.0, 162.0, 9.0, 9.0).expect("mapped subsurface"))
         );
 
         let canonical_outer = PresentationRect::new(
@@ -5678,11 +5730,30 @@ mod tests {
             f64::from(projected.plan.layout.outer.height),
         )
         .expect("presented decoration bounds");
-        let mapped_outer = transform.map_rect(canonical_outer).expect("mapped outer");
-        assert_eq!(presented_outer.x(), mapped_outer.x().floor());
-        assert_eq!(presented_outer.y(), mapped_outer.y().floor());
-        assert!(presented_outer.width() >= mapped_outer.width());
-        assert!(presented_outer.height() >= mapped_outer.height());
+        // The decoration wraps the presented window box with the same
+        // border and titlebar thickness it has around the canonical box.
+        assert_eq!(presented_outer.x() - 160.0, canonical_outer.x() - 100.0);
+        assert_eq!(presented_outer.y() - 156.0, canonical_outer.y() - 126.0);
+        assert_eq!(
+            presented_outer.width() - 30.0,
+            canonical_outer.width() - 20.0
+        );
+        assert_eq!(
+            presented_outer.height() - 30.0,
+            canonical_outer.height() - 20.0
+        );
+        let titlebar_rect = |instance: &DecorationRenderInstance| match instance.plan.primitives[0] {
+            DecorationRenderPrimitive::SolidRect { rect, .. } => rect,
+            _ => panic!("the first test primitive is the titlebar"),
+        };
+        let titlebar = titlebar_rect(&instance);
+        let projected_titlebar = titlebar_rect(&projected);
+        assert_eq!(projected_titlebar.height, titlebar.height);
+        assert_eq!(
+            projected.origin_y + projected_titlebar.y + projected_titlebar.height as i32 - 156,
+            instance.origin_y + titlebar.y + titlebar.height as i32 - 126,
+            "the titlebar stays attached to the client box"
+        );
         assert_eq!(
             projected.plan.primitives.len(),
             instance.plan.primitives.len(),

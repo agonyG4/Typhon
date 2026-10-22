@@ -6061,3 +6061,52 @@ fn pending_frame_callback_does_not_make_an_animating_frame_protocol_only() {
         "the fullscreen animation must keep the output repainting"
     );
 }
+
+
+#[test]
+fn animated_decoration_keeps_titlebar_and_border_thickness() {
+    let surface_id = 165;
+    let mut state = xdg_state(
+        test_surface(surface_id),
+        DecorationPreference::ServerSide,
+        ToplevelMode::Normal,
+    );
+    state.set_surface_placement(surface_id, SurfacePlacement::absolute_root_at(360, 250));
+    state.rebuild_active_scene_view();
+    let decoration = state
+        .native_decoration_render_instances_for_scale(&state.renderable_surfaces, 1.0)
+        .into_iter()
+        .next()
+        .expect("SSD decoration");
+    let (_, canonical_top, canonical_width, canonical_height) =
+        decoration.scene_snapshot().bounds();
+    let canonical_window = PresentationRect::new(360.0, 250.0, 300.0, 200.0).unwrap();
+    // A fullscreen exit starts with the window box four times larger.
+    let presented_window = PresentationRect::new(0.0, 100.0, 1200.0, 800.0).unwrap();
+    let transform = crate::presentation_animation::PresentationGroupTransform::new(
+        surface_id,
+        crate::presentation_animation::TransitionId::new(std::num::NonZeroU64::MIN),
+        canonical_window,
+        presented_window,
+        false,
+    );
+    let animated = decoration
+        .with_presentation_transform(transform)
+        .expect("animated decoration");
+    let (x, top, width, height) = animated.scene_snapshot().bounds();
+
+    let titlebar_above = 250 - canonical_top;
+    assert_eq!(100 - top, titlebar_above, "the titlebar keeps its height");
+    let border_left = 360 - decoration.scene_snapshot().bounds().0;
+    assert_eq!(0 - x, border_left, "the left border keeps its width");
+    assert_eq!(
+        width - 1200,
+        canonical_width - 300,
+        "side borders keep their width"
+    );
+    assert_eq!(
+        height - 800,
+        canonical_height - 200,
+        "titlebar and bottom border keep their height"
+    );
+}
