@@ -370,10 +370,15 @@ impl CompositorState {
         if self.visible_pending_frame_callback_count == 0 {
             return false;
         }
+        // A client idling on its frame callback must not turn a frame that
+        // advances a compositor animation into a protocol-only present.
         !self.pending_resize_configure_is_flushable()
             && !self.has_pending_frame_prepare_work()
             && self.pending_color_info.is_empty()
             && !self.has_frame_eligible_pending_presentation_feedbacks()
+            && !(self.presentation_animator.active_count() > 0
+                && self.presentation_animation_has_pending_visible())
+            && !self.lifecycle_animation_has_pending_visible()
     }
 
     fn pending_presentation_feedback_is_frame_eligible(

@@ -6030,3 +6030,34 @@ fn window_scale_above_maximized_xdg_window_starts_at_canonical_opacity() {
         PresentationOpacity::OPAQUE
     );
 }
+
+#[test]
+fn pending_frame_callback_does_not_make_an_animating_frame_protocol_only() {
+    let surface_id = 163;
+    let mut state = xdg_state(
+        test_surface(surface_id),
+        DecorationPreference::ServerSide,
+        ToplevelMode::Normal,
+    );
+    state.set_test_effective_xdg_window_geometry(
+        surface_id,
+        XdgWindowGeometry::new(0, 0, SURFACE_WIDTH as i32, SURFACE_HEIGHT as i32),
+    );
+    state.xdg_surface_lifecycles.entry(surface_id).or_default();
+    let (_display, _client) = install_test_toplevel_role(&mut state, surface_id);
+    state.set_surface_placement(surface_id, SurfacePlacement::absolute_root_at(360, 250));
+    state.rebuild_active_scene_view();
+    state.presentation_animator.set_enabled(true);
+    let source = state.current_presentation_rect_for_root(surface_id).unwrap();
+    state.publish_presented_window_geometry(1, PresentedWindowGeometry::new(surface_id, source));
+    // The client is idle, waiting on its frame callback.
+    state.visible_pending_frame_callback_count = 1;
+    assert!(state.has_only_pending_surface_frame_callbacks());
+
+    assert!(state.set_root_window_mode(surface_id, ToplevelMode::Fullscreen));
+    assert!(state.presentation_animation_has_pending_visible());
+    assert!(
+        !state.has_only_pending_surface_frame_callbacks(),
+        "the fullscreen animation must keep the output repainting"
+    );
+}

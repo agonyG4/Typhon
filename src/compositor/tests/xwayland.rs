@@ -4464,6 +4464,9 @@ fn future_buffer_replaces_adopted_initial_buffer() {
 fn mapped_xwayland_frame_callback_completes_after_output_sample_before_present() {
     let mut fixture = first_buffer_fixture();
     admit_first_buffer(&mut fixture, 100, 120);
+    // The window-open animation is visual work of its own; this test is
+    // about a frame callback that is the only pending work.
+    fixture.server.state.presentation_animator.set_enabled(false);
 
     let server = fixture.server;
     let (running, server_thread) = super::spawn_test_server(server);
