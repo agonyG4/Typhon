@@ -1047,7 +1047,21 @@ impl Dispatch<xdg_toplevel::XdgToplevel, XdgToplevelData> for CompositorState {
                 );
             }
             xdg_toplevel::Request::SetMinimized => {
-                state.minimize_root_window(compositor_surface_id(&data.surface));
+                let surface_id = compositor_surface_id(&data.surface);
+                // Fullscreen Windows games (Wine/Proton) minimize themselves
+                // whenever they lose focus, so a workspace switch made them
+                // vanish. Only the focused window may minimize itself.
+                let window_id = state
+                    .toplevel_surfaces
+                    .get(&surface_id)
+                    .map(|toplevel| toplevel.window_id);
+                if window_id.is_some() && window_id != state.focused_window_id {
+                    focus_debug_log(|| {
+                        format!("minimize_ignored surface={surface_id} reason=unfocused_self_minimize")
+                    });
+                    return;
+                }
+                state.minimize_root_window(surface_id);
             }
             xdg_toplevel::Request::SetMinSize { width, height } => {
                 let surface_id = compositor_surface_id(&data.surface);
