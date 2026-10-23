@@ -229,3 +229,21 @@ likely GPU clock (DVFS), not extra work. Remaining cost: every frame still
 re-runs the Kawase blur and composite of every window even when its backdrop
 is unchanged; caching blurred outputs per instance is the next cut.
 Analysis tool: `~/Bench/typhon-trace/tools/rtail_an.py RUN LABEL`.
+
+### Estimator check after the fixes
+
+`tools/risk_sim.py` replays render-risk selectors over the exact R samples of
+the day's traces (under% = frames whose R exceeded the predicted risk):
+
+| run | current (max of 120) under% | p95 only | p95 + max(last 8) | p95 + max(last 24) |
+|---|---|---|---|---|
+| 155242 | 1.24 | 6.71 | 3.74 | 3.00 |
+| 162404 | 1.36 | 6.72 | 3.92 | 3.25 |
+| 172848 | 1.71 | 7.20 | 4.23 | 3.55 |
+| 181021 | 1.11 | 6.68 | 3.17 | 2.49 |
+
+Every faster-decaying selector under-predicts 2–6× more often. Credit 2 is
+also mostly earned: R alone exceeds 0.6 refresh (the double-buffered budget
+after wake and KMS guards) in 14–64% of frames. At 165 Hz the way back to
+credit 1 is a smaller R (blur is ~2/3 of it), not a looser estimator. The
+estimator stays as is.
