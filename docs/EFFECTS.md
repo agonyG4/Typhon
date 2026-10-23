@@ -123,8 +123,10 @@ window blurs share one precomputed backdrop. The default is `on`; `off`
 retains the exact per-instance backdrop graph for every window.
 
 With `on`, Typhon may precompute one shared backdrop blur for compatible
-compositor-synthesized window blur when at least two eligible consumers are
-present. Client-requested `ext-background-effect-v1` blur remains exact.
+compositor-synthesized window blur when at least one eligible consumer is
+present. The blurred backdrop is cached across frames while the scene below the
+earliest shared blur is unchanged, so a window moving over a static wallpaper
+reuses it instead of recapturing a window-local domain on every move. Client-requested `ext-background-effect-v1` blur remains exact.
 Layer-rule blur and custom or trusted effects also remain exact.
 
 The shared source is the scene prefix immediately before the earliest eligible

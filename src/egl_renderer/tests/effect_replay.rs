@@ -2970,7 +2970,16 @@ fn precomputed_policy_off_and_assignment_provenance_remain_exact() {
     )
     .expect("client exact variants compile");
     assert_eq!(client_variants.eligible_instances, 1);
-    assert!(client_variants.precomputed_backdrop.is_none());
+    let shared = client_variants
+        .precomputed_backdrop
+        .expect("one eligible window still shares the backdrop");
+    assert!(
+        shared
+            .consumers
+            .iter()
+            .all(|consumer| consumer.instance != client_scene.instances[1].id),
+        "exact client blur never consumes the shared backdrop"
+    );
 }
 
 #[test]

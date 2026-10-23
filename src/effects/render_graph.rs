@@ -2477,7 +2477,10 @@ fn compile_frame_execution_variants_unpruned(
         .collect::<Vec<_>>();
     eligible.sort_by_key(|(instance, _)| (instance.scene_order, instance.id));
     let eligible_instances = eligible.len();
-    if !options.precomputed_window_blur || eligible_instances < 2 {
+    // One consumer is enough: the shared backdrop is cached across frames, so
+    // a window moving over an unchanged wallpaper reuses it, while a
+    // window-local capture changes domain and refreshes on every move.
+    if !options.precomputed_window_blur || eligible_instances == 0 {
         return Ok(CompiledFrameExecutionVariants {
             exact,
             precomputed_graph: None,
@@ -4024,7 +4027,7 @@ mod tests {
     }
 
     #[test]
-    fn one_candidate_or_client_exact_blur_does_not_create_shared_plan() {
+    fn one_candidate_creates_shared_plan_but_exact_blur_does_not() {
         let bounds = EffectRect::new(0, 0, 800, 600).unwrap();
         let (one, registry) = synthesized_builtin_blur_scene(1);
         let one = compile_frame_execution_variants(
@@ -4036,9 +4039,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(one.eligible_instances, 1);
-        assert!(one.precomputed_backdrop.is_none());
+        assert!(one.precomputed_backdrop.is_some());
 
-        let (mut client, registry) = synthesized_builtin_blur_scene(2);
+        let (mut client, registry) = synthesized_builtin_blur_scene(1);
         client.instances[0].backdrop_reuse = crate::compositor::EffectBackdropReuse::Exact;
         let client = compile_frame_execution_variants(
             &client,
@@ -4048,7 +4051,7 @@ mod tests {
             true,
         )
         .unwrap();
-        assert_eq!(client.eligible_instances, 1);
+        assert_eq!(client.eligible_instances, 0);
         assert!(client.precomputed_backdrop.is_none());
     }
 
