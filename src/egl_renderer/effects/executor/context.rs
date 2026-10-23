@@ -382,15 +382,18 @@ impl<'a> EffectExecutionContext<'a> {
             target_width: output_size.0,
             target_height: output_size.1,
         };
-        let (prefix_end, _) = composition_range_with_metadata(
-            &self.scene.commands,
+        let indices = super::super::capture::indices_for_capture(
             &self.scene.capture_layers,
             &self.scene.capture_visual_groups,
             anchor,
+            false,
             visual_group,
             anchor_scope,
         );
         let full_output = [OutputRect::new(0, 0, output_size.0, output_size.1)];
+        let output_domain = EffectRect::new(0, 0, output_size.0, output_size.1)
+            .ok_or_else(|| io::Error::other("invalid precomputed backdrop output size"))?;
+        let framebuffer_origin = self.output_target_space.framebuffer_origin();
         let timing_scope = self.begin_precomputed_build_scope();
         let capture_span = timing_scope.and_then(|scope| {
             self.begin_precomputed_build_stage(
@@ -410,31 +413,73 @@ impl<'a> EffectExecutionContext<'a> {
             self.runtime.canonical_blur_semantics_policy,
             true,
         );
+        // Scene vertices are built for the output framebuffer's origin, so a
+        // plain scene replay stores the backdrop in scanout orientation (upside
+        // down on native top-left scanout). The capture program reprojects
+        // into the bottom-left graph texture, exactly like exact Replay
+        // captures.
         let capture_result: RendererResult<()> = (|| {
-            let framebuffer = self
-                .runtime
+            self.runtime
                 .effect_resources
                 .bind_draw_target(self.gl, capture_texture)?;
-            self.establish_scene_state_for_framebuffer(Some(framebuffer));
             unsafe {
+                self.gl
+                    .viewport(0, 0, output_size.0 as i32, output_size.1 as i32);
                 self.gl.disable(glow::SCISSOR_TEST);
                 self.gl.disable(glow::BLEND);
                 self.gl.clear_color(0.0, 0.0, 0.0, 1.0);
                 self.gl.clear(glow::COLOR_BUFFER_BIT);
             }
-            // The capture is a graph texture with bottom-left storage. Only a
-            // draw straight into a top-left scanout framebuffer flips, so
-            // replaying with the output's origin stored the backdrop upside
-            // down on native scanout.
-            self.draw_effect_scene_range(
+            establish_effect_pass_blend_state(self.gl, capture_blend_mode());
+            unsafe {
+                self.gl.use_program(Some(self.runtime.capture_program));
+                if let Some(location) = self.capture_uniform_location("u_capture_output_size") {
+                    let size = self.output_target_space.output_size();
+                    self.gl.uniform_2_f32(
+                        Some(&location),
+                        size.0.max(1) as f32,
+                        size.1.max(1) as f32,
+                    );
+                }
+                if let Some(location) = self.capture_uniform_location("u_capture_domain") {
+                    self.gl.uniform_4_f32(
+                        Some(&location),
+                        0.0,
+                        0.0,
+                        output_size.0.max(1) as f32,
+                        output_size.1.max(1) as f32,
+                    );
+                }
+                if let Some(location) =
+                    self.capture_uniform_location("u_capture_origin_bottom_left")
+                {
+                    self.gl.uniform_1_i32(
+                        Some(&location),
+                        i32::from(matches!(
+                            framebuffer_origin,
+                            OutputFramebufferOrigin::BottomLeft
+                        )),
+                    );
+                }
+            }
+            self.scene.capture_unattenuated_visual_group = visual_group;
+            self.scene.capture_unclipped_presentation_owner =
+                self.presentation_owner_for_visual_group(visual_group);
+            let draw_result = self.draw_capture_commands_for_regions(
+                &indices,
                 &full_output,
-                0,
-                prefix_end,
-                OutputFramebufferOrigin::BottomLeft,
-                EffectFramebufferTarget::new(Some(framebuffer)),
-            )
+                output_domain,
+                output_size,
+                framebuffer_origin,
+                false,
+            );
+            self.scene.capture_unattenuated_visual_group = None;
+            self.scene.capture_unclipped_presentation_owner = None;
+            draw_result.map(|_| ())
         })();
         self.runtime.effect_resources.unbind_render_target(self.gl);
+        restore_output_viewport(self.gl, self.scene.current_size);
+        establish_effect_pass_blend_state(self.gl, EffectPassBlendMode::Replace);
         self.establish_scene_state_for_framebuffer(self.scene.active_output_framebuffer);
         self.end_precomputed_build_stage(capture_span);
         match capture_result {
