@@ -134,6 +134,23 @@ pub(crate) enum PresentationTransactionEvent {
         transaction_id: OutputTransactionId,
         timestamp_ns: u64,
     },
+    /// One composited primary's scheduling evidence, recorded at its pageflip.
+    /// `timestamp_ns` is the presentation time.
+    FrameTiming {
+        transaction_id: OutputTransactionId,
+        timestamp_ns: u64,
+        frame_id: u64,
+        composite_started_ns: u64,
+        fence_signal_ns: Option<u64>,
+        fence_exact: bool,
+        worker_queued_ns: Option<u64>,
+        target_sequence: u64,
+        actual_sequence: u64,
+        target_presentation_ns: u64,
+        render_start_deadline_ns: u64,
+        future_primary_credit: u8,
+        selected_total_ns: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -173,6 +190,7 @@ impl PresentationTransactionEvent {
             Self::Rejected { .. } => "rejected",
             Self::FeedbackCompleted { .. } => "feedback_completed",
             Self::BufferReleased { .. } => "buffer_released",
+            Self::FrameTiming { .. } => "frame_timing",
         }
     }
 
@@ -199,7 +217,8 @@ impl PresentationTransactionEvent {
             | Self::SameBufferSuppressed { transaction_id, .. }
             | Self::Rejected { transaction_id, .. }
             | Self::FeedbackCompleted { transaction_id, .. }
-            | Self::BufferReleased { transaction_id, .. } => transaction_id,
+            | Self::BufferReleased { transaction_id, .. }
+            | Self::FrameTiming { transaction_id, .. } => transaction_id,
         }
     }
 
@@ -226,7 +245,8 @@ impl PresentationTransactionEvent {
             | Self::SameBufferSuppressed { timestamp_ns, .. }
             | Self::Rejected { timestamp_ns, .. }
             | Self::FeedbackCompleted { timestamp_ns, .. }
-            | Self::BufferReleased { timestamp_ns, .. } => timestamp_ns,
+            | Self::BufferReleased { timestamp_ns, .. }
+            | Self::FrameTiming { timestamp_ns, .. } => timestamp_ns,
         }
     }
 }
@@ -684,6 +704,44 @@ fn append_event_jsonl(output: &mut String, record: PresentationTransactionTraceR
                 timestamp_ns,
             );
         }
+        PresentationTransactionEvent::FrameTiming {
+            transaction_id,
+            timestamp_ns,
+            frame_id,
+            composite_started_ns,
+            fence_signal_ns,
+            fence_exact,
+            worker_queued_ns,
+            target_sequence,
+            actual_sequence,
+            target_presentation_ns,
+            render_start_deadline_ns,
+            future_primary_credit,
+            selected_total_ns,
+        } => {
+            let optional = |value: Option<u64>| value.map_or("null".to_owned(), |v| v.to_string());
+            let _ = writeln!(
+                output,
+                "{{\"schema_version\":1,\"record\":\"event\",\"source\":\"native_reactor\",\"process_id\":{},\"source_id\":{},\"sequence\":{},\"event\":\"{}\",\"transaction_id\":{},\"timestamp_clock\":\"CLOCK_MONOTONIC\",\"timestamp_ns\":{},\"frame_id\":{},\"composite_started_ns\":{},\"fence_signal_ns\":{},\"fence_exact\":{},\"worker_queued_ns\":{},\"target_sequence\":{},\"actual_sequence\":{},\"target_presentation_ns\":{},\"render_start_deadline_ns\":{},\"future_primary_credit\":{},\"selected_total_ns\":{}}}",
+                record.process_id,
+                record.source_id,
+                record.sequence,
+                event.name(),
+                transaction_id.get(),
+                timestamp_ns,
+                frame_id,
+                composite_started_ns,
+                optional(fence_signal_ns),
+                fence_exact,
+                optional(worker_queued_ns),
+                target_sequence,
+                actual_sequence,
+                target_presentation_ns,
+                render_start_deadline_ns,
+                future_primary_credit,
+                selected_total_ns,
+            );
+        }
         _ => {
             let _ = writeln!(
                 output,
@@ -854,6 +912,44 @@ mod tests {
         assert!(serialized.contains("\"timestamp_ns\":2"));
         assert!(serialized.contains("\"timestamp_clock\":\"CLOCK_MONOTONIC\""));
         assert!(!serialized.contains("\"timestamp_ns\":1"));
+    }
+
+    #[test]
+    fn frame_timing_exports_scheduling_fields() {
+        let mut ring = PresentationTransactionTraceRing::new(4);
+        let cursor = ring.export_cursor();
+        ring.push(PresentationTransactionEvent::FrameTiming {
+            transaction_id: OutputTransactionId::new(NonZeroU64::new(7).unwrap()),
+            timestamp_ns: 9_000,
+            frame_id: 3,
+            composite_started_ns: 1_000,
+            fence_signal_ns: Some(4_000),
+            fence_exact: true,
+            worker_queued_ns: None,
+            target_sequence: 11,
+            actual_sequence: 12,
+            target_presentation_ns: 8_000,
+            render_start_deadline_ns: 900,
+            future_primary_credit: 2,
+            selected_total_ns: 7_100,
+        });
+        let TraceExport::Append(delta) = ring.export_delta(cursor) else {
+            panic!("expected append-only export");
+        };
+        let mut serialized = String::new();
+        append_trace_record_jsonl(&mut serialized, delta[0]);
+        let value: serde_json::Value = serde_json::from_str(serialized.trim()).unwrap();
+        assert_eq!(value["event"], "frame_timing");
+        assert_eq!(value["transaction_id"], 7);
+        assert_eq!(value["timestamp_ns"], 9_000);
+        assert_eq!(value["fence_signal_ns"], 4_000);
+        assert_eq!(value["fence_exact"], true);
+        assert!(value["worker_queued_ns"].is_null());
+        assert_eq!(value["target_sequence"], 11);
+        assert_eq!(value["actual_sequence"], 12);
+        assert_eq!(value["render_start_deadline_ns"], 900);
+        assert_eq!(value["future_primary_credit"], 2);
+        assert_eq!(value["selected_total_ns"], 7_100);
     }
 
     #[test]

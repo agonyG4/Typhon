@@ -3609,6 +3609,25 @@ impl NativeRuntime {
                             frame.deferred_o1_binding_timing,
                         );
                     let post_record_prediction = render_journal.prediction(target.refresh_interval);
+                    self.presentation_trace
+                        .push(PresentationTransactionEvent::FrameTiming {
+                            transaction_id: frame.transaction_id,
+                            timestamp_ns: presented_at_ns,
+                            frame_id: frame.frame_id,
+                            composite_started_ns: frame.composite_started_at.get(),
+                            fence_signal_ns: frame.fence_signal.map(|(at, _)| at.get()),
+                            fence_exact: matches!(
+                                frame.fence_signal,
+                                Some((_, FenceTimestampQuality::ExactSyncFile))
+                            ),
+                            worker_queued_ns: frame.worker_queued_at.map(|at| at.get()),
+                            target_sequence: target.sequence,
+                            actual_sequence: actual_logical_sequence,
+                            target_presentation_ns: target.presentation_time.get(),
+                            render_start_deadline_ns: target.render_start_deadline.get(),
+                            future_primary_credit: adaptive_buffering.future_primary_credit(),
+                            selected_total_ns: post_record_prediction.total_cost_ns,
+                        });
                     let recovery_remaining_before =
                         post_record_prediction.miss_recovery_remaining;
                     if let Some((raw_render_ready_ns, raw_queue_ready_ns)) = exact_branch_sample {
