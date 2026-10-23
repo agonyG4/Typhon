@@ -49,8 +49,10 @@ use super::render_worker::{
     AtomicRenderWorkerEvent, AtomicRenderWorkerFailureReason, AtomicRenderWorkerHandle,
     AtomicRenderWorkerIdentity, AtomicRenderWorkerInitialFrame, AtomicRenderWorkerJob,
     AtomicRenderWorkerPolicy, AtomicRenderWorkerReleaseFence, AtomicRenderWorkerStartup,
-    RenderWorkerJobId, SequencedRenderControl, apply_render_control, validate_render_control_batch,
+    RenderWorkerJobId, SequencedRenderControl, apply_render_control,
 };
+#[cfg(test)]
+use super::render_worker::validate_render_control_batch;
 use super::*;
 use crate::native_output::presentation::async_validation::CompositedPresentationValidationKey;
 use crate::native_output::presentation::kms_timing::{KmsPresentationTiming, KmsSubmitWindow};
