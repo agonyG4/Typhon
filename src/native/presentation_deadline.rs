@@ -281,11 +281,14 @@ impl PresentationDeadlinePlanner {
             .map(|previous| {
                 let elapsed = presented_at.get().saturating_sub(previous.get());
                 let refresh_ns = duration_ns(self.refresh_interval).max(1);
+                // A completion stamped with the vblank already recorded stays on
+                // that sequence. NVIDIA completes cursor-only commits right away
+                // with the current vblank's timestamp; counting them as a new
+                // refresh made the next primary look one vblank late.
                 let intervals = elapsed
                     .saturating_add(refresh_ns / 2)
                     .checked_div(refresh_ns)
-                    .unwrap_or(1)
-                    .max(1);
+                    .unwrap_or(1);
                 self.last_presented_sequence.saturating_add(intervals)
             })
             .unwrap_or_else(|| self.last_presented_sequence.saturating_add(1));
@@ -1166,6 +1169,25 @@ mod tests {
         assert_eq!(
             planner.note_presented(MonotonicTimestampNs::new(36_363_636)),
             6
+        );
+    }
+
+    #[test]
+    fn completion_stamped_with_the_recorded_vblank_does_not_add_a_refresh() {
+        let mut planner = PresentationDeadlinePlanner::new(Duration::from_nanos(6_060_606));
+        assert_eq!(
+            planner.note_presented(MonotonicTimestampNs::new(6_060_606)),
+            1
+        );
+        // A cursor-only completion carrying the same vblank timestamp.
+        assert_eq!(
+            planner.note_presented(MonotonicTimestampNs::new(6_060_606)),
+            1
+        );
+        // The next primary one refresh later is sequence 2, not 3.
+        assert_eq!(
+            planner.note_presented(MonotonicTimestampNs::new(12_121_212)),
+            2
         );
     }
 
