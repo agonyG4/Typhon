@@ -745,6 +745,22 @@ impl FramePipeline<'_> {
                 };
             }
         };
+        drop(context);
+        let dump_directory = shared_backdrop_dump_directory();
+        if let Some(directory) = dump_directory.as_ref() {
+            dump_effect_texture(
+                self.gl,
+                &mut self.effects.effect_resources,
+                &capture,
+                false,
+                &directory.join("shared-capture.ppm"),
+            );
+            self.scene.establish_scene_state_for_framebuffer(
+                self.gl,
+                self.scene.active_output_framebuffer,
+            );
+        }
+        let mut context = self.effect_execution_context();
         let build_result = super::super::effects::execute_precomputed_backdrop_build(
             &mut context,
             &build,
@@ -752,6 +768,22 @@ impl FramePipeline<'_> {
             timing_scope,
             framebuffer_origin,
         );
+        drop(context);
+        if let (Some(directory), Ok((_, texture))) =
+            (dump_directory.as_ref(), build_result.as_ref())
+        {
+            dump_effect_texture(
+                self.gl,
+                &mut self.effects.effect_resources,
+                texture,
+                true,
+                &directory.join("shared-blurred.ppm"),
+            );
+            self.scene.establish_scene_state_for_framebuffer(
+                self.gl,
+                self.scene.active_output_framebuffer,
+            );
+        }
         match build_result {
             Ok((stats, texture)) => Ok(PrecomputedBackdropPreparation {
                 texture,
@@ -1330,5 +1362,82 @@ pub(in crate::egl_renderer) fn legacy_scene_scissored_phase_plan(
     LegacySceneScissoredPhasePlan {
         repair_count,
         index: 0,
+    }
+}
+
+/// `TYPHON_EFFECT_DUMP_SHARED_BACKDROP=<dir>` writes the first shared
+/// backdrop capture and its blurred result as PPM images (diagnostic).
+fn shared_backdrop_dump_directory() -> Option<std::path::PathBuf> {
+    static DUMPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let directory = std::env::var_os("TYPHON_EFFECT_DUMP_SHARED_BACKDROP")?;
+    (!DUMPED.swap(true, std::sync::atomic::Ordering::Relaxed))
+        .then(|| std::path::PathBuf::from(directory))
+}
+
+fn dump_effect_texture(
+    gl: &glow::Context,
+    resources: &mut super::super::effects::EffectGlResourceCache,
+    texture: &PooledEffectTexture,
+    float: bool,
+    path: &std::path::Path,
+) {
+    use glow::HasContext;
+    let (width, height) = (texture.key.width as usize, texture.key.height as usize);
+    if resources.bind_draw_target(gl, texture).is_err() {
+        eprintln!(
+            "typhon effect: shared backdrop dump could not bind {}",
+            path.display()
+        );
+        return;
+    }
+    let mut rgb = Vec::with_capacity(width * height * 3);
+    unsafe {
+        gl.pixel_store_i32(glow::PACK_ALIGNMENT, 1);
+        if float {
+            let mut pixels = vec![0_f32; width * height * 4];
+            gl.read_pixels(
+                0,
+                0,
+                width as i32,
+                height as i32,
+                glow::RGBA,
+                glow::FLOAT,
+                glow::PixelPackData::Slice(Some(bytemuck::cast_slice_mut(&mut pixels))),
+            );
+            for row in (0..height).rev() {
+                for pixel in pixels[row * width * 4..(row + 1) * width * 4].chunks_exact(4) {
+                    for channel in &pixel[..3] {
+                        // Linear working space; encode roughly for viewing.
+                        rgb.push((channel.clamp(0.0, 1.0).powf(1.0 / 2.2) * 255.0) as u8);
+                    }
+                }
+            }
+        } else {
+            let mut pixels = vec![0_u8; width * height * 4];
+            gl.read_pixels(
+                0,
+                0,
+                width as i32,
+                height as i32,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelPackData::Slice(Some(&mut pixels)),
+            );
+            for row in (0..height).rev() {
+                for pixel in pixels[row * width * 4..(row + 1) * width * 4].chunks_exact(4) {
+                    rgb.extend_from_slice(&pixel[..3]);
+                }
+            }
+        }
+    }
+    resources.unbind_render_target(gl);
+    let mut file = format!("P6\n{width} {height}\n255\n").into_bytes();
+    file.extend_from_slice(&rgb);
+    match std::fs::write(path, file) {
+        Ok(()) => eprintln!(
+            "typhon effect: shared backdrop dumped to {}",
+            path.display()
+        ),
+        Err(error) => eprintln!("typhon effect: shared backdrop dump failed: {error}"),
     }
 }

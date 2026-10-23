@@ -5567,3 +5567,210 @@ fn canonical_noise_field_origin_is_invariant_with_capture_clipped_to_output() {
         "canonical terminal Noise field differs from the canonical staged field"
     );
 }
+
+#[test]
+fn shared_backdrop_capture_matches_the_output_scene_prefix() {
+    let mut harness = GlesEffectTestHarness::new(320, 240);
+    harness.install_texture_backed_output();
+    let a_group = oblivion_one::compositor::VisualGroupId::new(1).expect("A visual group");
+    let b_group = oblivion_one::compositor::VisualGroupId::new(2).expect("B visual group");
+    install_native_stacked_diagnostic_scene(
+        &mut harness,
+        NativeStackedBackdropSceneSpec {
+            background_surface: 7,
+            a_surface: 42,
+            b_surface: 43,
+            a_content_bounds: EffectRect::new(12, 12, 32, 24).expect("A bounds"),
+            b_content_bounds: EffectRect::new(232, 112, 32, 24).expect("B bounds"),
+            a_visual_group: a_group,
+            b_visual_group: b_group,
+        },
+    );
+    harness.renderer.establish_ordinary_scene_state();
+    let anchor = oblivion_one::compositor::EffectAnchor::BeforeSurface(42);
+    let scope = oblivion_one::compositor::EffectAnchorScope::VisualGroup;
+    let (prefix_end, _) = effects::composition_range_with_metadata(
+        &harness.renderer.scene_state.commands,
+        &harness.renderer.scene_state.capture_layers,
+        &harness.renderer.scene_state.capture_visual_groups,
+        anchor,
+        Some(a_group),
+        scope,
+    );
+    assert!(prefix_end > 0, "the background is below the shared blur");
+
+    unsafe {
+        harness.gl.bind_framebuffer(
+            glow::FRAMEBUFFER,
+            harness.renderer.scene_state.active_output_framebuffer,
+        );
+        harness.gl.disable(glow::SCISSOR_TEST);
+        harness.gl.clear_color(0.0, 0.0, 0.0, 1.0);
+        harness.gl.clear(glow::COLOR_BUFFER_BIT);
+    }
+    {
+        let output = harness.renderer.scene_state.active_output_framebuffer;
+        let mut context = harness.renderer.effect_execution_context();
+        context
+            .draw_effect_scene_range(
+                &[OutputRect::new(0, 0, 320, 240)],
+                0,
+                prefix_end,
+                OutputFramebufferOrigin::BottomLeft,
+                EffectFramebufferTarget::new(output),
+            )
+            .expect("scene prefix draws to the output");
+    }
+    let expected = read_diagnostic_pixels(&harness);
+
+    let capture = harness
+        .renderer
+        .effect_runtime
+        .effect_resources
+        .acquire(
+            &harness.gl,
+            EffectTextureKey::new(
+                320,
+                240,
+                EffectTextureFormat::Rgba8,
+                EffectTextureFilter::Linear,
+                oblivion_one::effects::EffectWorkingSpace::OutputEncodedSrgb,
+            ),
+        )
+        .expect("shared capture texture allocates");
+    {
+        let mut context = harness.renderer.effect_execution_context();
+        context
+            .replay_precomputed_backdrop_capture(&capture, anchor, Some(a_group), scope)
+            .expect("shared backdrop capture replays");
+    }
+    harness
+        .renderer
+        .effect_runtime
+        .effect_resources
+        .bind_draw_target(&harness.gl, &capture)
+        .expect("shared capture binds for readback");
+    let captured = read_diagnostic_pixels(&harness);
+    harness
+        .renderer
+        .effect_runtime
+        .effect_resources
+        .unbind_render_target(&harness.gl);
+
+    let differing = expected
+        .chunks_exact(4)
+        .zip(captured.chunks_exact(4))
+        .filter(|(left, right)| {
+            left.iter()
+                .zip(right.iter())
+                .any(|(a, b)| a.abs_diff(*b) > 2)
+        })
+        .count();
+    assert_eq!(
+        differing,
+        0,
+        "shared capture must equal the output prefix (first expected {:?}, captured {:?})",
+        &expected[..4],
+        &captured[..4]
+    );
+}
+
+#[test]
+fn shared_backdrop_capture_is_bottom_left_on_top_left_scanout() {
+    let mut harness = GlesEffectTestHarness::new(320, 240);
+    harness.install_texture_backed_output();
+    let a_group = oblivion_one::compositor::VisualGroupId::new(1).expect("A visual group");
+    let b_group = oblivion_one::compositor::VisualGroupId::new(2).expect("B visual group");
+    install_native_stacked_diagnostic_scene(
+        &mut harness,
+        NativeStackedBackdropSceneSpec {
+            background_surface: 7,
+            a_surface: 42,
+            b_surface: 43,
+            a_content_bounds: EffectRect::new(12, 12, 32, 24).expect("A bounds"),
+            b_content_bounds: EffectRect::new(232, 112, 32, 24).expect("B bounds"),
+            a_visual_group: a_group,
+            b_visual_group: b_group,
+        },
+    );
+    harness.renderer.establish_ordinary_scene_state();
+    let anchor = oblivion_one::compositor::EffectAnchor::BeforeSurface(42);
+    let scope = oblivion_one::compositor::EffectAnchorScope::VisualGroup;
+    let key = EffectTextureKey::new(
+        320,
+        240,
+        EffectTextureFormat::Rgba8,
+        EffectTextureFilter::Linear,
+        oblivion_one::effects::EffectWorkingSpace::OutputEncodedSrgb,
+    );
+    let capture_and_read = |harness: &mut GlesEffectTestHarness| {
+        let capture = harness
+            .renderer
+            .effect_runtime
+            .effect_resources
+            .acquire(&harness.gl, key)
+            .expect("capture allocates");
+        {
+            let mut context = harness.renderer.effect_execution_context();
+            context
+                .replay_precomputed_backdrop_capture(&capture, anchor, Some(a_group), scope)
+                .expect("shared backdrop capture replays");
+        }
+        harness
+            .renderer
+            .effect_runtime
+            .effect_resources
+            .bind_draw_target(&harness.gl, &capture)
+            .expect("capture binds");
+        let pixels = read_diagnostic_pixels(harness);
+        harness
+            .renderer
+            .effect_runtime
+            .effect_resources
+            .unbind_render_target(&harness.gl);
+        harness
+            .renderer
+            .effect_runtime
+            .effect_resources
+            .release(capture)
+            .expect("capture releases");
+        pixels
+    };
+    let bottom_left = capture_and_read(&mut harness);
+
+    // Same scene, built for a top-left scanout framebuffer.
+    let commands = harness.renderer.scene_state.commands.clone();
+    harness.renderer.scene_state.vertices.clear();
+    harness.renderer.scene_state.commands.clear();
+    for command in &commands {
+        let index = harness.renderer.scene_state.commands.len();
+        crate::egl_renderer::geometry::push_draw_command(
+            &mut harness.renderer.scene_state.vertices,
+            &mut harness.renderer.scene_state.commands,
+            command.layer,
+            command.bounds,
+            320,
+            240,
+            OutputFramebufferOrigin::TopLeftScanout,
+        );
+        harness.renderer.scene_state.commands[index].visual_group = command.visual_group;
+    }
+    harness.renderer.scene_state.scene_geometry_dirty = true;
+    harness.renderer.scene_state.current_framebuffer_origin =
+        OutputFramebufferOrigin::TopLeftScanout;
+    let top_left = capture_and_read(&mut harness);
+
+    let differing = bottom_left
+        .chunks_exact(4)
+        .zip(top_left.chunks_exact(4))
+        .filter(|(left, right)| {
+            left.iter()
+                .zip(right.iter())
+                .any(|(a, b)| a.abs_diff(*b) > 2)
+        })
+        .count();
+    assert_eq!(
+        differing, 0,
+        "a top-left scanout scene must store the same bottom-left capture"
+    );
+}
