@@ -7,11 +7,12 @@ use std::{
 use glow::HasContext;
 use oblivion_one::compositor::{EffectAnchorScope, VisualGroupId};
 use oblivion_one::effects::{
-    CompiledFrameGraph, EffectInstanceId, EffectWorkingSpace, GraphTextureId, GraphTexturePlan,
-    GraphTextureSource, RenderPassKind,
+    CompiledFrameGraph, DualKawaseBlurSpec, EffectInstanceId, EffectWorkingSpace, GraphTextureId,
+    GraphTexturePlan, GraphTextureSource, RenderPassKind,
 };
 
 use super::super::CheckpointCausalState;
+use super::super::checkpoint::EglCheckpointCommandCausalSnapshot;
 
 mod scratch_gl;
 mod scratch_pool;
@@ -433,6 +434,33 @@ struct CachedCheckpointCapture {
     last_populated_frame_serial: Option<u64>,
 }
 
+/// Identity of a shared window-blur backdrop. The blurred texture is reused only while the
+/// replayed scene prefix below the earliest shared blur is identical, compared through the
+/// causal snapshot of each command.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct PrecomputedBackdropCacheKey {
+    output_size: (u32, u32),
+    blur: DualKawaseBlurSpec,
+    working_space: EffectWorkingSpace,
+    prefix: Vec<EglCheckpointCommandCausalSnapshot>,
+}
+
+impl PrecomputedBackdropCacheKey {
+    pub(in crate::egl_renderer) fn new(
+        output_size: (u32, u32),
+        blur: DualKawaseBlurSpec,
+        working_space: EffectWorkingSpace,
+        prefix: Vec<EglCheckpointCommandCausalSnapshot>,
+    ) -> Self {
+        Self {
+            output_size,
+            blur,
+            working_space,
+            prefix,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct CheckpointCacheAdmissionStats {
     pub(crate) candidates_total: usize,
@@ -719,6 +747,7 @@ pub(crate) struct EffectGlResourceCache {
     checkpoint_compatibility: Option<CheckpointCacheCompatibility>,
     checkpoint_frame_serial: u64,
     checkpoint_causal_baseline: Option<CheckpointCacheCausalBaseline>,
+    precomputed_backdrop: Option<(PrecomputedBackdropCacheKey, PooledEffectTexture)>,
     scratch_residency_publisher:
         Option<std::sync::Arc<crate::gpu_residency::AtomicEffectScratchResidencySnapshot>>,
 }
@@ -745,6 +774,7 @@ impl EffectGlResourceCache {
             checkpoint_compatibility: None,
             checkpoint_frame_serial: 0,
             checkpoint_causal_baseline: None,
+            precomputed_backdrop: None,
             scratch_residency_publisher: None,
         })
     }
@@ -1258,6 +1288,7 @@ impl EffectGlResourceCache {
 
     pub(crate) fn invalidate_checkpoint_capture_contents(&mut self) {
         self.invalidate_checkpoint_causal_state();
+        self.clear_precomputed_backdrop();
         for cached in self.checkpoint_captures.values_mut() {
             cached.last_populated_frame_serial = None;
         }
@@ -1265,9 +1296,41 @@ impl EffectGlResourceCache {
 
     pub(crate) fn clear_checkpoint_capture_cache(&mut self) {
         self.invalidate_checkpoint_causal_state();
+        self.clear_precomputed_backdrop();
         let entries = std::mem::take(&mut self.checkpoint_captures);
         for cached in entries.into_values() {
             let _ = self.release(cached.texture);
+        }
+    }
+
+    /// Takes the cached shared backdrop out of the cache. The texture is returned only when its
+    /// key matches; a mismatched entry is released.
+    pub(crate) fn take_precomputed_backdrop(
+        &mut self,
+        key: &PrecomputedBackdropCacheKey,
+    ) -> Option<PooledEffectTexture> {
+        let (stored_key, texture) = self.precomputed_backdrop.take()?;
+        if stored_key == *key {
+            return Some(texture);
+        }
+        let _ = self.release(texture);
+        None
+    }
+
+    pub(crate) fn store_precomputed_backdrop(
+        &mut self,
+        key: PrecomputedBackdropCacheKey,
+        texture: PooledEffectTexture,
+    ) {
+        self.clear_precomputed_backdrop();
+        self.pool
+            .set_purpose(&texture, EffectTexturePurpose::Checkpoint);
+        self.precomputed_backdrop = Some((key, texture));
+    }
+
+    pub(crate) fn clear_precomputed_backdrop(&mut self) {
+        if let Some((_, texture)) = self.precomputed_backdrop.take() {
+            let _ = self.release(texture);
         }
     }
 
@@ -3037,6 +3100,73 @@ mod tests {
         assert_eq!(cache.pool.checked_out_bytes(), 8 * 8 * 4);
         cache.clear_checkpoint_capture_cache();
         assert!(!cache.pool.is_checked_out(texture_id));
+        assert_eq!(cache.pool.checked_out_bytes(), 0);
+    }
+
+    fn precomputed_key(output_size: (u32, u32)) -> PrecomputedBackdropCacheKey {
+        PrecomputedBackdropCacheKey::new(
+            output_size,
+            DualKawaseBlurSpec::new(4.0, 2, 1.0).unwrap(),
+            EffectWorkingSpace::LinearSrgb,
+            Vec::new(),
+        )
+    }
+
+    #[test]
+    fn precomputed_backdrop_cache_returns_only_matching_key() {
+        let mut cache = EffectGlResourceCache::with_budget(1024 * 1024).unwrap();
+        assert!(
+            cache
+                .take_precomputed_backdrop(&precomputed_key((8, 8)))
+                .is_none()
+        );
+
+        let texture = cache.pool.checkout(key(8, 8)).unwrap();
+        let texture_id = texture.id;
+        cache.store_precomputed_backdrop(precomputed_key((8, 8)), texture);
+        assert!(cache.pool.is_checked_out(texture_id));
+
+        let mismatched = precomputed_key((16, 8));
+        assert!(cache.take_precomputed_backdrop(&mismatched).is_none());
+        assert!(!cache.pool.is_checked_out(texture_id));
+        assert_eq!(cache.pool.checked_out_bytes(), 0);
+    }
+
+    #[test]
+    fn precomputed_backdrop_cache_hands_back_stored_texture_once() {
+        let mut cache = EffectGlResourceCache::with_budget(1024 * 1024).unwrap();
+        let texture = cache.pool.checkout(key(8, 8)).unwrap();
+        let texture_id = texture.id;
+        cache.store_precomputed_backdrop(precomputed_key((8, 8)), texture);
+
+        let hit = cache
+            .take_precomputed_backdrop(&precomputed_key((8, 8)))
+            .unwrap();
+        assert_eq!(hit.id, texture_id);
+        assert!(cache.pool.is_checked_out(texture_id));
+        assert!(
+            cache
+                .take_precomputed_backdrop(&precomputed_key((8, 8)))
+                .is_none()
+        );
+
+        cache.release(hit).unwrap();
+        assert!(!cache.pool.is_checked_out(texture_id));
+    }
+
+    #[test]
+    fn precomputed_backdrop_cache_is_dropped_by_invalidation_and_clear() {
+        let mut cache = EffectGlResourceCache::with_budget(1024 * 1024).unwrap();
+        let texture = cache.pool.checkout(key(8, 8)).unwrap();
+        let texture_id = texture.id;
+        cache.store_precomputed_backdrop(precomputed_key((8, 8)), texture);
+        cache.invalidate_checkpoint_capture_contents();
+        assert!(!cache.pool.is_checked_out(texture_id));
+        assert_eq!(cache.pool.checked_out_bytes(), 0);
+
+        let texture = cache.pool.checkout(key(8, 8)).unwrap();
+        cache.store_precomputed_backdrop(precomputed_key((8, 8)), texture);
+        cache.clear_checkpoint_capture_cache();
         assert_eq!(cache.pool.checked_out_bytes(), 0);
     }
 

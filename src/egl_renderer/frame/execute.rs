@@ -14,7 +14,7 @@ use super::super::{
     effects::{
         EffectDebugConfig, EffectExecutionSelection, EffectExecutionStats, EffectTextureFilter,
         EffectTextureFormat, EffectTextureKey, GraphTextureBinding, PooledEffectTexture,
-        SceneReplayWorkMode, composition_range_with_metadata,
+        PrecomputedBackdropCacheKey, SceneReplayWorkMode, composition_range_with_metadata,
     },
     scene_state::{SceneRenderState, SceneTextureSources},
 };
@@ -29,9 +29,17 @@ use super::{
 struct PrecomputedWindowBlurFrameTelemetry {
     consumers: usize,
     built: bool,
+    cache_hit: bool,
     fallback: bool,
     fallback_reason: &'static str,
     build_stats: Option<EffectExecutionStats>,
+}
+
+struct PrecomputedBackdropPreparation {
+    texture: PooledEffectTexture,
+    stats: EffectExecutionStats,
+    cache_key: Option<PrecomputedBackdropCacheKey>,
+    cache_hit: bool,
 }
 
 impl FramePipeline<'_> {
@@ -109,8 +117,14 @@ impl FramePipeline<'_> {
                         .prepare_precomputed_backdrop(precomputed, framebuffer_origin)
                         .map_err(|_| ());
                     dispatch_shared_preparation(preparation, |outcome| match outcome {
-                        SharedPreparationOutcome::Ready((shared_texture, build_stats)) => {
-                            precomputed_telemetry.built = true;
+                        SharedPreparationOutcome::Ready(PrecomputedBackdropPreparation {
+                            texture: shared_texture,
+                            stats: build_stats,
+                            cache_key,
+                            cache_hit,
+                        }) => {
+                            precomputed_telemetry.built = !cache_hit;
+                            precomputed_telemetry.cache_hit = cache_hit;
                             precomputed_telemetry.build_stats = Some(build_stats);
                             if self
                                 .effects
@@ -164,11 +178,22 @@ impl FramePipeline<'_> {
                                         demand,
                                         selection,
                                     );
-                                let release = self.effects.effect_resources.release(shared_texture);
-                                match (optimized, release) {
-                                    (Ok(stats), Ok(())) => Ok(stats),
-                                    (Err(error), _) => Err(error),
-                                    (Ok(_), Err(error)) => Err(error.into()),
+                                match (optimized, cache_key) {
+                                    (Ok(stats), Some(key)) => {
+                                        self.effects
+                                            .effect_resources
+                                            .store_precomputed_backdrop(key, shared_texture);
+                                        Ok(stats)
+                                    }
+                                    (optimized, _) => {
+                                        let release =
+                                            self.effects.effect_resources.release(shared_texture);
+                                        match (optimized, release) {
+                                            (Ok(stats), Ok(())) => Ok(stats),
+                                            (Err(error), _) => Err(error),
+                                            (Ok(_), Err(error)) => Err(error.into()),
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -643,8 +668,52 @@ impl FramePipeline<'_> {
         &mut self,
         plan: &CompiledPrecomputedBackdropPlan,
         framebuffer_origin: super::super::OutputFramebufferOrigin,
-    ) -> RendererResult<(PooledEffectTexture, EffectExecutionStats)> {
+    ) -> RendererResult<PrecomputedBackdropPreparation> {
         let size = self.scene.current_size;
+        let (prefix_end, _) = composition_range_with_metadata(
+            &self.scene.commands,
+            &self.scene.capture_layers,
+            &self.scene.capture_visual_groups,
+            plan.baseline_anchor,
+            plan.baseline_visual_group,
+            plan.baseline_anchor_scope,
+        );
+        // The shared backdrop is reusable only when every replayed command is comparable
+        // through the causal snapshot and the snapshot matches the current output.
+        let cache_key = self
+            .scene
+            .current_checkpoint_scene_causal_snapshot
+            .as_ref()
+            .and_then(|snapshot| {
+                (snapshot.output_size == size
+                    && prefix_end <= snapshot.commands.len()
+                    && snapshot.commands[..prefix_end]
+                        .iter()
+                        .all(|command| command.pixel_source.is_some()))
+                .then(|| {
+                    PrecomputedBackdropCacheKey::new(
+                        size,
+                        plan.blur,
+                        plan.working_space,
+                        snapshot.commands[..prefix_end].to_vec(),
+                    )
+                })
+            });
+        let cached = match &cache_key {
+            Some(key) => self.effects.effect_resources.take_precomputed_backdrop(key),
+            None => {
+                self.effects.effect_resources.clear_precomputed_backdrop();
+                None
+            }
+        };
+        if let Some(texture) = cached {
+            return Ok(PrecomputedBackdropPreparation {
+                texture,
+                stats: EffectExecutionStats::default(),
+                cache_key,
+                cache_hit: true,
+            });
+        }
         let output_bounds = oblivion_one::effects::EffectRect::new(0, 0, size.0, size.1)
             .ok_or_else(|| std::io::Error::other("invalid precomputed backdrop output size"))?;
         let build = compile_precomputed_backdrop_build(plan, output_bounds);
@@ -684,7 +753,12 @@ impl FramePipeline<'_> {
             framebuffer_origin,
         );
         match build_result {
-            Ok((stats, texture)) => Ok((texture, stats)),
+            Ok((stats, texture)) => Ok(PrecomputedBackdropPreparation {
+                texture,
+                stats,
+                cache_key,
+                cache_hit: false,
+            }),
             Err(error) => Err(error),
         }
     }
@@ -804,12 +878,13 @@ impl FramePipeline<'_> {
         };
         // Preformat so stderr receives one write instead of one per argument.
         let line = format!(
-            "typhon effect: event=precomputed_window_blur precomputed_window_blur_frame_id={} precomputed_window_blur_policy={} precomputed_window_blur_eligible_instances={} precomputed_window_blur_consumers={} precomputed_window_blur_built={} precomputed_window_blur_fallback={} precomputed_window_blur_fallback_reason={} precomputed_window_blur_baseline_instance={} precomputed_window_blur_build_passes={} precomputed_window_blur_saved_scene_captures={} precomputed_window_blur_saved_kawase_downsamples={} precomputed_window_blur_saved_kawase_upsamples={} precomputed_window_blur_capture_pixels={} precomputed_window_blur_downsample_pixels={} precomputed_window_blur_upsample_pixels={} precomputed_window_blur_saved_capture_pixels={} precomputed_window_blur_saved_downsample_pixels={} precomputed_window_blur_saved_upsample_pixels={}",
+            "typhon effect: event=precomputed_window_blur precomputed_window_blur_frame_id={} precomputed_window_blur_policy={} precomputed_window_blur_eligible_instances={} precomputed_window_blur_consumers={} precomputed_window_blur_built={} precomputed_window_blur_cache_hit={} precomputed_window_blur_fallback={} precomputed_window_blur_fallback_reason={} precomputed_window_blur_baseline_instance={} precomputed_window_blur_build_passes={} precomputed_window_blur_saved_scene_captures={} precomputed_window_blur_saved_kawase_downsamples={} precomputed_window_blur_saved_kawase_upsamples={} precomputed_window_blur_capture_pixels={} precomputed_window_blur_downsample_pixels={} precomputed_window_blur_upsample_pixels={} precomputed_window_blur_saved_capture_pixels={} precomputed_window_blur_saved_downsample_pixels={} precomputed_window_blur_saved_upsample_pixels={}",
             frame_id,
             policy,
             eligible,
             state.consumers,
             state.built,
+            state.cache_hit,
             state.fallback,
             state.fallback_reason,
             baseline,

@@ -87,7 +87,7 @@ pub(crate) use metrics::{EffectFailureReason, EffectGraphMetrics, graph_metrics}
 pub(crate) use resources::checkpoint_capture_cache_key;
 pub(crate) use resources::{
     EffectGlResourceCache, EffectTextureFilter, EffectTextureFormat, EffectTextureKey,
-    GraphTextureBinding, PooledEffectTexture,
+    GraphTextureBinding, PooledEffectTexture, PrecomputedBackdropCacheKey,
 };
 pub(super) use runtime::{EffectRuntime, EffectRuntimeCaptureSnapshot};
 #[cfg(test)]
