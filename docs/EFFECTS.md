@@ -102,7 +102,7 @@ when the variable is unset.
 | `TYPHON_EFFECT_TERMINAL_BLUR_FUSION` | `on`, `off` | `on` | Fuses the terminal Kawase passes. Unrecognized values fall back to `off`. Disabled while `TYPHON_EFFECT_DEBUG_KAWASE_MODE=full`. |
 | `TYPHON_EFFECT_CHECKPOINT_DEPENDENCY_PRUNING` | `on`, `off` | `off` | Newer path, off by default. Unrecognized values fall back to `off`. |
 | `TYPHON_EFFECT_DEMAND_PLANNER` | `legacy`, `regional` | `legacy` | Unrecognized values fall back to `legacy`. |
-| `TYPHON_EFFECT_PRECOMPUTED_WINDOW_BLUR` | `off`, `on` | `off` | See [Experimental shared window blur](#experimental-shared-window-blur). |
+| `TYPHON_EFFECT_PRECOMPUTED_WINDOW_BLUR` | `off`, `on` | `on` | See [Shared window blur](#shared-window-blur). |
 | `TYPHON_EFFECT_RESOURCE_BUDGET_MIB`, `TYPHON_EFFECT_CHECKPOINT_CACHE_BUDGET_MIB` | positive integer MiB | built-in budgets | See [Resource limits and diagnostics](#resource-limits-and-diagnostics). |
 
 Diagnostic switches, all off unless set: `TYPHON_EFFECT_EXEC_TRACE=1`,
@@ -116,28 +116,24 @@ outside the effects engine: `TYPHON_PARTIAL_REPAINT_COMPLEXITY_POLICY` and
 `OBLIVION_ONE_DISABLE_BUFFER_AGE=1`, which disables buffer-age based partial
 repaint.
 
-## Experimental shared window blur
+## Shared window blur
 
-`TYPHON_EFFECT_PRECOMPUTED_WINDOW_BLUR=off|on` selects an opt-in diagnostic
-experiment. The default is `off`; that mode retains the exact per-instance
-backdrop graph and prefix-causal semantics.
+`TYPHON_EFFECT_PRECOMPUTED_WINDOW_BLUR=off|on` selects whether compatible
+window blurs share one precomputed backdrop. The default is `on`; `off`
+retains the exact per-instance backdrop graph for every window.
 
 With `on`, Typhon may precompute one shared backdrop blur for compatible
 compositor-synthesized window blur when at least two eligible consumers are
 present. Client-requested `ext-background-effect-v1` blur remains exact.
-Layer-rule blur and custom or trusted effects also remain exact in this
-milestone.
+Layer-rule blur and custom or trusted effects also remain exact.
 
 The shared source is the scene prefix immediately before the earliest eligible
-window blur. Later optimized synthesized windows intentionally reuse that same
-prefix, so they do not include intervening windows in their blur source. This
-mode is not semantically equivalent to exact backdrop blur and is not exposed
-as a client policy.
-
-The experiment tests whether reusing one blur pyramid explains part of the
-measured smoothness gap between Typhon and Hyprland. No performance claim is
-valid until native A/B qualification confirms both structural work reduction
-and GPU timing behavior.
+window blur. A window keeps the shared backdrop only when no other desktop
+window below it overlaps its blur region, so the prefix equals its exact
+backdrop there. A window stacked over another window falls back to exact blur
+and still blurs the windows (and blurs) beneath it. This mirrors Hyprland's
+`new_optimizations`, which reserves the precomputed blur for windows with only
+the wallpaper and bottom layers beneath them.
 
 When GPU timing is active, `event=effect_gpu_timing` reports
 `replay_capture_cache_hits`, `replay_capture_cache_full_refreshes`,
