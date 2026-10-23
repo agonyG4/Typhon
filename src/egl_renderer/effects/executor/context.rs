@@ -372,7 +372,6 @@ impl<'a> EffectExecutionContext<'a> {
         anchor: oblivion_one::compositor::EffectAnchor,
         visual_group: Option<VisualGroupId>,
         anchor_scope: oblivion_one::compositor::EffectAnchorScope,
-        framebuffer_origin: OutputFramebufferOrigin,
     ) -> RendererResult<Option<GraphTimingScope>> {
         let output_size = self.scene.current_size;
         let capture_pixels = u64::from(output_size.0).saturating_mul(u64::from(output_size.1));
@@ -423,11 +422,15 @@ impl<'a> EffectExecutionContext<'a> {
                 self.gl.clear_color(0.0, 0.0, 0.0, 1.0);
                 self.gl.clear(glow::COLOR_BUFFER_BIT);
             }
+            // The capture is a graph texture with bottom-left storage. Only a
+            // draw straight into a top-left scanout framebuffer flips, so
+            // replaying with the output's origin stored the backdrop upside
+            // down on native scanout.
             self.draw_effect_scene_range(
                 &full_output,
                 0,
                 prefix_end,
-                framebuffer_origin,
+                OutputFramebufferOrigin::BottomLeft,
                 EffectFramebufferTarget::new(Some(framebuffer)),
             )
         })();

@@ -665,7 +665,6 @@ impl FramePipeline<'_> {
             plan.baseline_anchor,
             plan.baseline_visual_group,
             plan.baseline_anchor_scope,
-            framebuffer_origin,
         ) {
             Ok(scope) => scope,
             Err(error) => {
