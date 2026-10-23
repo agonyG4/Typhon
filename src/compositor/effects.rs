@@ -446,6 +446,11 @@ impl super::CompositorState {
                 });
             }
         }
+        self.demote_precomputed_backdrops_under_lower_windows(
+            self.active_scene_surfaces(),
+            self.active_scene_surface_origins(),
+            &mut instances,
+        );
         for instance in &mut instances {
             instance.scene_order = self.scene_order_for_instance(instance);
         }
@@ -579,6 +584,11 @@ impl super::CompositorState {
                     )),
                 });
             }
+            self.demote_precomputed_backdrops_under_lower_windows(
+                surfaces,
+                &origins,
+                &mut instances,
+            );
         }
 
         for instance in &mut instances {
@@ -590,6 +600,51 @@ impl super::CompositorState {
         }
         instances.sort_by_key(effect_semantic_sort_key);
         ResolvedEffectScene::new(self.scene_render_generation, instances)
+    }
+
+    /// A precomputed window blur reads one shared backdrop: the scene prefix
+    /// below the earliest shared blur. A window stacked above another window
+    /// would therefore miss that lower window, so it falls back to exact blur
+    /// when a lower desktop window overlaps its blur region.
+    fn demote_precomputed_backdrops_under_lower_windows(
+        &self,
+        surfaces: &[super::RenderableSurface],
+        origins: &[(i32, i32)],
+        instances: &mut [ResolvedEffectInstance],
+    ) {
+        for instance in instances {
+            if instance.backdrop_reuse != super::EffectBackdropReuse::PrecomputedWindowCandidate {
+                continue;
+            }
+            let EffectAnchor::BeforeSurface(anchor_surface_id) = instance.anchor else {
+                continue;
+            };
+            let Some(anchor_index) = surfaces
+                .iter()
+                .position(|surface| surface.surface_id == anchor_surface_id)
+            else {
+                continue;
+            };
+            let own_root_surface_id = self.root_surface_id_for_surface(anchor_surface_id);
+            let target_bounds = instance.target_bounds;
+            let blocked = surfaces
+                .iter()
+                .zip(origins)
+                .take(anchor_index)
+                .any(|(lower, origin)| {
+                    let lower_surface_id = lower.surface_id;
+                    lower_surface_id != own_root_surface_id
+                        && self.root_surface_id_for_surface(lower_surface_id) == lower_surface_id
+                        && self
+                            .window_id_for_surface(lower_surface_id)
+                            .is_some_and(|window_id| self.desktop_windows.contains_key(&window_id))
+                        && EffectRect::new(origin.0, origin.1, lower.width, lower.height)
+                            .is_some_and(|rect| rect.intersect(target_bounds).is_some())
+                });
+            if blocked {
+                instance.backdrop_reuse = super::EffectBackdropReuse::Exact;
+            }
+        }
     }
 
     fn scene_order_for_frame_instance(
@@ -1691,6 +1746,109 @@ mod tests {
             buffer_transform: wl_output::Transform::Normal,
             damage: RenderableSurfaceDamage::Full,
         }
+    }
+
+    fn register_test_desktop_window(
+        state: &mut crate::compositor::CompositorState,
+        root_surface_id: u32,
+    ) {
+        let window_id = crate::core::WindowId::new(
+            std::num::NonZeroU64::new(u64::from(root_surface_id)).unwrap(),
+        );
+        state.desktop_windows.insert(
+            window_id,
+            crate::compositor::desktop_window::DesktopWindow::new_xdg(window_id, root_surface_id),
+        );
+        state
+            .window_by_root_surface
+            .insert(root_surface_id, window_id);
+    }
+
+    fn precomputed_window_blur_at(surface_id: u32, rect: EffectRect) -> ResolvedEffectInstance {
+        let mut instance = test_effect_instance(
+            EffectInstanceId::new(u64::from(surface_id)).unwrap(),
+            crate::effects::EffectFrameDemand::OnDamage,
+            EffectRegion::from_rect(rect),
+        );
+        instance.anchor = EffectAnchor::BeforeSurface(surface_id);
+        instance.anchor_scope = EffectAnchorScope::Surface;
+        instance.backdrop_reuse =
+            crate::compositor::EffectBackdropReuse::PrecomputedWindowCandidate;
+        instance
+    }
+
+    #[test]
+    fn precomputed_window_blur_stays_shared_without_overlapping_lower_window() {
+        let mut state = crate::compositor::CompositorState::new(None);
+        register_test_desktop_window(&mut state, 1);
+        register_test_desktop_window(&mut state, 2);
+        let surfaces = [test_effect_surface(1), test_effect_surface(2)];
+        let origins = [(0, 0), (200, 0)];
+        let mut instances = vec![
+            precomputed_window_blur_at(1, EffectRect::new(0, 0, 80, 40).unwrap()),
+            precomputed_window_blur_at(2, EffectRect::new(200, 0, 80, 40).unwrap()),
+        ];
+
+        state.demote_precomputed_backdrops_under_lower_windows(&surfaces, &origins, &mut instances);
+
+        assert!(
+            instances.iter().all(|instance| instance.backdrop_reuse
+                == crate::compositor::EffectBackdropReuse::PrecomputedWindowCandidate),
+            "non-overlapping windows keep the shared precomputed backdrop"
+        );
+    }
+
+    #[test]
+    fn precomputed_window_blur_falls_back_to_exact_over_overlapping_lower_window() {
+        let mut state = crate::compositor::CompositorState::new(None);
+        register_test_desktop_window(&mut state, 1);
+        register_test_desktop_window(&mut state, 2);
+        // Bottom-to-top: window 2 is below window 1 and overlaps its blur region.
+        let surfaces = [test_effect_surface(2), test_effect_surface(1)];
+        let origins = [(0, 0), (20, 10)];
+        let mut instances = vec![
+            precomputed_window_blur_at(2, EffectRect::new(0, 0, 80, 40).unwrap()),
+            precomputed_window_blur_at(1, EffectRect::new(20, 10, 80, 40).unwrap()),
+        ];
+
+        state.demote_precomputed_backdrops_under_lower_windows(&surfaces, &origins, &mut instances);
+
+        let upper = instances
+            .iter()
+            .find(|instance| instance.anchor == EffectAnchor::BeforeSurface(1))
+            .unwrap();
+        let lower = instances
+            .iter()
+            .find(|instance| instance.anchor == EffectAnchor::BeforeSurface(2))
+            .unwrap();
+        assert_eq!(
+            upper.backdrop_reuse,
+            crate::compositor::EffectBackdropReuse::Exact
+        );
+        assert_eq!(
+            lower.backdrop_reuse,
+            crate::compositor::EffectBackdropReuse::PrecomputedWindowCandidate
+        );
+    }
+
+    #[test]
+    fn precomputed_window_blur_ignores_lower_layer_surfaces() {
+        let mut state = crate::compositor::CompositorState::new(None);
+        register_test_desktop_window(&mut state, 1);
+        // Surface 5 is a layer-shell style surface: no desktop window owns it.
+        let surfaces = [test_effect_surface(5), test_effect_surface(1)];
+        let origins = [(0, 0), (0, 0)];
+        let mut instances = vec![precomputed_window_blur_at(
+            1,
+            EffectRect::new(0, 0, 80, 40).unwrap(),
+        )];
+
+        state.demote_precomputed_backdrops_under_lower_windows(&surfaces, &origins, &mut instances);
+
+        assert_eq!(
+            instances[0].backdrop_reuse,
+            crate::compositor::EffectBackdropReuse::PrecomputedWindowCandidate
+        );
     }
 
     #[test]
