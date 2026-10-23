@@ -102,7 +102,7 @@ when the variable is unset.
 | `TYPHON_EFFECT_TERMINAL_BLUR_FUSION` | `on`, `off` | `on` | Fuses the terminal Kawase passes. Unrecognized values fall back to `off`. Disabled while `TYPHON_EFFECT_DEBUG_KAWASE_MODE=full`. |
 | `TYPHON_EFFECT_CHECKPOINT_DEPENDENCY_PRUNING` | `on`, `off` | `off` | Newer path, off by default. Unrecognized values fall back to `off`. |
 | `TYPHON_EFFECT_DEMAND_PLANNER` | `legacy`, `regional` | `legacy` | Unrecognized values fall back to `legacy`. |
-| `TYPHON_EFFECT_PRECOMPUTED_WINDOW_BLUR` | `off`, `on` | `on` | See [Shared window blur](#shared-window-blur). |
+| `TYPHON_EFFECT_PRECOMPUTED_WINDOW_BLUR` | `off`, `on` | `off` | See [Shared window blur](#shared-window-blur). |
 | `TYPHON_EFFECT_RESOURCE_BUDGET_MIB`, `TYPHON_EFFECT_CHECKPOINT_CACHE_BUDGET_MIB` | positive integer MiB | built-in budgets | See [Resource limits and diagnostics](#resource-limits-and-diagnostics). |
 
 Diagnostic switches, all off unless set: `TYPHON_EFFECT_EXEC_TRACE=1`,
@@ -119,8 +119,9 @@ repaint.
 ## Shared window blur
 
 `TYPHON_EFFECT_PRECOMPUTED_WINDOW_BLUR=off|on` selects whether compatible
-window blurs share one precomputed backdrop. The default is `on`; `off`
-retains the exact per-instance backdrop graph for every window.
+window blurs share one precomputed backdrop. The default is `off` until the
+shared path is verified on native top-left scanout, where windows have shown
+the unblurred wallpaper; `off` retains the exact per-instance backdrop graph.
 
 With `on`, Typhon may precompute one shared backdrop blur for compatible
 compositor-synthesized window blur when at least one eligible consumer is

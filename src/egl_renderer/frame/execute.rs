@@ -734,6 +734,7 @@ impl FramePipeline<'_> {
             plan.baseline_anchor,
             plan.baseline_visual_group,
             plan.baseline_anchor_scope,
+            framebuffer_origin,
         ) {
             Ok(scope) => scope,
             Err(error) => {
@@ -1383,32 +1384,40 @@ fn dump_effect_texture(
 ) {
     use glow::HasContext;
     let (width, height) = (texture.key.width as usize, texture.key.height as usize);
-    if resources.bind_draw_target(gl, texture).is_err() {
+    let Ok(framebuffer) = resources.bind_draw_target(gl, texture) else {
         eprintln!(
             "typhon effect: shared backdrop dump could not bind {}",
             path.display()
         );
         return;
-    }
+    };
+    // bind_draw_target binds only the draw framebuffer; read_pixels reads the
+    // read framebuffer.
+    unsafe { gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(framebuffer)) };
     let mut rgb = Vec::with_capacity(width * height * 3);
     unsafe {
         gl.pixel_store_i32(glow::PACK_ALIGNMENT, 1);
         if float {
-            let mut pixels = vec![0_f32; width * height * 4];
+            let mut pixels = vec![0_u16; width * height * 4];
             gl.read_pixels(
                 0,
                 0,
                 width as i32,
                 height as i32,
                 glow::RGBA,
-                glow::FLOAT,
+                glow::HALF_FLOAT,
                 glow::PixelPackData::Slice(Some(bytemuck::cast_slice_mut(&mut pixels))),
             );
+            let error = gl.get_error();
+            if error != glow::NO_ERROR {
+                eprintln!("typhon effect: shared backdrop dump read error 0x{error:x}");
+            }
             for row in (0..height).rev() {
                 for pixel in pixels[row * width * 4..(row + 1) * width * 4].chunks_exact(4) {
                     for channel in &pixel[..3] {
                         // Linear working space; encode roughly for viewing.
-                        rgb.push((channel.clamp(0.0, 1.0).powf(1.0 / 2.2) * 255.0) as u8);
+                        let value = half_to_f32(*channel).clamp(0.0, 1.0).powf(1.0 / 2.2);
+                        rgb.push((value * 255.0) as u8);
                     }
                 }
             }
@@ -1439,5 +1448,16 @@ fn dump_effect_texture(
             path.display()
         ),
         Err(error) => eprintln!("typhon effect: shared backdrop dump failed: {error}"),
+    }
+}
+
+fn half_to_f32(bits: u16) -> f32 {
+    let sign = if bits & 0x8000 != 0 { -1.0 } else { 1.0 };
+    let exponent = i32::from((bits >> 10) & 0x1f);
+    let mantissa = f32::from(bits & 0x03ff);
+    match exponent {
+        0 => sign * mantissa * 2_f32.powi(-24),
+        31 => sign * f32::INFINITY,
+        _ => sign * (1.0 + mantissa / 1024.0) * 2_f32.powi(exponent - 15),
     }
 }

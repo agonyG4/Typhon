@@ -120,7 +120,7 @@ headless correctness; it makes no native performance claim or qualification.
 ## Precomputed synthesized-window blur experiment
 
 The diagnostic environment variable is
-`TYPHON_EFFECT_PRECOMPUTED_WINDOW_BLUR=off|on`; `on` is the default. Keep EGL
+`TYPHON_EFFECT_PRECOMPUTED_WINDOW_BLUR=off|on`; `off` is the default. Keep EGL
 context priority fixed at `medium` for both runs. Compare the same stacked
 15-Kitty workload with Effects timing settings, blur configuration, refresh and
 queue policies unchanged. Save exact and precomputed runs separately, and use

@@ -372,6 +372,7 @@ impl<'a> EffectExecutionContext<'a> {
         anchor: oblivion_one::compositor::EffectAnchor,
         visual_group: Option<VisualGroupId>,
         anchor_scope: oblivion_one::compositor::EffectAnchorScope,
+        framebuffer_origin: OutputFramebufferOrigin,
     ) -> RendererResult<Option<GraphTimingScope>> {
         let output_size = self.scene.current_size;
         let capture_pixels = u64::from(output_size.0).saturating_mul(u64::from(output_size.1));
@@ -393,7 +394,6 @@ impl<'a> EffectExecutionContext<'a> {
         let full_output = [OutputRect::new(0, 0, output_size.0, output_size.1)];
         let output_domain = EffectRect::new(0, 0, output_size.0, output_size.1)
             .ok_or_else(|| io::Error::other("invalid precomputed backdrop output size"))?;
-        let framebuffer_origin = self.output_target_space.framebuffer_origin();
         let timing_scope = self.begin_precomputed_build_scope();
         let capture_span = timing_scope.and_then(|scope| {
             self.begin_precomputed_build_stage(

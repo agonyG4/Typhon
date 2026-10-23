@@ -5639,9 +5639,10 @@ fn shared_backdrop_capture_matches_the_output_scene_prefix() {
         )
         .expect("shared capture texture allocates");
     {
+        let origin = harness.renderer.scene_state.current_framebuffer_origin;
         let mut context = harness.renderer.effect_execution_context();
         context
-            .replay_precomputed_backdrop_capture(&capture, anchor, Some(a_group), scope)
+            .replay_precomputed_backdrop_capture(&capture, anchor, Some(a_group), scope, origin)
             .expect("shared backdrop capture replays");
     }
     harness
@@ -5649,6 +5650,11 @@ fn shared_backdrop_capture_matches_the_output_scene_prefix() {
         .effect_runtime
         .effect_resources
         .bind_draw_target(&harness.gl, &capture)
+        .map(|framebuffer| unsafe {
+            harness
+                .gl
+                .bind_framebuffer(glow::READ_FRAMEBUFFER, Some(framebuffer));
+        })
         .expect("shared capture binds for readback");
     let captured = read_diagnostic_pixels(&harness);
     harness
@@ -5711,9 +5717,10 @@ fn shared_backdrop_capture_is_bottom_left_on_top_left_scanout() {
             .acquire(&harness.gl, key)
             .expect("capture allocates");
         {
+            let origin = harness.renderer.scene_state.current_framebuffer_origin;
             let mut context = harness.renderer.effect_execution_context();
             context
-                .replay_precomputed_backdrop_capture(&capture, anchor, Some(a_group), scope)
+                .replay_precomputed_backdrop_capture(&capture, anchor, Some(a_group), scope, origin)
                 .expect("shared backdrop capture replays");
         }
         harness
@@ -5721,6 +5728,11 @@ fn shared_backdrop_capture_is_bottom_left_on_top_left_scanout() {
             .effect_runtime
             .effect_resources
             .bind_draw_target(&harness.gl, &capture)
+            .map(|framebuffer| unsafe {
+                harness
+                    .gl
+                    .bind_framebuffer(glow::READ_FRAMEBUFFER, Some(framebuffer));
+            })
             .expect("capture binds");
         let pixels = read_diagnostic_pixels(harness);
         harness
