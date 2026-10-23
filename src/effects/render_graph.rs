@@ -3345,7 +3345,7 @@ fn compile_instance(
             | EffectNodeKind::CustomFragment(_)
             | EffectNodeKind::Blend(_)
             | EffectNodeKind::Mask(_) => {
-                let inputs = step
+                let mut inputs = step
                     .input_slots
                     .iter()
                     .copied()
@@ -3358,6 +3358,43 @@ fn compile_instance(
                         .ok_or(RenderGraphCompileError::InvalidGraph(
                             EffectValidationError::MissingInputNode(node.id),
                         ))?;
+                // Stage shaders sample their input over the output's domain, so
+                // the full-output shared backdrop is first cropped to the region
+                // this window repairs.
+                if uses_precomputed_backdrop {
+                    let crop_domain = capture_damage.bounding_rect().unwrap_or(output_bounds);
+                    let input_plan = builder.texture(primary_input);
+                    if input_plan.domain != crop_domain {
+                        let cropped = builder.add_texture_with_layout(
+                            GraphTextureSource::Intermediate,
+                            crop_domain,
+                            crop_domain.width,
+                            crop_domain.height,
+                            input_plan.working_space,
+                        )?;
+                        builder.add_pass(
+                            RenderPassKind::NormalizeInput,
+                            vec![primary_input],
+                            Some(cropped),
+                            output_damage.expand_clamped_xy(
+                                step.stage_footprint.sample_radius_x,
+                                step.stage_footprint.sample_radius_y,
+                                crop_domain,
+                            ),
+                            instance.id,
+                            instance.anchor,
+                            None,
+                            instance.anchor_scope,
+                        )?;
+                        builder
+                            .passes
+                            .last_mut()
+                            .expect("backdrop crop pass was appended")
+                            .visual_group = visual_group;
+                        inputs[0] = cropped;
+                    }
+                }
+                let primary_input = inputs[0];
                 let primary_plan = builder.texture(primary_input);
                 let multi_input = inputs.len() > 1;
                 let mut normalized_inputs = Vec::with_capacity(inputs.len());
@@ -4053,6 +4090,54 @@ mod tests {
         .unwrap();
         assert_eq!(client.eligible_instances, 0);
         assert!(client.precomputed_backdrop.is_none());
+    }
+
+    #[test]
+    fn shared_consumer_stages_read_the_window_crop_of_the_backdrop() {
+        let bounds = EffectRect::new(0, 0, 800, 600).unwrap();
+        let (mut scene, registry) = synthesized_builtin_blur_scene(1);
+        let window = EffectRect::new(120, 80, 300, 200).unwrap();
+        scene.instances[0].region = EffectRegion::from_rect(window);
+        scene.instances[0].target_bounds = window;
+        let variants = compile_frame_execution_variants(
+            &scene,
+            &full_test_damage(bounds),
+            bounds,
+            &registry,
+            true,
+        )
+        .unwrap();
+        let graph = variants
+            .precomputed_graph
+            .expect("one candidate selects the shared graph");
+        let texture = |id: GraphTextureId| {
+            graph
+                .textures
+                .iter()
+                .find(|texture| texture.id == id)
+                .expect("pass texture is planned")
+        };
+        let crop = graph
+            .passes
+            .iter()
+            .find(|pass| pass.kind == RenderPassKind::NormalizeInput)
+            .expect("the full-output backdrop is cropped before the material stage");
+        assert_eq!(
+            texture(crop.inputs[0]).source,
+            GraphTextureSource::PrecomputedBackdrop
+        );
+        let fragments = graph
+            .passes
+            .iter()
+            .filter(|pass| pass.kind == RenderPassKind::Fragment)
+            .collect::<Vec<_>>();
+        assert!(!fragments.is_empty());
+        for pass in fragments {
+            let output = texture(pass.output.expect("fragment pass has an output"));
+            let input = texture(pass.inputs[0]);
+            assert_eq!(input.domain, output.domain);
+            assert_ne!(input.source, GraphTextureSource::PrecomputedBackdrop);
+        }
     }
 
     #[test]
