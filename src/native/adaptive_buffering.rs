@@ -249,6 +249,35 @@ fn exact_parallel_branch_samples_ns(observation: &FrameTimingObservation) -> Opt
     ))
 }
 
+/// Wait between the compositor observing a rendered frame and its
+/// predecessor's pageflip authorizing it for the KMS lane. Zero unless the
+/// binding came from the predecessor pageflip and the timestamps are ordered.
+fn predecessor_lane_wait_ns(
+    observation: &FrameTimingObservation,
+    rendered_observed_at: Option<MonotonicTimestampNs>,
+    evidence: Option<DeferredO1BindingTimingEvidence>,
+) -> u64 {
+    let (Some(rendered_observed_at), Some(evidence), Some(worker_queued_at)) = (
+        rendered_observed_at,
+        evidence,
+        observation.worker_queued_at,
+    ) else {
+        return 0;
+    };
+    if evidence.origin != DeferredO1BindingOrigin::PredecessorPageflip {
+        return 0;
+    }
+    let rendered_ns = rendered_observed_at.get();
+    let authority_ns = evidence.authority_observed_at.get();
+    if rendered_ns < observation.composite_started_at.get()
+        || authority_ns < rendered_ns
+        || authority_ns > worker_queued_at.get()
+    {
+        return 0;
+    }
+    authority_ns - rendered_ns
+}
+
 pub fn render_sample_duration_ns(
     composite_started_at: MonotonicTimestampNs,
     fence_signaled_at: MonotonicTimestampNs,
@@ -805,9 +834,18 @@ impl AdaptiveRenderJournal {
     ) -> Option<(u64, u64)> {
         let exact_branch_samples = exact_parallel_branch_samples_ns(&observation);
         if let Some((render_ready_ns, queue_ready_ns)) = exact_branch_samples {
+            // Time a ready frame spent waiting for its predecessor's pageflip
+            // exists only because credit 2 queued it behind another primary.
+            // Counting it as service made Q predict overlap, which held
+            // credit 2, which produced the wait again.
+            let lane_wait_ns = predecessor_lane_wait_ns(
+                &observation,
+                rendered_observed_at,
+                deferred_o1_binding_timing,
+            );
             self.exact_parallel.record(
                 render_ready_ns,
-                queue_ready_ns,
+                queue_ready_ns.saturating_sub(lane_wait_ns),
                 observation.composite_started_at,
             );
             self.exact_parallel
@@ -3053,19 +3091,9 @@ mod exact_parallel_diagnostics_tests {
             prediction.exact_render_ready_risk_ns,
             control_prediction.exact_render_ready_risk_ns
         );
-        assert_eq!(
-            prediction.exact_queue_ready_risk_ns,
-            control_prediction.exact_queue_ready_risk_ns
-        );
-        assert_eq!(
-            prediction.parallel_service_ns,
-            control_prediction.parallel_service_ns
-        );
-        assert_eq!(
-            prediction.warm_parallel_total_cost_ns,
-            control_prediction.warm_parallel_total_cost_ns
-        );
-        assert_eq!(prediction.total_cost_ns, control_prediction.total_cost_ns);
+        // The 2 ms wait for the predecessor pageflip is not queue service.
+        assert_eq!(control_prediction.exact_queue_ready_risk_ns, 4_300_000);
+        assert_eq!(prediction.exact_queue_ready_risk_ns, 2_300_000);
         assert_eq!(prediction.estimator_mode, control_prediction.estimator_mode);
 
         let diagnostics = journal.exact_parallel_diagnostics(REFRESH_NS);
@@ -3117,7 +3145,7 @@ mod exact_parallel_diagnostics_tests {
     }
 
     #[test]
-    fn deferred_o1_evidence_does_not_change_warm_parallel_prediction() {
+    fn predecessor_pageflip_wait_is_excluded_from_queue_risk() {
         let mut journal = AdaptiveRenderJournal::default();
         let mut control = AdaptiveRenderJournal::default();
         for sample in 0..WARM_PARALLEL_MIN_SAMPLES {
@@ -3143,24 +3171,13 @@ mod exact_parallel_diagnostics_tests {
             prediction.estimator_mode,
             PredictionEstimatorMode::WarmParallel
         );
-        assert_eq!(prediction, control_prediction);
         assert_eq!(
             prediction.exact_render_ready_risk_ns,
             control_prediction.exact_render_ready_risk_ns
         );
-        assert_eq!(
-            prediction.exact_queue_ready_risk_ns,
-            control_prediction.exact_queue_ready_risk_ns
-        );
-        assert_eq!(
-            prediction.parallel_service_ns,
-            control_prediction.parallel_service_ns
-        );
-        assert_eq!(
-            prediction.warm_parallel_total_cost_ns,
-            control_prediction.warm_parallel_total_cost_ns
-        );
-        assert_eq!(prediction.total_cost_ns, control_prediction.total_cost_ns);
+        assert_eq!(control_prediction.exact_queue_ready_risk_ns, 4_000_000);
+        assert_eq!(prediction.exact_queue_ready_risk_ns, 3_000_000);
+        assert!(prediction.total_cost_ns < control_prediction.total_cost_ns);
 
         let diagnostics = journal.exact_parallel_diagnostics(REFRESH_NS);
         assert_eq!(
@@ -3170,6 +3187,30 @@ mod exact_parallel_diagnostics_tests {
         assert_eq!(
             journal.prediction(Duration::from_nanos(REFRESH_NS)),
             prediction
+        );
+    }
+
+    #[test]
+    fn render_completion_binding_keeps_the_full_queue_sample() {
+        let observation = observation(1_000_000, 4_000_000, 5_300_000);
+        let mut journal = AdaptiveRenderJournal::default();
+        rendered_deferred(
+            &mut journal,
+            observation,
+            3_000_000,
+            DeferredO1BindingOrigin::RenderCompletion,
+            3_000_000,
+            Some(5_100_000),
+        );
+        let mut control = AdaptiveRenderJournal::default();
+        control.record_frame_service_observation(observation);
+        assert_eq!(
+            journal
+                .prediction(Duration::from_millis(10))
+                .exact_queue_ready_risk_ns,
+            control
+                .prediction(Duration::from_millis(10))
+                .exact_queue_ready_risk_ns
         );
     }
 
