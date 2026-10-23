@@ -168,6 +168,56 @@ impl EglCheckpointSceneCausalSnapshot {
             })
             .count()
     }
+
+    /// Names the first field that ends the unchanged prefix at `index`, for
+    /// the causal trace.
+    pub(in crate::egl_renderer) fn command_difference(
+        &self,
+        current: &Self,
+        index: usize,
+    ) -> &'static str {
+        if self.output_size != current.output_size {
+            return "output_size";
+        }
+        let (Some(previous), Some(current)) =
+            (self.commands.get(index), current.commands.get(index))
+        else {
+            return "command_count";
+        };
+        if previous.pixel_source.is_none() || current.pixel_source.is_none() {
+            "no_pixel_source"
+        } else if previous.layer != current.layer {
+            "layer"
+        } else if previous.pixel_source != current.pixel_source {
+            "pixel_source"
+        } else if previous.bounds != current.bounds {
+            "bounds"
+        } else if previous.vertices != current.vertices
+            || previous.vertex_start != current.vertex_start
+            || previous.vertex_count != current.vertex_count
+        {
+            "vertices"
+        } else if previous.presentation_opacity_bits != current.presentation_opacity_bits {
+            "opacity"
+        } else if previous.presentation_clip != current.presentation_clip {
+            "clip"
+        } else if previous.opaque_regions != current.opaque_regions {
+            "opaque_regions"
+        } else if previous.visual_group != current.visual_group
+            || previous.presentation_owner_root != current.presentation_owner_root
+        {
+            "visual_group"
+        } else {
+            "sampling"
+        }
+    }
+
+    pub(in crate::egl_renderer) fn command_layer_debug(&self, index: usize) -> String {
+        self.commands.get(index).map_or_else(
+            || "none".to_owned(),
+            |command| format!("{:?}", command.layer),
+        )
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -1,5 +1,14 @@
 use super::*;
 
+/// `TYPHON_EFFECT_CAUSAL_TRACE=1` logs, every 30th frame, which scene command
+/// ends the unchanged prefix that proves capture sources unchanged.
+fn causal_trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("TYPHON_EFFECT_CAUSAL_TRACE").as_deref() == Some(std::ffi::OsStr::new("1"))
+    })
+}
+
 pub(super) fn checkpoint_causal_stability_plan_for_owners(
     scene: &SceneRenderState,
     runtime: &EffectRuntime,
@@ -14,6 +23,21 @@ pub(super) fn checkpoint_causal_stability_plan_for_owners(
     let common_prefix_end = cache_baseline
         .zip(current_scene)
         .map(|(baseline, current)| baseline.scene.unchanged_command_prefix_len(current));
+    if causal_trace_enabled()
+        && let (Some(baseline), Some(current), Some(prefix_end)) =
+            (cache_baseline, current_scene, common_prefix_end)
+        && prefix_end < current.commands.len()
+        && frame_serial % 30 == 0
+    {
+        eprintln!(
+            "typhon effect: event=causal_prefix_diff frame_serial={frame_serial} unchanged_prefix={prefix_end} previous_commands={} current_commands={} difference={} previous_layer={} current_layer={}",
+            baseline.scene.commands.len(),
+            current.commands.len(),
+            baseline.scene.command_difference(current, prefix_end),
+            baseline.scene.command_layer_debug(prefix_end),
+            current.command_layer_debug(prefix_end),
+        );
+    }
     let passes_by_id = graph
         .passes
         .iter()
