@@ -354,6 +354,41 @@ fn stale_presented_validation_base_is_returned_before_test_or_submit() {
 }
 
 #[test]
+fn reseeded_presented_base_admits_the_next_output_epoch() {
+    // A runtime modeset rebases the presented planes without restarting the
+    // worker; the worker must take the new epoch's base or every job of that
+    // epoch is invalidated and re-planned forever.
+    let executor = Arc::new(RecordingExecutor::accepting());
+    let handle = KmsCommitWorkerHandle::start(executor.clone()).unwrap();
+    let revision = |value| {
+        crate::native_output::presentation::plane::PlaneStateRevision::new(
+            std::num::NonZeroU64::new(value).unwrap(),
+        )
+    };
+    handle.set_established_presented_base(revision(2), 1, 7);
+    let mut snapshot =
+        crate::native_output::presentation::plane::PresentedPlaneSnapshot::legacy(None);
+    snapshot.revision = revision(3);
+    handle.set_established_presented_base(revision(3), 2, 7);
+    let mut job = test_cursor_job(3362);
+    job.output_epoch = crate::native_output::OutputEpochId::new(2).expect("nonzero epoch");
+    job.validation_base = KmsValidationBase::Presented {
+        output_id: oblivion_one::core::OutputId::from_raw(1).expect("nonzero output id"),
+        snapshot,
+        output_generation: 2,
+        crtc_id: 7,
+    };
+    reserve_for_test(&handle, job.kind).enqueue(job).unwrap();
+    wait_for_fence_event(
+        &handle,
+        3362,
+        |event| matches!(event, KmsWorkerEvent::Submitted { ownership } if ownership.job.token.get() == 3362),
+    );
+    handle.request_quiesce();
+    handle.join().unwrap();
+}
+
+#[test]
 fn rejected_predecessor_returns_dependent_cursor_before_test_or_submit() {
     let executor = Arc::new(RecordingExecutor {
         test_outcomes: Mutex::new(VecDeque::from([Err(

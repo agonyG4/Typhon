@@ -2822,6 +2822,17 @@ impl NativeRuntime {
         );
         self.presented_planes
             .rebase_after_synchronous_modeset(cursor_plane_state);
+        // The KMS worker outlives the modeset, so its established base still
+        // names the old epoch's presented revision. Every new-epoch job would
+        // be invalidated and re-planned against that stale base forever.
+        if let Some(worker) = self.kms_commit_worker.as_ref() {
+            worker.set_established_presented_base_for_output(
+                self.output_id,
+                self.presented_planes.revision,
+                output_epoch.get(),
+                target.crtc_id,
+            );
+        }
         self.confirmed_kms_presentation = ConfirmedKmsPresentationState::default();
         // Validation keys are tied to the output's KMS geometry and plane
         // state. Drop any qualification carried by the replacement scanout
