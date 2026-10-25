@@ -15,10 +15,10 @@ use oblivion_one::native::scheduler::NativeFrameScheduler;
 use oblivion_one::private_config::{PrivateConfigError, PrivateConfigFile};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
-// Production mode mutation stays disabled until the target-hardware matrix is
-// qualified. The explicit boot policy is the only development qualification
-// override and still passes through every runtime capability check.
-const OUTPUT_MODE_SELECTION_RUNTIME_QUALIFIED: bool = false;
+// Mode mutation is qualified on the target hardware (Atomic KMS, explicit
+// EGL/GBM scanout, render and KMS workers). It still passes through every
+// runtime capability check, and OBLIVION_ONE_OUTPUT_MODE_MUTATION=off disables it.
+const OUTPUT_MODE_SELECTION_RUNTIME_QUALIFIED: bool = true;
 const OUTPUT_MODE_MUTATION_POLICY_ENV: &str = "OBLIVION_ONE_OUTPUT_MODE_MUTATION";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3481,8 +3481,16 @@ mod tests {
     }
 
     #[test]
-    fn mode_selection_stays_unavailable_until_runtime_integration_is_qualified() {
-        assert!(!OUTPUT_MODE_SELECTION_RUNTIME_QUALIFIED);
+    fn mode_selection_is_exposed_by_default_on_qualified_runtimes() {
+        assert!(OUTPUT_MODE_SELECTION_RUNTIME_QUALIFIED);
+        assert_eq!(
+            output_mode_mutation_support(
+                OUTPUT_MODE_SELECTION_RUNTIME_QUALIFIED,
+                OutputModeMutationPolicy::Auto,
+                fully_qualified_evidence(),
+            ),
+            Ok(())
+        );
     }
 
     #[test]
