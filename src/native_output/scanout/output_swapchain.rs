@@ -4430,6 +4430,19 @@ mod tests {
             pre_r17_error.to_string(),
             "unsubmitted READY disagrees with scheduler READY ownership"
         );
+        // A render-worker READY makes no scheduler timing claim; it must not
+        // be mistaken for the stale metadata above when output reconfigures.
+        let mut worker_scheduler = NativeFrameScheduler::new_with_refresh_interval_ns(6_060_606, 0);
+        worker_scheduler.note_untimed_ready_frame();
+        validate_reconfiguration_frame_ownership_for_swapchain(
+            &swapchain,
+            OutputEpochId::initial(),
+            &scene_history,
+            &frame_pacing,
+            &worker_scheduler,
+            &output_transactions,
+        )
+        .expect("an untimed worker READY retires against its physical reservation");
         validate_reconfiguration_frame_ownership_for_swapchain(
             &swapchain,
             OutputEpochId::initial(),

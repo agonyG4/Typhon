@@ -902,7 +902,8 @@ fn validate_unsubmitted_output_frame_owners(
         pacing_lane,
         crate::native_output::pacing::UnsubmittedPhysicalFrameLane::Ready
     ) && (!frame_scheduler.ready_frame_queued()
-        || frame_scheduler.ready_target() != owner.reservation.fixed_target())
+        || (!frame_scheduler.ready_frame_untimed()
+            && frame_scheduler.ready_target() != owner.reservation.fixed_target()))
     {
         return Err(OutputFrameRetirementInvariantError::SchedulerReadyOwnershipMismatch.into());
     }

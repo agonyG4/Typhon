@@ -135,6 +135,9 @@ pub struct NativeFrameScheduler {
     worker_queued: Option<WorkerSubmissionReservation>,
     ready_frame_queued: bool,
     ready_target: Option<PresentationTarget>,
+    /// The READY frame carries no scheduler timing claim: its submission
+    /// timing belongs to the KMS worker, whatever its physical reservation.
+    ready_untimed: bool,
     refresh_deadline_ns: Option<u64>,
     watchdog_deadline_ns: Option<u64>,
     watchdog_interval_ns: u64,
@@ -303,6 +306,7 @@ impl NativeFrameScheduler {
             worker_queued: None,
             ready_frame_queued: false,
             ready_target: None,
+            ready_untimed: false,
             refresh_deadline_ns: None,
             watchdog_deadline_ns: None,
             watchdog_interval_ns: watchdog_interval_ns.max(1),
@@ -526,6 +530,14 @@ impl NativeFrameScheduler {
         self.refresh_deadline_ns = None;
         self.ready_frame_queued = true;
         self.ready_target = target;
+        self.ready_untimed = false;
+    }
+
+    /// Queue READY without a timing claim, for a frame whose submission the
+    /// KMS worker times. Ownership checks then cannot compare its target.
+    pub fn note_untimed_ready_frame(&mut self) {
+        self.note_ready_frame(None);
+        self.ready_untimed = true;
     }
 
     pub fn prepare_ready_target_metadata_rebase(
@@ -552,6 +564,7 @@ impl NativeFrameScheduler {
         debug_assert!(self.ready_frame_queued);
         debug_assert_eq!(self.ready_target, prepared.expected_target);
         self.ready_target = prepared.replacement_target;
+        self.ready_untimed = false;
     }
 
     pub fn consume_ready_frame(&mut self) {
@@ -771,6 +784,10 @@ impl NativeFrameScheduler {
 
     pub fn ready_target(&self) -> Option<PresentationTarget> {
         self.ready_target
+    }
+
+    pub fn ready_frame_untimed(&self) -> bool {
+        self.ready_frame_queued && self.ready_untimed
     }
 
     pub fn pending_page_flip_token(&self) -> Option<u64> {

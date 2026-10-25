@@ -54,13 +54,9 @@ fn handoff_render_worker_ready(
     render_ahead: bool,
 ) -> Result<(), &'static str> {
     frame_pacing.finish_render_worker_with_ready_frame(ready_at_ns, waits_for_target)?;
-    // The scheduler READY must name the same fixed target as the physical
-    // READY owner; reconfiguration retires the frame only when they agree.
-    frame_scheduler.note_ready_frame(
-        frame_pacing
-            .unsubmitted_physical_identity()
-            .and_then(|identity| identity.reservation.fixed_target()),
-    );
+    // The KMS worker times this submission, so the scheduler must not wait
+    // for or retarget the frame's physical reservation.
+    frame_scheduler.note_untimed_ready_frame();
     if render_ahead {
         frame_pacing.note_predictive_unbound_ready();
     }
@@ -1572,7 +1568,7 @@ mod tests {
     }
 
     #[test]
-    fn worker_completion_hands_the_physical_fixed_target_to_the_scheduler() {
+    fn worker_completion_hands_off_untimed_ready_for_a_fixed_reservation() {
         use crate::native_output::presentation::transaction::FramePresentationReservation;
         use oblivion_one::native::presentation_deadline::{
             MonotonicTimestampNs, PresentationTarget, PresentationTargetReason,
@@ -1612,7 +1608,14 @@ mod tests {
 
         handoff_render_worker_ready(&mut pacing, &mut scheduler, 2, true, false).unwrap();
         assert!(scheduler.ready_frame_queued());
-        assert_eq!(scheduler.ready_target(), Some(target));
+        // No scheduler timing claim, but the READY is known to be untimed so
+        // ownership checks do not mistake it for stale target metadata.
+        assert_eq!(scheduler.ready_target(), None);
+        assert!(scheduler.ready_frame_untimed());
+        assert_eq!(
+            scheduler.decision(0),
+            oblivion_one::native::scheduler::SchedulerDecision::SubmitReady
+        );
     }
 
     #[test]
