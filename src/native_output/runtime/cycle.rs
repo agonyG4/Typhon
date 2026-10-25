@@ -822,7 +822,12 @@ impl NativeRuntime {
                 .is_some_and(|deadline| deadline <= monotonic_now_ns().unwrap_or(0)),
         );
         if output_configuration_cycle {
-            let _ = self.advance_output_configuration(monotonic_now_ns()?)?;
+            let now_ns = monotonic_now_ns()?;
+            if self.advance_output_configuration(now_ns)?
+                == super::output_configuration::OutputConfigurationAdvance::Waiting
+            {
+                self.report_stalled_output_configuration(now_ns);
+            }
         }
         if let Some(start_ns) = cursor_control_started_at_ns {
             self.pointer_timing.record_phase(

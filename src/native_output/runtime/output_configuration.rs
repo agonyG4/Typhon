@@ -249,6 +249,42 @@ pub(crate) struct PendingOutputConfigurationRequest {
     pub(super) candidate: Option<CandidateScanoutState>,
     failure_code: Option<oblivion_one::control::ControlErrorCode>,
     prepared_transaction: Option<PreparedOutputConfigurationTransaction>,
+    waiting_since_ns: Option<u64>,
+    stall_reported_at_ns: Option<u64>,
+}
+
+/// A pending output configuration that keeps waiting this long is reported,
+/// once per interval, with the state and the boundary that holds it.
+const OUTPUT_CONFIGURATION_STALL_REPORT_NS: u64 = 1_000_000_000;
+
+impl CandidateScanoutState {
+    const fn name(&self) -> &'static str {
+        match self {
+            Self::RenderingFence { .. } => "rendering_fence",
+            Self::ReadyReplacement { .. } => "ready_replacement",
+            Self::ReuseReady { .. } => "reuse_ready",
+            Self::WorkerPreparing { .. } => "worker_preparing",
+            Self::WorkerCancelAfterPrepare { .. } => "worker_cancel_after_prepare",
+            Self::WorkerRenderingFence { .. } => "worker_rendering_fence",
+            Self::WorkerReady { .. } => "worker_ready",
+            Self::WorkerPromoting { .. } => "worker_promoting",
+            Self::WorkerPromotionQueued { .. } => "worker_promotion_queued",
+            Self::WorkerPromoted { .. } => "worker_promoted",
+            Self::WorkerDiscardQueued { .. } => "worker_discard_queued",
+            Self::WorkerDiscarding { .. } => "worker_discarding",
+        }
+    }
+
+    /// The new mode is already committed to KMS; only the worker promotion
+    /// and publication remain, and the old epoch was quiesced before commit.
+    const fn modeset_committed(&self) -> bool {
+        matches!(
+            self,
+            Self::WorkerPromotionQueued { .. }
+                | Self::WorkerPromoting { .. }
+                | Self::WorkerPromoted { .. }
+        )
+    }
 }
 
 impl PendingOutputConfigurationRequest {
@@ -264,6 +300,8 @@ impl PendingOutputConfigurationRequest {
             candidate: None,
             failure_code: None,
             prepared_transaction: None,
+            waiting_since_ns: None,
+            stall_reported_at_ns: None,
         }
     }
 
@@ -1581,6 +1619,38 @@ impl NativeRuntime {
         Ok(())
     }
 
+    /// Report a pending output configuration that keeps waiting, so a stall
+    /// names the candidate state and the boundary owners that hold it.
+    pub(crate) fn report_stalled_output_configuration(&mut self, now_ns: u64) {
+        let boundary = self.native_output_reconfiguration_boundary();
+        let render_worker_busy = self.scanout.render_worker_busy();
+        let Some(pending) = self.pending_output_configuration.as_mut() else {
+            return;
+        };
+        let waiting_since_ns = *pending.waiting_since_ns.get_or_insert(now_ns);
+        let waited_ns = now_ns.saturating_sub(waiting_since_ns);
+        if waited_ns < OUTPUT_CONFIGURATION_STALL_REPORT_NS
+            || pending.stall_reported_at_ns.is_some_and(|reported_at_ns| {
+                now_ns.saturating_sub(reported_at_ns) < OUTPUT_CONFIGURATION_STALL_REPORT_NS
+            })
+        {
+            return;
+        }
+        pending.stall_reported_at_ns = Some(now_ns);
+        eprintln!(
+            "native output configuration: event=stalled waited_ms={} state={} target={}x{} render_worker_busy={} boundary={:?}",
+            waited_ns / 1_000_000,
+            pending
+                .candidate
+                .as_ref()
+                .map_or("unprepared", CandidateScanoutState::name),
+            pending.target.width,
+            pending.target.height,
+            render_worker_busy,
+            boundary,
+        );
+    }
+
     pub(crate) fn advance_output_configuration(
         &mut self,
         now_ns: u64,
@@ -1628,22 +1698,31 @@ impl NativeRuntime {
             return Ok(OutputConfigurationAdvance::Completed);
         };
         let candidate_render_fence_owned = pending.waiting_on_render_fence();
-        if let NativeScanoutBackend::AtomicEglGbm(explicit) = &*self.scanout {
-            self.validate_output_configuration_ready_ownership(explicit)?;
-        }
-        let boundary = self.native_output_reconfiguration_boundary();
-        if boundary.is_safe_to_retire_unsubmitted_ready_frame() {
-            self.abandon_unsubmitted_output_frame()?;
-        }
-        if let NativeScanoutBackend::AtomicEglGbm(explicit) = &*self.scanout {
-            self.validate_output_configuration_ready_ownership(explicit)?;
-        }
-        if !self
-            .native_output_reconfiguration_boundary()
-            .is_safe_with_candidate_render_fence(candidate_render_fence_owned)
-        {
-            self.pending_output_configuration = Some(pending);
-            return Ok(OutputConfigurationAdvance::Waiting);
+        // After the modeset commit the old epoch is gone. Waiting for its
+        // boundary here deadlocked: cursor and frame work stay gated while the
+        // configuration is pending, so a cursor move kept the boundary unsafe.
+        let modeset_committed = pending
+            .candidate
+            .as_ref()
+            .is_some_and(CandidateScanoutState::modeset_committed);
+        if !modeset_committed {
+            if let NativeScanoutBackend::AtomicEglGbm(explicit) = &*self.scanout {
+                self.validate_output_configuration_ready_ownership(explicit)?;
+            }
+            let boundary = self.native_output_reconfiguration_boundary();
+            if boundary.is_safe_to_retire_unsubmitted_ready_frame() {
+                self.abandon_unsubmitted_output_frame()?;
+            }
+            if let NativeScanoutBackend::AtomicEglGbm(explicit) = &*self.scanout {
+                self.validate_output_configuration_ready_ownership(explicit)?;
+            }
+            if !self
+                .native_output_reconfiguration_boundary()
+                .is_safe_with_candidate_render_fence(candidate_render_fence_owned)
+            {
+                self.pending_output_configuration = Some(pending);
+                return Ok(OutputConfigurationAdvance::Waiting);
+            }
         }
 
         if pending.candidate.is_none() {
