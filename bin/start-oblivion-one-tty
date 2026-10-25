@@ -14,7 +14,31 @@ done
 script_dir="$(CDPATH= cd -- "$(dirname -- "$script_path")" && pwd)"
 
 export OBLIVION_ONE_PROFILE="${OBLIVION_ONE_PROFILE:-release}"
-export OBLIVION_ONE_SOCKET="${OBLIVION_ONE_SOCKET:-oblivion-one-tty}"
+
+# A second Typhon on another VT must not reuse a live instance's Wayland
+# socket name: the name also keys the control socket. Keep the usual name
+# (and session.log) for the first instance and suffix later ones by VT.
+socket_in_use() {
+    local lock="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/$1.lock"
+    [[ -e "$lock" ]] || return 1
+    ! flock -n "$lock" true 2>/dev/null
+}
+if [[ -z "${OBLIVION_ONE_SOCKET:-}" ]]; then
+    OBLIVION_ONE_SOCKET="oblivion-one-tty"
+    if socket_in_use "$OBLIVION_ONE_SOCKET"; then
+        base="oblivion-one-tty${XDG_VTNR:+-vt$XDG_VTNR}"
+        OBLIVION_ONE_SOCKET="$base"
+        suffix=2
+        while socket_in_use "$OBLIVION_ONE_SOCKET"; do
+            OBLIVION_ONE_SOCKET="$base-$suffix"
+            suffix=$((suffix + 1))
+        done
+        state_dir="${OBLIVION_ONE_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/oblivion-one}"
+        export OBLIVION_ONE_LOG_FILE="${OBLIVION_ONE_LOG_FILE:-$state_dir/session-$OBLIVION_ONE_SOCKET.log}"
+        echo "start-oblivion-one-tty: oblivion-one-tty is in use; starting as $OBLIVION_ONE_SOCKET (log: $OBLIVION_ONE_LOG_FILE)" >&2
+    fi
+fi
+export OBLIVION_ONE_SOCKET
 export OBLIVION_ONE_MODE="${OBLIVION_ONE_MODE:-1920x1080@165}"
 
 # Prefer the local xwayland-satellite fork (maximize/minimize support) when it is built.
