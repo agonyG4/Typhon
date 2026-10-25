@@ -35,6 +35,9 @@ if [[ -z "${OBLIVION_ONE_SOCKET:-}" ]]; then
         done
         state_dir="${OBLIVION_ONE_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/oblivion-one}"
         export OBLIVION_ONE_LOG_FILE="${OBLIVION_ONE_LOG_FILE:-$state_dir/session-$OBLIVION_ONE_SOCKET.log}"
+        # The shell's per-user endpoints (shell IPC, Paper control) take this
+        # suffix so they do not collide with the primary session's shell.
+        export ASTREA_SESSION_INSTANCE="${ASTREA_SESSION_INSTANCE:-$OBLIVION_ONE_SOCKET}"
         echo "start-oblivion-one-tty: oblivion-one-tty is in use; starting as $OBLIVION_ONE_SOCKET (log: $OBLIVION_ONE_LOG_FILE)" >&2
     fi
 fi

@@ -128,6 +128,28 @@ fn read_one_response(stream: &mut UnixStream) -> Result<Vec<u8>, AstreactlError>
     }
 }
 
+/// A secondary Typhon session suffixes its shell's Paper endpoint with
+/// ASTREA_SESSION_INSTANCE, sanitized the same way the shell does.
+fn paper_endpoint_file_name(instance: Option<&str>) -> String {
+    let instance: String = instance
+        .unwrap_or_default()
+        .trim()
+        .chars()
+        .map(|character| {
+            if character.is_alphanumeric() || character == '-' || character == '_' {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if instance.is_empty() {
+        "wallpaper.sock".to_string()
+    } else {
+        format!("wallpaper-{instance}.sock")
+    }
+}
+
 fn discover_endpoint() -> Result<PathBuf, AstreactlError> {
     let runtime = std::env::var_os("XDG_RUNTIME_DIR").ok_or_else(|| {
         AstreactlError::EndpointNotFound("XDG_RUNTIME_DIR is not set".to_string())
@@ -141,7 +163,9 @@ fn discover_endpoint() -> Result<PathBuf, AstreactlError> {
     validate_directory(&runtime, None, "XDG_RUNTIME_DIR")?;
     let shell_dir = runtime.join("astrea-shell");
     validate_directory(&shell_dir, Some(0o700), "Paper runtime directory")?;
-    let endpoint = shell_dir.join("wallpaper.sock");
+    let endpoint = shell_dir.join(paper_endpoint_file_name(
+        std::env::var("ASTREA_SESSION_INSTANCE").ok().as_deref(),
+    ));
     if endpoint.as_os_str().len() >= 108 {
         return Err(AstreactlError::Transport(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -193,6 +217,20 @@ mod tests {
     use super::*;
     use std::os::unix::net::UnixListener;
     use std::thread;
+
+    #[test]
+    fn paper_endpoint_is_scoped_only_for_a_secondary_session() {
+        assert_eq!(paper_endpoint_file_name(None), "wallpaper.sock");
+        assert_eq!(paper_endpoint_file_name(Some("  ")), "wallpaper.sock");
+        assert_eq!(
+            paper_endpoint_file_name(Some("oblivion-one-tty-vt4")),
+            "wallpaper-oblivion-one-tty-vt4.sock"
+        );
+        assert_eq!(
+            paper_endpoint_file_name(Some("a/b.c")),
+            "wallpaper-a_b_c.sock"
+        );
+    }
 
     #[test]
     fn default_wallpaper_timeout_includes_operation_margin() {
