@@ -1375,7 +1375,10 @@ pub(crate) fn validate_reconfiguration_frame_ownership_for_swapchain_with_arbite
                 frame_pacing.worker_reservation_ticket(),
                 worker_queued.frame,
             )
-            .map_err(|_| OutputFrameRetirementInvariantError::WorkerPacingOwnerMismatch)?;
+            .map_err(|reason| {
+                eprintln!("native output ownership: worker-queued owner check failed: {reason}");
+                OutputFrameRetirementInvariantError::WorkerPacingOwnerMismatch
+            })?;
     } else if frame_pacing
         .worker_reservation_ticket()
         .is_some_and(|ticket| ticket.physical_identity().is_some())

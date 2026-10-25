@@ -1706,6 +1706,21 @@ impl NativeRuntime {
             .as_ref()
             .is_some_and(CandidateScanoutState::modeset_committed);
         if !modeset_committed {
+            // A frame still owned by KMS (pageflip, worker queue or worker
+            // submission) blocks the boundary below anyway. Wait for it to
+            // settle before the strict ownership checks: a request that
+            // arrived while the worker held a frame failed them mid-flight
+            // and took the compositor down.
+            let in_flight = self.native_output_reconfiguration_boundary();
+            if in_flight.main_thread_pageflip_owned
+                || in_flight.worker_in_flight_owned
+                || in_flight.worker_queued_next_owned
+                || in_flight.atomic_commit_arbiter_owned
+                || in_flight.direct_scanout_pageflip_owned
+            {
+                self.pending_output_configuration = Some(pending);
+                return Ok(OutputConfigurationAdvance::Waiting);
+            }
             if let NativeScanoutBackend::AtomicEglGbm(explicit) = &*self.scanout {
                 self.validate_output_configuration_ready_ownership(explicit)?;
             }
