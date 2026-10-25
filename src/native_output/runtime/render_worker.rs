@@ -54,7 +54,13 @@ fn handoff_render_worker_ready(
     render_ahead: bool,
 ) -> Result<(), &'static str> {
     frame_pacing.finish_render_worker_with_ready_frame(ready_at_ns, waits_for_target)?;
-    frame_scheduler.note_ready_frame(None);
+    // The scheduler READY must name the same fixed target as the physical
+    // READY owner; reconfiguration retires the frame only when they agree.
+    frame_scheduler.note_ready_frame(
+        frame_pacing
+            .unsubmitted_physical_identity()
+            .and_then(|identity| identity.reservation.fixed_target()),
+    );
     if render_ahead {
         frame_pacing.note_predictive_unbound_ready();
     }
@@ -1563,6 +1569,50 @@ mod tests {
             assert_eq!(pacing.active_physical_identity(), Some(identity(2)));
             assert_eq!(pacing.unsubmitted_physical_identity(), Some(first));
         }
+    }
+
+    #[test]
+    fn worker_completion_hands_the_physical_fixed_target_to_the_scheduler() {
+        use crate::native_output::presentation::transaction::FramePresentationReservation;
+        use oblivion_one::native::presentation_deadline::{
+            MonotonicTimestampNs, PresentationTarget, PresentationTargetReason,
+            PrimaryRefreshClaim, TargetSelectionEvidence,
+        };
+
+        let at = MonotonicTimestampNs::new(10);
+        let target = PresentationTarget {
+            sequence: 1219,
+            presentation_time: at,
+            submit_not_before: at,
+            render_start_deadline: at,
+            refresh_interval: std::time::Duration::from_nanos(6_060_637),
+            reason: PresentationTargetReason::PredictedPressure,
+            clock_generation: 1,
+            estimated: false,
+            predicted_unreachable: false,
+            physical_claim: PrimaryRefreshClaim {
+                sequence: 1219,
+                presentation_time: at,
+                clock_generation: 1,
+            },
+            selection_evidence: TargetSelectionEvidence::default(),
+        };
+        let mut pacing = NativeFramePacing::from_env();
+        let mut scheduler = NativeFrameScheduler::new_with_refresh_interval_ns(6_060_637, 0);
+        pacing.queue_visual(1, 1);
+        scheduler.queue_visual_work();
+        pacing
+            .begin_render_attempt(NativeOutputPacingMode::ReactiveDouble, false)
+            .unwrap();
+        pacing.mark_render_worker_dispatched().unwrap();
+        let mut fixed = identity(1);
+        fixed.reservation = FramePresentationReservation::Fixed(target);
+        pacing.bind_physical_output_frame(fixed).unwrap();
+        scheduler.consume_visual_work();
+
+        handoff_render_worker_ready(&mut pacing, &mut scheduler, 2, true, false).unwrap();
+        assert!(scheduler.ready_frame_queued());
+        assert_eq!(scheduler.ready_target(), Some(target));
     }
 
     #[test]
