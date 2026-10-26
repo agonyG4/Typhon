@@ -218,6 +218,8 @@ impl Dispatch<client_astrea_toplevel_v1::AstreaToplevelV1, ()> for ToplevelClien
                 ));
                 "handle_done"
             }
+            client_astrea_toplevel_v1::Event::IconName { .. } => "icon_name",
+            client_astrea_toplevel_v1::Event::IconPixels { .. } => "icon_pixels",
             client_astrea_toplevel_v1::Event::Closed => {
                 handle.closed = true;
                 "closed"

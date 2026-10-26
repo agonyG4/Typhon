@@ -658,6 +658,7 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn destroy_xdg_association(&mut self, surface_id: u32) {
+        self.toplevel_icons.remove_surface(surface_id);
         if let Some(lifecycle) = self.surface_role_lifecycles.get_mut(&surface_id) {
             lifecycle.xdg_association = false;
             if lifecycle.permanent.is_none() && lifecycle.live_instance.is_none() {

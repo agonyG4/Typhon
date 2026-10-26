@@ -4,7 +4,7 @@
     Copyright 2026 AstreaOS contributors
   </copyright>
 
-  <interface name="astrea_toplevel_manager_v1" version="3">
+  <interface name="astrea_toplevel_manager_v1" version="4">
     <description summary="authoritative Astrea toplevel list and actions">
       This private protocol publishes compositor-managed application toplevels.
       Version 1 has no window mutation requests. Handle events are grouped into
@@ -13,7 +13,7 @@
       whose completion is reported by this manager because a handle may close.
       A failed manager is terminal and does not disconnect other managers owned
       by the same client. Version 3 adds trusted shell-owned minimize anchor
-      metadata to each exact toplevel handle.
+      metadata to each exact toplevel handle. Version 4 adds window icons.
     </description>
 
     <enum name="error">
@@ -84,7 +84,7 @@
     </event>
   </interface>
 
-  <interface name="astrea_toplevel_v1" version="3">
+  <interface name="astrea_toplevel_v1" version="4">
     <description summary="one compositor-managed Astrea toplevel">
       The handle is read-only. Its identifier is the stable decimal Typhon
       WindowId, and its lifetime is independent of the underlying compositor
@@ -167,5 +167,26 @@
     </request>
 
     <request name="clear_minimize_anchor" since="3"/>
+
+    <event name="icon_name" since="4">
+      <description summary="replace the window icon">
+        Starts a new icon value and clears any previous pixel image. An empty
+        name resets the icon to the application's desktop-entry or placeholder.
+        A subsequent icon_pixels event in the same handle transaction supplies
+        a fallback when the name is empty or unavailable in the current theme.
+        This metadata becomes visible only at the manager done boundary.
+      </description>
+      <arg name="name" type="string"/>
+    </event>
+    <event name="icon_pixels" since="4">
+      <description summary="immutable square ARGB window icon">
+        The sealed shared-memory fd contains exactly size*size*4 bytes of
+        native-endian premultiplied ARGB8888 pixels with tightly packed rows.
+        Size is between 1 and 256. This follows icon_name in the same handle
+        transaction. The receiver owns and must close the fd.
+      </description>
+      <arg name="pixels" type="fd"/>
+      <arg name="size" type="uint"/>
+    </event>
   </interface>
 </protocol>

@@ -1451,6 +1451,7 @@ impl CompositorState {
         surface_id: u32,
         reason: SurfaceTeardownReason,
     ) {
+        self.toplevel_icons.remove_surface(surface_id);
         self.forget_destroyed_drag_icon(surface_id);
         self.detach_dmabuf_surface(surface_id);
         let commit_sequence = self

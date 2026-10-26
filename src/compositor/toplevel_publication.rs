@@ -94,6 +94,7 @@ pub(crate) struct AstreaToplevelSnapshot {
     pub(crate) kind: AstreaToplevelKind,
     pub(crate) states: AstreaToplevelStates,
     pub(crate) focus_serial: u64,
+    pub(crate) icon: Option<std::sync::Arc<super::toplevel_icon::ToplevelIcon>>,
 }
 
 impl AstreaToplevelSnapshot {
@@ -116,6 +117,7 @@ impl AstreaToplevelSnapshot {
             kind,
             states,
             focus_serial,
+            icon: None,
         }
     }
 }
@@ -1508,6 +1510,9 @@ fn send_initial_handle(
         serial_hi,
         serial_lo,
     })?;
+    if snapshot.icon.is_some() {
+        super::toplevel_icon::send_icon(resource, snapshot.icon.as_deref())?;
+    }
     let (revision_hi, revision_lo) = split_u64(revision);
     resource.send_event(astrea_toplevel_v1::Event::Done {
         revision_hi,
@@ -1551,6 +1556,9 @@ fn send_changed_handle(
             serial_hi,
             serial_lo,
         })?;
+    }
+    if old.icon != new.icon {
+        super::toplevel_icon::send_icon(resource, new.icon.as_deref())?;
     }
     let (revision_hi, revision_lo) = split_u64(revision);
     resource.send_event(astrea_toplevel_v1::Event::Done {

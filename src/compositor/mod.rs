@@ -127,6 +127,7 @@ mod surface;
 mod surface_pacing_data;
 mod toplevel_actions;
 mod toplevel_collection;
+mod toplevel_icon;
 mod toplevel_publication;
 mod toplevel_publication_state;
 mod window_backend;
@@ -1013,6 +1014,7 @@ pub struct CompositorState {
     pending_color_info: Vec<color::PendingColorInfo>,
     astrea_shortcut_registry: AstreaShortcutRegistry,
     astrea_toplevel_publisher: AstreaToplevelPublisher,
+    toplevel_icons: toplevel_icon::ToplevelIcons,
     pub(in crate::compositor) workspace_presence_dirty: bool,
     astrea_toplevel_authorized_clients: HashSet<ClientId>,
     astrea_shell_authenticated_clients: HashSet<ClientId>,

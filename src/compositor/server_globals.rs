@@ -45,6 +45,7 @@ pub(super) fn register_minimum_globals(
             (),
         );
     }
+    display.create_global::<CompositorState, wayland_protocols::xdg::toplevel_icon::v1::server::xdg_toplevel_icon_manager_v1::XdgToplevelIconManagerV1, _>(1, ());
     display.create_global::<CompositorState, wl_shm::WlShm, _>(versions::WL_SHM, ());
     display.create_global::<CompositorState, wp_viewporter::WpViewporter, _>(
         versions::WP_VIEWPORTER,

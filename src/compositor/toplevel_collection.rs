@@ -58,7 +58,7 @@ impl CompositorState {
                     states = states.union(AstreaToplevelStates::FULLSCREEN);
                 }
             }
-            AstreaToplevelSnapshot::bounded(
+            let mut snapshot = AstreaToplevelSnapshot::bounded(
                 window.id,
                 window.metadata.app_id.as_deref(),
                 window.metadata.title.as_deref(),
@@ -66,7 +66,11 @@ impl CompositorState {
                 kind,
                 states,
                 window.last_focus_serial,
-            )
+            );
+            if let WindowBackend::Xdg(handle) = window.backend {
+                snapshot.icon = self.toplevel_icons.current.get(&handle.root_surface_id()).cloned();
+            }
+            snapshot
         })
     }
 

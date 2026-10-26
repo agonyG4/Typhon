@@ -184,4 +184,5 @@ mod xdg_output;
 mod xwayland;
 mod xwayland_selection;
 
+mod toplevel_icon;
 mod client_backpressure;

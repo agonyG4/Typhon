@@ -918,6 +918,7 @@ impl Dispatch<xdg_toplevel::XdgToplevel, XdgToplevelData> for CompositorState {
                     );
                     return;
                 }
+                state.toplevel_icons.remove_surface(surface_id);
                 state.unregister_toplevel_surface(surface_id);
             }
             xdg_toplevel::Request::Move { seat, serial } => {

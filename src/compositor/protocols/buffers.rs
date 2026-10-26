@@ -162,6 +162,7 @@ impl Dispatch<wl_buffer::WlBuffer, ShmBufferData> for CompositorState {
         resource: &wl_buffer::WlBuffer,
         _data: &ShmBufferData,
     ) {
+        state.toplevel_icons.buffer_destroyed(resource.id());
         state.cancel_pending_surface_trees_for_buffer(
             resource,
             AcquireWatchCancelReason::BufferDestroyed,

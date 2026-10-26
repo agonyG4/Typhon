@@ -23,6 +23,7 @@ mod shell_control;
 mod shortcuts;
 mod syncobj;
 mod toplevel_management;
+mod toplevel_icon;
 pub(crate) mod versions;
 mod viewport;
 mod workspace;

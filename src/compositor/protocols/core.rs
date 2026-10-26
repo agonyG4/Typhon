@@ -102,6 +102,7 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for CompositorState {
                 let commit_sequence = state.allocate_surface_commit_sequence();
                 let commit_id = SurfaceCommitId::from_sequence(commit_sequence);
                 state.apply_pending_toplevel_constraints(surface_id);
+                state.commit_toplevel_icon(surface_id);
                 let pointer_constraint_state =
                     state.take_pending_pointer_constraint_surface_state(surface_id);
                 let window_geometry = state
