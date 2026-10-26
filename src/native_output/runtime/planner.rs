@@ -4,7 +4,7 @@ use oblivion_one::native::presentation_deadline::{
     PresentationTargetAuthority, PresentationTargetReason,
 };
 use oblivion_one::native::scheduler::NativeOutputPacingMode;
-use oblivion_one::{compositor::OwnCompositorServer, native::scheduler::NativeFrameScheduler};
+use oblivion_one::compositor::OwnCompositorServer;
 use std::io;
 use std::time::Duration;
 
@@ -173,56 +173,50 @@ pub(super) fn pending_fixed_target_for_scanout(
     }
 }
 
-pub(super) fn plan_commit_timing_target(
-    planner: &mut PresentationDeadlinePlanner,
-    server: &mut OwnCompositorServer,
-    _frame_scheduler: &NativeFrameScheduler,
-    scheduled: Option<PresentationTarget>,
-    now: MonotonicTimestampNs,
-    predicted_total_cost: Duration,
-) -> Option<PresentationTarget> {
-    let candidates = server.commit_timing_planning_candidates();
-    if candidates.is_empty() {
-        return scheduled;
-    }
+/// Margin after the refresh preceding a Commit Timing target before the
+/// transaction is released, so a frame started at release cannot still pick
+/// that preceding refresh when the vblank estimate drifts.
+const COMMIT_TIMING_RELEASE_MARGIN_NS: u64 = 250_000;
 
-    let mut planned_targets = Vec::with_capacity(candidates.len());
-    for candidate in candidates {
+/// Arm each Commit Timing transaction for the first refresh at or after its
+/// requested time. The constraint holds only that surface's content: it is
+/// released once the refresh before its target has passed, so any frame that
+/// latches it presents no earlier than requested. The output's own target is
+/// left alone; a timed client must not pace the rest of the desktop.
+pub(super) fn plan_commit_timing_targets(
+    planner: &PresentationDeadlinePlanner,
+    server: &mut OwnCompositorServer,
+    now: MonotonicTimestampNs,
+) {
+    for candidate in server.commit_timing_planning_candidates() {
         if !candidate.clock_mapping.is_representable {
             continue;
         }
         let mut candidate_planner = *planner;
-        let Some(target) = candidate_planner.plan_not_before(
-            now,
-            candidate.monotonic_not_before,
-            predicted_total_cost,
-        ) else {
+        let Some(target) =
+            candidate_planner.plan_not_before(now, candidate.monotonic_not_before, Duration::ZERO)
+        else {
             continue;
         };
-        if server.arm_commit_timing_target(
+        server.arm_commit_timing_target(
             candidate,
             target.presentation_time,
-            target.render_start_deadline,
+            commit_timing_release_at(target),
             target.sequence,
             target.clock_generation,
-        ) {
-            planned_targets.push(target);
-        }
+        );
     }
+}
 
-    let Some(earliest) = planned_targets.into_iter().min_by_key(|target| {
-        (
-            target.render_start_deadline,
-            target.presentation_time,
-            target.sequence,
-        )
-    }) else {
-        return scheduled;
-    };
-    planner.clear_scheduled_target();
-    planner
-        .plan_not_before(now, earliest.presentation_time, predicted_total_cost)
-        .or(Some(earliest))
+fn commit_timing_release_at(target: PresentationTarget) -> MonotonicTimestampNs {
+    let refresh_ns = u64::try_from(target.refresh_interval.as_nanos()).unwrap_or(u64::MAX);
+    MonotonicTimestampNs::new(
+        target
+            .presentation_time
+            .get()
+            .saturating_sub(refresh_ns)
+            .saturating_add(COMMIT_TIMING_RELEASE_MARGIN_NS.min(refresh_ns / 8)),
+    )
 }
 
 /// Preserve the already-owned target while keeping generic output planning
@@ -613,6 +607,44 @@ mod tests {
     use oblivion_one::native::scheduler::NativeFrameScheduler;
 
     use super::*;
+
+    #[test]
+    fn commit_timing_releases_after_the_refresh_before_its_target() {
+        let refresh = Duration::from_nanos(6_060_637);
+        let mut planner = PresentationDeadlinePlanner::new(refresh);
+        planner.note_presented(MonotonicTimestampNs::new(100_000_000));
+        // es2gears asks for the next refresh minus half a millisecond, right
+        // after the previous one was presented.
+        let now = MonotonicTimestampNs::new(100_600_000);
+        let requested = MonotonicTimestampNs::new(100_000_000 + 6_060_637 - 500_000);
+
+        let target = planner
+            .plan_not_before(now, requested, Duration::ZERO)
+            .unwrap();
+        let release = commit_timing_release_at(target);
+
+        assert_eq!(target.presentation_time.get(), 106_060_637);
+        assert_eq!(release.get(), 100_250_000);
+        assert!(release <= now, "released into the very next frame");
+    }
+
+    #[test]
+    fn commit_timing_far_target_is_held_until_its_preceding_refresh() {
+        let refresh = Duration::from_nanos(6_060_637);
+        let mut planner = PresentationDeadlinePlanner::new(refresh);
+        planner.note_presented(MonotonicTimestampNs::new(100_000_000));
+        let now = MonotonicTimestampNs::new(100_600_000);
+        let requested = MonotonicTimestampNs::new(120_000_000);
+
+        let target = planner
+            .plan_not_before(now, requested, Duration::ZERO)
+            .unwrap();
+        let release = commit_timing_release_at(target);
+
+        assert_eq!(target.presentation_time.get(), 100_000_000 + 4 * 6_060_637);
+        assert_eq!(release.get(), 100_000_000 + 3 * 6_060_637 + 250_000);
+        assert!(target.presentation_time >= requested);
+    }
 
     fn discovery_error() -> AtomicKmsError {
         AtomicKmsError::new(

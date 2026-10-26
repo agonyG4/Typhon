@@ -17,6 +17,7 @@ const SAMPLE_CAPACITY: usize = 120;
 const WARM_PARALLEL_MIN_SAMPLES: usize = 20;
 const MISS_RECOVERY_EXACT_SUCCESSES: usize = 20;
 const COLD_WAKE_REFRESH_INTERVALS: u64 = 100;
+const MAX_TOTAL_COST_REFRESH_INTERVALS: u64 = 2;
 
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1024,6 +1025,9 @@ impl AdaptiveRenderJournal {
         if cold_wake {
             total = total.max(refresh_ns.saturating_sub(100_000));
         }
+        // One slow sample must not plan several refreshes ahead; KWin and
+        // Mutter bound their lead the same way.
+        total = total.min(refresh_ns.saturating_mul(MAX_TOTAL_COST_REFRESH_INTERVALS));
         RenderPrediction {
             ewma_render_ns: self.ewma_render_ns,
             upper_render_deviation_ns: self.upper_render_deviation_ns,
@@ -2154,6 +2158,27 @@ mod tests {
             journal.prediction_estimator_mode(),
             PredictionEstimatorMode::WarmParallel
         );
+    }
+
+    #[test]
+    fn slow_samples_never_plan_more_than_two_refreshes_ahead() {
+        let mut journal = AdaptiveRenderJournal::default();
+        record_uniform_prediction_inputs(
+            &mut journal,
+            30_000_000,
+            30_000_000,
+            90_000_000,
+            0,
+            0,
+            500_000,
+        );
+        journal.note_proven_deadline_miss(EstimatorRecoveryDisposition::ResetIndependentHorizon);
+        let refresh = Duration::from_nanos(6_060_637);
+
+        let prediction = journal.prediction(refresh);
+
+        assert!(prediction.independent_total_cost_ns > 2 * 6_060_637);
+        assert_eq!(prediction.total_cost_ns, 2 * 6_060_637);
     }
 
     #[test]

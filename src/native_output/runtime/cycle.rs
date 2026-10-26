@@ -453,21 +453,10 @@ impl NativeRuntime {
         if !self.server.has_pending_commit_timing_planning() {
             return;
         }
-        let predicted_total_cost = Duration::from_nanos(
-            self.render_journal
-                .prediction_with_kms_guard(
-                    Duration::from_nanos(self.presentation_timing.mode().refresh_interval_ns()),
-                    self.presentation_timing.apply_guard_ns(),
-                )
-                .total_cost_ns,
-        );
-        self.scheduled_presentation_target = super::planner::plan_commit_timing_target(
-            &mut self.presentation_deadline,
+        super::planner::plan_commit_timing_targets(
+            &self.presentation_deadline,
             &mut self.server,
-            &self.frame_scheduler,
-            self.scheduled_presentation_target,
             MonotonicTimestampNs::new(now_ns),
-            predicted_total_cost,
         );
     }
 
