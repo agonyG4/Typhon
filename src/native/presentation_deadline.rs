@@ -256,6 +256,48 @@ impl PreparedPhysicalPresentation {
     pub const fn logical_sequence(self) -> u64 {
         self.claim.sequence
     }
+
+    /// Two primary pageflips can never complete on the same refresh, so the
+    /// claim of a primary pageflip is at least one refresh after the previous
+    /// primary claim. Rounding a jittered or receive-based timestamp estimate
+    /// to the nearest refresh can land on the previous sequence; this floors
+    /// the claim instead of reporting a regression. Returns `None` when the
+    /// claim is already strictly later or belongs to another clock generation.
+    pub fn strictly_after_primary(self, previous: PrimaryRefreshClaim) -> Option<Self> {
+        if previous.clock_generation != self.claim.clock_generation {
+            return None;
+        }
+        let sequence = self.claim.sequence.max(previous.sequence.checked_add(1)?);
+        let presentation_time = self
+            .claim
+            .presentation_time
+            .max(MonotonicTimestampNs::new(previous.presentation_time.get().checked_add(1)?));
+        if sequence == self.claim.sequence && presentation_time == self.claim.presentation_time {
+            return None;
+        }
+        Some(Self {
+            claim: PrimaryRefreshClaim {
+                sequence,
+                presentation_time,
+                clock_generation: self.claim.clock_generation,
+            },
+        })
+    }
+
+    /// Keep a planner anchor from falling behind a primary claim that the
+    /// swapchain already recorded.
+    pub fn no_earlier_than(self, claim: PrimaryRefreshClaim) -> Self {
+        if claim.clock_generation != self.claim.clock_generation {
+            return self;
+        }
+        Self {
+            claim: PrimaryRefreshClaim {
+                sequence: self.claim.sequence.max(claim.sequence),
+                presentation_time: self.claim.presentation_time.max(claim.presentation_time),
+                clock_generation: self.claim.clock_generation,
+            },
+        }
+    }
 }
 
 impl PresentationDeadlinePlanner {
@@ -1233,6 +1275,74 @@ mod tests {
                 .is_none()
         );
         assert!(planner.next_variable_opportunity_id().is_none());
+    }
+
+    #[test]
+    fn primary_claim_within_half_refresh_of_previous_primary_is_floored() {
+        let refresh_ns = 6_060_606;
+        let mut planner = PresentationDeadlinePlanner::new(Duration::from_nanos(refresh_ns));
+        let previous = planner.prepare_presented(MonotonicTimestampNs::new(1_000_000_000));
+        planner.commit_presented(previous);
+        let previous = previous.claim();
+
+        // A late receive-based estimate followed by an accurate one lands
+        // less than half a refresh after the previous primary anchor.
+        let estimated = planner.prepare_presented(MonotonicTimestampNs::new(1_002_000_000));
+        assert_eq!(estimated.logical_sequence(), previous.sequence);
+
+        let floored = estimated
+            .strictly_after_primary(previous)
+            .expect("same-sequence claim is floored");
+        assert_eq!(floored.logical_sequence(), previous.sequence + 1);
+        assert_eq!(
+            floored.claim().presentation_time,
+            MonotonicTimestampNs::new(1_002_000_000)
+        );
+
+        let backwards = planner.prepare_presented(MonotonicTimestampNs::new(999_000_000));
+        let floored = backwards
+            .strictly_after_primary(previous)
+            .expect("backwards claim is floored");
+        assert_eq!(floored.logical_sequence(), previous.sequence + 1);
+        assert_eq!(
+            floored.claim().presentation_time,
+            MonotonicTimestampNs::new(1_000_000_001)
+        );
+    }
+
+    #[test]
+    fn strictly_later_or_foreign_generation_primary_claims_are_not_floored() {
+        let mut planner = PresentationDeadlinePlanner::new(Duration::from_nanos(6_060_606));
+        let previous = planner.prepare_presented(MonotonicTimestampNs::new(1_000_000_000));
+        planner.commit_presented(previous);
+        let previous = previous.claim();
+
+        let next = planner.prepare_presented(MonotonicTimestampNs::new(1_006_060_606));
+        assert!(next.strictly_after_primary(previous).is_none());
+
+        let foreign = PrimaryRefreshClaim {
+            clock_generation: previous.clock_generation + 1,
+            ..previous
+        };
+        let same = planner.prepare_presented(MonotonicTimestampNs::new(1_000_000_000));
+        assert!(same.strictly_after_primary(foreign).is_none());
+    }
+
+    #[test]
+    fn conservative_anchor_never_falls_behind_the_recorded_primary_claim() {
+        let mut planner = PresentationDeadlinePlanner::new(Duration::from_nanos(6_060_606));
+        planner.last_presented_sequence = 42;
+        planner.last_presented_at = Some(MonotonicTimestampNs::new(1_000_000_000));
+        let recorded = planner
+            .prepare_variable_presented(MonotonicTimestampNs::new(1_002_000_000))
+            .expect("variable claim")
+            .claim();
+        assert_eq!(recorded.sequence, 43);
+
+        let anchor = planner
+            .prepare_presented(MonotonicTimestampNs::new(1_002_000_000))
+            .no_earlier_than(recorded);
+        assert_eq!(anchor.logical_sequence(), 43);
     }
 
     #[test]

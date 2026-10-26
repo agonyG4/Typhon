@@ -959,6 +959,7 @@ mod tests {
             "physical_claim_overtake_recoveries=0",
             "physical_claim_overtake_recovery_failures=0",
             "physical_claim_fatal_violations=0",
+            "physical_claim_floor_corrections=0",
             "active_pageflip_interval_p50_us=0",
             "active_pageflip_interval_p95_us=0",
             "active_pageflip_interval_p99_us=0",
@@ -2992,6 +2993,7 @@ pub(crate) struct NativeFramePacing {
     physical_claim_overtake_recoveries: u64,
     physical_claim_overtake_recovery_failures: u64,
     physical_claim_fatal_violations: u64,
+    physical_claim_floor_corrections: u64,
     content_attribution: [u64; CONTENT_ATTRIBUTION_COUNT],
     last_prediction: Option<RenderPrediction>,
     last_primary_sequence: Option<u64>,
@@ -3230,6 +3232,7 @@ impl NativeFramePacing {
             physical_claim_overtake_recoveries: 0,
             physical_claim_overtake_recovery_failures: 0,
             physical_claim_fatal_violations: 0,
+            physical_claim_floor_corrections: 0,
             content_attribution: [0; CONTENT_ATTRIBUTION_COUNT],
             last_prediction: None,
             last_primary_sequence: None,
@@ -3286,6 +3289,13 @@ impl NativeFramePacing {
         if self.enabled {
             self.physical_claim_fatal_violations =
                 self.physical_claim_fatal_violations.saturating_add(1);
+        }
+    }
+
+    pub(crate) fn note_physical_claim_floor_correction(&mut self) {
+        if self.enabled {
+            self.physical_claim_floor_corrections =
+                self.physical_claim_floor_corrections.saturating_add(1);
         }
     }
     pub(crate) fn queue_visual(&mut self, now_ns: u64, render_generation: u64) {
@@ -5865,6 +5875,10 @@ impl NativeFramePacing {
                     self.physical_claim_fatal_violations,
                 ),
                 PacingField::u64(
+                    "physical_claim_floor_corrections",
+                    self.physical_claim_floor_corrections,
+                ),
+                PacingField::u64(
                     "content_attribution_callback_handoff_limited",
                     self.content_attribution
                         [ContentCadenceAttribution::CallbackHandoffLimited.index()],
@@ -6282,6 +6296,10 @@ impl NativeFramePacing {
                 PacingField::u64(
                     "physical_claim_fatal_violations",
                     self.physical_claim_fatal_violations,
+                ),
+                PacingField::u64(
+                    "physical_claim_floor_corrections",
+                    self.physical_claim_floor_corrections,
                 ),
                 PacingField::u64("scheduler_wakeup_lateness_p50_us", wake50),
                 PacingField::u64("scheduler_wakeup_lateness_p95_us", wake95),

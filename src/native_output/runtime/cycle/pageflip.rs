@@ -3140,6 +3140,26 @@ impl NativeRuntime {
                             timestamp_estimate,
                         )?,
                     };
+                    let previous_primary_claim =
+                        explicit.swapchain()?.last_presented_primary_claim();
+                    let prepared_physical = match previous_primary_claim
+                        .and_then(|previous| prepared_physical.strictly_after_primary(previous))
+                    {
+                        Some(floored) => {
+                            frame_pacing.note_physical_claim_floor_correction();
+                            eprintln!(
+                                "native output: physical primary claim floored after previous primary previous={:?} estimated={:?} floored={:?} reservation={:?} timestamp_uncertainty={:?} variable_violation={}",
+                                previous_primary_claim,
+                                prepared_physical.claim(),
+                                floored.claim(),
+                                pending_identity.frame.reservation,
+                                timestamp_estimate.uncertainty,
+                                variable_physical_violation.is_some(),
+                            );
+                            floored
+                        }
+                        None => prepared_physical,
+                    };
                     let actual_logical_sequence = prepared_physical.logical_sequence();
                     let previous_assignment = presented_planes.primary;
                     let presented_transition = scene_history
@@ -3318,7 +3338,8 @@ impl NativeRuntime {
                     }
                     if variable_physical_violation.is_some() {
                         let conservative_anchor = presentation_deadline
-                            .prepare_presented(MonotonicTimestampNs::new(compositor_receive_ns));
+                            .prepare_presented(MonotonicTimestampNs::new(compositor_receive_ns))
+                            .no_earlier_than(physical_claim);
                         presentation_deadline.commit_presented(conservative_anchor);
                     } else {
                         presentation_deadline.commit_presented(prepared_physical);
