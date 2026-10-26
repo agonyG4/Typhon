@@ -32,6 +32,29 @@ pub struct DirectScanoutSceneAnalysis {
     pub blockers: DirectScanoutSceneBlockers,
 }
 
+impl DirectScanoutSceneAnalysis {
+    /// Surface whose allocation feedback should prefer direct scanout.
+    /// Pending commits affect presentation readiness, not allocation preference.
+    pub fn feedback_surface_id(&self) -> Option<u32> {
+        if let Some(candidate) = self.candidate.as_ref() {
+            return Some(candidate.surface_id);
+        }
+        if self.blockers.reasons() != [DirectScanoutSceneRejection::PendingOrUnpublishedWork] {
+            return None;
+        }
+        self.coverage
+            .covering_application_group
+            .as_ref()?
+            .covering_surface
+            .as_ref()
+            .map(|source| source.surface_id)
+    }
+}
+
+#[cfg(test)]
+#[path = "direct_scanout_feedback_tests.rs"]
+mod feedback_tests;
+
 impl CompositorState {
     pub(in crate::compositor) fn direct_scanout_effect_identity_scene(
         &self,

@@ -101,6 +101,8 @@ fn fullscreen_identity_viewport_xrgb_dmabuf_is_direct_scanout_candidate() {
     let eligibility = capture_fullscreen_presentation_eligibility(&commands);
     assert!(eligibility.eligible);
     let candidate = capture_direct_scanout_candidate(&commands).unwrap();
+    let analysis = capture_direct_scanout_scene_analysis(&commands);
+    assert_eq!(analysis.feedback_surface_id(), Some(candidate.surface_id));
     let _server = stop_controllable_test_server(commands, server_thread);
 
     assert_eq!(candidate.buffer_size, BufferSize::new(1280, 800).unwrap());

@@ -228,9 +228,12 @@ pub(super) fn inspect_direct_presentation(
             })
         })
         .flatten();
-    let candidate_surface_id = direct_candidate
+    // Allocation preferences must survive ordinary pending commits. Actual
+    // presentation below still requires the fully validated direct candidate.
+    let candidate_surface_id = scene_analysis
         .as_ref()
-        .map(|candidate| candidate.surface_id);
+        .filter(|_| inspect_candidate)
+        .and_then(|analysis| analysis.feedback_surface_id());
     let direct_candidate_changed = inspect_candidate
         && direct_candidate_changed(
             direct_candidate_key,
