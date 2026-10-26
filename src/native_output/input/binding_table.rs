@@ -1056,4 +1056,30 @@ mod tests {
 
         assert_eq!(first, second);
     }
+
+    #[test]
+    fn default_super_e_launches_astrea_explorer_with_astrea_root_removed() {
+        let table = CompiledBindingTable::compile(default_astrea_binding_specs()).unwrap();
+        let matched = table
+            .match_binding(
+                ModifierMask::SUPER,
+                BindingTrigger::Press,
+                BindingInput::PhysicalKey(KEY_E),
+                false,
+                false,
+                AstreaSystemActionCapabilities::EMPTY,
+            )
+            .expect("Super+E should be bound by default");
+
+        let command = match table.action_catalog().action(matched.action) {
+            Some(BindingActionDefinition::LaunchCommand(command)) => command.clone(),
+            other => panic!("Super+E should launch a command, got {other:?}"),
+        };
+        assert_eq!(command, astrea_explorer_launch_command());
+        assert_eq!(&command[..3], ["env", "-u", "ASTREA_ROOT"]);
+        assert!(command[3].ends_with("astrea-explorer-open"));
+        assert_eq!(matched.repeat, RepeatPolicy::Disabled);
+        assert_eq!(matched.inhibition, InhibitionPolicy::Respect);
+        assert!(!table.binding(matched.binding).unwrap().reserved);
+    }
 }

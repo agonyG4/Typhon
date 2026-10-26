@@ -1082,7 +1082,7 @@ fn default_xf86_system_bindings_have_typed_actions_and_expected_policies() {
         .iter()
         .filter(|spec| !matches!(&spec.action, BindingActionDefinition::SystemAction(_)))
         .collect();
-    assert_eq!(existing_specs.len(), 38);
+    assert_eq!(existing_specs.len(), 40);
     assert!(existing_specs.iter().all(|spec| {
         matches!(
             spec.input,

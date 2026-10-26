@@ -16,6 +16,7 @@ pub(crate) const KEY_9: u16 = 10;
 pub(crate) const KEY_0: u16 = 11;
 pub(crate) const KEY_TAB: u16 = 15;
 pub(crate) const KEY_Q: u16 = 16;
+pub(crate) const KEY_E: u16 = 18;
 #[cfg(test)]
 pub(crate) const KEY_A: u16 = 30;
 pub(crate) const KEY_P: u16 = 25;

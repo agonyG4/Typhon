@@ -135,6 +135,27 @@ pub(super) const fn shortcut_phase(trigger: BindingTrigger, repeated: bool) -> A
     }
 }
 
+/// Command vector for the Super+E Astrea Explorer launcher.
+///
+/// `LaunchCommand` argv is spawned directly (no shell), so `$HOME` is resolved
+/// here. `ASTREA_ROOT` is removed from the child environment so the launcher
+/// selects its installed root instead of an inherited development root.
+pub(crate) fn astrea_explorer_launch_command() -> Vec<String> {
+    let launcher = match std::env::var_os("HOME") {
+        Some(home) if !home.is_empty() => std::path::Path::new(&home)
+            .join(".local/share/Astrea/bin/astrea-explorer-open")
+            .display()
+            .to_string(),
+        _ => "astrea-explorer-open".to_string(),
+    };
+    vec![
+        "env".to_string(),
+        "-u".to_string(),
+        "ASTREA_ROOT".to_string(),
+        launcher,
+    ]
+}
+
 pub(crate) fn default_astrea_binding_specs() -> Vec<BindingSpec> {
     let mut specs = vec![
         BindingSpec {
@@ -142,6 +163,15 @@ pub(crate) fn default_astrea_binding_specs() -> Vec<BindingSpec> {
             trigger: BindingTrigger::Press,
             input: BindingInput::PhysicalKey(KEY_Q),
             action: BindingActionDefinition::LaunchCommand(vec!["kitty".to_string()]),
+            repeat: RepeatPolicy::Disabled,
+            inhibition: InhibitionPolicy::Respect,
+            reserved: false,
+        },
+        BindingSpec {
+            modifiers: ModifierMask::SUPER,
+            trigger: BindingTrigger::Press,
+            input: BindingInput::PhysicalKey(KEY_E),
+            action: BindingActionDefinition::LaunchCommand(astrea_explorer_launch_command()),
             repeat: RepeatPolicy::Disabled,
             inhibition: InhibitionPolicy::Respect,
             reserved: false,
