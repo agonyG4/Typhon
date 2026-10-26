@@ -772,6 +772,7 @@ enum SameStorageReuseRejection {
     HeightChanged,
     ScaleChanged,
     TransformChanged,
+    ColorDepthChanged,
 }
 
 impl SameStorageReuseRejection {
@@ -785,6 +786,7 @@ impl SameStorageReuseRejection {
             Self::HeightChanged => "height_changed",
             Self::ScaleChanged => "scale_changed",
             Self::TransformChanged => "transform_changed",
+            Self::ColorDepthChanged => "color_depth_changed",
         }
     }
 }
@@ -833,6 +835,8 @@ fn same_storage_reuse_decision(
         Some(SameStorageReuseRejection::ScaleChanged)
     } else if current.transform != target.transform {
         Some(SameStorageReuseRejection::TransformChanged)
+    } else if current.color_depth != target.color_depth {
+        Some(SameStorageReuseRejection::ColorDepthChanged)
     } else {
         None
     };
@@ -1340,6 +1344,7 @@ impl NativeRuntime {
             self.output_capabilities.connector_name.clone(),
             physical_size_mm,
             &target.mode,
+            target.color_depth,
         ))
     }
 
@@ -2674,6 +2679,7 @@ impl NativeRuntime {
                 target.height,
                 output_epoch,
                 pool_generation,
+                target.color_depth,
                 job_id,
                 self.frame_index.wrapping_add(1).max(1),
                 frozen_frame,
@@ -2707,6 +2713,7 @@ impl NativeRuntime {
                     self.drm_session_generation,
                     pool_generation,
                     output_id,
+                    target.color_depth,
                     initial_generation,
                     self.cursor_image.clone(),
                 )?;
@@ -2871,6 +2878,9 @@ impl NativeRuntime {
         now_ns: u64,
     ) {
         self.target = target;
+        // A 10-bit request falls back to 8-bit when the live swapchain could
+        // not negotiate it; the snapshot must report what is actually scanned out.
+        self.target.color_depth = self.scanout.output_color_depth();
         self.output_epoch = output_epoch;
         self.scanout.bind_output_epoch(output_epoch);
         self.acquire_watches.set_output_epoch(output_epoch);

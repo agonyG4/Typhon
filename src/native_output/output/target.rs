@@ -289,6 +289,7 @@ fn select_kms_target_internal(
                         height: u32::from(mode.vdisplay),
                         scale_milli: 1000,
                         transform: oblivion_one::control_snapshots::OutputTransformSnapshot::Normal,
+                        color_depth: OutputColorDepth::Bits8,
                     },
                     capabilities: native_output_capabilities(&connector, &modes),
                 }));

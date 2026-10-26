@@ -973,7 +973,11 @@ impl NativeRuntime {
             }
         };
         println!("native output startup mode source: {mode_startup_source:?}");
-        let target = selection.target;
+        let mut target = selection.target;
+        let requested_color_depth = persisted_configuration
+            .as_ref()
+            .map(|configuration| configuration.color_depth())
+            .unwrap_or_default();
         let mut output_capabilities = selection.capabilities;
         let selected_sysfs_connector = selected_connector_for_kms_target(
             bootstrap.kms_device.as_deref(),
@@ -1121,6 +1125,7 @@ impl NativeRuntime {
                         drm_session_generation,
                         1,
                         output_id,
+                        requested_color_depth,
                         std::sync::Arc::clone(&initial_renderer_generation),
                         cursor_image.clone(),
                     )?;
@@ -1195,6 +1200,12 @@ impl NativeRuntime {
                 build_native_kms_startup_plan(kms_policy, scanout.kind(), discovery)?;
             (startup_plan, scanout)
         };
+        target.color_depth = scanout.output_color_depth();
+        println!(
+            "native output color depth: requested={} effective={}",
+            requested_color_depth.bits(),
+            target.color_depth.bits()
+        );
         publish_scanout_runtime_capabilities(&mut server, &scanout);
         if !scanout.render_worker_active() {
             scanout.publish_material_effect_generation(&initial_renderer_generation);

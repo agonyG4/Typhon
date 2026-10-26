@@ -52,10 +52,20 @@ pub(crate) fn choose_surfaceless_egl_config(
         .copied()
         .map(|config| native_egl_config_candidate(egl, display, config))
         .collect::<Result<Vec<_>, _>>()?;
+    // The context renders only into EGLImage-backed framebuffers, so its
+    // config just has to be GLES3-capable. Prefer the exact visual, then the
+    // XRGB8888 one: drivers without 2:10:10:10 configs still render 10-bit
+    // dmabufs through such a context.
+    let xrgb8888 = u32::from_le_bytes(*b"XR24");
     let selected = candidates
         .iter()
         .position(|candidate| {
             native_egl_config_candidate_matches_common(candidate, native_visual_id)
+        })
+        .or_else(|| {
+            candidates.iter().position(|candidate| {
+                native_egl_config_candidate_matches_common(candidate, xrgb8888)
+            })
         })
         .ok_or_else(|| {
             io::Error::other(format!(

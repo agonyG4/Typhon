@@ -54,6 +54,7 @@ use super::render_worker::{
 #[cfg(test)]
 use super::render_worker::validate_render_control_batch;
 use super::*;
+use crate::native_output::output::OutputColorDepth;
 use crate::native_output::presentation::async_validation::CompositedPresentationValidationKey;
 use crate::native_output::presentation::kms_timing::{KmsPresentationTiming, KmsSubmitWindow};
 use crate::native_output::presentation::transaction::{
@@ -537,6 +538,8 @@ pub(crate) struct AtomicEglGbmScanout {
     dmabuf_scanout_capabilities: DirectScanoutFeedbackCapabilities,
     dmabuf_kms_preferred_state: DmabufKmsPreferredState,
     pub(crate) format_modifier: DrmFormatModifierPair,
+    /// Whether this plane, renderer and allocator can drive a 10-bit swapchain.
+    ten_bit_output_capable: bool,
     drm_cleanup_armed: bool,
     deadline_hints_enabled: bool,
     counters: ExplicitOutputCounters,
@@ -760,6 +763,26 @@ fn discover_direct_scanout_capabilities(
             })
         })
         .collect()
+}
+
+/// Whether a 10-bit request would actually get a 2:10:10:10 swapchain rather
+/// than the 8-bit fallback.
+fn ten_bit_output_capable(
+    discovery: &AtomicDiscovery,
+    renderable: &[EglGlesDmabufFormat],
+    probe: &mut impl GbmAllocationProbe,
+) -> bool {
+    select_output_format_modifier_for_presentation(
+        oblivion_one::compositor::OutputPresentationMode::Vsync,
+        &discovery.plane_scanout_formats,
+        Some(&discovery.plane_async_scanout_formats),
+        renderable,
+        probe,
+        OutputColorDepth::Bits10,
+    )
+    .is_ok_and(|selected| {
+        output_format_color_depth(selected.fourcc) == OutputColorDepth::Bits10
+    })
 }
 
 impl GbmAllocationProbe for DeviceAllocationProbe<'_> {
@@ -1008,6 +1031,7 @@ fn create_synchronous_render_setup(
     width: u32,
     height: u32,
     pool_generation: u64,
+    color_depth: OutputColorDepth,
 ) -> io::Result<(
     AtomicRenderTransport,
     DrmFormatModifierPair,
@@ -1028,6 +1052,7 @@ fn create_synchronous_render_setup(
         Some(&discovery.plane_async_scanout_formats),
         bootstrap.renderable_dmabuf_formats(),
         &mut probe,
+        color_depth,
     )?;
     let (mut domain, info) = bootstrap.initialize_renderer(width, height, format_modifier)?;
     let pool = create_physical_pool_with_render_import(
@@ -1054,6 +1079,7 @@ fn create_worker_render_setup(
     width: u32,
     height: u32,
     pool_generation: u64,
+    color_depth: OutputColorDepth,
     initial_generation: std::sync::Arc<oblivion_one::effects::EffectRegistryGeneration>,
     cursor_image: std::sync::Arc<oblivion_one::cursor_theme::CompositorCursorImage>,
 ) -> io::Result<(
@@ -1076,6 +1102,7 @@ fn create_worker_render_setup(
         Some(&discovery.plane_async_scanout_formats),
         &renderable_formats,
         &mut probe,
+        color_depth,
     )?;
     let mut render_info = None;
     let pool = create_physical_pool_with_render_import(
@@ -1904,6 +1931,7 @@ impl AtomicEglGbmScanout {
         height: u32,
         output_epoch: oblivion_one::native::OutputEpochId,
         pool_generation: u64,
+        color_depth: OutputColorDepth,
         job_id: RenderWorkerJobId,
         frame_id: u64,
         frozen_frame: FrozenNativeRenderFrame,
@@ -1938,6 +1966,7 @@ impl AtomicEglGbmScanout {
             Some(&discovery.plane_async_scanout_formats),
             &self.renderable_dmabuf_formats,
             &mut probe,
+            color_depth,
         )?;
         let physical_pool = create_physical_output_pool(
             &physical_device,
@@ -2087,6 +2116,15 @@ impl AtomicEglGbmScanout {
         }
         let (physical_device, physical_pool, discovery, drm_rdev, format_modifier, width, height) =
             candidate.take_parts()?;
+        let ten_bit_output_capable = ten_bit_output_capable(
+            &discovery,
+            render_info.dmabuf_feedback.formats(),
+            &mut DeviceAllocationProbe {
+                device: &physical_device,
+                width,
+                height,
+            },
+        );
         let physical_identities = physical_pool.identities();
         if physical_pool.pool_generation() != candidate.identity.pool_generation
             || !physical_identities
@@ -2184,6 +2222,7 @@ impl AtomicEglGbmScanout {
         self.width = width;
         self.height = height;
         self.format_modifier = format_modifier;
+        self.ten_bit_output_capable = ten_bit_output_capable;
         self.render_slot_identities = self
             .physical_pool
             .as_ref()
@@ -2206,6 +2245,7 @@ impl AtomicEglGbmScanout {
         drm_session_generation: crate::native_output::output::DrmSessionGeneration,
         pool_generation: u64,
         output_id: OutputId,
+        color_depth: OutputColorDepth,
         initial_generation: std::sync::Arc<oblivion_one::effects::EffectRegistryGeneration>,
         cursor_image: std::sync::Arc<oblivion_one::cursor_theme::CompositorCursorImage>,
     ) -> io::Result<Self> {
@@ -2223,6 +2263,7 @@ impl AtomicEglGbmScanout {
             pool_generation,
             output_id,
             worker_policy,
+            color_depth,
             initial_generation,
             cursor_image,
         )
@@ -2239,6 +2280,7 @@ impl AtomicEglGbmScanout {
         drm_session_generation: crate::native_output::output::DrmSessionGeneration,
         pool_generation: u64,
         output_id: OutputId,
+        color_depth: OutputColorDepth,
         initial_generation: std::sync::Arc<oblivion_one::effects::EffectRegistryGeneration>,
         cursor_image: std::sync::Arc<oblivion_one::cursor_theme::CompositorCursorImage>,
     ) -> io::Result<Self> {
@@ -2252,6 +2294,7 @@ impl AtomicEglGbmScanout {
             pool_generation,
             output_id,
             AtomicRenderWorkerPolicy::Off,
+            color_depth,
             initial_generation,
             cursor_image,
         )
@@ -2267,6 +2310,7 @@ impl AtomicEglGbmScanout {
         pool_generation: u64,
         output_id: OutputId,
         worker_policy: AtomicRenderWorkerPolicy,
+        color_depth: OutputColorDepth,
         initial_generation: std::sync::Arc<oblivion_one::effects::EffectRegistryGeneration>,
         cursor_image: std::sync::Arc<oblivion_one::cursor_theme::CompositorCursorImage>,
     ) -> io::Result<Self> {
@@ -2282,6 +2326,7 @@ impl AtomicEglGbmScanout {
                     width,
                     height,
                     pool_generation,
+                    color_depth,
                 )
                 .map(|setup| {
                     (
@@ -2300,6 +2345,7 @@ impl AtomicEglGbmScanout {
                         width,
                         height,
                         pool_generation,
+                        color_depth,
                         std::sync::Arc::clone(&initial_generation),
                         std::sync::Arc::clone(&cursor_image),
                     ) {
@@ -2321,6 +2367,7 @@ impl AtomicEglGbmScanout {
                                 width,
                                 height,
                                 pool_generation,
+                                color_depth,
                             )
                             .map(|setup| {
                                 (
@@ -2342,6 +2389,7 @@ impl AtomicEglGbmScanout {
                         width,
                         height,
                         pool_generation,
+                        color_depth,
                         std::sync::Arc::clone(&initial_generation),
                         std::sync::Arc::clone(&cursor_image),
                     )?;
@@ -2368,6 +2416,15 @@ impl AtomicEglGbmScanout {
         );
 
         let renderable_dmabuf_formats = render_info.dmabuf_feedback.formats().to_vec();
+        let ten_bit_output_capable = ten_bit_output_capable(
+            discovery,
+            &renderable_dmabuf_formats,
+            &mut DeviceAllocationProbe {
+                device: &physical_device,
+                width,
+                height,
+            },
+        );
         let scanout_capabilities = discover_direct_scanout_capabilities(
             &discovery.plane_scanout_formats,
             &render_info.dmabuf_feedback,
@@ -2426,6 +2483,7 @@ impl AtomicEglGbmScanout {
             dmabuf_scanout_capabilities: scanout_capabilities,
             dmabuf_kms_preferred_state,
             format_modifier,
+            ten_bit_output_capable,
             drm_cleanup_armed: true,
             renderable_dmabuf_formats,
             deadline_hints_enabled: true,
@@ -2480,6 +2538,14 @@ impl AtomicEglGbmScanout {
 
     pub(crate) fn initial_slot(&self) -> OutputSlotId {
         OutputSlotId::new(0).expect("slot zero is valid")
+    }
+
+    pub(crate) const fn output_color_depth(&self) -> OutputColorDepth {
+        output_format_color_depth(self.format_modifier.fourcc)
+    }
+
+    pub(crate) const fn ten_bit_output_capable(&self) -> bool {
+        self.ten_bit_output_capable
     }
 
     pub(crate) const fn dimensions(&self) -> (u32, u32) {

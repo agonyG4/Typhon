@@ -183,6 +183,8 @@ struct OutputConfigureArgs {
     mode_id: u32,
     scale_milli: u32,
     transform: OutputTransformSnapshot,
+    #[serde(default)]
+    color_depth_bits: Option<u8>,
 }
 
 impl OutputConfigureArgs {
@@ -211,6 +213,7 @@ fn validate_output_configuration_change(
     mode_inventory: &NativeOutputModeInventory,
     mutation_busy: bool,
     mode_selection_supported: bool,
+    supported_color_depths: &[OutputColorDepth],
 ) -> Result<Option<NativeAppliedOutputConfiguration>, OutputConfigureValidationError> {
     let reject = |code, message| Err(OutputConfigureValidationError { code, message });
 
@@ -220,6 +223,18 @@ fn validate_output_configuration_change(
             "invalid output configuration request",
         );
     }
+    let requested_color_depth = match args.color_depth_bits {
+        None => current.color_depth,
+        Some(bits) => match OutputColorDepth::from_bits(bits) {
+            Some(depth) => depth,
+            None => {
+                return reject(
+                    ControlErrorCode::InvalidArgument,
+                    "invalid output color depth",
+                );
+            }
+        },
+    };
     if !output_available || args.output_id != expected_output_id {
         return reject(
             ControlErrorCode::UnknownOutput,
@@ -254,7 +269,8 @@ fn validate_output_configuration_change(
 
     let no_change = args.mode_id == current.mode_id
         && args.scale_milli == current.scale_milli
-        && args.transform == current.transform;
+        && args.transform == current.transform
+        && requested_color_depth == current.color_depth;
     if no_change {
         return Ok(None);
     }
@@ -269,6 +285,14 @@ fn validate_output_configuration_change(
         return reject(
             ControlErrorCode::UnsupportedOutputTransform,
             "canonical output transform mutation is unavailable",
+        );
+    }
+    if requested_color_depth != current.color_depth
+        && !supported_color_depths.contains(&requested_color_depth)
+    {
+        return reject(
+            ControlErrorCode::UnsupportedOutputMode,
+            "the requested color depth is unavailable for this output",
         );
     }
     if !mode_selection_supported {
@@ -287,6 +311,7 @@ fn validate_output_configuration_change(
         height: u32::from(mode.mode.vdisplay),
         scale_milli: current.scale_milli,
         transform: current.transform,
+        color_depth: requested_color_depth,
     }))
 }
 
@@ -4562,6 +4587,7 @@ impl NativeRuntime {
             &self.output_capabilities.mode_inventory,
             mutation_busy,
             self.mode_selection_supported(),
+            &self.scanout.supported_color_depths(),
         ) {
             Ok(target) => target,
             Err(error) => {
@@ -4628,8 +4654,18 @@ impl NativeRuntime {
             configuration_generation: self.output_configuration_generation.get(),
             scale_milli: self.target.scale_milli,
             transform: self.target.transform,
+            color_depth_bits: self.target.color_depth.bits(),
             mutation_capabilities: OutputMutationCapabilitiesSnapshot {
                 mode_selection_supported: self.mode_selection_supported(),
+                color_depth_bits: if self.mode_selection_supported() {
+                    self.scanout
+                        .supported_color_depths()
+                        .into_iter()
+                        .map(OutputColorDepth::bits)
+                        .collect()
+                } else {
+                    vec![self.target.color_depth.bits()]
+                },
                 scale: ScaleMutationCapabilitySnapshot {
                     supported: false,
                     min_milli: None,
@@ -4845,6 +4881,7 @@ mod output_configuration_validation_tests {
             height: 1080,
             scale_milli: 1000,
             transform: OutputTransformSnapshot::Normal,
+            color_depth: OutputColorDepth::Bits8,
         }
     }
 
@@ -4889,25 +4926,46 @@ mod output_configuration_validation_tests {
             mode_id,
             scale_milli: 1000,
             transform: OutputTransformSnapshot::Normal,
+            color_depth_bits: None,
         }
     }
+
+    const BOTH_COLOR_DEPTHS: [OutputColorDepth; 2] =
+        [OutputColorDepth::Bits8, OutputColorDepth::Bits10];
 
     fn validate(
         args: &OutputConfigureArgs,
         mutation_busy: bool,
         mode_selection_supported: bool,
     ) -> Result<Option<NativeAppliedOutputConfiguration>, OutputConfigureValidationError> {
+        validate_with_depths(
+            args,
+            current_configuration(),
+            mutation_busy,
+            mode_selection_supported,
+            &BOTH_COLOR_DEPTHS,
+        )
+    }
+
+    fn validate_with_depths(
+        args: &OutputConfigureArgs,
+        current: NativeAppliedOutputConfiguration,
+        mutation_busy: bool,
+        mode_selection_supported: bool,
+        supported_color_depths: &[OutputColorDepth],
+    ) -> Result<Option<NativeAppliedOutputConfiguration>, OutputConfigureValidationError> {
         let (public_modes, inventory) = test_inventory();
         validate_output_configuration_change(
             args,
             "output-11",
             true,
-            current_configuration(),
+            current,
             OutputConfigurationGeneration::initial(),
             &public_modes,
             &inventory,
             mutation_busy,
             mode_selection_supported,
+            supported_color_depths,
         )
     }
 
@@ -4965,5 +5023,64 @@ mod output_configuration_validation_tests {
             validate(&transform, false, true).unwrap_err().code,
             ControlErrorCode::UnsupportedOutputTransform
         );
+    }
+
+    #[test]
+    fn depth_only_change_to_a_supported_depth_is_queued() {
+        let mut request = args(1);
+        request.color_depth_bits = Some(10);
+
+        let resolved = validate(&request, false, true)
+            .unwrap()
+            .expect("depth-only change is queued");
+
+        assert_eq!(resolved.color_depth, OutputColorDepth::Bits10);
+        assert_eq!(resolved.mode_id, 1);
+        assert_eq!((resolved.width, resolved.height), (1920, 1080));
+    }
+
+    #[test]
+    fn unsupported_color_depth_is_rejected() {
+        let mut request = args(1);
+        request.color_depth_bits = Some(10);
+
+        let error = validate_with_depths(
+            &request,
+            current_configuration(),
+            false,
+            true,
+            &[OutputColorDepth::Bits8],
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, ControlErrorCode::UnsupportedOutputMode);
+        assert_eq!(
+            error.message,
+            "the requested color depth is unavailable for this output"
+        );
+    }
+
+    #[test]
+    fn invalid_color_depth_bits_are_rejected() {
+        let mut request = args(1);
+        request.color_depth_bits = Some(12);
+
+        let error = validate(&request, false, true).unwrap_err();
+
+        assert_eq!(error.code, ControlErrorCode::InvalidArgument);
+        assert_eq!(error.message, "invalid output color depth");
+    }
+
+    #[test]
+    fn omitted_color_depth_keeps_the_current_depth() {
+        let mut ten_bit_current = current_configuration();
+        ten_bit_current.color_depth = OutputColorDepth::Bits10;
+
+        assert!(
+            validate_with_depths(&args(1), ten_bit_current, false, true, &BOTH_COLOR_DEPTHS)
+                .unwrap()
+                .is_none()
+        );
+        assert!(validate(&args(1), false, true).unwrap().is_none());
     }
 }

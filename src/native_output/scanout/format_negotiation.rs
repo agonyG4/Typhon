@@ -9,6 +9,23 @@ use oblivion_one::{
     },
 };
 
+use crate::native_output::output::OutputColorDepth;
+
+pub(crate) const XRGB2101010_FOURCC: u32 = u32::from_le_bytes(*b"XR30");
+pub(crate) const XBGR2101010_FOURCC: u32 = u32::from_le_bytes(*b"XB30");
+pub(crate) const ARGB2101010_FOURCC: u32 = u32::from_le_bytes(*b"AR30");
+pub(crate) const ABGR2101010_FOURCC: u32 = u32::from_le_bytes(*b"AB30");
+
+/// Color depth an output swapchain FourCC actually carries.
+pub(crate) const fn output_format_color_depth(fourcc: u32) -> OutputColorDepth {
+    match fourcc {
+        XRGB2101010_FOURCC | XBGR2101010_FOURCC | ARGB2101010_FOURCC | ABGR2101010_FOURCC => {
+            OutputColorDepth::Bits10
+        }
+        _ => OutputColorDepth::Bits8,
+    }
+}
+
 pub(crate) trait GbmAllocationProbe {
     fn supports(&mut self, candidate: DrmFormatModifierPair) -> bool;
 }
@@ -164,6 +181,7 @@ pub(crate) fn select_output_format_modifier(
         None,
         egl,
         gbm,
+        OutputColorDepth::Bits8,
     )
 }
 
@@ -173,6 +191,7 @@ pub(crate) fn select_output_format_modifier_for_presentation(
     async_drm: Option<&[DrmFormatModifierPair]>,
     egl: &[EglGlesDmabufFormat],
     gbm: &mut impl GbmAllocationProbe,
+    color_depth: OutputColorDepth,
 ) -> io::Result<DrmFormatModifierPair> {
     let drm = if presentation_mode.is_async() {
         async_drm.unwrap_or(&[])
@@ -189,7 +208,9 @@ pub(crate) fn select_output_format_modifier_for_presentation(
                     && renderable.modifier.0 == candidate.modifier
             })
         })
-        .filter_map(|candidate| preference_key(candidate).map(|key| (key, candidate)))
+        .filter_map(|candidate| {
+            preference_key(candidate, color_depth).map(|key| (key, candidate))
+        })
         .collect::<Vec<_>>();
     candidates.sort_unstable_by_key(|(key, _)| *key);
     candidates.dedup_by_key(|(_, candidate)| *candidate);
@@ -207,13 +228,33 @@ pub(crate) fn select_output_format_modifier_for_presentation(
     )))
 }
 
-fn preference_key(candidate: DrmFormatModifierPair) -> Option<(u8, u64)> {
+/// Orders opaque before alpha and tiled before linear. A 10-bit request ranks
+/// the 2:10:10:10 formats first and keeps the 8-bit ones as the fallback.
+fn preference_key(
+    candidate: DrmFormatModifierPair,
+    color_depth: OutputColorDepth,
+) -> Option<(u8, u64)> {
     let linear = candidate.modifier == DrmModifier::LINEAR.0;
-    match (candidate.fourcc, linear) {
-        (DrmFormat::XRGB8888_FOURCC, false) => Some((0, candidate.modifier)),
-        (DrmFormat::ARGB8888_FOURCC, false) => Some((1, candidate.modifier)),
-        (DrmFormat::XRGB8888_FOURCC, true) => Some((2, candidate.modifier)),
-        (DrmFormat::ARGB8888_FOURCC, true) => Some((3, candidate.modifier)),
+    let eight_bit = match (candidate.fourcc, linear) {
+        (DrmFormat::XRGB8888_FOURCC, false) => Some(0),
+        (DrmFormat::ARGB8888_FOURCC, false) => Some(1),
+        (DrmFormat::XRGB8888_FOURCC, true) => Some(2),
+        (DrmFormat::ARGB8888_FOURCC, true) => Some(3),
         _ => None,
-    }
+    };
+    let rank = match color_depth {
+        OutputColorDepth::Bits8 => eight_bit,
+        OutputColorDepth::Bits10 => match (candidate.fourcc, linear) {
+            (XRGB2101010_FOURCC, false) => Some(0),
+            (XBGR2101010_FOURCC, false) => Some(1),
+            (ARGB2101010_FOURCC, false) => Some(2),
+            (ABGR2101010_FOURCC, false) => Some(3),
+            (XRGB2101010_FOURCC, true) => Some(4),
+            (XBGR2101010_FOURCC, true) => Some(5),
+            (ARGB2101010_FOURCC, true) => Some(6),
+            (ABGR2101010_FOURCC, true) => Some(7),
+            _ => eight_bit.map(|rank| rank + 8),
+        },
+    }?;
+    Some((rank, candidate.modifier))
 }

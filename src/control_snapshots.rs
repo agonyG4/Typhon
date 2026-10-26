@@ -486,6 +486,7 @@ pub struct OutputMutationCapabilitiesSnapshot {
     pub enable_disable_supported: bool,
     pub topology_supported: bool,
     pub vrr_mutation_supported: bool,
+    pub color_depth_bits: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -531,6 +532,7 @@ pub struct OutputSnapshot {
     pub configuration_generation: u64,
     pub scale_milli: u32,
     pub transform: OutputTransformSnapshot,
+    pub color_depth_bits: u8,
     pub mutation_capabilities: OutputMutationCapabilitiesSnapshot,
     pub position: PositionSnapshot,
     pub focused: bool,
@@ -1227,6 +1229,7 @@ mod tests {
                 configuration_generation: 1,
                 scale_milli: 1000,
                 transform: OutputTransformSnapshot::Normal,
+                color_depth_bits: 8,
                 mutation_capabilities: OutputMutationCapabilitiesSnapshot {
                     mode_selection_supported: false,
                     scale: ScaleMutationCapabilitySnapshot {
@@ -1242,6 +1245,7 @@ mod tests {
                     enable_disable_supported: false,
                     topology_supported: false,
                     vrr_mutation_supported: false,
+                    color_depth_bits: vec![8],
                 },
                 position: PositionSnapshot { x: 0, y: 0 },
                 focused: true,

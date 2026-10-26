@@ -70,6 +70,32 @@ impl OutputConfigurationGeneration {
     }
 }
 
+/// Bits per color channel of the output swapchain. 10-bit renders into a
+/// 2:10:10:10 primary-plane buffer; the driver picks the link depth from it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub(crate) enum OutputColorDepth {
+    #[default]
+    Bits8,
+    Bits10,
+}
+
+impl OutputColorDepth {
+    pub(crate) const fn bits(self) -> u8 {
+        match self {
+            Self::Bits8 => 8,
+            Self::Bits10 => 10,
+        }
+    }
+
+    pub(crate) const fn from_bits(bits: u8) -> Option<Self> {
+        match bits {
+            8 => Some(Self::Bits8),
+            10 => Some(Self::Bits10),
+            _ => None,
+        }
+    }
+}
+
 /// One user-visible applied Display configuration. Native KMS identifiers and
 /// the exact mode remain runtime-only and are never written to persistence.
 #[derive(Debug, Clone, Copy)]
@@ -82,6 +108,7 @@ pub(crate) struct NativeAppliedOutputConfiguration {
     pub(crate) height: u32,
     pub(crate) scale_milli: u32,
     pub(crate) transform: oblivion_one::control_snapshots::OutputTransformSnapshot,
+    pub(crate) color_depth: OutputColorDepth,
 }
 
 pub(crate) const OUTPUT_CONFIGURATION_ROLLBACK_TIMEOUT_NS: u64 = 15_000_000_000;
@@ -565,6 +592,10 @@ pub(crate) struct PersistedOutputConfiguration {
     pub(crate) connector_name: String,
     pub(crate) physical_size_mm: Option<PersistedOutputPhysicalSize>,
     pub(crate) mode: NativeOutputModeTimingFingerprint,
+    /// Absent in files written before color depth was configurable; those
+    /// keep the 8-bit default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) color_depth_bits: Option<u8>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -578,13 +609,21 @@ impl PersistedOutputConfiguration {
         connector_name: impl Into<String>,
         physical_size_mm: Option<PersistedOutputPhysicalSize>,
         mode: &drm_sys::drm_mode_modeinfo,
+        color_depth: OutputColorDepth,
     ) -> Self {
         Self {
             version: 1,
             connector_name: connector_name.into(),
             physical_size_mm,
             mode: NativeOutputModeTimingFingerprint::from_mode(mode),
+            color_depth_bits: Some(color_depth.bits()),
         }
+    }
+
+    pub(crate) fn color_depth(&self) -> OutputColorDepth {
+        self.color_depth_bits
+            .and_then(OutputColorDepth::from_bits)
+            .unwrap_or_default()
     }
 
     pub(crate) fn parse(bytes: &[u8]) -> Result<Self, PersistedOutputConfigurationError> {
@@ -652,6 +691,9 @@ impl PersistedOutputConfiguration {
             || !connector_identity_is_valid
             || !physical_size_is_valid
             || !self.mode.is_valid()
+            || self
+                .color_depth_bits
+                .is_some_and(|bits| OutputColorDepth::from_bits(bits).is_none())
         {
             return Err(PersistedOutputConfigurationError::Invalid);
         }
@@ -703,6 +745,7 @@ mod tests {
             height: u32::from(height),
             scale_milli: 1000,
             transform: oblivion_one::control_snapshots::OutputTransformSnapshot::Normal,
+            color_depth: OutputColorDepth::Bits8,
         }
     }
 
@@ -1047,7 +1090,7 @@ mod tests {
         metadata_changed.type_ = drm_sys::DRM_MODE_TYPE_PREFERRED;
         metadata_changed.name[0] = b'r' as _;
 
-        let saved = PersistedOutputConfiguration::from_native_mode("DP-1", None, &mode);
+        let saved = PersistedOutputConfiguration::from_native_mode("DP-1", None, &mode, OutputColorDepth::Bits8);
 
         assert!(saved.matches_native_mode(&metadata_changed));
     }
@@ -1060,7 +1103,7 @@ mod tests {
         let mut porch_changed = mode;
         porch_changed.hsync_start += 1;
 
-        let saved = PersistedOutputConfiguration::from_native_mode("DP-1", None, &mode);
+        let saved = PersistedOutputConfiguration::from_native_mode("DP-1", None, &mode, OutputColorDepth::Bits8);
 
         assert!(!saved.matches_native_mode(&clock_changed));
         assert!(!saved.matches_native_mode(&porch_changed));
@@ -1078,6 +1121,7 @@ mod tests {
                 height_mm: 340,
             }),
             &mode,
+            OutputColorDepth::Bits8,
         );
 
         assert!(
@@ -1108,7 +1152,12 @@ mod tests {
     #[test]
     fn persisted_output_schema_rejects_unknown_fields_and_invalid_versions() {
         let mut saved =
-            PersistedOutputConfiguration::from_native_mode("DP-1", None, &native_mode());
+            PersistedOutputConfiguration::from_native_mode(
+                "DP-1",
+                None,
+                &native_mode(),
+                OutputColorDepth::Bits10,
+            );
         let valid = serde_json::to_vec(&saved).expect("schema serializes");
         assert!(PersistedOutputConfiguration::parse(&valid).is_ok());
 
@@ -1121,9 +1170,37 @@ mod tests {
         let with_unknown_field = serde_json::to_vec(&unknown).expect("unknown field serializes");
         assert!(PersistedOutputConfiguration::parse(&with_unknown_field).is_err());
 
+        let mut unsupported_depth = saved.clone();
+        unsupported_depth.color_depth_bits = Some(12);
+        let unsupported_depth = serde_json::to_vec(&unsupported_depth).expect("schema serializes");
+        assert!(PersistedOutputConfiguration::parse(&unsupported_depth).is_err());
+
         saved.version = 2;
         let unsupported_version = serde_json::to_vec(&saved).expect("schema serializes");
         assert!(PersistedOutputConfiguration::parse(&unsupported_version).is_err());
+    }
+
+    #[test]
+    fn persisted_color_depth_round_trips_and_defaults_to_eight_bit_for_older_files() {
+        let saved = PersistedOutputConfiguration::from_native_mode(
+            "DP-1",
+            None,
+            &native_mode(),
+            OutputColorDepth::Bits10,
+        );
+        let encoded = saved.encode().expect("schema encodes");
+        let parsed = PersistedOutputConfiguration::parse(&encoded).expect("schema parses");
+        assert_eq!(parsed.color_depth(), OutputColorDepth::Bits10);
+
+        let mut legacy: serde_json::Value =
+            serde_json::from_slice(&encoded).expect("serialized schema parses as JSON");
+        legacy
+            .as_object_mut()
+            .expect("record is a JSON object")
+            .remove("colorDepthBits");
+        let legacy = serde_json::to_vec(&legacy).expect("legacy record serializes");
+        let parsed = PersistedOutputConfiguration::parse(&legacy).expect("legacy record parses");
+        assert_eq!(parsed.color_depth(), OutputColorDepth::Bits8);
     }
 
     fn native_mode() -> drm_sys::drm_mode_modeinfo {

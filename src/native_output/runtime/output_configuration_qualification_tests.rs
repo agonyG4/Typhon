@@ -568,6 +568,7 @@ fn configuration(
         height: u32::from(height),
         scale_milli: 1000,
         transform: OutputTransformSnapshot::Normal,
+        color_depth: OutputColorDepth::Bits8,
     }
 }
 
@@ -602,6 +603,8 @@ fn same_storage_reuse_reports_each_storage_topology_rejection() {
     changed_connector.connector_id += 1;
     let mut changed_crtc = refresh_target;
     changed_crtc.crtc_id += 1;
+    let mut changed_color_depth = refresh_target;
+    changed_color_depth.color_depth = OutputColorDepth::Bits10;
 
     for (target, reason, reason_name) in [
         (
@@ -633,6 +636,11 @@ fn same_storage_reuse_reports_each_storage_topology_rejection() {
             changed_transform,
             SameStorageReuseRejection::TransformChanged,
             "transform_changed",
+        ),
+        (
+            changed_color_depth,
+            SameStorageReuseRejection::ColorDepthChanged,
+            "color_depth_changed",
         ),
     ] {
         assert_eq!(
@@ -729,6 +737,9 @@ fn same_storage_reuse_rejection_order_is_deterministic() {
             }
             SameStorageReuseRejection::TransformChanged => {
                 ordered_target.transform = current.transform
+            }
+            SameStorageReuseRejection::ColorDepthChanged => {
+                ordered_target.color_depth = current.color_depth
             }
             SameStorageReuseRejection::ScanoutBackend
             | SameStorageReuseRejection::RenderWorkerInactive => unreachable!(),

@@ -787,6 +787,24 @@ impl NativeScanoutBackend {
         }
     }
 
+    pub(crate) fn output_color_depth(&self) -> crate::native_output::output::OutputColorDepth {
+        output_format_color_depth(self.scanout_format())
+    }
+
+    /// Color depths this backend can switch to. Only the explicit Atomic
+    /// swapchain negotiates its format; the others are fixed at 8 bits.
+    pub(crate) fn supported_color_depths(
+        &self,
+    ) -> Vec<crate::native_output::output::OutputColorDepth> {
+        use crate::native_output::output::OutputColorDepth;
+        match self {
+            Self::AtomicEglGbm(scanout) if scanout.ten_bit_output_capable() => {
+                vec![OutputColorDepth::Bits8, OutputColorDepth::Bits10]
+            }
+            _ => vec![OutputColorDepth::Bits8],
+        }
+    }
+
     pub(crate) fn finish_initial_scanout(&mut self) {
         match self {
             Self::AtomicEglGbm(_) => {}

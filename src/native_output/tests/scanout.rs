@@ -1,4 +1,5 @@
 use super::*;
+use crate::native_output::output::OutputColorDepth;
 use oblivion_one::native::kms::DrmFormatModifierPair;
 use oblivion_one::render_backend::{
     buffer::{DrmFormat, DrmModifier},
@@ -96,9 +97,108 @@ fn async_modifier_intersection_requires_explicit_async_formats() {
         None,
         &egl,
         &mut TestGbmAllocationProbe { rejected: vec![] },
+        OutputColorDepth::Bits8,
     );
 
     assert!(result.is_err());
+}
+
+fn select_for_depth(
+    drm: &[DrmFormatModifierPair],
+    egl: &[EglGlesDmabufFormat],
+    rejected: Vec<DrmFormatModifierPair>,
+    color_depth: OutputColorDepth,
+) -> io::Result<DrmFormatModifierPair> {
+    select_output_format_modifier_for_presentation(
+        OutputPresentationMode::Vsync,
+        drm,
+        None,
+        egl,
+        &mut TestGbmAllocationProbe { rejected },
+        color_depth,
+    )
+}
+
+fn xrgb8_tiled() -> DrmFormatModifierPair {
+    DrmFormatModifierPair {
+        fourcc: DrmFormat::XRGB8888_FOURCC,
+        modifier: 11,
+    }
+}
+
+fn xr30_tiled() -> DrmFormatModifierPair {
+    DrmFormatModifierPair {
+        fourcc: XRGB2101010_FOURCC,
+        modifier: 11,
+    }
+}
+
+fn xb30_tiled() -> DrmFormatModifierPair {
+    DrmFormatModifierPair {
+        fourcc: XBGR2101010_FOURCC,
+        modifier: 11,
+    }
+}
+
+fn egl_tiled(fourcc: u32) -> EglGlesDmabufFormat {
+    EglGlesDmabufFormat::new(DrmFormat::from_fourcc(fourcc), DrmModifier(11))
+}
+
+#[test]
+fn ten_bit_request_selects_the_ten_bit_pair_and_eight_bit_request_keeps_eight_bit() {
+    let drm = [xrgb8_tiled(), xr30_tiled()];
+    let egl = [
+        egl_tiled(DrmFormat::XRGB8888_FOURCC),
+        egl_tiled(XRGB2101010_FOURCC),
+    ];
+
+    assert_eq!(
+        select_for_depth(&drm, &egl, vec![], OutputColorDepth::Bits10).unwrap(),
+        xr30_tiled(),
+    );
+    assert_eq!(
+        select_for_depth(&drm, &egl, vec![], OutputColorDepth::Bits8).unwrap(),
+        xrgb8_tiled(),
+    );
+}
+
+#[test]
+fn ten_bit_request_falls_back_to_eight_bit_when_the_ten_bit_pair_is_not_renderable() {
+    let drm = [xrgb8_tiled(), xr30_tiled()];
+    let egl = [egl_tiled(DrmFormat::XRGB8888_FOURCC)];
+
+    assert_eq!(
+        select_for_depth(&drm, &egl, vec![], OutputColorDepth::Bits10).unwrap(),
+        xrgb8_tiled(),
+    );
+}
+
+#[test]
+fn ten_bit_request_falls_back_to_eight_bit_when_gbm_rejects_the_ten_bit_pair() {
+    let drm = [xrgb8_tiled(), xr30_tiled()];
+    let egl = [
+        egl_tiled(DrmFormat::XRGB8888_FOURCC),
+        egl_tiled(XRGB2101010_FOURCC),
+    ];
+
+    assert_eq!(
+        select_for_depth(&drm, &egl, vec![xr30_tiled()], OutputColorDepth::Bits10).unwrap(),
+        xrgb8_tiled(),
+    );
+}
+
+#[test]
+fn ten_bit_request_uses_xbgr2101010_when_xr30_is_absent() {
+    let drm = [xrgb8_tiled(), xb30_tiled()];
+    let egl = [
+        egl_tiled(DrmFormat::XRGB8888_FOURCC),
+        egl_tiled(XBGR2101010_FOURCC),
+    ];
+
+    assert_eq!(
+        select_for_depth(&drm, &egl, vec![], OutputColorDepth::Bits10).unwrap(),
+        xb30_tiled(),
+    );
 }
 
 #[test]

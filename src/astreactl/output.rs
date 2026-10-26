@@ -125,7 +125,7 @@ pub fn human(result: &AstreactlResult) -> String {
                             })
                             .unwrap_or_else(|| "unknown mode".to_string());
                         format!(
-                            "{}\t{}\t{}\t{}",
+                            "{}\t{}\t{}\t{}\t{}-bit",
                             sanitize_terminal_text(&output.name),
                             sanitize_terminal_text(&output.backend),
                             mode,
@@ -133,7 +133,8 @@ pub fn human(result: &AstreactlResult) -> String {
                                 "enabled"
                             } else {
                                 "disabled"
-                            }
+                            },
+                            output.color_depth_bits
                         )
                     })
                     .collect::<Vec<_>>()
@@ -495,6 +496,7 @@ mod tests {
                 configuration_generation: 1,
                 scale_milli: 1000,
                 transform: crate::control_snapshots::OutputTransformSnapshot::Normal,
+                color_depth_bits: 8,
                 mutation_capabilities:
                     crate::control_snapshots::OutputMutationCapabilitiesSnapshot {
                         mode_selection_supported: false,
@@ -511,6 +513,7 @@ mod tests {
                         enable_disable_supported: false,
                         topology_supported: false,
                         vrr_mutation_supported: false,
+                        color_depth_bits: vec![8],
                     },
                 position: crate::control_snapshots::PositionSnapshot { x: 0, y: 0 },
                 focused: true,
@@ -537,7 +540,10 @@ mod tests {
         });
 
         let output = human(&value);
-        assert_eq!(output, "DP-1\tatomic\t1920x1080 @ 165.000 Hz\tenabled");
+        assert_eq!(
+            output,
+            "DP-1\tatomic\t1920x1080 @ 165.000 Hz\tenabled\t8-bit"
+        );
         assert!(!output.contains("preferred"));
     }
 
