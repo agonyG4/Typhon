@@ -94,6 +94,9 @@ use super::{
 
 const MAX_WAYLAND_ACCEPTS_PER_DISPATCH: usize = 16;
 const MAX_WAYLAND_CLIENTS_PER_DISPATCH: usize = 32;
+// Grow lazily when a client temporarily stops reading (for example while
+// loading a game scene), instead of disconnecting at libwayland's 4 KiB default.
+const MAX_WAYLAND_CLIENT_BUFFER_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug)]
 pub struct OwnCompositorServer {
@@ -534,6 +537,9 @@ impl OwnCompositorServer {
         };
         let display =
             Display::new().map_err(|error| CompositorError::DisplayInit(error.to_string()))?;
+        display
+            .handle()
+            .set_default_max_buffer_size(MAX_WAYLAND_CLIENT_BUFFER_BYTES);
         #[cfg(test)]
         let syncobj_device = if gpu_buffers_enabled {
             DrmSyncobjDevice::open_available()

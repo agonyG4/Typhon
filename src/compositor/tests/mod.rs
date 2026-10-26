@@ -183,3 +183,5 @@ mod xdg_decoration;
 mod xdg_output;
 mod xwayland;
 mod xwayland_selection;
+
+mod client_backpressure;
