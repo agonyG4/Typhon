@@ -508,9 +508,10 @@ fn translucent_egl_presentation_command_is_not_an_opaque_occluder() {
         .commands
         .last()
         .expect("surface command is emitted");
+    // One opacity per command: the output background, then the surface.
     assert_eq!(
         harness.renderer.scene_state.presentation_opacities,
-        vec![0.5]
+        vec![1.0, 0.5]
     );
     assert!(translucent_command.opaque_regions.is_empty());
 
@@ -545,9 +546,10 @@ fn translucent_egl_presentation_command_is_not_an_opaque_occluder() {
         .commands
         .last()
         .expect("surface command is emitted");
+    // One opacity per command: the output background, then the surface.
     assert_eq!(
         harness.renderer.scene_state.presentation_opacities,
-        vec![1.0]
+        vec![1.0, 1.0]
     );
     assert!(!opaque_command.opaque_regions.is_empty());
 
@@ -582,11 +584,63 @@ fn translucent_egl_presentation_command_is_not_an_opaque_occluder() {
         .commands
         .last()
         .expect("surface command is emitted");
+    // One opacity per command: the output background, then the surface.
     assert_eq!(
         harness.renderer.scene_state.presentation_opacities,
-        vec![0.0]
+        vec![1.0, 0.0]
     );
     assert!(zero_command.opaque_regions.is_empty());
+}
+
+#[test]
+fn presentation_opacities_stay_aligned_with_commands_across_groups() {
+    // A fading window followed by an opaque one: the faded group's last
+    // command (a title, in the special workspace close) must not read the
+    // next group's opacity.
+    let mut harness = GlesEffectTestHarness::new(320, 200);
+    let faded = test_shm_surface(RenderableSurfaceDamage::full());
+    let mut opaque = test_shm_surface(RenderableSurfaceDamage::full());
+    opaque.surface_id = 8;
+    let surfaces = vec![faded, opaque];
+    let signatures = egl_scene_surface_signatures(&surfaces);
+    let faded_opacity = PresentationGroupOpacity::with_scene_node(
+        oblivion_one::core::SceneNodeId::from_raw(1).expect("presentation scene node"),
+        7,
+        PresentationOpacity::new(0.25).expect("presentation opacity"),
+        None,
+    );
+
+    harness.renderer.scene_state.rebuild_scene_commands(
+        320,
+        200,
+        &surfaces,
+        &[],
+        &[],
+        1,
+        1.0,
+        1,
+        &signatures,
+        &[],
+        0,
+        &[faded_opacity],
+        &[],
+        &HashMap::from([(7, 7), (8, 8)]),
+        oblivion_one::compositor::SpecialWorkspaceDim::default(),
+        OutputFramebufferOrigin::BottomLeft,
+    );
+
+    let scene = &harness.renderer.scene_state;
+    assert_eq!(scene.presentation_opacities.len(), scene.commands.len());
+    let opacity_of = |surface_id| {
+        let index = scene
+            .commands
+            .iter()
+            .position(|command| command.layer == EglDrawLayer::Surface(surface_id))
+            .expect("surface command is emitted");
+        scene.presentation_opacities[index]
+    };
+    assert_eq!(opacity_of(7), 0.25);
+    assert_eq!(opacity_of(8), 1.0);
 }
 
 #[test]
@@ -1484,9 +1538,8 @@ fn special_workspace_dim_command_precedes_anchor_group_in_egl_scene() {
     let scene = &harness.renderer.scene_state;
     let layers = scene.commands.iter().map(|c| c.layer).collect::<Vec<_>>();
     assert_eq!(layers.len(), 3, "background, dim, surface");
-    // The leading background command has no opacity entry, matching the
-    // translucent presentation test; the dim takes its entry like a group.
-    assert_eq!(scene.presentation_opacities.len(), layers.len() - 1);
+    // Every command, the background and the dim included, has its own opacity.
+    assert_eq!(scene.presentation_opacities.len(), layers.len());
     assert_eq!(layers[1], dim_layer, "dim sits directly before the anchor");
     assert_eq!(
         scene.commands[1].bounds,

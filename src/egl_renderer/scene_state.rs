@@ -426,6 +426,9 @@ impl SceneRenderState {
             height,
             framebuffer_origin,
         );
+        // Opacities are indexed by command, so the background needs its own
+        // entry; without it every command read its successor's opacity.
+        self.presentation_opacities.push(1.0);
 
         let render_assignments =
             compositor::surface_render_space_assignments(surfaces, output_scale);
