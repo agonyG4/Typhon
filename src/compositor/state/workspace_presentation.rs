@@ -1,6 +1,9 @@
+use crate::compositor::state::special_workspace_presentation::SpecialWorkspacePresentationSample;
 use crate::compositor::{PopupLifecycle, RenderableSurface, SceneNodeId};
-use crate::presentation_animation::{AnimationCurve, AnimationTime};
-use crate::wm::{WorkspaceId, WorkspaceLocation, WorkspaceManager, WorkspaceSwitchOutcome};
+use crate::presentation_animation::{AnimationCurve, AnimationTime, SpringSpec};
+use crate::wm::{
+    SpecialWorkspaceId, WorkspaceId, WorkspaceLocation, WorkspaceManager, WorkspaceSwitchOutcome,
+};
 use std::collections::HashMap;
 use std::num::NonZeroU64;
 
@@ -63,11 +66,15 @@ pub struct WorkspacePresentationSample {
 
 #[derive(Debug, Clone)]
 pub struct WorkspaceFramePresentationScene {
-    pub workspace_sample: WorkspacePresentationSample,
+    /// `None` when only a special-workspace motion is in flight.
+    pub workspace_sample: Option<WorkspacePresentationSample>,
+    /// `None` when only a regular workspace slide is in flight.
+    pub special_sample: Option<SpecialWorkspacePresentationSample>,
     pub surfaces: Vec<RenderableSurface>,
     pub scene_node_ids: Vec<SceneNodeId>,
     pub presentation_owner_root_surface_ids: Vec<u32>,
     pub workspace_by_owner_root: HashMap<u32, WorkspaceId>,
+    pub special_by_owner_root: HashMap<u32, SpecialWorkspaceId>,
     pub surface_origins: Vec<(i32, i32)>,
     pub popup_surface_ids: Vec<u32>,
 }
@@ -186,26 +193,55 @@ impl WorkspacePresentationTransition {
     }
 
     fn sample_motion(self, at: AnimationTime) -> (f64, f64, bool) {
-        let elapsed = at.elapsed_seconds(self.started_at);
-        let (position, velocity, settled) = self.curve.sample_scalar(
+        sample_slide_motion(
             self.start_position,
             self.target_position,
             self.start_velocity,
-            elapsed,
-            true,
-        );
-        let crossed_target = if self.target_position > self.start_position {
-            position >= self.target_position
-        } else if self.target_position < self.start_position {
-            position <= self.target_position
-        } else {
-            true
-        };
-        if settled || crossed_target {
-            (self.target_position, 0.0, true)
-        } else {
-            (position, velocity, false)
-        }
+            self.started_at,
+            self.curve,
+            at,
+        )
+    }
+}
+
+/// Spring curve shared by every workspace-slide presentation (regular
+/// workspaces and special workspaces), scaled by the configured speed.
+pub(in crate::compositor) fn workspace_slide_curve(speed: f64) -> AnimationCurve {
+    crate::animation_control::scale_curve(
+        AnimationCurve::spring(SpringSpec::new(300.0, 38.1051).with_settlement(0.0001, 0.002)),
+        speed,
+    )
+}
+
+/// Samples one scalar slide motion as `(position, velocity, settled)`. Once
+/// settled or crossed, the position is pinned to the target.
+pub(in crate::compositor) fn sample_slide_motion(
+    start_position: f64,
+    target_position: f64,
+    start_velocity: f64,
+    started_at: AnimationTime,
+    curve: AnimationCurve,
+    at: AnimationTime,
+) -> (f64, f64, bool) {
+    let elapsed = at.elapsed_seconds(started_at);
+    let (position, velocity, settled) = curve.sample_scalar(
+        start_position,
+        target_position,
+        start_velocity,
+        elapsed,
+        true,
+    );
+    let crossed_target = if target_position > start_position {
+        position >= target_position
+    } else if target_position < start_position {
+        position <= target_position
+    } else {
+        true
+    };
+    if settled || crossed_target {
+        (target_position, 0.0, true)
+    } else {
+        (position, velocity, false)
     }
 }
 
@@ -350,13 +386,21 @@ impl crate::compositor::CompositorState {
             sampled_at,
             f64::from(self.output_size.width),
             f64::from(self.output_size.height),
-        )?;
+        );
+        let special_sample = self.special_workspace_presentation_sample_at(sampled_at);
+        if workspace_sample.is_none() && special_sample.is_none() {
+            return None;
+        }
         let mut surfaces = self
             .renderable_surfaces
             .iter()
             .enumerate()
             .filter(|(_, surface)| {
-                self.surface_is_visible_in_workspace_frame(surface.surface_id, &workspace_sample)
+                self.surface_is_visible_in_workspace_frame(
+                    surface.surface_id,
+                    workspace_sample.as_ref(),
+                    special_sample.as_ref(),
+                )
             })
             .map(|(position, surface)| (position, surface.clone()))
             .collect::<Vec<_>>();
@@ -389,6 +433,14 @@ impl crate::compositor::CompositorState {
                     .map(|workspace| (owner_root, workspace))
             })
             .collect();
+        let special_by_owner_root = presentation_owner_root_surface_ids
+            .iter()
+            .copied()
+            .filter_map(|owner_root| {
+                self.special_workspace_for_presentation_owner(owner_root)
+                    .map(|special| (owner_root, special))
+            })
+            .collect();
         let surface_origins = crate::compositor::render::surface_origins(&surfaces);
         let mut popup_surface_ids = self
             .popup_surfaces
@@ -398,8 +450,11 @@ impl crate::compositor::CompositorState {
                 self.popup_nodes.get(surface_id).is_some_and(|node| {
                     node.lifecycle == PopupLifecycle::Alive
                         && node.mapped
-                        && self
-                            .surface_is_visible_in_workspace_frame(*surface_id, &workspace_sample)
+                        && self.surface_is_visible_in_workspace_frame(
+                            *surface_id,
+                            workspace_sample.as_ref(),
+                            special_sample.as_ref(),
+                        )
                 })
             })
             .collect::<Vec<_>>();
@@ -407,10 +462,12 @@ impl crate::compositor::CompositorState {
 
         Some(WorkspaceFramePresentationScene {
             workspace_sample,
+            special_sample,
             surfaces,
             scene_node_ids,
             presentation_owner_root_surface_ids,
             workspace_by_owner_root,
+            special_by_owner_root,
             surface_origins,
             popup_surface_ids,
         })
@@ -428,10 +485,29 @@ impl crate::compositor::CompositorState {
         }
     }
 
+    fn special_workspace_for_presentation_owner(
+        &self,
+        owner_root: u32,
+    ) -> Option<SpecialWorkspaceId> {
+        let window_id = self.window_id_for_surface(owner_root)?;
+        let owner_id = self
+            .workspace_owner_window_id(window_id)
+            .unwrap_or(window_id);
+        let window = self.window(owner_id)?;
+        match window.management.map(|management| management.location())? {
+            WorkspaceLocation::Special(special) => Some(special),
+            WorkspaceLocation::Regular(_) => None,
+        }
+    }
+
+    /// A surface is in the frame scene when the active scene shows it, or when
+    /// it belongs to a regular workspace participating in the slide, or when
+    /// it belongs to a special workspace whose out-animation is still running.
     fn surface_is_visible_in_workspace_frame(
         &self,
         surface_id: u32,
-        sample: &WorkspacePresentationSample,
+        regular: Option<&WorkspacePresentationSample>,
+        special: Option<&SpecialWorkspacePresentationSample>,
     ) -> bool {
         let presentation_owner = self.presentation_owner_root_for_surface(surface_id);
         if let Some(window_id) = self.window_id_for_surface(presentation_owner) {
@@ -442,13 +518,21 @@ impl crate::compositor::CompositorState {
                 if window.state.is_minimized() {
                     return false;
                 }
-                if let Some(WorkspaceLocation::Regular(workspace)) =
-                    window.management.map(|management| management.location())
-                {
-                    return sample
-                        .participants
-                        .iter()
-                        .any(|participant| participant.workspace == workspace);
+                match window.management.map(|management| management.location()) {
+                    Some(WorkspaceLocation::Regular(workspace)) => {
+                        if let Some(sample) = regular {
+                            return sample
+                                .participants
+                                .iter()
+                                .any(|participant| participant.workspace == workspace);
+                        }
+                    }
+                    Some(WorkspaceLocation::Special(special_id)) => {
+                        if special.is_some_and(|sample| sample.is_departing(special_id)) {
+                            return true;
+                        }
+                    }
+                    None => {}
                 }
             }
         }
@@ -725,6 +809,8 @@ mod tests {
 
         let target_participant = frame_scene
             .workspace_sample
+            .as_ref()
+            .expect("regular slide sample")
             .participants
             .iter()
             .find(|participant| participant.workspace == target)

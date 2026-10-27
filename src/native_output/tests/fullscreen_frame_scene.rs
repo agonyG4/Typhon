@@ -71,6 +71,7 @@ fn solitary_fullscreen_snapshot_matches_the_filtered_renderer_scene() {
         canonical_scene_evidence: None,
         effects: ResolvedEffectScene::default(),
         workspace_presentation_sample: None,
+        special_workspace_presentation: None,
         effect_scene_resolution_ns: None,
         effect_scene_visible_instances: 0,
         presentation: PresentationSceneSample {
@@ -155,6 +156,7 @@ fn freezing_a_resolved_scene_shares_shm_payload_backing() {
         canonical_scene_evidence: None,
         effects: ResolvedEffectScene::default(),
         workspace_presentation_sample: None,
+        special_workspace_presentation: None,
         effect_scene_resolution_ns: None,
         effect_scene_visible_instances: 0,
         presentation: PresentationSceneSample::empty_for_output(

@@ -3,7 +3,11 @@ use super::*;
 use crate::wm::layout::TiledResizeHandle;
 use crate::wm::{LayoutMembership, WindowManagementState, WorkspaceId, WorkspaceLocation};
 
-pub(super) fn test_renderable_surface(surface_id: u32, width: u32, height: u32) -> RenderableSurface {
+pub(super) fn test_renderable_surface(
+    surface_id: u32,
+    width: u32,
+    height: u32,
+) -> RenderableSurface {
     let identity = BufferIdAllocator::default()
         .allocate()
         .expect("test buffer identity");

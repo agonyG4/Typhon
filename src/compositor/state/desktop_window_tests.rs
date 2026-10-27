@@ -3815,16 +3815,24 @@ fn special_workspace_dim_anchors_above_every_regular_surface() {
         test_renderable_surface(452, 64, 64),
     ];
 
-    assert!(!state.special_workspace_dim(&surfaces, &[451, 452]).is_active());
+    assert!(
+        !state
+            .special_workspace_dim(AnimationTime::from_nanos(0), &surfaces, &[451, 452])
+            .is_active()
+    );
 
-    assert!(state.workspace_manager.set_visible_special_workspace(Some(special)));
+    assert!(
+        state
+            .workspace_manager
+            .set_visible_special_workspace(Some(special))
+    );
     assert_eq!(
-        state.special_workspace_dim(&surfaces, &[451, 452]),
+        state.special_workspace_dim(AnimationTime::from_nanos(0), &surfaces, &[451, 452]),
         SpecialWorkspaceDim::new(SPECIAL_WORKSPACE_DIM_ALPHA, Some(452)),
         "the dim sits between the regular window and the special window"
     );
     assert_eq!(
-        state.special_workspace_dim(&surfaces[..1], &[451]),
+        state.special_workspace_dim(AnimationTime::from_nanos(0), &surfaces[..1], &[451]),
         SpecialWorkspaceDim::new(SPECIAL_WORKSPACE_DIM_ALPHA, None),
         "an empty special dims every regular surface"
     );

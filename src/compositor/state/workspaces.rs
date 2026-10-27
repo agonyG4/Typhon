@@ -4,10 +4,11 @@ use crate::wm::{
 };
 use crate::{
     animation_control::{AnimationEffect, AnimationRuntimeCapabilities, AnimationSlot},
-    presentation_animation::{AnimationCurve, AnimationTime, SpringSpec},
+    presentation_animation::AnimationTime,
 };
 
 use super::pointer_constraints::PointerConstraintDeactivationReason;
+use super::workspace_presentation::workspace_slide_curve;
 use super::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,17 +29,22 @@ impl CompositorState {
         self.workspace_manager.active_workspace()
     }
 
+    /// True when the workspace switch effect is a slide and animations are on.
+    /// Regular workspace slides and special workspace motions share this gate.
+    pub(in crate::compositor) fn workspace_slide_effect_enabled(&self) -> bool {
+        self.animation_control.enabled()
+            && self.animation_control.effective_effect(
+                AnimationSlot::WorkspaceSwitch,
+                AnimationRuntimeCapabilities::default(),
+            ) == AnimationEffect::WorkspaceSlide
+    }
+
     fn workspace_slide_admission_fallback(
         &self,
         previous: WorkspaceId,
         target: WorkspaceId,
     ) -> Option<&'static str> {
-        if !self.animation_control.enabled()
-            || self.animation_control.effective_effect(
-                AnimationSlot::WorkspaceSwitch,
-                AnimationRuntimeCapabilities::default(),
-            ) != AnimationEffect::WorkspaceSlide
-        {
+        if !self.workspace_slide_effect_enabled() {
             return Some("effect_disabled");
         }
 
@@ -93,10 +99,7 @@ impl CompositorState {
             return;
         }
 
-        let curve = crate::animation_control::scale_curve(
-            AnimationCurve::spring(SpringSpec::new(300.0, 38.1051).with_settlement(0.0001, 0.002)),
-            self.animation_control.configuration().speed,
-        );
+        let curve = workspace_slide_curve(self.animation_control.configuration().speed);
         let retarget = self.workspace_presentation.transition().is_some();
         if let Some(transition_id) = self.workspace_presentation.activate_for_switch(
             outcome,
@@ -130,6 +133,8 @@ impl CompositorState {
         let previous_selection = self.active_scene_selection();
         self.workspace_scene_transition_active = true;
         let outcome = self.workspace_manager.toggle_special_workspace(id);
+        let sampled_at = AnimationTime::monotonic_now().unwrap_or(AnimationTime::from_nanos(0));
+        self.begin_special_workspace_presentation(outcome, sampled_at);
         let new_selection = self.active_scene_selection();
         let shown_location = match outcome {
             SpecialWorkspaceToggleOutcome::Opened { id }

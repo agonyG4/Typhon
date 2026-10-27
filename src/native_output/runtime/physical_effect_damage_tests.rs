@@ -197,6 +197,7 @@ fn empty_resolved_scene_with_workspace_slide() -> ResolvedNativeFrameScene<'stat
                 signature: 9,
             },
         ),
+        special_workspace_presentation: None,
         effects: ResolvedEffectScene::default(),
         effect_scene_resolution_ns: None,
         effect_scene_visible_instances: 0,

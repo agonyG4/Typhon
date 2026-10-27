@@ -277,6 +277,9 @@ impl CompositorState {
         if self.workspace_presentation.transition().is_some() {
             blockers.push(DirectScanoutSceneRejection::WorkspacePresentationTransition);
         }
+        if self.special_workspace_presentation_active() {
+            blockers.push(DirectScanoutSceneRejection::SpecialWorkspacePresentationTransition);
+        }
         if !fullscreen_plan.composition_underlay_roots.is_empty() {
             blockers.push(DirectScanoutSceneRejection::FullscreenUnderlayVisible);
         }
@@ -319,8 +322,7 @@ impl CompositorState {
         // regular covering window is never scanned out while it is active.
         // Special-workspace windows sit above the dim band and keep their
         // existing eligibility.
-        if self.special_workspace_dim_alpha() > 0.0
-            && !self.application_root_is_special(root_surface_id)
+        if self.special_workspace_dim_active() && !self.application_root_is_special(root_surface_id)
         {
             blockers.push(DirectScanoutSceneRejection::SpecialWorkspaceDim);
         }

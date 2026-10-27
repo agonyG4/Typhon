@@ -1790,10 +1790,11 @@ impl OwnCompositorServer {
 
     pub fn special_workspace_dim(
         &self,
+        at: AnimationTime,
         surfaces: &[RenderableSurface],
         owner_roots: &[u32],
     ) -> crate::compositor::SpecialWorkspaceDim {
-        self.state.special_workspace_dim(surfaces, owner_roots)
+        self.state.special_workspace_dim(at, surfaces, owner_roots)
     }
 
     pub fn active_workspace(&self) -> WorkspaceId {
@@ -1802,6 +1803,15 @@ impl OwnCompositorServer {
 
     pub fn workspace_presentation_active(&self) -> bool {
         self.state.workspace_presentation.transition().is_some()
+            || self.state.special_workspace_presentation_active()
+    }
+
+    pub fn retire_special_workspace_presentation_if_rendered(
+        &mut self,
+        sample: &crate::compositor::SpecialWorkspacePresentationSample,
+    ) -> bool {
+        self.state
+            .retire_special_workspace_presentation_if_rendered(sample)
     }
 
     pub fn retire_workspace_presentation_if_rendered(

@@ -206,7 +206,17 @@ impl crate::compositor::CompositorState {
         self.presentation_animator.set_enabled(enabled);
         self.set_lifecycle_animation_enabled(enabled);
         self.reconcile_lifecycle_animation_policy();
-        if !enabled && self.workspace_presentation.clear() {
+        // Both clears run together so no motion survives a disable, even when
+        // a regular slide and a special motion were both in flight.
+        let (regular_cleared, special_cleared) = if enabled {
+            (false, false)
+        } else {
+            (
+                self.workspace_presentation.clear(),
+                self.special_workspace_presentation.clear(),
+            )
+        };
+        if regular_cleared || special_cleared {
             self.refresh_frame_work_visibility();
             self.advance_render_generation(
                 crate::compositor::RenderGenerationCause::WorkspaceSwitch,

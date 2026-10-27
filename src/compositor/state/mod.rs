@@ -77,6 +77,7 @@ mod surface_topology;
 mod surface_transaction_ownership_tests;
 pub(super) mod surface_transactions;
 pub(in crate::compositor) use surface_topology::SurfaceTopologyState;
+pub(in crate::compositor) mod special_workspace_presentation;
 mod surface_tree_readiness;
 mod surfaces;
 mod synchronized_cache;

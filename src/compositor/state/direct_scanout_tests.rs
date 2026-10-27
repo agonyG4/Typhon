@@ -1339,17 +1339,57 @@ fn xwayland_clip_track_and_physical_clip_follow_window_group_across_backing_repl
 }
 
 #[test]
+fn active_special_workspace_presentation_track_blocks_direct_scanout() {
+    let mut state = CompositorState::new(None);
+    let output_size = BufferSize::new(state.output_size.width, state.output_size.height)
+        .expect("configured output size");
+    install_probe_scanout_surface(&mut state, 304, output_size);
+
+    assert!(
+        state.direct_scanout_scene_candidate().is_ok(),
+        "the fullscreen-sized surface is scanout-compatible before the special motion"
+    );
+
+    state.special_workspace_presentation.begin_for_outcome(
+        crate::wm::SpecialWorkspaceToggleOutcome::Opened {
+            id: crate::wm::SpecialWorkspaceId::DEFAULT,
+        },
+        AnimationTime::from_nanos(0),
+        AnimationCurve::easing(Duration::from_secs(1), EasingCurve::Linear),
+    );
+
+    let analysis = state.direct_scanout_scene_analysis();
+    assert!(analysis.candidate.is_none());
+    assert!(
+        analysis
+            .blockers
+            .reasons()
+            .contains(&DirectScanoutSceneRejection::SpecialWorkspacePresentationTransition)
+    );
+}
+
+#[test]
 fn special_workspace_dim_alpha_follows_visible_special_workspace() {
     let mut state = CompositorState::new(None);
-    assert_eq!(state.special_workspace_dim_alpha(), 0.0);
-    let special = crate::wm::SpecialWorkspaceId::new(1).expect("special id");
-    assert!(state.workspace_manager.set_visible_special_workspace(Some(special)));
     assert_eq!(
-        state.special_workspace_dim_alpha(),
+        state.special_workspace_dim_alpha_at(AnimationTime::from_nanos(0)),
+        0.0
+    );
+    let special = crate::wm::SpecialWorkspaceId::new(1).expect("special id");
+    assert!(
+        state
+            .workspace_manager
+            .set_visible_special_workspace(Some(special))
+    );
+    assert_eq!(
+        state.special_workspace_dim_alpha_at(AnimationTime::from_nanos(0)),
         crate::compositor::state::scene_order::SPECIAL_WORKSPACE_DIM_ALPHA
     );
     assert!(state.workspace_manager.set_visible_special_workspace(None));
-    assert_eq!(state.special_workspace_dim_alpha(), 0.0);
+    assert_eq!(
+        state.special_workspace_dim_alpha_at(AnimationTime::from_nanos(0)),
+        0.0
+    );
 }
 
 #[test]
@@ -1364,7 +1404,11 @@ fn special_workspace_dim_blocks_regular_fullscreen_direct_scanout() {
     );
 
     let special = crate::wm::SpecialWorkspaceId::new(1).expect("special id");
-    assert!(state.workspace_manager.set_visible_special_workspace(Some(special)));
+    assert!(
+        state
+            .workspace_manager
+            .set_visible_special_workspace(Some(special))
+    );
     let analysis = state.direct_scanout_scene_analysis();
     assert!(analysis.candidate.is_none());
     assert!(

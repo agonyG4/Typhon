@@ -1,5 +1,6 @@
 use super::*;
 use crate::compositor::SpecialWorkspaceDim;
+use crate::presentation_animation::AnimationTime;
 use crate::wm::WorkspaceLocation;
 
 // Scene bands, bottom to top. Band numbers are compared before the layer and
@@ -21,15 +22,6 @@ const SCENE_BAND_DRAG_ICON: u8 = 10;
 pub(crate) const SPECIAL_WORKSPACE_DIM_ALPHA: f32 = 0.2;
 
 impl CompositorState {
-    /// Per-frame dim opacity: fully on while a special workspace is visible,
-    /// off otherwise. A later animation step scales this single value.
-    pub(in crate::compositor) fn special_workspace_dim_alpha(&self) -> f32 {
-        match self.workspace_manager.visible_special_workspace() {
-            Some(_) => SPECIAL_WORKSPACE_DIM_ALPHA,
-            None => 0.0,
-        }
-    }
-
     pub(in crate::compositor) fn surface_root_is_in_special_workspace(
         &self,
         root_surface_id: u32,
@@ -47,10 +39,11 @@ impl CompositorState {
     /// aligned presentation owner roots.
     pub(in crate::compositor) fn special_workspace_dim(
         &self,
+        at: AnimationTime,
         surfaces: &[RenderableSurface],
         owner_roots: &[u32],
     ) -> SpecialWorkspaceDim {
-        let alpha = self.special_workspace_dim_alpha();
+        let alpha = self.special_workspace_dim_alpha_at(at);
         if alpha <= 0.0 {
             return SpecialWorkspaceDim::default();
         }
@@ -81,7 +74,9 @@ impl CompositorState {
                     || self.renderable_root_stack_key(owner_root, 0).0 <= SCENE_BAND_BOTTOM_LAYER
             })
             .map_or(0, |index| index + 1);
-        surfaces.get(dimmed_prefix).map(|surface| surface.surface_id)
+        surfaces
+            .get(dimmed_prefix)
+            .map(|surface| surface.surface_id)
     }
 
     fn surface_root_is_in_regular_workspace(&self, root_surface_id: u32) -> bool {

@@ -40,13 +40,16 @@ impl CompositorState {
         };
         self.window(owner_id).is_some_and(|window| {
             !window.state.is_minimized()
-                && window.management.is_some_and(|management| {
-                    matches!(
-                        management.location(),
-                        WorkspaceLocation::Regular(workspace)
-                            if self.regular_workspace_is_visible_for_frame_work(workspace)
-                    )
-                })
+                && window
+                    .management
+                    .is_some_and(|management| match management.location() {
+                        WorkspaceLocation::Regular(workspace) => {
+                            self.regular_workspace_is_visible_for_frame_work(workspace)
+                        }
+                        WorkspaceLocation::Special(special) => {
+                            self.special_workspace_departing(special)
+                        }
+                    })
         })
     }
 

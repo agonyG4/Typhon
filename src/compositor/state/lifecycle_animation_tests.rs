@@ -2917,6 +2917,8 @@ fn restoring_during_workspace_slide_skips_retained_restore_and_keeps_live_transl
     );
     let target_participant = scene
         .workspace_sample
+        .as_ref()
+        .expect("regular slide sample")
         .participants
         .iter()
         .find(|participant| participant.workspace == target_workspace)

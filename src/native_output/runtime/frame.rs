@@ -16,11 +16,13 @@ use oblivion_one::compositor::{
     AnimationTime, ClientCursorRenderState, DecorationRenderInstance, DecorationSceneSnapshot,
     DesktopVisualState, FrameEffectSceneInput, FullscreenRenderPlanMetrics, PointerWarpOrigin,
     PresentationFrameSnapshot, PresentationSceneSample, PresentedCanonicalSceneSnapshot,
-    ResolvedEffectScene, SceneNodeId, SpecialWorkspaceDim, SurfacePlacement,
-    SurfaceResourceSyncState, WindowExitFrameEvidence, WorkspacePresentationSample,
+    ResolvedEffectScene, SPECIAL_WORKSPACE_SLIDE_OFFSET_FRACTION, SceneNodeId, SpecialWorkspaceDim,
+    SpecialWorkspacePresentationSample, SurfacePlacement, SurfaceResourceSyncState,
+    WindowExitFrameEvidence, WorkspacePresentationSample,
 };
 use oblivion_one::presentation_animation::{
-    PresentationClip, PresentationClipRect, PresentationGroupClip,
+    PresentationClip, PresentationClipRect, PresentationGroupClip, PresentationGroupOpacity,
+    PresentationOpacity,
 };
 use oblivion_one::window_lifecycle_animation::{LifecycleFrameSnapshot, LifecycleSceneSample};
 
@@ -96,6 +98,7 @@ pub(crate) struct ResolvedNativeFrameScene<'a> {
     pub(crate) canonical_scene_evidence: Option<PresentedCanonicalSceneSnapshot>,
     pub(crate) scene_identity_signature: u64,
     pub(crate) workspace_presentation_sample: Option<WorkspacePresentationSample>,
+    pub(crate) special_workspace_presentation: Option<SpecialWorkspacePresentationSample>,
     pub(crate) effects: ResolvedEffectScene,
     pub(crate) effect_scene_resolution_ns: Option<u64>,
     pub(crate) effect_scene_visible_instances: usize,
@@ -213,6 +216,57 @@ fn intersect_presentation_clip_rects(
     let bottom_edge = (left.y() + left.height()).min(right.y() + right.height());
     PresentationClipRect::new(x, y, (right_edge - x).max(0.0), (bottom_edge - y).max(0.0))
         .expect("intersecting finite presentation clips remains finite")
+}
+
+/// Sampled presence of each special workspace window that is still
+/// animating, keyed by presentation owner root. Settled windows are omitted.
+fn special_presence_by_owner_root(
+    sample: Option<&SpecialWorkspacePresentationSample>,
+    special_by_owner_root: &HashMap<u32, oblivion_one::wm::SpecialWorkspaceId>,
+) -> HashMap<u32, f64> {
+    let Some(sample) = sample else {
+        return HashMap::new();
+    };
+    special_by_owner_root
+        .iter()
+        .filter_map(|(&owner_root, &special)| {
+            let presence = sample.presence_of(special)?;
+            (presence != 1.0).then_some((owner_root, presence))
+        })
+        .collect()
+}
+
+/// Multiplies each animating special window's presence into its group opacity.
+/// Existing window open or close opacity on the same root is kept and scaled.
+fn merge_special_workspace_opacities(
+    server: &OwnCompositorServer,
+    presentation: &mut PresentationSceneSample,
+    presence_by_owner_root: &HashMap<u32, f64>,
+) {
+    for (&root_surface_id, &presence) in presence_by_owner_root {
+        let opacity_value = presence.clamp(0.0, 1.0);
+        if let Some(existing) = presentation
+            .opacities
+            .iter_mut()
+            .find(|entry| entry.root_surface_id == root_surface_id)
+        {
+            existing.opacity = PresentationOpacity::new(existing.opacity.get() * opacity_value)
+                .unwrap_or(PresentationOpacity::TRANSPARENT);
+        } else if let (Some(scene_node_id), Some(opacity)) = (
+            server.presentation_scene_node_id_for_root(root_surface_id),
+            PresentationOpacity::new(opacity_value),
+        ) {
+            presentation.opacities.push(PresentationGroupOpacity {
+                scene_node_id,
+                root_surface_id,
+                opacity,
+                transition: None,
+            });
+        }
+    }
+    presentation
+        .opacities
+        .sort_unstable_by_key(|opacity| opacity.root_surface_id);
 }
 
 fn merge_workspace_presentation_clips(
@@ -557,6 +611,7 @@ impl<'a> ResolvedNativeFrameScene<'a> {
         scene.canonical_scene_evidence = None;
         scene.scene_identity_signature = 0;
         scene.workspace_presentation_sample = None;
+        scene.special_workspace_presentation = None;
         scene.effects = ResolvedEffectScene::default();
         scene.presentation = presentation;
         scene.presentation_snapshot = PresentationFrameSnapshot::from_sample(&scene.presentation);
@@ -614,12 +669,19 @@ impl<'a> ResolvedNativeFrameScene<'a> {
         let workspace_frame_scene = server.workspace_frame_presentation_scene_at(at);
         let workspace_presentation_sample = workspace_frame_scene
             .as_ref()
-            .map(|scene| scene.workspace_sample.clone());
+            .and_then(|scene| scene.workspace_sample.clone());
+        let special_workspace_presentation = workspace_frame_scene
+            .as_ref()
+            .and_then(|scene| scene.special_sample.clone());
+        let special_by_owner_root = workspace_frame_scene
+            .as_ref()
+            .map(|scene| scene.special_by_owner_root.clone())
+            .unwrap_or_default();
         let workspace_by_owner_root = workspace_frame_scene
             .as_ref()
             .map(|scene| scene.workspace_by_owner_root.clone())
             .unwrap_or_default();
-        let workspace_translations_by_owner_root = workspace_presentation_sample
+        let mut workspace_translations_by_owner_root = workspace_presentation_sample
             .as_ref()
             .map(|sample| {
                 workspace_by_owner_root
@@ -639,6 +701,16 @@ impl<'a> ResolvedNativeFrameScene<'a> {
                     .collect::<HashMap<_, _>>()
             })
             .unwrap_or_default();
+        let special_presence_by_owner_root = special_presence_by_owner_root(
+            special_workspace_presentation.as_ref(),
+            &special_by_owner_root,
+        );
+        let output_height = f64::from(server.output_dimensions().1);
+        for (&owner_root, &presence) in &special_presence_by_owner_root {
+            let translation_y =
+                (presence - 1.0) * SPECIAL_WORKSPACE_SLIDE_OFFSET_FRACTION * output_height;
+            workspace_translations_by_owner_root.insert(owner_root, (0.0, translation_y));
+        }
         let workspace_clips_by_owner_root = workspace_presentation_sample
             .as_ref()
             .map(|sample| {
@@ -775,6 +847,11 @@ impl<'a> ResolvedNativeFrameScene<'a> {
         let targets = exit_parts.targets;
         let mut presentation = exit_parts.presentation;
         merge_workspace_presentation_clips(&mut presentation, &workspace_clips_by_owner_root);
+        merge_special_workspace_opacities(
+            server,
+            &mut presentation,
+            &special_presence_by_owner_root,
+        );
         let canonical_surface_ids = exit_parts
             .canonical_surface_ids
             .into_iter()
@@ -788,8 +865,11 @@ impl<'a> ResolvedNativeFrameScene<'a> {
         let lifecycle_snapshot = LifecycleFrameSnapshot::from_sample(&lifecycle);
         let popup_surface_ids = frame_popup_surface_ids;
         let external_overlay_surface_ids = server.external_overlay_surface_ids(&lifecycle);
-        let special_workspace_dim =
-            server.special_workspace_dim(surfaces.as_ref(), all_canonical_ordered_owners.as_ref());
+        let special_workspace_dim = server.special_workspace_dim(
+            at,
+            surfaces.as_ref(),
+            all_canonical_ordered_owners.as_ref(),
+        );
         let lifecycle_marker_insertions = lifecycle_marker_insertions(
             server,
             surfaces.as_ref(),
@@ -904,6 +984,10 @@ impl<'a> ResolvedNativeFrameScene<'a> {
             scene_identity_signature = scene_identity_signature.wrapping_mul(0x0000_0100_0000_01b3)
                 ^ workspace_sample.signature;
         }
+        if let Some(special_sample) = &special_workspace_presentation {
+            scene_identity_signature = scene_identity_signature.wrapping_mul(0x0000_0100_0000_01b3)
+                ^ special_sample.signature;
+        }
         #[cfg(test)]
         {
             note_snapshot_finalization();
@@ -985,6 +1069,7 @@ impl<'a> ResolvedNativeFrameScene<'a> {
             canonical_scene_evidence,
             scene_identity_signature,
             workspace_presentation_sample,
+            special_workspace_presentation,
             effects,
             effect_scene_resolution_ns,
             effect_scene_visible_instances,
@@ -1015,6 +1100,7 @@ impl<'a> ResolvedNativeFrameScene<'a> {
             canonical_scene_evidence: self.canonical_scene_evidence,
             scene_identity_signature: self.scene_identity_signature,
             workspace_presentation_sample: self.workspace_presentation_sample,
+            special_workspace_presentation: self.special_workspace_presentation,
             effects: self.effects,
             effect_scene_resolution_ns: self.effect_scene_resolution_ns,
             effect_scene_visible_instances: self.effect_scene_visible_instances,

@@ -1015,6 +1015,7 @@ fn snapshot_ref_preserves_constructor_popup_ids_and_order() {
             canonical_scene_evidence: None,
             scene_identity_signature: 0,
             workspace_presentation_sample: None,
+            special_workspace_presentation: None,
             effects: ResolvedEffectScene::default(),
             effect_scene_resolution_ns: None,
             effect_scene_visible_instances: 0,

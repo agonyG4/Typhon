@@ -3586,6 +3586,11 @@ impl AtomicEglGbmScanout {
                 {
                     server.retire_workspace_presentation_if_rendered(sample);
                 }
+                // Each special track retires on its own once its settled
+                // sample is rendered, so one settling track never holds another.
+                if let Some(sample) = resolved_scene.special_workspace_presentation.as_ref() {
+                    server.retire_special_workspace_presentation_if_rendered(sample);
+                }
                 server.mark_frame_callbacks_rendered(protocol_batch_id);
                 Ok(AtomicFrameRenderOutcome::Rendered {
                     frame_id,

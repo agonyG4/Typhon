@@ -362,14 +362,13 @@ pub use render::{
     DesktopFrameCopyKind, DesktopSceneRebuildKind, DesktopSceneRenderer, DesktopVisualState,
     FrozenLifecycleRenderLayout, OUTPUT_BACKGROUND, RenderSceneElement, RenderSceneElementId,
     RenderSceneElementKind, ServerFrameColor, SpecialWorkspaceDim, SurfaceRenderPlan,
-    SurfaceRenderSpaceAssignment,
-    SurfaceTargetRect, SurfaceVisualAperture, VisualGroupId, VisualStackGroup, WindowVisualGroup,
-    compose_output, cursor_damage_rect, output_scale_key, render_scene_elements_for_surfaces,
-    scale_desktop_visual_state, scale_logical_coordinate, scale_logical_extent,
-    server_frame_rects_by_surface, server_frame_rects_for_surface, surface_origin, surface_origins,
-    surface_render_plan, surface_render_plan_with_clip, surface_render_plans_with_aperture,
-    surface_render_space_assignments, visual_stack_groups, window_visual_stack_order,
-    xwayland_visual_backing_target,
+    SurfaceRenderSpaceAssignment, SurfaceTargetRect, SurfaceVisualAperture, VisualGroupId,
+    VisualStackGroup, WindowVisualGroup, compose_output, cursor_damage_rect, output_scale_key,
+    render_scene_elements_for_surfaces, scale_desktop_visual_state, scale_logical_coordinate,
+    scale_logical_extent, server_frame_rects_by_surface, server_frame_rects_for_surface,
+    surface_origin, surface_origins, surface_render_plan, surface_render_plan_with_clip,
+    surface_render_plans_with_aperture, surface_render_space_assignments, visual_stack_groups,
+    window_visual_stack_order, xwayland_visual_backing_target,
 };
 use runtime_files::{compositor_debug_surface_logging_enabled, unique_runtime_file_path};
 pub use runtime_files::{resize_debug_log, resize_debug_logging_enabled};
@@ -835,6 +834,8 @@ pub struct CompositorState {
     pub(in crate::compositor) workspace_manager: WorkspaceManager,
     pub(in crate::compositor) workspace_presentation:
         state::workspace_presentation::WorkspacePresentationState,
+    pub(in crate::compositor) special_workspace_presentation:
+        state::special_workspace_presentation::SpecialWorkspacePresentationState,
     pub(in crate::compositor) window_stacking: Vec<WindowId>,
     pub(in crate::compositor) applied_override_redirect_stack: Option<(XwaylandGeneration, u64)>,
     xwayland_scene_batch: XwaylandSceneBatchState,
@@ -1259,6 +1260,10 @@ pub use presented_frame::{
     PresentedCanonicalSceneSnapshot, PresentedSurfaceContentEvidence, WindowExitFrameEvidence,
 };
 pub use presented_frame::{PresentedFramePublication, PresentedLifecycleScene};
+pub use state::special_workspace_presentation::{
+    SPECIAL_WORKSPACE_SLIDE_OFFSET_FRACTION, SpecialWorkspaceMotionKind,
+    SpecialWorkspacePresentationSample, SpecialWorkspaceTrackSample,
+};
 #[doc(hidden)]
 pub use state::window_exit_retained::{
     WindowExitFrozenContent, WindowExitPainterOrder, WindowExitRenderGroup, WindowExitSurfaceMerge,
