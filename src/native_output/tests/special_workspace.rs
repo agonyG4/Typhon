@@ -9,7 +9,9 @@ fn native_input_special_shortcuts_are_consumed_press_only_without_key_leak() {
     let toggle = input.handle_key_event(KEY_S, 1);
     assert_eq!(
         toggle.window_actions,
-        vec![NativeWindowAction::ToggleDefaultSpecialWorkspace]
+        vec![NativeWindowAction::ToggleSpecialWorkspace(
+            oblivion_one::wm::SpecialWorkspaceId::DEFAULT
+        )]
     );
     assert!(toggle.keyboard_events.is_empty());
 
@@ -21,6 +23,31 @@ fn native_input_special_shortcuts_are_consumed_press_only_without_key_leak() {
     assert!(release.keyboard_events.is_empty());
     let super_release = input.handle_key_event(KEY_LEFTMETA, 0);
     assert!(super_release.keyboard_events.is_empty());
+}
+
+#[test]
+fn native_input_numbered_special_shortcuts_carry_their_workspace_id() {
+    let mut input = NativeInputState::new(320, 200);
+    let super_press = input.handle_key_event(KEY_LEFTMETA, 1);
+    assert!(super_press.keyboard_events.is_empty());
+    let _ = input.handle_key_event(KEY_LEFTALT, 1);
+
+    let toggle = input.handle_key_event(KEY_3, 1);
+    assert_eq!(
+        toggle.window_actions,
+        vec![NativeWindowAction::ToggleSpecialWorkspace(
+            oblivion_one::wm::SpecialWorkspaceId::new(3).expect("non-zero special workspace")
+        )]
+    );
+    assert!(toggle.keyboard_events.is_empty());
+    assert!(input.handle_key_event(KEY_3, 0).keyboard_events.is_empty());
+    let _ = input.handle_key_event(KEY_LEFTALT, 0);
+    assert!(
+        input
+            .handle_key_event(KEY_LEFTMETA, 0)
+            .keyboard_events
+            .is_empty()
+    );
 }
 
 #[test]

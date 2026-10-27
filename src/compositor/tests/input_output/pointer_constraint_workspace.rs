@@ -1694,11 +1694,15 @@ fn closing_special_workspace_releases_constraint_owned_by_departing_window() {
     let backend_id = activate_locked_backend(&commands, &mut fixture.state, &mut fixture.queue);
 
     commands
-        .send(ServerCommand::ToggleDefaultSpecialWorkspace)
+        .send(ServerCommand::ToggleSpecialWorkspace(
+            crate::wm::SpecialWorkspaceId::DEFAULT,
+        ))
         .unwrap();
     wait_for_server_commands(&commands);
     commands
-        .send(ServerCommand::MoveFocusedWindowToOrFromSpecialWorkspace)
+        .send(ServerCommand::MoveFocusedWindowToOrFromSpecialWorkspace(
+            crate::wm::SpecialWorkspaceId::DEFAULT,
+        ))
         .unwrap();
     wait_for_server_commands(&commands);
     assert!(
@@ -1708,7 +1712,9 @@ fn closing_special_workspace_releases_constraint_owned_by_departing_window() {
     );
 
     commands
-        .send(ServerCommand::ToggleDefaultSpecialWorkspace)
+        .send(ServerCommand::ToggleSpecialWorkspace(
+            crate::wm::SpecialWorkspaceId::DEFAULT,
+        ))
         .unwrap();
     wait_for_server_commands(&commands);
     let snapshot = capture_pointer_constraint_snapshot(&commands, constraint_id)

@@ -2,6 +2,9 @@ use std::num::NonZeroU32;
 
 use super::WorkspaceId;
 
+/// Number of special workspaces the manager registers, ids `1..=SPECIAL_WORKSPACE_COUNT`.
+pub const SPECIAL_WORKSPACE_COUNT: u32 = 4;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SpecialWorkspaceId(NonZeroU32);
 

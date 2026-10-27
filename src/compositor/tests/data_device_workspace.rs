@@ -316,12 +316,16 @@ fn sourced_drag_retargets_workspace_at_stationary_pointer_without_cancellation()
     let enters_before_special = state.data_device_enter_count;
     let leaves_before_special = state.data_device_leave_count;
     commands
-        .send(ServerCommand::ToggleDefaultSpecialWorkspace)
+        .send(ServerCommand::ToggleSpecialWorkspace(
+            crate::wm::SpecialWorkspaceId::DEFAULT,
+        ))
         .unwrap();
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
     commands
-        .send(ServerCommand::ToggleDefaultSpecialWorkspace)
+        .send(ServerCommand::ToggleSpecialWorkspace(
+            crate::wm::SpecialWorkspaceId::DEFAULT,
+        ))
         .unwrap();
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
@@ -396,7 +400,9 @@ fn sourced_drag_retargets_workspace_at_stationary_pointer_without_cancellation()
     queue.roundtrip(&mut state).unwrap();
     for _ in 0..2 {
         commands
-            .send(ServerCommand::ToggleDefaultSpecialWorkspace)
+            .send(ServerCommand::ToggleSpecialWorkspace(
+                crate::wm::SpecialWorkspaceId::DEFAULT,
+            ))
             .unwrap();
         wait_for_server_commands(&commands);
         queue.roundtrip(&mut state).unwrap();

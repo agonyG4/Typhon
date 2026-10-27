@@ -185,8 +185,8 @@ pub(in crate::compositor::tests) enum ServerCommand {
     ActivateWorkspace {
         workspace: u32,
     },
-    ToggleDefaultSpecialWorkspace,
-    MoveFocusedWindowToOrFromSpecialWorkspace,
+    ToggleSpecialWorkspace(crate::wm::SpecialWorkspaceId),
+    MoveFocusedWindowToOrFromSpecialWorkspace(crate::wm::SpecialWorkspaceId),
     MoveFocusedWindowToWorkspace {
         workspace: u32,
     },
@@ -875,11 +875,11 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                             server.activate_workspace(workspace);
                         }
                     }
-                    ServerCommand::ToggleDefaultSpecialWorkspace => {
-                        server.toggle_default_special_workspace();
+                    ServerCommand::ToggleSpecialWorkspace(special) => {
+                        server.toggle_special_workspace(special);
                     }
-                    ServerCommand::MoveFocusedWindowToOrFromSpecialWorkspace => {
-                        server.move_focused_window_to_or_from_special_workspace();
+                    ServerCommand::MoveFocusedWindowToOrFromSpecialWorkspace(special) => {
+                        server.move_focused_window_to_or_from_special_workspace(special);
                     }
                     ServerCommand::MoveFocusedWindowToWorkspace { workspace } => {
                         let Some(workspace) = WorkspaceId::new(workspace) else {

@@ -249,7 +249,8 @@ mod tests {
         let special = wm::SpecialWorkspaceId::DEFAULT;
 
         assert_eq!(manager.visible_special_workspace(), None);
-        let unknown = wm::SpecialWorkspaceId::new(2).expect("non-zero special workspace");
+        let unknown = wm::SpecialWorkspaceId::new(wm::SPECIAL_WORKSPACE_COUNT + 1)
+            .expect("non-zero special workspace");
         assert_eq!(
             manager.toggle_special_workspace(unknown),
             wm::SpecialWorkspaceToggleOutcome::UnknownSpecial { id: unknown }
@@ -274,6 +275,49 @@ mod tests {
         );
         assert_eq!(manager.visible_special_workspace(), None);
         assert_eq!(manager.workspaces().count(), 10);
+    }
+
+    #[test]
+    fn special_toggle_switches_between_registered_specials_with_one_visible() {
+        let mut manager = wm::WorkspaceManager::default();
+        let first = wm::SpecialWorkspaceId::DEFAULT;
+        let second = wm::SpecialWorkspaceId::new(2).expect("non-zero special workspace");
+        let third = wm::SpecialWorkspaceId::new(3).expect("non-zero special workspace");
+        let last = wm::SpecialWorkspaceId::new(wm::SPECIAL_WORKSPACE_COUNT)
+            .expect("non-zero special workspace");
+
+        assert!(manager.contains_special_workspace(last));
+        assert!(
+            !manager.contains_special_workspace(
+                wm::SpecialWorkspaceId::new(wm::SPECIAL_WORKSPACE_COUNT + 1)
+                    .expect("non-zero special workspace")
+            )
+        );
+        assert_eq!(
+            manager.toggle_special_workspace(first),
+            wm::SpecialWorkspaceToggleOutcome::Opened { id: first }
+        );
+        assert_eq!(
+            manager.toggle_special_workspace(second),
+            wm::SpecialWorkspaceToggleOutcome::Switched {
+                previous: first,
+                current: second,
+            }
+        );
+        assert_eq!(manager.visible_special_workspace(), Some(second));
+        assert_eq!(
+            manager.toggle_special_workspace(third),
+            wm::SpecialWorkspaceToggleOutcome::Switched {
+                previous: second,
+                current: third,
+            }
+        );
+        assert_eq!(manager.visible_special_workspace(), Some(third));
+        assert_eq!(
+            manager.toggle_special_workspace(third),
+            wm::SpecialWorkspaceToggleOutcome::Closed { id: third }
+        );
+        assert_eq!(manager.visible_special_workspace(), None);
     }
 
     #[test]

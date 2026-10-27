@@ -1856,8 +1856,8 @@ pub(crate) fn apply_native_input_effect(
             | BindingActionDefinition::ToggleFocusedWindowLayout
             | BindingActionDefinition::SwitchWorkspace(_)
             | BindingActionDefinition::MoveFocusedWindowToWorkspace(_)
-            | BindingActionDefinition::ToggleDefaultSpecialWorkspace
-            | BindingActionDefinition::MoveFocusedWindowToOrFromSpecialWorkspace
+            | BindingActionDefinition::ToggleSpecialWorkspace(_)
+            | BindingActionDefinition::MoveFocusedWindowToOrFromSpecialWorkspace(_)
             | BindingActionDefinition::BeginMove
             | BindingActionDefinition::BeginResize => {}
         }
@@ -2405,12 +2405,12 @@ pub(crate) fn apply_native_window_action(
         NativeWindowAction::MoveFocusedWindowToWorkspace(workspace) => {
             server.move_focused_window_to_workspace(workspace)
         }
-        NativeWindowAction::ToggleDefaultSpecialWorkspace => {
-            server.toggle_default_special_workspace();
+        NativeWindowAction::ToggleSpecialWorkspace(special) => {
+            server.toggle_special_workspace(special);
             true
         }
-        NativeWindowAction::MoveFocusedWindowToOrFromSpecialWorkspace => {
-            server.move_focused_window_to_or_from_special_workspace()
+        NativeWindowAction::MoveFocusedWindowToOrFromSpecialWorkspace(special) => {
+            server.move_focused_window_to_or_from_special_workspace(special)
         }
     };
     if let Some(action_name) = input_trace_action {

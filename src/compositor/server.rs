@@ -60,7 +60,9 @@ mod control_api;
 pub use control_api::{MaterialProgramSetError, MaterialSetError};
 #[path = "server_xwayland.rs"]
 mod xwayland_api;
-use crate::wm::{SpecialWorkspaceToggleOutcome, WorkspaceId, WorkspaceSwitchOutcome};
+use crate::wm::{
+    SpecialWorkspaceId, SpecialWorkspaceToggleOutcome, WorkspaceId, WorkspaceSwitchOutcome,
+};
 use crate::xwayland::xwm::{ConfigureSource, XwmCommand, XwmEvent};
 use crate::xwayland::{X11WindowHandle, XwaylandAssociationEvent, XwaylandGeneration};
 #[path = "server_globals.rs"]
@@ -1850,13 +1852,19 @@ impl OwnCompositorServer {
         self.state.move_focused_window_to_workspace(workspace)
     }
 
-    pub fn toggle_default_special_workspace(&mut self) -> SpecialWorkspaceToggleOutcome {
-        self.state.toggle_default_special_workspace()
+    pub fn toggle_special_workspace(
+        &mut self,
+        id: SpecialWorkspaceId,
+    ) -> SpecialWorkspaceToggleOutcome {
+        self.state.toggle_special_workspace(id)
     }
 
-    pub fn move_focused_window_to_or_from_special_workspace(&mut self) -> bool {
+    pub fn move_focused_window_to_or_from_special_workspace(
+        &mut self,
+        id: SpecialWorkspaceId,
+    ) -> bool {
         self.state
-            .move_focused_window_to_or_from_special_workspace()
+            .move_focused_window_to_or_from_special_workspace(id)
     }
 
     pub fn toggle_focused_window_layout(&mut self) -> bool {

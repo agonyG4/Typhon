@@ -1,5 +1,5 @@
 use super::*;
-use oblivion_one::wm::WorkspaceId;
+use oblivion_one::wm::{SpecialWorkspaceId, WorkspaceId};
 
 pub(crate) const WAYLAND_SCROLL_LINE_DISTANCE: f64 = 15.0;
 pub(crate) const EV_KEY: u16 = 0x01;
@@ -264,8 +264,8 @@ pub(crate) enum NativeWindowAction {
     ToggleFocusedWindowLayout,
     SwitchWorkspace(WorkspaceId),
     MoveFocusedWindowToWorkspace(WorkspaceId),
-    ToggleDefaultSpecialWorkspace,
-    MoveFocusedWindowToOrFromSpecialWorkspace,
+    ToggleSpecialWorkspace(SpecialWorkspaceId),
+    MoveFocusedWindowToOrFromSpecialWorkspace(SpecialWorkspaceId),
 }
 
 #[cfg(test)]

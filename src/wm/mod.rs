@@ -5,7 +5,7 @@ mod window;
 mod workspace;
 
 pub use crate::core::WindowId;
-pub use special_workspace::{SpecialWorkspaceId, WorkspaceLocation};
+pub use special_workspace::{SPECIAL_WORKSPACE_COUNT, SpecialWorkspaceId, WorkspaceLocation};
 pub use window::{
     LayoutMembership, WindowChromePolicy, WindowDecorationPolicy, WindowManagementState,
 };

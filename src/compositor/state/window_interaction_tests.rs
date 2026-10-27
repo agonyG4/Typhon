@@ -1230,10 +1230,10 @@ fn closing_special_ends_departing_resize_through_terminal_lifecycle() {
     interaction.drag_committed = true;
     state.window_interaction = Some(interaction);
 
-    state.toggle_default_special_workspace();
+    state.toggle_special_workspace(crate::wm::SpecialWorkspaceId::DEFAULT);
     assert!(state.window_interaction_active());
 
-    state.toggle_default_special_workspace();
+    state.toggle_special_workspace(crate::wm::SpecialWorkspaceId::DEFAULT);
 
     assert!(!state.window_interaction_active());
     assert_eq!(
@@ -1281,8 +1281,8 @@ fn closing_special_does_not_cancel_unrelated_regular_interaction() {
     interaction.root_surface_id = 101;
     state.window_interaction = Some(interaction);
 
-    state.toggle_default_special_workspace();
-    state.toggle_default_special_workspace();
+    state.toggle_special_workspace(crate::wm::SpecialWorkspaceId::DEFAULT);
+    state.toggle_special_workspace(crate::wm::SpecialWorkspaceId::DEFAULT);
 
     assert_eq!(
         state
@@ -1310,11 +1310,11 @@ fn closing_special_move_defers_terminal_pointer_refresh_until_final_scene() {
     interaction.root_surface_id = 103;
     state.window_interaction = Some(interaction);
 
-    state.toggle_default_special_workspace();
+    state.toggle_special_workspace(crate::wm::SpecialWorkspaceId::DEFAULT);
     let before_close = state
         .window_interaction_release_metrics()
         .window_interaction_post_terminal_pointer_refreshes;
-    state.toggle_default_special_workspace();
+    state.toggle_special_workspace(crate::wm::SpecialWorkspaceId::DEFAULT);
 
     assert_eq!(
         state

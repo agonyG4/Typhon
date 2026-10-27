@@ -1212,7 +1212,7 @@ fn default_special_toggle_preserves_regular_selection_and_updates_scene() {
     let regular = state.active_workspace();
     let backend_commands_before = state.backend_commands.len();
     assert_eq!(
-        state.toggle_default_special_workspace(),
+        state.toggle_special_workspace(crate::wm::SpecialWorkspaceId::DEFAULT),
         crate::wm::SpecialWorkspaceToggleOutcome::Opened {
             id: crate::wm::SpecialWorkspaceId::DEFAULT,
         }
@@ -1221,7 +1221,7 @@ fn default_special_toggle_preserves_regular_selection_and_updates_scene() {
     assert!(state.active_scene_surfaces().is_empty());
     assert_eq!(state.backend_commands.len(), backend_commands_before);
     assert_eq!(
-        state.toggle_default_special_workspace(),
+        state.toggle_special_workspace(crate::wm::SpecialWorkspaceId::DEFAULT),
         crate::wm::SpecialWorkspaceToggleOutcome::Closed {
             id: crate::wm::SpecialWorkspaceId::DEFAULT,
         }
@@ -1247,7 +1247,11 @@ fn focused_family_moves_between_special_and_current_regular_without_geometry_cha
     );
     let before_commands = state.backend_commands.len();
 
-    assert!(state.move_focused_window_to_or_from_special_workspace());
+    assert!(
+        state.move_focused_window_to_or_from_special_workspace(
+            crate::wm::SpecialWorkspaceId::DEFAULT
+        )
+    );
     assert_eq!(
         state.window(id).unwrap().management.unwrap().location(),
         WorkspaceLocation::Special(crate::wm::SpecialWorkspaceId::DEFAULT)
@@ -1263,10 +1267,99 @@ fn focused_family_moves_between_special_and_current_regular_without_geometry_cha
         .workspace_manager
         .toggle_special_workspace(crate::wm::SpecialWorkspaceId::DEFAULT);
     state.focused_window_id = Some(id);
-    assert!(state.move_focused_window_to_or_from_special_workspace());
+    assert!(
+        state.move_focused_window_to_or_from_special_workspace(
+            crate::wm::SpecialWorkspaceId::DEFAULT
+        )
+    );
     assert_eq!(
         state.window(id).unwrap().management.unwrap().location(),
         WorkspaceLocation::Regular(WorkspaceId::new(1).unwrap())
+    );
+}
+
+fn insert_window_in_special(
+    state: &mut CompositorState,
+    root_surface_id: u32,
+    special: crate::wm::SpecialWorkspaceId,
+) -> WindowId {
+    let id = state.allocate_window_id().expect("window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_xdg(id, root_surface_id))
+        .expect("window");
+    state.window_mut(id).expect("window").management = Some(WindowManagementState::new(
+        WorkspaceLocation::Special(special),
+    ));
+    id
+}
+
+#[test]
+fn numbered_special_toggle_switches_visibility_and_hides_departing_window() {
+    let mut state = CompositorState::new(None);
+    let first = crate::wm::SpecialWorkspaceId::DEFAULT;
+    let second = crate::wm::SpecialWorkspaceId::new(2).expect("non-zero special workspace");
+    let on_first = insert_window_in_special(&mut state, 441, first);
+    let on_second = insert_window_in_special(&mut state, 442, second);
+
+    assert_eq!(
+        state.toggle_special_workspace(first),
+        crate::wm::SpecialWorkspaceToggleOutcome::Opened { id: first }
+    );
+    assert!(state.window_is_visible_in_active_scene(on_first));
+    assert!(!state.window_is_visible_in_active_scene(on_second));
+
+    assert_eq!(
+        state.toggle_special_workspace(second),
+        crate::wm::SpecialWorkspaceToggleOutcome::Switched {
+            previous: first,
+            current: second,
+        }
+    );
+    assert_eq!(
+        state.workspace_manager.visible_special_workspace(),
+        Some(second)
+    );
+    assert!(!state.window_is_visible_in_active_scene(on_first));
+    assert!(state.window_is_visible_in_active_scene(on_second));
+
+    assert_eq!(
+        state.toggle_special_workspace(second),
+        crate::wm::SpecialWorkspaceToggleOutcome::Closed { id: second }
+    );
+    assert_eq!(state.workspace_manager.visible_special_workspace(), None);
+    assert!(!state.window_is_visible_in_active_scene(on_second));
+}
+
+#[test]
+fn focused_family_moves_between_numbered_specials_and_back_to_regular() {
+    let mut state = CompositorState::new(None);
+    let second = crate::wm::SpecialWorkspaceId::new(2).expect("non-zero special workspace");
+    let third = crate::wm::SpecialWorkspaceId::new(3).expect("non-zero special workspace");
+    let id = state.allocate_window_id().expect("window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_xdg(id, 443))
+        .expect("window");
+    state.focused_window_id = Some(id);
+
+    assert!(state.move_focused_window_to_or_from_special_workspace(second));
+    assert_eq!(
+        state.window(id).unwrap().management.unwrap().location(),
+        WorkspaceLocation::Special(second)
+    );
+    assert!(!state.window_is_visible_in_active_scene(id));
+
+    state.focused_window_id = Some(id);
+    assert!(state.move_focused_window_to_or_from_special_workspace(third));
+    assert_eq!(
+        state.window(id).unwrap().management.unwrap().location(),
+        WorkspaceLocation::Special(third)
+    );
+
+    state.focused_window_id = Some(id);
+    assert!(state.move_focused_window_to_or_from_special_workspace(third));
+    assert_eq!(
+        state.window(id).unwrap().management.unwrap().location(),
+        WorkspaceLocation::Regular(state.active_workspace())
     );
 }
 
@@ -1296,7 +1389,11 @@ fn moving_between_regular_and_special_marks_presence_dirty() {
     state.focused_window_id = Some(id);
     state.workspace_presence_dirty = false;
 
-    assert!(state.move_focused_window_to_or_from_special_workspace());
+    assert!(
+        state.move_focused_window_to_or_from_special_workspace(
+            crate::wm::SpecialWorkspaceId::DEFAULT
+        )
+    );
     assert!(state.workspace_presence_dirty);
 
     state.workspace_presence_dirty = false;
@@ -1304,7 +1401,11 @@ fn moving_between_regular_and_special_marks_presence_dirty() {
         .workspace_manager
         .toggle_special_workspace(crate::wm::SpecialWorkspaceId::DEFAULT);
     state.focused_window_id = Some(id);
-    assert!(state.move_focused_window_to_or_from_special_workspace());
+    assert!(
+        state.move_focused_window_to_or_from_special_workspace(
+            crate::wm::SpecialWorkspaceId::DEFAULT
+        )
+    );
     assert!(state.workspace_presence_dirty);
 }
 
@@ -1335,7 +1436,11 @@ fn moving_x11_family_to_special_queues_typed_clear_workspace() {
     let id = insert_x11(&mut state, x11_snapshot(generation, 240, 241));
     state.focused_window_id = Some(id);
 
-    assert!(state.move_focused_window_to_or_from_special_workspace());
+    assert!(
+        state.move_focused_window_to_or_from_special_workspace(
+            crate::wm::SpecialWorkspaceId::DEFAULT
+        )
+    );
     assert!(matches!(
         state.backend_commands.last(),
         Some(crate::compositor::window_backend::WindowBackendCommand::ClearWorkspace {
@@ -1386,7 +1491,7 @@ fn closing_special_restores_the_best_visible_regular_focus_candidate() {
         .workspace_manager
         .toggle_special_workspace(crate::wm::SpecialWorkspaceId::DEFAULT);
 
-    let _ = state.toggle_default_special_workspace();
+    let _ = state.toggle_special_workspace(crate::wm::SpecialWorkspaceId::DEFAULT);
 
     assert_eq!(state.topmost_renderable_toplevel_window_id(), Some(regular));
 }

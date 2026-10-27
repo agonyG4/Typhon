@@ -123,21 +123,28 @@ impl CompositorState {
         }
     }
 
-    pub(in crate::compositor) fn toggle_default_special_workspace(
+    pub(in crate::compositor) fn toggle_special_workspace(
         &mut self,
+        id: SpecialWorkspaceId,
     ) -> SpecialWorkspaceToggleOutcome {
         let previous_selection = self.active_scene_selection();
         self.workspace_scene_transition_active = true;
-        let outcome = self
-            .workspace_manager
-            .toggle_special_workspace(SpecialWorkspaceId::DEFAULT);
+        let outcome = self.workspace_manager.toggle_special_workspace(id);
         let new_selection = self.active_scene_selection();
-        let special_location = WorkspaceLocation::Special(SpecialWorkspaceId::DEFAULT);
-        let layout_batch = matches!(outcome, SpecialWorkspaceToggleOutcome::Opened { .. })
-            && ((self.tiled_layout.tree(special_location).is_some()
-                && self.tiled_layout_dirty.contains(&special_location))
-                || self.location_has_deferred_floating_restore(special_location));
-        if layout_batch {
+        let shown_location = match outcome {
+            SpecialWorkspaceToggleOutcome::Opened { id }
+            | SpecialWorkspaceToggleOutcome::Switched { current: id, .. } => {
+                Some(WorkspaceLocation::Special(id))
+            }
+            SpecialWorkspaceToggleOutcome::Closed { .. }
+            | SpecialWorkspaceToggleOutcome::UnknownSpecial { .. } => None,
+        };
+        let layout_batch = shown_location.is_some_and(|location| {
+            (self.tiled_layout.tree(location).is_some()
+                && self.tiled_layout_dirty.contains(&location))
+                || self.location_has_deferred_floating_restore(location)
+        });
+        if let Some(special_location) = shown_location.filter(|_| layout_batch) {
             self.begin_layout_reflow_batch();
             if self.tiled_layout_dirty.contains(&special_location) {
                 let _ = self.reflow_tiled_location(special_location);
@@ -155,7 +162,7 @@ impl CompositorState {
         self.reconcile_idle_inhibition();
         self.mark_astrea_toplevel_structure_dirty();
         self.recompute_layer_keyboard_focus();
-        if matches!(outcome, SpecialWorkspaceToggleOutcome::Opened { .. })
+        if shown_location.is_some()
             && self.active_exclusive_layer_surface_id().is_none()
             && self
                 .topmost_renderable_toplevel_window_id()
@@ -168,10 +175,13 @@ impl CompositorState {
         {
             let _ = self.focus_topmost_renderable_toplevel();
         }
-        if matches!(outcome, SpecialWorkspaceToggleOutcome::Closed { .. })
-            && self
-                .focused_window_id
-                .is_some_and(|window_id| !self.window_is_visible_in_active_scene(window_id))
+        if matches!(
+            outcome,
+            SpecialWorkspaceToggleOutcome::Closed { .. }
+                | SpecialWorkspaceToggleOutcome::Switched { .. }
+        ) && self
+            .focused_window_id
+            .is_some_and(|window_id| !self.window_is_visible_in_active_scene(window_id))
         {
             self.focused_window_id = None;
             if self.active_exclusive_layer_surface_id().is_none() {
@@ -466,6 +476,7 @@ impl CompositorState {
 
     pub(in crate::compositor) fn move_focused_window_to_or_from_special_workspace(
         &mut self,
+        id: SpecialWorkspaceId,
     ) -> bool {
         let Some(window_id) = self.focused_window_id else {
             return false;
@@ -479,10 +490,12 @@ impl CompositorState {
             return false;
         };
         let destination = match current {
-            WorkspaceLocation::Regular(_) => {
-                WorkspaceLocation::Special(SpecialWorkspaceId::DEFAULT)
+            WorkspaceLocation::Special(current_special) if current_special == id => {
+                WorkspaceLocation::Regular(self.active_workspace())
             }
-            WorkspaceLocation::Special(_) => WorkspaceLocation::Regular(self.active_workspace()),
+            WorkspaceLocation::Regular(_) | WorkspaceLocation::Special(_) => {
+                WorkspaceLocation::Special(id)
+            }
         };
         self.move_window_family_to_location(window_id, destination)
     }

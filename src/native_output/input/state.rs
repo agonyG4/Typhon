@@ -1275,16 +1275,16 @@ impl NativeInputState {
                     .push(NativeWindowAction::MoveFocusedWindowToWorkspace(*workspace));
                 effect.request_visual_redraw();
             }
-            BindingActionDefinition::ToggleDefaultSpecialWorkspace => {
+            BindingActionDefinition::ToggleSpecialWorkspace(special) => {
                 effect
                     .window_actions
-                    .push(NativeWindowAction::ToggleDefaultSpecialWorkspace);
+                    .push(NativeWindowAction::ToggleSpecialWorkspace(*special));
                 effect.request_visual_redraw();
             }
-            BindingActionDefinition::MoveFocusedWindowToOrFromSpecialWorkspace => {
+            BindingActionDefinition::MoveFocusedWindowToOrFromSpecialWorkspace(special) => {
                 effect
                     .window_actions
-                    .push(NativeWindowAction::MoveFocusedWindowToOrFromSpecialWorkspace);
+                    .push(NativeWindowAction::MoveFocusedWindowToOrFromSpecialWorkspace(*special));
                 effect.request_visual_redraw();
             }
             BindingActionDefinition::LaunchCommand(_)

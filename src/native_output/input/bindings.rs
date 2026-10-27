@@ -1,6 +1,6 @@
 use super::*;
 use crate::system_action::AstreaSystemAction;
-use oblivion_one::wm::WorkspaceId;
+use oblivion_one::wm::{SPECIAL_WORKSPACE_COUNT, SpecialWorkspaceId, WorkspaceId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct ModifierMask(u8);
@@ -62,8 +62,8 @@ pub(crate) enum BindingActionDefinition {
     ToggleFocusedWindowLayout,
     SwitchWorkspace(WorkspaceId),
     MoveFocusedWindowToWorkspace(WorkspaceId),
-    ToggleDefaultSpecialWorkspace,
-    MoveFocusedWindowToOrFromSpecialWorkspace,
+    ToggleSpecialWorkspace(SpecialWorkspaceId),
+    MoveFocusedWindowToOrFromSpecialWorkspace(SpecialWorkspaceId),
     LaunchCommand(Vec<String>),
     LaunchSessionCommand {
         index: u8,
@@ -180,7 +180,7 @@ pub(crate) fn default_astrea_binding_specs() -> Vec<BindingSpec> {
             modifiers: ModifierMask::SUPER,
             trigger: BindingTrigger::Press,
             input: BindingInput::PhysicalKey(KEY_S),
-            action: BindingActionDefinition::ToggleDefaultSpecialWorkspace,
+            action: BindingActionDefinition::ToggleSpecialWorkspace(SpecialWorkspaceId::DEFAULT),
             repeat: RepeatPolicy::Disabled,
             inhibition: InhibitionPolicy::Respect,
             reserved: false,
@@ -189,7 +189,9 @@ pub(crate) fn default_astrea_binding_specs() -> Vec<BindingSpec> {
             modifiers: ModifierMask::SUPER | ModifierMask::SHIFT,
             trigger: BindingTrigger::Press,
             input: BindingInput::PhysicalKey(KEY_S),
-            action: BindingActionDefinition::MoveFocusedWindowToOrFromSpecialWorkspace,
+            action: BindingActionDefinition::MoveFocusedWindowToOrFromSpecialWorkspace(
+                SpecialWorkspaceId::DEFAULT,
+            ),
             repeat: RepeatPolicy::Disabled,
             inhibition: InhibitionPolicy::Respect,
             reserved: false,
@@ -369,6 +371,30 @@ pub(crate) fn default_astrea_binding_specs() -> Vec<BindingSpec> {
             reserved: true,
         },
     ];
+    for special_number in 2..=SPECIAL_WORKSPACE_COUNT {
+        let special =
+            SpecialWorkspaceId::new(special_number).expect("special workspace binding id");
+        let key = special_workspace_key(special);
+        specs.push(BindingSpec {
+            modifiers: ModifierMask::SUPER | ModifierMask::ALT,
+            trigger: BindingTrigger::Press,
+            input: BindingInput::PhysicalKey(key),
+            action: BindingActionDefinition::ToggleSpecialWorkspace(special),
+            repeat: RepeatPolicy::Disabled,
+            inhibition: InhibitionPolicy::Respect,
+            reserved: false,
+        });
+        specs.push(BindingSpec {
+            modifiers: ModifierMask::SUPER | ModifierMask::ALT | ModifierMask::SHIFT,
+            trigger: BindingTrigger::Press,
+            input: BindingInput::PhysicalKey(key),
+            action: BindingActionDefinition::MoveFocusedWindowToOrFromSpecialWorkspace(special),
+            repeat: RepeatPolicy::Disabled,
+            inhibition: InhibitionPolicy::Respect,
+            reserved: false,
+        });
+    }
+
     for workspace_number in 1..=10 {
         let workspace = WorkspaceId::new(workspace_number).expect("workspace binding id");
         let key = workspace_key(workspace);
@@ -494,6 +520,16 @@ pub(crate) fn default_astrea_binding_specs() -> Vec<BindingSpec> {
     specs
 }
 
+/// Physical digit keys for special workspaces 2..=4. Special 1 keeps Super+S.
+fn special_workspace_key(special: SpecialWorkspaceId) -> u16 {
+    match special.get() {
+        2 => KEY_2,
+        3 => KEY_3,
+        4 => KEY_4,
+        _ => unreachable!("special workspace binding keys cover 2..=4"),
+    }
+}
+
 const fn workspace_key(workspace: WorkspaceId) -> u16 {
     match workspace.get() {
         1 => KEY_1,
@@ -588,12 +624,71 @@ mod tests {
     }
 
     #[test]
+    fn numbered_special_workspace_bindings_use_super_alt_digits() {
+        let mut manager = AstreaBindingManager::default();
+        let special_three = SpecialWorkspaceId::new(3).expect("non-zero special workspace");
+        let special_four = SpecialWorkspaceId::new(4).expect("non-zero special workspace");
+
+        let matched = manager.handle_key(
+            ModifierMask::SUPER | ModifierMask::ALT,
+            KEY_3,
+            true,
+            false,
+            false,
+        );
+        assert_eq!(
+            action_for_match(&manager, matched),
+            Some(&BindingActionDefinition::ToggleSpecialWorkspace(
+                special_three
+            ))
+        );
+        let matched = manager.handle_key(
+            ModifierMask::SUPER | ModifierMask::ALT | ModifierMask::SHIFT,
+            KEY_4,
+            true,
+            false,
+            false,
+        );
+        assert_eq!(
+            action_for_match(&manager, matched),
+            Some(&BindingActionDefinition::MoveFocusedWindowToOrFromSpecialWorkspace(special_four))
+        );
+        for special_number in 2..=SPECIAL_WORKSPACE_COUNT {
+            let special = SpecialWorkspaceId::new(special_number).expect("non-zero special");
+            let key = special_workspace_key(special);
+            let matched = manager.handle_key(
+                ModifierMask::SUPER | ModifierMask::ALT,
+                key,
+                true,
+                false,
+                false,
+            );
+            assert_eq!(
+                action_for_match(&manager, matched),
+                Some(&BindingActionDefinition::ToggleSpecialWorkspace(special))
+            );
+        }
+        assert_eq!(
+            manager.handle_key(
+                ModifierMask::SUPER | ModifierMask::ALT,
+                KEY_3,
+                true,
+                true,
+                false
+            ),
+            AstreaBindingMatch::Pass
+        );
+    }
+
+    #[test]
     fn special_workspace_bindings_are_press_only_exact_and_inhibition_aware() {
         let mut manager = AstreaBindingManager::default();
         let matched = manager.handle_key(ModifierMask::SUPER, KEY_S, true, false, false);
         assert_eq!(
             action_for_match(&manager, matched),
-            Some(&BindingActionDefinition::ToggleDefaultSpecialWorkspace)
+            Some(&BindingActionDefinition::ToggleSpecialWorkspace(
+                SpecialWorkspaceId::DEFAULT
+            ))
         );
         assert_eq!(
             manager.handle_key(ModifierMask::SUPER, KEY_S, true, true, false),
@@ -608,7 +703,11 @@ mod tests {
         );
         assert_eq!(
             action_for_match(&manager, matched),
-            Some(&BindingActionDefinition::MoveFocusedWindowToOrFromSpecialWorkspace)
+            Some(
+                &BindingActionDefinition::MoveFocusedWindowToOrFromSpecialWorkspace(
+                    SpecialWorkspaceId::DEFAULT
+                )
+            )
         );
         assert_eq!(
             manager.handle_key(ModifierMask::SUPER, KEY_S, true, false, true),

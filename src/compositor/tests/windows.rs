@@ -944,7 +944,9 @@ fn special_workspace_visibility_controls_fullscreen_composition() {
 
     focus_root_window(&commands, surface_ids[1]);
     commands
-        .send(ServerCommand::MoveFocusedWindowToOrFromSpecialWorkspace)
+        .send(ServerCommand::MoveFocusedWindowToOrFromSpecialWorkspace(
+            crate::wm::SpecialWorkspaceId::DEFAULT,
+        ))
         .unwrap();
     wait_for_server_commands(&commands);
     commands
@@ -973,7 +975,9 @@ fn special_workspace_visibility_controls_fullscreen_composition() {
     let pointer_hits_before_open = capture_pointer_input_metrics(&commands).pointer_scene_hit_calls;
     let configure_serial_before_open = capture_configure_serial(&commands);
     commands
-        .send(ServerCommand::ToggleDefaultSpecialWorkspace)
+        .send(ServerCommand::ToggleSpecialWorkspace(
+            crate::wm::SpecialWorkspaceId::DEFAULT,
+        ))
         .unwrap();
     wait_for_server_commands(&commands);
 
@@ -1001,7 +1005,9 @@ fn special_workspace_visibility_controls_fullscreen_composition() {
     let pointer_hits_before_close =
         capture_pointer_input_metrics(&commands).pointer_scene_hit_calls;
     commands
-        .send(ServerCommand::ToggleDefaultSpecialWorkspace)
+        .send(ServerCommand::ToggleSpecialWorkspace(
+            crate::wm::SpecialWorkspaceId::DEFAULT,
+        ))
         .unwrap();
     wait_for_server_commands(&commands);
     let closed_metrics = capture_fullscreen_render_plan_metrics(&commands);

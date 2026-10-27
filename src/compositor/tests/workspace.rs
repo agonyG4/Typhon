@@ -278,7 +278,9 @@ fn wire_visibility_is_atomic_and_independent_of_astrea_manager() {
     assert_eq!(state.workspace("typhon.workspace.3").state, 1);
 
     commands
-        .send(ServerCommand::MoveFocusedWindowToOrFromSpecialWorkspace)
+        .send(ServerCommand::MoveFocusedWindowToOrFromSpecialWorkspace(
+            crate::wm::SpecialWorkspaceId::DEFAULT,
+        ))
         .unwrap();
     wait_for_server_commands(&commands);
     let done_before_special = state.done_snapshots.len();
@@ -287,7 +289,9 @@ fn wire_visibility_is_atomic_and_independent_of_astrea_manager() {
     assert_eq!(state.workspace("typhon.workspace.3").state, 1);
 
     commands
-        .send(ServerCommand::ToggleDefaultSpecialWorkspace)
+        .send(ServerCommand::ToggleSpecialWorkspace(
+            crate::wm::SpecialWorkspaceId::DEFAULT,
+        ))
         .unwrap();
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
@@ -319,7 +323,9 @@ fn wire_visibility_is_atomic_and_independent_of_astrea_manager() {
     );
 
     commands
-        .send(ServerCommand::ToggleDefaultSpecialWorkspace)
+        .send(ServerCommand::ToggleSpecialWorkspace(
+            crate::wm::SpecialWorkspaceId::DEFAULT,
+        ))
         .unwrap();
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();

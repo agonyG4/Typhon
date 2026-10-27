@@ -1,6 +1,6 @@
 use std::{fmt, num::NonZeroU32};
 
-use super::SpecialWorkspaceId;
+use super::{SPECIAL_WORKSPACE_COUNT, SpecialWorkspaceId};
 
 const DEFAULT_WORKSPACE_COUNT: u32 = 10;
 
@@ -61,9 +61,19 @@ pub enum WorkspaceSwitchOutcome {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpecialWorkspaceToggleOutcome {
-    Opened { id: SpecialWorkspaceId },
-    Closed { id: SpecialWorkspaceId },
-    UnknownSpecial { id: SpecialWorkspaceId },
+    Opened {
+        id: SpecialWorkspaceId,
+    },
+    Closed {
+        id: SpecialWorkspaceId,
+    },
+    Switched {
+        previous: SpecialWorkspaceId,
+        current: SpecialWorkspaceId,
+    },
+    UnknownSpecial {
+        id: SpecialWorkspaceId,
+    },
 }
 
 impl WorkspaceManager {
@@ -72,10 +82,13 @@ impl WorkspaceManager {
             .map(WorkspaceId::new)
             .collect::<Option<Vec<_>>>()?;
         let active_workspace = workspaces.first().copied()?;
+        let special_workspaces = (1..=SPECIAL_WORKSPACE_COUNT)
+            .map(SpecialWorkspaceId::new)
+            .collect::<Option<Vec<_>>>()?;
         Some(Self {
             active_workspace,
             workspaces,
-            special_workspaces: vec![SpecialWorkspaceId::DEFAULT],
+            special_workspaces,
             visible_special_workspace: None,
         })
     }
@@ -104,7 +117,14 @@ impl WorkspaceManager {
                 self.visible_special_workspace = None;
                 SpecialWorkspaceToggleOutcome::Closed { id }
             }
-            _ => {
+            Some(previous) => {
+                self.visible_special_workspace = Some(id);
+                SpecialWorkspaceToggleOutcome::Switched {
+                    previous,
+                    current: id,
+                }
+            }
+            None => {
                 self.visible_special_workspace = Some(id);
                 SpecialWorkspaceToggleOutcome::Opened { id }
             }
