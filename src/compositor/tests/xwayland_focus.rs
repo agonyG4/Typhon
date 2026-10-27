@@ -319,3 +319,84 @@ fn m7_a_hundred_mixed_hover_and_click_cycles_keep_policy_outcomes_distinct() {
         }
     }
 }
+
+#[test]
+fn click_activation_raises_a_window_inside_the_visible_special_workspace() {
+    let mut fixture = stationary_pointer_xwayland_fixture();
+    let (first_id, second_id) = admit_focus_pair(&mut fixture);
+    let special = crate::wm::SpecialWorkspaceId::DEFAULT;
+    for window_id in [first_id, second_id] {
+        fixture.server.state.focused_window_id = Some(window_id);
+        assert!(
+            fixture
+                .server
+                .state
+                .move_focused_window_to_or_from_special_workspace(special)
+        );
+    }
+    fixture.server.state.toggle_special_workspace(special);
+    let _ = fixture.server.state.raise_window_id(second_id);
+    assert_eq!(
+        fixture.server.state.window_stacking.last().copied(),
+        Some(second_id)
+    );
+
+    assert_eq!(
+        fixture
+            .server
+            .state
+            .activate_desktop_window(first_id, WindowFocusReason::PointerPress),
+        WindowActivationOutcome::Changed
+    );
+    assert_eq!(
+        fixture.server.state.window_stacking.last().copied(),
+        Some(first_id),
+        "clicking a special window must raise it like a regular one"
+    );
+    assert_eq!(fixture.server.state.focused_window_id, Some(first_id));
+}
+
+#[test]
+fn activating_a_window_of_a_hidden_special_workspace_shows_that_special() {
+    let mut fixture = stationary_pointer_xwayland_fixture();
+    let (first_id, _) = admit_focus_pair(&mut fixture);
+    let special = crate::wm::SpecialWorkspaceId::new(2).expect("special id");
+    fixture.server.state.focused_window_id = Some(first_id);
+    assert!(
+        fixture
+            .server
+            .state
+            .move_focused_window_to_or_from_special_workspace(special)
+    );
+    assert_eq!(
+        fixture
+            .server
+            .state
+            .workspace_manager
+            .visible_special_workspace(),
+        None
+    );
+
+    assert_eq!(
+        fixture
+            .server
+            .state
+            .activate_desktop_window(first_id, WindowFocusReason::ShellActivation),
+        WindowActivationOutcome::Changed
+    );
+    assert_eq!(
+        fixture
+            .server
+            .state
+            .workspace_manager
+            .visible_special_workspace(),
+        Some(special)
+    );
+    assert!(
+        fixture
+            .server
+            .state
+            .window_is_visible_in_active_scene(first_id)
+    );
+    assert_eq!(fixture.server.state.focused_window_id, Some(first_id));
+}

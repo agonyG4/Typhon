@@ -9,7 +9,9 @@ use crate::window_lifecycle_animation::{
     LifecycleDirection, LifecycleVisualGroup, ResolvedLifecycleTarget, canonical_visual_rect,
     presented_visual_rect,
 };
-use crate::wm::{LayoutMembership, WorkspaceSwitchOutcome};
+use crate::wm::{
+    LayoutMembership, SpecialWorkspaceToggleOutcome, WorkspaceLocation, WorkspaceSwitchOutcome,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum PendingXwaylandRestoreWaitReason {
@@ -384,20 +386,35 @@ impl CompositorState {
         window_id: WindowId,
         reason: WindowFocusReason,
     ) -> WindowActivationOutcome {
-        let Some(target_workspace) = self.window(window_id).and_then(|window| {
-            window
-                .management
-                .and_then(|management| management.regular_workspace())
-        }) else {
+        let Some(target_location) = self
+            .window(window_id)
+            .and_then(|window| window.management.map(|management| management.location()))
+        else {
             return WindowActivationOutcome::Unavailable;
         };
-        if target_workspace != self.active_workspace()
-            && matches!(
-                self.activate_workspace(target_workspace),
-                WorkspaceSwitchOutcome::UnknownWorkspace
-            )
-        {
-            return WindowActivationOutcome::Unavailable;
+        match target_location {
+            WorkspaceLocation::Regular(target_workspace) => {
+                if target_workspace != self.active_workspace()
+                    && matches!(
+                        self.activate_workspace(target_workspace),
+                        WorkspaceSwitchOutcome::UnknownWorkspace
+                    )
+                {
+                    return WindowActivationOutcome::Unavailable;
+                }
+            }
+            // Like Hyprland, activating a window of a hidden special workspace
+            // shows that special (switching away from another visible one).
+            WorkspaceLocation::Special(special) => {
+                if self.workspace_manager.visible_special_workspace() != Some(special)
+                    && matches!(
+                        self.toggle_special_workspace(special),
+                        SpecialWorkspaceToggleOutcome::UnknownSpecial { .. }
+                    )
+                {
+                    return WindowActivationOutcome::Unavailable;
+                }
+            }
         }
         let Some(window) = self.window(window_id) else {
             return WindowActivationOutcome::Unavailable;
