@@ -224,12 +224,16 @@ pub(in crate::compositor) fn sample_slide_motion(
     at: AnimationTime,
 ) -> (f64, f64, bool) {
     let elapsed = at.elapsed_seconds(started_at);
+    // An easing curve keeps its own shape unless a retarget carries
+    // velocity; the Hermite blend only exists to preserve that velocity.
+    let preserve_start_velocity =
+        start_velocity != 0.0 || !matches!(curve, AnimationCurve::Easing { .. });
     let (position, velocity, settled) = curve.sample_scalar(
         start_position,
         target_position,
         start_velocity,
         elapsed,
-        true,
+        preserve_start_velocity,
     );
     let crossed_target = if target_position > start_position {
         position >= target_position

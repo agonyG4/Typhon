@@ -104,7 +104,15 @@ impl CompositorState {
             return;
         }
 
-        let curve = workspace_slide_curve(self.animation_control.configuration().speed);
+        let configuration = self.animation_control.configuration();
+        let curve = if configuration.preset == crate::animation_control::AnimationPreset::Hyprland {
+            crate::animation_control::scale_curve(
+                crate::animation_control::HYPRLAND_WORKSPACES_CURVE,
+                configuration.speed,
+            )
+        } else {
+            workspace_slide_curve(configuration.speed)
+        };
         let retarget = self.workspace_presentation.transition().is_some();
         if let Some(transition_id) = self.workspace_presentation.activate_for_switch(
             outcome,

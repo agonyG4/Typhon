@@ -287,9 +287,40 @@ impl CompositorState {
             self.special_workspace_presentation.clear();
             return;
         }
-        let curve = special_workspace_curve(self.animation_control.configuration().speed);
+        let configuration = self.animation_control.configuration();
+        let curve = if configuration.preset == crate::animation_control::AnimationPreset::Hyprland {
+            crate::animation_control::scale_curve(
+                crate::animation_control::HYPRLAND_SPECIAL_WORKSPACE_CURVE,
+                configuration.speed,
+            )
+        } else {
+            special_workspace_curve(configuration.speed)
+        };
         self.special_workspace_presentation
             .begin_for_outcome(outcome, sampled_at, curve);
+    }
+
+    /// Logical offset of a special window at `presence` (1 = shown). The
+    /// Hyprland preset slides it in from and out to the right edge by the
+    /// output width, like Hyprland's special `slide`; the others drop it
+    /// slightly from above.
+    pub(in crate::compositor) fn special_workspace_slide_translation(
+        &self,
+        presence: f64,
+    ) -> (f64, f64) {
+        let hidden = 1.0 - presence;
+        if self.animation_control.configuration().preset
+            == crate::animation_control::AnimationPreset::Hyprland
+        {
+            (hidden * f64::from(self.output_size.width), 0.0)
+        } else {
+            (
+                0.0,
+                -hidden
+                    * SPECIAL_WORKSPACE_SLIDE_OFFSET_FRACTION
+                    * f64::from(self.output_size.height),
+            )
+        }
     }
 
     pub(in crate::compositor) fn special_workspace_presentation_active(&self) -> bool {

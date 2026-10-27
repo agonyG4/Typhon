@@ -17,6 +17,8 @@ use std::time::Duration;
 const WINDOW_CLOSE_BASE_DURATION: Duration = Duration::from_millis(180);
 const WINDOW_CLOSE_SCALE_FACTOR: f64 = 0.94;
 const WINDOW_CLOSE_GLIDE_OFFSET_LOGICAL_PIXELS: f64 = 24.0;
+/// Hyprland's popin with no percentage shrinks to its 5x5 minimum, centered.
+const WINDOW_CLOSE_POPIN_MIN_EXTENT: f64 = 5.0;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) struct WindowCloseAnimationPlan {
@@ -55,8 +57,33 @@ pub(super) fn window_close_animation_plan(
             source_presented_rect.width(),
             source_presented_rect.height(),
         )?,
+        AnimationEffect::WindowPopin => {
+            let width = WINDOW_CLOSE_POPIN_MIN_EXTENT.min(source_presented_rect.width());
+            let height = WINDOW_CLOSE_POPIN_MIN_EXTENT.min(source_presented_rect.height());
+            PresentationRect::new(
+                source_presented_rect.x() + (source_presented_rect.width() - width) / 2.0,
+                source_presented_rect.y() + (source_presented_rect.height() - height) / 2.0,
+                width,
+                height,
+            )?
+        }
         _ => return None,
     };
+    if effect == AnimationEffect::WindowPopin {
+        // Geometry (windowsOut) and fade (fadeOut) run on separate curves; the
+        // fade finishes well before the shrink, like Hyprland.
+        return Some(WindowCloseAnimationPlan {
+            geometry_start: source_presented_rect,
+            geometry_target,
+            opacity_start: source_presented_opacity,
+            opacity_target: PresentationOpacity::TRANSPARENT,
+            geometry_curve: scale_curve(
+                crate::animation_control::HYPRLAND_WINDOWS_OUT_CURVE,
+                speed,
+            ),
+            opacity_curve: scale_curve(crate::animation_control::HYPRLAND_FADE_OUT_CURVE, speed),
+        });
+    }
     let curve = || {
         scale_curve(
             AnimationCurve::easing(WINDOW_CLOSE_BASE_DURATION, EasingCurve::EaseInCubic),
@@ -93,7 +120,9 @@ impl CompositorState {
         );
         if !matches!(
             effect,
-            AnimationEffect::WindowScale | AnimationEffect::WindowGlide
+            AnimationEffect::WindowScale
+                | AnimationEffect::WindowGlide
+                | AnimationEffect::WindowPopin
         ) {
             return false;
         }

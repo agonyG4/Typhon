@@ -29,7 +29,9 @@ fn cubic_bezier(x1: f64, y1: f64, x2: f64, y2: f64, progress: f64) -> (f64, f64)
     };
     let slope = |t: f64, p1: f64, p2: f64| {
         let remaining = 1.0 - t;
-        3.0 * remaining * remaining * p1 + 6.0 * remaining * t * (p2 - p1) + 3.0 * t * t * (1.0 - p2)
+        3.0 * remaining * remaining * p1
+            + 6.0 * remaining * t * (p2 - p1)
+            + 3.0 * t * t * (1.0 - p2)
     };
     let mut low = 0.0;
     let mut high = 1.0;
@@ -50,7 +52,11 @@ fn cubic_bezier(x1: f64, y1: f64, x2: f64, y2: f64, progress: f64) -> (f64, f64)
     };
     let dx = slope(t, x1, x2);
     let dy = slope(t, y1, y2);
-    let velocity = if dx.abs() > f64::EPSILON { dy / dx } else { 0.0 };
+    let velocity = if dx.abs() > f64::EPSILON {
+        dy / dx
+    } else {
+        0.0
+    };
     (axis(t, y1, y2), velocity)
 }
 

@@ -1810,6 +1810,10 @@ impl OwnCompositorServer {
             || self.state.special_workspace_presentation_active()
     }
 
+    pub fn special_workspace_slide_translation(&self, presence: f64) -> (f64, f64) {
+        self.state.special_workspace_slide_translation(presence)
+    }
+
     pub fn retire_special_workspace_presentation_if_rendered(
         &mut self,
         sample: &crate::compositor::SpecialWorkspacePresentationSample,

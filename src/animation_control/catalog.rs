@@ -82,20 +82,24 @@ pub enum AnimationEffect {
     None,
     GeometryKde,
     GeometryMacos,
+    GeometryHyprland,
     WindowScale,
     WindowGlide,
+    WindowPopin,
     MinimizeLamp,
     MinimizeSquash,
     WorkspaceSlide,
 }
 
 impl AnimationEffect {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 10] = [
         Self::None,
         Self::GeometryKde,
         Self::GeometryMacos,
+        Self::GeometryHyprland,
         Self::WindowScale,
         Self::WindowGlide,
+        Self::WindowPopin,
         Self::MinimizeLamp,
         Self::MinimizeSquash,
         Self::WorkspaceSlide,
@@ -106,8 +110,10 @@ impl AnimationEffect {
             Self::None => "none",
             Self::GeometryKde => "geometry.kde",
             Self::GeometryMacos => "geometry.macos",
+            Self::GeometryHyprland => "geometry.hyprland",
             Self::WindowScale => "window.scale",
             Self::WindowGlide => "window.glide",
+            Self::WindowPopin => "window.popin",
             Self::MinimizeLamp => "minimize.lamp",
             Self::MinimizeSquash => "minimize.squash",
             Self::WorkspaceSlide => "workspace.slide",
@@ -120,8 +126,10 @@ impl AnimationEffect {
             Self::None
                 | Self::GeometryKde
                 | Self::GeometryMacos
+                | Self::GeometryHyprland
                 | Self::WindowScale
                 | Self::WindowGlide
+                | Self::WindowPopin
                 | Self::MinimizeLamp
                 | Self::MinimizeSquash
                 | Self::WorkspaceSlide
@@ -136,7 +144,7 @@ impl AnimationEffect {
     pub const fn is_available_for_slot(self, slot: AnimationSlot) -> bool {
         match self {
             Self::WorkspaceSlide => matches!(slot, AnimationSlot::WorkspaceSwitch),
-            Self::WindowScale | Self::WindowGlide => {
+            Self::WindowScale | Self::WindowGlide | Self::WindowPopin => {
                 matches!(slot, AnimationSlot::WindowOpen | AnimationSlot::WindowClose)
             }
             Self::MinimizeLamp | Self::MinimizeSquash => matches!(
@@ -204,8 +212,10 @@ impl AnimationEffect {
     pub const fn compatible_with(self, slot: AnimationSlot) -> bool {
         match self {
             Self::None => true,
-            Self::GeometryKde | Self::GeometryMacos => slot.geometry_kind().is_some(),
-            Self::WindowScale | Self::WindowGlide => {
+            Self::GeometryKde | Self::GeometryMacos | Self::GeometryHyprland => {
+                slot.geometry_kind().is_some()
+            }
+            Self::WindowScale | Self::WindowGlide | Self::WindowPopin => {
                 matches!(slot, AnimationSlot::WindowOpen | AnimationSlot::WindowClose)
             }
             Self::MinimizeLamp | Self::MinimizeSquash => {
@@ -224,16 +234,19 @@ pub enum AnimationPreset {
     Astrea,
     Kde,
     Macos,
+    /// The user's Hyprland setup: popin 80% windows, easeOutExpo motion.
+    Hyprland,
 }
 
 impl AnimationPreset {
-    pub const ALL: [Self; 3] = [Self::Astrea, Self::Kde, Self::Macos];
+    pub const ALL: [Self; 4] = [Self::Astrea, Self::Kde, Self::Macos, Self::Hyprland];
 
     pub const fn id(self) -> &'static str {
         match self {
             Self::Astrea => "astrea",
             Self::Kde => "kde",
             Self::Macos => "macos",
+            Self::Hyprland => "hyprland",
         }
     }
 
@@ -249,6 +262,9 @@ impl AnimationPreset {
             (Self::Macos, AnimationSlot::WindowOpen | AnimationSlot::WindowClose) => {
                 AnimationEffect::WindowGlide
             }
+            (Self::Hyprland, AnimationSlot::WindowOpen | AnimationSlot::WindowClose) => {
+                AnimationEffect::WindowPopin
+            }
             (_, AnimationSlot::WorkspaceSwitch) => AnimationEffect::WorkspaceSlide,
             (
                 Self::Astrea | Self::Kde,
@@ -258,9 +274,18 @@ impl AnimationPreset {
                 | AnimationSlot::WindowMaximize
                 | AnimationSlot::WindowFullscreen,
             ) => AnimationEffect::GeometryKde,
-            (Self::Astrea, AnimationSlot::WindowMinimize | AnimationSlot::WindowRestore) => {
-                AnimationEffect::MinimizeLamp
-            }
+            (
+                Self::Hyprland,
+                AnimationSlot::WindowMove
+                | AnimationSlot::WindowResize
+                | AnimationSlot::LayoutReflow
+                | AnimationSlot::WindowMaximize
+                | AnimationSlot::WindowFullscreen,
+            ) => AnimationEffect::GeometryHyprland,
+            (
+                Self::Astrea | Self::Hyprland,
+                AnimationSlot::WindowMinimize | AnimationSlot::WindowRestore,
+            ) => AnimationEffect::MinimizeLamp,
             (Self::Kde, AnimationSlot::WindowMinimize | AnimationSlot::WindowRestore) => {
                 AnimationEffect::MinimizeSquash
             }
@@ -301,10 +326,10 @@ mod tests {
     fn stable_catalog_contains_all_v1_ids() {
         assert_eq!(AnimationSlot::ALL[0].id(), "window.move");
         assert_eq!(AnimationSlot::ALL[10].id(), "workspace.window-move");
-        assert_eq!(AnimationEffect::ALL[5].id(), "minimize.lamp");
+        assert_eq!(AnimationEffect::ALL[7].id(), "minimize.lamp");
         assert_eq!(
             AnimationPreset::ALL.map(AnimationPreset::id),
-            ["astrea", "kde", "macos"]
+            ["astrea", "kde", "macos", "hyprland"]
         );
     }
 

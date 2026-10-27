@@ -26,7 +26,7 @@ pub struct AnimationRuntimeCapabilities {
     pub squash_renderer: bool,
 }
 
-use crate::presentation_animation::{AnimationCurve, SpringSpec};
+use crate::presentation_animation::{AnimationCurve, EasingCurve, SpringSpec};
 use crate::presentation_animation_policy::{
     PresentationAnimationKind, PresentationAnimationPolicy, PresentationAnimationStyle,
     presentation_animation_style_from_env,
@@ -35,6 +35,30 @@ use catalog::effect_for_request;
 use std::{collections::BTreeMap, time::Duration};
 
 const MIN_DURATION: Duration = Duration::from_nanos(1);
+
+// The Hyprland preset mirrors the user's hyprland.conf. Hyprland speeds are
+// in deciseconds, so speed 2.5 is 250 ms.
+/// windowsMove: speed 2.5, easeOutExpo.
+pub(crate) const HYPRLAND_WINDOWS_MOVE_CURVE: AnimationCurve =
+    AnimationCurve::easing(Duration::from_millis(250), EasingCurve::EaseOutExpo);
+/// windowsIn: speed 2.5, easeOutBack, popin 80%.
+pub(crate) const HYPRLAND_WINDOWS_IN_CURVE: AnimationCurve =
+    AnimationCurve::easing(Duration::from_millis(250), EasingCurve::EaseOutBack);
+/// windowsOut: speed 2.5, easeOutExpo, popin to the 5x5 minimum.
+pub(crate) const HYPRLAND_WINDOWS_OUT_CURVE: AnimationCurve =
+    AnimationCurve::easing(Duration::from_millis(250), EasingCurve::EaseOutExpo);
+/// fadeIn: speed 3, easeOutExpo.
+pub(crate) const HYPRLAND_FADE_IN_CURVE: AnimationCurve =
+    AnimationCurve::easing(Duration::from_millis(300), EasingCurve::EaseOutExpo);
+/// fadeOut: speed 1.5, quick.
+pub(crate) const HYPRLAND_FADE_OUT_CURVE: AnimationCurve =
+    AnimationCurve::easing(Duration::from_millis(150), EasingCurve::Quick);
+/// workspaces: speed 2.5, easeOutExpo, slide.
+pub(crate) const HYPRLAND_WORKSPACES_CURVE: AnimationCurve =
+    AnimationCurve::easing(Duration::from_millis(250), EasingCurve::EaseOutExpo);
+/// specialWorkspace: speed 3.5, easeOutExpo, slide (horizontal, with fade).
+pub(crate) const HYPRLAND_SPECIAL_WORKSPACE_CURVE: AnimationCurve =
+    AnimationCurve::easing(Duration::from_millis(350), EasingCurve::EaseOutExpo);
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct AnimationControlState {
@@ -141,6 +165,10 @@ impl AnimationControlState {
             )),
             AnimationEffect::GeometryMacos => Some(scale_curve(
                 PresentationAnimationPolicy::macos().curve_for(kind),
+                self.configuration.speed,
+            )),
+            AnimationEffect::GeometryHyprland => Some(scale_curve(
+                HYPRLAND_WINDOWS_MOVE_CURVE,
                 self.configuration.speed,
             )),
             _ => None,

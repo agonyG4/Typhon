@@ -16,9 +16,9 @@ use oblivion_one::compositor::{
     AnimationTime, ClientCursorRenderState, DecorationRenderInstance, DecorationSceneSnapshot,
     DesktopVisualState, FrameEffectSceneInput, FullscreenRenderPlanMetrics, PointerWarpOrigin,
     PresentationFrameSnapshot, PresentationSceneSample, PresentedCanonicalSceneSnapshot,
-    ResolvedEffectScene, SPECIAL_WORKSPACE_SLIDE_OFFSET_FRACTION, SceneNodeId, SpecialWorkspaceDim,
-    SpecialWorkspacePresentationSample, SurfacePlacement, SurfaceResourceSyncState,
-    WindowExitFrameEvidence, WorkspacePresentationSample,
+    ResolvedEffectScene, SceneNodeId, SpecialWorkspaceDim, SpecialWorkspacePresentationSample,
+    SurfacePlacement, SurfaceResourceSyncState, WindowExitFrameEvidence,
+    WorkspacePresentationSample,
 };
 use oblivion_one::presentation_animation::{
     PresentationClip, PresentationClipRect, PresentationGroupClip, PresentationGroupOpacity,
@@ -706,11 +706,11 @@ impl<'a> ResolvedNativeFrameScene<'a> {
             special_workspace_presentation.as_ref(),
             &special_by_owner_root,
         );
-        let output_height = f64::from(server.output_dimensions().1);
         for (&owner_root, &presence) in &special_presence_by_owner_root {
-            let translation_y =
-                (presence - 1.0) * SPECIAL_WORKSPACE_SLIDE_OFFSET_FRACTION * output_height;
-            workspace_translations_by_owner_root.insert(owner_root, (0.0, translation_y));
+            workspace_translations_by_owner_root.insert(
+                owner_root,
+                server.special_workspace_slide_translation(presence),
+            );
         }
         let workspace_clips_by_owner_root = workspace_presentation_sample
             .as_ref()

@@ -452,3 +452,42 @@ fn removing_a_window_during_window_scale_cancels_geometry_ownership() {
     assert!(!state.presentation_animator.has_track(scene_node_id));
     assert_eq!(state.presentation_animator.transaction_count(), 0);
 }
+
+#[test]
+fn popin_plan_grows_from_eighty_percent_with_hyprland_curves() {
+    let target = rect(100.0, 200.0, 500.0, 400.0);
+    let opacity = PresentationOpacity::new(0.9).expect("canonical opacity");
+    let plan = window_open_animation_plan(AnimationEffect::WindowPopin, target, opacity, 1.0)
+        .expect("popin plan");
+
+    assert_eq!(plan.geometry_start, rect(150.0, 240.0, 400.0, 320.0));
+    assert_eq!(plan.geometry_target, target);
+    assert_eq!(
+        plan.geometry_curve,
+        AnimationCurve::easing(Duration::from_millis(250), EasingCurve::EaseOutBack)
+    );
+    let fade = plan.opacity.expect("popin fades in");
+    assert_eq!(fade.start, PresentationOpacity::TRANSPARENT);
+    assert_eq!(fade.target, opacity);
+    assert_eq!(
+        fade.curve,
+        AnimationCurve::easing(Duration::from_millis(300), EasingCurve::EaseOutExpo)
+    );
+}
+
+#[test]
+fn hyprland_preset_requests_popin_windows_and_hyprland_geometry() {
+    assert_eq!(
+        AnimationPreset::Hyprland.requested_effect(crate::animation_control::AnimationSlot::WindowOpen),
+        AnimationEffect::WindowPopin
+    );
+    assert_eq!(
+        AnimationPreset::Hyprland.requested_effect(crate::animation_control::AnimationSlot::WindowClose),
+        AnimationEffect::WindowPopin
+    );
+    assert_eq!(
+        AnimationPreset::Hyprland.requested_effect(crate::animation_control::AnimationSlot::WindowMove),
+        AnimationEffect::GeometryHyprland
+    );
+    assert_eq!(AnimationPreset::parse("hyprland"), Some(AnimationPreset::Hyprland));
+}

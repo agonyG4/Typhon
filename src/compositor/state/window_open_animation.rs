@@ -10,6 +10,8 @@ use std::time::Duration;
 const WINDOW_OPEN_SCALE_FACTOR: f64 = 0.94;
 const WINDOW_OPEN_GLIDE_OFFSET_LOGICAL_PIXELS: f64 = 24.0;
 const WINDOW_OPEN_BASE_DURATION: Duration = Duration::from_millis(180);
+/// Hyprland's `popin 80%`: the window grows from 80% of its size, centered.
+const WINDOW_OPEN_POPIN_FACTOR: f64 = 0.8;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct WindowOpenAnimationPlan {
@@ -49,8 +51,31 @@ pub(super) fn window_open_animation_plan(
             target.width(),
             target.height(),
         )?,
+        AnimationEffect::WindowPopin => {
+            let width = target.width() * WINDOW_OPEN_POPIN_FACTOR;
+            let height = target.height() * WINDOW_OPEN_POPIN_FACTOR;
+            PresentationRect::new(
+                target.x() + (target.width() - width) / 2.0,
+                target.y() + (target.height() - height) / 2.0,
+                width,
+                height,
+            )?
+        }
         _ => return None,
     };
+    if effect == AnimationEffect::WindowPopin {
+        // Geometry (windowsIn) and fade (fadeIn) run on separate curves.
+        return Some(WindowOpenAnimationPlan {
+            geometry_start,
+            geometry_target: target,
+            geometry_curve: scale_curve(crate::animation_control::HYPRLAND_WINDOWS_IN_CURVE, speed),
+            opacity: Some(WindowOpenOpacityAnimationPlan {
+                start: PresentationOpacity::TRANSPARENT,
+                target: canonical_opacity,
+                curve: scale_curve(crate::animation_control::HYPRLAND_FADE_IN_CURVE, speed),
+            }),
+        });
+    }
     let curve = || {
         scale_curve(
             AnimationCurve::easing(WINDOW_OPEN_BASE_DURATION, EasingCurve::EaseOutCubic),
@@ -273,7 +298,9 @@ impl CompositorState {
         );
         if !matches!(
             effect,
-            AnimationEffect::WindowScale | AnimationEffect::WindowGlide
+            AnimationEffect::WindowScale
+                | AnimationEffect::WindowGlide
+                | AnimationEffect::WindowPopin
         ) {
             return false;
         }

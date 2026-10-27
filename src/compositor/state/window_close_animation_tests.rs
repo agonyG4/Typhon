@@ -72,3 +72,25 @@ fn close_planner_rejects_non_window_effects_and_invalid_speed() {
         );
     }
 }
+
+#[test]
+fn popin_close_shrinks_to_the_five_pixel_minimum_and_fades_quickly() {
+    let source = rect(100.0, 200.0, 500.0, 400.0);
+    let source_opacity = PresentationOpacity::new(0.8).expect("presented opacity");
+    let plan =
+        window_close_animation_plan(AnimationEffect::WindowPopin, source, source_opacity, 1.0)
+            .expect("popin close plan");
+
+    assert_eq!(plan.geometry_start, source);
+    assert_eq!(plan.geometry_target, rect(347.5, 397.5, 5.0, 5.0));
+    assert_eq!(plan.opacity_start, source_opacity);
+    assert_eq!(plan.opacity_target, PresentationOpacity::TRANSPARENT);
+    assert_eq!(
+        plan.geometry_curve,
+        AnimationCurve::easing(Duration::from_millis(250), EasingCurve::EaseOutExpo)
+    );
+    assert_eq!(
+        plan.opacity_curve,
+        AnimationCurve::easing(Duration::from_millis(150), EasingCurve::Quick)
+    );
+}
