@@ -28,8 +28,13 @@ const SCENE_BAND_DRAG_ICON: u8 = 10;
 pub(crate) const SPECIAL_WORKSPACE_DIM_ALPHA: f32 = 0.2;
 
 /// Hyprland `blur:special`: blur the regular content behind a visible special
-/// workspace. Switch off to keep only the dim.
-pub(crate) const SPECIAL_WORKSPACE_BLUR_ENABLED: bool = true;
+/// workspace. `OBLIVION_ONE_SPECIAL_BLUR=0` keeps only the dim.
+fn special_workspace_blur_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("OBLIVION_ONE_SPECIAL_BLUR").is_none_or(|value| value != "0")
+    })
+}
 
 /// Composite opacity at or below which the special blur is skipped entirely.
 const SPECIAL_WORKSPACE_BLUR_MIN_OPACITY: f32 = 0.001;
@@ -79,7 +84,8 @@ impl CompositorState {
         popup_surface_ids: &[u32],
         output_size: (u32, u32),
     ) -> Option<ResolvedEffectInstance> {
-        if !SPECIAL_WORKSPACE_BLUR_ENABLED || !dim.is_active() || !self.background_effect_enabled {
+        if !special_workspace_blur_enabled() || !dim.is_active() || !self.background_effect_enabled
+        {
             return None;
         }
         // The blur fades in and out with the dim; a fully faded blur is skipped.
