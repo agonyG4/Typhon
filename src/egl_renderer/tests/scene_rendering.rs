@@ -407,6 +407,66 @@ fn ordinary_egl_presentation_opacity_resolves_owner_values() {
 }
 
 #[test]
+fn special_workspace_dim_sits_between_regular_groups_and_its_anchor_group() {
+    let mut harness = GlesEffectTestHarness::new(64, 64);
+    let mut regular = test_shm_surface(RenderableSurfaceDamage::full());
+    regular.surface_id = 7;
+    let mut special = regular.clone();
+    special.surface_id = 8;
+    let surfaces = vec![regular, special];
+    let signatures = egl_scene_surface_signatures(&surfaces);
+
+    harness.renderer.scene_state.rebuild_scene_commands(
+        64,
+        64,
+        &surfaces,
+        &[],
+        &[],
+        1,
+        1.0,
+        1,
+        &signatures,
+        &[],
+        0,
+        &[],
+        &[],
+        &HashMap::new(),
+        oblivion_one::compositor::SpecialWorkspaceDim::new(0.2, Some(8)),
+        OutputFramebufferOrigin::BottomLeft,
+    );
+
+    let scene = &harness.renderer.scene_state;
+    let anchor_index = scene
+        .commands
+        .iter()
+        .position(|command| command.layer == EglDrawLayer::Surface(8))
+        .expect("special window command");
+    let dim_index = anchor_index - 1;
+    assert!(matches!(
+        scene.commands[dim_index].layer,
+        EglDrawLayer::SolidRgba(_)
+    ));
+    assert_eq!(scene.commands[dim_index].visual_group, None);
+    let regular_group = scene
+        .commands
+        .iter()
+        .find(|command| command.layer == EglDrawLayer::Surface(7))
+        .and_then(|command| command.visual_group);
+    assert!(regular_group.is_some());
+    assert_ne!(regular_group, scene.commands[anchor_index].visual_group);
+
+    // A visual-group-scoped AfterSurface blur over the regular group captures
+    // exactly the commands before the dim and is composited at that boundary,
+    // so it lands between the regular content and the dim.
+    let last_regular = scene
+        .capture_visual_groups
+        .iter()
+        .rposition(|group| *group == regular_group)
+        .expect("regular group commands");
+    assert_eq!(last_regular + 1, dim_index);
+}
+
+#[test]
 fn translucent_egl_presentation_command_is_not_an_opaque_occluder() {
     let mut harness = GlesEffectTestHarness::new(320, 200);
     let mut surface = test_shm_surface(RenderableSurfaceDamage::full());

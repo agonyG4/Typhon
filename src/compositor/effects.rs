@@ -181,6 +181,10 @@ pub struct FrameEffectSceneInput<'a> {
     pub workspace_by_owner_root: &'a HashMap<u32, crate::wm::WorkspaceId>,
     /// Set only while a workspace slide composes this frame.
     pub workspace_sample: Option<&'a super::WorkspacePresentationSample>,
+    /// The special dim drawn for this frame; drives the special-workspace blur.
+    pub special_workspace_dim: super::SpecialWorkspaceDim,
+    /// Full output size in pixels; the special-workspace blur covers it.
+    pub output_size: (u32, u32),
 }
 
 impl Default for ResolvedEffectScene {
@@ -337,37 +341,8 @@ impl super::CompositorState {
         #[cfg(test)]
         RESOLVED_EFFECT_SCENE_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
 
-        let registry_generation = self.trusted_effect_registry.current();
-        let material_selection = self.material_program_control.snapshot(
-            &registry_generation,
-            self.material_program_rendering_available,
-        );
-        let selected_effect = registry_generation
-            .effects
-            .get(&material_selection.effective_program);
-        let selected_effect_with_parameters = selected_effect.and_then(|effect| {
-            self.material_program_parameter_control
-                .parameter_block_for_effect(effect)
-                .ok()
-                .map(|parameters| (effect, parameters))
-        });
         let (selected_program, selected_parameter_block, selected_frame_demand) =
-            selected_effect_with_parameters.map_or_else(
-                || {
-                    (
-                        crate::effects::builtin_background_blur_program_id(),
-                        EffectParameterBlock::default(),
-                        EffectFrameDemand::OnDamage,
-                    )
-                },
-                |(effect, parameters)| {
-                    (
-                        effect.program.program.id,
-                        parameters,
-                        effect.program.program.frame_demand,
-                    )
-                },
-            );
+            self.selected_background_blur_material();
 
         let mut instances = self
             .internal_surface_effects
@@ -483,38 +458,9 @@ impl super::CompositorState {
             .cloned()
             .collect::<Vec<_>>();
 
-        let selected_background_effect = self.background_effect_enabled.then(|| {
-            let registry_generation = self.trusted_effect_registry.current();
-            let material_selection = self.material_program_control.snapshot(
-                &registry_generation,
-                self.material_program_rendering_available,
-            );
-            registry_generation
-                .effects
-                .get(&material_selection.effective_program)
-                .and_then(|effect| {
-                    self.material_program_parameter_control
-                        .parameter_block_for_effect(effect)
-                        .ok()
-                        .map(|parameters| (effect, parameters))
-                })
-                .map_or_else(
-                    || {
-                        (
-                            crate::effects::builtin_background_blur_program_id(),
-                            EffectParameterBlock::default(),
-                            EffectFrameDemand::OnDamage,
-                        )
-                    },
-                    |(effect, parameters)| {
-                        (
-                            effect.program.program.id,
-                            parameters,
-                            effect.program.program.frame_demand,
-                        )
-                    },
-                )
-        });
+        let selected_background_effect = self
+            .background_effect_enabled
+            .then(|| self.selected_background_blur_material());
         if let Some((selected_program, selected_parameter_block, selected_frame_demand)) =
             selected_background_effect
         {
@@ -647,7 +593,44 @@ impl super::CompositorState {
         }
     }
 
-    fn scene_order_for_frame_instance(
+    /// Program, parameters and frame demand shared by every background blur:
+    /// the selected material program, or the built-in blur when none resolves.
+    pub(in crate::compositor) fn selected_background_blur_material(
+        &self,
+    ) -> (EffectProgramId, EffectParameterBlock, EffectFrameDemand) {
+        let registry_generation = self.trusted_effect_registry.current();
+        let material_selection = self.material_program_control.snapshot(
+            &registry_generation,
+            self.material_program_rendering_available,
+        );
+        registry_generation
+            .effects
+            .get(&material_selection.effective_program)
+            .and_then(|effect| {
+                self.material_program_parameter_control
+                    .parameter_block_for_effect(effect)
+                    .ok()
+                    .map(|parameters| (effect, parameters))
+            })
+            .map_or_else(
+                || {
+                    (
+                        crate::effects::builtin_background_blur_program_id(),
+                        EffectParameterBlock::default(),
+                        EffectFrameDemand::OnDamage,
+                    )
+                },
+                |(effect, parameters)| {
+                    (
+                        effect.program.program.id,
+                        parameters,
+                        effect.program.program.frame_demand,
+                    )
+                },
+            )
+    }
+
+    pub(in crate::compositor) fn scene_order_for_frame_instance(
         instance: &ResolvedEffectInstance,
         surfaces: &[super::RenderableSurface],
     ) -> EffectSceneOrder {
@@ -1226,6 +1209,14 @@ fn background_effect_instance_id(surface_id: u32) -> EffectInstanceId {
         .expect("background effect instance id is non-zero")
 }
 
+/// Bit 63 marks background-blur ids, which only ever use the low 32 bits.
+/// Bit 62 without bit 63 is the protocol range, so setting both bits
+/// keeps the special-workspace blur clear of every other allocation.
+pub(in crate::compositor) fn special_workspace_blur_instance_id() -> EffectInstanceId {
+    EffectInstanceId::new((1_u64 << 63) | (1_u64 << 62))
+        .expect("special workspace blur instance id is non-zero")
+}
+
 pub(in crate::compositor) fn background_effect_output_region(
     region: &BackgroundEffectRegion,
     origin: (i32, i32),
@@ -1327,7 +1318,7 @@ fn effect_rect_from_edges(left: i64, top: i64, right: i64, bottom: i64) -> Optio
 }
 
 #[allow(dead_code)] // Called by the staged internal assignment API.
-fn internal_effect_signature(
+pub(in crate::compositor) fn internal_effect_signature(
     surface_id: u32,
     anchor: EffectAnchor,
     program: EffectProgramId,
@@ -1664,6 +1655,8 @@ mod tests {
             presentation_owner_roots: &selected_owner_roots,
             workspace_by_owner_root: &workspace_by_owner_root,
             workspace_sample: Some(&workspace_sample),
+            special_workspace_dim: crate::compositor::SpecialWorkspaceDim::default(),
+            output_size: (1920, 1080),
         };
         let scene = state.resolved_effect_scene_with_frame_presentation(
             &frame_source,
@@ -1709,6 +1702,177 @@ mod tests {
             scene.instances[0].signature,
             next_scene.instances[0].signature
         );
+    }
+
+    #[test]
+    fn special_workspace_blur_covers_output_after_the_dimmed_groups() {
+        use crate::compositor::SpecialWorkspaceDim;
+
+        let mut state = crate::compositor::CompositorState::new(None);
+        state.set_background_effect_enabled(true);
+        let surfaces = [test_effect_surface(11), test_effect_surface(12)];
+        let dim = SpecialWorkspaceDim::new(0.2, Some(12));
+
+        let blur = state
+            .special_workspace_blur_instance(dim, &surfaces, &[], (1920, 1080))
+            .expect("active dim with regular content beneath yields a blur");
+        let (program, parameters, demand) = state.selected_background_blur_material();
+        assert_eq!(blur.id, special_workspace_blur_instance_id());
+        assert_eq!(blur.program, program);
+        assert_eq!(blur.parameter_block, parameters);
+        assert_eq!(blur.frame_demand, demand);
+        assert_eq!(blur.frame_demand, EffectFrameDemand::OnDamage);
+        assert_eq!(blur.anchor, EffectAnchor::AfterSurface(11));
+        assert_eq!(blur.anchor_scope, EffectAnchorScope::VisualGroup);
+        assert_eq!(
+            blur.backdrop_reuse,
+            crate::compositor::EffectBackdropReuse::Exact
+        );
+        assert!(blur.coverage.is_none());
+        let full_output = EffectRect::new(0, 0, 1920, 1080).unwrap();
+        assert_eq!(blur.region.rects(), &[full_output]);
+        assert_eq!(blur.target_bounds, full_output);
+        let regular_group = blur
+            .visual_group
+            .expect("blur belongs to the regular group");
+        assert!(
+            crate::compositor::CompositorState::visual_group_for_surface_in_groups(
+                &surfaces,
+                &visual_stack_groups(&surfaces, &[]),
+                12,
+            )
+            .is_some_and(|special| special != regular_group),
+            "the special group is a different visual group"
+        );
+        assert_eq!(
+            blur.scene_order.phase, 2,
+            "blur sorts as an after-surface pass"
+        );
+        assert_ne!(
+            blur.id,
+            background_effect_instance_id(11),
+            "special blur ids never collide with per-surface background blur"
+        );
+
+        let to_bottom = state
+            .special_workspace_blur_instance(
+                SpecialWorkspaceDim::new(0.2, None),
+                &surfaces,
+                &[],
+                (1920, 1080),
+            )
+            .expect("an empty special leaves every surface beneath the dim");
+        assert_eq!(to_bottom.anchor, EffectAnchor::AfterSurface(12));
+    }
+
+    #[test]
+    fn special_workspace_blur_requires_active_dim_background_blur_and_known_anchor() {
+        use crate::compositor::SpecialWorkspaceDim;
+
+        let mut state = crate::compositor::CompositorState::new(None);
+        let surfaces = [test_effect_surface(11), test_effect_surface(12)];
+        let active = SpecialWorkspaceDim::new(0.2, Some(12));
+
+        state.set_background_effect_enabled(true);
+        assert!(
+            state
+                .special_workspace_blur_instance(
+                    SpecialWorkspaceDim::default(),
+                    &surfaces,
+                    &[],
+                    (1920, 1080),
+                )
+                .is_none(),
+            "an inactive dim draws no blur"
+        );
+        assert!(
+            state
+                .special_workspace_blur_instance(
+                    SpecialWorkspaceDim::new(0.2, Some(999)),
+                    &surfaces,
+                    &[],
+                    (1920, 1080),
+                )
+                .is_none(),
+            "a dim anchor absent from the frame draws no blur"
+        );
+        assert!(
+            state
+                .special_workspace_blur_instance(
+                    SpecialWorkspaceDim::new(0.2, Some(11)),
+                    &surfaces,
+                    &[],
+                    (1920, 1080),
+                )
+                .is_none(),
+            "nothing regular precedes the first surface, so there is nothing to blur"
+        );
+
+        state.set_background_effect_enabled(false);
+        assert!(
+            state
+                .special_workspace_blur_instance(active, &surfaces, &[], (1920, 1080))
+                .is_none(),
+            "disabled background effects suppress the special blur"
+        );
+    }
+
+    #[test]
+    fn special_workspace_blur_joins_the_frame_effect_scene_only_while_dimmed() {
+        use crate::compositor::SpecialWorkspaceDim;
+        use crate::presentation_animation::{AnimationTime, PresentationSampleTimeSource};
+
+        let mut state = crate::compositor::CompositorState::new(None);
+        state.set_background_effect_enabled(true);
+        let surfaces = [test_effect_surface(11), test_effect_surface(12)];
+        let owner_roots = [11, 12];
+        let workspace_by_owner_root = std::collections::HashMap::new();
+        let sampled_at = AnimationTime::from_nanos(15);
+        let presentation = crate::presentation_animation::PresentationSceneSample::empty_for_output(
+            crate::core::OutputId::from_raw(1).unwrap(),
+            sampled_at,
+            PresentationSampleTimeSource::ZeroFallback,
+        );
+        let fullscreen_plan = state.fullscreen_composition_plan();
+        let lifecycle = state.lifecycle_scene_sample_at(sampled_at);
+        let frame_source = |special_workspace_dim| FrameEffectSceneInput {
+            surfaces: &surfaces,
+            popup_surface_ids: &[],
+            presentation_owner_roots: &owner_roots,
+            workspace_by_owner_root: &workspace_by_owner_root,
+            workspace_sample: None,
+            special_workspace_dim,
+            output_size: (1920, 1080),
+        };
+
+        let undimmed = state.resolved_effect_scene_with_frame_presentation(
+            &frame_source(SpecialWorkspaceDim::default()),
+            &presentation,
+            &fullscreen_plan,
+            &lifecycle,
+        );
+        assert!(
+            undimmed
+                .instances
+                .iter()
+                .all(|instance| instance.id != special_workspace_blur_instance_id())
+        );
+
+        let dimmed = state.resolved_effect_scene_with_frame_presentation(
+            &frame_source(SpecialWorkspaceDim::new(0.2, Some(12))),
+            &presentation,
+            &fullscreen_plan,
+            &lifecycle,
+        );
+        assert_eq!(
+            dimmed
+                .instances
+                .iter()
+                .filter(|instance| instance.id == special_workspace_blur_instance_id())
+                .count(),
+            1
+        );
+        assert_ne!(dimmed.signature, undimmed.signature);
     }
 
     fn test_effect_surface(surface_id: u32) -> crate::compositor::RenderableSurface {

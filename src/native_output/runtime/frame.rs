@@ -896,6 +896,8 @@ impl<'a> ResolvedNativeFrameScene<'a> {
             presentation_owner_roots: frame_owner_roots.as_ref(),
             workspace_by_owner_root: &workspace_by_owner_root,
             workspace_sample: workspace_presentation_sample.as_ref(),
+            special_workspace_dim,
+            output_size: server.output_dimensions(),
         };
         let canonical_effects = server.resolved_effect_scene_for_workspace_frame_with_lifecycle(
             &frame_effect_source,

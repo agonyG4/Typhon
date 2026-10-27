@@ -1,5 +1,10 @@
 use super::*;
 use crate::compositor::SpecialWorkspaceDim;
+use crate::compositor::effects::{
+    EffectAnchor, EffectAnchorScope, EffectSceneOrder, ResolvedEffectInstance,
+    internal_effect_signature, special_workspace_blur_instance_id,
+};
+use crate::effects::{EffectRect, EffectRegion};
 use crate::presentation_animation::AnimationTime;
 use crate::wm::WorkspaceLocation;
 
@@ -20,6 +25,10 @@ const SCENE_BAND_DRAG_ICON: u8 = 10;
 /// sits between the regular bands and the special bands (see
 /// `special_workspace_dim_anchor_surface_id`).
 pub(crate) const SPECIAL_WORKSPACE_DIM_ALPHA: f32 = 0.2;
+
+/// Hyprland `blur:special`: blur the regular content behind a visible special
+/// workspace. Switch off to keep only the dim.
+pub(crate) const SPECIAL_WORKSPACE_BLUR_ENABLED: bool = true;
 
 impl CompositorState {
     pub(in crate::compositor) fn surface_root_is_in_special_workspace(
@@ -51,6 +60,68 @@ impl CompositorState {
             alpha,
             self.special_workspace_dim_anchor_surface_id(surfaces, owner_roots),
         )
+    }
+
+    /// Full-output background blur for the special dim, composited between the
+    /// regular content and the dim (regular -> blur -> dim -> special). It is
+    /// anchored after the last dimmed visual group, not before the dim anchor:
+    /// a `BeforeSurface` capture would include the dim quad, and
+    /// `OutputPostProcess` would also blur the special windows and overlays.
+    /// Returns `None` when nothing regular lies under the dim.
+    pub(in crate::compositor) fn special_workspace_blur_instance(
+        &self,
+        dim: SpecialWorkspaceDim,
+        surfaces: &[RenderableSurface],
+        popup_surface_ids: &[u32],
+        output_size: (u32, u32),
+    ) -> Option<ResolvedEffectInstance> {
+        if !SPECIAL_WORKSPACE_BLUR_ENABLED || !dim.is_active() || !self.background_effect_enabled {
+            return None;
+        }
+        let dimmed_end = match dim.anchor_surface_id() {
+            Some(anchor_surface_id) => surfaces
+                .iter()
+                .position(|surface| surface.surface_id == anchor_surface_id)?,
+            None => surfaces.len(),
+        };
+        let last_dimmed = surfaces.get(dimmed_end.checked_sub(1)?)?;
+        let groups = visual_stack_groups(surfaces, popup_surface_ids);
+        let visual_group =
+            Self::visual_group_for_surface_in_groups(surfaces, &groups, last_dimmed.surface_id)?;
+        if let Some(anchor_surface_id) = dim.anchor_surface_id()
+            && Self::visual_group_for_surface_in_groups(surfaces, &groups, anchor_surface_id)
+                == Some(visual_group)
+        {
+            return None;
+        }
+        let region = EffectRegion::from_rect(EffectRect::new(0, 0, output_size.0, output_size.1)?);
+        let target_bounds = region.bounding_rect()?;
+        let (program, parameter_block, frame_demand) = self.selected_background_blur_material();
+        let anchor = EffectAnchor::AfterSurface(last_dimmed.surface_id);
+        let mut instance = ResolvedEffectInstance {
+            id: special_workspace_blur_instance_id(),
+            program,
+            anchor,
+            signature: internal_effect_signature(
+                last_dimmed.surface_id,
+                anchor,
+                program,
+                &region,
+                &parameter_block,
+                None,
+            ),
+            region,
+            target_bounds,
+            parameter_block,
+            coverage: None,
+            frame_demand,
+            visual_group: Some(visual_group),
+            anchor_scope: EffectAnchorScope::VisualGroup,
+            backdrop_reuse: EffectBackdropReuse::Exact,
+            scene_order: EffectSceneOrder::for_anchor(anchor),
+        };
+        instance.scene_order = Self::scene_order_for_frame_instance(&instance, surfaces);
+        Some(instance)
     }
 
     /// The dim is drawn immediately after the last surface that belongs to a

@@ -226,6 +226,18 @@ impl CompositorState {
             instances.push(instance);
         }
 
+        // Full-output and unmapped by window presentation or workspace
+        // translation: the special dim it blurs under is full-output too.
+        if let Some(blur) = self.special_workspace_blur_instance(
+            frame_source.special_workspace_dim,
+            frame_source.surfaces,
+            frame_source.popup_surface_ids,
+            frame_source.output_size,
+        ) && self.effect_instance_allows_presentation(&blur, fullscreen_plan, lifecycle)
+        {
+            instances.push(blur);
+        }
+
         let mut resolved = ResolvedEffectScene::new(scene.generation, instances);
         if let Some(workspace_sample) = frame_source.workspace_sample {
             resolved.signature =
