@@ -3510,6 +3510,17 @@ impl AtomicEglGbmScanout {
             Some(frame_id),
         );
         let repaint_stats = parts.stats;
+        let special_workspace_debug_plan = special_workspace_frame_debug_enabled().then(|| {
+            let plan = parts.scene_commit.repaint_plan();
+            format!(
+                "mode={:?} age={:?} fallback={:?} render_damage={:?} repair_damage={:?}",
+                plan.mode,
+                plan.buffer_age,
+                plan.fallback_reason,
+                plan.render_damage,
+                plan.repair_damage
+            )
+        });
         let render_damage_signature = parts
             .scene_commit
             .repaint_plan()
@@ -3588,8 +3599,19 @@ impl AtomicEglGbmScanout {
                 }
                 // Each special track retires on its own once its settled
                 // sample is rendered, so one settling track never holds another.
-                if let Some(sample) = resolved_scene.special_workspace_presentation.as_ref() {
-                    server.retire_special_workspace_presentation_if_rendered(sample);
+                let special_workspace_retired = resolved_scene
+                    .special_workspace_presentation
+                    .as_ref()
+                    .is_some_and(|sample| {
+                        server.retire_special_workspace_presentation_if_rendered(sample)
+                    });
+                if let Some(plan) = special_workspace_debug_plan.as_deref() {
+                    log_special_workspace_frame(
+                        frame_id,
+                        &resolved_scene,
+                        plan,
+                        special_workspace_retired,
+                    );
                 }
                 server.mark_frame_callbacks_rendered(protocol_batch_id);
                 Ok(AtomicFrameRenderOutcome::Rendered {
@@ -5369,4 +5391,96 @@ mod tests {
             None
         );
     }
+}
+
+/// `OBLIVION_ONE_DEBUG_SPECIAL=1` logs every rendered frame while a special
+/// workspace motion is in flight and for a tail of frames after it settles.
+fn special_workspace_frame_debug_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("OBLIVION_ONE_DEBUG_SPECIAL").is_some_and(|value| value != "0")
+    })
+}
+
+const SPECIAL_WORKSPACE_DEBUG_TAIL_FRAMES: u32 = 600;
+
+fn log_special_workspace_frame(
+    frame_id: u64,
+    scene: &ResolvedNativeFrameScene<'_>,
+    plan: &str,
+    retired: bool,
+) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static TAIL: AtomicU32 = AtomicU32::new(0);
+    if scene.special_workspace_presentation.is_some() {
+        TAIL.store(SPECIAL_WORKSPACE_DEBUG_TAIL_FRAMES, Ordering::Relaxed);
+    } else if TAIL
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |tail| {
+            tail.checked_sub(1)
+        })
+        .is_err()
+    {
+        return;
+    }
+    let tracks = scene
+        .special_workspace_presentation
+        .as_ref()
+        .map(|sample| {
+            sample
+                .tracks
+                .iter()
+                .map(|track| {
+                    format!(
+                        "{:?}:{:.4}->{:.1}{}",
+                        track.kind,
+                        track.progress,
+                        track.target_progress,
+                        if track.mathematically_settled {
+                            "*"
+                        } else {
+                            ""
+                        }
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .unwrap_or_default();
+    let surfaces = scene
+        .surfaces
+        .iter()
+        .zip(scene.presentation_owner_root_surface_ids.iter())
+        .map(|(surface, owner)| {
+            let opacity = scene
+                .presentation
+                .opacities
+                .iter()
+                .find(|entry| entry.root_surface_id == *owner)
+                .map_or(1.0, |entry| entry.opacity.get());
+            format!(
+                "{}@{}({},{} {}x{} a{:.3})",
+                surface.surface_id,
+                owner,
+                surface.x,
+                surface.y,
+                surface.width,
+                surface.height,
+                opacity
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let decorations = scene
+        .decorations
+        .iter()
+        .map(|decoration| decoration.root_surface_id().to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    eprintln!(
+        "typhon.special_debug frame={frame_id} tracks=[{tracks}] retired={retired} dim={:.4}@{:?} effects={} generation={} {plan} decorations=[{decorations}] surfaces=[{surfaces}]",
+        scene.special_workspace_dim.alpha(),
+        scene.special_workspace_dim.anchor_surface_id(),
+        scene.effects.instances.len(),
+        scene.render_generation,
+    );
 }
