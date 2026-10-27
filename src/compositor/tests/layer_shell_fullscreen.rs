@@ -616,3 +616,146 @@ fn fullscreen_preserved_background_feedback_is_sampled_with_its_frame() {
             .contains(&(feedback_b.id().protocol_id(), "presented"))
     );
 }
+
+#[test]
+fn notification_overlay_survives_workspace_switch_and_stays_above_fullscreen() {
+    let socket_name = unique_socket_name();
+    let socket_path = runtime_socket_path(&socket_name);
+    let server = OwnCompositorServer::bind_cpu_composition(socket_name).unwrap();
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    create_buffered_toplevel_then_toggle_fullscreen(&socket_path, &commands).unwrap();
+    let owner_id = capture_fullscreen_render_plan_metrics(&commands)
+        .owner_root_surface_id
+        .expect("fullscreen owner should be registered");
+    let focused_before_notification = capture_focused_window_id(&commands);
+    let keyboard_focus_before_notification = capture_keyboard_focus_surface_id(&commands);
+    assert!(focused_before_notification.is_some());
+
+    let (connection, mut queue, qh, compositor, shm, layer_shell) =
+        connect_layer_client(&socket_path);
+    let mut client_state = RegistryTestState::default();
+    let (notification_surface, notification) = create_layer_surface(
+        &compositor,
+        &layer_shell,
+        &qh,
+        client_zwlr_layer_shell_v1::Layer::Overlay,
+        "steam-notification",
+    );
+    notification.set_anchor(
+        client_zwlr_layer_surface_v1::Anchor::Top | client_zwlr_layer_surface_v1::Anchor::Left,
+    );
+    notification.set_size(320, 96);
+    notification.set_margin(36, 0, 0, 24);
+    notification.set_exclusive_zone(-1);
+    notification
+        .set_keyboard_interactivity(client_zwlr_layer_surface_v1::KeyboardInteractivity::None);
+    notification_surface.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut client_state).unwrap();
+    commit_test_buffered_surface(&notification_surface, &shm, &qh, 320, 96).unwrap();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut client_state).unwrap();
+
+    assert_eq!(
+        capture_focused_window_id(&commands),
+        focused_before_notification
+    );
+    assert_eq!(
+        capture_keyboard_focus_surface_id(&commands),
+        keyboard_focus_before_notification
+    );
+    let mapped_notification = capture_renderable_surface_snapshot(&commands)
+        .into_iter()
+        .find(|surface| surface.width == 320 && surface.height == 96)
+        .expect("notification should be mapped");
+    assert_eq!(mapped_notification.local_x, 24);
+    assert_eq!(mapped_notification.local_y, 36);
+
+    commands
+        .send(ServerCommand::PublishTestPresentationAt {
+            frame_id: 1,
+            at: AnimationTime::from_nanos(u64::MAX),
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    assert!(
+        capture_native_frame_surface_ids(&commands).contains(&mapped_notification.surface_id),
+        "notification should be included in the fullscreen frame"
+    );
+    let fullscreen_scene = capture_renderable_surface_snapshot(&commands);
+    let owner_scene_index = fullscreen_scene
+        .iter()
+        .position(|surface| surface.surface_id == owner_id)
+        .expect("fullscreen owner should be in the scene");
+    let notification_scene_index = fullscreen_scene
+        .iter()
+        .position(|surface| surface.surface_id == mapped_notification.surface_id)
+        .expect("notification should be in the scene");
+    assert!(
+        notification_scene_index > owner_scene_index,
+        "overlay should be painted after the fullscreen owner"
+    );
+    let scanout = capture_direct_scanout_scene_analysis(&commands);
+    assert!(scanout.candidate.is_none());
+    assert!(capture_fullscreen_render_plan_metrics(&commands).fullscreen_composition_active);
+
+    commands
+        .send(ServerCommand::ActivateWorkspace { workspace: 2 })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    commands
+        .send(ServerCommand::PublishTestPresentationAt {
+            frame_id: 2,
+            at: AnimationTime::from_nanos(u64::MAX),
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    let switched_workspace_frame = capture_native_frame_surface_ids(&commands);
+    assert!(
+        switched_workspace_frame.contains(&mapped_notification.surface_id),
+        "output-global notification should survive switching to another workspace"
+    );
+    assert!(!switched_workspace_frame.contains(&owner_id));
+
+    commands
+        .send(ServerCommand::ActivateWorkspace { workspace: 1 })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    commands
+        .send(ServerCommand::PublishTestPresentationAt {
+            frame_id: 3,
+            at: AnimationTime::from_nanos(u64::MAX),
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    let restored_fullscreen_frame = capture_native_frame_surface_ids(&commands);
+    assert!(restored_fullscreen_frame.contains(&owner_id));
+    assert!(restored_fullscreen_frame.contains(&mapped_notification.surface_id));
+    assert_eq!(
+        capture_focused_window_id(&commands),
+        focused_before_notification
+    );
+
+    notification.destroy();
+    notification_surface.destroy();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut client_state).unwrap();
+    commands
+        .send(ServerCommand::PublishTestPresentationAt {
+            frame_id: 4,
+            at: AnimationTime::from_nanos(u64::MAX),
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    let frame_without_notification = capture_native_frame_surface_ids(&commands);
+    assert!(frame_without_notification.contains(&owner_id));
+    assert!(!frame_without_notification.contains(&mapped_notification.surface_id));
+    assert_eq!(
+        capture_focused_window_id(&commands),
+        focused_before_notification
+    );
+
+    commands.send(ServerCommand::Stop).unwrap();
+    let _server = server_thread.join().unwrap();
+}

@@ -43,10 +43,16 @@ if [[ -z "${OBLIVION_ONE_SOCKET:-}" ]]; then
 fi
 export OBLIVION_ONE_SOCKET
 
-# Prefer the local xwayland-satellite fork (maximize/minimize support) when it is built.
+# Prefer the stable Aether satellite build when available. An explicit binary
+# always wins; otherwise retain the checkout-local fork as the fallback.
+satellite_aether="/mnt/Aether/Desktop/GitHub/xwayland-satellite-target/release/xwayland-satellite"
 satellite_fork="$script_dir/../../xwayland-satellite/target/release/xwayland-satellite"
-if [[ -z "${TYPHON_XWAYLAND_SATELLITE_BINARY:-}" && -x "$satellite_fork" ]]; then
-    export TYPHON_XWAYLAND_SATELLITE_BINARY="$(realpath -- "$satellite_fork")"
+if [[ -z "${TYPHON_XWAYLAND_SATELLITE_BINARY:-}" ]]; then
+    if [[ -x "$satellite_aether" ]]; then
+        export TYPHON_XWAYLAND_SATELLITE_BINARY="$(realpath -- "$satellite_aether")"
+    elif [[ -x "$satellite_fork" ]]; then
+        export TYPHON_XWAYLAND_SATELLITE_BINARY="$(realpath -- "$satellite_fork")"
+    fi
 fi
 
 exec "$script_dir/start-oblivion-one" "$@"

@@ -161,6 +161,15 @@ binary. It is opt-in; the default managed and base modes are unchanged.
   with `WAYLAND_DISPLAY` set to Typhon's own Wayland socket, so the satellite
   is an ordinary Wayland client that presents X windows as `xdg_toplevel`s and
   spawns Xwayland itself.
+- A Typhon-patched satellite can present explicit X11 notification windows as
+  `zwlr_layer_shell_v1` Overlay surfaces. Notifications use non-interactive
+  keyboard behavior, a non-exclusive zone, and top-left margins relative to
+  their selected output; they remain visible across ordinary workspace
+  switches, stack above fullscreen windows, and trigger composition while
+  mapped. This requires the patched satellite binary selected for the session.
+  Typhon has no X11 notification translator or `xdg_toplevel` layer-shell
+  fallback, so a satellite build without this support continues to use its
+  ordinary window behavior.
 - A clean satellite exit re-arms the listeners so the next X11 client relaunches
   it. A crash enters the usual failure backoff; repeated crashes end in the
   failed state.

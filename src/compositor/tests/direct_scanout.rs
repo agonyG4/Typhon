@@ -23,6 +23,26 @@ fn create_mapped_layer_shell_surface(
     width: usize,
     height: usize,
 ) -> Result<Connection, Box<dyn std::error::Error>> {
+    create_mapped_layer_shell_surface_with_handles(socket_path, layer, namespace, width, height)
+        .map(|(connection, _, _, _, _)| connection)
+}
+
+fn create_mapped_layer_shell_surface_with_handles(
+    socket_path: &PathBuf,
+    layer: client_zwlr_layer_shell_v1::Layer,
+    namespace: &str,
+    width: usize,
+    height: usize,
+) -> Result<
+    (
+        Connection,
+        EventQueue<RegistryTestState>,
+        RegistryTestState,
+        client_wl_surface::WlSurface,
+        client_zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
+    ),
+    Box<dyn std::error::Error>,
+> {
     let stream = UnixStream::connect(socket_path)?;
     let connection = Connection::from_socket(stream)?;
     let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
@@ -46,7 +66,7 @@ fn create_mapped_layer_shell_surface(
     commit_test_buffered_surface(&surface, &shm, &qh, width, height)?;
     connection.flush()?;
     queue.roundtrip(&mut client_state)?;
-    Ok(connection)
+    Ok((connection, queue, client_state, surface, layer_surface))
 }
 
 fn settle_fullscreen_presentation(commands: &Sender<ServerCommand>) {
@@ -378,7 +398,14 @@ fn fullscreen_overlay_layer_shell_remains_visible_and_blocks_direct_scanout() {
 
     let _game = create_fullscreen_identity_viewport_xrgb_dmabuf(&socket_path, &commands).unwrap();
     settle_fullscreen_presentation(&commands);
-    let _layer_connection = create_mapped_layer_shell_surface(
+    let eligible_before_overlay = capture_direct_scanout_candidate(&commands).unwrap();
+    let (
+        layer_connection,
+        mut layer_queue,
+        mut layer_client_state,
+        layer_surface_base,
+        layer_surface,
+    ) = create_mapped_layer_shell_surface_with_handles(
         &socket_path,
         client_zwlr_layer_shell_v1::Layer::Overlay,
         "critical-overlay",
@@ -395,7 +422,6 @@ fn fullscreen_overlay_layer_shell_remains_visible_and_blocks_direct_scanout() {
         .surface_id;
     let presented_ids = capture_native_frame_surface_ids(&commands);
     let rejection = capture_direct_scanout_candidate(&commands).unwrap_err();
-    let _server = stop_controllable_test_server(commands, server_thread);
 
     assert!(
         raw_scene
@@ -414,6 +440,25 @@ fn fullscreen_overlay_layer_shell_remains_visible_and_blocks_direct_scanout() {
             })
     );
     assert_eq!(rejection, DirectScanoutSceneRejection::OverlayVisible);
+
+    layer_surface.destroy();
+    layer_surface_base.destroy();
+    layer_connection.flush().unwrap();
+    layer_queue.roundtrip(&mut layer_client_state).unwrap();
+    settle_fullscreen_presentation(&commands);
+    let frame_without_overlay = capture_native_frame_surface_ids(&commands);
+    assert!(!frame_without_overlay.contains(&overlay_id));
+    let eligible_after_overlay = capture_direct_scanout_candidate(&commands)
+        .expect("direct scanout should become eligible after the overlay is destroyed");
+    assert_eq!(
+        eligible_after_overlay.surface_id,
+        eligible_before_overlay.surface_id
+    );
+    assert_eq!(
+        eligible_after_overlay.commit_sequence,
+        eligible_before_overlay.commit_sequence
+    );
+    let _server = stop_controllable_test_server(commands, server_thread);
 }
 
 #[test]
