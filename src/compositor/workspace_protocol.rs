@@ -525,7 +525,7 @@ impl CompositorState {
         else {
             return;
         };
-        let _ = self.activate_workspace(workspace);
+        let _ = self.switch_workspace_leaving_special(workspace);
     }
 
     pub(in crate::compositor) fn publish_workspace_state(&mut self) {

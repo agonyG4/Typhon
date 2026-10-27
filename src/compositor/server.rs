@@ -1852,6 +1852,10 @@ impl OwnCompositorServer {
         self.state.activate_workspace(workspace)
     }
 
+    pub fn switch_workspace_leaving_special(&mut self, workspace: WorkspaceId) -> bool {
+        self.state.switch_workspace_leaving_special(workspace)
+    }
+
     pub fn set_test_window_workspace(
         &mut self,
         window_id: crate::compositor::WindowId,

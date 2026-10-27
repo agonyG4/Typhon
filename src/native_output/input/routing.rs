@@ -2442,10 +2442,7 @@ pub(crate) fn apply_native_window_action(
         NativeWindowAction::ToggleFullscreen => server.toggle_fullscreen_focused_window(),
         NativeWindowAction::ToggleFocusedWindowLayout => server.toggle_focused_window_layout(),
         NativeWindowAction::SwitchWorkspace(workspace) => {
-            matches!(
-                server.activate_workspace(workspace),
-                oblivion_one::wm::WorkspaceSwitchOutcome::Changed { .. }
-            )
+            server.switch_workspace_leaving_special(workspace)
         }
         NativeWindowAction::MoveFocusedWindowToWorkspace(workspace) => {
             server.move_focused_window_to_workspace(workspace)

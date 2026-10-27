@@ -439,6 +439,32 @@ impl CompositorState {
         None
     }
 
+    /// A user's workspace switch (keybinding or shell) leaves a visible
+    /// special workspace like any other workspace, then activates `workspace`.
+    /// Returns true when either the special closed or the workspace changed.
+    pub(in crate::compositor) fn switch_workspace_leaving_special(
+        &mut self,
+        workspace: WorkspaceId,
+    ) -> bool {
+        if !self.workspace_manager.contains(workspace) {
+            return false;
+        }
+        let special_closed = self
+            .workspace_manager
+            .visible_special_workspace()
+            .is_some_and(|special| {
+                matches!(
+                    self.toggle_special_workspace(special),
+                    SpecialWorkspaceToggleOutcome::Closed { .. }
+                )
+            });
+        let switched = matches!(
+            self.activate_workspace(workspace),
+            WorkspaceSwitchOutcome::Changed { .. }
+        );
+        special_closed || switched
+    }
+
     pub(in crate::compositor) fn activate_workspace(
         &mut self,
         workspace: WorkspaceId,

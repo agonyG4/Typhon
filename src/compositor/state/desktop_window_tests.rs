@@ -1331,6 +1331,38 @@ fn numbered_special_toggle_switches_visibility_and_hides_departing_window() {
 }
 
 #[test]
+fn switching_workspace_from_a_visible_special_leaves_the_special() {
+    let mut state = CompositorState::new(None);
+    let special = crate::wm::SpecialWorkspaceId::DEFAULT;
+    let in_special = insert_window_in_special(&mut state, 451, special);
+    let current = state.active_workspace();
+    let target = state
+        .workspace_manager
+        .workspaces()
+        .find(|workspace| *workspace != current)
+        .expect("a second workspace");
+
+    state.toggle_special_workspace(special);
+    assert!(state.switch_workspace_leaving_special(target));
+    assert_eq!(state.workspace_manager.visible_special_workspace(), None);
+    assert_eq!(state.active_workspace(), target);
+    assert!(!state.window_is_visible_in_active_scene(in_special));
+
+    // Pressing the current workspace's key inside the special only leaves it.
+    state.toggle_special_workspace(special);
+    assert!(state.switch_workspace_leaving_special(target));
+    assert_eq!(state.workspace_manager.visible_special_workspace(), None);
+    assert_eq!(state.active_workspace(), target);
+
+    // Toggling the special again reopens it the way it was.
+    assert_eq!(
+        state.toggle_special_workspace(special),
+        crate::wm::SpecialWorkspaceToggleOutcome::Opened { id: special }
+    );
+    assert!(state.window_is_visible_in_active_scene(in_special));
+}
+
+#[test]
 fn focused_family_moves_between_numbered_specials_and_back_to_regular() {
     let mut state = CompositorState::new(None);
     let second = crate::wm::SpecialWorkspaceId::new(2).expect("non-zero special workspace");
