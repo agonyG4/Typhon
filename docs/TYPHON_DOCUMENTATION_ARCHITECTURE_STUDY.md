@@ -1026,7 +1026,7 @@ Compositor integration plans reflow and applies resulting canonical geometry acr
 
 ### 14.4 Workspaces
 
-`WorkspaceManager` owns active regular workspace state, stable typed `WorkspaceId`s, special workspaces and visible-special state. The current default product model is a fixed set of regular workspaces plus a default special workspace; this is product policy, not a fundamental architectural requirement.
+`WorkspaceManager` owns active regular workspace state, stable typed `WorkspaceId`s, special workspaces and visible-special state. The current default product model is a fixed set of regular workspaces plus four numbered special workspaces (`special:1`..`special:4`, one visible at a time); this is product policy, not a fundamental architectural requirement. A visible special dims the regular content behind it (`SPECIAL_WORKSPACE_DIM_ALPHA`), animates open/close/switch with the regular slide spring (`special_workspace_presentation`), receives newly managed toplevels while shown, and may launch a command when opened empty (`special_workspace_launch_on_empty`). There is no per-output special state because the product is single-output.
 
 Window families can migrate together. Workspace visibility gates whether tiled geometry is immediately applied or deferred. `ext-workspace-v1` publishes a protocol view of the canonical workspace model rather than becoming a separate workspace authority.
 
