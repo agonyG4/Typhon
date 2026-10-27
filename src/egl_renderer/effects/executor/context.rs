@@ -710,6 +710,8 @@ impl EffectExecutionContext<'_> {
         let mut missing_required_decoration_resources = 0usize;
         let mut texture_binds = 0usize;
         let mut draw_calls = 0usize;
+        let mut special_debug =
+            (!capture_plan && special_workspace_render_debug_enabled()).then(Vec::new);
         for planned_index in 0..planned_command_count {
             let planned = if effect_plan {
                 self.scene.effect_region_plan.commands[planned_index]
@@ -718,6 +720,23 @@ impl EffectExecutionContext<'_> {
             };
             let command = self.scene.commands[planned.command_index].clone();
             commands_considered += 1;
+            if let Some(log) = special_debug.as_mut() {
+                let texture = if self.texture_for_layer(command.layer).is_some() {
+                    ""
+                } else {
+                    "!no_texture"
+                };
+                let opacity = self
+                    .scene
+                    .presentation_opacities
+                    .get(planned.command_index)
+                    .copied()
+                    .unwrap_or(1.0);
+                log.push(format!(
+                    "{}{texture}@{opacity:.3}",
+                    special_debug_layer_name(command.layer)
+                ));
+            }
             let bypass_presentation_clip = self
                 .scene
                 .capture_unclipped_presentation_owner
@@ -902,6 +921,38 @@ impl EffectExecutionContext<'_> {
         self.set_scissor_for_target_space(None, target_space);
         unsafe {
             self.gl.bind_texture(glow::TEXTURE_2D, None);
+        }
+        if let Some(log) = special_debug {
+            let (repairs, planned) = if effect_plan {
+                (
+                    &self.scene.effect_region_plan.repairs,
+                    &self.scene.effect_region_plan.commands,
+                )
+            } else {
+                (
+                    &self.scene.scene_region_plan.repairs,
+                    &self.scene.scene_region_plan.commands,
+                )
+            };
+            let culled = self
+                .scene
+                .commands
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| !planned.iter().any(|p| p.command_index == *index))
+                .map(|(_, command)| special_debug_layer_name(command.layer))
+                .collect::<Vec<_>>();
+            let repairs = repairs
+                .iter()
+                .map(|r| format!("{},{} {}x{}", r.x, r.y, r.width, r.height))
+                .collect::<Vec<_>>();
+            eprintln!(
+                "typhon.special_render plan={} repairs=[{}] drawn=[{}] not_planned=[{}]",
+                if effect_plan { "effect" } else { "scene" },
+                repairs.join(" "),
+                log.join(" "),
+                culled.join(" ")
+            );
         }
 
         self.scene.frame_stats.commands_considered = self
@@ -1930,6 +1981,16 @@ impl EffectExecutionContext<'_> {
 /// `OBLIVION_ONE_DEBUG_SPECIAL=1` also logs what each scene draw pass did with
 /// every surface command: drawn (with opacity), occluded, outside, or skipped
 /// for a missing texture. The frame trace shows the scene; this shows the GPU.
+fn special_debug_layer_name(layer: EglDrawLayer) -> String {
+    match layer {
+        EglDrawLayer::Surface(surface_id) => format!("s{surface_id}"),
+        EglDrawLayer::DecorationAsset(asset) => format!("deco{asset:?}"),
+        EglDrawLayer::SolidRgba(color) => format!("rgba{color:08x}"),
+        EglDrawLayer::Solid(color) => format!("solid{color:?}"),
+        other => format!("{other:?}"),
+    }
+}
+
 fn special_workspace_render_debug_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
