@@ -2197,6 +2197,7 @@ fn native_initial_frame_has_no_builtin_compositor_ui() {
             height: 200,
             surfaces: &[],
             external_overlay_surface_ids: Vec::new(),
+            special_workspace_dim: oblivion_one::compositor::SpecialWorkspaceDim::default(),
             visual_state: DesktopVisualState::wallpaper_only(),
             render_generation: 0,
             client_cursor: None,

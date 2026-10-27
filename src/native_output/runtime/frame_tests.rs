@@ -1004,6 +1004,7 @@ fn snapshot_ref_preserves_constructor_popup_ids_and_order() {
             decorations: Vec::new(),
             popup_surface_ids: Cow::Borrowed(popup_surface_ids),
             external_overlay_surface_ids: Vec::new(),
+            special_workspace_dim: oblivion_one::compositor::SpecialWorkspaceDim::default(),
             render_generation: 1,
             visibility: FullscreenRenderPlanMetrics::default(),
             snapshot: NativeSceneSnapshot::from_surfaces_with_popup_ids(
@@ -1082,6 +1083,7 @@ fn finalized_snapshot_contains_all_dynamic_metadata_fields() {
     let (snapshot, cached_signature) = finalize_snapshot(
         NativeSceneSnapshot::from_surfaces_with_popup_ids(&[], Vec::new(), &[701, 702]),
         &[703],
+        oblivion_one::compositor::SpecialWorkspaceDim::default(),
         visibility,
         &effects,
     );

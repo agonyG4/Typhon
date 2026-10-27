@@ -72,9 +72,84 @@ pub struct DesktopComposeRequest<'a> {
     pub output_scale: f64,
     pub surfaces: &'a [RenderableSurface],
     pub external_overlay_surface_ids: Vec<u32>,
+    pub special_workspace_dim: SpecialWorkspaceDim,
     pub content_generation: u64,
     pub visual_state: DesktopVisualState,
     pub client_cursor: Option<ClientCursorRenderState<'a>>,
+}
+
+/// Full-output black dim behind a visible special workspace. Drawn as one
+/// premultiplied quad immediately before the visual group that contains
+/// `anchor_surface_id`; `None` anchors it after every group.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct SpecialWorkspaceDim {
+    alpha: f32,
+    anchor_surface_id: Option<u32>,
+}
+
+impl SpecialWorkspaceDim {
+    pub fn new(alpha: f32, anchor_surface_id: Option<u32>) -> Self {
+        let alpha = alpha.clamp(0.0, 1.0);
+        if alpha <= 0.0 {
+            return Self::default();
+        }
+        Self {
+            alpha,
+            anchor_surface_id,
+        }
+    }
+
+    pub fn is_active(self) -> bool {
+        self.alpha > 0.0
+    }
+
+    pub fn anchor_surface_id(self) -> Option<u32> {
+        self.anchor_surface_id
+    }
+
+    /// Premultiplied black at the dim opacity: scaling destination channels
+    /// by `1 - alpha` is exactly this over-composite.
+    pub fn premultiplied_rgba(self) -> [u8; 4] {
+        [0, 0, 0, (self.alpha * 255.0).round() as u8]
+    }
+
+    /// Mixes the dim into a scene signature. Inactive dims leave the
+    /// signature untouched so unchanged scenes keep their identity.
+    pub fn fold_signature(self, signature: u64) -> u64 {
+        if !self.is_active() {
+            return signature;
+        }
+        let mut signature = signature ^ u64::from(self.alpha.to_bits());
+        signature = signature.wrapping_mul(0x1000_0000_01b3);
+        signature ^ u64::from(self.anchor_surface_id.unwrap_or(u32::MAX))
+    }
+
+    /// Index of the visual group the dim precedes. `groups.len()` means the
+    /// dim follows every group. `None` when the dim is inactive.
+    pub fn group_index(
+        self,
+        groups: &[WindowVisualGroup],
+        surfaces: &[RenderableSurface],
+    ) -> Option<usize> {
+        if !self.is_active() {
+            return None;
+        }
+        let Some(anchor) = self.anchor_surface_id else {
+            return Some(groups.len());
+        };
+        Some(
+            groups
+                .iter()
+                .position(|group| {
+                    group.surface_indices().iter().any(|&surface_index| {
+                        surfaces
+                            .get(surface_index)
+                            .is_some_and(|surface| surface.surface_id == anchor)
+                    })
+                })
+                .unwrap_or(groups.len()),
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -933,6 +1008,7 @@ pub struct DesktopSceneRenderer {
     presentation_opacities: HashMap<u32, f32>,
     presentation_clips: HashMap<u32, PresentationClipRect>,
     presentation_owner_roots: HashMap<u32, u32>,
+    special_workspace_dim: SpecialWorkspaceDim,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -968,6 +1044,7 @@ impl DesktopSceneRenderer {
             presentation_opacities: HashMap::new(),
             presentation_clips: HashMap::new(),
             presentation_owner_roots: HashMap::new(),
+            special_workspace_dim: SpecialWorkspaceDim::default(),
         }
     }
 
@@ -1007,6 +1084,19 @@ impl DesktopSceneRenderer {
         self.presentation_opacities = next_opacities;
         self.presentation_clips = next_clips;
         self.presentation_owner_roots = next_owner_roots;
+        self.scene_width = 0;
+        self.scene_height = 0;
+        self.scene_surface_snapshots.clear();
+        self.reusable_frame_key = None;
+    }
+
+    /// A dim change alters pixels outside any surface snapshot, so it forces a
+    /// full scene rebuild the same way a presentation projection change does.
+    pub fn set_special_workspace_dim(&mut self, dim: SpecialWorkspaceDim) {
+        if dim == self.special_workspace_dim {
+            return;
+        }
+        self.special_workspace_dim = dim;
         self.scene_width = 0;
         self.scene_height = 0;
         self.scene_surface_snapshots.clear();
@@ -1144,10 +1234,12 @@ impl DesktopSceneRenderer {
             output_scale,
             surfaces,
             external_overlay_surface_ids,
+            special_workspace_dim,
             content_generation,
             visual_state,
             client_cursor,
         } = request;
+        self.set_special_workspace_dim(special_workspace_dim);
         let (base_surfaces, overlay_surfaces) =
             split_external_overlay_surfaces(surfaces, &external_overlay_surface_ids);
         let scene_surfaces = if external_overlay_surface_ids.is_empty() {
@@ -1355,6 +1447,7 @@ impl DesktopSceneRenderer {
                 presentation_opacities: &self.presentation_opacities,
                 presentation_clips: &self.presentation_clips,
                 presentation_owner_roots: &self.presentation_owner_roots,
+                special_workspace_dim: self.special_workspace_dim,
                 clip: Some(damage_rect),
             });
         }
@@ -1432,6 +1525,7 @@ impl DesktopSceneRenderer {
             presentation_opacities: &self.presentation_opacities,
             presentation_clips: &self.presentation_clips,
             presentation_owner_roots: &self.presentation_owner_roots,
+            special_workspace_dim: self.special_workspace_dim,
             clip: None,
         });
         self.scene_surface_snapshots = snapshots;
@@ -1930,6 +2024,7 @@ struct WindowVisualDrawRequest<'a> {
     presentation_opacities: &'a HashMap<u32, f32>,
     presentation_clips: &'a HashMap<u32, PresentationClipRect>,
     presentation_owner_roots: &'a HashMap<u32, u32>,
+    special_workspace_dim: SpecialWorkspaceDim,
     clip: Option<OutputRect>,
 }
 
@@ -1946,9 +2041,22 @@ fn draw_window_visual_groups(request: WindowVisualDrawRequest<'_>) {
         presentation_opacities,
         presentation_clips,
         presentation_owner_roots,
+        special_workspace_dim,
         clip,
     } = request;
-    for group in window_visual_stack_order_with_popups(surfaces, decorations, popup_surface_ids) {
+    let groups = window_visual_stack_order_with_popups(surfaces, decorations, popup_surface_ids);
+    let group_count = groups.len();
+    let dim_group_index = special_workspace_dim.group_index(&groups, surfaces);
+    for (group_index, group) in groups.into_iter().enumerate() {
+        if dim_group_index == Some(group_index) {
+            darken_output_rect_for_special_workspace_dim(
+                frame,
+                frame_width,
+                frame_height,
+                special_workspace_dim,
+                clip,
+            );
+        }
         let owner_root = presentation_owner_roots
             .get(&group.root_surface_id())
             .copied()
@@ -2011,6 +2119,53 @@ fn draw_window_visual_groups(request: WindowVisualDrawRequest<'_>) {
                     .unwrap_or(1.0),
                 effective_clip,
             );
+        }
+    }
+    if dim_group_index == Some(group_count) {
+        darken_output_rect_for_special_workspace_dim(
+            frame,
+            frame_width,
+            frame_height,
+            special_workspace_dim,
+            clip,
+        );
+    }
+}
+
+/// Premultiplied black over-composite: each color channel keeps `1 - alpha`
+/// of its value. The alpha byte of the frame pixel is left untouched.
+fn darken_output_rect_for_special_workspace_dim(
+    frame: &mut [u32],
+    frame_width: u32,
+    frame_height: u32,
+    dim: SpecialWorkspaceDim,
+    clip: Option<OutputRect>,
+) {
+    if !dim.is_active() {
+        return;
+    }
+    let Some(rect) = clip
+        .unwrap_or_else(|| OutputRect::full(frame_width, frame_height))
+        .clipped_to_output(frame_width, frame_height)
+    else {
+        return;
+    };
+    let keep = 255 - u32::from(dim.premultiplied_rgba()[3]);
+    let scale = |channel: u32| (channel * keep + 127) / 255;
+    let frame_width = frame_width as usize;
+    let left = rect.x as usize;
+    let row_width = rect.width as usize;
+    for output_y in rect.y as usize..(rect.y as usize).saturating_add(rect.height as usize) {
+        let row_start = output_y.saturating_mul(frame_width).saturating_add(left);
+        let Some(row) = frame.get_mut(row_start..row_start.saturating_add(row_width)) else {
+            continue;
+        };
+        for pixel in row {
+            let color = *pixel;
+            let red = scale((color >> 16) & 0xff);
+            let green = scale((color >> 8) & 0xff);
+            let blue = scale(color & 0xff);
+            *pixel = (color & 0xff00_0000) | (red << 16) | (green << 8) | blue;
         }
     }
 }
@@ -3897,6 +4052,7 @@ mod tests {
             output_scale: 1.0,
             surfaces: &surfaces,
             external_overlay_surface_ids: Vec::new(),
+            special_workspace_dim: SpecialWorkspaceDim::default(),
             content_generation: 1,
             visual_state: DesktopVisualState::wallpaper_only(),
             client_cursor: None,
@@ -3967,6 +4123,7 @@ mod tests {
             output_scale: 1.0,
             surfaces: &popup_surfaces,
             external_overlay_surface_ids: Vec::new(),
+            special_workspace_dim: SpecialWorkspaceDim::default(),
             content_generation: 1,
             visual_state: DesktopVisualState::wallpaper_only(),
             client_cursor: None,
@@ -4004,6 +4161,7 @@ mod tests {
             output_scale: 1.0,
             surfaces: &surfaces,
             external_overlay_surface_ids: Vec::new(),
+            special_workspace_dim: SpecialWorkspaceDim::default(),
             content_generation: 1,
             visual_state: DesktopVisualState::wallpaper_only(),
             client_cursor: None,
@@ -4065,6 +4223,7 @@ mod tests {
             output_scale: 1.0,
             surfaces: &surfaces,
             external_overlay_surface_ids: Vec::new(),
+            special_workspace_dim: SpecialWorkspaceDim::default(),
             content_generation: 1,
             visual_state: DesktopVisualState::wallpaper_only(),
             client_cursor: None,
@@ -4105,6 +4264,7 @@ mod tests {
             output_scale: 1.0,
             surfaces: &[surface],
             external_overlay_surface_ids: Vec::new(),
+            special_workspace_dim: SpecialWorkspaceDim::default(),
             content_generation: 1,
             visual_state: DesktopVisualState::wallpaper_only(),
             client_cursor: None,
@@ -4140,6 +4300,7 @@ mod tests {
             output_scale: 1.0,
             surfaces: &[surface],
             external_overlay_surface_ids: Vec::new(),
+            special_workspace_dim: SpecialWorkspaceDim::default(),
             content_generation: 1,
             visual_state: DesktopVisualState::wallpaper_only(),
             client_cursor: None,
@@ -4156,6 +4317,79 @@ mod tests {
             frame[1] >> 24,
             scale_premultiplied_argb(0xffff_6432, 0.5) >> 24,
             "client and SSD contributions carry the same opacity"
+        );
+    }
+
+    #[test]
+    fn special_workspace_dim_is_inactive_by_default_and_quantizes_to_alpha_byte() {
+        assert!(!SpecialWorkspaceDim::default().is_active());
+        assert_eq!(
+            SpecialWorkspaceDim::new(0.0, Some(3)),
+            SpecialWorkspaceDim::default()
+        );
+        assert_eq!(
+            SpecialWorkspaceDim::new(0.2, None).premultiplied_rgba(),
+            [0, 0, 0, 51]
+        );
+        assert_eq!(SpecialWorkspaceDim::default().fold_signature(7), 7);
+        assert_ne!(SpecialWorkspaceDim::new(0.2, None).fold_signature(7), 7);
+    }
+
+    #[test]
+    fn special_workspace_dim_darkens_surfaces_at_or_above_its_anchor_on_cpu() {
+        let surfaces = vec![
+            solid_test_surface(721, 0, 0, 1, 1, 0xffff_0000),
+            solid_test_surface(722, 1, 0, 1, 1, 0xff00_00ff),
+        ];
+        let mut renderer = DesktopSceneRenderer::default();
+        let mut frame = vec![0; 2];
+        let compose = |renderer: &mut DesktopSceneRenderer,
+                       frame: &mut [u32],
+                       dim: SpecialWorkspaceDim,
+                       content_generation: u64| {
+            renderer.compose_request(DesktopComposeRequest {
+                frame,
+                frame_width: 2,
+                frame_height: 1,
+                output_scale: 1.0,
+                surfaces: &surfaces,
+                external_overlay_surface_ids: Vec::new(),
+                special_workspace_dim: dim,
+                content_generation,
+                visual_state: DesktopVisualState::wallpaper_only(),
+                client_cursor: None,
+            });
+        };
+
+        compose(
+            &mut renderer,
+            &mut frame,
+            SpecialWorkspaceDim::new(0.2, Some(722)),
+            1,
+        );
+        // The dim is drawn before the anchor group, so it darkens the content
+        // below the special workspace and leaves the anchor and above intact.
+        assert_eq!(
+            frame[0], 0xffcc_0000,
+            "surface below the anchor is darkened"
+        );
+        assert_eq!(frame[1], 0xff00_00ff, "anchor surface stays undimmed");
+
+        compose(&mut renderer, &mut frame, SpecialWorkspaceDim::default(), 2);
+        assert_eq!(frame[0], 0xffff_0000, "dim off restores the lower pixel");
+
+        let mut unanchored = DesktopSceneRenderer::default();
+        let mut frame = vec![0; 2];
+        compose(
+            &mut unanchored,
+            &mut frame,
+            SpecialWorkspaceDim::new(0.2, None),
+            1,
+        );
+        assert_eq!(frame[0], 0xffcc_0000, "unanchored dim follows every group");
+        assert_eq!(
+            frame[1], 0xff00_00cc,
+            "unanchored dim darkens the top group too"
         );
     }
 
@@ -4206,6 +4440,7 @@ mod tests {
             output_scale: 1.0,
             surfaces: &[lower, higher],
             external_overlay_surface_ids: Vec::new(),
+            special_workspace_dim: SpecialWorkspaceDim::default(),
             content_generation: 1,
             visual_state: DesktopVisualState::wallpaper_only(),
             client_cursor: None,
@@ -4284,6 +4519,7 @@ mod tests {
             output_scale: 1.0,
             surfaces: &[],
             external_overlay_surface_ids: Vec::new(),
+            special_workspace_dim: SpecialWorkspaceDim::default(),
             content_generation: 1,
             visual_state: DesktopVisualState::wallpaper_only(),
             client_cursor: None,
@@ -4297,6 +4533,7 @@ mod tests {
             output_scale: 1.0,
             surfaces: &[],
             external_overlay_surface_ids: Vec::new(),
+            special_workspace_dim: SpecialWorkspaceDim::default(),
             content_generation: 1,
             visual_state: DesktopVisualState::wallpaper_only(),
             client_cursor: None,
@@ -5271,6 +5508,7 @@ mod tests {
             output_scale: 1.0,
             surfaces: std::slice::from_ref(&initial_surface),
             external_overlay_surface_ids: Vec::new(),
+            special_workspace_dim: SpecialWorkspaceDim::default(),
             content_generation: 1,
             visual_state: DesktopVisualState::wallpaper_only(),
             client_cursor: None,
@@ -5292,6 +5530,7 @@ mod tests {
             output_scale: 1.0,
             surfaces: std::slice::from_ref(&resized_surface),
             external_overlay_surface_ids: Vec::new(),
+            special_workspace_dim: SpecialWorkspaceDim::default(),
             content_generation: 2,
             visual_state: DesktopVisualState::wallpaper_only(),
             client_cursor: None,
@@ -5487,6 +5726,7 @@ mod tests {
             output_scale: 1.0,
             surfaces: &[initial_surface],
             external_overlay_surface_ids: Vec::new(),
+            special_workspace_dim: SpecialWorkspaceDim::default(),
             content_generation: 1,
             visual_state: DesktopVisualState::wallpaper_only(),
             client_cursor: None,
@@ -5530,6 +5770,7 @@ mod tests {
             output_scale: 1.0,
             surfaces: &[updated_surface],
             external_overlay_surface_ids: Vec::new(),
+            special_workspace_dim: SpecialWorkspaceDim::default(),
             content_generation: 2,
             visual_state: DesktopVisualState::wallpaper_only(),
             client_cursor: None,
@@ -5561,6 +5802,7 @@ mod tests {
             output_scale: 1.0,
             surfaces: &[lower.clone(), upper],
             external_overlay_surface_ids: Vec::new(),
+            special_workspace_dim: SpecialWorkspaceDim::default(),
             content_generation: 1,
             visual_state: DesktopVisualState::wallpaper_only(),
             client_cursor: None,
@@ -5574,6 +5816,7 @@ mod tests {
             output_scale: 1.0,
             surfaces: std::slice::from_ref(&lower),
             external_overlay_surface_ids: Vec::new(),
+            special_workspace_dim: SpecialWorkspaceDim::default(),
             content_generation: 2,
             visual_state: DesktopVisualState::wallpaper_only(),
             client_cursor: None,
@@ -5775,6 +6018,7 @@ mod tests {
             output_scale: 1.0,
             surfaces: std::slice::from_ref(&root),
             external_overlay_surface_ids: Vec::new(),
+            special_workspace_dim: SpecialWorkspaceDim::default(),
             content_generation: 1,
             visual_state: DesktopVisualState::wallpaper_only(),
             client_cursor: None,
@@ -5791,6 +6035,7 @@ mod tests {
             output_scale: 1.0,
             surfaces: std::slice::from_ref(&root),
             external_overlay_surface_ids: Vec::new(),
+            special_workspace_dim: SpecialWorkspaceDim::default(),
             content_generation: 1,
             visual_state: DesktopVisualState::wallpaper_only(),
             client_cursor: None,
@@ -6278,6 +6523,7 @@ mod tests {
                 output_scale: 1.0,
                 surfaces: std::slice::from_ref(&initial_surface),
                 external_overlay_surface_ids: Vec::new(),
+                special_workspace_dim: SpecialWorkspaceDim::default(),
                 content_generation: 1,
                 visual_state: DesktopVisualState::wallpaper_only(),
                 client_cursor: None,
@@ -6305,6 +6551,7 @@ mod tests {
                 output_scale: 1.0,
                 surfaces: &[updated_surface],
                 external_overlay_surface_ids: Vec::new(),
+                special_workspace_dim: SpecialWorkspaceDim::default(),
                 content_generation: 2,
                 visual_state: DesktopVisualState::wallpaper_only(),
                 client_cursor: None,
@@ -6985,6 +7232,7 @@ mod tests {
             output_scale: 1.0,
             surfaces: &[],
             external_overlay_surface_ids: Vec::new(),
+            special_workspace_dim: SpecialWorkspaceDim::default(),
             content_generation: 1,
             visual_state: DesktopVisualState::with_cursor(0, 0),
             client_cursor: Some(crate::compositor::ClientCursorRenderState {
@@ -7006,6 +7254,7 @@ mod tests {
             output_scale: 1.0,
             surfaces: &[],
             external_overlay_surface_ids: Vec::new(),
+            special_workspace_dim: SpecialWorkspaceDim::default(),
             content_generation: 1,
             visual_state: DesktopVisualState::wallpaper_only(),
             client_cursor: Some(crate::compositor::ClientCursorRenderState {
@@ -7029,6 +7278,7 @@ mod tests {
             output_scale: 1.0,
             surfaces: &[],
             external_overlay_surface_ids: Vec::new(),
+            special_workspace_dim: SpecialWorkspaceDim::default(),
             content_generation: 1,
             visual_state: DesktopVisualState::wallpaper_only(),
             client_cursor: None,

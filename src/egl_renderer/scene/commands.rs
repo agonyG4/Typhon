@@ -29,6 +29,28 @@ pub(in crate::egl_renderer) fn push_output_background_command(
     );
 }
 
+/// Full-output premultiplied black quad for the special workspace dim. It
+/// carries no visual group, so it never takes part in client presentation
+/// opacity or clip lookups.
+pub(in crate::egl_renderer) fn push_special_workspace_dim_command(
+    vertices: &mut Vec<EglTexturedVertex>,
+    commands: &mut Vec<EglDrawCommand>,
+    width: u32,
+    height: u32,
+    dim: compositor::SpecialWorkspaceDim,
+    framebuffer_origin: OutputFramebufferOrigin,
+) {
+    push_draw_command(
+        vertices,
+        commands,
+        EglDrawLayer::SolidRgba(rgba_to_pixel(dim.premultiplied_rgba())),
+        EglRect::new(0.0, 0.0, width as f32, height as f32),
+        width,
+        height,
+        framebuffer_origin,
+    );
+}
+
 pub(in crate::egl_renderer) fn push_egl_decoration_instance(
     vertices: &mut Vec<EglTexturedVertex>,
     commands: &mut Vec<EglDrawCommand>,

@@ -235,6 +235,7 @@ impl FramePipeline<'_> {
                 .decoration_instances
                 .iter()
                 .chain(request.lifecycle_decorations.iter()),
+            request.special_workspace_dim,
         )?;
         if frame.scaled_visual_state.cursor.is_some() {
             self.resources
@@ -310,13 +311,19 @@ impl FramePipeline<'_> {
             base_surfaces.as_slice()
         };
         let surface_signatures = super::super::egl_scene_surface_signatures(request.surfaces);
+        // The dim is a global output change; folding it into the presentation
+        // signature invalidates the cached command list and the full output
+        // damage exactly when the dim toggles or moves.
+        let scene_presentation_signature = request
+            .special_workspace_dim
+            .fold_signature(request.presentation_visual_signature);
         let candidate_scene_key = EglSceneCacheKey::new_with_decorations_and_external_overlay_ids(
             frame.width,
             frame.height,
             request.content_generation,
             frame.output_scale_key,
             &surface_signatures,
-            request.presentation_visual_signature,
+            scene_presentation_signature,
             request.external_overlay_surface_ids,
             request.decoration_instances,
             request.popup_surface_ids,
@@ -332,7 +339,7 @@ impl FramePipeline<'_> {
             request.external_overlay_surface_ids,
             request.decoration_instances,
             request.popup_surface_ids,
-            request.presentation_visual_signature,
+            scene_presentation_signature,
             framebuffer_origin,
         );
         let client_cursor_damage = request.client_cursor.map(|cursor| {
@@ -402,10 +409,11 @@ impl FramePipeline<'_> {
                 frame.output_scale_key,
                 &surface_signatures,
                 request.external_overlay_surface_ids,
-                request.presentation_visual_signature,
+                scene_presentation_signature,
                 request.presentation_opacities,
                 request.presentation_clips,
                 &presentation_owner_roots_by_surface,
+                request.special_workspace_dim,
                 framebuffer_origin,
             );
         }

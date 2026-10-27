@@ -4605,6 +4605,7 @@ fn ssd_render_uses_resolved_cascaded_root_origin_for_titlebar_and_content() {
         output_scale: 1.0,
         surfaces: &surfaces,
         external_overlay_surface_ids: Vec::new(),
+        special_workspace_dim: crate::compositor::SpecialWorkspaceDim::default(),
         content_generation: 1,
         visual_state: DesktopVisualState::wallpaper_only(),
         client_cursor: None,

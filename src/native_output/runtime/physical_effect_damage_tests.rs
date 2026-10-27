@@ -178,6 +178,7 @@ fn empty_resolved_scene_with_workspace_slide() -> ResolvedNativeFrameScene<'stat
         decorations: Vec::new(),
         popup_surface_ids: std::borrow::Cow::Borrowed(&[]),
         external_overlay_surface_ids: Vec::new(),
+        special_workspace_dim: oblivion_one::compositor::SpecialWorkspaceDim::default(),
         render_generation: 1,
         visibility: FullscreenRenderPlanMetrics::default(),
         snapshot: NativeSceneSnapshot::default(),

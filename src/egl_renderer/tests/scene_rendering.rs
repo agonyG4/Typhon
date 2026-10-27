@@ -438,6 +438,7 @@ fn translucent_egl_presentation_command_is_not_an_opaque_occluder() {
         &[opacity],
         &[],
         &HashMap::from([(7, owner_root)]),
+        oblivion_one::compositor::SpecialWorkspaceDim::default(),
         OutputFramebufferOrigin::BottomLeft,
     );
 
@@ -474,6 +475,7 @@ fn translucent_egl_presentation_command_is_not_an_opaque_occluder() {
         &[opaque],
         &[],
         &HashMap::from([(7, owner_root)]),
+        oblivion_one::compositor::SpecialWorkspaceDim::default(),
         OutputFramebufferOrigin::BottomLeft,
     );
 
@@ -510,6 +512,7 @@ fn translucent_egl_presentation_command_is_not_an_opaque_occluder() {
         &[zero],
         &[],
         &HashMap::from([(7, owner_root)]),
+        oblivion_one::compositor::SpecialWorkspaceDim::default(),
         OutputFramebufferOrigin::BottomLeft,
     );
 
@@ -1389,5 +1392,70 @@ fn scene_cache_key_invalidates_when_dock_overlay_partition_changes() {
             11,
             OutputFramebufferOrigin::BottomLeft,
         )
+    );
+}
+
+#[test]
+fn special_workspace_dim_command_precedes_anchor_group_in_egl_scene() {
+    let mut harness = GlesEffectTestHarness::new(320, 200);
+    let surfaces = vec![test_shm_surface(RenderableSurfaceDamage::full())];
+    let surface_id = surfaces[0].surface_id;
+    let signatures = egl_scene_surface_signatures(&surfaces);
+    let dim_layer = EglDrawLayer::SolidRgba(0x3300_0000);
+
+    harness.renderer.scene_state.rebuild_scene_commands(
+        320,
+        200,
+        &surfaces,
+        &[],
+        &[],
+        1,
+        1.0,
+        1,
+        &signatures,
+        &[],
+        0,
+        &[],
+        &[],
+        &HashMap::new(),
+        oblivion_one::compositor::SpecialWorkspaceDim::new(0.2, Some(surface_id)),
+        OutputFramebufferOrigin::BottomLeft,
+    );
+    let scene = &harness.renderer.scene_state;
+    let layers = scene.commands.iter().map(|c| c.layer).collect::<Vec<_>>();
+    assert_eq!(layers.len(), 3, "background, dim, surface");
+    // The leading background command has no opacity entry, matching the
+    // translucent presentation test; the dim takes its entry like a group.
+    assert_eq!(scene.presentation_opacities.len(), layers.len() - 1);
+    assert_eq!(layers[1], dim_layer, "dim sits directly before the anchor");
+    assert_eq!(
+        scene.commands[1].bounds,
+        EglRect::new(0.0, 0.0, 320.0, 200.0)
+    );
+
+    harness.renderer.scene_state.rebuild_scene_commands(
+        320,
+        200,
+        &surfaces,
+        &[],
+        &[],
+        2,
+        1.0,
+        1,
+        &signatures,
+        &[],
+        0,
+        &[],
+        &[],
+        &HashMap::new(),
+        oblivion_one::compositor::SpecialWorkspaceDim::new(0.2, None),
+        OutputFramebufferOrigin::BottomLeft,
+    );
+    let scene = &harness.renderer.scene_state;
+    assert_eq!(scene.commands.len(), 3);
+    assert_eq!(
+        scene.commands[2].layer,
+        dim_layer,
+        "unanchored dim follows every group"
     );
 }

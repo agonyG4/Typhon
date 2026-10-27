@@ -1700,7 +1700,13 @@ fn draw_scene_reconciles_canonical_and_empty_lifecycle_decoration_resources_toge
 
     renderer
         .resources
-        .ensure_decoration_resources(&renderer.gl, &egl, display, std::iter::empty())
+        .ensure_decoration_resources(
+            &renderer.gl,
+            &egl,
+            display,
+            std::iter::empty(),
+            oblivion_one::compositor::SpecialWorkspaceDim::default(),
+        )
         .expect("unused decoration textures are retired");
     assert!(required_layers.iter().all(|layer| match layer {
         EglDrawLayer::SolidRgba(color) => {
@@ -1790,7 +1796,13 @@ fn draw_scene_reconciles_canonical_and_empty_lifecycle_decoration_resources_toge
 
     renderer
         .resources
-        .ensure_decoration_resources(&renderer.gl, &egl, display, std::iter::empty())
+        .ensure_decoration_resources(
+            &renderer.gl,
+            &egl,
+            display,
+            std::iter::empty(),
+            oblivion_one::compositor::SpecialWorkspaceDim::default(),
+        )
         .expect("unused decoration textures are retired again before draw accounting");
     renderer.scene_state.frame_stats = GlesSceneFrameStats::default();
     renderer

@@ -1788,6 +1788,14 @@ impl OwnCompositorServer {
         self.state.external_overlay_surface_ids(lifecycle)
     }
 
+    pub fn special_workspace_dim(
+        &self,
+        surfaces: &[RenderableSurface],
+        owner_roots: &[u32],
+    ) -> crate::compositor::SpecialWorkspaceDim {
+        self.state.special_workspace_dim(surfaces, owner_roots)
+    }
+
     pub fn active_workspace(&self) -> WorkspaceId {
         self.state.active_workspace()
     }

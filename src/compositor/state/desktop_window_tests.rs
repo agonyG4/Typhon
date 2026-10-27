@@ -3793,3 +3793,39 @@ fn maximized_x11_window_skips_window_open_when_policy_is_off() {
         canonical_opacity
     );
 }
+
+#[test]
+fn special_workspace_dim_anchors_above_every_regular_surface() {
+    use super::scene_order::SPECIAL_WORKSPACE_DIM_ALPHA;
+    use super::tiled_layout_tests::test_renderable_surface;
+    use crate::compositor::SpecialWorkspaceDim;
+
+    let mut state = CompositorState::new(None);
+    let special = crate::wm::SpecialWorkspaceId::DEFAULT;
+    let regular = state.allocate_window_id().expect("window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_xdg(regular, 451))
+        .expect("window");
+    state.window_mut(regular).expect("window").management = Some(WindowManagementState::new(
+        WorkspaceLocation::Regular(state.active_workspace()),
+    ));
+    insert_window_in_special(&mut state, 452, special);
+    let surfaces = [
+        test_renderable_surface(451, 64, 64),
+        test_renderable_surface(452, 64, 64),
+    ];
+
+    assert!(!state.special_workspace_dim(&surfaces, &[451, 452]).is_active());
+
+    assert!(state.workspace_manager.set_visible_special_workspace(Some(special)));
+    assert_eq!(
+        state.special_workspace_dim(&surfaces, &[451, 452]),
+        SpecialWorkspaceDim::new(SPECIAL_WORKSPACE_DIM_ALPHA, Some(452)),
+        "the dim sits between the regular window and the special window"
+    );
+    assert_eq!(
+        state.special_workspace_dim(&surfaces[..1], &[451]),
+        SpecialWorkspaceDim::new(SPECIAL_WORKSPACE_DIM_ALPHA, None),
+        "an empty special dims every regular surface"
+    );
+}

@@ -1337,3 +1337,40 @@ fn xwayland_clip_track_and_physical_clip_follow_window_group_across_backing_repl
     );
     assert!(state.direct_scanout_scene_candidate().is_ok());
 }
+
+#[test]
+fn special_workspace_dim_alpha_follows_visible_special_workspace() {
+    let mut state = CompositorState::new(None);
+    assert_eq!(state.special_workspace_dim_alpha(), 0.0);
+    let special = crate::wm::SpecialWorkspaceId::new(1).expect("special id");
+    assert!(state.workspace_manager.set_visible_special_workspace(Some(special)));
+    assert_eq!(
+        state.special_workspace_dim_alpha(),
+        crate::compositor::state::scene_order::SPECIAL_WORKSPACE_DIM_ALPHA
+    );
+    assert!(state.workspace_manager.set_visible_special_workspace(None));
+    assert_eq!(state.special_workspace_dim_alpha(), 0.0);
+}
+
+#[test]
+fn special_workspace_dim_blocks_regular_fullscreen_direct_scanout() {
+    let mut state = CompositorState::new(None);
+    let output_size = BufferSize::new(state.output_size.width, state.output_size.height)
+        .expect("configured output size");
+    install_probe_scanout_surface(&mut state, 304, output_size);
+    assert!(
+        state.direct_scanout_scene_candidate().is_ok(),
+        "the regular fullscreen surface is scanout-compatible without a dim"
+    );
+
+    let special = crate::wm::SpecialWorkspaceId::new(1).expect("special id");
+    assert!(state.workspace_manager.set_visible_special_workspace(Some(special)));
+    let analysis = state.direct_scanout_scene_analysis();
+    assert!(analysis.candidate.is_none());
+    assert!(
+        analysis
+            .blockers
+            .reasons()
+            .contains(&DirectScanoutSceneRejection::SpecialWorkspaceDim)
+    );
+}

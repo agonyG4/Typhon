@@ -221,12 +221,19 @@ impl RendererResourceState {
         egl: &EglInstance,
         egl_display: egl::Display,
         instances: I,
+        special_workspace_dim: compositor::SpecialWorkspaceDim,
     ) -> RendererResult<()>
     where
         I: IntoIterator<Item = &'a compositor::DecorationRenderInstance>,
     {
-        self.ui
-            .ensure_decoration_resources(gl, egl, egl_display, instances, &mut self.upload)
+        self.ui.ensure_decoration_resources(
+            gl,
+            egl,
+            egl_display,
+            instances,
+            special_workspace_dim,
+            &mut self.upload,
+        )
     }
 
     pub(super) fn capture_snapshot(&self) -> RendererResourceCaptureSnapshot {

@@ -3,7 +3,7 @@ use std::borrow::Cow;
 use super::super::NativeSceneSnapshot;
 use oblivion_one::compositor::{
     FullscreenPresentationRejection, FullscreenRenderPlanMetrics, RenderableSurface,
-    ResolvedEffectScene, SceneNodeId,
+    ResolvedEffectScene, SceneNodeId, SpecialWorkspaceDim,
 };
 use oblivion_one::effects::EffectRegion;
 
@@ -190,11 +190,15 @@ pub(crate) fn visibility_signature(metrics: FullscreenRenderPlanMetrics) -> u64 
 pub(crate) fn finalize_snapshot(
     mut snapshot: NativeSceneSnapshot,
     external_overlay_surface_ids: &[u32],
+    special_workspace_dim: SpecialWorkspaceDim,
     visibility: FullscreenRenderPlanMetrics,
     effects: &ResolvedEffectScene,
 ) -> (NativeSceneSnapshot, u64) {
     snapshot.external_overlay_surface_ids = external_overlay_surface_ids.to_vec();
-    snapshot.visibility_signature = visibility_signature(visibility);
+    // The special dim covers the whole output, so it shares the global
+    // invalidation that visibility already gets in damage comparison.
+    snapshot.visibility_signature =
+        special_workspace_dim.fold_signature(visibility_signature(visibility));
     snapshot.effect_damage = effects
         .instances
         .iter()

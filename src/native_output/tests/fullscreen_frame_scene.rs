@@ -48,6 +48,7 @@ fn solitary_fullscreen_snapshot_matches_the_filtered_renderer_scene() {
         decorations: Vec::new(),
         popup_surface_ids: Cow::Owned(Vec::new()),
         external_overlay_surface_ids: Vec::new(),
+        special_workspace_dim: oblivion_one::compositor::SpecialWorkspaceDim::default(),
         render_generation: 1,
         visibility: FullscreenRenderPlanMetrics {
             fullscreen_active: true,
@@ -146,6 +147,7 @@ fn freezing_a_resolved_scene_shares_shm_payload_backing() {
         decorations: Vec::new(),
         popup_surface_ids: Cow::Borrowed(&[]),
         external_overlay_surface_ids: Vec::new(),
+        special_workspace_dim: oblivion_one::compositor::SpecialWorkspaceDim::default(),
         render_generation: 1,
         visibility: FullscreenRenderPlanMetrics::default(),
         scene_identity_signature: snapshot.identity_signature(),

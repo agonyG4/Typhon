@@ -1,4 +1,5 @@
 use super::*;
+use crate::egl_renderer::scene::push_special_workspace_dim_command;
 use glow::HasContext;
 
 pub(in crate::egl_renderer) fn establish_scene_gl_state(
@@ -403,6 +404,7 @@ impl SceneRenderState {
         presentation_opacities: &[oblivion_one::presentation_animation::PresentationGroupOpacity],
         presentation_clips: &[oblivion_one::presentation_animation::PresentationGroupClip],
         presentation_owner_roots_by_surface: &HashMap<u32, u32>,
+        special_workspace_dim: compositor::SpecialWorkspaceDim,
         framebuffer_origin: OutputFramebufferOrigin,
     ) {
         self.frame_stats.orphan_decoration_count =
@@ -427,14 +429,25 @@ impl SceneRenderState {
 
         let render_assignments =
             compositor::surface_render_space_assignments(surfaces, output_scale);
-        for (group_index, group) in compositor::WindowVisualGroup::stack_order_with_popups(
+        let groups = compositor::WindowVisualGroup::stack_order_with_popups(
             surfaces,
             decoration_instances,
             popup_surface_ids,
-        )
-        .into_iter()
-        .enumerate()
-        {
+        );
+        let group_count = groups.len();
+        let dim_group_index = special_workspace_dim.group_index(&groups, surfaces);
+        for (group_index, group) in groups.into_iter().enumerate() {
+            if dim_group_index == Some(group_index) {
+                push_special_workspace_dim_command(
+                    &mut self.vertices,
+                    &mut self.commands,
+                    width,
+                    height,
+                    special_workspace_dim,
+                    framebuffer_origin,
+                );
+                self.presentation_opacities.push(1.0);
+            }
             let command_start = self.commands.len();
             let visual_group = VisualGroupId::new(
                 u32::try_from(group_index)
@@ -515,6 +528,17 @@ impl SceneRenderState {
                     command.opaque_regions.clear();
                 }
             }
+        }
+        if dim_group_index == Some(group_count) {
+            push_special_workspace_dim_command(
+                &mut self.vertices,
+                &mut self.commands,
+                width,
+                height,
+                special_workspace_dim,
+                framebuffer_origin,
+            );
+            self.presentation_opacities.push(1.0);
         }
 
         self.scene_cache_key = Some(

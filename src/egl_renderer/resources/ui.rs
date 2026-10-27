@@ -127,19 +127,27 @@ impl UiResourceStore {
         egl: &EglInstance,
         egl_display: egl::Display,
         instances: I,
+        special_workspace_dim: oblivion_one::compositor::SpecialWorkspaceDim,
         upload: &mut UploadScratch,
     ) -> RendererResult<()>
     where
         I: IntoIterator<Item = &'a DecorationRenderInstance>,
     {
         let DecorationResourceRequirements {
-            required,
+            mut required,
             required_assets,
         } = decoration_resource_requirements(
             instances
                 .into_iter()
                 .map(DecorationRenderInstance::primitives),
         );
+        // The special workspace dim is drawn as a SolidRgba layer that no
+        // decoration primitive mentions, so its color is required explicitly.
+        if special_workspace_dim.is_active() {
+            required.insert(DecorationResourceKey::Solid(argb_color_key(
+                special_workspace_dim.premultiplied_rgba(),
+            )));
+        }
 
         let stale = self
             .decorations

@@ -20,7 +20,6 @@ use crate::compositor::render::SurfaceTargetRect;
 use crate::effects::EffectRect;
 use crate::presentation_animation::AnimationTime;
 use crate::render_backend::buffer::{BufferSize, SurfaceBufferSource};
-use crate::wm::WorkspaceLocation;
 use wayland_server::Resource;
 
 #[derive(Debug, Clone)]
@@ -316,6 +315,15 @@ impl CompositorState {
             };
         };
         let root_surface_id = covering_group.root_surface_id;
+        // The special dim is drawn over every regular-workspace surface, so a
+        // regular covering window is never scanned out while it is active.
+        // Special-workspace windows sit above the dim band and keep their
+        // existing eligibility.
+        if self.special_workspace_dim_alpha() > 0.0
+            && !self.application_root_is_special(root_surface_id)
+        {
+            blockers.push(DirectScanoutSceneRejection::SpecialWorkspaceDim);
+        }
         let candidate_scene_node_id = scene
             .owner_root_for_surface(root_surface_id)
             .filter(|owner_root| *owner_root == root_surface_id)
@@ -671,12 +679,6 @@ impl CompositorState {
     }
 
     fn application_root_is_special(&self, root_surface_id: u32) -> bool {
-        self.window_id_for_surface(root_surface_id)
-            .is_some_and(|window_id| {
-                matches!(
-                    self.scene_work_owner_for_window(window_id),
-                    SceneWorkOwner::Location(WorkspaceLocation::Special(_))
-                )
-            })
+        self.surface_root_is_in_special_workspace(root_surface_id)
     }
 }

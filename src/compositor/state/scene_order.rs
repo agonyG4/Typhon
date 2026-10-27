@@ -1,8 +1,10 @@
 use super::*;
+use crate::compositor::SpecialWorkspaceDim;
 use crate::wm::WorkspaceLocation;
 
 // Scene bands, bottom to top. Band numbers are compared before the layer and
 // stack keys, so the order here is the stacking order.
+const SCENE_BAND_BOTTOM_LAYER: u8 = 1;
 const SCENE_BAND_TOP_LAYER: u8 = 6;
 // Windows of the fullscreen owner family, and windows whose maximize or
 // fullscreen mode-transition animation is in flight, stack above Top layers.
@@ -13,7 +15,85 @@ const SCENE_BAND_FULLSCREEN_ALLOWED_WINDOW: u8 = 8;
 const SCENE_BAND_OVERLAY_LAYER: u8 = 9;
 const SCENE_BAND_DRAG_ICON: u8 = 10;
 
+/// Opacity of the black dim drawn behind a visible special workspace. The dim
+/// sits between the regular bands and the special bands (see
+/// `special_workspace_dim_anchor_surface_id`).
+pub(crate) const SPECIAL_WORKSPACE_DIM_ALPHA: f32 = 0.2;
+
 impl CompositorState {
+    /// Per-frame dim opacity: fully on while a special workspace is visible,
+    /// off otherwise. A later animation step scales this single value.
+    pub(in crate::compositor) fn special_workspace_dim_alpha(&self) -> f32 {
+        match self.workspace_manager.visible_special_workspace() {
+            Some(_) => SPECIAL_WORKSPACE_DIM_ALPHA,
+            None => 0.0,
+        }
+    }
+
+    pub(in crate::compositor) fn surface_root_is_in_special_workspace(
+        &self,
+        root_surface_id: u32,
+    ) -> bool {
+        self.window_id_for_surface(root_surface_id)
+            .is_some_and(|window_id| {
+                matches!(
+                    self.scene_work_owner_for_window(window_id),
+                    SceneWorkOwner::Location(WorkspaceLocation::Special(_))
+                )
+            })
+    }
+
+    /// Frame-level dim description for the ordered `surfaces` and their
+    /// aligned presentation owner roots.
+    pub(in crate::compositor) fn special_workspace_dim(
+        &self,
+        surfaces: &[RenderableSurface],
+        owner_roots: &[u32],
+    ) -> SpecialWorkspaceDim {
+        let alpha = self.special_workspace_dim_alpha();
+        if alpha <= 0.0 {
+            return SpecialWorkspaceDim::default();
+        }
+        SpecialWorkspaceDim::new(
+            alpha,
+            self.special_workspace_dim_anchor_surface_id(surfaces, owner_roots),
+        )
+    }
+
+    /// The dim is drawn immediately after the last surface that belongs to a
+    /// regular workspace window or to the background/bottom layers, so every
+    /// regular surface is dimmed even when a regular fullscreen owner is
+    /// raised above the Top layers. Special windows stack above all regular
+    /// windows (bands 4/5, or band 8 over a fullscreen owner), so they and the
+    /// Top/Overlay layers above them stay undimmed; an empty special still
+    /// dims the regular content. With nothing above the regular content the
+    /// dim is drawn last (`None`).
+    fn special_workspace_dim_anchor_surface_id(
+        &self,
+        surfaces: &[RenderableSurface],
+        owner_roots: &[u32],
+    ) -> Option<u32> {
+        let dimmed_prefix = surfaces
+            .iter()
+            .zip(owner_roots.iter().copied())
+            .rposition(|(_, owner_root)| {
+                self.surface_root_is_in_regular_workspace(owner_root)
+                    || self.renderable_root_stack_key(owner_root, 0).0 <= SCENE_BAND_BOTTOM_LAYER
+            })
+            .map_or(0, |index| index + 1);
+        surfaces.get(dimmed_prefix).map(|surface| surface.surface_id)
+    }
+
+    fn surface_root_is_in_regular_workspace(&self, root_surface_id: u32) -> bool {
+        self.window_id_for_surface(root_surface_id)
+            .is_some_and(|window_id| {
+                matches!(
+                    self.scene_work_owner_for_window(window_id),
+                    SceneWorkOwner::Location(WorkspaceLocation::Regular(_))
+                )
+            })
+    }
+
     pub(in crate::compositor) fn reorder_renderable_surfaces_by_committed_stack(&mut self) -> bool {
         if self.defer_render_stack_reorder() {
             return false;
@@ -117,7 +197,7 @@ impl CompositorState {
         if let Some(role) = self.layer_surfaces.get(&root_id) {
             let band = match role.committed.layer.scene_rank() {
                 0 => 0,
-                1 => 1,
+                1 => SCENE_BAND_BOTTOM_LAYER,
                 3 => SCENE_BAND_TOP_LAYER,
                 4 => SCENE_BAND_OVERLAY_LAYER,
                 rank => rank,

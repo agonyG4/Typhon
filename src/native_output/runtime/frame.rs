@@ -16,8 +16,8 @@ use oblivion_one::compositor::{
     AnimationTime, ClientCursorRenderState, DecorationRenderInstance, DecorationSceneSnapshot,
     DesktopVisualState, FrameEffectSceneInput, FullscreenRenderPlanMetrics, PointerWarpOrigin,
     PresentationFrameSnapshot, PresentationSceneSample, PresentedCanonicalSceneSnapshot,
-    ResolvedEffectScene, SceneNodeId, SurfacePlacement, SurfaceResourceSyncState,
-    WindowExitFrameEvidence, WorkspacePresentationSample,
+    ResolvedEffectScene, SceneNodeId, SpecialWorkspaceDim, SurfacePlacement,
+    SurfaceResourceSyncState, WindowExitFrameEvidence, WorkspacePresentationSample,
 };
 use oblivion_one::presentation_animation::{
     PresentationClip, PresentationClipRect, PresentationGroupClip,
@@ -89,6 +89,7 @@ pub(crate) struct ResolvedNativeFrameScene<'a> {
     pub(crate) decorations: Vec<DecorationRenderInstance>,
     pub(crate) popup_surface_ids: Cow<'a, [u32]>,
     pub(crate) external_overlay_surface_ids: Vec<u32>,
+    pub(crate) special_workspace_dim: SpecialWorkspaceDim,
     pub(crate) render_generation: u64,
     pub(crate) visibility: FullscreenRenderPlanMetrics,
     pub(crate) snapshot: NativeSceneSnapshot,
@@ -550,6 +551,7 @@ impl<'a> ResolvedNativeFrameScene<'a> {
         scene.decorations.clear();
         scene.popup_surface_ids = Cow::Owned(Vec::new());
         scene.external_overlay_surface_ids.clear();
+        scene.special_workspace_dim = SpecialWorkspaceDim::default();
         scene.visibility = FullscreenRenderPlanMetrics::default();
         scene.snapshot = NativeSceneSnapshot::default();
         scene.canonical_scene_evidence = None;
@@ -786,6 +788,8 @@ impl<'a> ResolvedNativeFrameScene<'a> {
         let lifecycle_snapshot = LifecycleFrameSnapshot::from_sample(&lifecycle);
         let popup_surface_ids = frame_popup_surface_ids;
         let external_overlay_surface_ids = server.external_overlay_surface_ids(&lifecycle);
+        let special_workspace_dim =
+            server.special_workspace_dim(surfaces.as_ref(), all_canonical_ordered_owners.as_ref());
         let lifecycle_marker_insertions = lifecycle_marker_insertions(
             server,
             surfaces.as_ref(),
@@ -892,6 +896,7 @@ impl<'a> ResolvedNativeFrameScene<'a> {
         let (snapshot, mut scene_identity_signature) = finalize_snapshot(
             snapshot,
             &external_overlay_surface_ids,
+            special_workspace_dim,
             visibility,
             &effects,
         );
@@ -973,6 +978,7 @@ impl<'a> ResolvedNativeFrameScene<'a> {
             decorations,
             popup_surface_ids,
             external_overlay_surface_ids,
+            special_workspace_dim,
             render_generation,
             visibility,
             snapshot,
@@ -1002,6 +1008,7 @@ impl<'a> ResolvedNativeFrameScene<'a> {
             decorations: self.decorations,
             popup_surface_ids: Cow::Owned(self.popup_surface_ids.into_owned()),
             external_overlay_surface_ids: self.external_overlay_surface_ids,
+            special_workspace_dim: self.special_workspace_dim,
             render_generation: self.render_generation,
             visibility: self.visibility,
             snapshot: self.snapshot,
@@ -2230,6 +2237,7 @@ impl NativeFrameRenderer {
             height,
             surfaces: resolved_scene.surfaces.as_ref(),
             external_overlay_surface_ids: resolved_scene.external_overlay_surface_ids.clone(),
+            special_workspace_dim: resolved_scene.special_workspace_dim,
             visual_state: input_state.desktop_visual_state(cursor_mode, cursor_visible),
             render_generation: resolved_scene.render_generation,
             client_cursor: cursor_mode
@@ -2251,6 +2259,7 @@ impl NativeFrameRenderer {
             render_generation,
             client_cursor,
             external_overlay_surface_ids,
+            special_workspace_dim,
         } = request;
         let pixel_count = width.saturating_mul(height) as usize;
         self.frame.resize(pixel_count, 0);
@@ -2262,6 +2271,7 @@ impl NativeFrameRenderer {
                 output_scale: 1.0,
                 surfaces,
                 external_overlay_surface_ids,
+                special_workspace_dim,
                 content_generation: native_scene_content_generation(render_generation),
                 visual_state,
                 client_cursor,
@@ -2679,6 +2689,7 @@ fn project_egl_scene_draw_request<'a>(
         height,
         surfaces: scene.surfaces.as_ref(),
         external_overlay_surface_ids: &scene.external_overlay_surface_ids,
+        special_workspace_dim: scene.special_workspace_dim,
         popup_surface_ids: scene.popup_surface_ids.as_ref(),
         content_generation: native_scene_content_generation(scene.render_generation),
         frame_id,
@@ -2735,6 +2746,7 @@ pub(crate) struct NativeFrameRequest<'a> {
     pub(crate) height: u32,
     pub(crate) surfaces: &'a [RenderableSurface],
     pub(crate) external_overlay_surface_ids: Vec<u32>,
+    pub(crate) special_workspace_dim: SpecialWorkspaceDim,
     pub(crate) visual_state: DesktopVisualState,
     pub(crate) render_generation: u64,
     pub(crate) client_cursor: Option<oblivion_one::compositor::ClientCursorRenderState<'a>>,
