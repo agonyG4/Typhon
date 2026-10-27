@@ -1407,6 +1407,7 @@ impl EffectExecutionContext<'_> {
         let mut missing_required_decoration_resources: usize = 0;
         let mut texture_binds = 0;
         let mut draw_calls = 0;
+        let mut special_debug = (scene && special_workspace_render_debug_enabled()).then(Vec::new);
         for command_index in 0..commands_len {
             if command_range
                 .is_some_and(|(start, end)| command_index < start || command_index >= end)
@@ -1460,7 +1461,20 @@ impl EffectExecutionContext<'_> {
             if scene && use_visibility_plan {
                 match self.scene.scene_visibility_plan[command_index] {
                     EglVisibilityDecision::Drawable => {}
-                    EglVisibilityDecision::OutsideRemaining | EglVisibilityDecision::Occluded => {
+                    decision @ (EglVisibilityDecision::OutsideRemaining
+                    | EglVisibilityDecision::Occluded) => {
+                        if let (Some(log), EglDrawLayer::Surface(surface_id)) =
+                            (special_debug.as_mut(), command.layer)
+                        {
+                            log.push(format!(
+                                "{surface_id}:{}",
+                                if decision == EglVisibilityDecision::Occluded {
+                                    "occluded"
+                                } else {
+                                    "outside"
+                                }
+                            ));
+                        }
                         continue;
                     }
                 }
@@ -1479,8 +1493,22 @@ impl EffectExecutionContext<'_> {
                     missing_required_decoration_resources =
                         missing_required_decoration_resources.saturating_add(1);
                 }
+                if let Some(log) = special_debug.as_mut() {
+                    log.push(format!("{:?}:no_texture", command.layer));
+                }
                 continue;
             };
+            if let (Some(log), EglDrawLayer::Surface(surface_id)) =
+                (special_debug.as_mut(), command.layer)
+            {
+                let opacity = self
+                    .scene
+                    .presentation_opacities
+                    .get(command_index)
+                    .copied()
+                    .unwrap_or(1.0);
+                log.push(format!("{surface_id}:drawn@{opacity:.3}"));
+            }
             unsafe {
                 self.gl.bind_texture(glow::TEXTURE_2D, Some(texture));
                 texture_binds += 1;
@@ -1518,6 +1546,12 @@ impl EffectExecutionContext<'_> {
         }
         if current_scissor != initial_scissor {
             self.set_scissor_for_target_space(initial_scissor, target_space);
+        }
+        if let Some(log) = special_debug {
+            eprintln!(
+                "typhon.special_render scissor={initial_scissor:?} range={command_range:?} visibility_plan={use_visibility_plan} commands=[{}]",
+                log.join(" ")
+            );
         }
         self.scene.frame_stats.commands_considered = self
             .scene
@@ -1891,6 +1925,16 @@ impl EffectExecutionContext<'_> {
             EglDrawLayer::SolidRgba(_) | EglDrawLayer::DecorationAsset(_)
         )
     }
+}
+
+/// `OBLIVION_ONE_DEBUG_SPECIAL=1` also logs what each scene draw pass did with
+/// every surface command: drawn (with opacity), occluded, outside, or skipped
+/// for a missing texture. The frame trace shows the scene; this shows the GPU.
+fn special_workspace_render_debug_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("OBLIVION_ONE_DEBUG_SPECIAL").is_some_and(|value| value == "1")
+    })
 }
 
 #[cfg(test)]
