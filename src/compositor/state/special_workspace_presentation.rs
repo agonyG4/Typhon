@@ -1,14 +1,22 @@
 use crate::compositor::CompositorState;
 use crate::compositor::state::scene_order::SPECIAL_WORKSPACE_DIM_ALPHA;
-use crate::compositor::state::workspace_presentation::{
-    sample_slide_motion, workspace_slide_curve,
-};
-use crate::presentation_animation::{AnimationCurve, AnimationTime};
+use crate::compositor::state::workspace_presentation::sample_slide_motion;
+use crate::presentation_animation::{AnimationCurve, AnimationTime, SpringSpec};
 use crate::wm::{SpecialWorkspaceId, SpecialWorkspaceToggleOutcome};
 
 /// Vertical travel of a special workspace on open and close, as a fraction of
 /// the output height. The windows rest at their own position when shown.
 pub const SPECIAL_WORKSPACE_SLIDE_OFFSET_FRACTION: f64 = 0.06;
+
+/// The regular workspace-slide spring, settled for a 0..1 progress instead of
+/// workspace positions: 0.002 is a fraction of a pixel of the slide and of
+/// opacity, so the motion no longer spends ~90 invisible frames in its tail.
+pub(in crate::compositor) fn special_workspace_curve(speed: f64) -> AnimationCurve {
+    crate::animation_control::scale_curve(
+        AnimationCurve::spring(SpringSpec::new(300.0, 38.1051).with_settlement(0.002, 0.05)),
+        speed,
+    )
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpecialWorkspaceMotionKind {
@@ -279,7 +287,7 @@ impl CompositorState {
             self.special_workspace_presentation.clear();
             return;
         }
-        let curve = workspace_slide_curve(self.animation_control.configuration().speed);
+        let curve = special_workspace_curve(self.animation_control.configuration().speed);
         self.special_workspace_presentation
             .begin_for_outcome(outcome, sampled_at, curve);
     }
@@ -629,7 +637,7 @@ mod tests {
     fn dim_alpha_rises_on_open_and_falls_on_close() {
         let mut state = CompositorState::new(None);
         let special_id = special(1);
-        let curve = workspace_slide_curve(1.0);
+        let curve = special_workspace_curve(1.0);
         assert_eq!(state.special_workspace_dim_alpha_at(at_ms(0)), 0.0);
 
         assert!(
