@@ -9,6 +9,7 @@ use ::input::AsRaw;
 use oblivion_one::compositor::{
     InteractionUpdateOutcome, PointerRestoreDecision, PointerWarpOrigin,
 };
+use oblivion_one::wm::SpecialWorkspaceId;
 
 #[inline]
 fn libinput_event_type_is_pending(event_type: ::input::ffi::libinput_event_type) -> bool {
@@ -1553,7 +1554,7 @@ pub(crate) const fn interaction_primary_redraw_requested(
 
 pub(crate) fn apply_native_input_effect(
     mut effect: NativeInputEffect,
-    context: NativeInputApplyContext<'_>,
+    mut context: NativeInputApplyContext<'_>,
 ) -> NativeResult<NativeInputApplication> {
     let mut application = NativeInputApplication {
         redraw_requested: effect.requires_frame_repaint(context.cursor_mode),
@@ -1748,8 +1749,15 @@ pub(crate) fn apply_native_input_effect(
         context.server.send_pointer_axis_frame(frame);
     }
     for action in effect.window_actions {
+        let toggled_special = match action {
+            NativeWindowAction::ToggleSpecialWorkspace(special) => Some(special),
+            _ => None,
+        };
         application.redraw_requested |=
             apply_native_window_action(action, context.server, context.perf, context.resize_perf);
+        if let Some(special) = toggled_special {
+            launch_special_workspace_on_empty(special, &mut context);
+        }
     }
     let mut fallback_attempt = None;
     for invocation in effect.binding_action_invocations.iter().copied() {
@@ -1927,6 +1935,43 @@ pub(crate) fn apply_native_input_effect(
         }
     }
     Ok(application)
+}
+
+/// After a toggle leaves `special` shown and empty, spawns its configured
+/// launch-on-empty command through the same path as `LaunchCommand`. The
+/// compositor's pending record suppresses repeat spawns until a window maps
+/// into the special or the pending timeout elapses.
+fn launch_special_workspace_on_empty(
+    special: SpecialWorkspaceId,
+    context: &mut NativeInputApplyContext<'_>,
+) {
+    if !context.server.special_workspace_is_shown(special) {
+        return;
+    }
+    let Some(command) = special_workspace_launch_on_empty(special) else {
+        return;
+    };
+    if !context.server.claim_special_workspace_launch(special) {
+        return;
+    }
+    match launch_native_shell_command_with_xwayland_environment(
+        context.server,
+        context.process_supervisor,
+        command,
+        context.app_gpu_policy,
+        NativeLaunchSource::BindingApplication,
+        context.xwayland,
+    ) {
+        Ok(Some(_)) => {}
+        Ok(None) => context.server.release_special_workspace_launch(special),
+        Err(error) => {
+            context.server.release_special_workspace_launch(special);
+            eprintln!(
+                "native input: special workspace {} launch failed: {error}",
+                special.get()
+            );
+        }
+    }
 }
 
 pub(crate) struct NativeInputApplyContext<'a> {

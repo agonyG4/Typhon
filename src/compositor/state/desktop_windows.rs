@@ -196,9 +196,10 @@ impl CompositorState {
         if let WindowBackend::X11(handle) = window.backend {
             self.window_by_x11_handle.insert(handle, window_id);
         }
-        window.refresh_workspace_membership(self.workspace_manager.active_workspace());
+        window.refresh_workspace_membership(self.initial_window_location());
         self.window_stacking.push(window_id);
         self.desktop_windows.insert(window_id, window);
+        self.clear_special_workspace_launch_pending_for_window(window_id);
         self.trace_x11_geometry_authority_change(
             window_id,
             X11GeometryAuthoritySource::InitialManage,
@@ -872,10 +873,11 @@ impl CompositorState {
             crate::xwayland::xwm::X11MetadataDelta::Protocols { .. } => {}
         }
         if structure_dirty {
-            let active_workspace = self.workspace_manager.active_workspace();
+            let initial_location = self.initial_window_location();
             if let Some(window) = self.window_mut(window_id) {
-                window.refresh_workspace_membership(active_workspace);
+                window.refresh_workspace_membership(initial_location);
             }
+            self.clear_special_workspace_launch_pending_for_window(window_id);
             self.rebuild_x11_transient_relationships();
             self.reconcile_workspace_inheritance();
         }

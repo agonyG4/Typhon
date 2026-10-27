@@ -135,6 +135,16 @@ pub(super) const fn shortcut_phase(trigger: BindingTrigger, repeated: bool) -> A
     }
 }
 
+/// Command spawned when a special workspace is shown while it holds no
+/// managed windows (Hyprland's `on-created-empty`). Ids without an entry
+/// start empty.
+pub(crate) fn special_workspace_launch_on_empty(id: SpecialWorkspaceId) -> Option<Vec<String>> {
+    match id.get() {
+        2 => Some(vec!["kitty".to_string()]),
+        _ => None,
+    }
+}
+
 /// Command vector for the Super+E Astrea Explorer launcher.
 ///
 /// `LaunchCommand` argv is spawned directly (no shell), so `$HOME` is resolved
@@ -717,5 +727,17 @@ mod tests {
             manager.handle_key(ModifierMask::SUPER, KEY_S, false, false, false),
             AstreaBindingMatch::Pass
         );
+    }
+
+    #[test]
+    fn special_workspace_launch_on_empty_table_only_launches_kitty_on_special_two() {
+        let special = |value| SpecialWorkspaceId::new(value).expect("non-zero special workspace");
+        assert_eq!(
+            special_workspace_launch_on_empty(special(2)),
+            Some(vec!["kitty".to_string()])
+        );
+        for value in [1, 3, 4] {
+            assert_eq!(special_workspace_launch_on_empty(special(value)), None);
+        }
     }
 }

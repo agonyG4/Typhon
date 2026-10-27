@@ -894,6 +894,9 @@ pub struct CompositorState {
     window_interaction_terminal_refresh_pending: bool,
     window_interaction_terminal_refresh_root_surface_id: Option<u32>,
     workspace_scene_transition_active: bool,
+    /// Launch-on-empty spawns issued for a special workspace whose first
+    /// window has not mapped yet, keyed by special id, with the issue time.
+    special_workspace_launch_pending: HashMap<crate::wm::SpecialWorkspaceId, std::time::Instant>,
     window_interaction_release_debug: VecDeque<WindowInteractionReleaseDebugRecord>,
     next_resize_configure_sequence: u64,
     next_surface_commit_sequence: u64,

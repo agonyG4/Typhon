@@ -5,7 +5,7 @@ use std::io;
 use crate::core::WindowId;
 use crate::presentation_animation::PresentationRect;
 use crate::presentation_animation::{PresentationClip, PresentationOpacity};
-use crate::wm::{WindowDecorationPolicy, WindowManagementState, WorkspaceId, WorkspaceLocation};
+use crate::wm::{WindowDecorationPolicy, WindowManagementState, WorkspaceLocation};
 use crate::xwayland::X11WindowHandle;
 use crate::xwayland::xwm::{
     X11DecorationHints, X11Geometry, X11WindowSnapshot, X11WindowType, X11WindowTypes,
@@ -169,12 +169,10 @@ impl DesktopWindow {
         }
     }
 
-    pub(crate) fn refresh_workspace_membership(&mut self, workspace: WorkspaceId) {
+    pub(crate) fn refresh_workspace_membership(&mut self, location: WorkspaceLocation) {
         if self.is_workspace_managed() {
             if self.management.is_none() {
-                self.management = Some(WindowManagementState::new(WorkspaceLocation::Regular(
-                    workspace,
-                )));
+                self.management = Some(WindowManagementState::new(location));
             }
         } else {
             self.management = None;

@@ -1877,6 +1877,19 @@ impl OwnCompositorServer {
         self.state.toggle_special_workspace(id)
     }
 
+    pub fn special_workspace_is_shown(&self, id: SpecialWorkspaceId) -> bool {
+        self.state.special_workspace_is_shown(id)
+    }
+
+    pub fn claim_special_workspace_launch(&mut self, id: SpecialWorkspaceId) -> bool {
+        self.state
+            .claim_special_workspace_launch(id, std::time::Instant::now())
+    }
+
+    pub fn release_special_workspace_launch(&mut self, id: SpecialWorkspaceId) {
+        self.state.release_special_workspace_launch(id);
+    }
+
     pub fn move_focused_window_to_or_from_special_workspace(
         &mut self,
         id: SpecialWorkspaceId,

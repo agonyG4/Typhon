@@ -18,6 +18,11 @@ struct WindowWorkspaceChange {
     new: WorkspaceLocation,
 }
 
+/// How long a launch-on-empty spawn blocks repeat spawns for the same special
+/// while its first window has not mapped yet.
+const SPECIAL_WORKSPACE_LAUNCH_PENDING_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(5);
+
 #[derive(Debug, Default)]
 struct WorkspaceMembershipTransition {
     changes: Vec<WindowWorkspaceChange>,
@@ -248,6 +253,71 @@ impl CompositorState {
         ActiveSceneSelection {
             regular: self.active_workspace(),
             special: self.workspace_manager.visible_special_workspace(),
+        }
+    }
+
+    /// Location a newly managed toplevel joins: the visible special workspace
+    /// while one is shown (new windows follow the focused workspace), otherwise
+    /// the active regular workspace.
+    pub(in crate::compositor) fn initial_window_location(&self) -> WorkspaceLocation {
+        match self.workspace_manager.visible_special_workspace() {
+            Some(special) => WorkspaceLocation::Special(special),
+            None => WorkspaceLocation::Regular(self.active_workspace()),
+        }
+    }
+
+    pub(in crate::compositor) fn special_workspace_is_shown(&self, id: SpecialWorkspaceId) -> bool {
+        self.workspace_manager.visible_special_workspace() == Some(id)
+    }
+
+    pub(in crate::compositor) fn special_workspace_is_empty(&self, id: SpecialWorkspaceId) -> bool {
+        let location = WorkspaceLocation::Special(id);
+        !self.desktop_windows.values().any(|window| {
+            window
+                .management
+                .is_some_and(|management| management.location() == location)
+        })
+    }
+
+    /// Decides whether a launch-on-empty spawn for `id` should be issued now.
+    /// Returns true only when the special is empty and no spawn is already
+    /// pending for it; a true result records the pending launch at `now`.
+    pub(in crate::compositor) fn claim_special_workspace_launch(
+        &mut self,
+        id: SpecialWorkspaceId,
+        now: std::time::Instant,
+    ) -> bool {
+        if !self.special_workspace_is_empty(id) {
+            return false;
+        }
+        if let Some(issued) = self.special_workspace_launch_pending.get(&id)
+            && now.saturating_duration_since(*issued) < SPECIAL_WORKSPACE_LAUNCH_PENDING_TIMEOUT
+        {
+            return false;
+        }
+        self.special_workspace_launch_pending.insert(id, now);
+        true
+    }
+
+    /// Clears a pending launch whose spawn did not produce a process.
+    pub(in crate::compositor) fn release_special_workspace_launch(
+        &mut self,
+        id: SpecialWorkspaceId,
+    ) {
+        self.special_workspace_launch_pending.remove(&id);
+    }
+
+    /// A managed window mapping into a special workspace satisfies its pending launch.
+    pub(in crate::compositor) fn clear_special_workspace_launch_pending_for_window(
+        &mut self,
+        window_id: WindowId,
+    ) {
+        let location = self
+            .window(window_id)
+            .and_then(|window| window.management)
+            .map(|management| management.location());
+        if let Some(WorkspaceLocation::Special(id)) = location {
+            self.special_workspace_launch_pending.remove(&id);
         }
     }
 

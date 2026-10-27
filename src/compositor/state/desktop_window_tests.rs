@@ -3837,3 +3837,138 @@ fn special_workspace_dim_anchors_above_every_regular_surface() {
         "an empty special dims every regular surface"
     );
 }
+
+fn special_id(value: u32) -> crate::wm::SpecialWorkspaceId {
+    crate::wm::SpecialWorkspaceId::new(value).expect("non-zero special workspace")
+}
+
+fn managed_location(state: &CompositorState, id: WindowId) -> Option<WorkspaceLocation> {
+    state
+        .window(id)
+        .and_then(|window| window.management)
+        .map(|management| management.location())
+}
+
+#[test]
+fn new_toplevel_joins_the_visible_special_workspace() {
+    let mut state = CompositorState::new(None);
+    let special = special_id(1);
+    assert_eq!(
+        state.toggle_special_workspace(special),
+        crate::wm::SpecialWorkspaceToggleOutcome::Opened { id: special }
+    );
+
+    let id = state.allocate_window_id().expect("window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_xdg(id, 451))
+        .expect("window");
+
+    assert_eq!(
+        managed_location(&state, id),
+        Some(WorkspaceLocation::Special(special))
+    );
+}
+
+#[test]
+fn new_toplevel_without_a_visible_special_joins_the_active_regular_workspace() {
+    let mut state = CompositorState::new(None);
+    let regular = state.active_workspace();
+    let id = state.allocate_window_id().expect("window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_xdg(id, 452))
+        .expect("window");
+
+    assert_eq!(
+        managed_location(&state, id),
+        Some(WorkspaceLocation::Regular(regular))
+    );
+}
+
+#[test]
+fn dialog_child_follows_its_parent_location_not_the_visible_special() {
+    let mut state = CompositorState::new(None);
+    let regular = state.active_workspace();
+    let parent_id = state.allocate_window_id().expect("parent id");
+    state
+        .insert_desktop_window(DesktopWindow::new_xdg(parent_id, 453))
+        .expect("parent");
+    assert_eq!(
+        state.toggle_special_workspace(special_id(1)),
+        crate::wm::SpecialWorkspaceToggleOutcome::Opened { id: special_id(1) }
+    );
+
+    let child_id = state.allocate_window_id().expect("child id");
+    let mut child = DesktopWindow::new_xdg(child_id, 454);
+    child.relationships.transient_for = Some(parent_id);
+    state.insert_desktop_window(child).expect("child");
+
+    assert_eq!(
+        managed_location(&state, parent_id),
+        Some(WorkspaceLocation::Regular(regular))
+    );
+    assert_eq!(
+        managed_location(&state, child_id),
+        Some(WorkspaceLocation::Regular(regular))
+    );
+}
+
+#[test]
+fn special_emptiness_tracks_managed_windows_in_that_special() {
+    let mut state = CompositorState::new(None);
+    let special = special_id(3);
+    assert!(state.special_workspace_is_empty(special));
+
+    let _window = insert_window_in_special(&mut state, 455, special);
+
+    assert!(!state.special_workspace_is_empty(special));
+    assert!(state.special_workspace_is_empty(special_id(4)));
+}
+
+#[test]
+fn special_launch_claims_only_empty_specials_and_suppresses_repeats_until_timeout() {
+    let mut state = CompositorState::new(None);
+    let special = special_id(2);
+    let now = std::time::Instant::now();
+
+    assert!(state.claim_special_workspace_launch(special, now));
+    assert!(!state.claim_special_workspace_launch(special, now));
+    assert!(
+        !state.claim_special_workspace_launch(special, now + std::time::Duration::from_secs(4))
+    );
+    assert!(state.claim_special_workspace_launch(special, now + std::time::Duration::from_secs(6)));
+
+    insert_window_in_special(&mut state, 456, special_id(1));
+    assert!(!state.claim_special_workspace_launch(special_id(1), now));
+}
+
+#[test]
+fn special_launch_pending_clears_when_a_window_maps_into_that_special() {
+    let mut state = CompositorState::new(None);
+    let special = special_id(2);
+    let now = std::time::Instant::now();
+    assert!(state.claim_special_workspace_launch(special, now));
+
+    state.toggle_special_workspace(special);
+    let window = state.allocate_window_id().expect("window id");
+    state
+        .insert_desktop_window(DesktopWindow::new_xdg(window, 457))
+        .expect("window");
+    assert_eq!(
+        managed_location(&state, window),
+        Some(WorkspaceLocation::Special(special))
+    );
+
+    // The launched window leaves again; the special is empty and unpending.
+    state.window_mut(window).expect("window").management = None;
+    assert!(state.claim_special_workspace_launch(special, now));
+}
+
+#[test]
+fn releasing_a_special_launch_allows_an_immediate_retry() {
+    let mut state = CompositorState::new(None);
+    let special = special_id(2);
+    let now = std::time::Instant::now();
+    assert!(state.claim_special_workspace_launch(special, now));
+    state.release_special_workspace_launch(special);
+    assert!(state.claim_special_workspace_launch(special, now));
+}
