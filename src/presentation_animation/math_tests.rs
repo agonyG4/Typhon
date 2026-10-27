@@ -131,3 +131,31 @@ fn invalid_geometry_never_enters_the_engine() {
     );
     assert_eq!(engine.active_count(), 0);
 }
+
+#[test]
+fn hyprland_bezier_curves_match_their_control_points() {
+    for curve in [
+        EasingCurve::EaseOutExpo,
+        EasingCurve::EaseOutBack,
+        EasingCurve::Quick,
+    ] {
+        close(curve.evaluate(0.0).0, 0.0);
+        close(curve.evaluate(1.0).0, 1.0);
+    }
+    // easeOutExpo's Y control points are both 1, so Y(t) = 1 - (1 - t)^3.
+    let (value, _) = EasingCurve::EaseOutExpo.evaluate(0.5);
+    assert!(value > 0.9 && value < 1.0, "{value}");
+    // easeOutBack overshoots past the target before settling.
+    let peak = (1..100)
+        .map(|step| EasingCurve::EaseOutBack.evaluate(f64::from(step) / 100.0).0)
+        .fold(f64::MIN, f64::max);
+    assert!(peak > 1.05 && peak < 1.2, "{peak}");
+    // quick starts slow, then rises steeply, and never overshoots.
+    assert!(EasingCurve::Quick.evaluate(0.1).0 < 0.2);
+    let mut previous = 0.0;
+    for step in 1..=100 {
+        let (value, _) = EasingCurve::Quick.evaluate(f64::from(step) / 100.0);
+        assert!(value >= previous - 1.0e-9 && value <= 1.0 + 1.0e-9);
+        previous = value;
+    }
+}

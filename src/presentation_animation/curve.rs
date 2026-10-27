@@ -11,6 +11,47 @@ pub enum EasingCurve {
     /// The easeOutExpo cubic Bezier (0.16, 1, 0.3, 1).
     EaseOutExpo,
     EaseInOutCubic,
+    /// Hyprland's easeOutBack cubic Bezier (0.34, 1.56, 0.64, 1); it
+    /// overshoots past 1 before settling.
+    EaseOutBack,
+    /// Hyprland's "quick" cubic Bezier (0.15, 0, 0.1, 1).
+    Quick,
+}
+
+/// CSS-style cubic Bezier from (0, 0) to (1, 1) with control points
+/// (x1, y1) and (x2, y2). Time is the curve's X coordinate, which is strictly
+/// increasing for x1, x2 in [0, 1]; returns `(value, d value / d time)`.
+fn cubic_bezier(x1: f64, y1: f64, x2: f64, y2: f64, progress: f64) -> (f64, f64) {
+    let progress = progress.clamp(0.0, 1.0);
+    let axis = |t: f64, p1: f64, p2: f64| {
+        let remaining = 1.0 - t;
+        3.0 * remaining * remaining * t * p1 + 3.0 * remaining * t * t * p2 + t * t * t
+    };
+    let slope = |t: f64, p1: f64, p2: f64| {
+        let remaining = 1.0 - t;
+        3.0 * remaining * remaining * p1 + 6.0 * remaining * t * (p2 - p1) + 3.0 * t * t * (1.0 - p2)
+    };
+    let mut low = 0.0;
+    let mut high = 1.0;
+    for _ in 0..48 {
+        let t = (low + high) * 0.5;
+        if axis(t, x1, x2) < progress {
+            low = t;
+        } else {
+            high = t;
+        }
+    }
+    let t = if progress <= 0.0 {
+        0.0
+    } else if progress >= 1.0 {
+        1.0
+    } else {
+        (low + high) * 0.5
+    };
+    let dx = slope(t, x1, x2);
+    let dy = slope(t, y1, y2);
+    let velocity = if dx.abs() > f64::EPSILON { dy / dx } else { 0.0 };
+    (axis(t, y1, y2), velocity)
 }
 
 impl EasingCurve {
@@ -38,39 +79,9 @@ impl EasingCurve {
                     3.0 * remaining * remaining,
                 )
             }
-            Self::EaseOutExpo => {
-                // Time is the Bezier's X coordinate, not its parameter.
-                // X is strictly increasing for these control points.
-                let mut low = 0.0;
-                let mut high = 1.0;
-                for _ in 0..40 {
-                    let t = (low + high) * 0.5;
-                    let remaining = 1.0 - t;
-                    let x = 3.0 * remaining * remaining * t * 0.16
-                        + 3.0 * remaining * t * t * 0.3
-                        + t * t * t;
-                    if x < progress {
-                        low = t;
-                    } else {
-                        high = t;
-                    }
-                }
-                let t = if progress <= 0.0 {
-                    0.0
-                } else if progress >= 1.0 {
-                    1.0
-                } else {
-                    (low + high) * 0.5
-                };
-                let remaining = 1.0 - t;
-                let dx = 3.0 * remaining * remaining * 0.16
-                    + 6.0 * remaining * t * (0.3 - 0.16)
-                    + 3.0 * t * t * (1.0 - 0.3);
-                (
-                    1.0 - remaining * remaining * remaining,
-                    3.0 * remaining * remaining / dx,
-                )
-            }
+            Self::EaseOutExpo => cubic_bezier(0.16, 1.0, 0.3, 1.0, progress),
+            Self::EaseOutBack => cubic_bezier(0.34, 1.56, 0.64, 1.0, progress),
+            Self::Quick => cubic_bezier(0.15, 0.0, 0.1, 1.0, progress),
             Self::EaseInOutCubic => {
                 if progress < 0.5 {
                     (
