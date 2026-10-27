@@ -1970,6 +1970,7 @@ mod tests {
             .map(|id| {
                 let anchor = EffectAnchor::BeforeSurface(1);
                 ResolvedEffectInstance {
+                    composite_opacity: None,
                     id: EffectInstanceId::new(id).unwrap(),
                     program: EffectProgramId::new(1).unwrap(),
                     anchor,
@@ -4135,6 +4136,7 @@ mod tests {
             .into_iter()
             .zip(pass_ids)
             .map(|((inputs, output), id)| CompiledRenderPass {
+                composite_opacity: None,
                 id,
                 kind: RenderPassKind::Composite,
                 final_kawase_upsample: false,
@@ -4278,6 +4280,7 @@ mod tests {
             .into_iter()
             .zip(pass_ids)
             .map(|((inputs, output), id)| CompiledRenderPass {
+                composite_opacity: None,
                 id,
                 kind: RenderPassKind::Composite,
                 final_kawase_upsample: false,

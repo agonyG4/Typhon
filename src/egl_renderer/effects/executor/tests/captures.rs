@@ -920,6 +920,52 @@ fn checkpoint_dependency_region_requires_prior_effect_influence_coverage() {
 }
 
 #[test]
+fn composite_opacity_override_replaces_the_visual_group_opacity() {
+    let group_opacity_calls = std::cell::Cell::new(0);
+    let group_opacity = || {
+        group_opacity_calls.set(group_opacity_calls.get() + 1);
+        0.25
+    };
+
+    assert_eq!(
+        composite_presentation_opacity(Some(0.5), group_opacity),
+        0.5,
+        "an instance composite opacity wins over the visual group opacity"
+    );
+    assert_eq!(
+        group_opacity_calls.get(),
+        0,
+        "the visual group opacity is not consulted when an override is present"
+    );
+    assert_eq!(
+        composite_presentation_opacity(Some(1.7), || 1.0),
+        1.0,
+        "override opacity clamps to the unit interval"
+    );
+    assert_eq!(
+        composite_presentation_opacity(Some(-0.3), || 1.0),
+        0.0,
+        "negative override opacity clamps to zero"
+    );
+    assert_eq!(
+        composite_presentation_opacity(None, group_opacity),
+        0.25,
+        "without an override the visual group opacity applies"
+    );
+    assert_eq!(
+        effect_pass_blend_mode(
+            RenderPassKind::Composite,
+            true,
+            oblivion_one::effects::EffectAlphaMode::Opaque,
+            composite_presentation_opacity(Some(0.5), || 1.0),
+            false,
+        ),
+        EffectPassBlendMode::PremultipliedSourceOver,
+        "a partially faded composite blends over the content beneath it"
+    );
+}
+
+#[test]
 fn effect_pass_blend_modes_are_explicit_for_each_pass_family() {
     for kind in [
         RenderPassKind::NormalizeInput,

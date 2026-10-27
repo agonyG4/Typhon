@@ -1107,6 +1107,7 @@ fn egl_lifecycle_pixels_participate_in_output_postprocess() {
     resolved.effects = ResolvedEffectScene::new(
         1,
         vec![oblivion_one::compositor::ResolvedEffectInstance {
+            composite_opacity: None,
             id: oblivion_one::effects::EffectInstanceId::new(1).expect("effect instance id"),
             program: program_id,
             anchor,

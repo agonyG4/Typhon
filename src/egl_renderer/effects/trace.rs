@@ -1666,6 +1666,7 @@ mod tests {
     fn visible_clip_fallback_trace_identifies_authoritative_output() {
         let trace = EffectExecutionTrace::enabled_for_test();
         let pass = CompiledRenderPass {
+            composite_opacity: None,
             id: oblivion_one::effects::GraphPassId::new(9).unwrap(),
             kind: RenderPassKind::Composite,
             final_kawase_upsample: false,
@@ -1709,6 +1710,7 @@ mod tests {
     fn execution_region_trace_reports_single_coverage_diagnostics() {
         let trace = EffectExecutionTrace::enabled_for_test();
         let pass = CompiledRenderPass {
+            composite_opacity: None,
             id: oblivion_one::effects::GraphPassId::new(10).unwrap(),
             kind: RenderPassKind::DualKawaseDownsample,
             final_kawase_upsample: false,
@@ -1752,6 +1754,7 @@ mod tests {
     fn capture_materialization_trace_reports_logical_and_physical_work() {
         let trace = EffectExecutionTrace::enabled_for_test();
         let pass = CompiledRenderPass {
+            composite_opacity: None,
             id: oblivion_one::effects::GraphPassId::new(11).unwrap(),
             kind: RenderPassKind::SceneCapture,
             final_kawase_upsample: false,
@@ -1813,6 +1816,7 @@ mod tests {
     fn scene_replay_trace_reports_bounded_work_metrics() {
         let trace = EffectExecutionTrace::enabled_for_test();
         let pass = CompiledRenderPass {
+            composite_opacity: None,
             id: oblivion_one::effects::GraphPassId::new(13).unwrap(),
             kind: RenderPassKind::SceneCapture,
             final_kawase_upsample: false,

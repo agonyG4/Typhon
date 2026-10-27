@@ -179,6 +179,19 @@ impl DiagnosticFullscreenShader {
     }
 }
 
+/// Opacity for a framebuffer composite. An instance-supplied composite opacity
+/// replaces the visual group's presentation opacity; otherwise the group's
+/// opacity applies.
+pub(super) fn composite_presentation_opacity(
+    composite_opacity: Option<f32>,
+    visual_group_opacity: impl FnOnce() -> f32,
+) -> f32 {
+    match composite_opacity {
+        Some(opacity) => opacity.clamp(0.0, 1.0),
+        None => visual_group_opacity(),
+    }
+}
+
 pub(super) fn effect_pass_blend_mode(
     kind: RenderPassKind,
     output_is_framebuffer: bool,
@@ -1600,7 +1613,9 @@ fn execute_fullscreen_pass_impl(
             pass.kind,
             RenderPassKind::Composite | RenderPassKind::OutputPostProcess
         ) {
-        renderer.presentation_opacity_for_visual_group(pass.visual_group)
+        composite_presentation_opacity(pass.composite_opacity, || {
+            renderer.presentation_opacity_for_visual_group(pass.visual_group)
+        })
     } else {
         1.0
     };

@@ -1049,6 +1049,7 @@ fn finalized_snapshot_contains_all_dynamic_metadata_fields() {
     let effects = ResolvedEffectScene::new(
         9,
         vec![ResolvedEffectInstance {
+            composite_opacity: None,
             id: EffectInstanceId::new(1).unwrap(),
             program: EffectProgramId::new(2).unwrap(),
             anchor: EffectAnchor::BeforeSurface(701),

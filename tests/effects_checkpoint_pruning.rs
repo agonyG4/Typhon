@@ -46,6 +46,7 @@ fn two_material_scene(second_x: i32) -> (ResolvedEffectScene, EffectRegistry, Ef
             let anchor = EffectAnchor::BeforeSurface(surface);
             let region = EffectRect::new(x, 110, 100, 70).unwrap();
             ResolvedEffectInstance {
+                composite_opacity: None,
                 id: EffectInstanceId::new(u64::from(surface)).unwrap(),
                 program: program_id,
                 anchor,
@@ -89,6 +90,7 @@ fn precomputed_isolation_scene() -> (ResolvedEffectScene, EffectRegistry, Effect
             let anchor = EffectAnchor::BeforeSurface(surface);
             let region = EffectRect::new(x, 110, 100, 70).unwrap();
             ResolvedEffectInstance {
+                composite_opacity: None,
                 id: EffectInstanceId::new(u64::from(surface)).unwrap(),
                 program: program_id,
                 anchor,

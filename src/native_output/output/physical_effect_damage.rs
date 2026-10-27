@@ -152,6 +152,7 @@ mod tests {
         frame_demand: EffectFrameDemand,
     ) -> ResolvedEffectInstance {
         ResolvedEffectInstance {
+            composite_opacity: None,
             id: EffectInstanceId::new(id).expect("effect instance id"),
             program,
             anchor,

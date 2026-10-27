@@ -37,6 +37,7 @@ pub(in crate::egl_renderer::tests) fn moving_blur_scene_with_spec(
         .insert(program)
         .expect("moving blur program inserts");
     let instance = oblivion_one::compositor::ResolvedEffectInstance {
+        composite_opacity: None,
         id: oblivion_one::effects::EffectInstanceId::new(1).expect("instance id"),
         program: EffectProgramId::new(1).expect("program id"),
         anchor: oblivion_one::compositor::EffectAnchor::OutputPostProcess,
@@ -94,6 +95,7 @@ pub(in crate::egl_renderer::tests) fn native_backdrop_effect_instance(
     program: EffectProgramId,
 ) -> oblivion_one::compositor::ResolvedEffectInstance {
     oblivion_one::compositor::ResolvedEffectInstance {
+        composite_opacity: None,
         id: oblivion_one::effects::EffectInstanceId::new(spec.id)
             .expect("native backdrop instance id"),
         program,

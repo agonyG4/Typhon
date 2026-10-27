@@ -2,7 +2,8 @@ use super::*;
 use crate::compositor::SpecialWorkspaceDim;
 use crate::compositor::effects::{
     EffectAnchor, EffectAnchorScope, EffectSceneOrder, ResolvedEffectInstance,
-    internal_effect_signature, special_workspace_blur_instance_id,
+    fold_composite_opacity_signature, internal_effect_signature,
+    special_workspace_blur_instance_id,
 };
 use crate::effects::{EffectRect, EffectRegion};
 use crate::presentation_animation::AnimationTime;
@@ -29,6 +30,9 @@ pub(crate) const SPECIAL_WORKSPACE_DIM_ALPHA: f32 = 0.2;
 /// Hyprland `blur:special`: blur the regular content behind a visible special
 /// workspace. Switch off to keep only the dim.
 pub(crate) const SPECIAL_WORKSPACE_BLUR_ENABLED: bool = true;
+
+/// Composite opacity at or below which the special blur is skipped entirely.
+const SPECIAL_WORKSPACE_BLUR_MIN_OPACITY: f32 = 0.001;
 
 impl CompositorState {
     pub(in crate::compositor) fn surface_root_is_in_special_workspace(
@@ -78,6 +82,12 @@ impl CompositorState {
         if !SPECIAL_WORKSPACE_BLUR_ENABLED || !dim.is_active() || !self.background_effect_enabled {
             return None;
         }
+        // The blur fades in and out with the dim; a fully faded blur is skipped.
+        let opacity = (dim.alpha() / SPECIAL_WORKSPACE_DIM_ALPHA).clamp(0.0, 1.0);
+        if opacity <= SPECIAL_WORKSPACE_BLUR_MIN_OPACITY {
+            return None;
+        }
+        let composite_opacity = Some(opacity);
         let dimmed_end = match dim.anchor_surface_id() {
             Some(anchor_surface_id) => surfaces
                 .iter()
@@ -102,13 +112,16 @@ impl CompositorState {
             id: special_workspace_blur_instance_id(),
             program,
             anchor,
-            signature: internal_effect_signature(
-                last_dimmed.surface_id,
-                anchor,
-                program,
-                &region,
-                &parameter_block,
-                None,
+            signature: fold_composite_opacity_signature(
+                internal_effect_signature(
+                    last_dimmed.surface_id,
+                    anchor,
+                    program,
+                    &region,
+                    &parameter_block,
+                    None,
+                ),
+                composite_opacity,
             ),
             region,
             target_bounds,
@@ -119,6 +132,7 @@ impl CompositorState {
             anchor_scope: EffectAnchorScope::VisualGroup,
             backdrop_reuse: EffectBackdropReuse::Exact,
             scene_order: EffectSceneOrder::for_anchor(anchor),
+            composite_opacity,
         };
         instance.scene_order = Self::scene_order_for_frame_instance(&instance, surfaces);
         Some(instance)

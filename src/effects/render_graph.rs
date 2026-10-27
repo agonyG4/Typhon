@@ -394,6 +394,9 @@ pub struct CompiledRenderPass {
     pub color_conversion: EffectColorConversion,
     pub checkpoint_dependencies: Vec<GraphPassId>,
     pub visual_group: Option<VisualGroupId>,
+    /// Final composite opacity supplied by the instance; `None` uses the
+    /// visual group's presentation opacity.
+    pub composite_opacity: Option<f32>,
     pub anchor_scope: EffectAnchorScope,
     pub visible_clip_fallback: Option<(usize, usize)>,
     /// Physical terminal Kawase/material work carried by the final Composite.
@@ -2324,6 +2327,7 @@ impl GraphBuilder {
             self.touch(texture, id);
         }
         self.passes.push(CompiledRenderPass {
+            composite_opacity: None,
             id,
             kind,
             final_kawase_upsample: false,
@@ -3553,6 +3557,7 @@ fn compile_instance(
     final_pass.encode_output =
         encode_output || final_pass.color_conversion == EffectColorConversion::EncodeLinearToSrgb;
     final_pass.visual_group = visual_group;
+    final_pass.composite_opacity = instance.composite_opacity;
     final_pass.visible_clip_fallback =
         output_clip_fallback.map(|fallback| (fallback.input_rect_count, fallback.clip_rect_count));
     Ok(composite)
@@ -3669,6 +3674,7 @@ mod tests {
         let mut registry = EffectRegistry::empty();
         registry.insert(validated).unwrap();
         let instance = ResolvedEffectInstance {
+            composite_opacity: None,
             id: EffectInstanceId::new(1).unwrap(),
             program: EffectProgramId::new(1).unwrap(),
             anchor: EffectAnchor::BeforeSurface(1),
@@ -3702,6 +3708,7 @@ mod tests {
         region: EffectRegion,
     ) -> ResolvedEffectInstance {
         ResolvedEffectInstance {
+            composite_opacity: None,
             id: EffectInstanceId::new(id).expect("test instance id is non-zero"),
             program,
             anchor: EffectAnchor::OutputPostProcess,
@@ -3749,6 +3756,7 @@ mod tests {
                 EffectRect::new(30 + i32::try_from(index).unwrap() * 120, 40, 80, 60).unwrap(),
             );
             instances.push(ResolvedEffectInstance {
+                composite_opacity: None,
                 id: EffectInstanceId::new(id).unwrap(),
                 program: program_id,
                 anchor: EffectAnchor::BeforeSurface(surface),
@@ -4297,6 +4305,7 @@ mod tests {
                         .expect("test effect region"),
                 );
                 ResolvedEffectInstance {
+                    composite_opacity: None,
                     id: EffectInstanceId::new(
                         u64::try_from(index + 1).expect("test instance id fits"),
                     )
@@ -4342,6 +4351,7 @@ mod tests {
 
     fn test_pass(id: u16) -> CompiledRenderPass {
         CompiledRenderPass {
+            composite_opacity: None,
             id: GraphPassId::new(id).expect("test pass id must be non-zero"),
             kind: RenderPassKind::Fragment,
             final_kawase_upsample: false,
@@ -5040,6 +5050,7 @@ mod tests {
         let scene = ResolvedEffectScene::new(
             1,
             vec![ResolvedEffectInstance {
+                composite_opacity: None,
                 id: EffectInstanceId::new(1).unwrap(),
                 program: EffectProgramId::new(19).unwrap(),
                 anchor: EffectAnchor::OutputPostProcess,
@@ -5479,6 +5490,7 @@ mod tests {
         output: Option<GraphTextureId>,
     ) -> CompiledRenderPass {
         CompiledRenderPass {
+            composite_opacity: None,
             id: GraphPassId::new(1).unwrap(),
             kind: RenderPassKind::SceneCapture,
             final_kawase_upsample: false,
@@ -6235,6 +6247,7 @@ mod tests {
         let child = |id, surface_id, surface_order| {
             let region = EffectRegion::from_rect(EffectRect::new(100, 80, 320, 180).unwrap());
             ResolvedEffectInstance {
+                composite_opacity: None,
                 id: EffectInstanceId::new(id).unwrap(),
                 program,
                 anchor: EffectAnchor::BeforeSurface(surface_id),
@@ -6544,6 +6557,7 @@ mod tests {
         let scene = ResolvedEffectScene::new(
             1,
             vec![ResolvedEffectInstance {
+                composite_opacity: None,
                 id: EffectInstanceId::new(1).unwrap(),
                 program: EffectProgramId::new(9).unwrap(),
                 anchor: EffectAnchor::OutputPostProcess,
@@ -6608,6 +6622,7 @@ mod tests {
         let scene = ResolvedEffectScene::new(
             1,
             vec![ResolvedEffectInstance {
+                composite_opacity: None,
                 id: EffectInstanceId::new(1).unwrap(),
                 program: EffectProgramId::new(11).unwrap(),
                 anchor: EffectAnchor::OutputPostProcess,
@@ -6797,6 +6812,7 @@ mod tests {
         let scene = ResolvedEffectScene::new(
             1,
             vec![ResolvedEffectInstance {
+                composite_opacity: None,
                 id: EffectInstanceId::new(1).unwrap(),
                 program: EffectProgramId::new(12).unwrap(),
                 anchor: EffectAnchor::OutputPostProcess,
@@ -6985,6 +7001,7 @@ mod tests {
         let scene = ResolvedEffectScene::new(
             1,
             vec![ResolvedEffectInstance {
+                composite_opacity: None,
                 id: EffectInstanceId::new(1).unwrap(),
                 program: EffectProgramId::new(10).unwrap(),
                 anchor: EffectAnchor::OutputPostProcess,
@@ -8388,6 +8405,7 @@ mod tests {
         let make_instance = |id, surface, rect| {
             let region = EffectRegion::from_rect(rect);
             ResolvedEffectInstance {
+                composite_opacity: None,
                 id: EffectInstanceId::new(id).unwrap(),
                 program: EffectProgramId::new(1).unwrap(),
                 anchor: EffectAnchor::BeforeSurface(surface),
@@ -8561,6 +8579,7 @@ mod tests {
                 let id = u64::try_from(index + 1).unwrap();
                 let surface = u32::try_from(index + 1).unwrap();
                 ResolvedEffectInstance {
+                    composite_opacity: None,
                     id: EffectInstanceId::new(id).unwrap(),
                     program: program_ids[index],
                     anchor: EffectAnchor::BeforeSurface(surface),

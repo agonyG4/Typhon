@@ -51,6 +51,7 @@ fn material_graph_for(
     let anchor = EffectAnchor::BeforeSurface(1);
     let id = EffectInstanceId::new(1).unwrap();
     let instance = ResolvedEffectInstance {
+        composite_opacity: None,
         id,
         program: program_id,
         anchor,
@@ -101,6 +102,7 @@ fn multi_material_graph(
             let surface = u32::try_from(index + 1).unwrap();
             let anchor = EffectAnchor::BeforeSurface(surface);
             ResolvedEffectInstance {
+                composite_opacity: None,
                 id: EffectInstanceId::new(u64::from(surface)).unwrap(),
                 program: program_id,
                 anchor,
@@ -149,6 +151,7 @@ fn program_graph(
     registry.insert(validated).unwrap();
     let id = EffectInstanceId::new(1).unwrap();
     let instance = ResolvedEffectInstance {
+        composite_opacity: None,
         id,
         program: program_id,
         anchor,
@@ -216,6 +219,7 @@ fn blur_graph(
     let anchor = EffectAnchor::BeforeSurface(1);
     let id = EffectInstanceId::new(1).unwrap();
     let instance = ResolvedEffectInstance {
+        composite_opacity: None,
         id,
         program: program_id,
         anchor,

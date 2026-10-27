@@ -28,6 +28,7 @@ fn test_pass(
     checkpoint_dependencies: Vec<GraphPassId>,
 ) -> CompiledRenderPass {
     CompiledRenderPass {
+        composite_opacity: None,
         id: GraphPassId::new(id).unwrap(),
         kind,
         final_kawase_upsample: false,
@@ -62,6 +63,7 @@ fn compile_builtin_background_blur(
     let scene = oblivion_one::compositor::ResolvedEffectScene::new(
         1,
         vec![oblivion_one::compositor::ResolvedEffectInstance {
+            composite_opacity: None,
             id: oblivion_one::effects::EffectInstanceId::new(1).unwrap(),
             program,
             anchor,

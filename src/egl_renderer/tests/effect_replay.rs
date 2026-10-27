@@ -279,6 +279,7 @@ fn terminal_builtin_blur_scene(
         .expect("canonical material inserts");
     let anchor = oblivion_one::compositor::EffectAnchor::BeforeSurface(42);
     let instance = oblivion_one::compositor::ResolvedEffectInstance {
+        composite_opacity: None,
         id: oblivion_one::effects::EffectInstanceId::new(1).expect("test effect id"),
         program: program_id,
         anchor,
@@ -2797,6 +2798,7 @@ fn precomputed_baseline_safety_scene(
                 10 + u32::try_from(index).expect("test surface index"),
             );
             oblivion_one::compositor::ResolvedEffectInstance {
+                composite_opacity: None,
                 id: oblivion_one::effects::EffectInstanceId::new(
                     u64::try_from(index + 1).expect("test effect instance id"),
                 )
@@ -3114,6 +3116,7 @@ fn precomputed_baseline_only_scene_content_matches_exact_gles_pixels() {
         .map(|(id, surface, bounds, visual_group)| {
             let anchor = oblivion_one::compositor::EffectAnchor::BeforeSurface(surface);
             oblivion_one::compositor::ResolvedEffectInstance {
+                composite_opacity: None,
                 id: oblivion_one::effects::EffectInstanceId::new(id)
                     .expect("test effect id is non-zero"),
                 program: program_id,

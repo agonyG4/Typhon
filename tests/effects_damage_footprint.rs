@@ -46,6 +46,7 @@ fn blur_graph(
     registry.insert(validated).unwrap();
     let anchor = EffectAnchor::BeforeSurface(1);
     let instance = ResolvedEffectInstance {
+        composite_opacity: None,
         id: EffectInstanceId::new(1).unwrap(),
         program: EffectProgramId::new(1).unwrap(),
         anchor,
@@ -92,6 +93,7 @@ fn canonical_material_graph(
     registry.insert(validated).unwrap();
     let anchor = EffectAnchor::BeforeSurface(1);
     let instance = ResolvedEffectInstance {
+        composite_opacity: None,
         id: EffectInstanceId::new(1).unwrap(),
         program: program_id,
         anchor,
@@ -526,6 +528,7 @@ fn expanded_capture_keeps_overlapping_backdrop_checkpoint_dependency() {
     let make_instance = |id: u64, region: EffectRect| {
         let anchor = EffectAnchor::BeforeSurface(u32::try_from(id).unwrap());
         ResolvedEffectInstance {
+            composite_opacity: None,
             id: EffectInstanceId::new(id).unwrap(),
             program: EffectProgramId::new(1).unwrap(),
             anchor,
@@ -605,6 +608,7 @@ fn footprint_change_preserves_builtin_terminal_fusion_topology() {
             let x = 20 + i32::try_from(index).unwrap() * 110;
             let region = EffectRect::new(x, 40, 90, 60).unwrap();
             ResolvedEffectInstance {
+                composite_opacity: None,
                 id: EffectInstanceId::new(u64::from(surface)).unwrap(),
                 program: program_id,
                 anchor,

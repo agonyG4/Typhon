@@ -103,6 +103,10 @@ impl SpecialWorkspaceDim {
         self.alpha > 0.0
     }
 
+    pub fn alpha(self) -> f32 {
+        self.alpha
+    }
+
     pub fn anchor_surface_id(self) -> Option<u32> {
         self.anchor_surface_id
     }

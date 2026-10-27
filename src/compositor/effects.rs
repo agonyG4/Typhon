@@ -155,6 +155,10 @@ pub struct ResolvedEffectInstance {
     pub anchor_scope: EffectAnchorScope,
     pub backdrop_reuse: super::EffectBackdropReuse,
     pub scene_order: EffectSceneOrder,
+    /// Composite opacity that replaces the visual group's presentation opacity
+    /// for this instance's final composite. `None` keeps the visual group's
+    /// opacity. Folded into `signature` when present.
+    pub composite_opacity: Option<f32>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -396,6 +400,7 @@ impl super::CompositorState {
                     None
                 };
                 instances.push(ResolvedEffectInstance {
+                    composite_opacity: None,
                     id: background_effect_instance_id(surface.surface_id),
                     program: selected_program,
                     anchor: EffectAnchor::BeforeSurface(surface.surface_id),
@@ -502,6 +507,7 @@ impl super::CompositorState {
                     None
                 };
                 instances.push(ResolvedEffectInstance {
+                    composite_opacity: None,
                     id: background_effect_instance_id(surface.surface_id),
                     program: selected_program,
                     anchor: EffectAnchor::BeforeSurface(surface.surface_id),
@@ -778,6 +784,7 @@ impl super::CompositorState {
             id
         };
         let instance = ResolvedEffectInstance {
+            composite_opacity: None,
             id,
             program,
             anchor,
@@ -993,6 +1000,7 @@ impl super::CompositorState {
             id
         };
         let instance = ResolvedEffectInstance {
+            composite_opacity: None,
             id,
             program,
             anchor: slot.anchor(surface_id),
@@ -1317,6 +1325,18 @@ fn effect_rect_from_edges(left: i64, top: i64, right: i64, bottom: i64) -> Optio
     EffectRect::new(x, y, width, height)
 }
 
+/// Mixes a composite opacity override into an instance signature. `None`
+/// leaves the signature untouched so existing instances keep their identity.
+pub(in crate::compositor) fn fold_composite_opacity_signature(
+    signature: u64,
+    composite_opacity: Option<f32>,
+) -> u64 {
+    let Some(opacity) = composite_opacity else {
+        return signature;
+    };
+    (signature ^ u64::from(opacity.to_bits())).wrapping_mul(0x1000_0000_01b3)
+}
+
 #[allow(dead_code)] // Called by the staged internal assignment API.
 pub(in crate::compositor) fn internal_effect_signature(
     surface_id: u32,
@@ -1476,6 +1496,7 @@ mod tests {
             .bounding_rect()
             .expect("test effect region must not be empty");
         ResolvedEffectInstance {
+            composite_opacity: None,
             id,
             program: EffectProgramId::new(1).unwrap(),
             anchor: EffectAnchor::OutputPostProcess,
@@ -1763,6 +1784,46 @@ mod tests {
             )
             .expect("an empty special leaves every surface beneath the dim");
         assert_eq!(to_bottom.anchor, EffectAnchor::AfterSurface(12));
+    }
+
+    #[test]
+    fn special_workspace_blur_fades_with_the_dim_and_skips_when_faded() {
+        use crate::compositor::SpecialWorkspaceDim;
+
+        let mut state = crate::compositor::CompositorState::new(None);
+        state.set_background_effect_enabled(true);
+        let surfaces = [test_effect_surface(11), test_effect_surface(12)];
+        let blur_at = |alpha: f32| {
+            state.special_workspace_blur_instance(
+                SpecialWorkspaceDim::new(alpha, Some(12)),
+                &surfaces,
+                &[],
+                (1920, 1080),
+            )
+        };
+
+        let full = blur_at(0.2).expect("full dim yields a blur");
+        assert_eq!(full.composite_opacity, Some(1.0));
+        let half = blur_at(0.1).expect("half dim yields a blur");
+        assert_eq!(half.composite_opacity, Some(0.5));
+        assert_ne!(
+            half.signature, full.signature,
+            "a fade changes the blur signature so its composite is never reused stale"
+        );
+        assert!(
+            blur_at(0.0001).is_none(),
+            "a fully faded blur is skipped instead of drawn at zero opacity"
+        );
+    }
+
+    #[test]
+    fn composite_opacity_signature_fold_is_identity_for_none() {
+        assert_eq!(fold_composite_opacity_signature(7, None), 7);
+        assert_ne!(
+            fold_composite_opacity_signature(7, Some(0.5)),
+            fold_composite_opacity_signature(7, Some(0.25))
+        );
+        assert_ne!(fold_composite_opacity_signature(7, Some(0.5)), 7);
     }
 
     #[test]
@@ -2245,6 +2306,7 @@ mod tests {
         let base_scene = ResolvedEffectScene::new(
             1,
             vec![ResolvedEffectInstance {
+                composite_opacity: None,
                 coverage: Some(base_coverage.clone()),
                 signature: base_instance_signature,
                 ..test_effect_instance(
@@ -2257,6 +2319,7 @@ mod tests {
         let identical_scene = ResolvedEffectScene::new(
             1,
             vec![ResolvedEffectInstance {
+                composite_opacity: None,
                 coverage: Some(base_coverage.clone()),
                 signature: base_instance_signature,
                 ..test_effect_instance(
@@ -2280,6 +2343,7 @@ mod tests {
             let scene = ResolvedEffectScene::new(
                 1,
                 vec![ResolvedEffectInstance {
+                    composite_opacity: None,
                     coverage: Some(coverage),
                     signature,
                     ..test_effect_instance(

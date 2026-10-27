@@ -61,6 +61,7 @@ pub(in crate::egl_renderer::tests) fn lifecycle_blur_effect_scene_for_rect(
     ResolvedEffectScene::new(
         1,
         vec![compositor::ResolvedEffectInstance {
+            composite_opacity: None,
             id: oblivion_one::effects::EffectInstanceId::new(1).unwrap(),
             program,
             anchor,

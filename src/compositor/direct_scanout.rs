@@ -404,6 +404,7 @@ mod tests {
     ) -> crate::compositor::ResolvedEffectInstance {
         let region = EffectRegion::from_rect(EffectRect::new(0, 0, 10, 10).unwrap());
         crate::compositor::ResolvedEffectInstance {
+            composite_opacity: None,
             id: EffectInstanceId::new(1).unwrap(),
             program: EffectProgramId::new(2).unwrap(),
             anchor,

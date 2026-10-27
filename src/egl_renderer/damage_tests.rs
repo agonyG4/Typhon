@@ -459,6 +459,7 @@ fn compiled_blur_graph(
             let id = u64::try_from(index + 1).unwrap();
             let surface = u32::try_from(index + 1).unwrap();
             ResolvedEffectInstance {
+                composite_opacity: None,
                 id: oblivion_one::effects::EffectInstanceId::new(id).unwrap(),
                 program: EffectProgramId::new(1).unwrap(),
                 anchor: EffectAnchor::BeforeSurface(surface),

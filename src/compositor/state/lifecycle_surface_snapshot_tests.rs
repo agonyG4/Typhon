@@ -309,6 +309,7 @@ fn resolved_effect_lifecycle_source_uses_the_captured_surface_topology() {
     let target_bounds = crate::effects::EffectRect::new(0, 0, 16, 16).expect("effect bounds");
     let region = crate::effects::EffectRegion::from_rect(target_bounds);
     let effect = crate::compositor::ResolvedEffectInstance {
+        composite_opacity: None,
         id: crate::effects::EffectInstanceId::new(1).expect("effect instance ID"),
         program: crate::effects::EffectProgramId::new(1).expect("effect program ID"),
         anchor,

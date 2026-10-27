@@ -401,6 +401,7 @@ mod presentation_effect_influence_tests {
         rect: EffectRect,
     ) -> ResolvedEffectInstance {
         ResolvedEffectInstance {
+            composite_opacity: None,
             id: EffectInstanceId::new(id).expect("test instance id"),
             program,
             anchor,

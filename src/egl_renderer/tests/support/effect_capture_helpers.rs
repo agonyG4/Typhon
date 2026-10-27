@@ -266,6 +266,7 @@ pub(in crate::egl_renderer::tests) fn translated_capture_test_graph() -> (
         last_use: None,
     };
     let pass = CompiledRenderPass {
+        composite_opacity: None,
         id: pass_id,
         kind: RenderPassKind::SceneCapture,
         final_kawase_upsample: false,

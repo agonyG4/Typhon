@@ -779,6 +779,7 @@ fn effect_surface_consumer_plan_keeps_capture_only_source() {
     let output = GraphTextureId::new(1).unwrap();
     let full = oblivion_one::effects::EffectRect::new(0, 0, 100, 100).unwrap();
     let pass = CompiledRenderPass {
+        composite_opacity: None,
         id: pass_id,
         kind: RenderPassKind::SceneCapture,
         final_kawase_upsample: false,
@@ -1081,6 +1082,7 @@ fn effect_selection_follows_direct_presentation_and_graph_dependencies() {
     let third = oblivion_one::effects::EffectInstanceId::new(3).unwrap();
     let unrelated = oblivion_one::effects::EffectInstanceId::new(4).unwrap();
     let pass = |id, instance, input, output| CompiledRenderPass {
+        composite_opacity: None,
         id: GraphPassId::new(id).unwrap(),
         kind: RenderPassKind::Fragment,
         final_kawase_upsample: false,

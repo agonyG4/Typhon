@@ -342,6 +342,7 @@ fn pruned_instance_does_not_realize_textures() {
     let second_input = GraphTextureId::new(3).unwrap();
     let second_output = GraphTextureId::new(4).unwrap();
     let pass = |id, instance, input, output| CompiledRenderPass {
+        composite_opacity: None,
         id: GraphPassId::new(id).unwrap(),
         kind: RenderPassKind::Fragment,
         final_kawase_upsample: false,
