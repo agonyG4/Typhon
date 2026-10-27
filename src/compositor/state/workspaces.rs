@@ -266,6 +266,25 @@ impl CompositorState {
         }
     }
 
+    /// Short identity of an owner root for debug traces: the layer-shell
+    /// namespace, or the window app id and workspace location.
+    pub(in crate::compositor) fn debug_surface_identity(&self, root_surface_id: u32) -> String {
+        if let Some(layer) = self.layer_surfaces.get(&root_surface_id) {
+            return format!("layer:{}", layer.namespace);
+        }
+        match self
+            .window_id_for_surface(root_surface_id)
+            .and_then(|window_id| self.window(window_id))
+        {
+            Some(window) => format!(
+                "win:{}:{:?}",
+                window.metadata.app_id.as_deref().unwrap_or("?"),
+                window.management.map(|management| management.location())
+            ),
+            None => "?".to_owned(),
+        }
+    }
+
     pub(in crate::compositor) fn special_workspace_is_shown(&self, id: SpecialWorkspaceId) -> bool {
         self.workspace_manager.visible_special_workspace() == Some(id)
     }

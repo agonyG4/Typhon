@@ -1788,6 +1788,10 @@ impl OwnCompositorServer {
         self.state.external_overlay_surface_ids(lifecycle)
     }
 
+    pub fn debug_surface_identity(&self, root_surface_id: u32) -> String {
+        self.state.debug_surface_identity(root_surface_id)
+    }
+
     pub fn special_workspace_dim(
         &self,
         at: AnimationTime,

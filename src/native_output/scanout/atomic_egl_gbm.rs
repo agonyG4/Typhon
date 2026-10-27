@@ -3607,6 +3607,7 @@ impl AtomicEglGbmScanout {
                     });
                 if let Some(plan) = special_workspace_debug_plan.as_deref() {
                     log_special_workspace_frame(
+                        server,
                         frame_id,
                         &resolved_scene,
                         plan,
@@ -5405,6 +5406,7 @@ fn special_workspace_frame_debug_enabled() -> bool {
 const SPECIAL_WORKSPACE_DEBUG_TAIL_FRAMES: u32 = 600;
 
 fn log_special_workspace_frame(
+    server: &OwnCompositorServer,
     frame_id: u64,
     scene: &ResolvedNativeFrameScene<'_>,
     plan: &str,
@@ -5458,9 +5460,10 @@ fn log_special_workspace_frame(
                 .find(|entry| entry.root_surface_id == *owner)
                 .map_or(1.0, |entry| entry.opacity.get());
             format!(
-                "{}@{}({},{} {}x{} a{:.3})",
+                "{}@{}[{}]({},{} {}x{} a{:.3})",
                 surface.surface_id,
                 owner,
+                server.debug_surface_identity(*owner),
                 surface.x,
                 surface.y,
                 surface.width,
