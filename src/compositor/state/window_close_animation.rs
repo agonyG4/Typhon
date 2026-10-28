@@ -305,7 +305,10 @@ impl CompositorState {
             .unwrap_or(usize::MAX);
         let (scene_band, layer_rank, stack_position, _) =
             self.renderable_root_stack_key(root_surface_id, root_position);
-        let speed = self.animation_control.configuration().speed;
+        let speed = self
+            .animation_control
+            .configuration()
+            .speed_for(AnimationSlot::WindowClose);
         let Some(close_plan) = window_close_animation_plan(
             effect,
             physical_geometry.presented_rect(),

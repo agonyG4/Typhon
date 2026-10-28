@@ -714,7 +714,10 @@ impl CompositorState {
             );
             return;
         };
-        let speed = self.animation_control.configuration().speed;
+        let speed = self
+            .animation_control
+            .configuration()
+            .speed_for(crate::animation_control::AnimationSlot::WindowMinimize);
         let frozen_decoration = lifecycle_decorations
             .into_iter()
             .find(|decoration| decoration.root_surface_id() == root_surface_id);
@@ -1259,7 +1262,10 @@ impl CompositorState {
             );
             return;
         };
-        let speed = self.animation_control.configuration().speed;
+        let speed = self
+            .animation_control
+            .configuration()
+            .speed_for(crate::animation_control::AnimationSlot::WindowRestore);
         let frozen_decoration = lifecycle_decorations
             .into_iter()
             .find(|decoration| decoration.root_surface_id() == root_surface_id);

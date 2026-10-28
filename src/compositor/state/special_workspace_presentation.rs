@@ -299,7 +299,10 @@ impl CompositorState {
             self.special_workspace_presentation.clear();
             return;
         }
-        let speed = self.animation_control.configuration().speed;
+        let speed = self
+            .animation_control
+            .configuration()
+            .speed_for(AnimationSlot::SpecialWorkspace);
         let curve = if self.special_workspace_effect() == AnimationEffect::SpecialSlideHyprland {
             crate::animation_control::scale_curve(
                 crate::animation_control::HYPRLAND_SPECIAL_WORKSPACE_CURVE,

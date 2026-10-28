@@ -110,7 +110,10 @@ impl CompositorState {
             return;
         }
 
-        let speed = self.animation_control.configuration().speed;
+        let speed = self
+            .animation_control
+            .configuration()
+            .speed_for(AnimationSlot::WorkspaceSwitch);
         let curve = if self.workspace_switch_effect() == AnimationEffect::WorkspaceSlideHyprland {
             crate::animation_control::scale_curve(
                 crate::animation_control::HYPRLAND_WORKSPACES_CURVE,

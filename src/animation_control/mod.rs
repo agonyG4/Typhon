@@ -161,15 +161,15 @@ impl AnimationControlState {
         match self.effective_effect(slot, AnimationRuntimeCapabilities::default()) {
             AnimationEffect::GeometryKde => Some(scale_curve(
                 PresentationAnimationPolicy::kde().curve_for(kind),
-                self.configuration.speed,
+                self.configuration.speed_for(slot),
             )),
             AnimationEffect::GeometryMacos => Some(scale_curve(
                 PresentationAnimationPolicy::macos().curve_for(kind),
-                self.configuration.speed,
+                self.configuration.speed_for(slot),
             )),
             AnimationEffect::GeometryHyprland => Some(scale_curve(
                 HYPRLAND_WINDOWS_MOVE_CURVE,
-                self.configuration.speed,
+                self.configuration.speed_for(slot),
             )),
             _ => None,
         }
@@ -227,7 +227,10 @@ impl AnimationControlState {
 
 pub(crate) fn scale_curve(curve: AnimationCurve, speed: f64) -> AnimationCurve {
     debug_assert!(
-        speed.is_finite() && (MIN_ANIMATION_SPEED..=MAX_ANIMATION_SPEED).contains(&speed)
+        speed.is_finite()
+            && (MIN_ANIMATION_SPEED * config::MIN_SLOT_SPEED
+                ..=MAX_ANIMATION_SPEED * config::MAX_SLOT_SPEED)
+                .contains(&speed)
     );
     if speed == 1.0 {
         return curve;

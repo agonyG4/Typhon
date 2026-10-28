@@ -346,6 +346,8 @@ struct AnimationConfigurationSetArgs {
     speed: f64,
     #[serde(default)]
     overrides: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    slot_speeds: std::collections::BTreeMap<String, f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1002,6 +1004,7 @@ impl NativeRuntime {
                 preset: args.preset,
                 speed: args.speed,
                 overrides: args.overrides,
+                slot_speeds: args.slot_speeds,
             };
             let configuration =
                 match oblivion_one::animation_control::AnimationConfiguration::from_document(
@@ -2978,6 +2981,7 @@ mod tests {
             preset: args.preset,
             speed: args.speed,
             overrides: args.overrides,
+            slot_speeds: args.slot_speeds,
         };
         let configuration =
             oblivion_one::animation_control::AnimationConfiguration::from_document(document)

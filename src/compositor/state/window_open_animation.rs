@@ -317,7 +317,10 @@ impl CompositorState {
         else {
             return false;
         };
-        let speed = self.animation_control.configuration().speed;
+        let speed = self
+            .animation_control
+            .configuration()
+            .speed_for(AnimationSlot::WindowOpen);
         let Some(plan) = window_open_animation_plan(effect, target, canonical_opacity, speed)
         else {
             return false;

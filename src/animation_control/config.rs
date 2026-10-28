@@ -11,6 +11,9 @@ pub const ANIMATION_CONFIGURATION_VERSION: u32 = 1;
 pub const MIN_ANIMATION_SPEED: f64 = 0.5;
 pub const MAX_ANIMATION_SPEED: f64 = 2.0;
 pub const MAX_ANIMATION_OVERRIDES: usize = AnimationSlot::ALL.len();
+/// Per-slot speed multipliers apply on top of the global speed.
+pub const MIN_SLOT_SPEED: f64 = 0.25;
+pub const MAX_SLOT_SPEED: f64 = 4.0;
 
 fn default_true() -> bool {
     true
@@ -23,6 +26,7 @@ pub struct AnimationConfiguration {
     pub preset: AnimationPreset,
     pub speed: f64,
     pub overrides: BTreeMap<AnimationSlot, AnimationEffect>,
+    pub slot_speeds: BTreeMap<AnimationSlot, f64>,
 }
 
 impl Default for AnimationConfiguration {
@@ -33,6 +37,7 @@ impl Default for AnimationConfiguration {
             preset: AnimationPreset::Astrea,
             speed: 1.0,
             overrides: BTreeMap::new(),
+            slot_speeds: BTreeMap::new(),
         }
     }
 }
@@ -47,6 +52,11 @@ impl AnimationConfiguration {
         if self.overrides.len() > MAX_ANIMATION_OVERRIDES {
             return Err(AnimationConfigurationError::TooManyOverrides);
         }
+        for (&slot, &speed) in &self.slot_speeds {
+            if !speed.is_finite() || !(MIN_SLOT_SPEED..=MAX_SLOT_SPEED).contains(&speed) {
+                return Err(AnimationConfigurationError::InvalidSlotSpeed(slot));
+            }
+        }
         for (&slot, &effect) in &self.overrides {
             if !effect.is_available_for_slot(slot) {
                 return Err(AnimationConfigurationError::PlannedEffect { slot, effect });
@@ -56,6 +66,11 @@ impl AnimationConfiguration {
             }
         }
         Ok(())
+    }
+
+    /// Global speed times the slot's own multiplier.
+    pub fn speed_for(&self, slot: AnimationSlot) -> f64 {
+        self.speed * self.slot_speeds.get(&slot).copied().unwrap_or(1.0)
     }
 
     pub fn requested_effect(&self, slot: AnimationSlot) -> (AnimationEffect, bool) {
@@ -100,6 +115,11 @@ impl AnimationConfiguration {
                 .iter()
                 .map(|(slot, effect)| (slot.id().to_string(), effect.id().to_string()))
                 .collect(),
+            slot_speeds: self
+                .slot_speeds
+                .iter()
+                .map(|(slot, speed)| (slot.id().to_string(), *speed))
+                .collect(),
         }
     }
 
@@ -126,12 +146,19 @@ impl AnimationConfiguration {
                 return Err(AnimationConfigurationError::DuplicateSlot(slot));
             }
         }
+        let mut slot_speeds = BTreeMap::new();
+        for (slot_id, speed) in document.slot_speeds {
+            let slot = AnimationSlot::parse(&slot_id)
+                .ok_or(AnimationConfigurationError::UnknownSlot(slot_id))?;
+            slot_speeds.insert(slot, speed);
+        }
         let configuration = Self {
             enabled: document.enabled,
             animate_maximized_window_open: document.animate_maximized_window_open,
             preset,
             speed: document.speed,
             overrides,
+            slot_speeds,
         };
         configuration.validate()?;
         Ok(configuration)
@@ -149,6 +176,8 @@ pub struct AnimationConfigurationDocument {
     pub speed: f64,
     #[serde(default)]
     pub overrides: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub slot_speeds: BTreeMap<String, f64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -159,6 +188,7 @@ pub enum AnimationConfigurationError {
     UnknownEffect(String),
     DuplicateSlot(AnimationSlot),
     InvalidSpeed,
+    InvalidSlotSpeed(AnimationSlot),
     TooManyOverrides,
     PlannedEffect {
         slot: AnimationSlot,
@@ -183,6 +213,11 @@ impl std::fmt::Display for AnimationConfigurationError {
             Self::UnknownEffect(value) => write!(formatter, "unknown effect {value}"),
             Self::DuplicateSlot(slot) => write!(formatter, "duplicate slot {}", slot.id()),
             Self::InvalidSpeed => formatter.write_str("animation speed is outside 0.5..=2.0"),
+            Self::InvalidSlotSpeed(slot) => write!(
+                formatter,
+                "speed for slot {} is outside 0.25..=4.0",
+                slot.id()
+            ),
             Self::TooManyOverrides => formatter.write_str("too many animation overrides"),
             Self::PlannedEffect { slot, effect } => write!(
                 formatter,
@@ -220,6 +255,30 @@ mod tests {
         assert_eq!(config.speed, 1.0);
         assert!(config.overrides.is_empty());
         assert!(config.animate_maximized_window_open);
+    }
+
+    #[test]
+    fn slot_speed_multiplies_the_global_speed_and_round_trips() {
+        let mut config = AnimationConfiguration {
+            speed: 1.5,
+            ..AnimationConfiguration::default()
+        };
+        config
+            .slot_speeds
+            .insert(AnimationSlot::WorkspaceSwitch, 0.5);
+        assert_eq!(config.speed_for(AnimationSlot::WorkspaceSwitch), 0.75);
+        assert_eq!(config.speed_for(AnimationSlot::WindowOpen), 1.5);
+
+        let restored = AnimationConfiguration::from_document(config.to_document()).unwrap();
+        assert_eq!(restored, config);
+
+        config.slot_speeds.insert(AnimationSlot::WindowOpen, 8.0);
+        assert_eq!(
+            config.validate(),
+            Err(AnimationConfigurationError::InvalidSlotSpeed(
+                AnimationSlot::WindowOpen
+            ))
+        );
     }
 
     #[test]

@@ -17,6 +17,8 @@ pub struct AnimationConfigurationSnapshot {
     pub preset: String,
     pub speed: f64,
     pub overrides: BTreeMap<String, String>,
+    #[serde(default)]
+    pub slot_speeds: BTreeMap<String, f64>,
 }
 
 impl From<&AnimationConfiguration> for AnimationConfigurationSnapshot {
@@ -30,6 +32,11 @@ impl From<&AnimationConfiguration> for AnimationConfigurationSnapshot {
                 .overrides
                 .iter()
                 .map(|(slot, effect)| (slot.id().to_string(), effect.id().to_string()))
+                .collect(),
+            slot_speeds: configuration
+                .slot_speeds
+                .iter()
+                .map(|(slot, speed)| (slot.id().to_string(), *speed))
                 .collect(),
         }
     }

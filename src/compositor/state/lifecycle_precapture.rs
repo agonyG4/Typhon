@@ -60,7 +60,9 @@ impl CompositorState {
             ResolvedEffectScene::default(),
             None,
             now,
-            self.animation_control.configuration().speed,
+            self.animation_control
+                .configuration()
+                .speed_for(crate::animation_control::AnimationSlot::WindowMinimize),
         )
         .is_ok()
     }
