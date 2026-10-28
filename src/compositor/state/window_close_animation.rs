@@ -371,6 +371,7 @@ impl CompositorState {
             canonical_rect,
             close_geometry_target: close_plan.geometry_target,
             close_curve: close_plan.geometry_curve,
+            close_opacity_curve: close_plan.opacity_curve,
             source_presented_rect: physical_geometry.presented_rect(),
             source_presented_opacity: physical_opacity,
             source_presented_clip: physical_clip,
@@ -512,7 +513,7 @@ impl CompositorState {
             opacity_start: content.source_presented_opacity,
             opacity_target: PresentationOpacity::TRANSPARENT,
             geometry_curve: content.close_curve,
-            opacity_curve: content.close_curve,
+            opacity_curve: content.close_opacity_curve,
         };
         let Some(now) = AnimationTime::monotonic_now() else {
             self.restore_window_exit_candidate(prepared);

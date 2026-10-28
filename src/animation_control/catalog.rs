@@ -15,10 +15,11 @@ pub enum AnimationSlot {
     WindowRestore,
     WorkspaceSwitch,
     WorkspaceWindowMove,
+    SpecialWorkspace,
 }
 
 impl AnimationSlot {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::WindowMove,
         Self::WindowResize,
         Self::LayoutReflow,
@@ -30,6 +31,7 @@ impl AnimationSlot {
         Self::WindowRestore,
         Self::WorkspaceSwitch,
         Self::WorkspaceWindowMove,
+        Self::SpecialWorkspace,
     ];
 
     pub const fn id(self) -> &'static str {
@@ -45,6 +47,7 @@ impl AnimationSlot {
             Self::WindowRestore => "window.restore",
             Self::WorkspaceSwitch => "workspace.switch",
             Self::WorkspaceWindowMove => "workspace.window-move",
+            Self::SpecialWorkspace => "workspace.special",
         }
     }
 
@@ -89,10 +92,13 @@ pub enum AnimationEffect {
     MinimizeLamp,
     MinimizeSquash,
     WorkspaceSlide,
+    WorkspaceSlideHyprland,
+    SpecialSlide,
+    SpecialSlideHyprland,
 }
 
 impl AnimationEffect {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 13] = [
         Self::None,
         Self::GeometryKde,
         Self::GeometryMacos,
@@ -103,6 +109,9 @@ impl AnimationEffect {
         Self::MinimizeLamp,
         Self::MinimizeSquash,
         Self::WorkspaceSlide,
+        Self::WorkspaceSlideHyprland,
+        Self::SpecialSlide,
+        Self::SpecialSlideHyprland,
     ];
 
     pub const fn id(self) -> &'static str {
@@ -117,6 +126,9 @@ impl AnimationEffect {
             Self::MinimizeLamp => "minimize.lamp",
             Self::MinimizeSquash => "minimize.squash",
             Self::WorkspaceSlide => "workspace.slide",
+            Self::WorkspaceSlideHyprland => "workspace.slide.hyprland",
+            Self::SpecialSlide => "special.slide",
+            Self::SpecialSlideHyprland => "special.slide.hyprland",
         }
     }
 
@@ -133,6 +145,9 @@ impl AnimationEffect {
                 | Self::MinimizeLamp
                 | Self::MinimizeSquash
                 | Self::WorkspaceSlide
+                | Self::WorkspaceSlideHyprland
+                | Self::SpecialSlide
+                | Self::SpecialSlideHyprland
         )
     }
 
@@ -143,7 +158,12 @@ impl AnimationEffect {
     /// still planned.
     pub const fn is_available_for_slot(self, slot: AnimationSlot) -> bool {
         match self {
-            Self::WorkspaceSlide => matches!(slot, AnimationSlot::WorkspaceSwitch),
+            Self::WorkspaceSlide | Self::WorkspaceSlideHyprland => {
+                matches!(slot, AnimationSlot::WorkspaceSwitch)
+            }
+            Self::SpecialSlide | Self::SpecialSlideHyprland => {
+                matches!(slot, AnimationSlot::SpecialWorkspace)
+            }
             Self::WindowScale | Self::WindowGlide | Self::WindowPopin => {
                 matches!(slot, AnimationSlot::WindowOpen | AnimationSlot::WindowClose)
             }
@@ -224,7 +244,12 @@ impl AnimationEffect {
                     AnimationSlot::WindowMinimize | AnimationSlot::WindowRestore
                 )
             }
-            Self::WorkspaceSlide => matches!(slot, AnimationSlot::WorkspaceSwitch),
+            Self::WorkspaceSlide | Self::WorkspaceSlideHyprland => {
+                matches!(slot, AnimationSlot::WorkspaceSwitch)
+            }
+            Self::SpecialSlide | Self::SpecialSlideHyprland => {
+                matches!(slot, AnimationSlot::SpecialWorkspace)
+            }
         }
     }
 }
@@ -265,7 +290,14 @@ impl AnimationPreset {
             (Self::Hyprland, AnimationSlot::WindowOpen | AnimationSlot::WindowClose) => {
                 AnimationEffect::WindowPopin
             }
+            (Self::Hyprland, AnimationSlot::WorkspaceSwitch) => {
+                AnimationEffect::WorkspaceSlideHyprland
+            }
             (_, AnimationSlot::WorkspaceSwitch) => AnimationEffect::WorkspaceSlide,
+            (Self::Hyprland, AnimationSlot::SpecialWorkspace) => {
+                AnimationEffect::SpecialSlideHyprland
+            }
+            (_, AnimationSlot::SpecialWorkspace) => AnimationEffect::SpecialSlide,
             (
                 Self::Astrea | Self::Kde,
                 AnimationSlot::WindowMove
@@ -350,15 +382,48 @@ mod tests {
     #[test]
     fn all_presets_request_slide_only_for_workspace_switch() {
         for preset in AnimationPreset::ALL {
+            let (switch, special) = if preset == AnimationPreset::Hyprland {
+                (
+                    AnimationEffect::WorkspaceSlideHyprland,
+                    AnimationEffect::SpecialSlideHyprland,
+                )
+            } else {
+                (
+                    AnimationEffect::WorkspaceSlide,
+                    AnimationEffect::SpecialSlide,
+                )
+            };
             assert_eq!(
                 preset.requested_effect(AnimationSlot::WorkspaceSwitch),
-                AnimationEffect::WorkspaceSlide
+                switch
+            );
+            assert_eq!(
+                preset.requested_effect(AnimationSlot::SpecialWorkspace),
+                special
             );
             assert_eq!(
                 preset.requested_effect(AnimationSlot::WorkspaceWindowMove),
                 AnimationEffect::None
             );
         }
+    }
+
+    #[test]
+    fn special_slides_belong_only_to_the_special_workspace_slot() {
+        let capabilities = super::super::AnimationRuntimeCapabilities::default();
+        for effect in [
+            AnimationEffect::SpecialSlide,
+            AnimationEffect::SpecialSlideHyprland,
+        ] {
+            assert!(effect.is_executable_for(AnimationSlot::SpecialWorkspace, capabilities));
+            assert!(effect.compatible_with(AnimationSlot::SpecialWorkspace));
+            assert!(!effect.compatible_with(AnimationSlot::WorkspaceSwitch));
+        }
+        assert!(
+            !AnimationEffect::WorkspaceSlideHyprland
+                .compatible_with(AnimationSlot::SpecialWorkspace)
+        );
+        assert_eq!(AnimationSlot::ALL[11].id(), "workspace.special");
     }
 
     #[test]

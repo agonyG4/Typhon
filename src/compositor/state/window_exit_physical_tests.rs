@@ -460,6 +460,24 @@ fn default_normal_xdg_window_is_admitted_with_sparse_default_properties() {
 }
 
 #[test]
+fn popin_close_is_admitted_and_activates_with_its_own_fade_curve() {
+    let (mut state, root_surface_id, scene_node_id, _) =
+        admission_window(super::super::window_state::ToplevelMode::Normal, (500, 400));
+    let mut configuration = state.animation_control.configuration().clone();
+    configuration.overrides.insert(
+        crate::animation_control::AnimationSlot::WindowClose,
+        crate::animation_control::AnimationEffect::WindowPopin,
+    );
+    state
+        .set_animation_configuration(configuration)
+        .expect("select popin Window Close");
+    publish_admission_evidence(&mut state, root_surface_id, scene_node_id, 1);
+
+    assert!(state.prepare_window_exit(root_surface_id));
+    assert!(state.activate_prepared_window_exit(root_surface_id));
+}
+
+#[test]
 fn active_workspace_slide_declines_new_window_exit_preparation() {
     let (mut state, root_surface_id, scene_node_id, window_id) =
         admission_window(super::super::window_state::ToplevelMode::Normal, (500, 400));
@@ -1113,6 +1131,10 @@ fn activate_window_exit(
             canonical_rect: rect,
             close_geometry_target: rect,
             close_curve: AnimationCurve::easing(Duration::from_millis(1), EasingCurve::EaseInCubic),
+            close_opacity_curve: AnimationCurve::easing(
+                Duration::from_millis(1),
+                EasingCurve::EaseInCubic,
+            ),
             source_presented_rect: rect,
             source_presented_opacity: PresentationOpacity::OPAQUE,
             source_presented_clip: PresentationClip::Unbounded,

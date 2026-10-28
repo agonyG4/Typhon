@@ -1,3 +1,4 @@
+use crate::animation_control::{AnimationEffect, AnimationRuntimeCapabilities, AnimationSlot};
 use crate::compositor::CompositorState;
 use crate::compositor::state::scene_order::SPECIAL_WORKSPACE_DIM_ALPHA;
 use crate::compositor::state::workspace_presentation::sample_slide_motion;
@@ -270,10 +271,21 @@ fn special_workspace_sample_signature(tracks: &[SpecialWorkspaceTrackSample]) ->
 }
 
 impl CompositorState {
-    /// Same admission policy as the regular workspace slide: the animation
-    /// system must be enabled and the workspace switch effect must be a slide.
+    /// The animation system must be enabled and the special workspace slot
+    /// must resolve to one of its slides.
     pub(in crate::compositor) fn special_workspace_slide_enabled(&self) -> bool {
-        self.workspace_slide_effect_enabled()
+        self.animation_control.enabled()
+            && matches!(
+                self.special_workspace_effect(),
+                AnimationEffect::SpecialSlide | AnimationEffect::SpecialSlideHyprland
+            )
+    }
+
+    fn special_workspace_effect(&self) -> AnimationEffect {
+        self.animation_control.effective_effect(
+            AnimationSlot::SpecialWorkspace,
+            AnimationRuntimeCapabilities::default(),
+        )
     }
 
     /// Starts the open, close, or switch motion for a toggle. With animations
@@ -287,31 +299,29 @@ impl CompositorState {
             self.special_workspace_presentation.clear();
             return;
         }
-        let configuration = self.animation_control.configuration();
-        let curve = if configuration.preset == crate::animation_control::AnimationPreset::Hyprland {
+        let speed = self.animation_control.configuration().speed;
+        let curve = if self.special_workspace_effect() == AnimationEffect::SpecialSlideHyprland {
             crate::animation_control::scale_curve(
                 crate::animation_control::HYPRLAND_SPECIAL_WORKSPACE_CURVE,
-                configuration.speed,
+                speed,
             )
         } else {
-            special_workspace_curve(configuration.speed)
+            special_workspace_curve(speed)
         };
         self.special_workspace_presentation
             .begin_for_outcome(outcome, sampled_at, curve);
     }
 
     /// Logical offset of a special window at `presence` (1 = shown). The
-    /// Hyprland preset slides it in from and out to the right edge by the
-    /// output width, like Hyprland's special `slide`; the others drop it
-    /// slightly from above.
+    /// Hyprland slide enters from and leaves to the right edge by the output
+    /// width, like Hyprland's special `slide`; the default drops it slightly
+    /// from above.
     pub(in crate::compositor) fn special_workspace_slide_translation(
         &self,
         presence: f64,
     ) -> (f64, f64) {
         let hidden = 1.0 - presence;
-        if self.animation_control.configuration().preset
-            == crate::animation_control::AnimationPreset::Hyprland
-        {
+        if self.special_workspace_effect() == AnimationEffect::SpecialSlideHyprland {
             (hidden * f64::from(self.output_size.width), 0.0)
         } else {
             (
@@ -548,6 +558,30 @@ mod tests {
         );
         assert!(!state.is_active());
         assert!(state.sample_at(at_ms(0)).is_none());
+    }
+
+    #[test]
+    fn special_slide_effect_picks_the_slide_direction() {
+        let mut state = CompositorState::new(None);
+        enable_special_slide(&mut state);
+        let (x, y) = state.special_workspace_slide_translation(0.0);
+        assert_eq!(x, 0.0);
+        assert!(y < 0.0);
+
+        let mut configuration = state.animation_control.configuration().clone();
+        configuration.overrides.insert(
+            crate::animation_control::AnimationSlot::SpecialWorkspace,
+            crate::animation_control::AnimationEffect::SpecialSlideHyprland,
+        );
+        state
+            .set_animation_configuration(configuration)
+            .expect("select the Hyprland special slide");
+        assert!(state.special_workspace_slide_enabled());
+        assert_eq!(
+            state.special_workspace_slide_translation(0.0),
+            (f64::from(state.output_size.width), 0.0)
+        );
+        assert_eq!(state.special_workspace_slide_translation(1.0), (0.0, 0.0));
     }
 
     fn enable_special_slide(state: &mut CompositorState) {

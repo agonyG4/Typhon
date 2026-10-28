@@ -309,6 +309,16 @@ fn wire_visibility_is_atomic_and_independent_of_astrea_manager() {
     assert_eq!(state.workspace("typhon.workspace.1").state, 1);
     assert_eq!(state.workspace("typhon.workspace.3").state, 4);
 
+    // Activating a workspace leaves the special, so show it again to focus
+    // its window before moving that window out.
+    commands
+        .send(ServerCommand::ToggleSpecialWorkspace(
+            crate::wm::SpecialWorkspaceId::DEFAULT,
+        ))
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+
     commands
         .send(ServerCommand::MoveFocusedWindowToWorkspace { workspace: 3 })
         .unwrap();

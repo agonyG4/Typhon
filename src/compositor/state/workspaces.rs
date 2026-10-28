@@ -35,13 +35,19 @@ impl CompositorState {
     }
 
     /// True when the workspace switch effect is a slide and animations are on.
-    /// Regular workspace slides and special workspace motions share this gate.
     pub(in crate::compositor) fn workspace_slide_effect_enabled(&self) -> bool {
         self.animation_control.enabled()
-            && self.animation_control.effective_effect(
-                AnimationSlot::WorkspaceSwitch,
-                AnimationRuntimeCapabilities::default(),
-            ) == AnimationEffect::WorkspaceSlide
+            && matches!(
+                self.workspace_switch_effect(),
+                AnimationEffect::WorkspaceSlide | AnimationEffect::WorkspaceSlideHyprland
+            )
+    }
+
+    fn workspace_switch_effect(&self) -> AnimationEffect {
+        self.animation_control.effective_effect(
+            AnimationSlot::WorkspaceSwitch,
+            AnimationRuntimeCapabilities::default(),
+        )
     }
 
     fn workspace_slide_admission_fallback(
@@ -104,14 +110,14 @@ impl CompositorState {
             return;
         }
 
-        let configuration = self.animation_control.configuration();
-        let curve = if configuration.preset == crate::animation_control::AnimationPreset::Hyprland {
+        let speed = self.animation_control.configuration().speed;
+        let curve = if self.workspace_switch_effect() == AnimationEffect::WorkspaceSlideHyprland {
             crate::animation_control::scale_curve(
                 crate::animation_control::HYPRLAND_WORKSPACES_CURVE,
-                configuration.speed,
+                speed,
             )
         } else {
-            workspace_slide_curve(configuration.speed)
+            workspace_slide_curve(speed)
         };
         let retarget = self.workspace_presentation.transition().is_some();
         if let Some(transition_id) = self.workspace_presentation.activate_for_switch(

@@ -52,6 +52,7 @@ pub struct WindowExitFrozenContent {
     pub canonical_rect: PresentationRect,
     pub close_geometry_target: PresentationRect,
     pub close_curve: AnimationCurve,
+    pub close_opacity_curve: AnimationCurve,
     pub source_presented_rect: PresentationRect,
     pub source_presented_opacity: PresentationOpacity,
     pub source_presented_clip: PresentationClip,
@@ -558,6 +559,10 @@ mod tests {
                 canonical_rect: rect,
                 close_geometry_target: rect,
                 close_curve: AnimationCurve::easing(
+                    std::time::Duration::from_millis(180),
+                    EasingCurve::EaseInCubic,
+                ),
+                close_opacity_curve: AnimationCurve::easing(
                     std::time::Duration::from_millis(180),
                     EasingCurve::EaseInCubic,
                 ),
