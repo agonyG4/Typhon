@@ -207,6 +207,85 @@ fn empty_completed_callback_batch_remains_terminal_after_render_mark() {
 }
 
 #[test]
+fn rendered_ready_slot_admits_callback_without_waiting_for_kms() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let feedback_client =
+        create_surface_with_unpresented_presentation_feedback(&socket_path).unwrap();
+    let batch_id = capture_live_frame_batch(&socket_path, &commands, 23);
+    commands
+        .send(ServerCommand::AdmitRenderedFrameCallbacks(batch_id))
+        .unwrap();
+    wait_for_server_commands(&commands);
+
+    // A callback-driven client must be able to prepare its next buffer while
+    // this exact rendered frame is still waiting for output presentation.
+    assert!(!capture_pending_frame_callbacks(&commands));
+    assert!(capture_frame_callback_pacing_is_completed(
+        &commands, batch_id
+    ));
+    let server = stop_controllable_test_server(commands, server_thread);
+    assert_eq!(server.frame_batch_count(), 1);
+    assert_eq!(
+        server.state.frame_batches[&batch_id]
+            .presentation_feedbacks
+            .len(),
+        1,
+        "READY admission must not claim that the output was presented"
+    );
+    assert_eq!(
+        server
+            .frame_callback_metrics()
+            .callbacks_completed_after_ready_admission,
+        1
+    );
+    drop(feedback_client);
+}
+
+#[test]
+fn rendered_ready_slot_callback_is_not_repeated_at_kms_admission_or_pageflip() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let batch_id = capture_live_frame_batch(&socket_path, &commands, 24);
+    for _ in 0..2 {
+        commands
+            .send(ServerCommand::AdmitRenderedFrameCallbacks(batch_id))
+            .unwrap();
+    }
+    commands
+        .send(ServerCommand::NoteFrameCallbackAdmissionFailure(batch_id))
+        .unwrap();
+    commands
+        .send(ServerCommand::CompleteFrameCallbacksAfterAdmission {
+            batch_id,
+            admission: FrameCallbackAdmission::Ready,
+        })
+        .unwrap();
+    commands
+        .send(ServerCommand::CompleteFrameBatchNow {
+            frame_id: 24,
+            batch_id,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+
+    let server = stop_controllable_test_server(commands, server_thread);
+    let metrics = server.frame_callback_metrics();
+    assert_eq!(metrics.callbacks_marked_rendered, 1);
+    assert_eq!(metrics.callbacks_completed_after_ready_admission, 1);
+    assert_eq!(metrics.callbacks_retained_after_failed_admission, 0);
+    assert_eq!(metrics.callbacks_found_at_pageflip, 0);
+    assert_eq!(metrics.callbacks_completed_at_presentation_fallback, 0);
+    assert_eq!(server.frame_batch_count(), 0);
+}
+
+#[test]
 fn render_ahead_ready_callback_stays_owned_until_admission() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();

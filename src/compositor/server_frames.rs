@@ -382,6 +382,17 @@ impl OwnCompositorServer {
         let _ = self.display.flush_clients();
     }
 
+    /// Admit callbacks after a rendered frame has acquired its bounded output READY slot.
+    ///
+    /// Chromium waits for this hint before submitting its next buffer. Waiting
+    /// for the KMS lane here serializes that work behind the previous output
+    /// frame. Presentation feedback and buffer releases remain owned by the
+    /// batch until their separate completion events.
+    pub fn admit_rendered_frame_callbacks(&mut self, batch_id: CompositorFrameBatchId) {
+        self.state.mark_frame_callbacks_rendered(batch_id);
+        self.complete_frame_callbacks_after_admission(batch_id, FrameCallbackAdmission::Ready);
+    }
+
     #[doc(hidden)]
     pub fn complete_frame_callbacks_after_admission(
         &mut self,

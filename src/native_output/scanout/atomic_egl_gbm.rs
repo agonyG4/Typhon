@@ -3614,7 +3614,7 @@ impl AtomicEglGbmScanout {
                         special_workspace_retired,
                     );
                 }
-                server.mark_frame_callbacks_rendered(protocol_batch_id);
+                server.admit_rendered_frame_callbacks(protocol_batch_id);
                 Ok(AtomicFrameRenderOutcome::Rendered {
                     frame_id,
                     transaction_id,

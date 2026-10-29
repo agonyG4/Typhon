@@ -537,6 +537,7 @@ pub(in crate::compositor::tests) enum ServerCommand {
         batch_id: CompositorFrameBatchId,
     },
     MarkFrameCallbacksRendered(CompositorFrameBatchId),
+    AdmitRenderedFrameCallbacks(CompositorFrameBatchId),
     CompleteFrameCallbacksAfterAdmission {
         batch_id: CompositorFrameBatchId,
         admission: FrameCallbackAdmission,
@@ -2479,6 +2480,9 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                     }
                     ServerCommand::MarkFrameCallbacksRendered(batch_id) => {
                         server.mark_frame_callbacks_rendered(batch_id);
+                    }
+                    ServerCommand::AdmitRenderedFrameCallbacks(batch_id) => {
+                        server.admit_rendered_frame_callbacks(batch_id);
                     }
                     ServerCommand::CompleteFrameCallbacksAfterAdmission {
                         batch_id,
