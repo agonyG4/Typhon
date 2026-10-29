@@ -81,3 +81,29 @@ not establish a reduction in physical mouse-to-display latency.
   launcher supports selecting it with `OBLIVION_ONE_BINARY`.
 - The offline release build and the resulting binary's `--help` smoke check
   completed successfully. No live before/after improvement is claimed.
+
+### Follow-up after session restart
+
+The user's subsequent session ran a newer checkout build containing this fix.
+The executable contained `admit_rendered_frame_callbacks`, and disassembly of
+`AtomicEglGbmScanout::settle_render_completion` confirmed its call through the
+corresponding relocation. The running executable's SHA-256 was
+`1608c8ccebc0bf584591b10cc0e1b96f79bcc3333c9f385dbfcc2354ca0bbef1`;
+the checkout head at validation was `e58ca77d`.
+
+The same conversation and six synthetic scroll gestures were sampled again,
+with AlwaysAnimate enabled and the window focused at the start and end:
+
+| Chromium-reported scroll latency | Original sample | Follow-up sample |
+| --- | ---: | ---: |
+| Median | 20.60 ms | 17.92 ms |
+| p95 | 30.49 ms | 30.27 ms |
+| p99 | 42.35 ms | 30.43 ms |
+
+The follow-up recorded 1,826 requestAnimationFrame intervals over approximately
+12 seconds, versus 1,718 originally, with no JavaScript long tasks in either
+steady-scroll sample. These are partial improvements in observed measurements:
+the builds and background load differ, p95 barely changed, and this is not an
+isolated causal estimate or proof that the perceived problem is fully resolved.
+The follow-up evidence is saved in
+`/mnt/Aether/Desktop/GitHub/Typhon-target/diagnostics/post-fix-validation.json`.
