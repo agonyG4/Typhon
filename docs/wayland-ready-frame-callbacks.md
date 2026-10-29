@@ -452,3 +452,63 @@ and all build output remain in the stable Aether target directory. The checksum
 is saved in `no-primary-owner-release.sha256`. Loading this build still requires
 a new compositor session; stability with Vesktop and scroll performance have
 not yet been measured live after this ownership correction.
+
+
+## Live validation after scheduler ownership correction (2026-10-29)
+
+The running compositor PID 28303 matched the corrected release SHA-256
+`2de586c4da4e3885a95dffb701dc938ef19fe2bb33158a96f292d14a39f60fcc`.
+It remained alive through Vesktop startup, two controlled scroll captures,
+diagnostic Vesktop shutdown and restoration of the normal launch (PID 29812).
+This validates those exercised operations; it is not a long-duration stability
+guarantee. No compositor restart was performed by the diagnostic scripts.
+
+Both runs used the same focused conversation, 1920x929 client area, DPR 1,
+AlwaysAnimate enabled, six alternating synthetic mouse scroll gestures and no
+injected animation-frame probe. Focus remained true and neither capture
+recorded a JavaScript long task. Each run contained 852 presented scroll updates;
+only updates carrying a display trace ID enter the latency quantiles.
+
+| Capture | Presented p50 | p95 | p99 | Layerize wall p50 |
+| --- | ---: | ---: | ---: | ---: |
+| Previous journal-only (`damage-fixed`) | 24.322 ms | 30.421 ms | 36.257 ms | 5.536 ms |
+| Cache + ownership correction (`owner-fixed`) | 24.393 ms | 30.497 ms | 36.481 ms | 5.506 ms |
+| Repeat (`owner-fixed-repeat`) | 24.362 ms | 30.432 ms | 36.338 ms | 5.491 ms |
+
+The latency result is effectively unchanged. The latest repeat's Chromium
+renderer compositor queueing median was 5.912 ms, begin-main-frame-to-commit
+7.165 ms, and submit-to-presentation 11.329 ms. Layerize is a measured component
+of renderer work; nested stage medians must not be added as independent costs.
+These synthetic input traces are not physical mouse-to-panel latency.
+
+The complete performance sampling windows include trace export and time after
+the gestures finish. Over these windows, repaint counts changed from 0 partial /
+2920 full previously to 1956 partial / 987 full (66.46% partial, 25.06 seconds)
+and 1790 partial / 947 full (65.40% partial, about 23 seconds). Registration-to-
+fence-signal mean was 2.116 ms previously and 1.106 / 1.087 ms in the new windows.
+This shows reduced work over the mixed capture, not that scrolling itself
+became 66% partial or that its GPU cost halved.
+
+To distinguish actual scrolling, `owner-fixed-scroll-only.json` uses only
+performance snapshots whose monotonic timestamps lie inside the presented
+scroll-event interval. This yields coarse interior windows rather than exact
+per-frame gesture attribution:
+
+| Capture | Interior duration | Partial / full frames | Partial share | GPU remaining-wait mean |
+| --- | ---: | ---: | ---: | ---: |
+| Journal-only | 4.009 s | 0 / 621 | 0% | 0.787 ms |
+| Cache + ownership | 4.009 s | 30 / 593 | 4.82% | 0.670 ms |
+| Repeat | 5.012 s | 31 / 756 | 3.94% | 0.678 ms |
+
+Most partial repaint benefit is therefore outside active scrolling; scrolling
+still usually promotes to full repair. This measurement does not establish
+whether remaining full repairs originate in fresh client damage, buffer-age
+repair expansion, effect dependencies, or a combination. Do not relax the
+repair threshold or discard damage based on these counters. Chromium's roughly
+5.5 ms Layerize cost and near-refresh queueing remain relevant measured costs.
+Further optimization requires attribution at those boundaries.
+
+Artifacts are `owner-fixed*` in the stable Aether diagnostics directory. The
+normal Vesktop launch was restored and all six preexisting unrelated source
+changes remain untouched. This validation changes documentation only; no new
+build or test run is required for the report.
