@@ -512,3 +512,67 @@ Artifacts are `owner-fixed*` in the stable Aether diagnostics directory. The
 normal Vesktop launch was restored and all six preexisting unrelated source
 changes remain untouched. This validation changes documentation only; no new
 build or test run is required for the report.
+
+
+## Blur attribution after cache/ownership corrections (2026-10-29)
+
+A new sequential blur-on/off comparison ran on the corrected compositor,
+keeping the same conversation, geometry, animation plugin, synthetic gesture
+sequence and no-RAF tracing procedure. Blur was changed only temporarily using
+`astreactl blur reload`; a finally block restored the original configuration.
+A byte comparison confirmed restoration. Vesktop was restored to its normal
+launch and the compositor PID remained 28303.
+
+| Capture | Presented p50 | p95 | p99 | Layerize wall p50 |
+| --- | ---: | ---: | ---: | ---: |
+| `cache-blur-on` | 24.422 ms | 30.490 ms | 36.435 ms | 5.445 ms |
+| `cache-blur-off` | 24.274 ms | 30.401 ms | 48.363 ms | 5.438 ms |
+
+This does not establish a scroll-latency improvement from disabling blur. The
+p99 worsened in the off run; a sequential pair does not isolate scheduling/load
+noise. In contrast, the repaint policy changed substantially in the interior
+scroll windows, bounded by sample timestamps inside presented scroll events:
+
+| Setting | Interior window | Partial / full | Partial share | Area / history full reasons |
+| --- | ---: | ---: | ---: | ---: |
+| Blur on | 4.010 s | 41 / 582 | 6.58% | 564 / 18 |
+| Blur off | 5.012 s | 656 / 136 | 82.83% | 122 / 14 |
+
+Most target buffers had age 2 (567/623 on, 755/792 off); ages above 3 explained
+only 18 and 14 full repairs respectively. Thus the large difference primarily
+tracks blur-associated area promotion rather than insufficient buffer history.
+Whole-window GPU remaining-wait means were 1.149 ms on and 1.610 ms off, again
+showing that repaint mode alone must not be equated with measured GPU latency.
+
+The saved previous client protocol log was parsed by pending damage requests
+per commit for the known root surface, with rectangles clipped to the settled
+1920x929 content extent. Exact rectangle-union area avoids counting overlapping
+client requests twice. Approximate realtime/monotonic alignment to the two prior
+scroll intervals found 722/720 commits; only six in each exceeded 75% of the
+1920x1080 output. Dominant fresh regions covered 1,263,245 pixels (60.92% output)
+and 976,325 pixels (47.08%). Alignment is an estimated cross-clock window, not
+frame-ID matching; startup damage and older padded buffer sizes are not used
+to infer settled per-frame geometry. Files:
+`owner-fixed-client-damage-analysis.json` and
+`owner-fixed-scroll-client-damage.json`.
+
+Source inspection explains a plausible amplification boundary: physical effect
+damage expands source damage by each effect's aggregate sampling footprint,
+then intersects the visible influence region. The current material position 0
+and no blur override yield semantic blur 0.12; the built-in two-pass Kawase
+radius is 1.8 and its conservative aggregate sampling radius computes to 69
+pixels. This can substantially enlarge large scrolling regions. Later
+buffer-age repair union and effect execution repair can also alter the region.
+The exact promotion stage has not yet been identified per live output frame.
+Do not shrink a proven sampling bound or remove required repair on this evidence.
+
+Existing diagnostics already provide the missing boundary data: native perf
+records include current-damage pixels, final repair pixels, age and fallback;
+`TYPHON_EFFECT_EXEC_TRACE=1` adds initial repair, selected presentation output,
+capture-only work, merged repair and final promotion outcome. The current
+session has `OBLIVION_ONE_PERF_LOG=0` and effect tracing caches its setting with
+OnceLock, so these diagnostics require a newly launched compositor. Logging
+will be directed to the stable Aether diagnostics directory. This attribution
+run will inspect causes; tracing overhead makes its latency unsuitable for a
+clean before/after performance claim. No production behavior was changed in
+this investigation.
