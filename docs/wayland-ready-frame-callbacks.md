@@ -10,8 +10,9 @@ rendered frame can therefore occupy a bounded READY slot while its client is
 unnecessarily blocked by the predecessor's presentation or deferred target
 binding.
 
-The measured Vesktop scroll presentation latency was 20.6 ms median on native
-Wayland versus 14.2 ms through Xwayland/satellite at 165 Hz. This is evidence to
+The measured latency across all scroll-update events, including coalesced
+updates, was 20.6 ms median on native Wayland versus 14.2 ms through
+Xwayland/satellite at 165 Hz. This is evidence to
 investigate the extra wait, not a measurement of the improvement from this fix.
 The original live compositor predates the checkout, and different client
 backends/presentation timestamp mechanisms limit that comparison.
@@ -94,7 +95,7 @@ the checkout head at validation was `e58ca77d`.
 The same conversation and six synthetic scroll gestures were sampled again,
 with AlwaysAnimate enabled and the window focused at the start and end:
 
-| Chromium-reported scroll latency | Original sample | Follow-up sample |
+| All scroll-update EventLatency, including coalesced updates | Original sample | Follow-up sample |
 | --- | ---: | ---: |
 | Median | 20.60 ms | 17.92 ms |
 | p95 | 30.49 ms | 30.27 ms |
@@ -107,3 +108,60 @@ the builds and background load differ, p95 barely changed, and this is not an
 isolated causal estimate or proof that the perceived problem is fully resolved.
 The follow-up evidence is saved in
 `/mnt/Aether/Desktop/GitHub/Typhon-target/diagnostics/post-fix-validation.json`.
+
+### Remaining latency: presented events and pipeline stages
+
+The aggregate metric above includes updates that Chromium coalesces without
+presenting a distinct frame. Filtering for `GESTURE_SCROLL_UPDATE` events with a
+`display_trace_id` gives a more specific measure of updates actually presented:
+
+| Presented scroll updates | Original sample | Follow-up | Follow-up without FPS probe |
+| --- | ---: | ---: | ---: |
+| Samples | 849 | 850 | 851 |
+| Median | 30.228 ms | 24.222 ms | 24.265 ms |
+| p95 | 36.307 ms | 30.337 ms | 30.395 ms |
+| p99 | 42.380 ms | 36.257 ms | 36.257 ms |
+
+The later capture omitted the injected requestAnimationFrame measurement loop
+to reduce probe interference, while retaining the same six synthetic gestures,
+conversation, profiler, and trace. No JavaScript long tasks were recorded in
+that capture. The approximately one-refresh reduction is consistent with
+removing the callback hold; build/load differences still prevent attributing
+the entire improvement exclusively to the patch. Synthetic gestures are
+synchronized differently from physical mouse events, so these are not measured
+physical input-to-panel latencies.
+
+For the quiet capture's median presented event, the non-overlapping stages were:
+
+| Stage | Duration |
+| --- | ---: |
+| Input transport and initial processing | 0.130 ms |
+| Chromium compositor queue and wait for main-frame work | 7.068 ms |
+| Main-frame work | 6.698 ms |
+| Commit, activation, and submission preparation | 0.725 ms |
+| Submission through presentation | 9.644 ms |
+
+These are components of one representative event, not a sum of independent
+percentiles. Layerize alone took 5.515 ms median and 6.521 ms p95 across the
+725 layer-preparation events. This approaches/exceeds the 6.06 ms refresh
+budget before the rest of the client pipeline and native composition.
+
+The native Wayland swap acknowledgement took approximately 4.1 ms median.
+Chromium's `MaybeProcessSubmittedFrames` waits for the preceding frame's buffers
+to be released before acknowledging the next submission. Typhon's composed
+release path transfers obligations to a GPU-fenced lease. This is a separate
+source of backpressure from the callback hold fixed above; the trace alone
+does not prove the GPU/buffer wait can safely be shortened.
+
+A temporary `WaylandExternalBeginFrameSource` experiment did not complete the
+CDP synthetic gestures, both with and without the FPS probe. At inspection the
+parsed client log had no outstanding frame callback, so the experiment is
+inconclusive and is not evidence of a compositor callback leak. The feature is
+disabled by default upstream and was not enabled persistently. Vesktop was
+restored to its original launch and settings after the experiment.
+
+Evidence and the category-scoped asynchronous-event parser are in the stable
+Aether diagnostics directory: `decompose-scroll.py`,
+`pacing-default-quiet-trace.json`, `pacing-default-quiet-scroll-decomposition.json`,
+and `vesktop-layers.json`. The layer snapshot contained 75 compositor layers;
+that count alone does not establish a defect or justify removing visual effects.
