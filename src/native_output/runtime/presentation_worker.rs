@@ -764,7 +764,12 @@ pub(super) fn native_output_damage_for_presented_scene(
         previous_scene,
         resolved_scene,
         scene_history.cursor_damage(cursor),
-    );
+    )
+    .union_surface_rects(scene_history.lifecycle_admission_damage(
+        &resolved_scene.lifecycle_snapshot,
+        width,
+        height,
+    ));
     if direct {
         damage
     } else {

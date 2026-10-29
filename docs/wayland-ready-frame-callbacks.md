@@ -984,3 +984,39 @@ repaints (14% vs 34% in the ordered-blur captures) and lower compositor CPU
 render time. The time-aging change was therefore not implemented. What raises
 queue-ready and full-repaint share in long sessions remains open; a capture
 after hours of use should compare those terms rather than the estimator window.
+
+
+## Minimize animation stalled after damage correction (2026-10-29)
+
+After the active-scene damage fix, minimizing a window froze the lamp
+animation until the pointer moved. A frame-counter sampler (`astreactl
+performance` every ~8 ms) captured two user minimizes without input: one
+produced 4 pageflips and then none for more than 3.7 s; the other produced 2,
+paused ~350 ms, briefly resumed and stopped again.
+
+Primary admission (`native_output_damage_for_presented_scene`) combined scene,
+cursor, opacity and clip damage but not lifecycle motion, which is sampled
+outside the logical scene. Only the later pageflip transition added lifecycle
+footprints. Before `30fa1ac6`, stale `Full` surface damage in the active-scene
+cache made every cycle render and hid this gap. With correct damage, a
+minimize frame whose only change is lifecycle progress became `NoPrimaryWork`:
+no frame was submitted, no pageflip completed, and nothing woke the loop until
+input. The damage fix exposed a latent admission bug rather than introducing
+wrong damage.
+
+`NativeSceneHistory::lifecycle_admission_damage` now adds the previous and
+current lifecycle footprints when the lifecycle snapshot signature changed, and
+admission unions it into primary damage. An unchanged signature adds nothing,
+so settled minimized windows do not force repaints. The red test
+`lifecycle_progress_alone_admits_a_primary_frame` failed on the motion
+assertion before the change and passes after it; it also checks that an
+unchanged sample stays empty.
+
+Runtime suite: 739 passed, 2 ignored, wake-authority count test excluded as
+before. `keyboard_layout_dispatch_qualifies_the_live_server_sequence` now fails
+to bind because its socket name embeds the PID: with six-digit PIDs after the
+reboot, the Aether `XDG_RUNTIME_DIR` path reaches 108 bytes (`SUN_LEN`). This is
+environmental and unrelated to the change. Release SHA-256
+`04b049c67d415c9b487a771e6c78914b2ad9005b4a9a714f179ced57d9b087b1`;
+logs `lifecycle-admission-*` in stable Aether diagnostics. Live confirmation
+requires restarting the compositor.

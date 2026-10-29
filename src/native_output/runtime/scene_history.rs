@@ -107,6 +107,27 @@ impl NativeSceneHistory {
         self.presented.as_ref().map(|snapshot| &snapshot.scene)
     }
 
+    /// Lifecycle motion is sampled outside the logical scene, so primary
+    /// admission needs its footprint change explicitly. Unchanged samples add
+    /// nothing, keeping settled minimized windows from forcing repaints.
+    pub(crate) fn lifecycle_admission_damage(
+        &self,
+        current: &LifecycleFrameSnapshot,
+        output_width: u32,
+        output_height: u32,
+    ) -> Vec<NativeDamageRect> {
+        let Some(previous) = self.presented.as_ref().map(|snapshot| &snapshot.lifecycle) else {
+            return Vec::new();
+        };
+        if previous.signature == current.signature {
+            return Vec::new();
+        }
+        lifecycle_damage_rects(previous, output_width, output_height)
+            .into_iter()
+            .chain(lifecycle_damage_rects(current, output_width, output_height))
+            .collect()
+    }
+
     pub(crate) fn ready_frame_identity(&self) -> Option<(u64, u64)> {
         self.ready
             .as_ref()
@@ -1022,6 +1043,86 @@ mod tests {
                 .lifecycle
                 .samples[0]
                 .mathematically_settled
+        );
+    }
+
+    fn resolved_with_lifecycle(
+        lifecycle_snapshot: LifecycleFrameSnapshot,
+    ) -> crate::native_output::runtime::frame::ResolvedNativeFrameScene<'static> {
+        let output_id = OutputId::from_raw(1).expect("nonzero output id");
+        crate::native_output::runtime::frame::ResolvedNativeFrameScene {
+            surfaces: std::borrow::Cow::Borrowed(&[]),
+            surface_scene_node_ids: std::borrow::Cow::Borrowed(&[]),
+            presentation_owner_root_surface_ids: std::borrow::Cow::Borrowed(&[]),
+            decorations: Vec::new(),
+            popup_surface_ids: std::borrow::Cow::Borrowed(&[]),
+            external_overlay_surface_ids: Vec::new(),
+            special_workspace_dim: oblivion_one::compositor::SpecialWorkspaceDim::default(),
+            wallpaper_echo: None,
+            render_generation: 2,
+            visibility: oblivion_one::compositor::FullscreenRenderPlanMetrics::default(),
+            snapshot: NativeSceneSnapshot::default(),
+            canonical_scene_evidence: None,
+            scene_identity_signature: 0,
+            workspace_presentation_sample: None,
+            special_workspace_presentation: None,
+            effects: ResolvedEffectScene::default(),
+            effect_scene_resolution_ns: None,
+            effect_scene_visible_instances: 0,
+            presentation: oblivion_one::compositor::PresentationSceneSample::empty_for_output(
+                output_id,
+                oblivion_one::compositor::AnimationTime::from_nanos(0),
+                oblivion_one::compositor::PresentationSampleTimeSource::ZeroFallback,
+            ),
+            presentation_snapshot: PresentationFrameSnapshot::empty_for_output(output_id),
+            lifecycle: LifecycleSceneSample {
+                sampled_at: oblivion_one::compositor::AnimationTime::from_nanos(0),
+                samples: Vec::new(),
+                minimized_visual_resource_payload_ids: Vec::new(),
+            },
+            lifecycle_marker_insertions: Vec::new(),
+            lifecycle_surfaces: Vec::new(),
+            lifecycle_decorations: Vec::new(),
+            lifecycle_snapshot,
+            window_exit_evidence: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn lifecycle_progress_alone_admits_a_primary_frame() {
+        // A minimize/restore frame may change nothing but lifecycle motion.
+        // Admission must see that motion, or the cycle ends as NoPrimaryWork
+        // and the animation stalls until unrelated input wakes the loop.
+        let mut presented = snapshot(1);
+        presented.lifecycle = lifecycle_snapshot(0.5);
+        let history = NativeSceneHistory::new(presented);
+
+        let moving = resolved_with_lifecycle(lifecycle_snapshot(0.75));
+        let damage = super::super::presentation_worker::native_output_damage_for_presented_scene(
+            false,
+            1920,
+            1080,
+            &history,
+            &moving,
+            (None, None),
+        );
+        assert!(
+            !damage.is_empty(),
+            "lifecycle motion must damage the output"
+        );
+
+        let unchanged = resolved_with_lifecycle(lifecycle_snapshot(0.5));
+        let damage = super::super::presentation_worker::native_output_damage_for_presented_scene(
+            false,
+            1920,
+            1080,
+            &history,
+            &unchanged,
+            (None, None),
+        );
+        assert!(
+            damage.is_empty(),
+            "an unchanged lifecycle sample must not manufacture repaint"
         );
     }
 
