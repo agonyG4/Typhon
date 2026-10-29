@@ -834,3 +834,64 @@ TYPHON_EFFECT_EXEC_TRACE=0` and a log file on Aether, run
 `capture-with-performance.py`, then split the commit→presented gap per commit
 into acquire wait, wait for a render slot, render to READY, READY to KMS
 submission, and submission to presentation.
+
+
+## Per-commit pipeline capture after restart (2026-10-29)
+
+The user restarted the compositor (PID 68699) with the release whose SHA-256 is
+`d53df0f11e46169cf37a59aa7d75b89009e7062e5d768aeead97849d47e18e64`,
+`TYPHON_SURFACE_PIPELINE_TRACE=stream`, native perf and effect trace disabled,
+and `OBLIVION_ONE_DIRECT_SCANOUT=experimental-auto`. This build was made from
+the working tree, so it also contains the six unrelated uncommitted files
+(direct scanout/dmabuf feedback work); no direct scanout counter changed during
+the scroll window. Vesktop ran under the diagnostic supervisor in the same
+maximized geometry with Kitty behind and blur unchanged (four assignments).
+The streamed trace wrote about 107 MB during the capture, so this session has
+logging overhead and is not a clean A/B against earlier captures.
+
+| Capture | Mean | p50 | p90 | p95 | p99 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `owner-fixed` | 27.08 | 24.39 | 30.44 | 30.50 | 36.48 |
+| `ordered-blur-fixed-repeat` | 27.03 | 24.33 | 30.42 | 35.97 | 36.45 |
+| `pipeline-stream` | 25.87 | 24.22 | 30.35 | 32.99 | 54.43 |
+
+Vblank buckets were 3 V: 82, 4 V: 583, 5 V: 145, 6 V: 9 and 33 events at
+7–13 V, so mass moved from 5 V to 4 V (335→145) while a new tail appeared.
+The compositor share fell: Wayland commit→presented p50/mean/p95 was
+6.38/6.51/10.11 ms (8.02/8.33/13.81 before) and commit→frame callback p50 1.68
+ms (2.6 before). Only 10/677 commits waited on the previous frame callback.
+
+The compositor-side stream agrees with the client log (commit→presented p50
+6.28 ms) and splits it per commit (677 scroll commits on surface 28):
+
+| Stage | p50 | p95 | max |
+| --- | ---: | ---: | ---: |
+| Commit → acquire ready (client GPU) | 0.29 | 0.84 | 12.58 |
+| Promotion → scene sampled (render slot + render) | 1.10 | 2.86 | 6.32 |
+| READY → KMS submission | 0.10 | 0.18 | 10.16 |
+| KMS submission → presented | 4.56 | 7.12 | 13.74 |
+
+In the median case Typhon renders and submits about 1.5 ms after the commit
+and the rest is waiting for the scanout refresh, close to the idealized
+deadline model (mean 6.25 ms at L = 3 ms). The 24 commits over two refreshes
+averaged 3.7 ms acquire wait (Chromium GPU work not finished), 3.5 ms waiting
+for KMS admission behind an earlier flip and 8.6 ms from submission to
+presentation; those stalls produce the 7–13 V Chromium tail together with
+renderer main-thread stalls. Their relation to the streaming log I/O is not
+established.
+
+Inside the scroll window, predictive-triple frames were 28/505 (5.5%),
+against 30%/30% in the ordered-blur captures and 61%/67% in `owner-fixed`.
+Across the three captures with client logs, compositor commit→presented means
+order the same way (8.78, 8.33, 6.51 ms). This is a correlation over three
+sessions, not proof: the render-ready risk estimator uses an evidence ceiling
+over its window, and a long-running session can keep render-ahead engaged,
+which queues frames one refresh deeper. This matches the earlier observation
+that render outliers pin the triple path. No pacing policy was changed.
+
+The remaining 24.2 ms median is now mostly upstream of the commit: for 4 V
+events input→Wayland commit is 18.2 ms (one synthetic-input refresh of
+queueing, about 9.5 ms renderer main thread including Layerize, and draw).
+Artifacts: `pipeline-stream-*` (trace, samples, client log, stage, latch and
+bucket logs, byte offsets into `pipeline-stream-session.log`) and
+`pipeline-stream-stages.py` in stable Aether diagnostics.
