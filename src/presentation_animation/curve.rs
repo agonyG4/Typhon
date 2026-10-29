@@ -16,6 +16,49 @@ pub enum EasingCurve {
     EaseOutBack,
     /// Hyprland's "quick" cubic Bezier (0.15, 0, 0.1, 1).
     Quick,
+    /// Qt's `QEasingCurve::InCurve`: a sine start blended into linear, which
+    /// KWin's Glide uses for opening windows.
+    QtInCurve,
+    /// Qt's `QEasingCurve::OutCurve`, the mirror used for closing windows.
+    QtOutCurve,
+}
+
+/// Qt's sine progress and smooth begin/end mix factor (qeasingcurve.cpp).
+fn qt_sin_progress(progress: f64) -> (f64, f64) {
+    let angle = progress * std::f64::consts::PI - std::f64::consts::FRAC_PI_2;
+    (
+        angle.sin() / 2.0 + 0.5,
+        std::f64::consts::FRAC_PI_2 * angle.cos(),
+    )
+}
+
+fn qt_mix_factor(value: f64) -> (f64, f64) {
+    let raw = 1.0 - value * 2.0 + 0.3;
+    if raw <= 0.0 {
+        (0.0, 0.0)
+    } else if raw >= 1.0 {
+        (1.0, 0.0)
+    } else {
+        (raw, -2.0)
+    }
+}
+
+fn qt_in_curve(progress: f64) -> (f64, f64) {
+    let (sine, sine_velocity) = qt_sin_progress(progress);
+    let (mix, mix_velocity) = qt_mix_factor(progress);
+    (
+        sine * mix + progress * (1.0 - mix),
+        sine_velocity * mix + (sine - progress) * mix_velocity + (1.0 - mix),
+    )
+}
+
+fn qt_out_curve(progress: f64) -> (f64, f64) {
+    let (sine, sine_velocity) = qt_sin_progress(progress);
+    let (mix, mix_velocity) = qt_mix_factor(1.0 - progress);
+    (
+        sine * mix + progress * (1.0 - mix),
+        sine_velocity * mix - (sine - progress) * mix_velocity + (1.0 - mix),
+    )
 }
 
 /// CSS-style cubic Bezier from (0, 0) to (1, 1) with control points
@@ -88,6 +131,8 @@ impl EasingCurve {
             Self::EaseOutExpo => cubic_bezier(0.16, 1.0, 0.3, 1.0, progress),
             Self::EaseOutBack => cubic_bezier(0.34, 1.56, 0.64, 1.0, progress),
             Self::Quick => cubic_bezier(0.15, 0.0, 0.1, 1.0, progress),
+            Self::QtInCurve => qt_in_curve(progress),
+            Self::QtOutCurve => qt_out_curve(progress),
             Self::EaseInOutCubic => {
                 if progress < 0.5 {
                     (

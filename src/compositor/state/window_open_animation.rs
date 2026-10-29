@@ -8,8 +8,39 @@ use crate::presentation_animation::{
 use std::time::Duration;
 
 const WINDOW_OPEN_SCALE_FACTOR: f64 = 0.94;
-const WINDOW_OPEN_GLIDE_OFFSET_LOGICAL_PIXELS: f64 = 24.0;
 const WINDOW_OPEN_BASE_DURATION: Duration = Duration::from_millis(180);
+/// KWin Glide's default duration.
+pub(super) const GLIDE_DURATION: Duration = Duration::from_millis(160);
+/// KWin Glide's InOpacity: windows start at 40% of their opacity.
+const GLIDE_OPEN_OPACITY: f64 = 0.4;
+
+/// Which window edge stays in place while Glide tilts the window away.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum GlideEdge {
+    Top,
+    Bottom,
+}
+
+/// KWin's Glide in two dimensions. KWin tilts the window 3 degrees about one
+/// edge and pushes it 30 units back (z scaled by 0.001) in front of a camera
+/// 1.1 away; we keep that projected size, averaged over the tilted height,
+/// anchored at the same edge.
+pub(super) fn glide_rect(rect: PresentationRect, edge: GlideEdge) -> Option<PresentationRect> {
+    const CAMERA_DEPTH: f64 = 1.1;
+    const DISTANCE: f64 = 30.0 * 0.001;
+    let tilt = 3.0_f64.to_radians();
+    let near_scale = CAMERA_DEPTH / (CAMERA_DEPTH + DISTANCE);
+    let far_scale = CAMERA_DEPTH / (CAMERA_DEPTH + DISTANCE + rect.height() * tilt.sin() * 0.001);
+    let scale = (near_scale + far_scale) / 2.0;
+    let width = rect.width() * scale;
+    let height = rect.height() * scale * tilt.cos();
+    let x = rect.x() + (rect.width() - width) / 2.0;
+    let y = match edge {
+        GlideEdge::Top => rect.y(),
+        GlideEdge::Bottom => rect.y() + rect.height() - height,
+    };
+    PresentationRect::new(x, y, width, height)
+}
 /// Hyprland's `popin 80%`: the window grows from 80% of its size, centered.
 const WINDOW_OPEN_POPIN_FACTOR: f64 = 0.8;
 
@@ -45,12 +76,7 @@ pub(super) fn window_open_animation_plan(
                 height,
             )?
         }
-        AnimationEffect::WindowGlide => PresentationRect::new(
-            target.x(),
-            target.y() + WINDOW_OPEN_GLIDE_OFFSET_LOGICAL_PIXELS,
-            target.width(),
-            target.height(),
-        )?,
+        AnimationEffect::WindowGlide => glide_rect(target, GlideEdge::Top)?,
         AnimationEffect::WindowPopin => {
             let width = target.width() * WINDOW_OPEN_POPIN_FACTOR;
             let height = target.height() * WINDOW_OPEN_POPIN_FACTOR;
@@ -83,13 +109,24 @@ pub(super) fn window_open_animation_plan(
         )
     };
 
+    if effect == AnimationEffect::WindowGlide {
+        let curve = scale_curve(
+            AnimationCurve::easing(GLIDE_DURATION, EasingCurve::QtInCurve),
+            speed,
+        );
+        return Some(WindowOpenAnimationPlan {
+            geometry_start,
+            geometry_target: target,
+            geometry_curve: curve,
+            opacity: Some(WindowOpenOpacityAnimationPlan {
+                start: PresentationOpacity::new(canonical_opacity.get() * GLIDE_OPEN_OPACITY)?,
+                target: canonical_opacity,
+                curve,
+            }),
+        });
+    }
     let opacity = match effect {
         AnimationEffect::WindowScale => None,
-        AnimationEffect::WindowGlide => Some(WindowOpenOpacityAnimationPlan {
-            start: PresentationOpacity::TRANSPARENT,
-            target: canonical_opacity,
-            curve: curve(),
-        }),
         _ => return None,
     };
 

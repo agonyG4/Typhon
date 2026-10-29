@@ -91,16 +91,23 @@ fn scale_plan_is_centered_at_ninety_four_percent_without_an_opacity_transition()
 }
 
 #[test]
-fn glide_plan_keeps_size_and_starts_twenty_four_logical_pixels_below_target() {
+fn glide_plan_tilts_in_from_the_top_edge_like_kwin() {
     let target = rect(100.0, 200.0, 500.0, 400.0);
-    let opacity = PresentationOpacity::new(0.37).expect("canonical opacity");
+    let opacity = PresentationOpacity::new(0.5).expect("canonical opacity");
     let plan = window_open_animation_plan(AnimationEffect::WindowGlide, target, opacity, 1.0)
         .expect("glide plan");
 
-    assert_eq!(plan.geometry_start, rect(100.0, 224.0, 500.0, 400.0));
+    let start = plan.geometry_start;
+    assert_eq!(start.y(), target.y());
+    assert!(start.width() < target.width() && start.width() > target.width() * 0.95);
+    assert!(start.height() < start.width() * target.height() / target.width());
+    assert!((start.x() + start.width() / 2.0 - (target.x() + target.width() / 2.0)).abs() < 1.0e-9);
     assert_eq!(plan.geometry_target, target);
     let opacity_transition = plan.opacity.expect("WindowGlide opacity transition");
-    assert_eq!(opacity_transition.start, PresentationOpacity::TRANSPARENT);
+    assert_eq!(
+        opacity_transition.start,
+        PresentationOpacity::new(0.2).unwrap()
+    );
     assert_eq!(opacity_transition.target, opacity);
 }
 
@@ -123,12 +130,13 @@ fn open_plan_uses_ease_out_cubic_and_existing_speed_scaling() {
         let glide_plan =
             window_open_animation_plan(AnimationEffect::WindowGlide, target, opacity, speed)
                 .expect("glide plan");
+        let glide_duration = Duration::from_millis(160).mul_f64(1.0 / speed);
         assert!(matches!(
             glide_plan.geometry_curve,
             AnimationCurve::Easing {
                 duration,
-                curve: EasingCurve::EaseOutCubic,
-            } if duration == Duration::from_millis(expected_duration)
+                curve: EasingCurve::QtInCurve,
+            } if duration == glide_duration
         ));
         assert!(matches!(
             glide_plan
@@ -137,8 +145,8 @@ fn open_plan_uses_ease_out_cubic_and_existing_speed_scaling() {
                 .curve,
             AnimationCurve::Easing {
                 duration,
-                curve: EasingCurve::EaseOutCubic,
-            } if duration == Duration::from_millis(expected_duration)
+                curve: EasingCurve::QtInCurve,
+            } if duration == glide_duration
         ));
     }
 }
@@ -306,12 +314,11 @@ fn window_glide_still_commits_geometry_and_opacity_together() {
             .sample_at_transition_start_for_scene_node(scene_node_id)
             .expect("WindowGlide Geometry start sample")
             .rect,
-        rect(
-            target.x(),
-            target.y() + 24.0,
-            target.width(),
-            target.height()
+        super::window_open_animation::glide_rect(
+            target,
+            super::window_open_animation::GlideEdge::Top
         )
+        .unwrap()
     );
     assert_eq!(
         state
@@ -319,7 +326,7 @@ fn window_glide_still_commits_geometry_and_opacity_together() {
             .sample_opacity_for_scene_node(scene_node_id, AnimationTime::from_nanos(0))
             .expect("WindowGlide Opacity start sample")
             .0,
-        PresentationOpacity::TRANSPARENT
+        PresentationOpacity::new(canonical_opacity.get() * 0.4).unwrap()
     );
     assert_eq!(
         state
@@ -396,7 +403,8 @@ fn window_glide_with_existing_geometry_owner_adds_only_its_opacity_track() {
             .sample_opacity_for_scene_node(scene_node_id, AnimationTime::from_nanos(0))
             .expect("WindowGlide opacity-only fallback sample")
             .0,
-        PresentationOpacity::TRANSPARENT
+        // KWin's Glide starts at 40% of the window's opacity.
+        PresentationOpacity::new(0.4).unwrap()
     );
 }
 
@@ -478,16 +486,22 @@ fn popin_plan_grows_from_eighty_percent_with_hyprland_curves() {
 #[test]
 fn hyprland_preset_requests_popin_windows_and_hyprland_geometry() {
     assert_eq!(
-        AnimationPreset::Hyprland.requested_effect(crate::animation_control::AnimationSlot::WindowOpen),
+        AnimationPreset::Hyprland
+            .requested_effect(crate::animation_control::AnimationSlot::WindowOpen),
         AnimationEffect::WindowPopin
     );
     assert_eq!(
-        AnimationPreset::Hyprland.requested_effect(crate::animation_control::AnimationSlot::WindowClose),
+        AnimationPreset::Hyprland
+            .requested_effect(crate::animation_control::AnimationSlot::WindowClose),
         AnimationEffect::WindowPopin
     );
     assert_eq!(
-        AnimationPreset::Hyprland.requested_effect(crate::animation_control::AnimationSlot::WindowMove),
+        AnimationPreset::Hyprland
+            .requested_effect(crate::animation_control::AnimationSlot::WindowMove),
         AnimationEffect::GeometryHyprland
     );
-    assert_eq!(AnimationPreset::parse("hyprland"), Some(AnimationPreset::Hyprland));
+    assert_eq!(
+        AnimationPreset::parse("hyprland"),
+        Some(AnimationPreset::Hyprland)
+    );
 }

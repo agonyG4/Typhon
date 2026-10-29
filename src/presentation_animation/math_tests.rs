@@ -159,3 +159,37 @@ fn hyprland_bezier_curves_match_their_control_points() {
         previous = value;
     }
 }
+
+#[test]
+fn qt_in_and_out_curves_match_qeasingcurve() {
+    for curve in [EasingCurve::QtInCurve, EasingCurve::QtOutCurve] {
+        close(curve.evaluate(0.0).0, 0.0);
+        close(curve.evaluate(1.0).0, 1.0);
+        let mut previous = 0.0;
+        for step in 1..100 {
+            let progress = f64::from(step) / 100.0;
+            let (value, velocity) = curve.evaluate(progress);
+            assert!(value >= previous, "{curve:?} decreases at {progress}");
+            previous = value;
+            // The analytic velocity matches a central difference away from
+            // the mix factor's kinks.
+            let h = 1.0e-5;
+            let numeric =
+                (curve.evaluate(progress + h).0 - curve.evaluate(progress - h).0) / (2.0 * h);
+            let kink = [0.15, 0.35, 0.65, 0.85]
+                .iter()
+                .any(|kink| (progress - kink).abs() < 0.02);
+            if !kink {
+                assert!(
+                    (velocity - numeric).abs() < 1.0e-3,
+                    "{curve:?} at {progress}"
+                );
+            }
+        }
+    }
+    // InCurve starts on the sine (slow) and ends linear; OutCurve mirrors it.
+    assert!(EasingCurve::QtInCurve.evaluate(0.1).0 < 0.05);
+    close(EasingCurve::QtInCurve.evaluate(0.8).0, 0.8);
+    close(EasingCurve::QtOutCurve.evaluate(0.2).0, 0.2);
+    assert!(EasingCurve::QtOutCurve.evaluate(0.9).0 > 0.95);
+}

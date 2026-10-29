@@ -24,7 +24,7 @@ fn scale_close_uses_physical_source_and_centered_ninety_four_percent_target() {
 }
 
 #[test]
-fn glide_close_uses_physical_source_and_moves_down_twenty_four_logical_pixels() {
+fn glide_close_recedes_about_the_bottom_edge_like_kwin() {
     let source = rect(33.0, 71.0, 511.0, 297.0);
     let source_opacity = PresentationOpacity::new(0.63).expect("presented opacity");
     let plan =
@@ -32,9 +32,22 @@ fn glide_close_uses_physical_source_and_moves_down_twenty_four_logical_pixels() 
             .expect("glide close plan");
 
     assert_eq!(plan.geometry_start, source);
-    assert_eq!(plan.geometry_target, rect(33.0, 95.0, 511.0, 297.0));
+    let target = plan.geometry_target;
+    // Pushed back to about 97% and anchored at the bottom, centered.
+    assert!(target.width() < source.width() && target.width() > source.width() * 0.95);
+    assert!((target.y() + target.height() - (source.y() + source.height())).abs() < 1.0e-9);
+    assert!(
+        (target.x() + target.width() / 2.0 - (source.x() + source.width() / 2.0)).abs() < 1.0e-9
+    );
     assert_eq!(plan.opacity_start, source_opacity);
     assert_eq!(plan.opacity_target, PresentationOpacity::TRANSPARENT);
+    assert!(matches!(
+        plan.opacity_curve,
+        AnimationCurve::Easing {
+            duration,
+            curve: EasingCurve::QtOutCurve,
+        } if duration == Duration::from_millis(160)
+    ));
 }
 
 #[test]

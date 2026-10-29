@@ -16,7 +16,6 @@ use std::time::Duration;
 
 const WINDOW_CLOSE_BASE_DURATION: Duration = Duration::from_millis(180);
 const WINDOW_CLOSE_SCALE_FACTOR: f64 = 0.94;
-const WINDOW_CLOSE_GLIDE_OFFSET_LOGICAL_PIXELS: f64 = 24.0;
 /// Hyprland's popin with no percentage shrinks to its 5x5 minimum, centered.
 const WINDOW_CLOSE_POPIN_MIN_EXTENT: f64 = 5.0;
 
@@ -51,11 +50,9 @@ pub(super) fn window_close_animation_plan(
                 height,
             )?
         }
-        AnimationEffect::WindowGlide => PresentationRect::new(
-            source_presented_rect.x(),
-            source_presented_rect.y() + WINDOW_CLOSE_GLIDE_OFFSET_LOGICAL_PIXELS,
-            source_presented_rect.width(),
-            source_presented_rect.height(),
+        AnimationEffect::WindowGlide => super::window_open_animation::glide_rect(
+            source_presented_rect,
+            super::window_open_animation::GlideEdge::Bottom,
         )?,
         AnimationEffect::WindowPopin => {
             let width = WINDOW_CLOSE_POPIN_MIN_EXTENT.min(source_presented_rect.width());
@@ -85,10 +82,16 @@ pub(super) fn window_close_animation_plan(
         });
     }
     let curve = || {
-        scale_curve(
-            AnimationCurve::easing(WINDOW_CLOSE_BASE_DURATION, EasingCurve::EaseInCubic),
-            speed,
-        )
+        let (duration, easing) = if effect == AnimationEffect::WindowGlide {
+            // KWin's Glide closes on Qt's OutCurve.
+            (
+                super::window_open_animation::GLIDE_DURATION,
+                EasingCurve::QtOutCurve,
+            )
+        } else {
+            (WINDOW_CLOSE_BASE_DURATION, EasingCurve::EaseInCubic)
+        };
+        scale_curve(AnimationCurve::easing(duration, easing), speed)
     };
 
     Some(WindowCloseAnimationPlan {
@@ -124,14 +127,14 @@ impl CompositorState {
                 | AnimationEffect::WindowGlide
                 | AnimationEffect::WindowPopin
         ) {
-            return false;
+            return self.decline_window_exit(root_surface_id, "effect_not_animated");
         }
 
         let Some(window_id) = self.window_id_for_surface(root_surface_id) else {
-            return false;
+            return self.decline_window_exit(root_surface_id, "no_window");
         };
         let Some(window) = self.window(window_id) else {
-            return false;
+            return self.decline_window_exit(root_surface_id, "window_missing");
         };
         let valid_root_role = match window.backend {
             WindowBackend::Xdg(handle) => {
@@ -147,11 +150,11 @@ impl CompositorState {
             || !self.window_is_visible_in_active_scene(window_id)
             || !self.window_exit_payloads.can_prepare_root(root_surface_id)
         {
-            return false;
+            return self.decline_window_exit(root_surface_id, "window_not_eligible");
         }
 
         let Some(scene_node_id) = self.scene_node_id_for_window_group(window_id) else {
-            return false;
+            return self.decline_window_exit(root_surface_id, "no_scene_node");
         };
         for kind in [
             PresentationRetainedVisualKind::WindowLifecycle,
@@ -162,23 +165,23 @@ impl CompositorState {
                 .active_retained_visual(scene_node_id, kind)
                 .is_some()
             {
-                return false;
+                return self.decline_window_exit(root_surface_id, "retained_visual_active");
             }
         }
         let Some(output_id) = self.native_output_id() else {
-            return false;
+            return self.decline_window_exit(root_surface_id, "no_output");
         };
         let Some(promoted) = self.presented_canonical_scene.as_ref() else {
-            return false;
+            return self.decline_window_exit(root_surface_id, "no_promoted_scene");
         };
         let Some(physical_geometry) = self.presented_window_geometry(root_surface_id) else {
-            return false;
+            return self.decline_window_exit(root_surface_id, "no_presented_geometry");
         };
         if physical_geometry.scene_node_id() != scene_node_id {
-            return false;
+            return self.decline_window_exit(root_surface_id, "presented_geometry_node_mismatch");
         }
         let Some(physical_frame) = self.presented_presentation.as_ref() else {
-            return false;
+            return self.decline_window_exit(root_surface_id, "no_presented_presentation");
         };
         let physical_opacity = physical_frame.opacity_for_scene_node(scene_node_id);
         let physical_clip = physical_frame.clip_for_scene_node(scene_node_id);
@@ -190,7 +193,7 @@ impl CompositorState {
             .map(|surface| self.presentation_owner_root_for_surface(surface.surface_id))
             .collect::<Vec<_>>();
         if surfaces.len() != scene_nodes.len() || surfaces.len() != owner_roots.len() {
-            return false;
+            return self.decline_window_exit(root_surface_id, "surface_alignment");
         }
         let mut current_group_surfaces = Vec::new();
         let mut current_group_nodes = Vec::new();
@@ -205,7 +208,7 @@ impl CompositorState {
             }
         }
         if current_group_surfaces.is_empty() {
-            return false;
+            return self.decline_window_exit(root_surface_id, "empty_group");
         }
 
         // Property tracks are cancelled during canonical teardown, after this
@@ -263,7 +266,7 @@ impl CompositorState {
             &presentation_keys,
             &visual_root_surface_ids,
         ) else {
-            return false;
+            return self.decline_window_exit(root_surface_id, "evidence_capture_failed");
         };
         if !super::window_exit_physical::prove_window_exit_source(
             Some(promoted),
@@ -274,7 +277,7 @@ impl CompositorState {
             &current_evidence.surfaces,
             true,
         ) {
-            return false;
+            return self.decline_window_exit(root_surface_id, "source_not_proven");
         }
 
         let canonical_geometry = window
@@ -285,7 +288,7 @@ impl CompositorState {
         let Some(canonical_rect) = canonical_geometry
             .and_then(|geometry| self.presentation_rect_for_geometry(root_surface_id, geometry))
         else {
-            return false;
+            return self.decline_window_exit(root_surface_id, "no_canonical_rect");
         };
         let Some(target) = targets
             .windows()
@@ -293,10 +296,10 @@ impl CompositorState {
             .copied()
             .find(|target| target.root_surface_id() == root_surface_id)
         else {
-            return false;
+            return self.decline_window_exit(root_surface_id, "no_presentation_target");
         };
         if target.scene_node_id() != scene_node_id || target.canonical_rect() != canonical_rect {
-            return false;
+            return self.decline_window_exit(root_surface_id, "target_mismatch");
         }
 
         let root_position = owner_roots
@@ -315,7 +318,7 @@ impl CompositorState {
             physical_opacity,
             speed,
         ) else {
-            return false;
+            return self.decline_window_exit(root_surface_id, "no_close_plan");
         };
         let current_group_id_set = current_group_surfaces
             .iter()
@@ -360,7 +363,7 @@ impl CompositorState {
                     .collect::<Vec<_>>()
             })
         else {
-            return false;
+            return self.decline_window_exit(root_surface_id, "visual_root_evidence_missing");
         };
 
         let content = Arc::new(WindowExitFrozenContent {
@@ -396,7 +399,7 @@ impl CompositorState {
             }
             let Some(obligation) = self.active_dmabuf_buffers.get(&surface.surface_id).cloned()
             else {
-                return false;
+                return self.decline_window_exit(root_surface_id, "dmabuf_obligation_missing");
             };
             if obligation.buffer_id != surface.buffer_id()
                 || self.buffer_release_is_owned(&obligation)
@@ -413,7 +416,7 @@ impl CompositorState {
                     },
                 )
             {
-                return false;
+                return self.decline_window_exit(root_surface_id, "dmabuf_obligation_conflict");
             }
             held_release_obligations.push(
                 super::window_exit_retained::WindowExitReleaseObligation {
@@ -432,7 +435,7 @@ impl CompositorState {
             .prepare_candidate_exact(root_surface_id, prepared)
             .is_err()
         {
-            return false;
+            return self.decline_window_exit(root_surface_id, "candidate_rejected");
         }
         let prepared = self
             .window_exit_payloads
@@ -441,14 +444,14 @@ impl CompositorState {
         for held in prepared.held_release_obligations.clone() {
             let Some(active) = self.active_dmabuf_buffers.remove(&held.surface_id) else {
                 self.restore_window_exit_candidate(prepared);
-                return false;
+                return self.decline_window_exit(root_surface_id, "dmabuf_obligation_moved");
             };
             if !active.same_release_token(&held.obligation)
                 || active.buffer_id != held.obligation.buffer_id
             {
                 self.active_dmabuf_buffers.insert(held.surface_id, active);
                 self.restore_window_exit_candidate(prepared);
-                return false;
+                return self.decline_window_exit(root_surface_id, "dmabuf_obligation_changed");
             }
         }
         match self
@@ -458,9 +461,18 @@ impl CompositorState {
             Ok(()) => true,
             Err(prepared) => {
                 self.restore_window_exit_candidate(prepared);
-                false
+                self.decline_window_exit(root_surface_id, "candidate_republish_rejected")
             }
         }
+    }
+
+    /// Closes are rare, so every declined exit names the guard that refused
+    /// it; a close that silently skips its animation is otherwise invisible.
+    fn decline_window_exit(&self, root_surface_id: u32, reason: &'static str) -> bool {
+        eprintln!(
+            "typhon.window_exit_admission event=preparation_skipped root_surface_id={root_surface_id} reason={reason}"
+        );
+        false
     }
 
     fn restore_window_exit_candidate(&mut self, prepared: PreparedWindowExit) {
