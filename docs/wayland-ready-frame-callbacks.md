@@ -740,3 +740,97 @@ Artifacts: `ordered-blur-fixed*`, `ordered-blur-validation-summary.json` and
 script records both scroll-bounded counters and trace quantiles. No new code
 or build was required for this validation report; the six unrelated dirty
 source files remain untouched.
+
+
+## Vblank-quantized attribution of the remaining scroll latency (2026-10-29)
+
+No new capture was taken for this analysis; it reuses the four comparable
+`quietbench` traces and the WAYLAND_DEBUG client logs of `owner-fixed` and
+`ordered-blur-fixed-repeat` (the latter preserved as
+`ordered-blur-fixed-repeat-client.log`). Presented scroll latency is strongly
+quantized to the 6.060637 ms refresh: the 24.4 ms median is four refreshes and
+the reported p95 values are five (30.4 ms) or six (36.3 ms) refreshes.
+
+| Capture | 3 V | 4 V | 5 V | 6 V | ≥7 V | Share ≤5 V |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `owner-fixed` | 22 | 451 | 345 | 33 | 1 | 96.0% |
+| `owner-fixed-repeat` | 28 | 465 | 337 | 22 | 0 | 97.4% |
+| `ordered-blur-fixed` | 43* | 403 | 344 | 49 | 12 | 92.8% |
+| `ordered-blur-fixed-repeat` | 32 | 442 | 335 | 43 | 0 | 95.0% |
+
+\* Includes two 2 V events.
+
+The p95 sits on the 5 V/6 V boundary, so the apparent p95 regression is roughly
+2–3% of presented updates crossing one extra refresh. In `ordered-blur-fixed`
+the twelve 7–9 V events have `SendBeginMainFrameToCommit` of 13–21 ms, i.e.
+renderer main-thread stalls, while their submit-to-presentation stays near
+12 ms. Buffering mode does not explain the shift either: predictive-triple share
+inside the scroll windows was 61%/67% in the earlier runs, 31%/30% in the new
+runs, and 18%/14% in the older `damage-fixed`/`release-followup` runs, all with
+the 30.4 ms p95 except the two new ones.
+
+Joining each presented Chromium event to its Wayland commit by presentation
+timestamp (all 851/852 matched) isolates the compositor share. Commit times are
+a lower bound because the client log clock is aligned with the minimum feedback
+delivery offset.
+
+| Client log | Scroll commits | Commit→presented p50/mean/p95 | Commit→frame callback p50/p95 |
+| --- | ---: | ---: | ---: |
+| `owner-fixed` | 723 | 8.56 / 8.78 / 13.71 ms | 3.0 / 7.2 ms |
+| `ordered-blur-fixed-repeat` | 705 | 8.02 / 8.33 / 13.81 ms | 2.6 / 7.3 ms |
+
+The compositor share did not get worse with the ordered blur correction; it is
+slightly lower. Grouping by total latency, the 4 V→5 V step adds about 2.4 ms
+before the commit (input→commit 17.5→19.8 ms) and 3.7 ms after it
+(commit→presented 6.8→10.4 ms); the 5 V group's frame callback arrives later
+(median 4.4 vs 2.0 ms after commit). About 11% of scroll commits (98/723 and
+76/705) are issued within 0.5 ms of the previous commit's frame callback, i.e.
+Chromium was still waiting on it; they concentrate in the 5 V group.
+
+A typical 4 V event spends about 5.7 ms in `RendererCompositorQueueingDelay`,
+8.7 ms in renderer main-thread work up to commit (Layerize ≈ 5.5 ms), about
+2 ms in activation/draw/submit, and 6.8 ms between Wayland commit and
+presentation. The queueing delay is nearly constant (p95 6.0 ms) because the
+synthetic gesture generator injects input aligned with BeginFrame; physical
+input arrives at random phase, so this part of the benchmark overstates real
+mouse latency by roughly half a refresh and must not be attributed to Typhon.
+
+As a reference, an idealized compositor that presents each commit at the first
+refresh at least L ms after it, in FIFO order, would give commit→presented
+mean/p95 of 6.15/9.06 ms for L = 3.0 ms and 6.91/9.77 ms for L = 3.5 ms on the
+same commit timeline, versus 8.33/13.81 ms measured. Allowing latest-state
+replacement instead of FIFO saves only another ~0.3–0.4 ms, so mailbox-style
+replacement of queued frames is not the main lever. The gap of roughly 1.4–2.2
+ms mean and 4 ms at p95 is not yet attributable: the compositor waits for the
+client's syncobj acquire point before applying a commit, and the client log
+cannot separate Chromium GPU completion from Typhon render, READY admission and
+KMS timing. Measured compositor render-ready (p50 2.75 ms, ceiling 4.9 ms) and
+fence-after-rendered (p50 1.8 ms) figures leave this open.
+
+Artifacts: `commit-latch-analysis.py`/`.log`, `vblank-bucket-stages.py`/`.log`
+and `scroll-buffering-modes.py`/`.log` in stable Aether diagnostics. No timing
+policy was changed based on this analysis.
+
+
+## Live per-commit pipeline stream (2026-10-29)
+
+`TYPHON_SURFACE_PIPELINE_TRACE` already records commit capture, acquire
+pending/ready, transaction promotion, scene sampling, frame callback admission,
+output frame rendered/submitted/presented, presentation feedback and buffer
+release with surface, commit and output-frame identities. It only kept a
+512-record ring printed at shutdown, with timestamps relative to a process-local
+epoch, which cannot cover a scroll capture or be joined with client traces.
+
+The value `stream` now also prints every record as it happens, appending an
+absolute `monotonic_ns=` stamp (CLOCK_MONOTONIC, the clock used by
+wp_presentation and Chromium trace timestamps). `1`/`true`/`on` keep the
+previous ring-only behavior, and the shutdown dump format is unchanged. This is
+diagnostic only and is off by default. Unit tests cover mode parsing and the
+streamed line format (`pipeline-stream-tests.log`).
+
+Next capture: start the compositor with
+`TYPHON_SURFACE_PIPELINE_TRACE=stream OBLIVION_ONE_PERF_LOG=0
+TYPHON_EFFECT_EXEC_TRACE=0` and a log file on Aether, run
+`capture-with-performance.py`, then split the commit→presented gap per commit
+into acquire wait, wait for a render slot, render to READY, READY to KMS
+submission, and submission to presentation.

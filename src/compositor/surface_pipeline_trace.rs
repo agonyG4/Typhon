@@ -3,6 +3,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn trace_mode_accepts_ring_and_stream_values() {
+        assert_eq!(trace_mode_from_value(None), (false, false));
+        assert_eq!(trace_mode_from_value(Some("0")), (false, false));
+        assert_eq!(trace_mode_from_value(Some("on")), (true, false));
+        assert_eq!(trace_mode_from_value(Some("stream")), (true, true));
+    }
+
+    #[test]
+    fn streamed_record_line_carries_absolute_monotonic_time() {
+        let record = SurfacePipelineRecord::commit_captured(7, SurfaceCommitSequence(11));
+        let ring = format_record(&record, None);
+        let streamed = format_record(&record, Some(42));
+        assert!(ring.starts_with("typhon_surface_pipeline timestamp_ns="));
+        assert!(!ring.contains("monotonic_ns="));
+        assert_eq!(streamed, format!("{ring} monotonic_ns=42"));
+    }
+
+    #[test]
     fn disabled_trace_retains_no_records() {
         let mut trace = SurfacePipelineTrace::new(false, 4);
         trace.record(SurfacePipelineRecord::commit_captured(
@@ -423,6 +441,10 @@ impl CompositorState {
 pub(crate) struct SurfacePipelineTrace {
     records: Option<VecDeque<SurfacePipelineRecord>>,
     capacity: usize,
+    /// Emit each record as it happens, stamped with absolute CLOCK_MONOTONIC so
+    /// live captures can be joined with client and KMS timelines. The bounded
+    /// ring is still kept for the shutdown dump.
+    stream: bool,
 }
 
 impl SurfacePipelineTrace {
@@ -430,20 +452,26 @@ impl SurfacePipelineTrace {
         Self {
             records: enabled.then(|| VecDeque::with_capacity(capacity)),
             capacity,
+            stream: false,
         }
     }
 
     pub(crate) fn from_env() -> Self {
-        let enabled = std::env::var("TYPHON_SURFACE_PIPELINE_TRACE")
-            .ok()
-            .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "on"));
-        Self::new(enabled, SURFACE_PIPELINE_TRACE_CAPACITY)
+        let value = std::env::var("TYPHON_SURFACE_PIPELINE_TRACE").ok();
+        let (enabled, stream) = trace_mode_from_value(value.as_deref());
+        let mut trace = Self::new(enabled, SURFACE_PIPELINE_TRACE_CAPACITY);
+        trace.stream = stream;
+        trace
     }
 
     pub(crate) fn record(&mut self, record: SurfacePipelineRecord) {
         let Some(records) = self.records.as_mut() else {
             return;
         };
+        if self.stream {
+            let monotonic_ns = crate::native::event_loop::monotonic_now_ns().ok();
+            eprintln!("{}", format_record(&record, monotonic_ns));
+        }
         if self.capacity == 0 {
             return;
         }
@@ -468,25 +496,42 @@ impl SurfacePipelineTrace {
 
     pub(crate) fn dump(&self) {
         for record in self.records() {
-            eprintln!(
-                "typhon_surface_pipeline timestamp_ns={} event={:?} surface_id={} surface_generation={:?} commit_sequence={} buffer_id={:?} buffer_generation={:?} xwayland_generation={:?} association_serial={:?} frame_batch_id={:?} surface_tree_transaction_id={:?} output_transaction_id={:?} output_frame_id={:?} pageflip_token={:?}",
-                record.timestamp_ns,
-                record.kind,
-                record.surface_id,
-                record.surface_generation,
-                record.commit_sequence.get(),
-                record.buffer_id,
-                record.buffer_generation,
-                record.xwayland_generation,
-                record.association_serial,
-                record.frame_batch_id,
-                record.surface_tree_transaction_id,
-                record.output_transaction_id,
-                record.output_frame_id,
-                record.pageflip_token,
-            );
+            eprintln!("{}", format_record(record, None));
         }
     }
+}
+
+/// `1`/`true`/`on` keep the shutdown ring; `stream` also logs every record live.
+fn trace_mode_from_value(value: Option<&str>) -> (bool, bool) {
+    match value {
+        Some("1" | "true" | "on") => (true, false),
+        Some("stream") => (true, true),
+        _ => (false, false),
+    }
+}
+
+fn format_record(record: &SurfacePipelineRecord, monotonic_ns: Option<u64>) -> String {
+    let mut line = format!(
+        "typhon_surface_pipeline timestamp_ns={} event={:?} surface_id={} surface_generation={:?} commit_sequence={} buffer_id={:?} buffer_generation={:?} xwayland_generation={:?} association_serial={:?} frame_batch_id={:?} surface_tree_transaction_id={:?} output_transaction_id={:?} output_frame_id={:?} pageflip_token={:?}",
+        record.timestamp_ns,
+        record.kind,
+        record.surface_id,
+        record.surface_generation,
+        record.commit_sequence.get(),
+        record.buffer_id,
+        record.buffer_generation,
+        record.xwayland_generation,
+        record.association_serial,
+        record.frame_batch_id,
+        record.surface_tree_transaction_id,
+        record.output_transaction_id,
+        record.output_frame_id,
+        record.pageflip_token,
+    );
+    if let Some(monotonic_ns) = monotonic_ns {
+        line.push_str(&format!(" monotonic_ns={monotonic_ns}"));
+    }
+    line
 }
 
 impl Default for SurfacePipelineTrace {
