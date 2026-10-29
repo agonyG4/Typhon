@@ -186,7 +186,7 @@ impl NativeRenderTelemetry {
     }
 }
 
-fn timing_summary_snapshot(summary: TimingSummary) -> TimingSummarySnapshot {
+pub(super) fn timing_summary_snapshot(summary: TimingSummary) -> TimingSummarySnapshot {
     let total_us = summary.total_ns / 1_000;
     TimingSummarySnapshot {
         count: summary.count,
@@ -314,6 +314,12 @@ impl NativeRuntime {
         let mut timing_scopes = BTreeMap::new();
         for (name, summary) in &self.timing_scopes {
             timing_scopes.insert((*name).to_string(), timing_summary_snapshot(*summary));
+        }
+        for (name, snapshot) in self
+            .dmabuf_gpu_release_registry
+            .diagnostic_timing_snapshots()
+        {
+            timing_scopes.insert(name.to_string(), snapshot);
         }
         PerformanceSnapshot {
             compositor_cpu_render,

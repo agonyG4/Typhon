@@ -165,3 +165,74 @@ Aether diagnostics directory: `decompose-scroll.py`,
 `pacing-default-quiet-trace.json`, `pacing-default-quiet-scroll-decomposition.json`,
 and `vesktop-layers.json`. The layer snapshot contained 75 compositor layers;
 that count alone does not establish a defect or justify removing visual effects.
+
+### Follow-up: buffer release and swap acknowledgement
+
+Matching frame IDs in the existing quiet trace confirms the Chromium ordering:
+submission N is acknowledged after buffer N-1 is released, rather than after
+buffer N itself is released. Across 1,404 matched frames:
+
+| Client-observed interval | Median | p95 | p99 |
+| --- | ---: | ---: | ---: |
+| Previous buffer release to new submission acknowledgement | 0.065 ms | 0.769 ms | 2.149 ms |
+| New frame callback delivery to previous buffer release | 2.053 ms | 3.390 ms | 4.051 ms |
+| New frame callback request to previous buffer release | 4.547 ms | 8.732 ms | 11.538 ms |
+
+These are measurements from client-side trace events. The last two rows include
+GPU execution, compositor scheduling and client delivery; they do not isolate
+any one of these costs. The first row shows prompt median acknowledgement once
+the release arrives, with a longer tail. Swap waits overlap the existing input
+pipeline and must not be added again to its total latency. Evidence:
+`/mnt/Aether/Desktop/GitHub/Typhon-target/diagnostics/release-to-swap-ack.json`.
+
+The GPU-fenced release registry now exposes three entries in the existing
+`performance` JSON `timingScopes` map, without changing buffer ownership:
+
+- `dmabuf_gpu_fence_wait`: registration to the kernel's actual completion-fence
+  signal. A fence already signalled at registration contributes zero. This is
+  remaining GPU wait after registration, not the entire render duration.
+- `dmabuf_gpu_release_service`: wall time servicing a ready release, including
+  the fence timestamp query and completion callback. This separates service
+  work from the delay before that work starts. It can be sampled even when
+  the GPU timestamp is unavailable.
+- `dmabuf_gpu_signal_to_release`: kernel fence signal to return from completing
+  the release obligations. This includes reactor scheduling, timestamp query,
+  ownership revalidation and successful release signalling/event enqueueing.
+  It excludes subsequent Wayland socket flushing and Chromium event handling.
+
+All expose microseconds and aggregate the output, rather than identifying an
+individual application. Use controlled scroll captures and correlate with the
+client trace before attributing the samples to Vesktop. Counts, means and maxima cover the session; exact
+p50/p95/p99 use the latest 256 valid samples. A delivery sample represents a
+GPU-fenced lease with at least one successfully completed obligation. Deferred
+current buffers, failed release signals, unavailable timestamps, zero signal
+timestamps and completion clocks earlier than the GPU signal do not create a
+delivery sample. Release paths outside this registry are not sampled. Always
+check `count` before interpreting zero timings.
+
+The release logic is unchanged, including direct-KMS ownership guards and
+reactivation checks. A regression first failed with an empty timing snapshot,
+then passed after recording completion. It verifies post-completion timing,
+exact quantiles, exclusion of deferred obligations and readiness replay.
+Another test verifies missing/inverted clocks do not block release or produce
+false zero-delay samples. All 42 registry tests passed. The targeted Clippy
+performance check remains blocked by diagnostics outside these changed files,
+including large enum/error variants and an always-false protocol comparison;
+it is not a passing check. Its output is in the Aether diagnostics directory
+as `release-timing-clippy.log`.
+
+The offline release build and its `--help` smoke check passed, and the binary
+contains all three diagnostic scope names. A new compositor session using that
+Aether executable is required to collect the new metrics. This instrumentation is not a demonstrated latency
+fix, and no GPU-versus-reactor attribution is claimed before that measurement.
+Query the running session with:
+
+```sh
+/mnt/Aether/Desktop/GitHub/Typhon-target/release/astreactl --json performance
+```
+
+Select the built compositor when launching the next session:
+
+```sh
+OBLIVION_ONE_BINARY=/mnt/Aether/Desktop/GitHub/Typhon-target/release/oblivion-one bin/start-oblivion-one-tty
+```

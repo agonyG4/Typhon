@@ -5,16 +5,17 @@ use std::{
 };
 
 use oblivion_one::compositor::{DmabufGpuReleaseLeaseId, OwnCompositorServer};
+use oblivion_one::control_snapshots::TimingSummarySnapshot;
 use oblivion_one::native::{
     event_loop::{NativeEventLoop, NativeEventSource, ReactorToken},
     sync_file::query_sync_file_info,
 };
 
 use crate::egl_renderer::native_fence::NativeRenderFence;
-use crate::native_output::NativePerfField;
 use crate::native_output::kms_worker::KmsCommitWorkerHandle;
 use crate::native_output::pacing::BoundedSamples;
 use crate::native_output::scanout::AtomicEglGbmScanout;
+use crate::native_output::{NativePerfField, TimingSummary};
 use crate::native_output::{
     OutputNoPageflipReason, OutputPhysicalTerminal, OutputTransactionId, OutputTransactionLedger,
 };
@@ -142,6 +143,11 @@ pub(crate) struct DmabufGpuReleaseObservability {
     correlations: HashMap<OutputTransactionId, DmabufGpuReleaseCorrelation>,
     summary: DmabufGpuReleaseQualificationSummary,
     fence_wait_ns: BoundedSamples<DMABUF_GPU_RELEASE_SAMPLE_CAPACITY>,
+    fence_wait_summary: TimingSummary,
+    signal_to_release_ns: BoundedSamples<DMABUF_GPU_RELEASE_SAMPLE_CAPACITY>,
+    signal_to_release_summary: TimingSummary,
+    release_service_ns: BoundedSamples<DMABUF_GPU_RELEASE_SAMPLE_CAPACITY>,
+    release_service_summary: TimingSummary,
     release_to_pageflip_lead_ns: BoundedSamples<DMABUF_GPU_RELEASE_SAMPLE_CAPACITY>,
     pageflip_to_release_lag_ns: BoundedSamples<DMABUF_GPU_RELEASE_SAMPLE_CAPACITY>,
 }
@@ -273,9 +279,11 @@ impl DmabufGpuReleaseObservability {
                 .already_signaled_before_registration
                 .saturating_add(1);
             self.fence_wait_ns.record(0);
+            self.fence_wait_summary.record(0);
         } else {
-            self.fence_wait_ns
-                .record(signal_ns.saturating_sub(registered_at_ns));
+            let wait_ns = signal_ns.saturating_sub(registered_at_ns);
+            self.fence_wait_ns.record(wait_ns);
+            self.fence_wait_summary.record(wait_ns);
         }
         if let DmabufGpuReleaseOrigin::Composited { transaction_id } = origin {
             self.note_gpu_signal(transaction_id, signal_ns);
@@ -693,6 +701,41 @@ impl DmabufGpuReleaseRegistry {
         self.metrics
     }
 
+    pub(crate) fn diagnostic_timing_snapshots(&self) -> [(&'static str, TimingSummarySnapshot); 3] {
+        let snapshot = |summary, samples: &BoundedSamples<DMABUF_GPU_RELEASE_SAMPLE_CAPACITY>| {
+            let mut result = super::metrics::timing_summary_snapshot(summary);
+            let (p50, p95, p99) = samples.percentiles();
+            // Retain exact recent quantiles rather than TimingSummary's coarse buckets.
+            result.p50_us = p50 / 1_000;
+            result.p95_us = p95 / 1_000;
+            result.p99_us = p99 / 1_000;
+            result
+        };
+        [
+            (
+                "dmabuf_gpu_fence_wait",
+                snapshot(
+                    self.observability.fence_wait_summary,
+                    &self.observability.fence_wait_ns,
+                ),
+            ),
+            (
+                "dmabuf_gpu_release_service",
+                snapshot(
+                    self.observability.release_service_summary,
+                    &self.observability.release_service_ns,
+                ),
+            ),
+            (
+                "dmabuf_gpu_signal_to_release",
+                snapshot(
+                    self.observability.signal_to_release_summary,
+                    &self.observability.signal_to_release_ns,
+                ),
+            ),
+        ]
+    }
+
     pub(crate) fn qualification_summary(&self) -> DmabufGpuReleaseQualificationSummary {
         self.observability.summary()
     }
@@ -733,6 +776,7 @@ impl DmabufGpuReleaseRegistry {
                     .map(|info| Some(info.signal_timestamp_ns))
             },
             |lease_id| server.complete_dmabuf_gpu_release_lease(lease_id),
+            oblivion_one::native::event_loop::monotonic_now_ns,
         )
     }
 
@@ -743,7 +787,13 @@ impl DmabufGpuReleaseRegistry {
         event_loop: &mut NativeEventLoop,
         complete: impl FnMut(DmabufGpuReleaseLeaseId) -> usize,
     ) -> io::Result<usize> {
-        self.service_ready_with_timestamp(tokens, event_loop, |_| Ok(None), complete)
+        self.service_ready_with_timestamp(
+            tokens,
+            event_loop,
+            |_| Ok(None),
+            complete,
+            oblivion_one::native::event_loop::monotonic_now_ns,
+        )
     }
 
     fn service_ready_with_timestamp(
@@ -752,27 +802,59 @@ impl DmabufGpuReleaseRegistry {
         event_loop: &mut NativeEventLoop,
         mut timestamp: impl FnMut(&DmabufGpuReleaseWatch) -> io::Result<Option<u64>>,
         mut complete: impl FnMut(DmabufGpuReleaseLeaseId) -> usize,
+        mut now_ns: impl FnMut() -> io::Result<u64>,
     ) -> io::Result<usize> {
         let mut completed = 0;
         for token in tokens.iter().copied() {
             if !self.watches.contains_key(&token) {
                 continue;
             }
+            let service_started_ns = now_ns().ok();
             // Unregister before removing the owned watch.  If the reactor
             // reports an error, the watch remains the registry's obligation.
             let _ = event_loop.unregister(token)?;
             let Some(watch) = self.watches.remove(&token) else {
                 continue;
             };
-            match timestamp(&watch) {
-                Ok(Some(signal_ns)) => self.observability.record_exact_signal(
-                    watch.origin,
-                    watch.registered_at_ns,
-                    signal_ns,
-                ),
-                Ok(None) | Err(_) => self.observability.note_timestamp_unavailable(watch.origin),
-            }
+            let signal_ns = match timestamp(&watch) {
+                Ok(Some(signal_ns)) => {
+                    self.observability.record_exact_signal(
+                        watch.origin,
+                        watch.registered_at_ns,
+                        signal_ns,
+                    );
+                    Some(signal_ns)
+                }
+                Ok(None) | Err(_) => {
+                    self.observability.note_timestamp_unavailable(watch.origin);
+                    None
+                }
+            };
             let watch_completed = complete(watch.lease_id);
+            // Only actual release completion is a delivery sample. Reactivated
+            // buffers and failed explicit signals remain deferred obligations.
+            // This ends after signalling/enqueuing the release, before client
+            // socket delivery or Chromium's own event processing.
+            if watch_completed > 0
+                && let Ok(completed_at_ns) = now_ns()
+            {
+                if let Some(signal_ns) = signal_ns.filter(|ns| *ns > 0)
+                    && let Some(delay_ns) = completed_at_ns.checked_sub(signal_ns)
+                {
+                    self.observability.signal_to_release_ns.record(delay_ns);
+                    self.observability
+                        .signal_to_release_summary
+                        .record(delay_ns);
+                }
+                if let Some(started_ns) = service_started_ns
+                    && let Some(service_ns) = completed_at_ns.checked_sub(started_ns)
+                {
+                    self.observability.release_service_ns.record(service_ns);
+                    self.observability
+                        .release_service_summary
+                        .record(service_ns);
+                }
+            }
             let _completion_fd = watch.completion_fd;
             completed += watch_completed;
             self.metrics.leases_completed = self.metrics.leases_completed.saturating_add(1);
@@ -1090,6 +1172,91 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    #[test]
+    fn release_delivery_timing_samples_completed_obligations_after_completion() {
+        let mut event_loop = NativeEventLoop::new().unwrap();
+        let mut registry = DmabufGpuReleaseRegistry::default();
+        let completed_id = lease_id(&mut registry);
+        let deferred_id = lease_id(&mut registry);
+        let mut writers = Vec::new();
+        for id in [completed_id, deferred_id] {
+            let (read, write) = pipe();
+            registry
+                .register_with_origin(
+                    id,
+                    read,
+                    &mut event_loop,
+                    DmabufGpuReleaseOrigin::NoVisual,
+                    1,
+                    1_000_000,
+                )
+                .unwrap();
+            unsafe { libc::write(write.as_raw_fd(), [1_u8].as_ptr().cast(), 1) };
+            writers.push(write);
+        }
+        let wakeup = event_loop.wait().unwrap();
+        assert_eq!(wakeup.dmabuf_gpu_release_tokens.len(), 2);
+        let now = std::cell::Cell::new(3_000_000);
+        let service = |registry: &mut DmabufGpuReleaseRegistry,
+                       event_loop: &mut NativeEventLoop| {
+            registry
+                .service_ready_with_timestamp(
+                    &wakeup.dmabuf_gpu_release_tokens,
+                    event_loop,
+                    |_| Ok(Some(2_000_000)),
+                    |id| {
+                        if id == completed_id {
+                            now.set(4_537_000);
+                            1
+                        } else {
+                            0
+                        }
+                    },
+                    || Ok(now.get()),
+                )
+                .unwrap()
+        };
+        assert_eq!(service(&mut registry, &mut event_loop), 1);
+        // Readiness replay must neither repeat a release nor add a timing sample.
+        assert_eq!(service(&mut registry, &mut event_loop), 0);
+        let [(_, fence), (_, service), (_, delivery)] = registry.diagnostic_timing_snapshots();
+        assert_eq!(fence.count, 2);
+        assert_eq!(fence.p50_us, 1_000);
+        assert_eq!(delivery.count, 1);
+        assert_eq!(delivery.p50_us, 2_537);
+        assert_eq!(delivery.last_us, 2_537);
+        assert_eq!(service.count, 1);
+        assert_eq!(service.p50_us, 1_537);
+    }
+
+    #[test]
+    fn release_delivery_timing_omits_invalid_clocks_without_blocking_release() {
+        for (signal, completion) in [
+            (Some(2_000_000), Some(1_000_000)),
+            (Some(2_000_000), None),
+            (None, Some(3_000_000)),
+        ] {
+            let mut event_loop = NativeEventLoop::new().unwrap();
+            let mut registry = DmabufGpuReleaseRegistry::default();
+            let id = lease_id(&mut registry);
+            let (read, write) = pipe();
+            registry.register(id, read, &mut event_loop).unwrap();
+            unsafe { libc::write(write.as_raw_fd(), [1_u8].as_ptr().cast(), 1) };
+            let wakeup = event_loop.wait().unwrap();
+            let completed = registry
+                .service_ready_with_timestamp(
+                    &wakeup.dmabuf_gpu_release_tokens,
+                    &mut event_loop,
+                    |_| Ok(signal),
+                    |_| 1,
+                    || completion.ok_or_else(|| io::Error::other("clock unavailable")),
+                )
+                .unwrap();
+            assert_eq!(completed, 1);
+            assert_eq!(registry.diagnostic_timing_snapshots()[2].1.count, 0);
+        }
+    }
 
     #[test]
     fn deferred_release_fence_completion_rejects_stale_job_or_control_epoch() {
@@ -1588,6 +1755,7 @@ mod tests {
                     completed.push(lease_id);
                     1
                 },
+                || Ok(4_000_000),
             )
             .unwrap();
 
@@ -1925,6 +2093,7 @@ mod tests {
                     completions += 1;
                     3
                 },
+                || Ok(4_000),
             )
             .unwrap();
         registry.note_composited_pageflip(transaction_id, 3_000);
@@ -1973,6 +2142,7 @@ mod tests {
                     completions += 1;
                     2
                 },
+                || Ok(4_000),
             )
             .unwrap();
 
