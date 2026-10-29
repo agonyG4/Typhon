@@ -359,6 +359,16 @@ region limit permits, and effect transition damage is identity-based so an
 unchanged static effect does not dirty itself every frame. Continuous effects
 request localized compositor-owned frame demand.
 
+A partial frame never changes pixels outside its repaint. The surfaces above a
+blur anchor are replayed only inside the repaint, so a composite or output
+post-process pass whose executed region extends past it (a composite region
+wider than the repair, or an overflow fallback to the instance's whole
+influence region) would show the backdrop without the window above it. Those
+pixels are captured before the graph runs and restored afterwards, the same
+way extra scene work is preserved. Without this, a translucent blurred window
+such as Zen showed the wallpaper over part or all of its content until a later
+frame repainted it.
+
 A successful trusted registry reload invalidates presented effect history and
 queues one compositor-owned redraw. `OnDamage` effects remain one-shot after
 that refresh, `Continuous` effects keep their existing cadence, and failed

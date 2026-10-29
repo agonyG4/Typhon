@@ -5789,3 +5789,91 @@ fn shared_backdrop_capture_is_bottom_left_on_top_left_scanout() {
         "a top-left scanout scene must store the same bottom-left capture"
     );
 }
+
+// A blur composite planned from a small source repair covers the repair
+// expanded by the kernel footprint. When the frame repaints only the repair,
+// the surfaces above the blur anchor are replayed only there, so any composite
+// pixel outside it would show the backdrop without the window above it.
+#[test]
+fn replay_blur_composite_leaves_pixels_outside_the_repaint_unchanged() {
+    let output_size = (160, 120);
+    let bounds = EffectRect::new(0, 0, output_size.0, output_size.1).expect("output bounds");
+    let rect = EffectRect::new(18, 14, 96, 72).expect("blur domain");
+    let visual_group = VisualGroupId::new(79).expect("test visual group");
+    let (scene, registry) = terminal_builtin_blur_scene(
+        rect,
+        visual_group,
+        oblivion_one::material::EffectiveMaterial {
+            blur: 0.37,
+            saturation: 1.0,
+            noise: 0.0,
+        },
+        None,
+    );
+    let config = effects::EffectDebugConfig::new(
+        effects::EffectDebugCaptureMode::Replay,
+        effects::EffectDebugKawaseMode::Partial,
+    );
+    let mut harness = GlesEffectTestHarness::new(output_size.0, output_size.1);
+    install_diagnostic_scene(&mut harness, rect, visual_group);
+    let initial_graph = terminal_graph_variant(&scene, &registry, bounds, false);
+    execute_diagnostic_frame_with_origin(
+        &mut harness,
+        &initial_graph,
+        &diagnostic_repaint_plan_for_repairs_in_size(&[], true, output_size),
+        EffectRegion::from_rect(bounds),
+        true,
+        config,
+        OutputFramebufferOrigin::BottomLeft,
+    );
+    let initial_pixels = read_diagnostic_pixels(&harness);
+
+    let repair = OutputRect::new(60, 40, 4, 4);
+    update_diagnostic_background_for_surface(&harness, 7, repair, [207, 43, 89, 255]);
+    let source_damage = diagnostic_region(repair);
+    let repair_graph =
+        terminal_graph_variant_with_source_damage(&scene, &registry, bounds, &source_damage, false);
+    assert!(
+        repair_graph
+            .final_damage
+            .subtract(&source_damage)
+            .rects()
+            .iter()
+            .any(|rect| rect.width > 0 && rect.height > 0),
+        "the blur footprint must expand the composite beyond the repaint"
+    );
+    execute_diagnostic_frame_with_origin(
+        &mut harness,
+        &repair_graph,
+        &diagnostic_repaint_plan_for_repairs_in_size(&[repair], false, output_size),
+        source_damage,
+        false,
+        config,
+        OutputFramebufferOrigin::BottomLeft,
+    );
+    let partial_pixels = read_diagnostic_pixels(&harness);
+
+    let (width, height) = output_size;
+    let mut changed_outside_repair = 0;
+    for row in 0..height {
+        // Rows are read bottom-up from a bottom-left framebuffer.
+        let y = (height - 1 - row) as i32;
+        for x in 0..width as i32 {
+            let inside = x >= repair.x
+                && x < repair.x + repair.width as i32
+                && y >= repair.y
+                && y < repair.y + repair.height as i32;
+            if inside {
+                continue;
+            }
+            let index = (row as usize * width as usize + x as usize) * 4;
+            if initial_pixels[index..index + 4] != partial_pixels[index..index + 4] {
+                changed_outside_repair += 1;
+            }
+        }
+    }
+    assert_eq!(
+        changed_outside_repair, 0,
+        "a partial frame must not change pixels outside its repaint"
+    );
+}

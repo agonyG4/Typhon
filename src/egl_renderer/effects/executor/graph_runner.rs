@@ -313,6 +313,54 @@ pub(super) fn scene_replay_work_mode(
     }
 }
 
+/// Rects outside the repaint that executed final-output passes write. Overlap
+/// with other preserved work is harmless: capture and restore are identity
+/// blits into a full-output texture.
+pub(super) fn final_output_spill_work(
+    graph: &CompiledFrameGraph,
+    selection: &EffectExecutionSelection,
+    demand: &EffectExecutionDemand,
+    repaint_rects: &[OutputRect],
+    output_size: (u32, u32),
+    scene_baseline_authority: SceneBaselineAuthority,
+    debug_config: EffectDebugConfig,
+) -> Vec<OutputRect> {
+    let mut written = Vec::new();
+    for pass in &graph.passes {
+        if !selection.executed_passes.contains(&pass.id)
+            || !matches!(
+                pass.kind,
+                RenderPassKind::Composite | RenderPassKind::OutputPostProcess
+            )
+            || pass
+                .output
+                .and_then(|output| graph.textures.iter().find(|texture| texture.id == output))
+                .is_none_or(|texture| texture.source != GraphTextureSource::Output)
+        {
+            continue;
+        }
+        let region = prepare_effect_execution_region(
+            graph,
+            pass,
+            capture_execution_damage(graph, demand, pass, scene_baseline_authority, debug_config),
+        )
+        .region;
+        if region.is_empty() {
+            continue;
+        }
+        match region.bounding_rect() {
+            None => written.push(full_output_rect(output_size)),
+            Some(_) => written.extend(
+                region
+                    .rects()
+                    .iter()
+                    .filter_map(|rect| clipped_output_rect(*rect, output_size)),
+            ),
+        }
+    }
+    extra_scene_work(&written, repaint_rects)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn execute_graph_passes_inner(
     renderer: &mut EffectExecutionContext<'_>,
@@ -378,13 +426,26 @@ pub(super) fn execute_graph_passes_inner(
     let mut scene_valid_region = initial_scene_valid_region(scene_baseline_authority, &scene_work);
     let mut effect_valid_regions =
         std::collections::HashMap::<oblivion_one::effects::EffectInstanceId, EffectRegion>::new();
+    // Final output outside the repaint is restored too: the scene above the
+    // anchor is replayed only inside the repaint, so a composite there would
+    // leave the backdrop without the surfaces above it on screen.
+    let mut preserved_work = scene_work.extra_scene_work.clone();
+    preserved_work.extend(final_output_spill_work(
+        graph,
+        selection,
+        demand,
+        repaint_rects,
+        output_size,
+        scene_baseline_authority,
+        debug_config,
+    ));
     let mut scene_work_preservation =
-        if !targets.uses_separate_targets() && !scene_work.extra_scene_work.is_empty() {
+        if !targets.uses_separate_targets() && !preserved_work.is_empty() {
             Some(capture_scene_work_preservation_context(
                 renderer,
                 output_size,
                 framebuffer_origin,
-                &scene_work.extra_scene_work,
+                &preserved_work,
             )?)
         } else {
             None
