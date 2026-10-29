@@ -115,6 +115,7 @@ fn snapshot_with_clip(frame_id: u64, clip: PresentationClip) -> NativeFrameScene
     scene.physical_effect_damage = NativeEffectDamageFrameSnapshot {
         registry_generation: 0,
         instances: vec![NativeEffectDamageInstanceSnapshot {
+            backdrop_anchor: None,
             instance_id: EffectInstanceId::new(1).expect("foreign effect instance"),
             region: EffectRegion::from_rect(foreign_effect_output),
             aggregate_footprint: EffectFootprint::symmetric(2),
@@ -158,6 +159,7 @@ fn snapshot_with_effect_recipe_at_generation(
     snapshot.scene.physical_effect_damage = NativeEffectDamageFrameSnapshot {
         registry_generation,
         instances: vec![NativeEffectDamageInstanceSnapshot {
+            backdrop_anchor: None,
             instance_id: EffectInstanceId::new(frame_id).expect("effect instance"),
             region: EffectRegion::from_rect(effect_rect),
             aggregate_footprint: EffectFootprint::symmetric(sample_radius),
@@ -335,11 +337,13 @@ fn expanded_physical_transition_enters_buffer_age_repair_history() {
 fn physical_effect_expansion_keeps_old_and_new_influence_regions() {
     let output_bounds = EffectRect::new(0, 0, 100, 80).expect("output bounds");
     let old_instance = NativeEffectDamageInstanceSnapshot {
+        backdrop_anchor: None,
         instance_id: EffectInstanceId::new(11).expect("old effect instance"),
         region: EffectRegion::from_rect(EffectRect::new(20, 20, 10, 10).unwrap()),
         aggregate_footprint: EffectFootprint::ZERO,
     };
     let new_instance = NativeEffectDamageInstanceSnapshot {
+        backdrop_anchor: None,
         instance_id: EffectInstanceId::new(12).expect("new effect instance"),
         region: EffectRegion::from_rect(EffectRect::new(60, 20, 10, 10).unwrap()),
         aggregate_footprint: EffectFootprint::ZERO,
@@ -400,6 +404,7 @@ fn removed_and_introduced_effects_cover_frozen_sample_and_output_footprints() {
     let previous = NativeEffectDamageFrameSnapshot {
         registry_generation: 0,
         instances: vec![NativeEffectDamageInstanceSnapshot {
+            backdrop_anchor: None,
             instance_id: EffectInstanceId::new(13).expect("removed effect instance"),
             region: EffectRegion::from_rect(EffectRect::new(18, 18, 14, 14).unwrap()),
             aggregate_footprint: footprint,
@@ -431,6 +436,7 @@ fn removed_and_introduced_effects_cover_frozen_sample_and_output_footprints() {
     let current = NativeEffectDamageFrameSnapshot {
         registry_generation: 0,
         instances: vec![NativeEffectDamageInstanceSnapshot {
+            backdrop_anchor: None,
             instance_id: EffectInstanceId::new(14).expect("introduced effect instance"),
             region: EffectRegion::from_rect(EffectRect::new(58, 18, 14, 14).unwrap()),
             aggregate_footprint: footprint,
@@ -464,6 +470,7 @@ fn removed_and_introduced_effects_cover_frozen_sample_and_output_footprints() {
 fn output_postprocess_and_continuous_dirty_use_frozen_recipe() {
     let output_bounds = EffectRect::new(0, 0, 100, 80).expect("output bounds");
     let postprocess = NativeEffectDamageInstanceSnapshot {
+        backdrop_anchor: None,
         instance_id: EffectInstanceId::new(20).expect("postprocess instance"),
         region: EffectRegion::from_rect(EffectRect::new(38, 38, 4, 4).unwrap()),
         aggregate_footprint: EffectFootprint::symmetric(2),
@@ -598,6 +605,7 @@ fn registry_generation_transition_for_visible_effect_is_full_output_without_sour
     let previous = NativeEffectDamageFrameSnapshot {
         registry_generation: 7,
         instances: vec![NativeEffectDamageInstanceSnapshot {
+            backdrop_anchor: None,
             instance_id: EffectInstanceId::new(40).expect("effect instance"),
             region: EffectRegion::from_rect(EffectRect::new(20, 20, 10, 10).unwrap()),
             aggregate_footprint: EffectFootprint::symmetric(2),
@@ -626,6 +634,7 @@ fn same_registry_generation_with_visible_effect_preserves_empty_physical_damage(
     let snapshot = NativeEffectDamageFrameSnapshot {
         registry_generation: 7,
         instances: vec![NativeEffectDamageInstanceSnapshot {
+            backdrop_anchor: None,
             instance_id: EffectInstanceId::new(41).expect("effect instance"),
             region: EffectRegion::from_rect(EffectRect::new(20, 20, 10, 10).unwrap()),
             aggregate_footprint: EffectFootprint::symmetric(2),
@@ -954,6 +963,7 @@ fn physical_expansion_matches_renderer_plan_for_frozen_footprint() {
     let snapshot = NativeEffectDamageFrameSnapshot {
         registry_generation: 0,
         instances: vec![NativeEffectDamageInstanceSnapshot {
+            backdrop_anchor: None,
             instance_id: EffectInstanceId::new(30).expect("renderer parity instance"),
             region: visible_region,
             aggregate_footprint: footprint,
@@ -977,6 +987,7 @@ fn unrelated_effect_domain_stays_out_of_physical_expansion() {
     let current = NativeEffectDamageFrameSnapshot {
         registry_generation: 0,
         instances: vec![NativeEffectDamageInstanceSnapshot {
+            backdrop_anchor: None,
             instance_id: EffectInstanceId::new(31).expect("unrelated effect instance"),
             region: EffectRegion::from_rect(EffectRect::new(60, 10, 10, 10).unwrap()),
             aggregate_footprint: EffectFootprint::symmetric(2),
@@ -1004,4 +1015,184 @@ fn unrelated_effect_domain_stays_out_of_physical_expansion() {
             height: 10,
         }
     ));
+}
+
+fn ordered_backdrop_frame(frame_id: u64, changed_surface: Option<u32>) -> NativeFrameSceneSnapshot {
+    use oblivion_one::compositor::{
+        EffectAnchor, EffectAnchorScope, EffectSceneOrder, ResolvedEffectInstance,
+    };
+    use oblivion_one::effects::{
+        EffectFrameDemand, EffectParameterBlock, EffectRegistryGeneration,
+    };
+    let bounds = EffectRect::new(0, 0, 1000, 800).unwrap();
+    let mut frame = snapshot_with_clip(frame_id, PresentationClip::Unbounded);
+    frame.presentation = PresentationFrameSnapshot::empty_for_output(frame.output_id);
+    frame.scene = NativeSceneSnapshot::default();
+    for id in [10, 21, 20, 30] {
+        frame.scene.surfaces.push(NativeSceneSurfaceSnapshot {
+            scene_node_id: SceneNodeId::from_raw(u64::from(id)).unwrap(),
+            surface_id: id,
+            visual_root_surface_id: if id == 21 { 20 } else { id },
+            presentation_owner_root_surface_id: if id == 21 { 20 } else { id },
+            bounds: Some(NativeDamageRect {
+                x: 0,
+                y: 0,
+                width: 1000,
+                height: 800,
+            }),
+            damage: if changed_surface == Some(id) {
+                NativeSurfaceDamageEvidence::Known(vec![NativeDamageRect {
+                    x: 500,
+                    y: 400,
+                    width: 2,
+                    height: 2,
+                }])
+            } else {
+                NativeSurfaceDamageEvidence::AuthoritativeEmpty
+            },
+            content_generation: 1,
+            commit_sequence: frame_id,
+        });
+    }
+    let anchor = EffectAnchor::BeforeSurface(20);
+    let effects = ResolvedEffectScene::new(
+        1,
+        vec![ResolvedEffectInstance {
+            id: EffectInstanceId::new(1).unwrap(),
+            program: oblivion_one::effects::builtin_background_blur_program_id(),
+            anchor,
+            region: EffectRegion::from_rect(bounds),
+            target_bounds: bounds,
+            parameter_block: EffectParameterBlock::default(),
+            coverage: None,
+            signature: 1,
+            frame_demand: EffectFrameDemand::OnDamage,
+            visual_group: None,
+            anchor_scope: EffectAnchorScope::VisualGroup,
+            backdrop_reuse: oblivion_one::compositor::EffectBackdropReuse::Exact,
+            scene_order: EffectSceneOrder::for_anchor(anchor),
+            composite_opacity: None,
+        }],
+    );
+    frame.scene.effect_identity_signature = 1;
+    frame.scene.effect_damage = EffectRegion::from_rect(bounds);
+    frame.scene.physical_effect_damage = freeze_native_effect_damage(
+        &effects,
+        &EffectRegistryGeneration::with_builtin_background_blur(),
+        bounds,
+    );
+    frame
+}
+
+fn ordered_backdrop_transition(
+    old: NativeFrameSceneSnapshot,
+    new: NativeFrameSceneSnapshot,
+) -> OutputDamage {
+    let mut history = NativeSceneHistory::new(old);
+    history.replace_ready(new);
+    assert!(history.queue_submission(20));
+    history
+        .prepare_pageflip_transition(20, 1000, 800)
+        .unwrap()
+        .damage
+}
+
+#[test]
+fn ordered_backdrop_foreground_scroll_does_not_invalidate_stationary_blur() {
+    for foreground in [20, 21, 30] {
+        let damage = ordered_backdrop_transition(
+            ordered_backdrop_frame(1, None),
+            ordered_backdrop_frame(2, Some(foreground)),
+        );
+        assert_eq!(
+            damage,
+            OutputDamage::Rects(vec![OutputRect::new(500, 400, 2, 2)]),
+            "own/group/foreground damage must not feed the backdrop: surface {foreground}"
+        );
+    }
+}
+
+#[test]
+fn ordered_backdrop_lower_source_still_expands_through_the_frozen_footprint() {
+    let old = ordered_backdrop_frame(1, None);
+    let radius = old.scene.physical_effect_damage.instances[0]
+        .aggregate_footprint
+        .sample_radius_x;
+    let damage = ordered_backdrop_transition(old, ordered_backdrop_frame(2, Some(10)));
+    assert!(output_damage_covers(
+        &damage,
+        OutputRect::new(
+            500 - radius as i32,
+            400 - radius as i32,
+            2 + 2 * radius,
+            2 + 2 * radius
+        )
+    ));
+}
+
+#[test]
+fn ordered_backdrop_preserves_cascading_lower_blur_influence() {
+    use oblivion_one::compositor::EffectAnchorScope;
+    let mut old = ordered_backdrop_frame(1, None);
+    let mut upper = old.scene.physical_effect_damage.instances[0].clone();
+    upper.instance_id = EffectInstanceId::new(2).unwrap();
+    upper.backdrop_anchor = Some((30, EffectAnchorScope::Surface));
+    old.scene.physical_effect_damage.instances.push(upper);
+    let mut new = old.clone();
+    new.frame_id = 2;
+    new.scene.surfaces[0].damage = NativeSurfaceDamageEvidence::Known(vec![NativeDamageRect {
+        x: 500,
+        y: 400,
+        width: 2,
+        height: 2,
+    }]);
+    let radius = old.scene.physical_effect_damage.instances[0]
+        .aggregate_footprint
+        .sample_radius_x;
+    let damage = ordered_backdrop_transition(old, new);
+    assert!(output_damage_covers(
+        &damage,
+        OutputRect::new(
+            500 - 2 * radius as i32,
+            400 - 2 * radius as i32,
+            2 + 4 * radius,
+            2 + 4 * radius
+        )
+    ));
+}
+
+#[test]
+fn ordered_backdrop_unproven_or_changed_scene_keeps_conservative_expansion() {
+    let old = ordered_backdrop_frame(1, None);
+    let baseline = ordered_backdrop_frame(2, Some(30));
+    let bounds = EffectRect::new(0, 0, 1000, 800).unwrap();
+    let base = NativeOutputDamage::surface_damage(vec![NativeDamageRect {
+        x: 500,
+        y: 400,
+        width: 2,
+        height: 2,
+    }]);
+    for case in 0..7 {
+        let mut new = baseline.clone();
+        match case {
+            0 => new.scene.surfaces.swap(0, 3),
+            1 => new.scene.surfaces[1].bounds.as_mut().unwrap().x += 1,
+            2 => new.scene.physical_effect_damage.instances[0].backdrop_anchor = None,
+            3 => new.scene.effect_identity_signature += 1,
+            4 => new.scene.physical_effect_damage.registry_generation += 1,
+            5 => {
+                new.scene.physical_effect_damage.frame_local_dirty = EffectRegion::from_rect(bounds)
+            }
+            _ => new.scene.visibility_signature += 1,
+        }
+        assert!(
+            expand_ordered_backdrop_content_damage(&base, &old.scene, &new.scene, bounds).is_none(),
+            "unproven transition {case} must retain fallback"
+        );
+        let damage = ordered_backdrop_transition(old.clone(), new);
+        assert!(
+            output_damage_covers(&damage, OutputRect::new(499, 399, 4, 4)),
+            "fallback {case} must preserve the expanded region"
+        );
+    }
 }

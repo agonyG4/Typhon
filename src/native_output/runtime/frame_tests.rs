@@ -1098,7 +1098,10 @@ fn finalized_snapshot_contains_all_dynamic_metadata_fields() {
         visibility_signature(visibility)
     );
     assert_eq!(snapshot.effect_damage, effect_region);
-    assert_eq!(snapshot.effect_identity_signature, effects.signature);
+    assert_eq!(
+        snapshot.effect_identity_signature,
+        effects.damage_identity_signature()
+    );
     let mut expected_signature = snapshot.identity_signature();
     expected_signature ^= effects.signature;
     expected_signature = expected_signature.wrapping_mul(0x1000_0000_01b3);
@@ -1389,4 +1392,87 @@ fn auto_unready_scene_bypasses_after_deadline_and_keeps_latest_epoch() {
     );
     assert_eq!(arbitration.plane_delta_plans(), 1);
     assert_eq!(arbitration.unready_primary_bypass_decisions, 1);
+}
+
+#[test]
+fn stationary_effect_damage_ignores_scene_publication_generation() {
+    use crate::native_output::{
+        NativeCursorDamageBounds, NativeDamageKind, native_output_damage_for_scene_snapshots,
+    };
+    let region = EffectRegion::from_rect(EffectRect::new(10, 10, 50, 40).unwrap());
+    let anchor = EffectAnchor::BeforeSurface(7);
+    let instance = ResolvedEffectInstance {
+        composite_opacity: None,
+        id: EffectInstanceId::new(1).unwrap(),
+        program: oblivion_one::effects::builtin_background_blur_program_id(),
+        anchor,
+        region: region.clone(),
+        target_bounds: region.bounding_rect().unwrap(),
+        parameter_block: EffectParameterBlock::default(),
+        coverage: None,
+        signature: 17,
+        frame_demand: EffectFrameDemand::OnDamage,
+        visual_group: None,
+        anchor_scope: EffectAnchorScope::Surface,
+        backdrop_reuse: oblivion_one::compositor::EffectBackdropReuse::Exact,
+        scene_order: EffectSceneOrder::for_anchor(anchor),
+    };
+    let make_snapshot = |generation, registry_generation, instance| {
+        finalize_snapshot(
+            NativeSceneSnapshot {
+                physical_effect_damage: crate::native_output::NativeEffectDamageFrameSnapshot {
+                    registry_generation,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            &[],
+            oblivion_one::compositor::SpecialWorkspaceDim::default(),
+            FullscreenRenderPlanMetrics::default(),
+            &ResolvedEffectScene::new(generation, vec![instance]),
+        )
+        .0
+    };
+    let old = make_snapshot(1, 0, instance.clone());
+    let new = make_snapshot(2, 0, instance.clone());
+    let damage = native_output_damage_for_scene_snapshots(
+        100,
+        80,
+        &old,
+        &new,
+        NativeCursorDamageBounds::default(),
+    );
+    assert_eq!(
+        damage.kind,
+        NativeDamageKind::Empty,
+        "unchanged effects must not inherit unrelated content generations"
+    );
+    let registry_changed = make_snapshot(2, 1, instance.clone());
+    assert_ne!(
+        native_output_damage_for_scene_snapshots(
+            100,
+            80,
+            &new,
+            &registry_changed,
+            NativeCursorDamageBounds::default()
+        )
+        .kind,
+        NativeDamageKind::Empty,
+        "a genuine effect registry reload must invalidate unchanged instance regions"
+    );
+    let mut changed_instance = instance;
+    changed_instance.signature += 1;
+    let changed = make_snapshot(3, 0, changed_instance);
+    assert_ne!(
+        native_output_damage_for_scene_snapshots(
+            100,
+            80,
+            &new,
+            &changed,
+            NativeCursorDamageBounds::default()
+        )
+        .kind,
+        NativeDamageKind::Empty,
+        "real effect changes must retain damage"
+    );
 }

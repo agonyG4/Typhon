@@ -205,7 +205,10 @@ pub(crate) fn finalize_snapshot(
         .fold(EffectRegion::empty(), |damage, instance| {
             damage.union(&instance.region)
         });
-    snapshot.effect_identity_signature = effects.signature;
+    // Surface publication generations are not visual effect changes; actual
+    // program registry reloads are, even if instance IDs/parameters stay fixed.
+    snapshot.effect_identity_signature =
+        effects.damage_identity_signature() ^ snapshot.physical_effect_damage.registry_generation;
     let mut scene_identity_signature = snapshot.identity_signature();
     scene_identity_signature ^= effects.signature;
     scene_identity_signature = scene_identity_signature.wrapping_mul(0x1000_0000_01b3);

@@ -469,13 +469,8 @@ impl NativeSceneHistory {
                         damage: OutputDamage::Full,
                     });
                 };
-                expand_physical_effect_damage(
-                    base_damage,
-                    &previous.scene.physical_effect_damage,
-                    &current.scene.physical_effect_damage,
-                    output_bounds,
-                )
-                .as_renderer_damage(output_width, output_height)
+                expand_frame_effect_damage(base_damage, previous, current, output_bounds)
+                    .as_renderer_damage(output_width, output_height)
             }
             None => NativeOutputDamage::full_output(output_width, output_height)
                 .as_renderer_damage(output_width, output_height),
@@ -552,6 +547,39 @@ impl NativeSceneHistory {
         self.ready = None;
         self.submitted.clear();
     }
+}
+
+fn expand_frame_effect_damage(
+    base_damage: NativeOutputDamage,
+    previous: &NativeFrameSceneSnapshot,
+    current: &NativeFrameSceneSnapshot,
+    output_bounds: EffectRect,
+) -> NativeOutputDamage {
+    let presentation_stable = previous.cursor_damage == current.cursor_damage
+        && previous.lifecycle.samples.is_empty()
+        && current.lifecycle.samples.is_empty()
+        && previous.window_exit_evidence.is_empty()
+        && current.window_exit_evidence.is_empty()
+        && previous.presentation.transforms == current.presentation.transforms
+        && previous.presentation.opacities == current.presentation.opacities
+        && previous.presentation.clips == current.presentation.clips
+        && previous.presentation.presented_windows == current.presentation.presented_windows;
+    if presentation_stable
+        && let Some(damage) = expand_ordered_backdrop_content_damage(
+            &base_damage,
+            &previous.scene,
+            &current.scene,
+            output_bounds,
+        )
+    {
+        return damage;
+    }
+    expand_physical_effect_damage(
+        base_damage,
+        &previous.scene.physical_effect_damage,
+        &current.scene.physical_effect_damage,
+        output_bounds,
+    )
 }
 
 fn lifecycle_damage_rects(

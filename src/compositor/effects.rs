@@ -229,6 +229,12 @@ impl ResolvedEffectScene {
         }
     }
 
+    /// Visual effect identity for damage comparisons. Publishing unrelated
+    /// surface content advances the scene generation without changing effects.
+    pub fn damage_identity_signature(&self) -> u64 {
+        scene_signature(0, &self.instances)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.instances.is_empty()
     }

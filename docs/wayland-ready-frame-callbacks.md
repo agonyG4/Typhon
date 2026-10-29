@@ -625,3 +625,67 @@ Artifacts: `kitty-blur-attribution.json`,
 `vesktop-attribution-session.log`. Temporary diagnostic scripts and outputs
 remain in the stable Aether diagnostics directory. No production code or
 persistent visual setting was changed by this experiment.
+
+
+## Correct stationary effect identity and ordered backdrop damage (2026-10-29)
+
+Two independent defects explain why a stationary blur could enlarge foreground
+scroll damage. First, `ResolvedEffectScene.signature` includes the scene
+publication generation. `finalize_snapshot` used that signature as the visual
+effect identity, so an unrelated surface commit looked like an effect change
+and `effect_transition_damage` invalidated the whole effect region. A new
+`damage_identity_signature` hashes the same instance visual identities, regions,
+coverage, anchors, scopes, reuse and order with a fixed generation seed. Native
+visual damage combines it with the frozen program registry generation, so real
+program reloads still invalidate effects even when instance parameters stay
+fixed. The original scene-generation-bearing signature is retained
+for scene identity and existing consumers. Actual effect instance changes still
+damage their regions, and registry transitions keep their full-output fallback.
+
+Second, physical effect expansion fed aggregate scene damage into every effect.
+The built-in background blur now freezes a trusted BeforeSurface anchor/scope
+alongside its immutable footprint. A content-only transition can use ordered
+surface damage: each backdrop sees only surfaces below its source boundary,
+plus expanded output of earlier backdrop effects. VisualGroup scopes start
+before the group's first surface, so the window's own children do not become
+its background source. The original base damage remains in the output.
+
+This path requires unchanged surface membership/order, owners, geometry,
+decorations, effect identities/recipes, registry, visibility and popup/overlay
+membership. It also requires stable cursor/presentation geometry, opacity and
+clips, no lifecycle/exit work, and no continuous frame-local effect demand.
+Only the built-in BeforeSurface blur with exclusively Backdrop sources is
+classified; unknown programs, TargetContent/StaticTexture sources, other anchor
+kinds and unresolved source boundaries use the existing conservative expansion.
+No sampling radius, repair threshold, buffer-age history, callback, buffer
+release or KMS ownership rule was relaxed. Partially visible backdrops and
+chains of lower effects keep their required influence.
+
+The original-behavior frame seam produced a proper red regression: a 2x2
+own-window/foreground update grew to a 160x160 region through a stationary
+background blur. A separate proper red frame-snapshot test showed unchanged
+effects becoming SurfaceDamage solely when publication generation advanced.
+Both now pass. An additional red/green guard verifies that a real registry
+reload still damages unchanged instance regions at initial scene planning,
+before any physical pageflip history is updated. Pageflip-path tests also
+verify lower-source expansion, group child exclusion and cascading lower blur; seven guard cases retain conservative
+fallback for reorder, geometry, unknown recipe, real effect identity, registry,
+continuous dirty and visibility changes. Actual effect identity changes remain
+damaging. Existing clip, opacity, lifecycle, registry and buffer-history cases
+remain in the runtime suite.
+
+Validation: 739 runtime tests passed, two ignored, with only the separately
+baseline-confirmed wake-authority count test excluded; 27 compositor effect
+tests passed, along with both frozen-recipe output tests. Changed-file rustfmt
+and `git diff --check` passed. The existing all-project Clippy baseline issues are not claimed resolved. Logs are saved
+as `ordered-backdrop-*` and `stationary-effect-red.log` in stable Aether
+diagnostics. The six preexisting unrelated dirty source files were preserved.
+Live behavior and performance of this change still require loading the new
+release; no numerical latency improvement is claimed from these code tests.
+
+The final offline release build and executable `--help` smoke check passed;
+checksum, help output and build log are saved as `ordered-backdrop-release.*`
+and `ordered-backdrop-release-build.log` in stable Aether diagnostics. Reloading
+the compositor is required to test this binary. For the next latency capture,
+explicitly set `OBLIVION_ONE_PERF_LOG=0` and `TYPHON_EFFECT_EXEC_TRACE=0` because
+the diagnostic session's child terminal may inherit enabled tracing settings.
