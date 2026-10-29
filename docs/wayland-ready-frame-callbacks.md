@@ -895,3 +895,55 @@ queueing, about 9.5 ms renderer main thread including Layerize, and draw).
 Artifacts: `pipeline-stream-*` (trace, samples, client log, stage, latch and
 bucket logs, byte offsets into `pipeline-stream-session.log`) and
 `pipeline-stream-stages.py` in stable Aether diagnostics.
+
+
+## Clean fresh-session capture and gesture-start transient (2026-10-29)
+
+The compositor was restarted again (PID 84223, 17:09) with the same
+`d53df0f1…` release and every trace disabled. The six unrelated dirty files
+predate the earlier `a0f106…` release build (last modified 2026-10-23 and
+2026-10-28), so both releases contain them and the only code difference between
+the two binaries is the disabled stream trace. Vesktop was maximized on
+workspace 3 with a Kitty window behind it at (496,102,1163,873) — same size,
+different position from earlier captures — and blur unchanged (four
+assignments). Capture `fresh-clean` used the usual `quietbench` procedure.
+
+It reproduces the `pipeline-stream` profile without logging overhead:
+compositor commit→presented p50/mean/p95 6.59/6.73/11.07 ms, commit→frame
+callback p50 1.57 ms, predictive-triple 56/505 frames in the scroll window, and
+vblank buckets 3 V: 80, 4 V: 575, 5 V: 154. Both fresh sessions also show a
+tail of 33–37 events at 7–10 V that earlier sessions did not. All of them fall
+in the first ~230 ms of the benchmark (one in `pipeline-stream` came later).
+
+| Capture | Window | n | Mean | p50 | p95 | p99 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| `owner-fixed-repeat` | after first 250 ms | 810 | 26.68 | 24.36 | 30.43 | 36.30 |
+| `ordered-blur-fixed` | after first 250 ms | 809 | 27.33 | 24.41 | 36.28 | 42.37 |
+| `ordered-blur-fixed-repeat` | after first 250 ms | 810 | 26.76 | 24.31 | 30.47 | 36.41 |
+| `pipeline-stream` | after first 250 ms | 793 | 24.73 | 24.21 | 30.36 | 30.46 |
+| `fresh-clean` | after first 250 ms | 810 | 24.87 | 24.28 | 30.40 | 30.48 |
+| `fresh-clean` | all | 851 | 26.09 | 24.29 | 33.30 | 54.57 |
+
+Apart from the initial transient, both fresh sessions are about 2 ms better in
+mean and one refresh better at p99 than the older long-running sessions, with
+the same four-refresh median. The per-commit stream of `pipeline-stream` shows
+what happens during the transient: client acquire waits of 5–12.6 ms (Chromium
+GPU work not finished when Typhon receives the commit), frames waiting 3–10 ms
+for KMS admission behind an earlier flip and 12 ms from submission to
+presentation. After that the stage shifts to render-slot waits of ~6 ms that
+drain within ~50 ms, and from about 240 ms commits again present 2–7 ms after
+arrival. At rest the GPU was in P8 (315 MHz graphics, 405 MHz memory) with
+PowerMizer adaptive mode, consistent with a clock ramp after idle slowing both
+Chromium and Typhon GPU work. This is inferred from timing and the idle
+P-state; the clock trajectory during the gesture was not recorded.
+
+For a physical user this transient would repeat at the start of each scroll
+after idle, which matters more for perceived input lag than the steady-state
+p95. Whether long-running sessions hide it by keeping predictive-triple
+render-ahead engaged (at the cost of the extra refresh measured above) is not
+yet established. A capture after several hours of normal use in this same
+session will test the session-age hypothesis. No pacing, power or GPU setting
+was changed.
+
+Artifacts: `fresh-clean-*` (trace, samples, client log, latch, bucket and
+steady-state logs) in stable Aether diagnostics.
