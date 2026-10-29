@@ -324,3 +324,51 @@ fn queued_redraw_retry_is_admitted_before_predictive_render_ahead() {
         .begin_render_attempt(NativeOutputPacingMode::PredictiveTriple, true)
         .expect("RenderAhead must have a pacing identity");
 }
+
+#[test]
+fn no_damage_cycle_without_protocol_work_retires_scheduler_ownership() {
+    let socket_name = format!(
+        "typhon-no-primary-owner-test-{}-{}",
+        std::process::id(),
+        NEXT_COMPATIBILITY_SKIP_SOCKET.fetch_add(1, Ordering::Relaxed)
+    );
+    let mut server = OwnCompositorServer::bind_cpu_composition(socket_name)
+        .expect("bind no-primary-work test compositor");
+    let mut pacing = NativeFramePacing::from_env();
+    let mut scheduler = NativeFrameScheduler::new(165, 0);
+    queue_visual_work(
+        &mut pacing,
+        &mut scheduler,
+        1,
+        1,
+        NativeVisualWorkQueueReason::SceneRepaint,
+    )
+    .expect("queue paired visual ownership");
+
+    // Damage settlement can leave no pixels and no protocol batch to complete.
+    // The cycle still consumed its scheduler request before canceling ACTIVE.
+    assert!(!super::presentation_metrics::settle_no_primary_work(
+        &mut server,
+        &mut scheduler,
+        None,
+        false,
+    ));
+    pacing.cancel_unsubmitted_render();
+    assert!(pacing.active.is_none());
+    assert!(
+        !scheduler.visual_work_queued(),
+        "empty cycles must not leave scheduler work without a pacing owner"
+    );
+
+    queue_visual_work(
+        &mut pacing,
+        &mut scheduler,
+        2,
+        2,
+        NativeVisualWorkQueueReason::SceneRepaint,
+    )
+    .expect("new damage gets a new paired owner");
+    pacing
+        .begin_render_attempt(NativeOutputPacingMode::ReactiveDouble, false)
+        .expect("next render retains a real pacing owner");
+}

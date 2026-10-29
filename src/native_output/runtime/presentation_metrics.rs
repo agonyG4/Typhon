@@ -200,6 +200,20 @@ fn duration_ns(duration: Duration) -> u64 {
     u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
 
+pub(super) fn settle_no_primary_work(
+    server: &mut OwnCompositorServer,
+    frame_scheduler: &mut NativeFrameScheduler,
+    surface_damage: Option<SurfaceDamagePresentation>,
+    owns_frame_batch: bool,
+) -> bool {
+    let completed_work = server.settle_no_visual_change_work(surface_damage, owns_frame_batch);
+    // This cycle consumed its visual request even when no protocol batch or
+    // surface lineage needed settlement. The caller cancels the pacing ACTIVE
+    // owner, so leaving scheduler visual work queued would orphan that request.
+    frame_scheduler.note_immediate_completion();
+    completed_work
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn finish_no_primary_work(
     perf: NativePerfLogger,
@@ -248,7 +262,8 @@ pub(super) fn finish_no_primary_work(
         ]);
         fields
     });
-    let completed_work = server.settle_no_visual_change_work(surface_damage, owns_frame_batch);
+    let completed_work =
+        settle_no_primary_work(server, frame_scheduler, surface_damage, owns_frame_batch);
     if completed_work {
         let no_visual_change_start = Instant::now();
         perf.log("native.no_visual_change", || {
@@ -259,7 +274,6 @@ pub(super) fn finish_no_primary_work(
                 NativePerfField::u64("render_generation", server.render_generation()),
             ]
         });
-        frame_scheduler.note_immediate_completion();
     }
     completed_work
 }

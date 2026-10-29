@@ -408,3 +408,47 @@ its checksum and build output are stored as `active-damage-release.sha256` and
 `active-damage-release-build.log`. A new native compositor session is required
 to measure this correction. The unchanged latency table above describes the
 preceding journal-only build, not this active-scene cache correction.
+
+
+## No-primary-work scheduler ownership regression (2026-10-29)
+
+The first two live validation attempts with the active-scene cache correction
+terminated the compositor before a scroll trace could be captured. The running
+binary matched the new Aether release checksum. Both session termination
+records reported `render attempt started without an active pacing owner`.
+The subsequent Vesktop connection failures were consequences of the compositor
+exit; there is no new scroll-latency result from these attempts.
+
+Inspection found that `finish_no_primary_work` only retired the scheduler's
+visual request when compositor protocol or surface-lineage settlement returned
+true. Its caller unconditionally canceled the pacing ACTIVE owner. When the
+scene was already current, damage empty and no frame batch remained, settlement
+returned false and left scheduler visual work queued with no pacing identity.
+The active-scene damage correction makes truly empty damage observable instead
+of continually retaining stale Full damage, exposing this ownership mismatch.
+
+The regression uses a real CPU-composition Wayland server, pairs scheduler and
+pacing work through `queue_visual_work`, settles an empty cycle without a batch,
+and cancels the pacing owner as the runtime does. Before the fix it fails because
+visual work remains queued. With the fix it also verifies that new damage can
+acquire ownership and begin a subsequent reactive render. The extracted
+`settle_no_primary_work` helper initially preserved the old behavior for the
+red run; it now completes the scheduler request regardless of the protocol
+settlement result. The result still reports only actual protocol/lineage work,
+and buffer release, frame callbacks and physical presentation are unchanged.
+
+All eight presentation-cycle tests pass. Runtime-wide validation passed 734
+tests with two ignored after excluding
+`keyboard_repeat_deadlines_are_counted_in_wake_authority_metrics`. The excluded
+test failed with `left: 15, right: 14`, both in the full suite and in isolation.
+Restoring the old settlement condition and rerunning that test produced the
+same failure, confirming it is independent of this correction. The fixed source
+was restored before the final passing runtime run. Changed-file rustfmt and
+`git diff --check` passed. Diagnostic logs use the `no-primary-owner-` prefix in
+the stable Aether diagnostics directory.
+
+The corrected offline release build and `--help` smoke check passed. The binary
+and all build output remain in the stable Aether target directory. The checksum
+is saved in `no-primary-owner-release.sha256`. Loading this build still requires
+a new compositor session; stability with Vesktop and scroll performance have
+not yet been measured live after this ownership correction.
