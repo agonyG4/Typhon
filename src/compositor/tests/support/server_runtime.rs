@@ -289,6 +289,7 @@ pub(in crate::compositor::tests) enum ServerCommand {
     CaptureSurfaceResourceCount(Sender<usize>),
     CaptureShmResourceCounts(Sender<(usize, usize, usize)>),
     CaptureRenderableSurfaceSnapshot(Sender<Vec<RenderableSurfaceSnapshot>>),
+    CaptureRenderableSurfaceDamage(Sender<Vec<RenderableSurfaceDamage>>),
     CaptureSurfaceBufferOwnership {
         internal_surface_id: u32,
         reply: Sender<SurfaceBufferOwnershipSnapshot>,
@@ -497,6 +498,10 @@ pub(in crate::compositor::tests) enum ServerCommand {
     FinishFrame,
     FinishFrameWithPresentation(FramePresentation),
     CaptureFrameBatch {
+        frame_id: u64,
+        reply: Sender<CompositorFrameBatchId>,
+    },
+    CaptureFrameBatchWithSurfaceDamage {
         frame_id: u64,
         reply: Sender<CompositorFrameBatchId>,
     },
@@ -1262,6 +1267,15 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                             server.state.frame_batches.len()
                                 + server.state.retired_frame_batches.len(),
                         ));
+                    }
+                    ServerCommand::CaptureRenderableSurfaceDamage(reply) => {
+                        let _ = reply.send(
+                            server
+                                .renderable_surfaces()
+                                .iter()
+                                .map(|surface| surface.damage.clone())
+                                .collect(),
+                        );
                     }
                     ServerCommand::CaptureRenderableSurfaceSnapshot(reply) => {
                         let surfaces = server.renderable_surfaces();
@@ -2422,6 +2436,12 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                     }
                     ServerCommand::CaptureFrameBatch { frame_id, reply } => {
                         let _ = reply.send(server.take_frame_batch_for_render(frame_id));
+                    }
+                    ServerCommand::CaptureFrameBatchWithSurfaceDamage { frame_id, reply } => {
+                        let batch_id = server.take_frame_batch_for_render(frame_id);
+                        let damage = server.capture_surface_damage_presentation();
+                        server.set_frame_batch_surface_damage(batch_id, damage);
+                        let _ = reply.send(batch_id);
                     }
                     ServerCommand::CaptureNativeFrameBatch { frame_id, reply } => {
                         let _ =

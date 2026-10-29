@@ -290,6 +290,10 @@ impl CompositorState {
         // Old retained pixels sharing this root must relinquish their exact
         // release tokens before new canonical content becomes frame-eligible.
         self.retire_window_exit_for_root(root_surface_id);
+        // The renderable keeps all unpresented damage, but the journal entry
+        // must describe only this commit. Otherwise a newer entry inherits
+        // damage that an older in-flight frame will already have presented.
+        let journal_damage = committed_damage.clone();
         let updated_surface_index = if let Some(index) = renderable_index {
             let visual_placement = {
                 let Some(existing) = self.renderable_surfaces.get_mut(index) else {
@@ -324,10 +328,6 @@ impl CompositorState {
             self.append_renderable_surface(surface);
             self.renderable_surfaces.len().saturating_sub(1)
         };
-        let journal_damage = self
-            .renderable_surfaces
-            .get(updated_surface_index)
-            .map(|surface| surface.damage.clone());
         let journal_size = self
             .renderable_surfaces
             .get(updated_surface_index)
@@ -397,11 +397,11 @@ impl CompositorState {
         if let Some(release) = shm_release {
             self.release_materialized_shm(release, copy_to_release_us);
         }
-        if let Some((damage, size)) = journal_damage.zip(journal_size) {
+        if let Some(size) = journal_size {
             self.record_surface_damage_commit_at(
                 surface_id,
                 Some(commit_sequence),
-                damage,
+                journal_damage,
                 size.width,
                 size.height,
             );
@@ -657,12 +657,12 @@ impl CompositorState {
         existing.buffer_transform = mapping.buffer_transform;
         existing.viewport_source = mapping.viewport_source;
         existing.viewport_destination = mapping.viewport_destination;
+        let journal_damage = damage.clone();
         existing.damage = existing.damage.clone().union(
             damage,
             existing.buffer_size().width,
             existing.buffer_size().height,
         );
-        let journal_damage = existing.damage.clone();
         let journal_size = existing.buffer_size();
         self.record_surface_damage_commit_at(
             surface_id,

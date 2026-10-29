@@ -236,3 +236,113 @@ Select the built compositor when launching the next session:
 ```sh
 OBLIVION_ONE_BINARY=/mnt/Aether/Desktop/GitHub/Typhon-target/release/oblivion-one bin/start-oblivion-one-tty
 ```
+
+### Measured GPU release path after restart
+
+The new timing scopes were present in the running compositor after restart.
+During the controlled `release-followup` scroll capture, the output-wide delta
+covered 1,459 completed GPU-fenced leases:
+
+| Interval | Mean over the measured counter delta |
+| --- | ---: |
+| Registration to completion-fence signal | 1.845 ms |
+| Ready-release service routine | 0.013 ms |
+| Completion-fence signal to successful release completion | 0.023 ms |
+
+The representative in-scroll rolling medians were 1.834 ms, 0.012 ms and
+0.016 ms respectively. The small post-signal delay contradicts the hypothesis
+of a multi-millisecond reactor release delay in this capture. These aggregate
+output measurements do not identify every lease with a specific application.
+Presented scroll latency remained 24.333 ms median / 30.541 ms p95 / 36.425 ms
+p99. Chromium Layerize took 5.904 ms median wall time, with a 5.855 ms median
+thread CPU duration. The page had about 9,806 DOM nodes and 60 message nodes;
+those counts alone do not establish a page bug. Native `perf record` sampling
+was unavailable under the current process/kernel permissions, so no
+per-function native C++ profile is claimed.
+
+All 1,459 output frames in that sample were full repaints: 1,328 exceeded the
+repair-area threshold and 131 lacked sufficient target history. A later
+same-session blur comparison retained full repainting both enabled (4,294
+frames) and disabled (3,799 frames). Median presented-event latency was
+30.277/30.269 ms. The higher latency relative to the earlier session and
+changing tails preclude treating this single sequential comparison as a
+controlled estimate of blur's performance cost. It does show that disabling
+blur did not remove the persistent full-repaint behavior. The original blur
+configuration was restored byte-for-byte, and Vesktop was relaunched without
+diagnostic arguments afterward.
+
+Evidence in the stable Aether diagnostics directory:
+`release-followup-trace.json`, `release-followup-samples.json`,
+`release-followup-scroll-decomposition.json`, `release-followup-render-stages.json`,
+`blur-on-render-stages.json`, `blur-off-render-stages.json`, and the matching
+blur trace/decomposition files. Captures contain local page data and are not
+included in the repository.
+
+### Per-commit damage journal defect
+
+Wayland damage belongs to an individual commit; the compositor may separately
+accumulate all unpresented commits for rendering. See the
+[Wayland damage contract](https://wayland.freedesktop.org/docs/html/apa.html#protocol-spec-wl_surface-request-damage).
+
+The normal buffer-publication path accumulated new damage into
+`RenderableSurface.damage`, then copied that already accumulated region into
+`SurfaceDamageJournal`. Retained-buffer damage/mapping commits and retained
+cursor commits had the same pattern. If A is rendered and B arrives before A's
+pageflip, B's journal entry contains A union B. Presenting A then queries
+`damage_since(A)` and incorrectly retains A through B. Continuous commits can
+keep a Full region alive indefinitely, even when subsequent client requests
+contain only small rectangles.
+
+The correction records the normalized current commit's damage before merging
+it into pending renderable damage. Rendering still retains all unpresented
+regions, and presentation still consumes only its frozen commit token. New or
+changed mappings still promote damage to Full. Xwayland's conservative Full
+policy, SHM materialization, callback admission, buffer releases and output
+buffer-age repair are unchanged.
+
+The regression fixture uses a real Wayland client and a frame batch explicitly
+bound to frozen surface-damage evidence. Four tests cover Full-to-partial
+updates with rotated and retained buffers, disjoint partial regions (both
+publication paths), and an empty rotated-buffer commit. All four fail against
+the original implementation because presented regions remain pending. They
+also assert that both regions remain pending before the older presentation,
+so reducing the accumulated renderable damage itself would be incorrect.
+
+Live performance improvement from this correction requires a new compositor
+session with the rebuilt executable; the code regression is independent of
+that subsequent measurement.
+
+#### Damage-journal verification
+
+| Check | Corrected implementation | Original implementation comparison |
+| --- | --- | --- |
+| New pipelined Wayland journal regressions | 4 passed | 4 failed with inherited Full/older regions |
+| Surface/frame suite | 90 passed, 2 failed | 86 passed, same 2 failed (new regressions excluded) |
+| Surface state tests | 31 passed | Not repeated; unchanged public contracts |
+| Cursor-filtered library tests | 214 passed, 3 failed | 214 passed, same 3 failed |
+| Renderer damage/repair tests | 91 passed, 1 failed | The failing threshold test also fails without the correction |
+| Physical effect damage tests | 22 passed | Not repeated; unchanged effect propagation |
+
+The six broader failures were verified against the original production code:
+
+- `compatibility_no_visual_change_with_callback_owns_one_terminal_batch`
+- `wayland_content_commits_skip_global_stack_reorder`
+- `custom_client_cursor_is_restored_after_resize`
+- `hidden_client_cursor_is_overridden_during_resize`
+- `hidden_client_cursor_state_is_restored_after_resize`
+- `effect_execution_repair_promotes_structured_plan_at_area_threshold`
+
+The failing/passing regression cycle uses the same test fixture and frozen
+surface-damage binding on both versions. It asserts pending-region preservation
+before pageflip, exact newer damage after the older pageflip, and Empty only
+after all sampled damage is presented. Test outputs are saved on Aether as
+`damage-journal-*-tests.log`; all test runtime/temporary directories used Aether.
+Rustfmt checks for the changed Rust files and `git diff --check` passed.
+
+The final offline release build completed successfully using
+`CARGO_TARGET_DIR=/mnt/Aether/Desktop/GitHub/Typhon-target`, and the resulting
+`oblivion-one --help` smoke check passed. The executable is
+`/mnt/Aether/Desktop/GitHub/Typhon-target/release/oblivion-one`. Its checksum and
+build output are saved in `damage-journal-release.sha256` and
+`damage-journal-release-build.log` under the stable diagnostics directory.
+The current compositor process is not restarted by this change.

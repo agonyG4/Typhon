@@ -234,6 +234,7 @@ impl CompositorState {
         if let Some(current) = self.current_surface_buffers.get_mut(&surface_id) {
             current.update_content_mapping(mapping, commit_sequence);
         }
+        let journal_damage = damage.clone();
         existing.damage = existing.damage.clone().union(
             damage,
             existing.buffer_size().width,
@@ -267,7 +268,6 @@ impl CompositorState {
                 output_scale,
             )
         });
-        let journal_damage = existing.damage.clone();
         let journal_size = existing.buffer_size();
         self.record_surface_damage_commit_at(
             surface_id,

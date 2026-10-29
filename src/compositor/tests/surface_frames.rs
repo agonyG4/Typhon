@@ -1286,6 +1286,176 @@ fn wayland_surface_damage_only_commit_keeps_owned_shm_snapshot() {
     );
 }
 
+fn pipelined_wayland_damage_journal_sample(
+    replace_buffer: bool,
+    first_frame_full: bool,
+    newer_commit_empty: bool,
+) -> (
+    RenderableSurfaceDamage,
+    RenderableSurfaceDamage,
+    RenderableSurfaceDamage,
+) {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    let stream = UnixStream::connect(&socket_path).unwrap();
+    let connection = Connection::from_socket(stream).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let surface = compositor.create_surface(&qh, ());
+    let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
+    let _toplevel = xdg_surface.get_toplevel(&qh, ());
+    let first = TestShmBuffer::new(&shm, &qh, 8, 8).unwrap();
+    let newer = TestShmBuffer::new(&shm, &qh, 8, 8).unwrap();
+    let mut state = RegistryTestState::default();
+    surface.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    xdg_surface.set_window_geometry(0, 0, 8, 8);
+    first.attach(&surface, 8, 8);
+    surface.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    if !first_frame_full {
+        commands
+            .send(ServerCommand::MarkRenderDamagePresented)
+            .unwrap();
+        wait_for_server_commands(&commands);
+        first.attach_without_damage(&surface);
+        surface.damage_buffer(0, 0, 1, 1);
+        surface.commit();
+        connection.flush().unwrap();
+        queue.roundtrip(&mut state).unwrap();
+    }
+    let (reply, result) = mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureFrameBatchWithSurfaceDamage {
+            frame_id: 11,
+            reply,
+        })
+        .unwrap();
+    let first_batch = result.recv_timeout(Duration::from_secs(1)).unwrap();
+    // The newer commit arrives while frame 11 is still in flight.
+    if replace_buffer {
+        newer.attach_without_damage(&surface);
+    }
+    if !newer_commit_empty {
+        surface.damage_buffer(7, 7, 1, 1);
+    }
+    surface.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    let capture_damage = || {
+        let (reply, result) = mpsc::channel();
+        commands
+            .send(ServerCommand::CaptureRenderableSurfaceDamage(reply))
+            .unwrap();
+        result.recv_timeout(Duration::from_secs(1)).unwrap()
+    };
+    let pending = capture_damage();
+    commands
+        .send(ServerCommand::CompleteFrameBatchNow {
+            frame_id: 11,
+            batch_id: first_batch,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    let after_first_present = capture_damage();
+    commands
+        .send(ServerCommand::MarkRenderDamagePresented)
+        .unwrap();
+    wait_for_server_commands(&commands);
+    let after_all_presented = capture_damage();
+    let _server = stop_controllable_test_server(commands, server_thread);
+    let only = |mut damage: Vec<RenderableSurfaceDamage>| {
+        assert_eq!(damage.len(), 1);
+        damage.pop().unwrap()
+    };
+    (
+        only(pending),
+        only(after_first_present),
+        only(after_all_presented),
+    )
+}
+
+#[test]
+fn pipelined_wayland_damage_journal_drops_presented_full_damage_on_buffer_rotation() {
+    let (pending, after_first, after_all) =
+        pipelined_wayland_damage_journal_sample(true, true, false);
+    assert_eq!(pending, RenderableSurfaceDamage::Full);
+    assert_eq!(
+        after_first,
+        RenderableSurfaceDamage::Partial(vec![SurfaceDamageRect {
+            x: 7,
+            y: 7,
+            width: 1,
+            height: 1
+        }])
+    );
+    assert_eq!(after_all, RenderableSurfaceDamage::Empty);
+}
+
+#[test]
+fn pipelined_wayland_damage_journal_drops_presented_full_damage_on_retained_buffer() {
+    let (pending, after_first, after_all) =
+        pipelined_wayland_damage_journal_sample(false, true, false);
+    assert_eq!(pending, RenderableSurfaceDamage::Full);
+    assert_eq!(
+        after_first,
+        RenderableSurfaceDamage::Partial(vec![SurfaceDamageRect {
+            x: 7,
+            y: 7,
+            width: 1,
+            height: 1
+        }])
+    );
+    assert_eq!(after_all, RenderableSurfaceDamage::Empty);
+}
+
+#[test]
+fn pipelined_wayland_damage_journal_keeps_only_unpresented_region() {
+    for replace_buffer in [false, true] {
+        let (pending, after_first, after_all) =
+            pipelined_wayland_damage_journal_sample(replace_buffer, false, false);
+        let older = RenderableSurfaceDamage::Partial(vec![SurfaceDamageRect {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+        }]);
+        let newer = RenderableSurfaceDamage::Partial(vec![SurfaceDamageRect {
+            x: 7,
+            y: 7,
+            width: 1,
+            height: 1,
+        }]);
+        assert_eq!(pending, older.union(newer.clone(), 8, 8));
+        assert_eq!(after_first, newer);
+        assert_eq!(after_all, RenderableSurfaceDamage::Empty);
+    }
+}
+
+#[test]
+fn pipelined_wayland_damage_journal_empty_rotated_commit_does_not_retain_old_damage() {
+    let (pending, after_first, after_all) =
+        pipelined_wayland_damage_journal_sample(true, false, true);
+    assert_eq!(
+        pending,
+        RenderableSurfaceDamage::Partial(vec![SurfaceDamageRect {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1
+        }])
+    );
+    assert_eq!(after_first, RenderableSurfaceDamage::Empty);
+    assert_eq!(after_all, RenderableSurfaceDamage::Empty);
+}
+
 #[test]
 fn wayland_bufferless_transform_commit_updates_retained_mapping_without_damage() {
     let socket_name = unique_socket_name();
