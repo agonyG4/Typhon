@@ -947,3 +947,40 @@ was changed.
 
 Artifacts: `fresh-clean-*` (trace, samples, client log, latch, bucket and
 steady-state logs) in stable Aether diagnostics.
+
+
+## Estimator comparison with KWin/Mutter and a rejected change (2026-10-29)
+
+KWin's `RenderJournal` predicts render time as a 500 ms time-weighted mean
+plus twice a one-sided positive deviation decaying over ~6 s; `RenderLoop`
+starts compositing that long before vblank, uses a second pending frame only
+when the prediction exceeds one refresh, needs 10 frames below 0.95 refresh to
+leave it, and after 100 idle pageflips assumes a cold GPU and composites almost
+a refresh early. Mutter estimates from KMS-ready/flip time with slow decay and
+uses dynamic triple buffering only when the estimate exceeds a refresh, a
+mechanism originally motivated by letting the driver raise GPU clocks. Neither
+holds GPU clocks up. Typhon's branch risk uses the same mean/deviation time
+constants and the same 100-refresh cold-wake rule, plus a floor at the p95 of
+the last 120 samples and a ceiling at their maximum.
+
+The hypothesis that the count-based window keeps stale slow samples and pins
+predictive triple across idle periods was checked against the snapshots taken
+mid-scroll before implementing time aging:
+
+| Capture | renderReady p50/p95/max | central risk | queueReady max | warm total |
+| --- | ---: | ---: | ---: | ---: |
+| `owner-fixed` (miss recovery) | 2.12/2.58/5.59 | 8.82 | 4.28 | 6.25 |
+| `ordered-blur-fixed-repeat` | 1.87/3.21/4.59 | 9.89 | 3.36 | 5.25 |
+| `pipeline-stream` | 2.66/4.05/4.29 | 17.80 | 2.36 | 4.95 |
+| `fresh-clean` | 2.56/3.94/4.42 | 25.26 | 2.26 | 5.09 |
+
+In every case the selected risk is the window maximum (`evidence_ceiling`),
+not the p95 floor, and the KWin-like central term is far larger. Aging the
+window by time would remove that ceiling and expose the central term, raising
+predictions. The fresh sessions actually show slower GPU completion
+(fence after rendered p50 1.6 vs 0.5 ms) but lower queue-ready risk; the lower
+warm total there comes from the CPU-side branch, together with fewer full
+repaints (14% vs 34% in the ordered-blur captures) and lower compositor CPU
+render time. The time-aging change was therefore not implemented. What raises
+queue-ready and full-repaint share in long sessions remains open; a capture
+after hours of use should compare those terms rather than the estimator window.
