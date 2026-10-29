@@ -290,6 +290,7 @@ pub(in crate::compositor::tests) enum ServerCommand {
     CaptureShmResourceCounts(Sender<(usize, usize, usize)>),
     CaptureRenderableSurfaceSnapshot(Sender<Vec<RenderableSurfaceSnapshot>>),
     CaptureRenderableSurfaceDamage(Sender<Vec<RenderableSurfaceDamage>>),
+    CaptureNativeFrameSurfaceDamage(Sender<Vec<RenderableSurfaceDamage>>),
     CaptureSurfaceBufferOwnership {
         internal_surface_id: u32,
         reply: Sender<SurfaceBufferOwnershipSnapshot>,
@@ -1267,6 +1268,17 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                             server.state.frame_batches.len()
                                 + server.state.retired_frame_batches.len(),
                         ));
+                    }
+                    ServerCommand::CaptureNativeFrameSurfaceDamage(reply) => {
+                        let (surfaces, _, _, _) = server
+                            .native_frame_renderable_surfaces_with_scene_nodes_and_composition_plan(
+                            );
+                        let _ = reply.send(
+                            surfaces
+                                .iter()
+                                .map(|surface| surface.damage.clone())
+                                .collect(),
+                        );
                     }
                     ServerCommand::CaptureRenderableSurfaceDamage(reply) => {
                         let _ = reply.send(

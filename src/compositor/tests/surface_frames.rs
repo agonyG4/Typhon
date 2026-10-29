@@ -1290,6 +1290,7 @@ fn pipelined_wayland_damage_journal_sample(
     replace_buffer: bool,
     first_frame_full: bool,
     newer_commit_empty: bool,
+    native_scene: bool,
 ) -> (
     RenderableSurfaceDamage,
     RenderableSurfaceDamage,
@@ -1351,9 +1352,12 @@ fn pipelined_wayland_damage_journal_sample(
     queue.roundtrip(&mut state).unwrap();
     let capture_damage = || {
         let (reply, result) = mpsc::channel();
-        commands
-            .send(ServerCommand::CaptureRenderableSurfaceDamage(reply))
-            .unwrap();
+        let command = if native_scene {
+            ServerCommand::CaptureNativeFrameSurfaceDamage(reply)
+        } else {
+            ServerCommand::CaptureRenderableSurfaceDamage(reply)
+        };
+        commands.send(command).unwrap();
         result.recv_timeout(Duration::from_secs(1)).unwrap()
     };
     let pending = capture_damage();
@@ -1385,7 +1389,7 @@ fn pipelined_wayland_damage_journal_sample(
 #[test]
 fn pipelined_wayland_damage_journal_drops_presented_full_damage_on_buffer_rotation() {
     let (pending, after_first, after_all) =
-        pipelined_wayland_damage_journal_sample(true, true, false);
+        pipelined_wayland_damage_journal_sample(true, true, false, false);
     assert_eq!(pending, RenderableSurfaceDamage::Full);
     assert_eq!(
         after_first,
@@ -1402,7 +1406,7 @@ fn pipelined_wayland_damage_journal_drops_presented_full_damage_on_buffer_rotati
 #[test]
 fn pipelined_wayland_damage_journal_drops_presented_full_damage_on_retained_buffer() {
     let (pending, after_first, after_all) =
-        pipelined_wayland_damage_journal_sample(false, true, false);
+        pipelined_wayland_damage_journal_sample(false, true, false, false);
     assert_eq!(pending, RenderableSurfaceDamage::Full);
     assert_eq!(
         after_first,
@@ -1420,7 +1424,7 @@ fn pipelined_wayland_damage_journal_drops_presented_full_damage_on_retained_buff
 fn pipelined_wayland_damage_journal_keeps_only_unpresented_region() {
     for replace_buffer in [false, true] {
         let (pending, after_first, after_all) =
-            pipelined_wayland_damage_journal_sample(replace_buffer, false, false);
+            pipelined_wayland_damage_journal_sample(replace_buffer, false, false, false);
         let older = RenderableSurfaceDamage::Partial(vec![SurfaceDamageRect {
             x: 0,
             y: 0,
@@ -1442,7 +1446,7 @@ fn pipelined_wayland_damage_journal_keeps_only_unpresented_region() {
 #[test]
 fn pipelined_wayland_damage_journal_empty_rotated_commit_does_not_retain_old_damage() {
     let (pending, after_first, after_all) =
-        pipelined_wayland_damage_journal_sample(true, false, true);
+        pipelined_wayland_damage_journal_sample(true, false, true, false);
     assert_eq!(
         pending,
         RenderableSurfaceDamage::Partial(vec![SurfaceDamageRect {
@@ -1454,6 +1458,25 @@ fn pipelined_wayland_damage_journal_empty_rotated_commit_does_not_retain_old_dam
     );
     assert_eq!(after_first, RenderableSurfaceDamage::Empty);
     assert_eq!(after_all, RenderableSurfaceDamage::Empty);
+}
+
+#[test]
+fn pipelined_wayland_damage_journal_native_scene_tracks_presented_damage() {
+    for replace_buffer in [false, true] {
+        let (pending, after_first, after_all) =
+            pipelined_wayland_damage_journal_sample(replace_buffer, true, false, true);
+        assert_eq!(pending, RenderableSurfaceDamage::Full);
+        assert_eq!(
+            after_first,
+            RenderableSurfaceDamage::Partial(vec![SurfaceDamageRect {
+                x: 7,
+                y: 7,
+                width: 1,
+                height: 1,
+            }])
+        );
+        assert_eq!(after_all, RenderableSurfaceDamage::Empty);
+    }
 }
 
 #[test]

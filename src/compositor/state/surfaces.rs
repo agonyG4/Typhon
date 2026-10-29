@@ -846,6 +846,7 @@ impl CompositorState {
             {
                 if let Some(surface) = self.renderable_surfaces.get_mut(index) {
                     surface.damage = damage;
+                    self.active_scene_view.sync_surface_damage(surface);
                 }
             } else if let Some(surface) = self.client_cursor_surfaces.get_mut(&key.surface_id) {
                 surface.damage = damage;

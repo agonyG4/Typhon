@@ -73,6 +73,23 @@ impl ActiveSceneView {
         &self.surfaces
     }
 
+    pub(super) fn sync_surface_damage(&mut self, source: &RenderableSurface) {
+        let Some(index) = self.surface_indices.get(&source.surface_id).copied() else {
+            return;
+        };
+        let Some(cached) = self.surfaces.get_mut(index) else {
+            return;
+        };
+        // A presentation settles damage on current content, independently of
+        // geometry/topology. Do not rewrite a cache entry for different content.
+        if cached.generation == source.generation
+            && cached.commit_sequence == source.commit_sequence
+            && cached.buffer_id() == source.buffer_id()
+        {
+            cached.damage.clone_from(&source.damage);
+        }
+    }
+
     pub(in crate::compositor) fn popup_surface_ids(&self) -> &[u32] {
         &self.popup_surface_ids
     }

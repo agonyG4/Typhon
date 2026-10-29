@@ -346,3 +346,65 @@ The final offline release build completed successfully using
 build output are saved in `damage-journal-release.sha256` and
 `damage-journal-release-build.log` under the stable diagnostics directory.
 The current compositor process is not restarted by this change.
+
+### Live check of d38f1a00 and active-scene damage cache
+
+After the next restart, `/proc/<compositor>/exe` matched the built executable's
+SHA-256 (`b0a25876235400098bc0fa28666dd001cfe2f859b879073c1fab7d10092699a6`).
+The focused Vesktop conversation was captured with the same six synthetic
+gestures, AlwaysAnimate enabled, a 1920x929 viewport at device scale 1, and no
+injected requestAnimationFrame probe. No JavaScript long tasks were recorded.
+
+| Presented scroll events | Before journal correction | After restart |
+| --- | ---: | ---: |
+| Samples | 852 | 851 |
+| Median | 24.333 ms | 24.322 ms |
+| p95 | 30.541 ms | 30.421 ms |
+| p99 | 36.425 ms | 36.257 ms |
+
+This is essentially unchanged latency, not evidence of a speedup. All 2,920
+output frames during the later sampling interval remained full repaints
+(2,723 area-threshold, 197 insufficient-history). The interval includes trace
+export time; counts should not be compared as equal-duration throughput.
+Across those leases, remaining GPU wait averaged 2.116 ms, ready-release
+service 0.012 ms, and signal-to-release 0.019 ms. Chromium Layerize median was
+5.536 ms. Session load and GPU clock differences limit causal interpretation
+of the small changes. Evidence is saved as `damage-fixed-trace.json`,
+`damage-fixed-scroll-decomposition.json`, `damage-fixed-samples.json`, and
+`damage-fixed-render-stages.json` in the stable Aether diagnostics directory.
+Vesktop was subsequently restored to its default launch without debugging.
+
+The real native snapshot consumes `ActiveSceneView`, which holds cloned
+renderable surfaces. `settle_surface_damage` updated pending damage in the
+canonical surface vector but left this cached copy unchanged. Consequently,
+even with fresh per-commit journal entries, the renderer could continue seeing
+Full damage in the active scene. The previous regressions inspected canonical
+surfaces and did not cover this additional boundary.
+
+A new regression reads the native composition-plan surface projection. It
+failed on d38f1a00: canonical damage was the newer 1x1 region, while native-scene
+damage remained Full. The fix synchronizes only the cached damage after
+presentation/no-visual settlement, using the existing surface index. It copies
+damage only when buffer identity, generation and commit sequence match current
+canonical content. Geometry, topology, scene generation and previously frozen
+frame snapshots are not rewritten, and the active scene is not rebuilt.
+
+All five pipelined journal/native-scene regressions pass with this change.
+The native-scene regression covers both rotated and retained buffers, preserves
+the newer commit's damage when an older frame presents, and observes Empty only
+after all sampled damage has been presented. This is a code-path correction;
+its live performance effect still requires loading the updated compositor.
+
+Surrounding checks: surface/frame tests 91 passed with the same two previously
+verified baseline failures; surface-state tests 31 passed; active-scene tests
+2 passed. Changed-file rustfmt and `git diff --check` passed. Logs are saved as
+`active-damage-*-tests.log` in the stable diagnostics directory. No passing
+all-project Clippy result is claimed; the previously documented unrelated
+baseline diagnostics remain outside this correction.
+
+The active-scene correction's offline release build and binary `--help` smoke
+check passed. The new executable remains at the stable Aether release path;
+its checksum and build output are stored as `active-damage-release.sha256` and
+`active-damage-release-build.log`. A new native compositor session is required
+to measure this correction. The unchanged latency table above describes the
+preceding journal-only build, not this active-scene cache correction.
