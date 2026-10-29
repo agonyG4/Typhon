@@ -576,3 +576,52 @@ will be directed to the stable Aether diagnostics directory. This attribution
 run will inspect causes; tracing overhead makes its latency unsuitable for a
 clean before/after performance claim. No production behavior was changed in
 this investigation.
+
+
+## Separate Kitty background blur from Vesktop (2026-10-29)
+
+The user pointed out that the terminal behind Vesktop has full-background blur.
+This distinction matters: prior global blur toggles removed every window's
+assignment and did not identify the owner of the costly blur. Do not interpret
+those runs as showing a blur requested by Vesktop specifically.
+
+The newly launched compositor PID 33812 has native perf and effect execution
+tracing enabled, with logs written to Aether. A short attribution experiment
+kept both windows and their geometry unchanged on workspace 1: active maximized
+Vesktop occupied (0,71,1920,929), while Kitty occupied (72,72,1163,873) behind it.
+A temporary last-matching window rule disabled blur only for app ID `kitty`.
+Blur remained globally enabled, and the three client assignments remained;
+the one automatic Wayland assignment disappeared. The original configuration
+was restored in a finally block and the diagnostic Vesktop launch was restored
+to normal. The compositor remained running. These runs use heavy logging and
+are for attribution, not latency comparison with earlier clean captures.
+
+Six alternating scroll gestures in each condition yielded:
+
+| Condition | Partial frames | Full frames | Partial share |
+| --- | ---: | ---: | ---: |
+| Kitty blur on | 34 | 827 | 3.95% |
+| Only Kitty blur disabled | 420 | 427 | 49.59% |
+
+The trace contains 860/846 corresponding repaint provenance records (one fewer
+than counter deltas at sampling boundaries). With Kitty blur on, 800 full
+promotions first occurred in `initial_repaint_plan` due to
+`damage_area_threshold`, and 27 due to `insufficient_history`. With only Kitty
+blur disabled, these counts were 411 and 16. No observed full promotion first
+occurred in final effect execution. Example frames show current logical damage
+already reaching about 1.824 million pixels, or age-2/3 repair candidates
+combining smaller current damage with prior damage before promoting to the
+2.0736-million-pixel output. Thus final effect execution is not the first
+promotion boundary in these records. The remaining distinction is upstream
+physical damage expansion versus the initial buffer-age repair union.
+
+This confirms that the terminal behind the maximized application affects
+repair planning; it does not yet prove which effect or occlusion rule should
+change, nor a reduction of input latency from removing that contribution.
+Correct handling of opaque coverage, backdrop dependencies and partially
+visible windows must be established before changing damage propagation.
+Artifacts: `kitty-blur-attribution.json`,
+`kitty-blur-attribution-analysis.json`, and the byte ranges recorded there in
+`vesktop-attribution-session.log`. Temporary diagnostic scripts and outputs
+remain in the stable Aether diagnostics directory. No production code or
+persistent visual setting was changed by this experiment.
