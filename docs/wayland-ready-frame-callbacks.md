@@ -689,3 +689,54 @@ and `ordered-backdrop-release-build.log` in stable Aether diagnostics. Reloading
 the compositor is required to test this binary. For the next latency capture,
 explicitly set `OBLIVION_ONE_PERF_LOG=0` and `TYPHON_EFFECT_EXEC_TRACE=0` because
 the diagnostic session's child terminal may inherit enabled tracing settings.
+
+
+## Live validation of ordered stationary blur correction (2026-10-29)
+
+Running compositor PID 53538 matched the corrected Aether release SHA-256
+`a0f106d6ededc3dbfa33f34a4b6101f5897557f5861437cf134ff14e912d0511`.
+Native perf logging was 0; effect trace was absent (disabled by its parser).
+Vesktop was maximized on workspace 1 at (0,71,1920,929), with Kitty behind it
+at (72,72,1163,873). Blur remained enabled with three client assignments and
+one automatic Wayland assignment; there were no temporary window rules.
+Both captures kept focus and visibility, DPR 1 and AlwaysAnimate on, with
+six alternating scroll gestures, no injected RAF probe and no JS long tasks.
+The compositor survived both captures and Vesktop's normal-launch restoration.
+
+| Capture | Presented updates | p50 | p95 | p99 | Partial share during interior scroll |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Earlier `owner-fixed` | 852 | 24.393 ms | 30.497 ms | 36.481 ms | 4.82% |
+| Earlier repeat | 852 | 24.362 ms | 30.432 ms | 36.338 ms | 3.94% |
+| `ordered-blur-fixed` | 851 | 24.430 ms | 36.286 ms | 42.371 ms | 65.09% |
+| New repeat | 852 | 24.333 ms | 35.969 ms | 36.449 ms | 65.99% |
+
+The interior windows contain 399 partial/214 full over 4.009 seconds and
+518 partial/267 full over 5.012 seconds. Remaining full reasons were area
+threshold 200/246 and insufficient history 14/21. Complete mixed capture
+windows had 2553/493 and 2354/429 partial/full frames respectively; these must
+not substitute for the scroll-only ratios. Earlier/new captures come from
+different compositor sessions, not an interleaved same-session binary A/B.
+The gesture and client procedure is the same, but session/load differences
+limit causal claims about the smaller timing changes.
+
+During the same coarse interior windows, delta means of the compositor CPU
+render counter changed from 1.691/1.705 ms in the earlier runs to 1.327/1.320 ms
+in the new runs (about 22% lower). The per-registration remaining GPU fence
+wait changed from 0.670/0.678 ms to 0.828/0.842 ms. This wait is not total GPU
+execution time and can depend on when registration follows CPU submission.
+Ready-release CPU service stayed about 12 microseconds. Layerize medians were
+5.554/5.556 ms in the new traces, versus 5.506/5.491 ms earlier.
+
+The correction therefore reduced complete repaints and measured compositor
+CPU render duration in these captures, but did not improve presented-scroll
+median latency. The p95 is worse in both new captures, near 36 ms instead of
+30.5 ms; it must not be presented as an overall latency improvement. Its cause
+has not yet been isolated between session/load differences, renderer scheduling
+and changed repair/GPU pacing. No additional timing-policy change was made on
+these measurements. There is no claim that the remaining input lag is fixed.
+
+Artifacts: `ordered-blur-fixed*`, `ordered-blur-validation-summary.json` and
+`ordered-blur-scroll-costs.json` in stable Aether diagnostics. The summary
+script records both scroll-bounded counters and trace quantiles. No new code
+or build was required for this validation report; the six unrelated dirty
+source files remain untouched.
