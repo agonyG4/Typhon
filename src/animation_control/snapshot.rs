@@ -14,6 +14,8 @@ pub struct AnimationConfigurationSnapshot {
     pub enabled: bool,
     #[serde(default = "default_true")]
     pub animate_maximized_window_open: bool,
+    #[serde(default)]
+    pub slide_wallpaper: bool,
     pub preset: String,
     pub speed: f64,
     pub overrides: BTreeMap<String, String>,
@@ -26,6 +28,7 @@ impl From<&AnimationConfiguration> for AnimationConfigurationSnapshot {
         Self {
             enabled: configuration.enabled,
             animate_maximized_window_open: configuration.animate_maximized_window_open,
+            slide_wallpaper: configuration.slide_wallpaper,
             preset: configuration.preset.id().to_string(),
             speed: configuration.speed,
             overrides: configuration

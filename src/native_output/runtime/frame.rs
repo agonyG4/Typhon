@@ -17,7 +17,7 @@ use oblivion_one::compositor::{
     DesktopVisualState, FrameEffectSceneInput, FullscreenRenderPlanMetrics, PointerWarpOrigin,
     PresentationFrameSnapshot, PresentationSceneSample, PresentedCanonicalSceneSnapshot,
     ResolvedEffectScene, SceneNodeId, SpecialWorkspaceDim, SpecialWorkspacePresentationSample,
-    SurfacePlacement, SurfaceResourceSyncState, WindowExitFrameEvidence,
+    SurfacePlacement, SurfaceResourceSyncState, WallpaperEcho, WindowExitFrameEvidence,
     WorkspacePresentationSample,
 };
 use oblivion_one::presentation_animation::{
@@ -92,6 +92,7 @@ pub(crate) struct ResolvedNativeFrameScene<'a> {
     pub(crate) popup_surface_ids: Cow<'a, [u32]>,
     pub(crate) external_overlay_surface_ids: Vec<u32>,
     pub(crate) special_workspace_dim: SpecialWorkspaceDim,
+    pub(crate) wallpaper_echo: Option<WallpaperEcho>,
     pub(crate) render_generation: u64,
     pub(crate) visibility: FullscreenRenderPlanMetrics,
     pub(crate) snapshot: NativeSceneSnapshot,
@@ -607,6 +608,7 @@ impl<'a> ResolvedNativeFrameScene<'a> {
         scene.popup_surface_ids = Cow::Owned(Vec::new());
         scene.external_overlay_surface_ids.clear();
         scene.special_workspace_dim = SpecialWorkspaceDim::default();
+        scene.wallpaper_echo = None;
         scene.visibility = FullscreenRenderPlanMetrics::default();
         scene.snapshot = NativeSceneSnapshot::default();
         scene.canonical_scene_evidence = None;
@@ -712,6 +714,28 @@ impl<'a> ResolvedNativeFrameScene<'a> {
                 server.special_workspace_slide_translation(presence),
             );
         }
+        // With the wallpaper slide on, the wallpaper follows the first
+        // participant and an echo fills the second participant's cell.
+        let wallpaper_echo = workspace_presentation_sample
+            .as_ref()
+            .and_then(|sample| match sample.participants.as_slice() {
+                [first, second] => Some((*first, *second)),
+                _ => None,
+            })
+            .and_then(|(first, second)| {
+                let owner_roots = server.sliding_wallpaper_roots();
+                if owner_roots.is_empty() {
+                    return None;
+                }
+                for &root in &owner_roots {
+                    workspace_translations_by_owner_root
+                        .insert(root, (first.translation_x, first.translation_y));
+                }
+                Some(WallpaperEcho {
+                    owner_roots,
+                    offset_x: second.translation_x - first.translation_x,
+                })
+            });
         let workspace_clips_by_owner_root = workspace_presentation_sample
             .as_ref()
             .map(|sample| {
@@ -991,6 +1015,9 @@ impl<'a> ResolvedNativeFrameScene<'a> {
             scene_identity_signature = scene_identity_signature.wrapping_mul(0x0000_0100_0000_01b3)
                 ^ special_sample.signature;
         }
+        if let Some(echo) = &wallpaper_echo {
+            scene_identity_signature = echo.fold_signature(scene_identity_signature);
+        }
         #[cfg(test)]
         {
             note_snapshot_finalization();
@@ -1066,6 +1093,7 @@ impl<'a> ResolvedNativeFrameScene<'a> {
             popup_surface_ids,
             external_overlay_surface_ids,
             special_workspace_dim,
+            wallpaper_echo,
             render_generation,
             visibility,
             snapshot,
@@ -1097,6 +1125,7 @@ impl<'a> ResolvedNativeFrameScene<'a> {
             popup_surface_ids: Cow::Owned(self.popup_surface_ids.into_owned()),
             external_overlay_surface_ids: self.external_overlay_surface_ids,
             special_workspace_dim: self.special_workspace_dim,
+            wallpaper_echo: self.wallpaper_echo,
             render_generation: self.render_generation,
             visibility: self.visibility,
             snapshot: self.snapshot,
@@ -2779,6 +2808,7 @@ fn project_egl_scene_draw_request<'a>(
         surfaces: scene.surfaces.as_ref(),
         external_overlay_surface_ids: &scene.external_overlay_surface_ids,
         special_workspace_dim: scene.special_workspace_dim,
+        wallpaper_echo: scene.wallpaper_echo.as_ref(),
         popup_surface_ids: scene.popup_surface_ids.as_ref(),
         content_generation: native_scene_content_generation(scene.render_generation),
         frame_id,

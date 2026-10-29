@@ -342,6 +342,8 @@ struct AnimationConfigurationSetArgs {
     enabled: bool,
     #[serde(default = "default_true")]
     animate_maximized_window_open: bool,
+    #[serde(default)]
+    slide_wallpaper: bool,
     preset: String,
     speed: f64,
     #[serde(default)]
@@ -1001,6 +1003,7 @@ impl NativeRuntime {
                 version: args.version,
                 enabled: args.enabled,
                 animate_maximized_window_open: args.animate_maximized_window_open,
+                slide_wallpaper: args.slide_wallpaper,
                 preset: args.preset,
                 speed: args.speed,
                 overrides: args.overrides,
@@ -2978,6 +2981,7 @@ mod tests {
             version: args.version,
             enabled: args.enabled,
             animate_maximized_window_open: args.animate_maximized_window_open,
+            slide_wallpaper: args.slide_wallpaper,
             preset: args.preset,
             speed: args.speed,
             overrides: args.overrides,

@@ -432,6 +432,7 @@ fn special_workspace_dim_sits_between_regular_groups_and_its_anchor_group() {
         &[],
         &HashMap::new(),
         oblivion_one::compositor::SpecialWorkspaceDim::new(0.2, Some(8)),
+        None,
         OutputFramebufferOrigin::BottomLeft,
     );
 
@@ -499,6 +500,7 @@ fn translucent_egl_presentation_command_is_not_an_opaque_occluder() {
         &[],
         &HashMap::from([(7, owner_root)]),
         oblivion_one::compositor::SpecialWorkspaceDim::default(),
+        None,
         OutputFramebufferOrigin::BottomLeft,
     );
 
@@ -537,6 +539,7 @@ fn translucent_egl_presentation_command_is_not_an_opaque_occluder() {
         &[],
         &HashMap::from([(7, owner_root)]),
         oblivion_one::compositor::SpecialWorkspaceDim::default(),
+        None,
         OutputFramebufferOrigin::BottomLeft,
     );
 
@@ -575,6 +578,7 @@ fn translucent_egl_presentation_command_is_not_an_opaque_occluder() {
         &[],
         &HashMap::from([(7, owner_root)]),
         oblivion_one::compositor::SpecialWorkspaceDim::default(),
+        None,
         OutputFramebufferOrigin::BottomLeft,
     );
 
@@ -626,6 +630,7 @@ fn presentation_opacities_stay_aligned_with_commands_across_groups() {
         &[],
         &HashMap::from([(7, 7), (8, 8)]),
         oblivion_one::compositor::SpecialWorkspaceDim::default(),
+        None,
         OutputFramebufferOrigin::BottomLeft,
     );
 
@@ -1533,6 +1538,7 @@ fn special_workspace_dim_command_precedes_anchor_group_in_egl_scene() {
         &[],
         &HashMap::new(),
         oblivion_one::compositor::SpecialWorkspaceDim::new(0.2, Some(surface_id)),
+        None,
         OutputFramebufferOrigin::BottomLeft,
     );
     let scene = &harness.renderer.scene_state;
@@ -1562,13 +1568,53 @@ fn special_workspace_dim_command_precedes_anchor_group_in_egl_scene() {
         &[],
         &HashMap::new(),
         oblivion_one::compositor::SpecialWorkspaceDim::new(0.2, None),
+        None,
         OutputFramebufferOrigin::BottomLeft,
     );
     let scene = &harness.renderer.scene_state;
     assert_eq!(scene.commands.len(), 3);
     assert_eq!(
-        scene.commands[2].layer,
-        dim_layer,
+        scene.commands[2].layer, dim_layer,
         "unanchored dim follows every group"
     );
+}
+
+#[test]
+fn wallpaper_echo_draws_a_second_copy_one_cell_away() {
+    let mut harness = GlesEffectTestHarness::new(320, 200);
+    let surfaces = vec![test_shm_surface(RenderableSurfaceDamage::full())];
+    let signatures = egl_scene_surface_signatures(&surfaces);
+    let echo = oblivion_one::compositor::WallpaperEcho {
+        owner_roots: vec![7],
+        offset_x: 320.0,
+    };
+
+    harness.renderer.scene_state.rebuild_scene_commands(
+        320,
+        200,
+        &surfaces,
+        &[],
+        &[],
+        1,
+        1.0,
+        1,
+        &signatures,
+        &[],
+        0,
+        &[],
+        &[],
+        &HashMap::new(),
+        oblivion_one::compositor::SpecialWorkspaceDim::default(),
+        Some(&echo),
+        OutputFramebufferOrigin::BottomLeft,
+    );
+
+    let scene = &harness.renderer.scene_state;
+    // Output background, the wallpaper, and its echo.
+    assert_eq!(scene.commands.len(), 3);
+    assert_eq!(scene.presentation_opacities.len(), scene.commands.len());
+    let (wallpaper, copy) = (&scene.commands[1], &scene.commands[2]);
+    assert_eq!(copy.bounds.x() - wallpaper.bounds.x(), 320.0);
+    assert_eq!(copy.bounds.y(), wallpaper.bounds.y());
+    assert_eq!(copy.visual_group, wallpaper.visual_group);
 }

@@ -23,6 +23,9 @@ fn default_true() -> bool {
 pub struct AnimationConfiguration {
     pub enabled: bool,
     pub animate_maximized_window_open: bool,
+    /// The wallpaper moves with each workspace during a slide, like KWin's
+    /// "Slide desktop background".
+    pub slide_wallpaper: bool,
     pub preset: AnimationPreset,
     pub speed: f64,
     pub overrides: BTreeMap<AnimationSlot, AnimationEffect>,
@@ -34,6 +37,7 @@ impl Default for AnimationConfiguration {
         Self {
             enabled: true,
             animate_maximized_window_open: true,
+            slide_wallpaper: false,
             preset: AnimationPreset::Astrea,
             speed: 1.0,
             overrides: BTreeMap::new(),
@@ -108,6 +112,7 @@ impl AnimationConfiguration {
             version: ANIMATION_CONFIGURATION_VERSION,
             enabled: self.enabled,
             animate_maximized_window_open: self.animate_maximized_window_open,
+            slide_wallpaper: self.slide_wallpaper,
             preset: self.preset.id().to_string(),
             speed: self.speed,
             overrides: self
@@ -155,6 +160,7 @@ impl AnimationConfiguration {
         let configuration = Self {
             enabled: document.enabled,
             animate_maximized_window_open: document.animate_maximized_window_open,
+            slide_wallpaper: document.slide_wallpaper,
             preset,
             speed: document.speed,
             overrides,
@@ -172,6 +178,8 @@ pub struct AnimationConfigurationDocument {
     pub enabled: bool,
     #[serde(default = "default_true")]
     pub animate_maximized_window_open: bool,
+    #[serde(default)]
+    pub slide_wallpaper: bool,
     pub preset: String,
     pub speed: f64,
     #[serde(default)]

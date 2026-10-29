@@ -229,6 +229,7 @@ pub struct EglSceneDrawRequest<'a> {
     pub surfaces: &'a [RenderableSurface],
     pub external_overlay_surface_ids: &'a [u32],
     pub special_workspace_dim: compositor::SpecialWorkspaceDim,
+    pub wallpaper_echo: Option<&'a compositor::WallpaperEcho>,
     pub popup_surface_ids: &'a [u32],
     pub content_generation: u64,
     pub(crate) frame_id: Option<u64>,

@@ -1810,6 +1810,10 @@ impl OwnCompositorServer {
             || self.state.special_workspace_presentation_active()
     }
 
+    pub fn sliding_wallpaper_roots(&self) -> Vec<u32> {
+        self.state.sliding_wallpaper_roots()
+    }
+
     pub fn special_workspace_slide_translation(&self, presence: f64) -> (f64, f64) {
         self.state.special_workspace_slide_translation(presence)
     }

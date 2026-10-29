@@ -37,10 +37,7 @@ impl CompositorState {
     /// True when the workspace switch effect is a slide and animations are on.
     pub(in crate::compositor) fn workspace_slide_effect_enabled(&self) -> bool {
         self.animation_control.enabled()
-            && matches!(
-                self.workspace_switch_effect(),
-                AnimationEffect::WorkspaceSlide | AnimationEffect::WorkspaceSlideHyprland
-            )
+            && self.workspace_switch_effect() == AnimationEffect::WorkspaceSlide
     }
 
     fn workspace_switch_effect(&self) -> AnimationEffect {
@@ -114,14 +111,7 @@ impl CompositorState {
             .animation_control
             .configuration()
             .speed_for(AnimationSlot::WorkspaceSwitch);
-        let curve = if self.workspace_switch_effect() == AnimationEffect::WorkspaceSlideHyprland {
-            crate::animation_control::scale_curve(
-                crate::animation_control::HYPRLAND_WORKSPACES_CURVE,
-                speed,
-            )
-        } else {
-            workspace_slide_curve(speed)
-        };
+        let curve = workspace_slide_curve(speed);
         let retarget = self.workspace_presentation.transition().is_some();
         if let Some(transition_id) = self.workspace_presentation.activate_for_switch(
             outcome,

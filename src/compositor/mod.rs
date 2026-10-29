@@ -1273,8 +1273,9 @@ pub use state::window_exit_retained::{
     window_exit_stack_order_key,
 };
 pub use state::workspace_presentation::{
-    WorkspaceFramePresentationScene, WorkspaceLogicalClip, WorkspacePresentationParticipant,
-    WorkspacePresentationSample, WorkspacePresentationTransitionId,
+    WallpaperEcho, WorkspaceFramePresentationScene, WorkspaceLogicalClip,
+    WorkspacePresentationParticipant, WorkspacePresentationSample,
+    WorkspacePresentationTransitionId,
 };
 use state::*;
 #[cfg(test)]

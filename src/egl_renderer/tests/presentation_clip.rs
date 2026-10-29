@@ -467,6 +467,7 @@ fn popup_visual_group_inherits_window_group_clip_from_its_presentation_owner() {
         &[clip],
         &HashMap::from([(7, owner_root), (8, owner_root)]),
         oblivion_one::compositor::SpecialWorkspaceDim::default(),
+        None,
         OutputFramebufferOrigin::BottomLeft,
     );
 

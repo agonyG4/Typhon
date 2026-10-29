@@ -405,6 +405,7 @@ impl SceneRenderState {
         presentation_clips: &[oblivion_one::presentation_animation::PresentationGroupClip],
         presentation_owner_roots_by_surface: &HashMap<u32, u32>,
         special_workspace_dim: compositor::SpecialWorkspaceDim,
+        wallpaper_echo: Option<&compositor::WallpaperEcho>,
         framebuffer_origin: OutputFramebufferOrigin,
     ) {
         self.frame_stats.orphan_decoration_count =
@@ -464,16 +465,47 @@ impl SceneRenderState {
                 else {
                     continue;
                 };
+                let echo_offset = wallpaper_echo
+                    .filter(|echo| {
+                        let owner_root = presentation_owner_roots_by_surface
+                            .get(&surface.surface_id)
+                            .copied()
+                            .unwrap_or(surface.surface_id);
+                        echo.owner_roots.contains(&owner_root)
+                            && render_assignment.visual_clip.is_none()
+                    })
+                    .map(|echo| (echo.offset_x * output_scale).round() as i32);
                 push_egl_surface_commands(
                     &mut self.vertices,
                     &mut self.commands,
                     width,
                     height,
                     surface,
-                    render_assignment,
+                    render_assignment.clone(),
                     framebuffer_origin,
                     visual_group,
                 );
+                // The wallpaper's second copy, one workspace cell away.
+                if let Some(offset) = echo_offset {
+                    let target = render_assignment.target;
+                    let mut echo_assignment = render_assignment;
+                    echo_assignment.target = compositor::SurfaceTargetRect::new(
+                        target.x().saturating_add(offset),
+                        target.y(),
+                        target.width(),
+                        target.height(),
+                    );
+                    push_egl_surface_commands(
+                        &mut self.vertices,
+                        &mut self.commands,
+                        width,
+                        height,
+                        surface,
+                        echo_assignment,
+                        framebuffer_origin,
+                        visual_group,
+                    );
+                }
             }
             if let Some(decoration_index) = group.decoration_index()
                 && let Some(instance) = decoration_instances.get(decoration_index)

@@ -1005,6 +1005,7 @@ fn snapshot_ref_preserves_constructor_popup_ids_and_order() {
             popup_surface_ids: Cow::Borrowed(popup_surface_ids),
             external_overlay_surface_ids: Vec::new(),
             special_workspace_dim: oblivion_one::compositor::SpecialWorkspaceDim::default(),
+            wallpaper_echo: None,
             render_generation: 1,
             visibility: FullscreenRenderPlanMetrics::default(),
             snapshot: NativeSceneSnapshot::from_surfaces_with_popup_ids(

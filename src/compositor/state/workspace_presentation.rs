@@ -64,6 +64,27 @@ pub struct WorkspacePresentationSample {
     pub signature: u64,
 }
 
+/// A second copy of the wallpaper drawn `offset_x` logical pixels from the
+/// first while it slides with the workspaces. The wallpaper is shared by every
+/// workspace, so the outgoing and incoming cells each need their own copy,
+/// which is how KWin's slide paints the desktop background per desktop.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WallpaperEcho {
+    pub owner_roots: Vec<u32>,
+    pub offset_x: f64,
+}
+
+impl WallpaperEcho {
+    pub fn fold_signature(&self, signature: u64) -> u64 {
+        const PRIME: u64 = 0x0000_0100_0000_01b3;
+        let mut signature = (signature ^ self.offset_x.to_bits()).wrapping_mul(PRIME);
+        for root in &self.owner_roots {
+            signature = (signature ^ u64::from(*root)).wrapping_mul(PRIME);
+        }
+        signature
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct WorkspaceFramePresentationScene {
     /// `None` when only a special-workspace motion is in flight.
@@ -475,6 +496,24 @@ impl crate::compositor::CompositorState {
             surface_origins,
             popup_surface_ids,
         })
+    }
+
+    /// Background-layer roots that move with a regular workspace slide; empty
+    /// unless the wallpaper slide is on.
+    pub(in crate::compositor) fn sliding_wallpaper_roots(&self) -> Vec<u32> {
+        if !self.animation_control.configuration().slide_wallpaper {
+            return Vec::new();
+        }
+        let mut roots = self
+            .layer_surfaces
+            .iter()
+            .filter(|(_, role)| {
+                role.committed.layer == crate::compositor::layer_shell::Layer::Background
+            })
+            .map(|(root, _)| *root)
+            .collect::<Vec<_>>();
+        roots.sort_unstable();
+        roots
     }
 
     fn regular_workspace_for_presentation_owner(&self, owner_root: u32) -> Option<WorkspaceId> {

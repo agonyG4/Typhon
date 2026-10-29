@@ -53,9 +53,6 @@ pub(crate) const HYPRLAND_FADE_IN_CURVE: AnimationCurve =
 /// fadeOut: speed 1.5, quick.
 pub(crate) const HYPRLAND_FADE_OUT_CURVE: AnimationCurve =
     AnimationCurve::easing(Duration::from_millis(150), EasingCurve::Quick);
-/// workspaces: speed 2.5, easeOutExpo, slide.
-pub(crate) const HYPRLAND_WORKSPACES_CURVE: AnimationCurve =
-    AnimationCurve::easing(Duration::from_millis(250), EasingCurve::EaseOutExpo);
 /// specialWorkspace: speed 3.5, easeOutExpo, slide (horizontal, with fade).
 pub(crate) const HYPRLAND_SPECIAL_WORKSPACE_CURVE: AnimationCurve =
     AnimationCurve::easing(Duration::from_millis(350), EasingCurve::EaseOutExpo);

@@ -314,9 +314,12 @@ impl FramePipeline<'_> {
         // The dim is a global output change; folding it into the presentation
         // signature invalidates the cached command list and the full output
         // damage exactly when the dim toggles or moves.
-        let scene_presentation_signature = request
+        let mut scene_presentation_signature = request
             .special_workspace_dim
             .fold_signature(request.presentation_visual_signature);
+        if let Some(echo) = request.wallpaper_echo {
+            scene_presentation_signature = echo.fold_signature(scene_presentation_signature);
+        }
         let candidate_scene_key = EglSceneCacheKey::new_with_decorations_and_external_overlay_ids(
             frame.width,
             frame.height,
@@ -414,6 +417,7 @@ impl FramePipeline<'_> {
                 request.presentation_clips,
                 &presentation_owner_roots_by_surface,
                 request.special_workspace_dim,
+                request.wallpaper_echo,
                 framebuffer_origin,
             );
         }

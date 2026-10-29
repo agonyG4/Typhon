@@ -92,13 +92,12 @@ pub enum AnimationEffect {
     MinimizeLamp,
     MinimizeSquash,
     WorkspaceSlide,
-    WorkspaceSlideHyprland,
     SpecialSlide,
     SpecialSlideHyprland,
 }
 
 impl AnimationEffect {
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 12] = [
         Self::None,
         Self::GeometryKde,
         Self::GeometryMacos,
@@ -109,7 +108,6 @@ impl AnimationEffect {
         Self::MinimizeLamp,
         Self::MinimizeSquash,
         Self::WorkspaceSlide,
-        Self::WorkspaceSlideHyprland,
         Self::SpecialSlide,
         Self::SpecialSlideHyprland,
     ];
@@ -126,7 +124,6 @@ impl AnimationEffect {
             Self::MinimizeLamp => "minimize.lamp",
             Self::MinimizeSquash => "minimize.squash",
             Self::WorkspaceSlide => "workspace.slide",
-            Self::WorkspaceSlideHyprland => "workspace.slide.hyprland",
             Self::SpecialSlide => "special.slide",
             Self::SpecialSlideHyprland => "special.slide.hyprland",
         }
@@ -145,7 +142,6 @@ impl AnimationEffect {
                 | Self::MinimizeLamp
                 | Self::MinimizeSquash
                 | Self::WorkspaceSlide
-                | Self::WorkspaceSlideHyprland
                 | Self::SpecialSlide
                 | Self::SpecialSlideHyprland
         )
@@ -158,9 +154,7 @@ impl AnimationEffect {
     /// still planned.
     pub const fn is_available_for_slot(self, slot: AnimationSlot) -> bool {
         match self {
-            Self::WorkspaceSlide | Self::WorkspaceSlideHyprland => {
-                matches!(slot, AnimationSlot::WorkspaceSwitch)
-            }
+            Self::WorkspaceSlide => matches!(slot, AnimationSlot::WorkspaceSwitch),
             Self::SpecialSlide | Self::SpecialSlideHyprland => {
                 matches!(slot, AnimationSlot::SpecialWorkspace)
             }
@@ -226,6 +220,11 @@ impl AnimationEffect {
     }
 
     pub fn parse(value: &str) -> Option<Self> {
+        // The Hyprland workspace slide was folded back into the plain slide;
+        // saved configurations that name it keep working.
+        if value == "workspace.slide.hyprland" {
+            return Some(Self::WorkspaceSlide);
+        }
         Self::ALL.into_iter().find(|effect| effect.id() == value)
     }
 
@@ -244,9 +243,7 @@ impl AnimationEffect {
                     AnimationSlot::WindowMinimize | AnimationSlot::WindowRestore
                 )
             }
-            Self::WorkspaceSlide | Self::WorkspaceSlideHyprland => {
-                matches!(slot, AnimationSlot::WorkspaceSwitch)
-            }
+            Self::WorkspaceSlide => matches!(slot, AnimationSlot::WorkspaceSwitch),
             Self::SpecialSlide | Self::SpecialSlideHyprland => {
                 matches!(slot, AnimationSlot::SpecialWorkspace)
             }
@@ -289,9 +286,6 @@ impl AnimationPreset {
             }
             (Self::Hyprland, AnimationSlot::WindowOpen | AnimationSlot::WindowClose) => {
                 AnimationEffect::WindowPopin
-            }
-            (Self::Hyprland, AnimationSlot::WorkspaceSwitch) => {
-                AnimationEffect::WorkspaceSlideHyprland
             }
             (_, AnimationSlot::WorkspaceSwitch) => AnimationEffect::WorkspaceSlide,
             (Self::Hyprland, AnimationSlot::SpecialWorkspace) => {
@@ -382,16 +376,11 @@ mod tests {
     #[test]
     fn all_presets_request_slide_only_for_workspace_switch() {
         for preset in AnimationPreset::ALL {
-            let (switch, special) = if preset == AnimationPreset::Hyprland {
-                (
-                    AnimationEffect::WorkspaceSlideHyprland,
-                    AnimationEffect::SpecialSlideHyprland,
-                )
+            let switch = AnimationEffect::WorkspaceSlide;
+            let special = if preset == AnimationPreset::Hyprland {
+                AnimationEffect::SpecialSlideHyprland
             } else {
-                (
-                    AnimationEffect::WorkspaceSlide,
-                    AnimationEffect::SpecialSlide,
-                )
+                AnimationEffect::SpecialSlide
             };
             assert_eq!(
                 preset.requested_effect(AnimationSlot::WorkspaceSwitch),
@@ -419,9 +408,10 @@ mod tests {
             assert!(effect.compatible_with(AnimationSlot::SpecialWorkspace));
             assert!(!effect.compatible_with(AnimationSlot::WorkspaceSwitch));
         }
-        assert!(
-            !AnimationEffect::WorkspaceSlideHyprland
-                .compatible_with(AnimationSlot::SpecialWorkspace)
+        assert!(!AnimationEffect::WorkspaceSlide.compatible_with(AnimationSlot::SpecialWorkspace));
+        assert_eq!(
+            AnimationEffect::parse("workspace.slide.hyprland"),
+            Some(AnimationEffect::WorkspaceSlide)
         );
         assert_eq!(AnimationSlot::ALL[11].id(), "workspace.special");
     }
