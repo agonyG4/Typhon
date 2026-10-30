@@ -19,6 +19,7 @@ pub(super) enum PresentationPolicyError {
     InvalidTripleBuffering,
     InvalidKmsWorker,
     InvalidHeldCommits,
+    InvalidCreditGrant,
     /// The worker cannot be started or stopped while KMS work is in flight.
     KmsWorkerBusy,
     KmsWorkerUnsupported,
@@ -32,6 +33,7 @@ impl PresentationPolicyError {
             Self::InvalidTripleBuffering => "invalid_triple_buffering",
             Self::InvalidKmsWorker => "invalid_kms_worker",
             Self::InvalidHeldCommits => "invalid_held_commits",
+            Self::InvalidCreditGrant => "invalid_credit_grant",
             Self::KmsWorkerBusy => "kms_worker_busy",
             Self::KmsWorkerUnsupported => "kms_worker_unsupported",
             Self::KmsWorkerStartFailed => "kms_worker_start_failed",
@@ -53,6 +55,12 @@ impl NativeRuntime {
                 "immediate"
             }
             .to_string(),
+            credit_grant: if self.adaptive_buffering.sustained_overlap_grants() {
+                "sustained"
+            } else {
+                "ceiling"
+            }
+            .to_string(),
         }
     }
 
@@ -64,7 +72,15 @@ impl NativeRuntime {
         triple_buffering: Option<&str>,
         kms_worker: Option<&str>,
         held_commits: Option<&str>,
+        credit_grant: Option<&str>,
     ) -> Result<(), PresentationPolicyError> {
+        let sustained_grants = credit_grant
+            .map(|value| match value {
+                "sustained" => Ok(true),
+                "ceiling" => Ok(false),
+                _ => Err(PresentationPolicyError::InvalidCreditGrant),
+            })
+            .transpose()?;
         let held_late_latch = held_commits
             .map(|value| match value {
                 "late_latch" => Ok(true),
@@ -82,6 +98,10 @@ impl NativeRuntime {
             .map_err(|_| PresentationPolicyError::InvalidKmsWorker)?;
         if let Some(worker) = worker {
             self.set_kms_commit_worker_policy(worker)?;
+        }
+        if let Some(sustained) = sustained_grants {
+            self.adaptive_buffering
+                .set_sustained_overlap_grants(sustained);
         }
         if let Some(late_latch) = held_late_latch {
             crate::native_output::kms_worker::set_held_commits_late_latch(late_latch);
@@ -197,6 +217,7 @@ struct PresentationPolicySetArgs {
     triple_buffering: Option<String>,
     kms_worker: Option<String>,
     held_commits: Option<String>,
+    credit_grant: Option<String>,
 }
 
 impl NativeRuntime {
@@ -210,7 +231,8 @@ impl NativeRuntime {
                 if command == ControlCommand::PresentationPolicySet
                     || (args.triple_buffering.is_none()
                         && args.kms_worker.is_none()
-                        && args.held_commits.is_none()) =>
+                        && args.held_commits.is_none()
+                        && args.credit_grant.is_none()) =>
             {
                 args
             }
@@ -228,11 +250,13 @@ impl NativeRuntime {
             args.triple_buffering.as_deref(),
             args.kms_worker.as_deref(),
             args.held_commits.as_deref(),
+            args.credit_grant.as_deref(),
         ) {
             let code = match error {
                 PresentationPolicyError::InvalidTripleBuffering
                 | PresentationPolicyError::InvalidKmsWorker
                 | PresentationPolicyError::InvalidHeldCommits
+                | PresentationPolicyError::InvalidCreditGrant
                 | PresentationPolicyError::KmsWorkerUnsupported => {
                     ControlErrorCode::InvalidArgument
                 }

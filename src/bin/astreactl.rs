@@ -443,13 +443,15 @@ fn parse_presentation_command(
             for assignment in &positionals[1..] {
                 let (key, value) = assignment.split_once('=').ok_or_else(|| {
                     AstreactlError::Usage(
-                        "presentation set takes triple=, worker= and/or held=VALUE".to_string(),
+                        "presentation set takes triple=, worker=, held= and/or grant=VALUE"
+                            .to_string(),
                     )
                 })?;
                 let key = match key {
                     "triple" => "tripleBuffering",
                     "worker" => "kmsWorker",
                     "held" => "heldCommits",
+                    "grant" => "creditGrant",
                     _ => {
                         return Err(AstreactlError::Usage(format!(
                             "unknown presentation policy {key}"
@@ -468,7 +470,7 @@ fn parse_presentation_command(
             "presentation get takes no arguments".to_string(),
         )),
         "set" => Err(AstreactlError::Usage(
-            "presentation set takes triple=, worker= and/or held=VALUE".to_string(),
+            "presentation set takes triple=, worker=, held= and/or grant=VALUE".to_string(),
         )),
         _ => Err(AstreactlError::Usage(format!(
             "unknown presentation subcommand {subcommand}"

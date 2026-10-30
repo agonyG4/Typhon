@@ -258,11 +258,9 @@ fn predecessor_lane_wait_ns(
     rendered_observed_at: Option<MonotonicTimestampNs>,
     evidence: Option<DeferredO1BindingTimingEvidence>,
 ) -> u64 {
-    let (Some(rendered_observed_at), Some(evidence), Some(worker_queued_at)) = (
-        rendered_observed_at,
-        evidence,
-        observation.worker_queued_at,
-    ) else {
+    let (Some(rendered_observed_at), Some(evidence), Some(worker_queued_at)) =
+        (rendered_observed_at, evidence, observation.worker_queued_at)
+    else {
         return 0;
     };
     if evidence.origin != DeferredO1BindingOrigin::PredecessorPageflip {
@@ -318,6 +316,11 @@ pub struct RenderPrediction {
     pub worker_non_ioctl_lead_ns: u64,
     pub miss_recovery_remaining: usize,
     pub total_cost_ns: u64,
+    /// `total_cost_ns` with each branch at its recent p95 instead of the
+    /// window-max evidence ceiling. A single slow render (a GPU clock ramp)
+    /// holds the ceiling for the whole window; this only exceeds a refresh
+    /// when the overload is sustained.
+    pub sustained_total_cost_ns: u64,
     pub cold_wake_guard: bool,
 }
 
@@ -397,6 +400,10 @@ impl BranchRiskHistory {
 
     fn risk_ns(&self) -> u64 {
         self.selection().selected_risk_ns
+    }
+
+    fn sustained_risk_ns(&self) -> u64 {
+        self.samples_ns.rank()
     }
 
     fn diagnostics(&self, refresh_interval_ns: u64) -> BranchRiskDiagnostics {
@@ -1016,6 +1023,19 @@ impl AdaptiveRenderJournal {
             .saturating_add(kms_dispatch_budget)
             .saturating_add(kms_apply_guard_ns);
         let estimator_mode = self.prediction_estimator_mode();
+        let sustained_total_cost_ns = match estimator_mode {
+            PredictionEstimatorMode::ColdStart | PredictionEstimatorMode::MissRecovery => {
+                independent_p90_floor_ns
+            }
+            PredictionEstimatorMode::WarmParallel => self::warm_parallel_total_cost_ns(
+                main_event_loop_wake_guard,
+                kms_apply_guard_ns,
+                self.exact_parallel.render_ready.sustained_risk_ns(),
+                self.exact_parallel.queue_ready.sustained_risk_ns(),
+                kms_dispatch_budget,
+            ),
+        }
+        .min(refresh_ns.saturating_mul(MAX_TOTAL_COST_REFRESH_INTERVALS));
         let mut total = match estimator_mode {
             PredictionEstimatorMode::ColdStart | PredictionEstimatorMode::MissRecovery => {
                 independent_total_cost_ns
@@ -1056,6 +1076,7 @@ impl AdaptiveRenderJournal {
             worker_non_ioctl_lead_ns,
             miss_recovery_remaining: self.miss_recovery_remaining,
             total_cost_ns: total,
+            sustained_total_cost_ns,
             cold_wake_guard: cold_wake,
         }
     }
@@ -1074,6 +1095,7 @@ pub struct AdaptiveBufferingController {
     entry_reason: Option<TripleEntryReason>,
     capability: TripleCapability,
     force_unavailable_blocker: Option<TripleCapabilityBlocker>,
+    sustained_overlap_grants: bool,
 }
 
 impl AdaptiveBufferingController {
@@ -1094,6 +1116,27 @@ impl AdaptiveBufferingController {
                 TripleCapabilityBlocker::ExplicitSwapchainUnavailable,
             ),
             force_unavailable_blocker: None,
+            sustained_overlap_grants: true,
+        }
+    }
+
+    /// Whether predicted overlap grants and releases credit 2 from the
+    /// sustained (p95) cost instead of the planning cost. Proven render
+    /// misses grant credit 2 either way.
+    pub const fn sustained_overlap_grants(&self) -> bool {
+        self.sustained_overlap_grants
+    }
+
+    pub fn set_sustained_overlap_grants(&mut self, sustained: bool) {
+        self.sustained_overlap_grants = sustained;
+    }
+
+    /// The cost whose predicted overlap grants or releases credit 2.
+    pub const fn overlap_grant_cost_ns(&self, prediction: &RenderPrediction) -> u64 {
+        if self.sustained_overlap_grants {
+            prediction.sustained_total_cost_ns
+        } else {
+            prediction.total_cost_ns
         }
     }
 
@@ -1335,14 +1378,18 @@ impl AdaptiveBufferingController {
     }
 
     pub fn reset(&mut self) {
+        let sustained = self.sustained_overlap_grants;
         *self = Self::new(self.policy);
+        self.sustained_overlap_grants = sustained;
     }
 
     /// Switch policy on a live output. Credit and mode restart from the new
     /// policy's initial state; the known capability carries over.
     pub fn set_policy(&mut self, policy: AdaptiveTripleBufferPolicy) {
         let capability = self.capability;
+        let sustained = self.sustained_overlap_grants;
         *self = Self::new(policy);
+        self.sustained_overlap_grants = sustained;
         self.apply_capability(capability);
     }
 }
@@ -3070,6 +3117,63 @@ mod exact_parallel_diagnostics_tests {
             diagnostics.queue_ready.selected_source.as_str(),
             "evidence_ceiling"
         );
+    }
+
+    #[test]
+    fn one_slow_render_raises_the_planning_cost_but_not_the_sustained_cost() {
+        let refresh = Duration::from_nanos(REFRESH_NS);
+        let journal_with = |render_ready: Vec<u64>| {
+            let mut journal = AdaptiveRenderJournal::default();
+            journal.exact_parallel.render_ready =
+                branch_history_with_window_and_model(render_ready, 3_000_000, 2_000_000);
+            journal.exact_parallel.queue_ready = branch_history_with_window_and_model(
+                std::iter::repeat_n(500_000, SAMPLE_CAPACITY),
+                500_000,
+                0,
+            );
+            for _ in 0..WARM_PARALLEL_MIN_SAMPLES {
+                journal.record_fixed_submission_budget(400_000);
+            }
+            journal.base_prediction(refresh, false, 460_000)
+        };
+
+        // A GPU clock ramp: one 5.5 ms render among 3 ms ones.
+        let mut ramp = vec![3_000_000; SAMPLE_CAPACITY - 1];
+        ramp.push(5_500_000);
+        let ramp = journal_with(ramp);
+        assert_eq!(ramp.estimator_mode, PredictionEstimatorMode::WarmParallel);
+        assert!(ramp.total_cost_ns > REFRESH_NS);
+        assert!(ramp.sustained_total_cost_ns < REFRESH_NS);
+
+        // Sustained overload: one in ten renders is slow.
+        let sustained = journal_with(
+            (0..SAMPLE_CAPACITY)
+                .map(|index| {
+                    if index % 10 == 0 {
+                        5_500_000
+                    } else {
+                        3_000_000
+                    }
+                })
+                .collect(),
+        );
+        assert!(sustained.sustained_total_cost_ns > REFRESH_NS);
+    }
+
+    #[test]
+    fn grant_cost_follows_the_runtime_switch_and_survives_resets() {
+        let prediction = RenderPrediction {
+            total_cost_ns: 7_000_000,
+            sustained_total_cost_ns: 5_000_000,
+            ..AdaptiveRenderJournal::default().prediction(Duration::from_nanos(REFRESH_NS))
+        };
+        let mut controller = AdaptiveBufferingController::new(AdaptiveTripleBufferPolicy::Auto);
+        assert_eq!(controller.overlap_grant_cost_ns(&prediction), 5_000_000);
+
+        controller.set_sustained_overlap_grants(false);
+        controller.reset();
+        controller.set_policy(AdaptiveTripleBufferPolicy::Force);
+        assert_eq!(controller.overlap_grant_cost_ns(&prediction), 7_000_000);
     }
 
     #[test]

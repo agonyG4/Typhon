@@ -257,6 +257,7 @@ mod tests {
             worker_non_ioctl_lead_ns: 0,
             miss_recovery_remaining: 0,
             total_cost_ns: 6_500_000,
+            sustained_total_cost_ns: 6_500_000,
             cold_wake_guard: false,
         }
     }

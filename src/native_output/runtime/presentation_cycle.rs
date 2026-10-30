@@ -651,7 +651,12 @@ impl NativeRuntime {
             }
         };
         adaptive_buffering.apply_capability(triple_capability);
-        let estimate = pipeline_service_estimate_for_prediction(&prediction);
+        // Credit 2 follows sustained overload; one slow render must not pin it
+        // for the whole risk window. Planning below keeps the full estimate.
+        let estimate = pipeline_service_estimate_for_prediction(&prediction)
+            .with_selected_end_to_end_service_ns(
+                adaptive_buffering.overlap_grant_cost_ns(&prediction),
+            );
         let overlap_required_ns =
             overlap_required_for_current_opportunity(pending_target, refresh_interval, estimate);
         let slack_ns = slack_for_current_opportunity(pending_target, refresh_interval, estimate);

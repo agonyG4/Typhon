@@ -214,12 +214,13 @@ pub fn human(result: &AstreactlResult) -> String {
                 .unwrap_or_default(),
         ),
         AstreactlResult::PresentationPolicy(snapshot) => format!(
-            "Triple buffering: {} (mode {})\nKMS worker: {} (transport {})\nHeld commits: {}",
+            "Triple buffering: {} (mode {})\nKMS worker: {} (transport {})\nHeld commits: {}\nCredit 2 grant: {}",
             sanitize_terminal_text(&snapshot.triple_buffering),
             sanitize_terminal_text(&snapshot.buffering_mode),
             sanitize_terminal_text(&snapshot.kms_worker),
             sanitize_terminal_text(&snapshot.kms_worker_transport),
             sanitize_terminal_text(&snapshot.held_commits),
+            sanitize_terminal_text(&snapshot.credit_grant),
         ),
         AstreactlResult::Wallpaper(snapshot) => format!(
             "State: {}\nEffective: {}\nConfigured: {}\nFallback: {}\nGeneration: {}\nError: {}",
