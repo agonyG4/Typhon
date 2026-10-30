@@ -204,6 +204,13 @@ pub fn human(result: &AstreactlResult) -> String {
             sanitize_optional_text(snapshot.last_reload_error.as_deref()),
         ),
         AstreactlResult::Animation(snapshot) => format_animation(snapshot),
+        AstreactlResult::PresentationPolicy(snapshot) => format!(
+            "Triple buffering: {} (mode {})\nKMS worker: {} (transport {})",
+            sanitize_terminal_text(&snapshot.triple_buffering),
+            sanitize_terminal_text(&snapshot.buffering_mode),
+            sanitize_terminal_text(&snapshot.kms_worker),
+            sanitize_terminal_text(&snapshot.kms_worker_transport),
+        ),
         AstreactlResult::Wallpaper(snapshot) => format!(
             "State: {}\nEffective: {}\nConfigured: {}\nFallback: {}\nGeneration: {}\nError: {}",
             sanitize_terminal_text(&snapshot.state),

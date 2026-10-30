@@ -120,7 +120,7 @@ fn run(args: Vec<String>) -> Result<u8, AstreactlError> {
             }
             "-h" | "--help" => {
                 println!(
-                    "astreactl [global options] <version|status|doctor|performance|outputs|windows|activewindow|window decoration-policy ID server|client-preference|keyboard config|keyboard configure|keyboard layout|keyboard next|keyboard previous|keyboard set INDEX|cursor ...|decoration ...|effects reload|blur ...|animation get|animation set JSON|wallpaper ...>"
+                    "astreactl [global options] <version|status|doctor|performance|outputs|windows|activewindow|window decoration-policy ID server|client-preference|keyboard config|keyboard configure|keyboard layout|keyboard next|keyboard previous|keyboard set INDEX|cursor ...|decoration ...|effects reload|blur ...|animation get|animation set JSON|presentation get|presentation set triple=MODE worker=MODE|wallpaper ...>"
                 );
                 return Ok(0);
             }
@@ -318,6 +318,17 @@ fn run(args: Vec<String>) -> Result<u8, AstreactlError> {
             ));
         }
         parse_blur_command(&positionals[1..])?
+    } else if command == "presentation" {
+        if keyboard_configure.has_any()
+            || cursor_theme.is_some()
+            || cursor_size.is_some()
+            || wallpaper_fit.is_some()
+        {
+            return Err(AstreactlError::Usage(
+                "presentation commands do not accept unrelated options".to_string(),
+            ));
+        }
+        parse_presentation_command(&positionals[1..])?
     } else if command == "animation" {
         if keyboard_configure.has_any()
             || cursor_theme.is_some()
@@ -393,6 +404,55 @@ fn run(args: Vec<String>) -> Result<u8, AstreactlError> {
         return Ok(7);
     }
     Ok(0)
+}
+
+fn parse_presentation_command(
+    positionals: &[String],
+) -> Result<(&'static str, &'static str, serde_json::Value), AstreactlError> {
+    let subcommand = positionals
+        .first()
+        .ok_or_else(|| AstreactlError::Usage("missing presentation subcommand".to_string()))?;
+    match subcommand.as_str() {
+        "get" if positionals.len() == 1 => Ok((
+            "presentation",
+            "presentation.policy.get",
+            serde_json::json!({}),
+        )),
+        "set" if positionals.len() > 1 => {
+            let mut args = serde_json::Map::new();
+            for assignment in &positionals[1..] {
+                let (key, value) = assignment.split_once('=').ok_or_else(|| {
+                    AstreactlError::Usage(
+                        "presentation set takes triple=VALUE and/or worker=VALUE".to_string(),
+                    )
+                })?;
+                let key = match key {
+                    "triple" => "tripleBuffering",
+                    "worker" => "kmsWorker",
+                    _ => {
+                        return Err(AstreactlError::Usage(format!(
+                            "unknown presentation policy {key}"
+                        )));
+                    }
+                };
+                args.insert(key.to_string(), serde_json::Value::from(value));
+            }
+            Ok((
+                "presentation",
+                "presentation.policy.set",
+                serde_json::Value::Object(args),
+            ))
+        }
+        "get" => Err(AstreactlError::Usage(
+            "presentation get takes no arguments".to_string(),
+        )),
+        "set" => Err(AstreactlError::Usage(
+            "presentation set takes triple=VALUE and/or worker=VALUE".to_string(),
+        )),
+        _ => Err(AstreactlError::Usage(format!(
+            "unknown presentation subcommand {subcommand}"
+        ))),
+    }
 }
 
 fn parse_animation_command(

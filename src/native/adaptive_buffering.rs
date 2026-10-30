@@ -1337,6 +1337,14 @@ impl AdaptiveBufferingController {
     pub fn reset(&mut self) {
         *self = Self::new(self.policy);
     }
+
+    /// Switch policy on a live output. Credit and mode restart from the new
+    /// policy's initial state; the known capability carries over.
+    pub fn set_policy(&mut self, policy: AdaptiveTripleBufferPolicy) {
+        let capability = self.capability;
+        *self = Self::new(policy);
+        self.apply_capability(capability);
+    }
 }
 
 pub fn triple_buffering_doctor_severity(
@@ -2384,6 +2392,26 @@ mod tests {
             AdaptiveTripleBufferPolicy::parse("yes").unwrap_err(),
             "invalid OBLIVION_ONE_TRIPLE_BUFFERING value 'yes'; accepted values: auto, off, force"
         );
+    }
+
+    #[test]
+    fn runtime_policy_switch_keeps_capability_and_restarts_credit() {
+        let mut policy = AdaptiveBufferingController::new(AdaptiveTripleBufferPolicy::Auto);
+        policy.apply_capability(TripleCapability::Capable);
+        policy.set_policy(AdaptiveTripleBufferPolicy::Force);
+        assert_eq!(policy.mode(), AdaptiveBufferingMode::Triple);
+        assert_eq!(policy.future_primary_credit(), 2);
+        assert_eq!(policy.capability(), TripleCapability::Capable);
+
+        policy.set_policy(AdaptiveTripleBufferPolicy::Off);
+        assert_eq!(policy.mode(), AdaptiveBufferingMode::Double);
+        assert_eq!(policy.future_primary_credit(), 1);
+
+        policy.set_policy(AdaptiveTripleBufferPolicy::Auto);
+        assert_eq!(policy.mode(), AdaptiveBufferingMode::Double);
+        assert_eq!(policy.capability(), TripleCapability::Capable);
+        policy.observe_o1_outcome(Some(ProvenDeadlineMiss::ExactRender));
+        assert_eq!(policy.future_primary_credit(), 2);
     }
 
     #[test]

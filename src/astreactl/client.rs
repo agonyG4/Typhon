@@ -141,6 +141,10 @@ fn decode_command_result(
             serde_json::from_value::<crate::blur_policy::BlurPolicySnapshot>(value)
                 .map(AstreactlResult::Blur)
         }
+        "presentation.policy.get" | "presentation.policy.set" => {
+            serde_json::from_value::<crate::control_snapshots::PresentationPolicySnapshot>(value)
+                .map(AstreactlResult::PresentationPolicy)
+        }
         "animation.config.get" | "animation.config.set" => {
             serde_json::from_value::<crate::animation_control::AnimationControlSnapshot>(value)
                 .map(AstreactlResult::Animation)

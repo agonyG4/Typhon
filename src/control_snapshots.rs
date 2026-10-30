@@ -1085,6 +1085,17 @@ pub struct TrustedEffectsReloadSnapshot {
     pub effect_count: usize,
 }
 
+/// Live triple-buffering and KMS commit worker policies.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct PresentationPolicySnapshot {
+    pub triple_buffering: String,
+    pub buffering_mode: String,
+    pub kms_worker: String,
+    pub kms_worker_transport: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum AstreactlResult {
@@ -1104,6 +1115,7 @@ pub enum AstreactlResult {
     TrustedEffects(TrustedEffectsReloadSnapshot),
     Blur(crate::blur_policy::BlurPolicySnapshot),
     Animation(crate::animation_control::AnimationControlSnapshot),
+    PresentationPolicy(PresentationPolicySnapshot),
     Wallpaper(WallpaperSnapshot),
     WallpaperList(WallpaperListSnapshot),
 }

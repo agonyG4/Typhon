@@ -966,6 +966,12 @@ impl NativeRuntime {
             };
             return self.queue_keyboard_configuration(token, request.id, args.into_config());
         }
+        if matches!(
+            command,
+            ControlCommand::PresentationPolicyGet | ControlCommand::PresentationPolicySet
+        ) {
+            return Some(self.dispatch_presentation_policy_command(command, request));
+        }
         if command == ControlCommand::AnimationConfigurationGet {
             if serde_json::from_value::<EmptyCursorArgs>(request.args).is_err() {
                 return Some(ControlResponse::failure(

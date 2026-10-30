@@ -69,6 +69,8 @@ pub enum ControlCommand {
     EffectsReload,
     BlurStatus,
     BlurReload,
+    PresentationPolicyGet,
+    PresentationPolicySet,
     AnimationConfigurationGet,
     AnimationConfigurationSet,
     MaterialConfigurationGet,
@@ -117,6 +119,8 @@ impl ControlCommand {
             Self::EffectsReload => "effects.reload",
             Self::BlurStatus => "blur.status",
             Self::BlurReload => "blur.reload",
+            Self::PresentationPolicyGet => "presentation.policy.get",
+            Self::PresentationPolicySet => "presentation.policy.set",
             Self::AnimationConfigurationGet => "animation.config.get",
             Self::AnimationConfigurationSet => "animation.config.set",
             Self::MaterialConfigurationGet => "material.config.get",
@@ -165,6 +169,8 @@ impl ControlCommand {
             "effects.reload" => Self::EffectsReload,
             "blur.status" => Self::BlurStatus,
             "blur.reload" => Self::BlurReload,
+            "presentation.policy.get" => Self::PresentationPolicyGet,
+            "presentation.policy.set" => Self::PresentationPolicySet,
             "animation.config.get" => Self::AnimationConfigurationGet,
             "animation.config.set" => Self::AnimationConfigurationSet,
             "material.config.get" => Self::MaterialConfigurationGet,
@@ -518,6 +524,17 @@ mod tests {
             "keyboard.config.set"
         );
         assert_eq!(ControlCommand::parse("keyboard.config"), None);
+    }
+
+    #[test]
+    fn presentation_policy_commands_are_explicitly_named() {
+        for command in [
+            ControlCommand::PresentationPolicyGet,
+            ControlCommand::PresentationPolicySet,
+        ] {
+            assert_eq!(ControlCommand::parse(command.as_str()), Some(command));
+        }
+        assert_eq!(ControlCommand::parse("presentation.policy"), None);
     }
 
     #[test]
