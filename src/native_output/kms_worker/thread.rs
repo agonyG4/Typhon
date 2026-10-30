@@ -994,7 +994,7 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
         dispatch_models
             .model_mut(service_class)
             .age_tail_guard(now_ns);
-        let planned_worker_wake_at = armed_wake_at(&job.presentation_timing, service_class);
+        let planned_worker_wake_at = job.presentation_timing.worker_wake_at_ns();
         let wait_armed = match job.presentation_timing {
             KmsPresentationTiming::Fixed(_) => job
                 .reason()
@@ -1404,29 +1404,6 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
                 }
             }
         }
-    }
-}
-
-/// How much earlier than its submit window a held primary or direct commit
-/// wakes. A held job is already rendered for a later refresh, so waking early
-/// only samples the cursor sidecar sooner, while a commit near the window's
-/// end can miss the latch. A presentation trace with the latency probe alone
-/// (DP-1 165 Hz, NVIDIA at low clocks) showed held credit-2 commits returning
-/// 0.8-1.2 ms before the target vblank missed ~4% of the time, and none of
-/// ~9800 returning >= 1.3 ms before it missed.
-pub(super) const HELD_COMMIT_LATCH_MARGIN_NS: u64 = 1_000_000;
-
-pub(super) fn armed_wake_at(timing: &KmsPresentationTiming, service_class: KmsServiceClass) -> u64 {
-    match timing {
-        KmsPresentationTiming::Fixed(window)
-            if service_class != KmsServiceClass::CursorPlaneDelta =>
-        {
-            window
-                .worker_wake_at_ns()
-                .saturating_sub(HELD_COMMIT_LATCH_MARGIN_NS)
-                .max(window.earliest_submit_ns())
-        }
-        _ => timing.worker_wake_at_ns(),
     }
 }
 
