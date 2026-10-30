@@ -71,6 +71,8 @@ pub enum ControlCommand {
     BlurReload,
     PresentationPolicyGet,
     PresentationPolicySet,
+    PresentationTraceStart,
+    PresentationTraceStop,
     AnimationConfigurationGet,
     AnimationConfigurationSet,
     MaterialConfigurationGet,
@@ -121,6 +123,8 @@ impl ControlCommand {
             Self::BlurReload => "blur.reload",
             Self::PresentationPolicyGet => "presentation.policy.get",
             Self::PresentationPolicySet => "presentation.policy.set",
+            Self::PresentationTraceStart => "presentation.trace.start",
+            Self::PresentationTraceStop => "presentation.trace.stop",
             Self::AnimationConfigurationGet => "animation.config.get",
             Self::AnimationConfigurationSet => "animation.config.set",
             Self::MaterialConfigurationGet => "material.config.get",
@@ -171,6 +175,8 @@ impl ControlCommand {
             "blur.reload" => Self::BlurReload,
             "presentation.policy.get" => Self::PresentationPolicyGet,
             "presentation.policy.set" => Self::PresentationPolicySet,
+            "presentation.trace.start" => Self::PresentationTraceStart,
+            "presentation.trace.stop" => Self::PresentationTraceStop,
             "animation.config.get" => Self::AnimationConfigurationGet,
             "animation.config.set" => Self::AnimationConfigurationSet,
             "material.config.get" => Self::MaterialConfigurationGet,
@@ -531,6 +537,8 @@ mod tests {
         for command in [
             ControlCommand::PresentationPolicyGet,
             ControlCommand::PresentationPolicySet,
+            ControlCommand::PresentationTraceStart,
+            ControlCommand::PresentationTraceStop,
         ] {
             assert_eq!(ControlCommand::parse(command.as_str()), Some(command));
         }

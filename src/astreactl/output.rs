@@ -204,6 +204,15 @@ pub fn human(result: &AstreactlResult) -> String {
             sanitize_optional_text(snapshot.last_reload_error.as_deref()),
         ),
         AstreactlResult::Animation(snapshot) => format_animation(snapshot),
+        AstreactlResult::PresentationTrace(snapshot) => format!(
+            "Presentation trace: {}{}",
+            if snapshot.active { "on" } else { "off" },
+            snapshot
+                .path
+                .as_deref()
+                .map(|path| format!(" ({})", sanitize_terminal_text(path)))
+                .unwrap_or_default(),
+        ),
         AstreactlResult::PresentationPolicy(snapshot) => format!(
             "Triple buffering: {} (mode {})\nKMS worker: {} (transport {})",
             sanitize_terminal_text(&snapshot.triple_buffering),

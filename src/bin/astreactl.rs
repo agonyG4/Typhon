@@ -120,7 +120,7 @@ fn run(args: Vec<String>) -> Result<u8, AstreactlError> {
             }
             "-h" | "--help" => {
                 println!(
-                    "astreactl [global options] <version|status|doctor|performance|outputs|windows|activewindow|window decoration-policy ID server|client-preference|keyboard config|keyboard configure|keyboard layout|keyboard next|keyboard previous|keyboard set INDEX|cursor ...|decoration ...|effects reload|blur ...|animation get|animation set JSON|presentation get|presentation set triple=MODE worker=MODE|wallpaper ...>"
+                    "astreactl [global options] <version|status|doctor|performance|outputs|windows|activewindow|window decoration-policy ID server|client-preference|keyboard config|keyboard configure|keyboard layout|keyboard next|keyboard previous|keyboard set INDEX|cursor ...|decoration ...|effects reload|blur ...|animation get|animation set JSON|presentation get|presentation set triple=MODE worker=MODE|presentation trace start PATH|presentation trace stop|wallpaper ...>"
                 );
                 return Ok(0);
             }
@@ -413,6 +413,26 @@ fn parse_presentation_command(
         .first()
         .ok_or_else(|| AstreactlError::Usage("missing presentation subcommand".to_string()))?;
     match subcommand.as_str() {
+        "trace" => match (positionals.get(1).map(String::as_str), positionals.len()) {
+            (Some("start"), 3) => {
+                let path = std::path::absolute(&positionals[2]).map_err(|_| {
+                    AstreactlError::Usage("presentation trace start needs a file path".to_string())
+                })?;
+                Ok((
+                    "presentation",
+                    "presentation.trace.start",
+                    serde_json::json!({ "path": path.to_string_lossy() }),
+                ))
+            }
+            (Some("stop"), 2) => Ok((
+                "presentation",
+                "presentation.trace.stop",
+                serde_json::json!({}),
+            )),
+            _ => Err(AstreactlError::Usage(
+                "presentation trace takes start PATH or stop".to_string(),
+            )),
+        },
         "get" if positionals.len() == 1 => Ok((
             "presentation",
             "presentation.policy.get",

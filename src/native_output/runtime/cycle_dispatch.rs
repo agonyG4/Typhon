@@ -972,6 +972,12 @@ impl NativeRuntime {
         ) {
             return Some(self.dispatch_presentation_policy_command(command, request));
         }
+        if matches!(
+            command,
+            ControlCommand::PresentationTraceStart | ControlCommand::PresentationTraceStop
+        ) {
+            return Some(self.dispatch_presentation_trace_command(command, request));
+        }
         if command == ControlCommand::AnimationConfigurationGet {
             if serde_json::from_value::<EmptyCursorArgs>(request.args).is_err() {
                 return Some(ControlResponse::failure(

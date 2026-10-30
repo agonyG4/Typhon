@@ -234,3 +234,76 @@ impl NativeRuntime {
         }
     }
 }
+
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PresentationTraceArgs {
+    path: Option<std::path::PathBuf>,
+}
+
+impl NativeRuntime {
+    /// Start or stop the presentation trace on a live session, so a capture
+    /// does not need a restart with OBLIVION_ONE_PRESENTATION_TRACE set.
+    pub(super) fn dispatch_presentation_trace_command(
+        &mut self,
+        command: ControlCommand,
+        request: ControlRequest,
+    ) -> ControlResponse {
+        let invalid = |message| {
+            ControlResponse::failure(
+                request.id,
+                ControlError::new(ControlErrorCode::InvalidArgument, message),
+            )
+        };
+        let Ok(args) = serde_json::from_value::<PresentationTraceArgs>(request.args) else {
+            return invalid("invalid presentation trace arguments");
+        };
+        let path = match (command, args.path) {
+            (ControlCommand::PresentationTraceStart, Some(path)) if path.is_absolute() => {
+                if self.presentation_trace_writer.is_some() {
+                    return invalid("presentation trace is already being written");
+                }
+                let trace = PresentationTransactionTraceRing::new(65_536);
+                match crate::native_output::presentation::trace_writer::PresentationTraceWriter::start_capture(
+                    path.clone(),
+                    &trace,
+                ) {
+                    Ok(writer) => {
+                        self.presentation_trace = trace;
+                        self.presentation_trace_writer = Some(writer);
+                        Some(path)
+                    }
+                    Err(error) => {
+                        return ControlResponse::failure(
+                            request.id,
+                            ControlError::new(
+                                ControlErrorCode::Internal,
+                                "presentation trace writer did not start",
+                            )
+                            .with_detail(error.to_string()),
+                        );
+                    }
+                }
+            }
+            (ControlCommand::PresentationTraceStop, None) => {
+                if let Some(mut writer) = self.presentation_trace_writer.take() {
+                    writer.shutdown(&self.presentation_trace);
+                }
+                self.presentation_trace = PresentationTransactionTraceRing::disabled(65_536);
+                None
+            }
+            _ => return invalid("presentation trace start needs an absolute path; stop takes none"),
+        };
+        let snapshot = oblivion_one::control_snapshots::PresentationTraceSnapshot {
+            active: path.is_some(),
+            path: path.map(|path| path.to_string_lossy().into_owned()),
+        };
+        match serde_json::to_value(snapshot) {
+            Ok(result) => ControlResponse::success(request.id, result),
+            Err(_) => ControlResponse::failure(
+                request.id,
+                ControlError::new(ControlErrorCode::Internal, "presentation trace snapshot failed"),
+            ),
+        }
+    }
+}

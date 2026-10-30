@@ -346,6 +346,20 @@ impl PresentationTraceWriter {
         Self::start_with_config(path, TraceWriterConfig::from_env(), trace)
     }
 
+    /// Writer for a capture started at runtime, sized for minutes of tracing
+    /// instead of the small default rolling window.
+    pub(crate) fn start_capture(
+        path: PathBuf,
+        trace: &PresentationTransactionTraceRing,
+    ) -> io::Result<Self> {
+        let config = TraceWriterConfig {
+            max_file_bytes: 256 * 1024 * 1024,
+            max_files: 8,
+            ..TraceWriterConfig::from_env()
+        };
+        Self::start_with_config(path, config, trace)
+    }
+
     fn start_with_config(
         path: PathBuf,
         config: TraceWriterConfig,

@@ -1096,6 +1096,15 @@ pub struct PresentationPolicySnapshot {
     pub kms_worker_transport: String,
 }
 
+/// Whether the per-transaction presentation trace is being written.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct PresentationTraceSnapshot {
+    pub active: bool,
+    pub path: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum AstreactlResult {
@@ -1116,6 +1125,7 @@ pub enum AstreactlResult {
     Blur(crate::blur_policy::BlurPolicySnapshot),
     Animation(crate::animation_control::AnimationControlSnapshot),
     PresentationPolicy(PresentationPolicySnapshot),
+    PresentationTrace(PresentationTraceSnapshot),
     Wallpaper(WallpaperSnapshot),
     WallpaperList(WallpaperListSnapshot),
 }

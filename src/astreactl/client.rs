@@ -145,6 +145,10 @@ fn decode_command_result(
             serde_json::from_value::<crate::control_snapshots::PresentationPolicySnapshot>(value)
                 .map(AstreactlResult::PresentationPolicy)
         }
+        "presentation.trace.start" | "presentation.trace.stop" => {
+            serde_json::from_value::<crate::control_snapshots::PresentationTraceSnapshot>(value)
+                .map(AstreactlResult::PresentationTrace)
+        }
         "animation.config.get" | "animation.config.set" => {
             serde_json::from_value::<crate::animation_control::AnimationControlSnapshot>(value)
                 .map(AstreactlResult::Animation)
