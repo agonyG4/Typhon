@@ -2,7 +2,11 @@ use super::task4_tests::test_sidecar;
 use super::tests::{
     ScriptedExecutor, reserve_for_test, test_job, wait_for_fence_event, wait_for_inflight,
 };
-use super::thread::{KmsCommitExecutor, KmsWorkerSubmission, KmsWorkerSubmitFailure};
+use super::thread::{
+    HELD_COMMIT_LATCH_MARGIN_NS, KmsCommitExecutor, KmsWorkerSubmission, KmsWorkerSubmitFailure,
+    armed_wake_at,
+};
+use super::timing::KmsServiceClass;
 use super::{
     CursorSidecarCoupling, KmsCommitJob, KmsCommitWorkerHandle, KmsTestOnlyPolicy,
     KmsValidationBase, KmsWorkerEvent,
@@ -656,4 +660,33 @@ fn cursor_sidecar_offers_do_not_wake_worker_deadline_sleep() {
 
     handle.request_quiesce();
     handle.join().unwrap();
+}
+
+#[test]
+fn held_primary_commits_wake_ahead_of_the_window_but_not_before_eligibility() {
+    let target = 100_000_000;
+    let window = KmsSubmitWindow::try_new(target, 90_000_000, 400_000, 500_000).unwrap();
+    let timing = KmsPresentationTiming::Fixed(window);
+    let window_wake = window.worker_wake_at_ns();
+
+    for class in [KmsServiceClass::Primary, KmsServiceClass::DirectScanout] {
+        assert_eq!(
+            armed_wake_at(&timing, class),
+            window_wake - HELD_COMMIT_LATCH_MARGIN_NS
+        );
+    }
+    // Cursor deltas keep the late latch; they are the reason it exists.
+    assert_eq!(
+        armed_wake_at(&timing, KmsServiceClass::CursorPlaneDelta),
+        window_wake
+    );
+
+    let late = KmsSubmitWindow::try_new(target, window_wake - 200_000, 400_000, 500_000).unwrap();
+    assert_eq!(
+        armed_wake_at(
+            &KmsPresentationTiming::Fixed(late),
+            KmsServiceClass::Primary
+        ),
+        late.earliest_submit_ns()
+    );
 }
