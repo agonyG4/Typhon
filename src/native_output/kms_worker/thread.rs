@@ -1408,11 +1408,15 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
 }
 
 /// Whether held primary and direct commits wait for their submit window
-/// (late latch, the default) or go out as soon as they are eligible. Runtime
-/// switchable through `astreactl presentation set held=...` so the two can be
-/// compared on one session; cursor deltas always keep the late latch.
+/// (late latch) or go out as soon as they are eligible (the default).
+/// Holding them let the freshest cursor sidecar ride along, but on NVIDIA
+/// held credit-2 commits missed their vblank ~1.3% of the time under light
+/// load, whatever their distance to it, while the same commits sent when
+/// eligible missed none (trace 20261030-115636: 71 late frames vs 6, and
+/// those 6 were late renders). Runtime switchable through
+/// `astreactl presentation set held=...`; cursor deltas always late latch.
 static HELD_COMMITS_LATE_LATCH: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(true);
+    std::sync::atomic::AtomicBool::new(false);
 
 pub(crate) fn set_held_commits_late_latch(late_latch: bool) {
     HELD_COMMITS_LATE_LATCH.store(late_latch, std::sync::atomic::Ordering::Relaxed);
