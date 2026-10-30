@@ -994,17 +994,20 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
         dispatch_models
             .model_mut(service_class)
             .age_tail_guard(now_ns);
-        let planned_worker_wake_at = held_wake_at(&job.presentation_timing, service_class);
+        // The submit window's wake stays the reference for dispatch-tail
+        // fairness; the worker itself may wake earlier (see held_wake_at).
+        let planned_worker_wake_at = job.presentation_timing.worker_wake_at_ns();
+        let worker_wake_at = held_wake_at(&job.presentation_timing, service_class);
         let wait_armed = match job.presentation_timing {
             KmsPresentationTiming::Fixed(_) => job
                 .reason()
-                .is_some_and(|reason| worker_wait_is_armed(reason, planned_worker_wake_at, now_ns)),
+                .is_some_and(|reason| worker_wait_is_armed(reason, worker_wake_at, now_ns)),
             KmsPresentationTiming::Variable { .. } => {
                 !job.presentation_timing.is_eligible_at(now_ns)
             }
         };
         let actual_worker_wait_returned_at = if wait_armed {
-            let Some(returned_at) = wait_until_or_quiesce(&shared, planned_worker_wake_at) else {
+            let Some(returned_at) = wait_until_or_quiesce(&shared, worker_wake_at) else {
                 drop(executing);
                 quiesce_with_jobs(&shared, vec![job]);
                 return;
@@ -1013,7 +1016,7 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
         } else {
             now_ns
         };
-        if wait_armed && actual_worker_wait_returned_at > planned_worker_wake_at {
+        if wait_armed && actual_worker_wait_returned_at > worker_wake_at {
             shared
                 .metrics
                 .late_wakeups
@@ -1164,9 +1167,9 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
                         .fetch_max(submit_duration_ns, std::sync::atomic::Ordering::Relaxed);
                     let queue_wait_ns = submit_started_at.saturating_sub(job.queued_at.get());
                     let fixed_timed_wake_lateness_ns = match job.presentation_timing {
-                        KmsPresentationTiming::Fixed(_) if wait_armed => Some(
-                            actual_worker_wait_returned_at.saturating_sub(planned_worker_wake_at),
-                        ),
+                        KmsPresentationTiming::Fixed(_) if wait_armed => {
+                            Some(actual_worker_wait_returned_at.saturating_sub(worker_wake_at))
+                        }
                         KmsPresentationTiming::Fixed(_)
                         | KmsPresentationTiming::Variable { .. } => None,
                     };
