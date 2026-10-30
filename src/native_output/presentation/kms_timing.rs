@@ -6,6 +6,12 @@ const INITIAL_ADAPTIVE_APPLY_GUARD_NS: u64 = 1_000_000;
 const APPLY_GUARD_STEP_NS: u64 = 50_000;
 const APPLY_HIT_DECAY_SAMPLES: u32 = 16;
 const MAX_ADAPTIVE_APPLY_GUARD_NS: u64 = 3_000_000;
+/// Hit decay never takes the adaptive guard below this. Without a floor the
+/// guard decays onto the hardware latch edge, where a few late applies per
+/// thousand frames are guaranteed: on DP-1 165 Hz (NVIDIA, base guard 0.16 ms)
+/// commits returning 0.2-0.4 ms before the target vblank missed ~1%, and none
+/// of ~7500 returning >= 0.5 ms before it missed.
+const MIN_ADAPTIVE_APPLY_GUARD_NS: u64 = 300_000;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct KmsModeTimingKey {
@@ -485,8 +491,10 @@ impl KmsPresentationTimingModel {
                     self.stable_target_hits = 0;
                     let decay = (self.adaptive_apply_guard_ns / APPLY_HIT_DECAY_SAMPLES as u64)
                         .max(APPLY_GUARD_STEP_NS);
-                    self.adaptive_apply_guard_ns =
-                        self.adaptive_apply_guard_ns.saturating_sub(decay);
+                    self.adaptive_apply_guard_ns = self
+                        .adaptive_apply_guard_ns
+                        .saturating_sub(decay)
+                        .max(MIN_ADAPTIVE_APPLY_GUARD_NS);
                 }
             }
             KmsPresentationOutcome::RenderReadinessMiss => {
@@ -657,6 +665,22 @@ mod tests {
             assert!(model.observe_pageflip(7, timing.key(), KmsPresentationOutcome::TargetHit));
         }
         assert!(model.adaptive_apply_guard_ns() < after_miss);
+    }
+
+    #[test]
+    fn hit_decay_stops_at_the_latch_margin_floor() {
+        let timing = KmsModeTiming::from_mode(&mode(325_000, 2200, 1125), 6_060_606);
+        let mut model = KmsPresentationTimingModel::new(timing, 7);
+        for _ in 0..10_000 {
+            model.observe_pageflip(7, timing.key(), KmsPresentationOutcome::TargetHit);
+        }
+        assert_eq!(model.adaptive_apply_guard_ns(), MIN_ADAPTIVE_APPLY_GUARD_NS);
+
+        model.observe_pageflip(7, timing.key(), KmsPresentationOutcome::KmsApplyGuardMiss);
+        assert_eq!(
+            model.adaptive_apply_guard_ns(),
+            MIN_ADAPTIVE_APPLY_GUARD_NS + APPLY_GUARD_STEP_NS
+        );
     }
 
     #[test]
