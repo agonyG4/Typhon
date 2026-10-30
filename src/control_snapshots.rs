@@ -1094,6 +1094,7 @@ pub struct PresentationPolicySnapshot {
     pub buffering_mode: String,
     pub kms_worker: String,
     pub kms_worker_transport: String,
+    pub held_commits: String,
 }
 
 /// Whether the per-transaction presentation trace is being written.

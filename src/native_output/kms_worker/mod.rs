@@ -36,6 +36,7 @@ pub(crate) use queue::{
 pub(crate) use thread::{KmsCommitExecutor, KmsWorkerSubmission, KmsWorkerSubmitFailure};
 pub(crate) use thread::{
     KmsCommitWorkerHandle, KmsWorkerEvent, KmsWorkerQuiesceHandle, ValidationBaseInvalidationReason,
+    held_commits_late_latch, set_held_commits_late_latch,
 };
 #[cfg(test)]
 pub(crate) use timing::KmsWorkerDispatchModel;

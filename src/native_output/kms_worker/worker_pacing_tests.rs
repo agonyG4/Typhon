@@ -2,7 +2,10 @@ use super::task4_tests::test_sidecar;
 use super::tests::{
     ScriptedExecutor, reserve_for_test, test_job, wait_for_fence_event, wait_for_inflight,
 };
-use super::thread::{KmsCommitExecutor, KmsWorkerSubmission, KmsWorkerSubmitFailure};
+use super::thread::{
+    KmsCommitExecutor, KmsWorkerSubmission, KmsWorkerSubmitFailure, held_wake_at_with,
+};
+use super::timing::KmsServiceClass;
 use super::{
     CursorSidecarCoupling, KmsCommitJob, KmsCommitWorkerHandle, KmsTestOnlyPolicy,
     KmsValidationBase, KmsWorkerEvent,
@@ -656,4 +659,25 @@ fn cursor_sidecar_offers_do_not_wake_worker_deadline_sleep() {
 
     handle.request_quiesce();
     handle.join().unwrap();
+}
+
+#[test]
+fn immediate_held_commits_wake_when_eligible_and_cursor_keeps_late_latch() {
+    let window = KmsSubmitWindow::try_new(100_000_000, 90_000_000, 400_000, 500_000).unwrap();
+    let timing = KmsPresentationTiming::Fixed(window);
+
+    for class in [KmsServiceClass::Primary, KmsServiceClass::DirectScanout] {
+        assert_eq!(
+            held_wake_at_with(&timing, class, true),
+            window.worker_wake_at_ns()
+        );
+        assert_eq!(
+            held_wake_at_with(&timing, class, false),
+            window.earliest_submit_ns()
+        );
+    }
+    assert_eq!(
+        held_wake_at_with(&timing, KmsServiceClass::CursorPlaneDelta, false),
+        window.worker_wake_at_ns()
+    );
 }

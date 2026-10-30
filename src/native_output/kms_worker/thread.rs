@@ -994,7 +994,7 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
         dispatch_models
             .model_mut(service_class)
             .age_tail_guard(now_ns);
-        let planned_worker_wake_at = job.presentation_timing.worker_wake_at_ns();
+        let planned_worker_wake_at = held_wake_at(&job.presentation_timing, service_class);
         let wait_armed = match job.presentation_timing {
             KmsPresentationTiming::Fixed(_) => job
                 .reason()
@@ -1404,6 +1404,40 @@ fn run_worker(shared: Arc<WorkerShared>, executor: Arc<dyn KmsCommitExecutor>) {
                 }
             }
         }
+    }
+}
+
+/// Whether held primary and direct commits wait for their submit window
+/// (late latch, the default) or go out as soon as they are eligible. Runtime
+/// switchable through `astreactl presentation set held=...` so the two can be
+/// compared on one session; cursor deltas always keep the late latch.
+static HELD_COMMITS_LATE_LATCH: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+pub(crate) fn set_held_commits_late_latch(late_latch: bool) {
+    HELD_COMMITS_LATE_LATCH.store(late_latch, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn held_commits_late_latch() -> bool {
+    HELD_COMMITS_LATE_LATCH.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn held_wake_at(timing: &KmsPresentationTiming, service_class: KmsServiceClass) -> u64 {
+    held_wake_at_with(timing, service_class, held_commits_late_latch())
+}
+
+pub(super) fn held_wake_at_with(
+    timing: &KmsPresentationTiming,
+    service_class: KmsServiceClass,
+    late_latch: bool,
+) -> u64 {
+    match timing {
+        KmsPresentationTiming::Fixed(window)
+            if service_class != KmsServiceClass::CursorPlaneDelta && !late_latch =>
+        {
+            window.earliest_submit_ns()
+        }
+        _ => timing.worker_wake_at_ns(),
     }
 }
 
