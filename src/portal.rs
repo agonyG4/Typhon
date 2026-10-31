@@ -191,15 +191,17 @@ impl DesktopIntegration {
         fs::set_permissions(&picker, fs::Permissions::from_mode(0o755))?;
 
         let xdph = self.xdph_config_path();
-        if !write_if_absent(&xdph, &xdph_config_contents(&picker))?
-            && fs::read_to_string(&xdph)
-                .is_ok_and(|current| !current.contains("custom_picker_binary"))
-        {
-            eprintln!(
-                "oblivion-one: add `custom_picker_binary = {}` to the screencopy block in {}",
-                picker.display(),
-                xdph.display()
-            );
+        if !write_if_absent(&xdph, &xdph_config_contents(&picker))? {
+            let current = fs::read_to_string(&xdph).unwrap_or_default();
+            if current == legacy_xdph_config_contents(&picker) {
+                write_if_changed(&xdph, &xdph_config_contents(&picker))?;
+            } else if !current.contains("custom_picker_binary") || !current.contains("force_shm") {
+                eprintln!(
+                    "oblivion-one: set `custom_picker_binary = {}` and `force_shm = true` in the screencopy block of {}",
+                    picker.display(),
+                    xdph.display()
+                );
+            }
         }
         Ok(())
     }
@@ -246,7 +248,22 @@ esac
     )
 }
 
+/// Typhon's screencopy copies into wl_shm only, so XDPH must not hand it
+/// DMA-BUF buffers.
 pub fn xdph_config_contents(picker: &Path) -> String {
+    [
+        "screencopy {",
+        "    allow_token_by_default = true",
+        "    force_shm = true",
+        &format!("    custom_picker_binary = {}", picker.display()),
+        "}",
+        "",
+    ]
+    .join("\n")
+}
+
+/// The first generated xdph.conf, upgraded in place because Typhon owns it.
+fn legacy_xdph_config_contents(picker: &Path) -> String {
     [
         "screencopy {",
         "    allow_token_by_default = true",
@@ -616,6 +633,20 @@ mod tests {
         assert!(
             xdph_config_contents(&integration.picker_path())
                 .contains("allow_token_by_default = true")
+        );
+
+        assert!(xdph_config_contents(&integration.picker_path()).contains("force_shm = true"));
+        fs::write(
+            &xdph,
+            legacy_xdph_config_contents(&integration.picker_path()),
+        )
+        .unwrap();
+        integration
+            .install()
+            .expect("upgrade generated xdph config");
+        assert_eq!(
+            fs::read_to_string(&xdph).unwrap(),
+            xdph_config_contents(&integration.picker_path())
         );
 
         fs::write(&xdph, "user config\n").unwrap();

@@ -195,6 +195,22 @@ fn import_activation_environment(socket_name: &str) {
             eprintln!("oblivion-one: could not update D-Bus activation environment: {error}")
         }
     }
+    restart_screencast_portal();
+}
+
+/// XDPH stays bound to the Wayland socket it started on and gives up after a
+/// few reconnect attempts while the compositor restarts. Clear that failure
+/// and point a running instance at this compositor.
+fn restart_screencast_portal() {
+    for action in ["reset-failed", "try-restart"] {
+        let mut command = Command::new("systemctl");
+        command.args(["--user", action, "xdg-desktop-portal-hyprland.service"]);
+        oblivion_one::process::prepare_child_signal_mask(&mut command);
+        if let Err(error) = command.status() {
+            eprintln!("oblivion-one: could not {action} xdg-desktop-portal-hyprland: {error}");
+            return;
+        }
+    }
 }
 
 fn parse_args(args: Vec<String>) -> Result<CliCommand, io::Error> {

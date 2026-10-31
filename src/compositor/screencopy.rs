@@ -21,6 +21,7 @@ use super::*;
 const XRGB8888_BYTES_PER_PIXEL: u32 = 4;
 const FRAME_DAMAGE_SINCE: u32 = 2;
 const FRAME_BUFFER_DONE_SINCE: u32 = 3;
+const DRM_FORMAT_XRGB8888: u32 = 0x3432_5258;
 
 /// Physical-pixel rectangle inside the output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -321,6 +322,9 @@ impl CompositorState {
             width * XRGB8888_BYTES_PER_PIXEL,
         );
         if frame.version() >= FRAME_BUFFER_DONE_SINCE {
+            // xdg-desktop-portal-hyprland derives its PipeWire format from
+            // this event even when it then copies through wl_shm.
+            frame.linux_dmabuf(DRM_FORMAT_XRGB8888, width, height);
             frame.buffer_done();
         }
     }
@@ -356,12 +360,9 @@ impl CompositorState {
             return;
         }
         let Some(shm) = buffer.data::<ShmBufferData>().cloned() else {
-            self.post_protocol_error(
-                client,
-                resource,
-                zwlr_screencopy_frame_v1::Error::InvalidBuffer,
-                "screencopy buffer must be wl_shm",
-            );
+            // linux_dmabuf is advertised for format negotiation only; a client
+            // that picks DMA-BUF gets a recoverable failure, not a disconnect.
+            resource.failed();
             return;
         };
         let (width, height) = source.buffer_size();
