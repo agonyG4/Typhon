@@ -198,13 +198,20 @@ fn import_activation_environment(socket_name: &str) {
     restart_screencast_portal();
 }
 
-/// XDPH stays bound to the Wayland socket it started on and gives up after a
-/// few reconnect attempts while the compositor restarts. Clear that failure
-/// and point a running instance at this compositor.
+/// XDPH dies with the previous compositor and is not reactivated: the portal
+/// frontend then reports no ScreenCast sources until it runs again. Clear any
+/// start-limit failure and start it against this compositor's socket.
+/// `--no-block` matters: XDPH's startup roundtrip needs this compositor's
+/// event loop, which has not started dispatching yet.
 fn restart_screencast_portal() {
-    for action in ["reset-failed", "try-restart"] {
+    const SERVICE: &str = "xdg-desktop-portal-hyprland.service";
+    for action in ["reset-failed", "restart"] {
         let mut command = Command::new("systemctl");
-        command.args(["--user", action, "xdg-desktop-portal-hyprland.service"]);
+        command.arg("--user");
+        if action == "restart" {
+            command.arg("--no-block");
+        }
+        command.args([action, SERVICE]);
         oblivion_one::process::prepare_child_signal_mask(&mut command);
         if let Err(error) = command.status() {
             eprintln!("oblivion-one: could not {action} xdg-desktop-portal-hyprland: {error}");
