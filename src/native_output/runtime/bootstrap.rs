@@ -1049,6 +1049,12 @@ impl NativeRuntime {
             refresh_hz,
             refresh_interval_ns / 1_000
         );
+        server.set_output_physical_size_mm(
+            output_capabilities
+                .physical_size_mm
+                .as_ref()
+                .map(|size| (size.width_mm, size.height_mm)),
+        );
         server.set_output_size(target.width, target.height);
         server.set_output_refresh_rate(output_refresh_rate);
         let cursor_store = CursorConfigurationStore::from_environment()

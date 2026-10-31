@@ -153,6 +153,7 @@ pub(in crate::compositor::tests) struct RegistryTestState {
     pub(in crate::compositor::tests) output_mode_count: usize,
     pub(in crate::compositor::tests) output_scale_count: usize,
     pub(in crate::compositor::tests) output_name: bool,
+    pub(in crate::compositor::tests) output_physical_size: (i32, i32),
     pub(in crate::compositor::tests) output_description: bool,
     pub(in crate::compositor::tests) output_width: i32,
     pub(in crate::compositor::tests) output_height: i32,
@@ -1304,6 +1305,13 @@ impl Dispatch<client_wl_output::WlOutput, ()> for RegistryTestState {
         _qhandle: &QueueHandle<Self>,
     ) {
         match event {
+            client_wl_output::Event::Geometry {
+                physical_width,
+                physical_height,
+                ..
+            } => {
+                state.output_physical_size = (physical_width, physical_height);
+            }
             client_wl_output::Event::Done => {
                 state.output_done = true;
                 state.output_event_log.push("wl_output.done");

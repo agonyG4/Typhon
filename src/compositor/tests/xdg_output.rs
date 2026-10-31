@@ -42,3 +42,37 @@ fn xdg_output_manager_reports_logical_geometry_and_wl_output_done_at_v3() {
         Some("Typhon native output")
     );
 }
+
+#[test]
+fn wl_output_reports_unknown_physical_size_without_connector_metadata() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind_cpu_composition(&socket_name).unwrap();
+    let (running, server_thread) = spawn_test_server(server);
+    let stream = UnixStream::connect(runtime_socket_path(&socket_name)).unwrap();
+    let connection = Connection::from_socket(stream).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let _output: client_wl_output::WlOutput = globals.bind(&queue.handle(), 4..=4, ()).unwrap();
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state).unwrap();
+    let _ = stop_test_server(running, server_thread);
+    assert_eq!(state.output_physical_size, (0, 0));
+}
+
+#[test]
+fn wl_output_reports_connector_millimetres_independent_of_pixel_mode() {
+    let socket_name = unique_socket_name();
+    let mut server = OwnCompositorServer::bind_cpu_composition(&socket_name).unwrap();
+    assert!(server.set_output_physical_size_mm(Some((600, 340))));
+    assert!(!server.set_output_physical_size_mm(Some((600, 340))));
+    server.set_output_size(1024, 768);
+    let (running, server_thread) = spawn_test_server(server);
+    let stream = UnixStream::connect(runtime_socket_path(&socket_name)).unwrap();
+    let connection = Connection::from_socket(stream).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let _output: client_wl_output::WlOutput = globals.bind(&queue.handle(), 4..=4, ()).unwrap();
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state).unwrap();
+    let _ = stop_test_server(running, server_thread);
+    assert_eq!(state.output_physical_size, (600, 340));
+    assert_eq!((state.output_width, state.output_height), (1024, 768));
+}

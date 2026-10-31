@@ -799,6 +799,7 @@ pub struct CompositorState {
     idle_inhibitor_resources: Vec<IdleInhibitorBinding>,
     idle_manager: IdleManager,
     output_size: OutputSize,
+    output_physical_size_mm: (i32, i32),
     output_scale: OutputScale,
     output_refresh: OutputRefreshRate,
     presentation_clock: PresentationClock,

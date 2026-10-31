@@ -124,6 +124,7 @@ impl CompositorState {
             self.output_size,
             self.output_scale,
             self.output_refresh,
+            self.output_physical_size_mm,
         );
         let binding = OutputBinding {
             output_id,

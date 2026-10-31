@@ -167,18 +167,9 @@ pub(super) fn send_output_description(
     output_size: OutputSize,
     output_scale: OutputScale,
     output_refresh: OutputRefreshRate,
+    physical_size_mm: (i32, i32),
 ) {
-    let (x, y) = OUTPUT_LOGICAL_POSITION;
-    let _ = output.send_event(wl_output::Event::Geometry {
-        x,
-        y,
-        physical_width: 344,
-        physical_height: 215,
-        subpixel: WEnum::Value(wl_output::Subpixel::Unknown),
-        make: "Oblivion".to_string(),
-        model: "Native Output".to_string(),
-        transform: WEnum::Value(OUTPUT_TRANSFORM),
-    });
+    send_output_geometry(output, physical_size_mm);
     send_output_mode(output, output_size, output_refresh);
     send_output_scale(output, output_scale);
     if output.version() >= WL_OUTPUT_NAME_SINCE {
@@ -192,6 +183,20 @@ pub(super) fn send_output_description(
         });
     }
     send_output_done_if_supported(output);
+}
+
+pub(super) fn send_output_geometry(output: &wl_output::WlOutput, physical_size_mm: (i32, i32)) {
+    let (x, y) = OUTPUT_LOGICAL_POSITION;
+    let _ = output.send_event(wl_output::Event::Geometry {
+        x,
+        y,
+        physical_width: physical_size_mm.0,
+        physical_height: physical_size_mm.1,
+        subpixel: WEnum::Value(wl_output::Subpixel::Unknown),
+        make: "Oblivion".to_string(),
+        model: "Native Output".to_string(),
+        transform: WEnum::Value(OUTPUT_TRANSFORM),
+    });
 }
 
 pub(super) fn send_output_scale(output: &wl_output::WlOutput, output_scale: OutputScale) {

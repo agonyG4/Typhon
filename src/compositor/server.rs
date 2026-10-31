@@ -2425,6 +2425,13 @@ impl OwnCompositorServer {
         changed
     }
 
+    /// Publish the connector's physical dimensions, independent of its pixel mode.
+    pub fn set_output_physical_size_mm(&mut self, size_mm: Option<(u32, u32)>) -> bool {
+        let changed = self.state.set_output_physical_size_mm(size_mm);
+        let _ = self.display.flush_clients();
+        changed
+    }
+
     pub fn set_output_size(&mut self, width: u32, height: u32) -> bool {
         let changed = self.state.set_output_size(width, height);
         let _ = self.display.flush_clients();
