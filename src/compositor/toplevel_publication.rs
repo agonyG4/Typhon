@@ -80,6 +80,10 @@ impl AstreaToplevelStates {
         Self(self.0 | other.0)
     }
 
+    pub(crate) const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
     const fn wire(self) -> astrea_toplevel_v1::State {
         astrea_toplevel_v1::State::from_bits_truncate(self.0)
     }

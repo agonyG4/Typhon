@@ -14,6 +14,7 @@ impl CompositorState {
         if !self.astrea_toplevel_publisher.should_reconcile() {
             return self.astrea_toplevel_publisher.clean_summary();
         }
+        self.sync_wlr_foreign_toplevels(display);
         let needs_full = self.astrea_toplevel_publisher.needs_full_reconciliation();
         let dirty_ids = self.astrea_toplevel_publisher.dirty_window_ids();
         let dirty_snapshots = dirty_ids

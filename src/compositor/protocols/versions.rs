@@ -569,6 +569,7 @@ pub(crate) const ASTREA_SHORTCUTS_MANAGER_V1: u32 = 2;
 pub(crate) const ASTREA_SHELL_AUTH_MANAGER_V1: u32 = 1;
 pub(crate) const ASTREA_SCREEN_CAPTURE_MANAGER_V1: u32 = 1;
 pub(crate) const ZWLR_SCREENCOPY_MANAGER_V1: u32 = 3;
+pub(crate) const ZWLR_FOREIGN_TOPLEVEL_MANAGER_V1: u32 = 3;
 pub(crate) const ASTREA_SHELL_CONTROL_MANAGER_V1: u32 = 1;
 pub(crate) const ASTREA_EFFECTS_MANAGER_V1: u32 = 1;
 pub(crate) const ASTREA_BACKGROUND_EFFECT_COVERAGE_MANAGER_V1: u32 = 1;
@@ -653,6 +654,10 @@ pub(crate) const ALL_GLOBALS: &[GlobalAdvertisement] = &[
     GlobalAdvertisement::new("wl_output", WL_OUTPUT),
     GlobalAdvertisement::new("zxdg_output_manager_v1", ZXDG_OUTPUT_MANAGER_V1),
     GlobalAdvertisement::new("zwlr_screencopy_manager_v1", ZWLR_SCREENCOPY_MANAGER_V1),
+    GlobalAdvertisement::new(
+        "zwlr_foreign_toplevel_manager_v1",
+        ZWLR_FOREIGN_TOPLEVEL_MANAGER_V1,
+    ),
     GlobalAdvertisement::new("wl_seat", WL_SEAT),
     GlobalAdvertisement::new("ext_workspace_manager_v1", EXT_WORKSPACE_MANAGER_V1),
     GlobalAdvertisement::new("xwayland_shell_v1", XWAYLAND_SHELL_V1),

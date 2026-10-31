@@ -64,6 +64,7 @@ Core/XDG request matrix, but they must remain synchronized with
 | `xdg_wm_base` | 6 | Implemented |
 | `wl_output` | 4 | Implemented |
 | `zxdg_output_manager_v1` | 3 | Implemented |
+| `zwlr_foreign_toplevel_manager_v1` | 3 | Implemented (title, app_id, state; activate, close, minimize, maximize; fullscreen and rectangle hints ignored) |
 | `zwlr_screencopy_manager_v1` | 3 | Implemented (output and region capture into wl_shm buffers; no DMA-BUF) |
 | `wl_seat` | 11 | Implemented |
 | `wp_cursor_shape_manager_v1` | 2 | Implemented (pointer capability gated) |
