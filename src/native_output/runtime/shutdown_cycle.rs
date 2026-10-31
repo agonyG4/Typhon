@@ -106,7 +106,7 @@ impl NativeRuntime {
         }
         let process_launch_backlog_pending = self.fail_pending_process_launches_for_shutdown();
         if advance_without_cycle
-            && !self.server.has_pending_astrea_screen_capture()
+            && !self.server.has_pending_screen_capture()
             && !process_launch_backlog_pending
         {
             self.advance_shutdown_lifecycle_without_cycle()

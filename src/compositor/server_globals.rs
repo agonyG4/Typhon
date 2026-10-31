@@ -13,6 +13,7 @@ use wayland_protocols::wp::{
     tearing_control::v1::server::wp_tearing_control_manager_v1,
 };
 use wayland_protocols::xdg::xdg_output::zv1::server::zxdg_output_manager_v1;
+use wayland_protocols_wlr::screencopy::v1::server::zwlr_screencopy_manager_v1;
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn register_minimum_globals(
@@ -192,6 +193,11 @@ pub(super) fn register_minimum_globals(
         astrea_shell_control_manager_v1::AstreaShellControlManagerV1,
         _,
     >(versions::ASTREA_SHELL_CONTROL_MANAGER_V1, ());
+    display
+        .create_global::<CompositorState, zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1, _>(
+            versions::ZWLR_SCREENCOPY_MANAGER_V1,
+            (),
+        );
     if renderer_capabilities.background_effect {
         display
             .create_global::<CompositorState, astrea_effects_manager_v1::AstreaEffectsManagerV1, _>(

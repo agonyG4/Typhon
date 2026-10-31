@@ -43,6 +43,8 @@ use super::atomic_render_domain::{
     AtomicRenderDomain, AtomicRenderDomainBootstrap, AtomicRenderDomainInfo,
 };
 pub(crate) use super::atomic_render_domain::{AtomicRenderedFrameParts, AtomicSlotRenderOutcome};
+#[cfg(test)]
+use super::render_worker::validate_render_control_batch;
 use super::render_worker::{
     AtomicRenderCandidateIdentity, AtomicRenderCandidateJob, AtomicRenderControl,
     AtomicRenderTransportKind, AtomicRenderWorkerCapture, AtomicRenderWorkerEffectReload,
@@ -51,8 +53,6 @@ use super::render_worker::{
     AtomicRenderWorkerPolicy, AtomicRenderWorkerReleaseFence, AtomicRenderWorkerStartup,
     RenderWorkerJobId, SequencedRenderControl, apply_render_control,
 };
-#[cfg(test)]
-use super::render_worker::validate_render_control_batch;
 use super::*;
 use crate::native_output::output::OutputColorDepth;
 use crate::native_output::presentation::async_validation::CompositedPresentationValidationKey;
@@ -780,9 +780,7 @@ fn ten_bit_output_capable(
         probe,
         OutputColorDepth::Bits10,
     )
-    .is_ok_and(|selected| {
-        output_format_color_depth(selected.fourcc) == OutputColorDepth::Bits10
-    })
+    .is_ok_and(|selected| output_format_color_depth(selected.fourcc) == OutputColorDepth::Bits10)
 }
 
 impl GbmAllocationProbe for DeviceAllocationProbe<'_> {
@@ -2650,15 +2648,14 @@ impl AtomicEglGbmScanout {
         server: &OwnCompositorServer,
         input_state: &NativeInputState,
         cursor_mode: NativeCursorRenderMode,
+        include_cursor: bool,
     ) -> io::Result<Vec<u8>> {
-        let mut frozen_frame = FrozenNativeRenderFrame::freeze(
-            self.width,
-            self.height,
+        let mut frozen_frame = self.freeze_capture_frame(
             resolved_scene,
             server,
             input_state,
             cursor_mode,
-            Some(OutputDamage::Full),
+            include_cursor,
         );
         match &mut self.render_transport {
             AtomicRenderTransport::Synchronous(domain) => domain.capture_scene(&mut frozen_frame),
@@ -2674,6 +2671,7 @@ impl AtomicEglGbmScanout {
         server: &OwnCompositorServer,
         input_state: &NativeInputState,
         cursor_mode: NativeCursorRenderMode,
+        include_cursor: bool,
     ) -> FrozenNativeRenderFrame {
         FrozenNativeRenderFrame::freeze(
             self.width,
@@ -2684,6 +2682,7 @@ impl AtomicEglGbmScanout {
             cursor_mode,
             Some(OutputDamage::Full),
         )
+        .with_capture_cursor(include_cursor)
     }
 
     pub(crate) fn dispatch_capture(

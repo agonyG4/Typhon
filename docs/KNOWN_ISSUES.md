@@ -100,10 +100,14 @@ transfer functions only; HDR is not supported.
 The Wayland protocols below are not implemented and not advertised, so clients
 that depend on them fall back or lose that feature: tablet input
 (`zwp_tablet_v2`), text input and input-method protocols, pointer gestures,
-`ext-session-lock`, `xdg-output`, and the wlroots/ext screencopy and foreign
-toplevel protocols. Screen capture and toplevel management are provided by
-Typhon's own `astrea-screen-capture-v1` and `astrea-toplevel-management-v1`
-protocols instead. See [the protocol source manifest](wayland/PROTOCOL_SOURCE_MANIFEST.md)
+`ext-session-lock`, the ext image-copy-capture screencopy protocol
+(`ext-image-copy-capture-v1`), and the foreign toplevel protocols. Toplevel
+management is provided by Typhon's own `astrea-toplevel-management-v1` protocol
+instead. `zwlr_screencopy_manager_v1` (v3) and `xdg-output` are advertised.
+wlr-screencopy is SHM-only: frames are copied to CPU memory and there is no
+DMA-BUF path yet. Only whole-output capture is supported; window capture is
+not. Screen sharing through portals is described in
+[screen capture](screen-capture.md). See [the protocol source manifest](wayland/PROTOCOL_SOURCE_MANIFEST.md)
 for the advertised set.
 
 ## Application-specific graphics warnings

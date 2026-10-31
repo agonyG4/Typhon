@@ -1318,6 +1318,16 @@ impl NativeCursorRenderMode {
     pub(crate) const fn is_software(self) -> bool {
         matches!(self, Self::Software | Self::SoftwareClient)
     }
+
+    /// Cursor mode for a private capture: a capture that keeps the cursor
+    /// must composite it even while the output shows it on a hardware plane.
+    pub(crate) const fn for_capture(self, include_cursor: bool, client_cursor: bool) -> Self {
+        match self {
+            Self::Hardware if include_cursor && client_cursor => Self::SoftwareClient,
+            Self::Hardware if include_cursor => Self::Software,
+            mode => mode,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2546,6 +2556,7 @@ pub(crate) struct FrozenNativeRenderFrame {
     #[allow(dead_code, reason = "Reserved snapshot metadata")]
     pub(crate) identity: FrozenRenderSnapshotIdentity,
     projection_consumed: bool,
+    capture_cursor: bool,
 }
 
 impl FrozenNativeRenderFrame {
@@ -2635,7 +2646,19 @@ impl FrozenNativeRenderFrame {
             presentation_visual_signature,
             identity,
             projection_consumed: false,
+            capture_cursor: false,
         }
+    }
+
+    /// Keep the cursor in a private screen capture (wlr-screencopy
+    /// `overlay_cursor`); captures strip it by default.
+    pub(crate) fn with_capture_cursor(mut self, capture_cursor: bool) -> Self {
+        self.capture_cursor = capture_cursor;
+        self
+    }
+
+    pub(crate) const fn capture_cursor(&self) -> bool {
+        self.capture_cursor
     }
 
     /// Borrow the frozen scene exactly once. Damage and resource-journal

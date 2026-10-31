@@ -203,6 +203,7 @@ impl CompositorState {
             .cloned()
             .collect::<Vec<_>>();
         self.fail_astrea_screen_captures_for_output(output_id, "output_gone");
+        self.fail_screencopy_for_output(output_id);
         for binding in &bindings {
             output_lifecycle_trace(
                 "logical_output.withdraw",

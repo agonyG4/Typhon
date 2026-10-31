@@ -147,6 +147,7 @@ use support::subsurface_client::*;
 use support::window_ops::*;
 
 mod astrea_screen_capture;
+mod screencopy_protocol;
 mod astrea_shell_auth;
 mod astrea_shell_capability;
 mod astrea_shortcuts;

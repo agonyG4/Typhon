@@ -24,7 +24,7 @@ use oblivion_one::{
         client_protocols_for_capabilities_with_frame_pacing,
     },
     default_state_dir, discover_tools, gpu_residency,
-    portal::PortalRuntime,
+    portal::{DesktopIntegration, PortalRuntime},
     session::NativeSessionProbe,
 };
 
@@ -344,11 +344,27 @@ fn own_compositor(options: CompositorCliOptions) -> AppResult<()> {
 fn portal(options: PortalCliOptions) -> AppResult<()> {
     let runtime = PortalRuntime::for_current_process(default_state_dir())?;
     runtime.install()?;
+    let desktop = match DesktopIntegration::from_environment(default_state_dir())
+        .and_then(|desktop| desktop.install().map(|()| desktop))
+    {
+        Ok(desktop) => Some(desktop),
+        Err(error) => {
+            eprintln!("oblivion-one: desktop portal integration not installed: {error}");
+            None
+        }
+    };
     if options.check_only || options.install_only {
         println!("Oblivion portal backend");
         println!("service: {}", runtime.service_path().display());
         println!("portal: {}", runtime.portal_path().display());
         println!("dbus name: {}", oblivion_one::portal::BACKEND_BUS_NAME);
+        if let Some(desktop) = &desktop {
+            for path in desktop.portal_config_paths() {
+                println!("desktop portal config: {}", path.display());
+            }
+            println!("share picker: {}", desktop.picker_path().display());
+            println!("xdph config: {}", desktop.xdph_config_path().display());
+        }
         return Ok(());
     }
     oblivion_one::portal::run_backend().map_err(Into::into)

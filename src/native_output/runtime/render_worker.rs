@@ -12,7 +12,7 @@ static NEXT_RENDER_WORKER_JOB_ID: AtomicU64 = AtomicU64::new(1);
 pub(super) struct PendingWorkerCapture {
     pub(super) job_id: crate::native_output::scanout::RenderWorkerJobId,
     pub(super) control_epoch: u64,
-    pub(super) pending: oblivion_one::compositor::AstreaScreenCapturePending,
+    pub(super) pending: oblivion_one::compositor::ScreenCaptureRequest,
     pub(super) dimensions: crate::native_output::screen_capture::CaptureDimensions,
     pub(super) cancelled: bool,
 }
@@ -373,7 +373,7 @@ impl NativeRuntime {
             .into());
         };
         if pending.job_id != job_id || pending.control_epoch != control_epoch {
-            pending.pending.capture.failed("render_failed".to_owned());
+            pending.pending.fail("render_failed");
             return Err(io::Error::other(
                 "render worker capture identity or control epoch mismatch",
             )
@@ -385,32 +385,19 @@ impl NativeRuntime {
         let payload = match result {
             Ok(payload) if payload.len() == pending.dimensions.payload_len => payload,
             Ok(_) => {
-                pending.pending.capture.failed("render_failed".to_owned());
+                pending.pending.fail("render_failed");
                 return Ok(());
             }
             Err(error) => {
                 eprintln!("native screen capture render failed: {error}");
-                pending.pending.capture.failed("render_failed".to_owned());
+                pending.pending.fail("render_failed");
                 return Ok(());
             }
         };
-        let memfd = match crate::native_output::screen_capture::create_sealed_memfd(&payload) {
-            Ok(memfd) => memfd,
-            Err(error) => {
-                eprintln!("native screen capture allocation failed: {error}");
-                pending
-                    .pending
-                    .capture
-                    .failed("allocation_failed".to_owned());
-                return Ok(());
-            }
-        };
-        pending.pending.capture.ready(
-            memfd.as_fd(),
-            pending.dimensions.width,
-            pending.dimensions.height,
-            pending.dimensions.stride,
-            crate::native_output::screen_capture::RGBA8888_FORMAT,
+        crate::native_output::screen_capture::deliver_screen_capture_payload(
+            pending.pending,
+            &payload,
+            pending.dimensions,
         );
         Ok(())
     }

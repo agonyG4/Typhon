@@ -648,14 +648,23 @@ impl NativeScanoutBackend {
         server: &OwnCompositorServer,
         input_state: &NativeInputState,
         cursor_mode: NativeCursorRenderMode,
+        include_cursor: bool,
     ) -> io::Result<Vec<u8>> {
         match self {
-            Self::AtomicEglGbm(scanout) => {
-                scanout.capture_scene(resolved_scene, server, input_state, cursor_mode)
-            }
-            Self::NativeEglGbm(scanout) => {
-                scanout.capture_scene(resolved_scene, server, input_state, cursor_mode)
-            }
+            Self::AtomicEglGbm(scanout) => scanout.capture_scene(
+                resolved_scene,
+                server,
+                input_state,
+                cursor_mode,
+                include_cursor,
+            ),
+            Self::NativeEglGbm(scanout) => scanout.capture_scene(
+                resolved_scene,
+                server,
+                input_state,
+                cursor_mode,
+                include_cursor,
+            ),
             Self::Gbm(_) | Self::Dumb(_) => Err(io::Error::other(
                 "screen capture requires a GLES native scanout backend",
             )),

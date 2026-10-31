@@ -15,7 +15,8 @@ pub use clipboard_bridge::{
     NoopClipboardBridge,
 };
 use gpu_protocol_capabilities::GpuProtocolCapabilities;
-pub use screen_capture::AstreaScreenCapturePending;
+pub use screen_capture::{AstreaScreenCapturePending, ScreenCaptureRequest};
+pub use screencopy::ScreencopyPending;
 use std::{
     cell::Cell,
     collections::{HashMap, HashSet, VecDeque},
@@ -96,6 +97,7 @@ mod layer_shell;
 mod lifecycle_compatibility;
 mod output;
 pub use output::OutputRefreshRate;
+pub(crate) use output::OUTPUT_NAME;
 pub(crate) mod pacing;
 mod plan;
 mod popup;
@@ -111,6 +113,7 @@ mod render;
 mod runtime_files;
 mod scene;
 mod screen_capture;
+mod screencopy;
 mod selection;
 mod server;
 mod server_backend;
@@ -1025,6 +1028,7 @@ pub struct CompositorState {
     astrea_toplevel_authorized_clients: HashSet<ClientId>,
     astrea_shell_authenticated_clients: HashSet<ClientId>,
     astrea_screen_captures: HashMap<ClientId, AstreaScreenCapturePending>,
+    screencopy_pending: VecDeque<ScreencopyPending>,
     astrea_shell_client_pids: HashSet<u32>,
     // Start-time identity for the selection exception; PID alone is reusable.
     astrea_shell_registered_process_start_times: HashMap<u32, u64>,

@@ -2,7 +2,7 @@ use wayland_server::{Resource, WEnum, protocol::wl_output};
 
 pub(super) const OUTPUT_LOGICAL_POSITION: (i32, i32) = (0, 0);
 pub(super) const OUTPUT_TRANSFORM: wl_output::Transform = wl_output::Transform::Normal;
-pub(super) const OUTPUT_NAME: &str = "Oblivion-1";
+pub(crate) const OUTPUT_NAME: &str = "Oblivion-1";
 pub(super) const OUTPUT_DESCRIPTION: &str = "Typhon native output";
 const DEFAULT_OUTPUT_WIDTH: u32 = 1280;
 const DEFAULT_OUTPUT_HEIGHT: u32 = 800;
@@ -61,6 +61,16 @@ impl OutputScale {
         self.preferred_scale
             .div_ceil(FRACTIONAL_SCALE_DENOMINATOR)
             .max(1) as i32
+    }
+
+    /// Physical pixel edges covering a logical span, rounded outward.
+    pub(super) fn logical_to_physical_bounds(self, logical: u32, length: u32) -> (u32, u32) {
+        let scale = u64::from(self.preferred_scale);
+        let denominator = u64::from(FRACTIONAL_SCALE_DENOMINATOR);
+        let start = u64::from(logical) * scale / denominator;
+        let end = ((u64::from(logical) + u64::from(length)) * scale).div_ceil(denominator);
+        let clamp = |value: u64| u32::try_from(value).unwrap_or(u32::MAX);
+        (clamp(start), clamp(end))
     }
 
     /// Logical extent along one axis, using the true (possibly fractional)

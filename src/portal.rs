@@ -1,6 +1,10 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    env, fs, io,
+    env,
+    ffi::OsString,
+    fs,
+    io::{self, Write},
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -14,6 +18,7 @@ use zbus::{
 };
 
 use crate::{
+    compositor::OUTPUT_NAME,
     cursor_persistence::CursorConfigurationStore,
     cursor_theme::{CursorConfiguration, default_cursor_configuration},
 };
@@ -122,6 +127,141 @@ impl PortalRuntime {
         write_if_changed(&self.data_config_path(), &self.config_contents())?;
         write_if_changed(&self.service_path(), &self.service_contents())
     }
+}
+
+pub const DESKTOP_PORTAL_NAMES: [&str; 2] = ["oblivionone", "astrea"];
+const SHARE_PICKER_NAME: &str = "typhon-share-picker";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DesktopIntegration {
+    config_home: PathBuf,
+    state_dir: PathBuf,
+}
+
+impl DesktopIntegration {
+    pub fn new(config_home: PathBuf, state_dir: PathBuf) -> Self {
+        Self {
+            config_home,
+            state_dir,
+        }
+    }
+
+    pub fn from_environment(state_dir: PathBuf) -> io::Result<Self> {
+        let config_home = default_config_home().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "neither XDG_CONFIG_HOME nor HOME is set",
+            )
+        })?;
+        Ok(Self::new(config_home, state_dir))
+    }
+
+    pub fn portal_config_paths(&self) -> Vec<PathBuf> {
+        DESKTOP_PORTAL_NAMES
+            .iter()
+            .map(|name| {
+                self.config_home
+                    .join("xdg-desktop-portal")
+                    .join(format!("{name}-portals.conf"))
+            })
+            .collect()
+    }
+
+    pub fn picker_path(&self) -> PathBuf {
+        self.state_dir.join("bin").join(SHARE_PICKER_NAME)
+    }
+
+    pub fn xdph_config_path(&self) -> PathBuf {
+        self.config_home.join("hypr").join("xdph.conf")
+    }
+
+    pub fn install(&self) -> io::Result<()> {
+        for path in self.portal_config_paths() {
+            write_if_absent(&path, &desktop_portal_config_contents())?;
+            if fs::read_to_string(&path).is_ok_and(|current| !has_screencast_line(&current)) {
+                eprintln!(
+                    "oblivion-one: {} has no ScreenCast= line; add `org.freedesktop.impl.portal.ScreenCast=hyprland` for screen sharing",
+                    path.display()
+                );
+            }
+        }
+
+        let picker = self.picker_path();
+        write_if_changed(&picker, &share_picker_script())?;
+        fs::set_permissions(&picker, fs::Permissions::from_mode(0o755))?;
+
+        let xdph = self.xdph_config_path();
+        if !write_if_absent(&xdph, &xdph_config_contents(&picker))?
+            && fs::read_to_string(&xdph)
+                .is_ok_and(|current| !current.contains("custom_picker_binary"))
+        {
+            eprintln!(
+                "oblivion-one: add `custom_picker_binary = {}` to the screencopy block in {}",
+                picker.display(),
+                xdph.display()
+            );
+        }
+        Ok(())
+    }
+}
+
+pub fn default_config_home() -> Option<PathBuf> {
+    config_home_from_env(env::var_os("XDG_CONFIG_HOME"), env::var_os("HOME"))
+}
+
+pub fn config_home_from_env(
+    xdg_config_home: Option<OsString>,
+    home: Option<OsString>,
+) -> Option<PathBuf> {
+    xdg_config_home
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| {
+            home.filter(|value| !value.is_empty())
+                .map(|home| PathBuf::from(home).join(".config"))
+        })
+}
+
+pub fn desktop_portal_config_contents() -> String {
+    [
+        "[preferred]",
+        "default=gtk",
+        "org.freedesktop.impl.portal.ScreenCast=hyprland",
+        "org.freedesktop.impl.portal.Screenshot=hyprland",
+        "org.freedesktop.impl.portal.Secret=gnome-keyring",
+        "",
+    ]
+    .join("\n")
+}
+
+pub fn share_picker_script() -> String {
+    format!(
+        r#"#!/bin/sh
+case "$XDG_CURRENT_DESKTOP" in
+  OblivionOne|Astrea) printf '[SELECTION]r/screen:%s\n' '{OUTPUT_NAME}' ;;
+  *) exec hyprland-share-picker "$@" ;;
+esac
+"#
+    )
+}
+
+pub fn xdph_config_contents(picker: &Path) -> String {
+    [
+        "screencopy {",
+        "    allow_token_by_default = true",
+        &format!("    custom_picker_binary = {}", picker.display()),
+        "}",
+        "",
+    ]
+    .join("\n")
+}
+
+fn has_screencast_line(config: &str) -> bool {
+    config.lines().any(|line| {
+        line.trim_start()
+            .starts_with("org.freedesktop.impl.portal.ScreenCast=")
+    })
 }
 
 pub fn settings_for_namespaces(namespaces: &[String]) -> PortalSettings {
@@ -355,6 +495,26 @@ fn write_if_changed(path: &Path, contents: &str) -> io::Result<()> {
     Ok(())
 }
 
+fn write_if_absent(path: &Path, contents: &str) -> io::Result<bool> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if let Err(error) = file.write_all(contents.as_bytes()) {
+        let _ = fs::remove_file(path);
+        return Err(error);
+    }
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -363,6 +523,108 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_SETTINGS_ROOT: AtomicU64 = AtomicU64::new(0);
+    static NEXT_DESKTOP_ROOT: AtomicU64 = AtomicU64::new(0);
+
+    fn temporary_desktop_root() -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "typhon-desktop-portal-{}-{}",
+            std::process::id(),
+            NEXT_DESKTOP_ROOT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("temporary desktop root");
+        root
+    }
+
+    #[test]
+    fn desktop_portal_config_routes_screencast_and_screenshot_to_hyprland() {
+        assert_eq!(
+            desktop_portal_config_contents(),
+            "[preferred]\ndefault=gtk\norg.freedesktop.impl.portal.ScreenCast=hyprland\norg.freedesktop.impl.portal.Screenshot=hyprland\norg.freedesktop.impl.portal.Secret=gnome-keyring\n"
+        );
+    }
+
+    #[test]
+    fn config_home_follows_xdg_rules() {
+        assert_eq!(
+            config_home_from_env(Some("/xdg".into()), Some("/home/u".into())),
+            Some(PathBuf::from("/xdg"))
+        );
+        assert_eq!(
+            config_home_from_env(Some("relative".into()), Some("/home/u".into())),
+            Some(PathBuf::from("/home/u/.config"))
+        );
+        assert_eq!(
+            config_home_from_env(None, Some("/home/u".into())),
+            Some(PathBuf::from("/home/u/.config"))
+        );
+        assert_eq!(config_home_from_env(Some("".into()), None), None);
+    }
+
+    #[test]
+    fn desktop_portal_configs_are_installed_without_overwriting() {
+        let root = temporary_desktop_root();
+        let integration = DesktopIntegration::new(root.join("config"), root.join("state"));
+        integration.install().expect("install desktop integration");
+
+        for path in integration.portal_config_paths() {
+            assert_eq!(
+                fs::read_to_string(&path).unwrap(),
+                desktop_portal_config_contents()
+            );
+        }
+
+        let oblivion = integration.portal_config_paths().remove(0);
+        fs::write(&oblivion, "[preferred]\ndefault=none\n").unwrap();
+        integration
+            .install()
+            .expect("reinstall desktop integration");
+        assert_eq!(
+            fs::read_to_string(&oblivion).unwrap(),
+            "[preferred]\ndefault=none\n"
+        );
+        assert!(!has_screencast_line("[preferred]\ndefault=none\n"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn share_picker_script_is_executable_and_names_the_output() {
+        let root = temporary_desktop_root();
+        let integration = DesktopIntegration::new(root.join("config"), root.join("state"));
+        integration.install().expect("install desktop integration");
+
+        let picker = integration.picker_path();
+        assert_eq!(fs::read_to_string(&picker).unwrap(), share_picker_script());
+        let mode = fs::metadata(&picker).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755);
+        assert!(share_picker_script().contains(&format!("'{OUTPUT_NAME}'")));
+        assert!(share_picker_script().starts_with("#!/bin/sh\n"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn xdph_config_is_written_once_and_preserved() {
+        let root = temporary_desktop_root();
+        let integration = DesktopIntegration::new(root.join("config"), root.join("state"));
+        integration.install().expect("install desktop integration");
+
+        let xdph = integration.xdph_config_path();
+        assert_eq!(
+            fs::read_to_string(&xdph).unwrap(),
+            xdph_config_contents(&integration.picker_path())
+        );
+        assert!(
+            xdph_config_contents(&integration.picker_path())
+                .contains("allow_token_by_default = true")
+        );
+
+        fs::write(&xdph, "user config\n").unwrap();
+        integration
+            .install()
+            .expect("reinstall desktop integration");
+        assert_eq!(fs::read_to_string(&xdph).unwrap(), "user config\n");
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn notification_backend_tracks_add_and_remove() {

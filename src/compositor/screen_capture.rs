@@ -3,12 +3,43 @@ use crate::astrea_screen_capture::server::{
 };
 use std::collections::HashMap;
 
+use super::screencopy::ScreencopyPending;
 use super::*;
 
 #[derive(Debug, Clone)]
 pub struct AstreaScreenCapturePending {
     pub capture: astrea_screen_capture_v1::AstreaScreenCaptureV1,
     pub output_id: OutputId,
+}
+
+/// A capture request the runtime must satisfy with a rendered frame.
+#[derive(Debug)]
+pub enum ScreenCaptureRequest {
+    Astrea(AstreaScreenCapturePending),
+    Screencopy(ScreencopyPending),
+}
+
+impl ScreenCaptureRequest {
+    pub fn output_id(&self) -> OutputId {
+        match self {
+            Self::Astrea(pending) => pending.output_id,
+            Self::Screencopy(pending) => pending.output_id(),
+        }
+    }
+
+    pub fn overlay_cursor(&self) -> bool {
+        match self {
+            Self::Astrea(_) => false,
+            Self::Screencopy(pending) => pending.overlay_cursor(),
+        }
+    }
+
+    pub fn fail(&self, reason: &str) {
+        match self {
+            Self::Astrea(pending) => pending.capture.failed(reason.to_string()),
+            Self::Screencopy(pending) => pending.fail(),
+        }
+    }
 }
 
 impl GlobalDispatch<astrea_screen_capture_manager_v1::AstreaScreenCaptureManagerV1, ()>
@@ -119,15 +150,21 @@ impl CompositorState {
         self.logical_output_ids.contains(&output_id)
     }
 
-    pub(in crate::compositor) fn has_pending_astrea_screen_capture(&self) -> bool {
-        !self.astrea_screen_captures.is_empty()
+    pub(in crate::compositor) fn has_pending_screen_capture(&self) -> bool {
+        !self.astrea_screen_captures.is_empty() || self.has_ready_screencopy()
     }
 
-    pub(in crate::compositor) fn take_pending_astrea_screen_capture(
+    pub(in crate::compositor) fn take_pending_screen_capture(
         &mut self,
-    ) -> Option<AstreaScreenCapturePending> {
-        let client_id = self.astrea_screen_captures.keys().next().cloned()?;
-        self.astrea_screen_captures.remove(&client_id)
+    ) -> Option<ScreenCaptureRequest> {
+        if let Some(client_id) = self.astrea_screen_captures.keys().next().cloned() {
+            return self
+                .astrea_screen_captures
+                .remove(&client_id)
+                .map(ScreenCaptureRequest::Astrea);
+        }
+        self.take_ready_screencopy()
+            .map(ScreenCaptureRequest::Screencopy)
     }
 
     pub(in crate::compositor) fn remove_astrea_screen_capture(
@@ -169,15 +206,15 @@ impl CompositorState {
 }
 
 impl OwnCompositorServer {
-    pub fn has_pending_astrea_screen_capture(&self) -> bool {
-        self.state.has_pending_astrea_screen_capture()
+    pub fn has_pending_screen_capture(&self) -> bool {
+        self.state.has_pending_screen_capture()
     }
 
-    pub fn take_pending_astrea_screen_capture(&mut self) -> Option<AstreaScreenCapturePending> {
-        self.state.take_pending_astrea_screen_capture()
+    pub fn take_pending_screen_capture(&mut self) -> Option<ScreenCaptureRequest> {
+        self.state.take_pending_screen_capture()
     }
 
-    pub fn astrea_screen_capture_output_is_current(&self, output_id: OutputId) -> bool {
+    pub fn screen_capture_output_is_current(&self, output_id: OutputId) -> bool {
         self.state.logical_output_is_current(output_id)
     }
 }

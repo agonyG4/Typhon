@@ -738,7 +738,7 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                         server.set_output_preferred_transform(transform);
                     }
                     ServerCommand::CapturePendingAstreaScreenCapture(reply) => {
-                        let _ = reply.send(server.has_pending_astrea_screen_capture());
+                        let _ = reply.send(server.has_pending_screen_capture());
                     }
                     ServerCommand::CapturePendingAstreaScreenCaptureOutput(reply) => {
                         let output =
@@ -750,7 +750,7 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                                 .map(|pending| {
                                     (
                                         pending.output_id,
-                                        server.astrea_screen_capture_output_is_current(
+                                        server.screen_capture_output_is_current(
                                             pending.output_id,
                                         ),
                                     )

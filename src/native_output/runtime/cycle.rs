@@ -1,7 +1,5 @@
 use super::*;
-use crate::native_output::screen_capture::{
-    CaptureDimensions, RGBA8888_FORMAT, create_sealed_memfd,
-};
+use crate::native_output::screen_capture::{CaptureDimensions, deliver_screen_capture_payload};
 
 const MAX_SCREEN_CAPTURES_FAILED_PER_TURN: usize = 16;
 
@@ -405,7 +403,7 @@ impl NativeRuntime {
             visual_work_deadline_due: self.queued_visual_work_deadline_due(now_ns),
             cursor_only_due: self.cursor_output_arbitration.pending()
                 && self.cursor_output_arbitration.due(now_ns),
-            screen_capture_pending: self.server.has_pending_astrea_screen_capture(),
+            screen_capture_pending: self.server.has_pending_screen_capture(),
             explicit_sync_service_due: cycle.wakeup.reasons.explicit_sync_acquire()
                 || !cycle.wakeup.explicit_sync_acquire_tokens.is_empty()
                 || self.server.has_pending_acquire_watch_changes()
@@ -564,7 +562,7 @@ impl NativeRuntime {
             self.reap_supervised_children(&cycle)?;
         }
         if signal_shutdown_requested {
-            if !self.server.has_pending_astrea_screen_capture()
+            if !self.server.has_pending_screen_capture()
                 && !self.server.has_pending_process_launches()
             {
                 self.advance_shutdown_lifecycle_without_cycle()?;
@@ -628,10 +626,10 @@ impl NativeRuntime {
         if !screen_capture_delivery_is_allowed(
             self.shutdown.is_running(),
             self.session.permits_output(),
-        ) && self.server.has_pending_astrea_screen_capture()
+        ) && self.server.has_pending_screen_capture()
         {
             self.fail_pending_screen_captures("session_inactive");
-            if self.server.has_pending_astrea_screen_capture() {
+            if self.server.has_pending_screen_capture() {
                 self.finish_slow_cycle(&cycle, render_attempted)?;
                 return Ok(());
             }
@@ -983,13 +981,13 @@ impl NativeRuntime {
             self.finish_slow_cycle(&cycle, render_attempted)?;
             return Ok(());
         }
-        let capture_service_attempted = prepare_operation_plan.service_screen_capture_if_pending(
-            self.server.has_pending_astrea_screen_capture(),
-            || self.service_pending_screen_capture(),
-        )?;
+        let capture_service_attempted = prepare_operation_plan
+            .service_screen_capture_if_pending(self.server.has_pending_screen_capture(), || {
+                self.service_pending_screen_capture()
+            })?;
         if capture_service_attempted
             && screen_capture_backlog_needs_immediate_continuation(
-                self.server.has_pending_astrea_screen_capture(),
+                self.server.has_pending_screen_capture(),
                 self.scanout.render_worker_active(),
                 self.scanout.render_worker_busy(),
             )
@@ -1658,16 +1656,16 @@ impl NativeRuntime {
         if let Some(pending) = self.pending_render_worker_capture.as_mut()
             && !pending.cancelled
         {
-            pending.pending.capture.failed(reason.to_owned());
+            pending.pending.fail(reason);
             pending.cancelled = true;
         }
         for _ in 0..MAX_SCREEN_CAPTURES_FAILED_PER_TURN {
-            let Some(pending) = self.server.take_pending_astrea_screen_capture() else {
+            let Some(pending) = self.server.take_pending_screen_capture() else {
                 break;
             };
-            pending.capture.failed(reason.to_owned());
+            pending.fail(reason);
         }
-        if self.server.has_pending_astrea_screen_capture() {
+        if self.server.has_pending_screen_capture() {
             let _ = self.event_loop.request_continuation(
                 oblivion_one::native::event_loop::NativeContinuationReason::ScreenCaptureBacklog,
             );
@@ -1691,18 +1689,18 @@ impl NativeRuntime {
             // fd will wake the reactor; no capture job is prepared here.
             return Ok(());
         }
-        let Some(pending) = self.server.take_pending_astrea_screen_capture() else {
+        let Some(pending) = self.server.take_pending_screen_capture() else {
             return Ok(());
         };
         if !self
             .server
-            .astrea_screen_capture_output_is_current(pending.output_id)
+            .screen_capture_output_is_current(pending.output_id())
         {
-            pending.capture.failed("output_gone".to_owned());
+            pending.fail("output_gone");
             return Ok(());
         }
         if !self.scanout.supports_gpu_buffer_protocols() {
-            pending.capture.failed("unsupported".to_owned());
+            pending.fail("unsupported");
             return Ok(());
         }
 
@@ -1710,11 +1708,16 @@ impl NativeRuntime {
         let dimensions = match CaptureDimensions::checked(width, height) {
             Ok(dimensions) => dimensions,
             Err(_) => {
-                pending.capture.failed("allocation_failed".to_owned());
+                pending.fail("allocation_failed");
                 return Ok(());
             }
         };
         let resolved_scene = ResolvedNativeFrameScene::from_server(&self.server).into_owned();
+        let include_cursor = pending.overlay_cursor();
+        let cursor_mode = self.cursor_render_mode.for_capture(
+            include_cursor,
+            self.server.client_cursor_render_state().is_some(),
+        );
         if self.scanout.render_worker_active() {
             let job_id = super::render_worker::next_render_worker_job_id()?;
             let frozen_frame = match &*self.scanout {
@@ -1723,11 +1726,12 @@ impl NativeRuntime {
                         resolved_scene,
                         &self.server,
                         &self.input_state,
-                        self.cursor_render_mode,
+                        cursor_mode,
+                        include_cursor,
                     )
                 }
                 _ => {
-                    pending.capture.failed("unsupported".to_owned());
+                    pending.fail("unsupported");
                     return Ok(());
                 }
             };
@@ -1738,12 +1742,12 @@ impl NativeRuntime {
                 Ok(epoch) => epoch,
                 Err(error) => {
                     eprintln!("native screen capture worker admission failed: {error}");
-                    pending.capture.failed("render_failed".to_owned());
+                    pending.fail("render_failed");
                     return Ok(());
                 }
             };
             if self.pending_render_worker_capture.is_some() {
-                pending.capture.failed("render_failed".to_owned());
+                pending.fail("render_failed");
                 return Err(io::Error::other(
                     "render worker admitted a second capture continuation",
                 )
@@ -1762,30 +1766,17 @@ impl NativeRuntime {
             resolved_scene,
             &self.server,
             &self.input_state,
-            self.cursor_render_mode,
+            cursor_mode,
+            include_cursor,
         ) {
             Ok(payload) => payload,
             Err(error) => {
                 eprintln!("native screen capture render failed: {error}");
-                pending.capture.failed("render_failed".to_owned());
+                pending.fail("render_failed");
                 return Ok(());
             }
         };
-        let memfd = match create_sealed_memfd(&payload) {
-            Ok(memfd) => memfd,
-            Err(error) => {
-                eprintln!("native screen capture allocation failed: {error}");
-                pending.capture.failed("allocation_failed".to_owned());
-                return Ok(());
-            }
-        };
-        pending.capture.ready(
-            memfd.as_fd(),
-            dimensions.width,
-            dimensions.height,
-            dimensions.stride,
-            RGBA8888_FORMAT,
-        );
+        deliver_screen_capture_payload(pending, &payload, dimensions);
         Ok(())
     }
 

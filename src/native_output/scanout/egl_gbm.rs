@@ -833,6 +833,7 @@ impl NativeEglGbmScanout {
         server: &OwnCompositorServer,
         input_state: &NativeInputState,
         cursor_mode: NativeCursorRenderMode,
+        include_cursor: bool,
     ) -> io::Result<Vec<u8>> {
         let mut frozen_frame = FrozenNativeRenderFrame::freeze(
             self.width,
@@ -860,6 +861,7 @@ impl NativeEglGbmScanout {
                 self.egl_display,
                 request,
                 OutputFramebufferOrigin::BottomLeft,
+                include_cursor,
             )
             .map_err(native_egl_io_error)
     }

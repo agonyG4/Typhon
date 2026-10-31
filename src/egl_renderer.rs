@@ -678,6 +678,7 @@ impl GlesSceneRenderer {
         egl_display: egl::Display,
         mut request: EglSceneDrawRequest<'_>,
         framebuffer_origin: OutputFramebufferOrigin,
+        include_cursor: bool,
     ) -> RendererResult<Vec<u8>> {
         let dimensions = crate::native_output::screen_capture::CaptureDimensions::checked(
             request.width,
@@ -687,8 +688,10 @@ impl GlesSceneRenderer {
         self.effect_runtime.capture_in_progress = true;
 
         request.current_damage = Some(OutputDamage::Full);
-        request.client_cursor = None;
-        request.visual_state.cursor = None;
+        if !include_cursor {
+            request.client_cursor = None;
+            request.visual_state.cursor = None;
+        }
 
         let result = (|| {
             let texture = unsafe { self.gl.create_texture().map_err(io::Error::other)? };

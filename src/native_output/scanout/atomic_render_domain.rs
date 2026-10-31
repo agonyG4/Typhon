@@ -637,6 +637,7 @@ impl AtomicRenderDomain {
             .egl
             .make_current(native_display.display, None, None, Some(context))
             .map_err(native_egl_io_error)?;
+        let include_cursor = frozen_frame.capture_cursor();
         let request = frozen_frame
             .draw_request(None)
             .ok_or_else(|| io::Error::other("frozen capture frame request already consumed"))?;
@@ -648,6 +649,7 @@ impl AtomicRenderDomain {
                 native_display.display,
                 request,
                 OutputFramebufferOrigin::TopLeftScanout,
+                include_cursor,
             )
             .map_err(native_egl_io_error)
     }

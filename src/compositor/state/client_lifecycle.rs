@@ -275,6 +275,7 @@ impl CompositorState {
         client_id: &ClientId,
     ) -> ClientTeardownSummary {
         self.clear_astrea_screen_capture_client(client_id);
+        self.clear_screencopy_client(client_id);
         self.remove_workspace_client(client_id);
         let renderables_before = self.renderable_surfaces.len();
         let surfaces_removed = self.teardown_surfaces_for_client(client_id);

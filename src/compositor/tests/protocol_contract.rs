@@ -20,6 +20,7 @@ fn advertised_global_versions_are_centralized() {
     assert_eq!(versions::ASTREA_TOPLEVEL_MANAGER_V1, 3);
     assert_eq!(versions::ASTREA_SHELL_AUTH_MANAGER_V1, 1);
     assert_eq!(versions::ASTREA_SCREEN_CAPTURE_MANAGER_V1, 1);
+    assert_eq!(versions::ZWLR_SCREENCOPY_MANAGER_V1, 3);
     assert_eq!(versions::EXT_BACKGROUND_EFFECT_MANAGER_V1, 1);
     assert_eq!(versions::ASTREA_BACKGROUND_EFFECT_COVERAGE_MANAGER_V1, 1);
 

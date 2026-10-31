@@ -163,6 +163,7 @@ The target contract is:
 | `xdg_wm_base` | 6 | always |
 | `wl_output` | 4 | always |
 | `zxdg_output_manager_v1` | 3 | always |
+| `zwlr_screencopy_manager_v1` | 3 | always; output capture only, SHM buffers only (no DMA-BUF); XML from `wayland-protocols-wlr` 0.3.12 |
 | `wl_seat` | 11 | always |
 | `wp_cursor_shape_manager_v1` | 2 | cursor-shape input capability |
 | `xwayland_shell_v1` | 1 | registered; visible only to the active private XWayland client |

@@ -10,7 +10,7 @@ use std::{
 use crate::{
     cursor_theme::CursorConfiguration,
     default_state_dir,
-    portal::{PortalRuntime, prepend_data_dir},
+    portal::{DesktopIntegration, PortalRuntime, prepend_data_dir},
     xwayland::XwaylandAppEnvironment,
 };
 
@@ -406,7 +406,13 @@ fn current_portal_runtime() -> PortalRuntime {
 }
 
 fn install_oblivion_portal_runtime() -> io::Result<()> {
-    current_portal_runtime().install()
+    current_portal_runtime().install()?;
+    if let Err(error) = DesktopIntegration::from_environment(default_state_dir())
+        .and_then(|desktop| desktop.install())
+    {
+        eprintln!("oblivion-one: desktop portal integration not installed: {error}");
+    }
+    Ok(())
 }
 
 fn apply_cpu_composition_app_runtime_guards(command: &mut Command) {

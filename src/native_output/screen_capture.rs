@@ -163,6 +163,39 @@ pub(crate) fn create_sealed_memfd(payload: &[u8]) -> io::Result<SealedMemfd> {
     Ok(SealedMemfd(file.into()))
 }
 
+/// Hand one rendered RGBA payload to the protocol that requested it.
+pub(crate) fn deliver_screen_capture_payload(
+    request: oblivion_one::compositor::ScreenCaptureRequest,
+    payload: &[u8],
+    dimensions: CaptureDimensions,
+) {
+    use oblivion_one::compositor::ScreenCaptureRequest;
+    match request {
+        ScreenCaptureRequest::Astrea(pending) => {
+            let memfd = match create_sealed_memfd(payload) {
+                Ok(memfd) => memfd,
+                Err(error) => {
+                    eprintln!("native screen capture allocation failed: {error}");
+                    pending.capture.failed("allocation_failed".to_owned());
+                    return;
+                }
+            };
+            pending.capture.ready(
+                memfd.as_fd(),
+                dimensions.width,
+                dimensions.height,
+                dimensions.stride,
+                RGBA8888_FORMAT,
+            );
+        }
+        ScreenCaptureRequest::Screencopy(pending) => {
+            if let Err(error) = pending.deliver_rgba(payload, dimensions.width, dimensions.height) {
+                eprintln!("native screencopy delivery failed: {error}");
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
