@@ -12,7 +12,13 @@ pub struct WindowPreviewTarget {
     pub max_height: u32,
     /// Set only after the runtime has frozen the selected window's source.
     pub image_size: Option<(u32, u32)>,
+    /// The window's unscaled logical size, reported to v3 clients.
+    pub window_size: Option<(u32, u32)>,
 }
+
+/// Largest preview edge a v3 client may request; older clients keep 1024.
+pub const MAX_WINDOW_PREVIEW_EDGE: u32 = 4096;
+pub const LEGACY_MAX_WINDOW_PREVIEW_EDGE: u32 = 1024;
 
 /// A frame-local, bounded projection of one committed window surface tree.
 #[derive(Debug)]
@@ -20,6 +26,9 @@ pub struct WindowPreviewSource {
     pub root_surface_id: u32,
     pub width: u32,
     pub height: u32,
+    /// Unscaled logical size of the window the image was fitted from.
+    pub window_width: u32,
+    pub window_height: u32,
     pub surfaces: Vec<RenderableSurface>,
     pub scene_node_ids: Vec<SceneNodeId>,
     pub retained_resource: Option<PresentationRetainedVisualPayloadId>,
@@ -40,7 +49,9 @@ impl CompositorState {
         max_width: u32,
         max_height: u32,
     ) -> Result<WindowPreviewSource, &'static str> {
-        if !(1..=1024).contains(&max_width) || !(1..=1024).contains(&max_height) {
+        if !(1..=MAX_WINDOW_PREVIEW_EDGE).contains(&max_width)
+            || !(1..=MAX_WINDOW_PREVIEW_EDGE).contains(&max_height)
+        {
             return Err("invalid_size");
         }
         let window = self.window(window_id).ok_or("window_gone")?;
@@ -55,6 +66,8 @@ impl CompositorState {
                 root_surface_id,
                 width: (width * scale).round().clamp(1.0, f64::from(max_width)) as u32,
                 height: (height * scale).round().clamp(1.0, f64::from(max_height)) as u32,
+                window_width: width.round().max(1.0) as u32,
+                window_height: height.round().max(1.0) as u32,
                 surfaces: Vec::new(),
                 scene_node_ids: Vec::new(),
                 retained_resource: Some(snapshot.resource_payload_id),
@@ -127,6 +140,8 @@ impl CompositorState {
             root_surface_id,
             width: image_width,
             height: image_height,
+            window_width: width as u32,
+            window_height: height as u32,
             surfaces,
             scene_node_ids,
             retained_resource: None,

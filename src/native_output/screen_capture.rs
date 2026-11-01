@@ -5,6 +5,7 @@ use std::{
     io::{self, Write as _},
     os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd},
 };
+use wayland_server::Resource as _;
 
 #[cfg(test)]
 use std::io::{Read as _, Seek as _, SeekFrom};
@@ -179,7 +180,9 @@ pub(crate) fn deliver_screen_capture_payload(
     use oblivion_one::compositor::ScreenCaptureRequest;
     match request {
         ScreenCaptureRequest::Astrea(pending) => {
+            let mut window_size = None;
             let (payload, dimensions) = if let Some(target) = pending.window_preview {
+                window_size = target.window_size;
                 let Some((width, height)) = target.image_size else {
                     pending.capture.failed("render_failed".to_owned());
                     return;
@@ -202,6 +205,11 @@ pub(crate) fn deliver_screen_capture_payload(
                     return;
                 }
             };
+            if let Some((width, height)) = window_size
+                && pending.capture.version() >= 3
+            {
+                pending.capture.window_size(width, height);
+            }
             pending.capture.ready(
                 memfd.as_fd(),
                 dimensions.width,

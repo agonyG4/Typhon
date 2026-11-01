@@ -67,6 +67,7 @@ impl Dispatch<client_astrea_screen_capture_v1::AstreaScreenCaptureV1, ()>
         match event {
             client_astrea_screen_capture_v1::Event::Ready { fd, .. } => drop(fd),
             client_astrea_screen_capture_v1::Event::Failed { reason } => state.failed.push(reason),
+            client_astrea_screen_capture_v1::Event::WindowSize { .. } => {}
         }
     }
 }

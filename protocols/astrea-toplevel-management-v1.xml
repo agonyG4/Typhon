@@ -4,7 +4,7 @@
     Copyright 2026 AstreaOS contributors
   </copyright>
 
-  <interface name="astrea_toplevel_manager_v1" version="4">
+  <interface name="astrea_toplevel_manager_v1" version="5">
     <description summary="authoritative Astrea toplevel list and actions">
       This private protocol publishes compositor-managed application toplevels.
       Version 1 has no window mutation requests. Handle events are grouped into
@@ -14,6 +14,7 @@
       A failed manager is terminal and does not disconnect other managers owned
       by the same client. Version 3 adds trusted shell-owned minimize anchor
       metadata to each exact toplevel handle. Version 4 adds window icons.
+      Version 5 restores minimized windows at a shell-chosen position.
     </description>
 
     <enum name="error">
@@ -84,7 +85,7 @@
     </event>
   </interface>
 
-  <interface name="astrea_toplevel_v1" version="4">
+  <interface name="astrea_toplevel_v1" version="5">
     <description summary="one compositor-managed Astrea toplevel">
       The handle is read-only. Its identifier is the stable decimal Typhon
       WindowId, and its lifetime is independent of the underlying compositor
@@ -167,6 +168,22 @@
     </request>
 
     <request name="clear_minimize_anchor" since="3"/>
+
+    <request name="restore_at" since="5">
+      <description summary="restore a minimized window at a position">
+        Restore the minimized window onto the active workspace with the top
+        left corner of its visible frame at the compositor-global logical
+        position x, y, at its minimized size and without the restore
+        animation: the shell has already presented the window there while it
+        was dragged out of the Dock. Tiled, maximized and fullscreen windows
+        ignore the position and restore normally. Completion is reported as
+        action restore.
+      </description>
+      <arg name="token_hi" type="uint"/>
+      <arg name="token_lo" type="uint"/>
+      <arg name="x" type="int"/>
+      <arg name="y" type="int"/>
+    </request>
 
     <event name="icon_name" since="4">
       <description summary="replace the window icon">

@@ -769,10 +769,12 @@ fn window_preview_keeps_minimized_content_without_restoring_the_window() {
     assert!(state.renderable_surfaces.is_empty());
     let preview = state.window_preview_source(window, 1024, 1024).unwrap();
     assert_eq!((preview.width, preview.height), (300, 200));
+    assert_eq!((preview.window_width, preview.window_height), (300, 200));
     assert_eq!(preview.surfaces[0].buffer_id(), buffer_id);
     assert!(state.window(window).unwrap().state.is_minimized());
     assert!(state.window_preview_source(window, 0, 320).is_err());
-    assert!(state.window_preview_source(window, 1025, 320).is_err());
+    assert!(state.window_preview_source(window, 1025, 320).is_ok());
+    assert!(state.window_preview_source(window, 4097, 320).is_err());
     assert!(
         state
             .window_preview_source(WindowId::from_raw(u64::MAX).unwrap(), 512, 320)

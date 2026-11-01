@@ -4,6 +4,7 @@ use crate::astrea_screen_capture::server::{
 use std::collections::HashMap;
 
 use super::screencopy::ScreencopyPending;
+use super::window_preview::{LEGACY_MAX_WINDOW_PREVIEW_EDGE, MAX_WINDOW_PREVIEW_EDGE};
 use super::*;
 
 #[derive(Debug, Clone)]
@@ -28,11 +29,12 @@ impl ScreenCaptureRequest {
         }
     }
 
-    pub fn set_window_preview_size(&mut self, width: u32, height: u32) {
+    pub fn set_window_preview_size(&mut self, width: u32, height: u32, window: (u32, u32)) {
         if let Self::Astrea(pending) = self
             && let Some(target) = &mut pending.window_preview
         {
             target.image_size = Some((width, height));
+            target.window_size = Some(window);
         }
     }
     pub fn output_id(&self) -> OutputId {
@@ -136,7 +138,12 @@ impl Dispatch<astrea_screen_capture_manager_v1::AstreaScreenCaptureManagerV1, ()
                     );
                     return;
                 }
-                if !(1..=1024).contains(&max_width) || !(1..=1024).contains(&max_height) {
+                let max_edge = if resource.version() >= 3 {
+                    MAX_WINDOW_PREVIEW_EDGE
+                } else {
+                    LEGACY_MAX_WINDOW_PREVIEW_EDGE
+                };
+                if !(1..=max_edge).contains(&max_width) || !(1..=max_edge).contains(&max_height) {
                     capture.failed("invalid_size".to_string());
                     return;
                 }
@@ -167,6 +174,7 @@ impl Dispatch<astrea_screen_capture_manager_v1::AstreaScreenCaptureManagerV1, ()
                             max_width,
                             max_height,
                             image_size: None,
+                            window_size: None,
                         }),
                     },
                 );

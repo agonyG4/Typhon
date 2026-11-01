@@ -155,10 +155,10 @@ The target contract is:
 | `astrea_shell_auth_manager_v1` | 1 | always |
 | `astrea_shortcuts_manager_v1` | 2 | always |
 | `astrea_shell_control_manager_v1` | 1 | always |
-| `astrea_screen_capture_manager_v1` | 1 | authenticated native screenshot capability |
+| `astrea_screen_capture_manager_v1` | 3 | authenticated native screenshot and window preview capability |
 | `astrea_effects_manager_v1` | 1 | qualified native background-effect capability |
 | `astrea_background_effect_coverage_manager_v1` | 1 | qualified native background-effect capability; authenticated Astrea refinement |
-| `astrea_toplevel_manager_v1` | 3 | always |
+| `astrea_toplevel_manager_v1` | 5 | always |
 | `ext_workspace_manager_v1` | 1 | always |
 | `xdg_wm_base` | 6 | always |
 | `wl_output` | 4 | always |

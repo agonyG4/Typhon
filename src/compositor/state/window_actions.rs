@@ -91,4 +91,26 @@ impl CompositorState {
             WindowActionOutcome::Unavailable
         }
     }
+
+    pub(in crate::compositor) fn restore_minimized_desktop_window_at_outcome(
+        &mut self,
+        window_id: WindowId,
+        x: i32,
+        y: i32,
+    ) -> WindowActionOutcome {
+        let Some(window) = self.window(window_id) else {
+            return WindowActionOutcome::Unavailable;
+        };
+        if window.kind != DesktopWindowKind::Managed || !window.is_normal_x11_role() {
+            return WindowActionOutcome::Unavailable;
+        }
+        if !window.state.is_minimized() {
+            return WindowActionOutcome::NoChange;
+        }
+        if self.restore_minimized_desktop_window_at(window_id, x, y) {
+            WindowActionOutcome::Changed
+        } else {
+            WindowActionOutcome::Unavailable
+        }
+    }
 }

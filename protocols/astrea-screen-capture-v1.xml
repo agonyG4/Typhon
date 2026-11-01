@@ -14,7 +14,7 @@
     all copies or substantial portions of the Software.
   </copyright>
 
-  <interface name="astrea_screen_capture_manager_v1" version="2">
+  <interface name="astrea_screen_capture_manager_v1" version="3">
     <description summary="authenticated one-shot compositor screen capture">
       Captures the latest compositor-published, acquire-ready scene for one
       output. The only version 1 format is RGBA8888. Capture has no physical
@@ -40,7 +40,9 @@
         unrelated windows and the cursor, and fits within max_width/max_height
         without upscaling. Limits must be between 1 and 1024. The shell must be
         authenticated on this connection. Ordinary failures include busy,
-        window_gone, invalid_size and render_failed.
+        window_gone, invalid_size and render_failed. Since version 3 the
+        limits may be up to 4096, and the capture sends window_size before
+        ready.
       </description>
       <arg name="capture" type="new_id" interface="astrea_screen_capture_v1"/>
       <arg name="window_id" type="string"/>
@@ -49,7 +51,7 @@
     </request>
   </interface>
 
-  <interface name="astrea_screen_capture_v1" version="1">
+  <interface name="astrea_screen_capture_v1" version="3">
     <description summary="one-shot RGBA8888 screen capture result">
       The fd is a sealed memfd containing exactly stride times height bytes in
       top-left RGBA8888 order. The client owns the received fd after the event.
@@ -65,6 +67,15 @@
 
     <event name="failed">
       <arg name="reason" type="string"/>
+    </event>
+
+    <event name="window_size" since="3">
+      <description summary="logical size of the captured window">
+        Sent once before ready for window captures: the window's visible size
+        in compositor logical pixels, independent of the scaled image size.
+      </description>
+      <arg name="width" type="uint"/>
+      <arg name="height" type="uint"/>
     </event>
 
     <request name="destroy" type="destructor"/>

@@ -10,6 +10,7 @@ fn dispatch_action(
     data: &AstreaToplevelResourceData,
     action: AstreaToplevelAction,
     token: AstreaActionToken,
+    restore_position: Option<(i32, i32)>,
 ) {
     if resource.version() < 2 {
         return;
@@ -83,7 +84,13 @@ fn dispatch_action(
             }
         }
         AstreaToplevelAction::Restore => {
-            match state.restore_minimized_desktop_window_outcome(prepared.window_id) {
+            let outcome = match restore_position {
+                Some((x, y)) => {
+                    state.restore_minimized_desktop_window_at_outcome(prepared.window_id, x, y)
+                }
+                None => state.restore_minimized_desktop_window_outcome(prepared.window_id),
+            };
+            match outcome {
                 WindowActionOutcome::Changed => astrea_toplevel_manager_v1::ActionResult::Accepted,
                 WindowActionOutcome::NoChange => astrea_toplevel_manager_v1::ActionResult::NoChange,
                 WindowActionOutcome::Unavailable => {
@@ -298,6 +305,7 @@ impl Dispatch<astrea_toplevel_v1::AstreaToplevelV1, AstreaToplevelResourceData>
                     data,
                     AstreaToplevelAction::Activate,
                     AstreaActionToken::new(token_hi, token_lo),
+                    None,
                 );
             }
             astrea_toplevel_v1::Request::Minimize { token_hi, token_lo } => {
@@ -308,6 +316,7 @@ impl Dispatch<astrea_toplevel_v1::AstreaToplevelV1, AstreaToplevelResourceData>
                     data,
                     AstreaToplevelAction::Minimize,
                     AstreaActionToken::new(token_hi, token_lo),
+                    None,
                 );
             }
             astrea_toplevel_v1::Request::Restore { token_hi, token_lo } => {
@@ -318,6 +327,26 @@ impl Dispatch<astrea_toplevel_v1::AstreaToplevelV1, AstreaToplevelResourceData>
                     data,
                     AstreaToplevelAction::Restore,
                     AstreaActionToken::new(token_hi, token_lo),
+                    None,
+                );
+            }
+            astrea_toplevel_v1::Request::RestoreAt {
+                token_hi,
+                token_lo,
+                x,
+                y,
+            } => {
+                if resource.version() < 5 {
+                    return;
+                }
+                dispatch_action(
+                    state,
+                    client,
+                    resource,
+                    data,
+                    AstreaToplevelAction::Restore,
+                    AstreaActionToken::new(token_hi, token_lo),
+                    Some((x, y)),
                 );
             }
             astrea_toplevel_v1::Request::Close { token_hi, token_lo } => {
@@ -328,6 +357,7 @@ impl Dispatch<astrea_toplevel_v1::AstreaToplevelV1, AstreaToplevelResourceData>
                     data,
                     AstreaToplevelAction::Close,
                     AstreaActionToken::new(token_hi, token_lo),
+                    None,
                 );
             }
             astrea_toplevel_v1::Request::SetMinimizeAnchor {

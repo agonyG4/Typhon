@@ -3249,3 +3249,96 @@ mod precapture_tests;
 
 #[path = "lifecycle_payload_tests.rs"]
 mod payload_tests;
+
+#[test]
+fn restoring_a_minimized_window_brings_it_to_the_active_workspace() {
+    {
+        let (mut state, window_id) = ssd_test_state(431);
+        assert!(state.minimize_desktop_window(window_id));
+        let workspace_two = crate::wm::WorkspaceId::new(2).unwrap();
+        assert!(matches!(
+            state.activate_workspace(workspace_two),
+            crate::wm::WorkspaceSwitchOutcome::Changed { .. }
+        ));
+
+        assert!(state.restore_minimized_desktop_window(window_id));
+
+        assert_eq!(state.active_workspace(), workspace_two);
+        assert_eq!(
+            state
+                .window(window_id)
+                .and_then(|window| window.management)
+                .map(|management| management.location()),
+            Some(crate::wm::WorkspaceLocation::Regular(workspace_two))
+        );
+        assert!(state.window_is_visible_in_active_scene(window_id));
+        assert!(
+            !state
+                .window(window_id)
+                .expect("restored window")
+                .state
+                .is_minimized()
+        );
+    }
+}
+
+#[test]
+fn restore_at_places_the_visible_frame_at_the_drop_point_without_lifecycle() {
+    let (mut state, window_id) = ssd_test_state(433);
+    assert!(state.set_output_size(1600, 900));
+    state
+        .set_animation_configuration(crate::animation_control::AnimationConfiguration {
+            enabled: false,
+            ..crate::animation_control::AnimationConfiguration::default()
+        })
+        .expect("disable lifecycle effects before minimizing fixture");
+    assert!(state.minimize_desktop_window(window_id));
+    let mut configuration = crate::animation_control::AnimationConfiguration {
+        enabled: true,
+        ..crate::animation_control::AnimationConfiguration::default()
+    };
+    configuration.overrides.insert(
+        crate::animation_control::AnimationSlot::WindowRestore,
+        crate::animation_control::AnimationEffect::MinimizeLamp,
+    );
+    state.lifecycle_animation_renderer_available = Some(true);
+    state
+        .set_animation_configuration(configuration)
+        .expect("enable the restore effect");
+    let scene_node_id = state
+        .scene_node_id_for_window_group(window_id)
+        .expect("window group node");
+
+    assert_eq!(
+        state.restore_minimized_desktop_window_at_outcome(window_id, 240, 180),
+        WindowActionOutcome::Changed
+    );
+
+    assert!(
+        !state
+            .window(window_id)
+            .expect("restored window")
+            .state
+            .is_minimized()
+    );
+    assert_eq!(
+        state.presentation_animator.active_retained_visual(
+            scene_node_id,
+            PresentationRetainedVisualKind::WindowLifecycle,
+        ),
+        None,
+        "a window dropped from the Dock appears in place, without the lamp"
+    );
+    let geometry = state
+        .current_visual_root_window_geometry(433)
+        .or_else(|| state.current_root_window_geometry(433))
+        .expect("restored geometry");
+    let visual = state
+        .presentation_rect_for_geometry(433, geometry)
+        .expect("restored visual rect");
+    assert_eq!((visual.x().round(), visual.y().round()), (240.0, 180.0));
+    assert_eq!(
+        state.restore_minimized_desktop_window_at_outcome(window_id, 0, 0),
+        WindowActionOutcome::NoChange
+    );
+}

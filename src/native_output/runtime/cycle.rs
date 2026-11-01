@@ -1724,7 +1724,11 @@ impl NativeRuntime {
                     return Ok(());
                 }
             };
-            pending.set_window_preview_size(source.width, source.height);
+            pending.set_window_preview_size(
+                source.width,
+                source.height,
+                (source.window_width, source.window_height),
+            );
             dimensions = CaptureDimensions::checked(source.width, source.height)?;
             ResolvedNativeFrameScene::for_window_preview(&self.server, source)
         } else {

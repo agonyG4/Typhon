@@ -386,6 +386,7 @@ impl CompositorState {
         window_id: WindowId,
         reason: WindowFocusReason,
     ) -> WindowActivationOutcome {
+        self.bring_minimized_window_to_active_workspace(window_id);
         let Some(target_location) = self
             .window(window_id)
             .and_then(|window| window.management.map(|management| management.location()))
@@ -2443,11 +2444,94 @@ impl CompositorState {
         }
     }
 
+    /// Like macOS, a minimized window comes back where the user is now, not
+    /// on the workspace it was minimized from: its family moves onto the
+    /// active workspace before the restore animation plays there.
+    fn bring_minimized_window_to_active_workspace(&mut self, window_id: WindowId) {
+        let Some(window) = self.window(window_id) else {
+            return;
+        };
+        if !window.state.is_minimized() {
+            return;
+        }
+        let Some(WorkspaceLocation::Regular(workspace)) =
+            window.management.map(|management| management.location())
+        else {
+            return;
+        };
+        let active = self.active_workspace();
+        if workspace != active {
+            let _ = self.move_window_family_to_workspace(window_id, active);
+        }
+    }
+
+    /// Restores a minimized floating window without the restore animation,
+    /// with the top left of its visible frame at the logical point `(x, y)`,
+    /// as if it had been dragged out of the Dock and dropped there. Windows
+    /// that cannot be placed freely restore normally.
+    pub(in crate::compositor) fn restore_minimized_desktop_window_at(
+        &mut self,
+        window_id: WindowId,
+        x: i32,
+        y: i32,
+    ) -> bool {
+        let placeable = self.window(window_id).is_some_and(|window| {
+            window.state.is_minimized()
+                && matches!(window.backend, WindowBackend::Xdg(_))
+                && window.state.mode() == ToplevelMode::Normal
+                && window
+                    .management
+                    .is_some_and(|management| management.layout() == LayoutMembership::Floating)
+        }) && !self.window_has_active_lifecycle(window_id);
+        if !placeable {
+            return self.restore_minimized_desktop_window(window_id);
+        }
+        if !self.restore_minimized_desktop_window_contents_with_effect(window_id, None, false) {
+            return false;
+        }
+        if let Some(root_surface_id) = self.window(window_id).map(|window| window.root_surface_id)
+            && let Some(geometry) = self
+                .current_visual_root_window_geometry(root_surface_id)
+                .or_else(|| self.current_root_window_geometry(root_surface_id))
+            && let Some(visual) = self.presentation_rect_for_geometry(root_surface_id, geometry)
+        {
+            let dx = x - visual.x().round() as i32;
+            let dy = y - visual.y().round() as i32;
+            if dx != 0 || dy != 0 {
+                let _ = self.set_surface_placement_with_cause(
+                    root_surface_id,
+                    SurfacePlacement {
+                        local_x: geometry.placement.local_x + dx,
+                        local_y: geometry.placement.local_y + dy,
+                        ..geometry.placement
+                    },
+                    RenderGenerationCause::WindowMove,
+                );
+            }
+        }
+        let _ = self.focus_desktop_window(window_id, WindowFocusReason::Restore);
+        true
+    }
+
     fn restore_minimized_desktop_window_contents(
         &mut self,
         window_id: WindowId,
         resolved_xwayland_source: Option<PendingXwaylandRestoreSource>,
     ) -> bool {
+        self.restore_minimized_desktop_window_contents_with_effect(
+            window_id,
+            resolved_xwayland_source,
+            true,
+        )
+    }
+
+    fn restore_minimized_desktop_window_contents_with_effect(
+        &mut self,
+        window_id: WindowId,
+        resolved_xwayland_source: Option<PendingXwaylandRestoreSource>,
+        animate: bool,
+    ) -> bool {
+        self.bring_minimized_window_to_active_workspace(window_id);
         let Some((root_surface_id, x11_surface_id)) = self
             .window(window_id)
             .map(|window| (window.root_surface_id, window.x11_surface_id))
@@ -2629,8 +2713,11 @@ impl CompositorState {
                 )
             })
             .is_some();
-        let restore_effect =
-            self.lifecycle_effect_kind_for_window(window_id, LifecycleDirection::Restore);
+        let restore_effect = if animate {
+            self.lifecycle_effect_kind_for_window(window_id, LifecycleDirection::Restore)
+        } else {
+            None
+        };
         let settled_visual_snapshot = (!has_active_lifecycle && restore_effect.is_some())
             .then_some(minimized_visual_snapshot)
             .flatten();
@@ -2743,14 +2830,16 @@ impl CompositorState {
                 visual_group,
             );
         }
-        self.begin_lifecycle_restore_with_source(
-            window_id,
-            root_surface_id,
-            lifecycle_visual_group,
-            lifecycle_effect_scene,
-            lifecycle_decorations,
-            settled_visual_snapshot.map(|snapshot| snapshot.resource_payload_id),
-        );
+        if animate {
+            self.begin_lifecycle_restore_with_source(
+                window_id,
+                root_surface_id,
+                lifecycle_visual_group,
+                lifecycle_effect_scene,
+                lifecycle_decorations,
+                settled_visual_snapshot.map(|snapshot| snapshot.resource_payload_id),
+            );
+        }
         let lifecycle_diagnostics_enabled = self.lifecycle_diagnostics_enabled();
         if let Some(window) = self.window_mut(window_id) {
             window.state.clear_minimized_lifecycle_target();
