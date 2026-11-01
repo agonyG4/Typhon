@@ -69,6 +69,9 @@ pub(crate) struct SceneRenderState {
     pub(in crate::egl_renderer) frame_stats: GlesSceneFrameStats,
     pub(in crate::egl_renderer) capture_unattenuated_visual_group: Option<VisualGroupId>,
     pub(in crate::egl_renderer) capture_unclipped_presentation_owner: Option<u32>,
+    /// A window preview is composited onto transparency, not the opaque black
+    /// output background, so translucent windows keep their alpha.
+    pub(in crate::egl_renderer) clear_transparent: bool,
 }
 
 /// Read-only scene texture lookup view. Resource ownership stays with the
@@ -118,6 +121,7 @@ pub(in crate::egl_renderer) struct SceneCaptureSnapshot {
     active_output_texture: Option<glow::Texture>,
     capture_unattenuated_visual_group: Option<VisualGroupId>,
     capture_unclipped_presentation_owner: Option<u32>,
+    clear_transparent: bool,
 }
 
 impl SceneCaptureSnapshot {
@@ -136,6 +140,7 @@ impl SceneCaptureSnapshot {
             active_output_texture: scene.active_output_texture,
             capture_unattenuated_visual_group: scene.capture_unattenuated_visual_group,
             capture_unclipped_presentation_owner: scene.capture_unclipped_presentation_owner,
+            clear_transparent: scene.clear_transparent,
         }
     }
 
@@ -152,6 +157,7 @@ impl SceneCaptureSnapshot {
         scene.active_output_texture = self.active_output_texture;
         scene.capture_unattenuated_visual_group = self.capture_unattenuated_visual_group;
         scene.capture_unclipped_presentation_owner = self.capture_unclipped_presentation_owner;
+        scene.clear_transparent = self.clear_transparent;
     }
 }
 
@@ -199,7 +205,8 @@ impl SceneRenderState {
         framebuffer_origin: OutputFramebufferOrigin,
     ) -> RendererResult<Vec<OutputRect>> {
         self.establish_scene_state_for_framebuffer(gl, self.active_output_framebuffer);
-        unsafe { gl.clear_color(0.0, 0.0, 0.0, 1.0) };
+        let clear_alpha = if self.clear_transparent { 0.0 } else { 1.0 };
+        unsafe { gl.clear_color(0.0, 0.0, 0.0, clear_alpha) };
         let execution = plan
             .render_execution(self.current_size.0, self.current_size.1, framebuffer_origin)
             .ok_or_else(|| io::Error::other("effect repaint conversion failed"))?;
@@ -240,8 +247,9 @@ impl SceneRenderState {
         composition_draw: EffectFramebufferTarget,
     ) -> RendererResult<()> {
         self.establish_scene_state_for_framebuffer(gl, composition_draw.framebuffer);
+        let clear_alpha = if self.clear_transparent { 0.0 } else { 1.0 };
         unsafe {
-            gl.clear_color(0.0, 0.0, 0.0, 1.0);
+            gl.clear_color(0.0, 0.0, 0.0, clear_alpha);
             gl.enable(glow::SCISSOR_TEST);
             for rect in rects {
                 let y = match framebuffer_origin {
@@ -420,16 +428,19 @@ impl SceneRenderState {
         self.vertices.reserve((1 + surfaces.len()) * 6);
         self.commands.reserve(1 + surfaces.len());
 
-        push_output_background_command(
-            &mut self.vertices,
-            &mut self.commands,
-            width,
-            height,
-            framebuffer_origin,
-        );
-        // Opacities are indexed by command, so the background needs its own
-        // entry; without it every command read its successor's opacity.
-        self.presentation_opacities.push(1.0);
+        // A window preview has no output background behind the window.
+        if !self.clear_transparent {
+            push_output_background_command(
+                &mut self.vertices,
+                &mut self.commands,
+                width,
+                height,
+                framebuffer_origin,
+            );
+            // Opacities are indexed by command, so the background needs its own
+            // entry; without it every command read its successor's opacity.
+            self.presentation_opacities.push(1.0);
+        }
 
         let render_assignments =
             compositor::surface_render_space_assignments(surfaces, output_scale);

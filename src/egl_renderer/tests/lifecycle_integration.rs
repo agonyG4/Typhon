@@ -260,12 +260,13 @@ fn egl_lifecycle_lamp_below_canonical_opaque_window_respects_painter_order() {
             for x in 0..width {
                 let actual = (y * width + x) * 4;
                 let expected = ((height - 1 - y) * width + x) * 4;
+                // Alpha included: a translucent window's retained snapshot
+                // must not be flattened onto black.
                 assert_eq!(
-                    &image[actual..actual + 3],
-                    &retained_pixels_before[expected..expected + 3],
+                    &image[actual..actual + 4],
+                    &retained_pixels_before[expected..expected + 4],
                     "cached window pixel at ({x},{y}) must survive capture"
                 );
-                assert_eq!(image[actual + 3], 255);
             }
         }
         preview_images.push(image);
@@ -302,7 +303,7 @@ fn egl_lifecycle_lamp_below_canonical_opaque_window_respects_painter_order() {
         crate::native_output::NativeCursorRenderMode::Hardware,
         Some(OutputDamage::Full),
     );
-    harness
+    let live_preview = harness
         .renderer
         .capture_scene(
             &harness.egl,
@@ -312,6 +313,13 @@ fn egl_lifecycle_lamp_below_canonical_opaque_window_respects_painter_order() {
             false,
         )
         .expect("live window preview capture");
+    // Nothing was drawn, so the preview must be transparent rather than the
+    // output's opaque black: translucent windows would otherwise turn black.
+    assert!(
+        live_preview.chunks_exact(4).all(|pixel| pixel == [0, 0, 0, 0]),
+        "a window preview is composited onto transparency: {:?}",
+        &live_preview[..16]
+    );
     assert_eq!(
         harness.renderer.lifecycle.resolved_visual_resource_count(),
         resource_count,

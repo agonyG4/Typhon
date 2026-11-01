@@ -419,6 +419,7 @@ impl GlesSceneRenderer {
                 frame_stats: GlesSceneFrameStats::default(),
                 capture_unattenuated_visual_group: None,
                 capture_unclipped_presentation_owner: None,
+                clear_transparent: false,
             },
             lifecycle,
             cursor_image,
@@ -687,6 +688,8 @@ impl GlesSceneRenderer {
         let snapshot = CaptureRendererState::take(self);
         self.effect_runtime.capture_in_progress = true;
         self.lifecycle.begin_capture();
+        let preserve_alpha = request.window_preview.is_some();
+        self.scene_state.clear_transparent = preserve_alpha;
 
         request.current_damage = Some(OutputDamage::Full);
         if !include_cursor {
@@ -787,7 +790,12 @@ impl GlesSceneRenderer {
                         image.height,
                         framebuffer_origin,
                     )?;
-                    return self.read_capture_pixels(framebuffer, dimensions, framebuffer_origin);
+                    return self.read_capture_pixels(
+                        framebuffer,
+                        dimensions,
+                        framebuffer_origin,
+                        preserve_alpha,
+                    );
                 }
                 self.draw_scene_to_target(
                     egl,
@@ -817,7 +825,12 @@ impl GlesSceneRenderer {
                             )
                             .into());
                         }
-                        self.read_capture_pixels(framebuffer, dimensions, framebuffer_origin)
+                        self.read_capture_pixels(
+                            framebuffer,
+                            dimensions,
+                            framebuffer_origin,
+                            preserve_alpha,
+                        )
                     }
                     EglFrameOutcome::Skipped { .. } => {
                         Err(io::Error::other("screenshot scene render produced no frame").into())
@@ -858,6 +871,7 @@ impl GlesSceneRenderer {
         framebuffer: glow::Framebuffer,
         dimensions: crate::native_output::screen_capture::CaptureDimensions,
         origin: OutputFramebufferOrigin,
+        preserve_alpha: bool,
     ) -> RendererResult<Vec<u8>> {
         let mut pixels = vec![0_u8; dimensions.payload_len];
         unsafe {
@@ -880,6 +894,7 @@ impl GlesSceneRenderer {
             dimensions.width,
             dimensions.height,
             origin,
+            preserve_alpha,
         )
         .map_err(Into::into)
     }

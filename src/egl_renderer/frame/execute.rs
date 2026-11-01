@@ -944,7 +944,8 @@ impl FramePipeline<'_> {
     ) -> RendererResult<()> {
         self.scene
             .establish_scene_state_for_framebuffer(self.gl, self.scene.active_output_framebuffer);
-        unsafe { self.gl.clear_color(0.0, 0.0, 0.0, 1.0) };
+        let clear_alpha = if self.scene.clear_transparent { 0.0 } else { 1.0 };
+        unsafe { self.gl.clear_color(0.0, 0.0, 0.0, clear_alpha) };
 
         let execution = plan
             .render_execution(

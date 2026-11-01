@@ -57,6 +57,7 @@ pub(crate) fn normalize_rgba_readback(
     width: u32,
     height: u32,
     origin: OutputFramebufferOrigin,
+    preserve_alpha: bool,
 ) -> io::Result<Vec<u8>> {
     let dimensions = CaptureDimensions::checked(width, height)?;
     if readback.len() != dimensions.payload_len {
@@ -82,8 +83,13 @@ pub(crate) fn normalize_rgba_readback(
         let source = &readback[source_row * row_len..(source_row + 1) * row_len];
         let destination = &mut normalized[displayed_row * row_len..(displayed_row + 1) * row_len];
         destination.copy_from_slice(source);
-        for alpha in destination.chunks_exact_mut(4).map(|pixel| &mut pixel[3]) {
-            *alpha = 0xff;
+        // Output captures are opaque by definition. A window preview keeps the
+        // window's own premultiplied alpha so translucent windows stay
+        // translucent instead of collapsing onto black.
+        if !preserve_alpha {
+            for alpha in destination.chunks_exact_mut(4).map(|pixel| &mut pixel[3]) {
+                *alpha = 0xff;
+            }
         }
     }
     Ok(normalized)
@@ -276,14 +282,32 @@ mod tests {
         let top_left = bottom_left.clone();
 
         assert_eq!(
-            normalize_rgba_readback(bottom_left, 1, 2, OutputFramebufferOrigin::BottomLeft)
-                .unwrap(),
+            normalize_rgba_readback(
+                bottom_left.clone(),
+                1,
+                2,
+                OutputFramebufferOrigin::BottomLeft,
+                false
+            )
+            .unwrap(),
             vec![4, 5, 6, 255, 1, 2, 3, 255]
         );
         assert_eq!(
-            normalize_rgba_readback(top_left, 1, 2, OutputFramebufferOrigin::TopLeftScanout)
-                .unwrap(),
+            normalize_rgba_readback(
+                top_left.clone(),
+                1,
+                2,
+                OutputFramebufferOrigin::TopLeftScanout,
+                false
+            )
+            .unwrap(),
             vec![1, 2, 3, 255, 4, 5, 6, 255]
+        );
+        assert_eq!(
+            normalize_rgba_readback(bottom_left, 1, 2, OutputFramebufferOrigin::BottomLeft, true)
+                .unwrap(),
+            vec![4, 5, 6, 7, 1, 2, 3, 0],
+            "window previews keep their translucency"
         );
     }
 
