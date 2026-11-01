@@ -281,6 +281,50 @@ fn egl_lifecycle_lamp_below_canonical_opaque_window_respects_painter_order() {
             .all(|(&a, &b)| a.abs_diff(b) <= 1),
         "preview orientation must be independent of scanout origin"
     );
+    // A live window preview renders a private scene without lifecycle samples.
+    // It must not retire the output's in-flight lamp capture or minimized
+    // snapshots, or the dock cancels the minimize animation it anchors.
+    let mut live_preview_scene =
+        crate::native_output::ResolvedNativeFrameScene::for_synchronous_output_reconfiguration(
+            &server,
+        );
+    live_preview_scene.window_preview = Some(compositor::WindowPreviewImage {
+        width: 64,
+        height: 40,
+        retained_resource: None,
+    });
+    let request = frame_renderer.egl_scene_draw_request(
+        320,
+        200,
+        &live_preview_scene,
+        &server,
+        &input_state,
+        crate::native_output::NativeCursorRenderMode::Hardware,
+        Some(OutputDamage::Full),
+    );
+    harness
+        .renderer
+        .capture_scene(
+            &harness.egl,
+            harness.display,
+            request,
+            OutputFramebufferOrigin::BottomLeft,
+            false,
+        )
+        .expect("live window preview capture");
+    assert_eq!(
+        harness.renderer.lifecycle.resolved_visual_resource_count(),
+        resource_count,
+        "a live window preview must keep lifecycle resources resident"
+    );
+    assert!(
+        harness
+            .renderer
+            .lifecycle
+            .resolved_visual_texture(payload_id)
+            .is_some(),
+        "the retained minimized visual must survive a live window preview"
+    );
     let canonical_surfaces = resolved.surfaces.as_ref().to_vec();
     let retained_lifecycle = resolved.lifecycle.clone();
     let retained_surfaces = resolved.lifecycle_surfaces.clone();

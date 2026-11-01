@@ -147,6 +147,8 @@ impl LifecycleCaptureFrameSnapshot {
 
 pub(in crate::egl_renderer) struct LifecycleCaptureSnapshot {
     pub(super) frame: LifecycleCaptureFrameSnapshot,
+    pub(super) minimized_snapshot_payloads:
+        std::collections::HashSet<compositor::PresentationRetainedVisualPayloadId>,
     pub(super) visual_sources: HashMap<
         oblivion_one::presentation_animation::PresentationRetainedVisualIdentity,
         LifecycleVisualSource,

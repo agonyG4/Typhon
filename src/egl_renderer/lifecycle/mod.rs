@@ -122,13 +122,21 @@ impl LifecycleRenderState {
     pub(super) fn capture_snapshot(&self) -> LifecycleCaptureSnapshot {
         LifecycleCaptureSnapshot {
             frame: LifecycleCaptureFrameSnapshot::take(&self.frame),
+            minimized_snapshot_payloads: self.visual_store.minimized_snapshot_payloads.clone(),
             visual_sources: self.visual_store.visual_sources.clone(),
         }
     }
 
+    /// Holds every resolved lifecycle resource until `restore_capture_snapshot`.
+    pub(super) fn begin_capture(&mut self) {
+        self.visual_store.capture_in_progress = true;
+    }
+
     pub(super) fn restore_capture_snapshot(&mut self, snapshot: LifecycleCaptureSnapshot) {
         snapshot.frame.restore(&mut self.frame);
+        self.visual_store.minimized_snapshot_payloads = snapshot.minimized_snapshot_payloads;
         self.visual_store.visual_sources = snapshot.visual_sources;
+        self.visual_store.capture_in_progress = false;
     }
 
     #[allow(dead_code, reason = "Reserved for alternate runtime paths")]

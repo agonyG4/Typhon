@@ -176,7 +176,12 @@ pub(super) struct LifecycleVisualStore {
     pub(super) resolved_visual_resources:
         HashMap<compositor::PresentationRetainedVisualPayloadId, LifecycleResolvedVisualResource>,
     captured_payloads: HashSet<compositor::PresentationRetainedVisualPayloadId>,
-    minimized_snapshot_payloads: HashSet<compositor::PresentationRetainedVisualPayloadId>,
+    pub(super) minimized_snapshot_payloads:
+        HashSet<compositor::PresentationRetainedVisualPayloadId>,
+    /// Offscreen captures render private scenes (a dock window preview has no
+    /// lifecycle samples), so they must never retire the output's live
+    /// animation captures or retained minimized snapshots.
+    pub(super) capture_in_progress: bool,
     pub(super) visual_sources: HashMap<
         oblivion_one::presentation_animation::PresentationRetainedVisualIdentity,
         LifecycleVisualSource,
@@ -350,6 +355,9 @@ impl LifecycleVisualStore {
     }
 
     pub(super) fn release_stale(&mut self, runtime: &mut EffectRuntime) {
+        if self.capture_in_progress {
+            return;
+        }
         let live_payload_ids = self
             .visual_sources
             .values()

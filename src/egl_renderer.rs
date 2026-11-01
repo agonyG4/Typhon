@@ -686,6 +686,7 @@ impl GlesSceneRenderer {
         )?;
         let snapshot = CaptureRendererState::take(self);
         self.effect_runtime.capture_in_progress = true;
+        self.lifecycle.begin_capture();
 
         request.current_damage = Some(OutputDamage::Full);
         if !include_cursor {
