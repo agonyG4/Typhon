@@ -599,6 +599,110 @@ fn implicit_pointer_grab_keeps_focus_and_button_state_outside_surface_until_rele
 }
 
 #[test]
+fn held_surface_keeps_the_implicit_grab_across_its_own_input_region_commits() {
+    // A Dock tile dragged out of the Dock: the pressed surface keeps
+    // committing while the button is held and must keep motion and release.
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let stream = UnixStream::connect(&socket_path).unwrap();
+    let connection = Connection::from_socket(stream).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let seat: client_wl_seat::WlSeat = globals.bind(&qh, 1..=7, ()).unwrap();
+    let _pointer = seat.get_pointer(&qh, ());
+    let (surface, _xdg_surface, _toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 400, 300).unwrap();
+    surface.commit();
+    connection.flush().unwrap();
+
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state).unwrap();
+    let pressed_surface_id = surface.id().protocol_id();
+    commands
+        .send(ServerCommand::PointerMotion {
+            x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 200.0,
+            y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 150.0,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    commands
+        .send(ServerCommand::PointerButton {
+            button: 272,
+            pressed: true,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    assert_eq!(state.pointer_enter_surface_id, Some(pressed_surface_id));
+
+    // Drag out of the surface, then have it commit a new input region, as
+    // the Dock does on every step of a tile drag.
+    commands
+        .send(ServerCommand::PointerMotion {
+            x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 600.0,
+            y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 140.0,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    let region = compositor.create_region(&qh, ());
+    region.add(0, 0, 200, 150);
+    surface.set_input_region(Some(&region));
+    surface.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    commands
+        .send(ServerCommand::PointerMotion {
+            x: f64::from(render::FIRST_SURFACE_OFFSET.0) + 610.0,
+            y: f64::from(render::FIRST_SURFACE_OFFSET.1) + 140.0,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+
+    assert_eq!(
+        state.pointer_leave_count, 0,
+        "the held surface lost the pointer: {:?}",
+        state.pointer_event_log
+    );
+    assert_eq!(state.pointer_enter_surface_id, Some(pressed_surface_id));
+    assert_eq!(state.pointer_surface_x, Some(610.0));
+
+    commands
+        .send(ServerCommand::PointerButton {
+            button: 272,
+            pressed: false,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    commands.send(ServerCommand::Stop).unwrap();
+    server_thread.join().unwrap();
+
+    let release_index = state
+        .pointer_event_log
+        .iter()
+        .position(|event| *event == "button_released")
+        .expect("the release reaches the pressed surface");
+    assert!(
+        state.pointer_event_log[..release_index]
+            .iter()
+            .all(|event| *event != "leave"),
+        "{:?}",
+        state.pointer_event_log
+    );
+}
+
+#[test]
 fn implicit_pointer_grab_ends_only_after_last_button_release() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();

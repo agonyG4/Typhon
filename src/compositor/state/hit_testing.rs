@@ -1386,6 +1386,18 @@ impl CompositorState {
             }
             return;
         }
+        // While a button is held the pressed surface owns the pointer, even
+        // outside its bounds: a commit or scene change mid-drag must not send
+        // it a leave, or the client drops the rest of the drag and its release.
+        // The grab's end refreshes focus once the last button is up. A popup
+        // grab opened by the press still takes the pointer, as before.
+        if self.topmost_popup_grab_surface_id().is_none()
+            && self
+                .implicit_pointer_grab_surface("surface-destroyed")
+                .is_some()
+        {
+            return;
+        }
 
         let scene_hit = self.pointer_scene_hit_at(self.last_pointer_x, self.last_pointer_y);
         if !self.pointer_scene_hit_allowed_by_popup_grab(&scene_hit) {
