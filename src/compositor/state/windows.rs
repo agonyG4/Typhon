@@ -2486,6 +2486,17 @@ impl CompositorState {
         if !placeable {
             return self.restore_minimized_desktop_window(window_id);
         }
+        // The shell sized its ghost from the minimized snapshot, whose rect is
+        // the visible frame including server-side decorations. Without one,
+        // the preview was the bare surface tree, matching the client rect.
+        let frame_origin = self.window(window_id).and_then(|window| {
+            window.state.minimized_visual_snapshot().map(|snapshot| {
+                (
+                    snapshot.source_visual_rect.x(),
+                    snapshot.source_visual_rect.y(),
+                )
+            })
+        });
         if !self.restore_minimized_desktop_window_contents_with_effect(window_id, None, false) {
             return false;
         }
@@ -2493,10 +2504,13 @@ impl CompositorState {
             && let Some(geometry) = self
                 .current_visual_root_window_geometry(root_surface_id)
                 .or_else(|| self.current_root_window_geometry(root_surface_id))
-            && let Some(visual) = self.presentation_rect_for_geometry(root_surface_id, geometry)
+            && let Some((frame_x, frame_y)) = frame_origin.or_else(|| {
+                self.presentation_rect_for_geometry(root_surface_id, geometry)
+                    .map(|visual| (visual.x(), visual.y()))
+            })
         {
-            let dx = x - visual.x().round() as i32;
-            let dy = y - visual.y().round() as i32;
+            let dx = x - frame_x.round() as i32;
+            let dy = y - frame_y.round() as i32;
             if dx != 0 || dy != 0 {
                 let _ = self.set_surface_placement_with_cause(
                     root_surface_id,

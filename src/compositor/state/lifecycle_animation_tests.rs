@@ -3342,3 +3342,64 @@ fn restore_at_places_the_visible_frame_at_the_drop_point_without_lifecycle() {
         WindowActionOutcome::NoChange
     );
 }
+
+#[test]
+fn restore_at_places_the_decorated_frame_captured_by_the_minimize_snapshot() {
+    let (mut state, window_id) = ssd_test_state(435);
+    assert!(state.set_output_size(1600, 900));
+    let mut configuration = crate::animation_control::AnimationConfiguration {
+        enabled: true,
+        ..crate::animation_control::AnimationConfiguration::default()
+    };
+    configuration.overrides.insert(
+        crate::animation_control::AnimationSlot::WindowMinimize,
+        crate::animation_control::AnimationEffect::MinimizeLamp,
+    );
+    state.lifecycle_animation_renderer_available = Some(true);
+    state
+        .set_animation_configuration(configuration)
+        .expect("enable the minimize effect");
+    let client_before = {
+        let geometry = state
+            .current_visual_root_window_geometry(435)
+            .or_else(|| state.current_root_window_geometry(435))
+            .expect("mapped geometry");
+        state
+            .presentation_rect_for_geometry(435, geometry)
+            .expect("mapped visual rect")
+    };
+    assert!(state.minimize_desktop_window(window_id));
+    settle_lifecycle_transition(&mut state, window_id);
+    let frame = state
+        .window(window_id)
+        .and_then(|window| window.state.minimized_visual_snapshot())
+        .map(|snapshot| snapshot.source_visual_rect)
+        .expect("settled minimize keeps the decorated frame snapshot");
+    let preview = state.window_preview_source(window_id, 4096, 4096).unwrap();
+    assert_eq!(
+        (
+            f64::from(preview.window_width),
+            f64::from(preview.window_height)
+        ),
+        (frame.width(), frame.height())
+    );
+    let titlebar = client_before.y() - frame.y();
+    assert!(titlebar > 0.0, "the SSD frame extends above the client");
+
+    assert_eq!(
+        state.restore_minimized_desktop_window_at_outcome(window_id, 240, 180),
+        WindowActionOutcome::Changed
+    );
+
+    let geometry = state
+        .current_visual_root_window_geometry(435)
+        .or_else(|| state.current_root_window_geometry(435))
+        .expect("restored geometry");
+    let client = state
+        .presentation_rect_for_geometry(435, geometry)
+        .expect("restored visual rect");
+    assert_eq!(
+        (client.x().round(), client.y().round()),
+        (240.0 + client_before.x() - frame.x(), 180.0 + titlebar)
+    );
+}
