@@ -345,7 +345,6 @@ impl LifecycleRenderState {
         self.visual_store.is_ready(payload_id, runtime)
     }
 
-    #[cfg(test)]
     pub(super) fn resolved_visual_texture(
         &self,
         payload_id: compositor::PresentationRetainedVisualPayloadId,

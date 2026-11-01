@@ -776,6 +776,18 @@ impl GlesSceneRenderer {
             })();
 
             let draw_result = setup_result.and_then(|()| {
+                if let Some(image) = request.window_preview
+                    && let Some(payload_id) = image.retained_resource
+                {
+                    self.blit_retained_window_preview(
+                        framebuffer,
+                        payload_id,
+                        image.width,
+                        image.height,
+                        framebuffer_origin,
+                    )?;
+                    return self.read_capture_pixels(framebuffer, dimensions, framebuffer_origin);
+                }
                 self.draw_scene_to_target(
                     egl,
                     egl_display,
@@ -804,29 +816,7 @@ impl GlesSceneRenderer {
                             )
                             .into());
                         }
-                        let mut readback = vec![0_u8; dimensions.payload_len];
-                        unsafe {
-                            self.gl
-                                .bind_framebuffer(glow::FRAMEBUFFER, Some(framebuffer));
-                            self.gl.pixel_store_i32(glow::PACK_ALIGNMENT, 1);
-                            self.gl.flush();
-                            self.gl.read_pixels(
-                                0,
-                                0,
-                                dimensions.width as i32,
-                                dimensions.height as i32,
-                                glow::RGBA,
-                                glow::UNSIGNED_BYTE,
-                                glow::PixelPackData::Slice(Some(&mut readback)),
-                            );
-                        }
-                        crate::native_output::screen_capture::normalize_rgba_readback(
-                            readback,
-                            dimensions.width,
-                            dimensions.height,
-                            framebuffer_origin,
-                        )
-                        .map_err(Into::into)
+                        self.read_capture_pixels(framebuffer, dimensions, framebuffer_origin)
                     }
                     EglFrameOutcome::Skipped { .. } => {
                         Err(io::Error::other("screenshot scene render produced no frame").into())
@@ -859,6 +849,119 @@ impl GlesSceneRenderer {
         })();
 
         snapshot.restore(self);
+        result
+    }
+
+    fn read_capture_pixels(
+        &self,
+        framebuffer: glow::Framebuffer,
+        dimensions: crate::native_output::screen_capture::CaptureDimensions,
+        origin: OutputFramebufferOrigin,
+    ) -> RendererResult<Vec<u8>> {
+        let mut pixels = vec![0_u8; dimensions.payload_len];
+        unsafe {
+            self.gl
+                .bind_framebuffer(glow::FRAMEBUFFER, Some(framebuffer));
+            self.gl.pixel_store_i32(glow::PACK_ALIGNMENT, 1);
+            self.gl.flush();
+            self.gl.read_pixels(
+                0,
+                0,
+                dimensions.width as i32,
+                dimensions.height as i32,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelPackData::Slice(Some(&mut pixels)),
+            );
+        }
+        crate::native_output::screen_capture::normalize_rgba_readback(
+            pixels,
+            dimensions.width,
+            dimensions.height,
+            origin,
+        )
+        .map_err(Into::into)
+    }
+
+    fn blit_retained_window_preview(
+        &self,
+        target: glow::Framebuffer,
+        payload_id: compositor::PresentationRetainedVisualPayloadId,
+        width: u32,
+        height: u32,
+        origin: OutputFramebufferOrigin,
+    ) -> RendererResult<()> {
+        let visual = self
+            .lifecycle
+            .resolved_visual_texture(payload_id)
+            .ok_or_else(|| io::Error::other("minimized window visual is unavailable"))?;
+        let texture = self
+            .effect_runtime
+            .effect_resources
+            .texture(visual)
+            .ok_or_else(|| io::Error::other("minimized window texture is unavailable"))?;
+        let source = unsafe { self.gl.create_framebuffer().map_err(io::Error::other)? };
+        crate::gpu_residency::record_gpu_resource_allocation(
+            crate::gpu_residency::GpuResourceClass::FramebufferObject,
+            None,
+        );
+        // Lifecycle visual textures have bottom-left storage even when the
+        // scanout uses top-left coordinates. Never re-import released buffers.
+        let (source_y0, source_y1) = match origin {
+            OutputFramebufferOrigin::BottomLeft => (0, visual.key.height as i32),
+            OutputFramebufferOrigin::TopLeftScanout => (visual.key.height as i32, 0),
+        };
+        let result = (|| {
+            unsafe {
+                self.gl
+                    .bind_framebuffer(glow::READ_FRAMEBUFFER, Some(source));
+                self.gl.framebuffer_texture_2d(
+                    glow::READ_FRAMEBUFFER,
+                    glow::COLOR_ATTACHMENT0,
+                    glow::TEXTURE_2D,
+                    Some(texture),
+                    0,
+                );
+                if self.gl.check_framebuffer_status(glow::READ_FRAMEBUFFER)
+                    != glow::FRAMEBUFFER_COMPLETE
+                {
+                    return Err(
+                        io::Error::other("minimized window framebuffer is incomplete").into(),
+                    );
+                }
+                self.gl
+                    .bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(target));
+                self.gl.disable(glow::SCISSOR_TEST);
+                self.gl.blit_framebuffer(
+                    0,
+                    source_y0,
+                    visual.key.width as i32,
+                    source_y1,
+                    0,
+                    0,
+                    width as i32,
+                    height as i32,
+                    glow::COLOR_BUFFER_BIT,
+                    glow::LINEAR,
+                );
+                let error = self.gl.get_error();
+                if error != glow::NO_ERROR {
+                    return Err(io::Error::other(format!(
+                        "minimized preview blit failed: 0x{error:04x}"
+                    ))
+                    .into());
+                }
+            }
+            Ok(())
+        })();
+        unsafe {
+            self.gl.bind_framebuffer(glow::READ_FRAMEBUFFER, None);
+            self.gl.delete_framebuffer(source);
+        }
+        crate::gpu_residency::record_gpu_resource_retirement(
+            crate::gpu_residency::GpuResourceClass::FramebufferObject,
+            None,
+        );
         result
     }
 

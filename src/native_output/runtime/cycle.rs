@@ -1689,7 +1689,7 @@ impl NativeRuntime {
             // fd will wake the reactor; no capture job is prepared here.
             return Ok(());
         }
-        let Some(pending) = self.server.take_pending_screen_capture() else {
+        let Some(mut pending) = self.server.take_pending_screen_capture() else {
             return Ok(());
         };
         if !self
@@ -1705,14 +1705,31 @@ impl NativeRuntime {
         }
 
         let (width, height) = self.scanout.dimensions();
-        let dimensions = match CaptureDimensions::checked(width, height) {
+        let mut dimensions = match CaptureDimensions::checked(width, height) {
             Ok(dimensions) => dimensions,
             Err(_) => {
                 pending.fail("allocation_failed");
                 return Ok(());
             }
         };
-        let resolved_scene = ResolvedNativeFrameScene::from_server(&self.server).into_owned();
+        let resolved_scene = if let Some(target) = pending.window_preview_target() {
+            let source = match self.server.window_preview_source(
+                target.window_id,
+                target.max_width.min(width),
+                target.max_height.min(height),
+            ) {
+                Ok(source) => source,
+                Err(reason) => {
+                    pending.fail(reason);
+                    return Ok(());
+                }
+            };
+            pending.set_window_preview_size(source.width, source.height);
+            dimensions = CaptureDimensions::checked(source.width, source.height)?;
+            ResolvedNativeFrameScene::for_window_preview(&self.server, source)
+        } else {
+            ResolvedNativeFrameScene::from_server(&self.server).into_owned()
+        };
         let include_cursor = pending.overlay_cursor();
         let cursor_mode = self.cursor_render_mode.for_capture(
             include_cursor,

@@ -998,6 +998,7 @@ fn snapshot_ref_preserves_constructor_popup_ids_and_order() {
         let output_id = oblivion_one::core::OutputId::from_raw(1).expect("test output id");
         let surfaces: &[RenderableSurface] = &[];
         let resolved = ResolvedNativeFrameScene {
+            window_preview: None,
             surfaces: Cow::Borrowed(surfaces),
             surface_scene_node_ids: Cow::Borrowed(&[]),
             presentation_owner_root_surface_ids: Cow::Borrowed(&[]),

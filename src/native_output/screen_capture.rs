@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     ffi::CString,
     fs::File,
     io::{self, Write as _},
@@ -172,7 +173,22 @@ pub(crate) fn deliver_screen_capture_payload(
     use oblivion_one::compositor::ScreenCaptureRequest;
     match request {
         ScreenCaptureRequest::Astrea(pending) => {
-            let memfd = match create_sealed_memfd(payload) {
+            let (payload, dimensions) = if let Some(target) = pending.window_preview {
+                let Some((width, height)) = target.image_size else {
+                    pending.capture.failed("render_failed".to_owned());
+                    return;
+                };
+                match compact_window_preview(payload, dimensions, width, height) {
+                    Ok(image) => image,
+                    Err(_) => {
+                        pending.capture.failed("render_failed".to_owned());
+                        return;
+                    }
+                }
+            } else {
+                (Cow::Borrowed(payload), dimensions)
+            };
+            let memfd = match create_sealed_memfd(&payload) {
                 Ok(memfd) => memfd,
                 Err(error) => {
                     eprintln!("native screen capture allocation failed: {error}");
@@ -196,9 +212,52 @@ pub(crate) fn deliver_screen_capture_payload(
     }
 }
 
+// Native capture uses its existing isolated framebuffer. Export just the
+// bounded top-left window image, never the unused framebuffer padding.
+fn compact_window_preview(
+    payload: &[u8],
+    frame: CaptureDimensions,
+    width: u32,
+    height: u32,
+) -> io::Result<(Cow<'_, [u8]>, CaptureDimensions)> {
+    if payload.len() != frame.payload_len || width > frame.width || height > frame.height {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid preview bounds",
+        ));
+    }
+    let image = CaptureDimensions::checked(width, height)?;
+    if image == frame {
+        return Ok((Cow::Borrowed(payload), image));
+    }
+    let mut pixels = Vec::with_capacity(image.payload_len);
+    for row in payload
+        .chunks_exact(frame.stride as usize)
+        .take(height as usize)
+    {
+        pixels.extend_from_slice(&row[..image.stride as usize]);
+    }
+    Ok((Cow::Owned(pixels), image))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn window_preview_export_compacts_rows_and_rejects_out_of_frame_bounds() {
+        let frame = CaptureDimensions::checked(3, 2).unwrap();
+        let payload = (0_u8..24).collect::<Vec<_>>();
+        let (image, size) = compact_window_preview(&payload, frame, 2, 2).unwrap();
+        assert_eq!(
+            image.as_ref(),
+            &[0, 1, 2, 3, 4, 5, 6, 7, 12, 13, 14, 15, 16, 17, 18, 19]
+        );
+        assert_eq!((size.width, size.height, size.stride), (2, 2, 8));
+        assert!(compact_window_preview(&payload, frame, 4, 2).is_err());
+        assert!(compact_window_preview(&payload[..23], frame, 2, 2).is_err());
+        assert!(compact_window_preview(&payload, frame, 0, 2).is_err());
+    }
     use crate::egl_renderer::OutputFramebufferOrigin;
 
     #[test]

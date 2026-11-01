@@ -14,7 +14,7 @@
     all copies or substantial portions of the Software.
   </copyright>
 
-  <interface name="astrea_screen_capture_manager_v1" version="1">
+  <interface name="astrea_screen_capture_manager_v1" version="2">
     <description summary="authenticated one-shot compositor screen capture">
       Captures the latest compositor-published, acquire-ready scene for one
       output. The only version 1 format is RGBA8888. Capture has no physical
@@ -32,6 +32,21 @@
     </request>
 
     <request name="destroy" type="destructor"/>
+
+    <request name="capture_window" since="2">
+      <description summary="capture one window, including retained minimized content">
+        Capture the window identified by its Astrea toplevel identifier without
+        activating it. The image includes its committed surface tree, excludes
+        unrelated windows and the cursor, and fits within max_width/max_height
+        without upscaling. Limits must be between 1 and 1024. The shell must be
+        authenticated on this connection. Ordinary failures include busy,
+        window_gone, invalid_size and render_failed.
+      </description>
+      <arg name="capture" type="new_id" interface="astrea_screen_capture_v1"/>
+      <arg name="window_id" type="string"/>
+      <arg name="max_width" type="uint"/>
+      <arg name="max_height" type="uint"/>
+    </request>
   </interface>
 
   <interface name="astrea_screen_capture_v1" version="1">

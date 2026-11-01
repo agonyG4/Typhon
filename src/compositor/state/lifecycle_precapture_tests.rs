@@ -713,3 +713,69 @@ fn renderer_error_after_sampling_cancels_the_precapture_lease_once() {
         0
     );
 }
+
+#[test]
+fn window_preview_isolates_and_fits_only_the_selected_surface_tree() {
+    let generation =
+        crate::xwayland::XwaylandGeneration::new(std::num::NonZeroU64::new(1900).unwrap());
+    let mut state = CompositorState::new(None);
+    let window = super::desktop_window_tests::insert_x11(
+        &mut state,
+        super::desktop_window_tests::x11_snapshot(generation, 1900, 1901),
+    );
+    let root = ssd_test_surface(1901);
+    let buffer_id = root.buffer_id();
+    let mut child = ssd_test_surface(1902);
+    child.placement = SurfacePlacement::subsurface(1901, 8, 12);
+    state.append_renderable_surface(root);
+    state.append_renderable_surface(child);
+    state.append_renderable_surface(ssd_test_surface(1903));
+    let preview = state.window_preview_source(window, 154, 106).unwrap();
+    assert_eq!((preview.width, preview.height), (154, 106));
+    assert_eq!(
+        preview
+            .surfaces
+            .iter()
+            .map(|s| s.surface_id)
+            .collect::<Vec<_>>(),
+        vec![1901, 1902]
+    );
+    assert_eq!(preview.surfaces[0].buffer_id(), buffer_id);
+    assert_eq!(
+        preview.surfaces[0].render_target_size,
+        BufferSize::new(150, 100)
+    );
+    assert_eq!(
+        preview.surfaces[1].placement,
+        SurfacePlacement::absolute_root_at(4, 6)
+    );
+    assert_eq!(state.renderable_surfaces[0].render_target_size, None);
+}
+
+#[test]
+fn window_preview_keeps_minimized_content_without_restoring_the_window() {
+    let generation =
+        crate::xwayland::XwaylandGeneration::new(std::num::NonZeroU64::new(1910).unwrap());
+    let mut state = CompositorState::new(None);
+    let window = super::desktop_window_tests::insert_x11(
+        &mut state,
+        super::desktop_window_tests::x11_snapshot(generation, 1910, 1911),
+    );
+    let root = ssd_test_surface(1911);
+    let buffer_id = root.buffer_id();
+    state.append_renderable_surface(root);
+    state.rebuild_active_scene_view();
+    assert!(state.minimize_desktop_window(window));
+    assert!(state.renderable_surfaces.is_empty());
+    let preview = state.window_preview_source(window, 1024, 1024).unwrap();
+    assert_eq!((preview.width, preview.height), (300, 200));
+    assert_eq!(preview.surfaces[0].buffer_id(), buffer_id);
+    assert!(state.window(window).unwrap().state.is_minimized());
+    assert!(state.window_preview_source(window, 0, 320).is_err());
+    assert!(state.window_preview_source(window, 1025, 320).is_err());
+    assert!(
+        state
+            .window_preview_source(WindowId::from_raw(u64::MAX).unwrap(), 512, 320)
+            .is_err()
+    );
+}

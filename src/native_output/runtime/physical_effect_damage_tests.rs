@@ -174,6 +174,7 @@ fn empty_resolved_scene_with_workspace_slide() -> ResolvedNativeFrameScene<'stat
     let output_id = OutputId::from_raw(1).expect("test output id");
     let sampled_at = oblivion_one::compositor::AnimationTime::from_nanos(1);
     ResolvedNativeFrameScene {
+        window_preview: None,
         surfaces: std::borrow::Cow::Borrowed(&[]),
         surface_scene_node_ids: std::borrow::Cow::Borrowed(&[]),
         presentation_owner_root_surface_ids: std::borrow::Cow::Borrowed(&[]),

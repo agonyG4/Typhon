@@ -16,6 +16,7 @@ pub use clipboard_bridge::{
 };
 use gpu_protocol_capabilities::GpuProtocolCapabilities;
 pub use screen_capture::{AstreaScreenCapturePending, ScreenCaptureRequest};
+pub use window_preview::{WindowPreviewImage, WindowPreviewSource, WindowPreviewTarget};
 pub use screencopy::ScreencopyPending;
 use std::{
     cell::Cell,
@@ -113,6 +114,7 @@ mod render;
 mod runtime_files;
 mod scene;
 mod screen_capture;
+mod window_preview;
 mod screencopy;
 mod wlr_foreign_toplevel;
 mod selection;

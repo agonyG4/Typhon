@@ -217,6 +217,70 @@ fn egl_lifecycle_lamp_below_canonical_opaque_window_respects_painter_order() {
         retained_texture.key.width,
         retained_texture.key.height,
     );
+    // A minimized-window preview reads this renderer-owned snapshot, even
+    // after its original client buffers can be released and reused.
+    let mut preview_images = Vec::new();
+    let resource_count = harness.renderer.lifecycle.resolved_visual_resource_count();
+    for origin in [
+        OutputFramebufferOrigin::BottomLeft,
+        OutputFramebufferOrigin::TopLeftScanout,
+    ] {
+        let mut preview_scene =
+            crate::native_output::ResolvedNativeFrameScene::for_synchronous_output_reconfiguration(
+                &server,
+            );
+        preview_scene.window_preview = Some(compositor::WindowPreviewImage {
+            width: retained_texture.key.width,
+            height: retained_texture.key.height,
+            retained_resource: Some(payload_id),
+        });
+        let request = frame_renderer.egl_scene_draw_request(
+            320,
+            200,
+            &preview_scene,
+            &server,
+            &input_state,
+            crate::native_output::NativeCursorRenderMode::Hardware,
+            Some(OutputDamage::Full),
+        );
+        let image = harness
+            .renderer
+            .capture_scene(&harness.egl, harness.display, request, origin, false)
+            .expect("retained window preview capture");
+        let width = retained_texture.key.width as usize;
+        let height = retained_texture.key.height as usize;
+        assert_eq!(image.len(), retained_pixels_before.len());
+        assert!(
+            retained_pixels_before
+                .chunks_exact(4)
+                .any(|pixel| pixel[..3].iter().any(|&channel| channel != 0)),
+            "the retained reference must contain visible window pixels"
+        );
+        for y in 0..height {
+            for x in 0..width {
+                let actual = (y * width + x) * 4;
+                let expected = ((height - 1 - y) * width + x) * 4;
+                assert_eq!(
+                    &image[actual..actual + 3],
+                    &retained_pixels_before[expected..expected + 3],
+                    "cached window pixel at ({x},{y}) must survive capture"
+                );
+                assert_eq!(image[actual + 3], 255);
+            }
+        }
+        preview_images.push(image);
+        assert_eq!(
+            harness.renderer.lifecycle.resolved_visual_resource_count(),
+            resource_count
+        );
+    }
+    assert!(
+        preview_images[0]
+            .iter()
+            .zip(&preview_images[1])
+            .all(|(&a, &b)| a.abs_diff(b) <= 1),
+        "preview orientation must be independent of scanout origin"
+    );
     let canonical_surfaces = resolved.surfaces.as_ref().to_vec();
     let retained_lifecycle = resolved.lifecycle.clone();
     let retained_surfaces = resolved.lifecycle_surfaces.clone();

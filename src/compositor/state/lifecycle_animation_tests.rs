@@ -1949,6 +1949,13 @@ fn settled_minimize_promotes_snapshot_and_restore_reuses_resolved_source() {
     assert_eq!(snapshot.resource_payload_id, resource_payload_id);
     assert_eq!(snapshot.source_client_rect, expected_source_client_rect);
     assert_eq!(snapshot.source_visual_rect, expected_source_visual_rect);
+    let preview = state
+        .window_preview_source(window_id, 512, 320)
+        .expect("settled minimized preview");
+    assert!(
+        preview.surfaces.is_empty(),
+        "a settled minimized preview must use its owned visual, not released client buffers"
+    );
     assert!(
         state
             .retained_lifecycle_payloads

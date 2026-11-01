@@ -224,6 +224,7 @@ impl EglSceneFrameCommit {
 }
 
 pub struct EglSceneDrawRequest<'a> {
+    pub window_preview: Option<compositor::WindowPreviewImage>,
     pub width: u32,
     pub height: u32,
     pub surfaces: &'a [RenderableSurface],

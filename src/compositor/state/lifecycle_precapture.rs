@@ -334,7 +334,7 @@ impl CompositorState {
         })
     }
 
-    pub(super) fn lifecycle_surface_candidates(
+    pub(in crate::compositor) fn lifecycle_surface_candidates(
         &self,
         window_id: WindowId,
         root_surface_id: u32,

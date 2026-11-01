@@ -85,6 +85,7 @@ use super::frame_scene_identity::{
 
 #[derive(Debug)]
 pub(crate) struct ResolvedNativeFrameScene<'a> {
+    pub(crate) window_preview: Option<oblivion_one::compositor::WindowPreviewImage>,
     pub(crate) surfaces: Cow<'a, [RenderableSurface]>,
     pub(crate) surface_scene_node_ids: Cow<'a, [SceneNodeId]>,
     pub(crate) presentation_owner_root_surface_ids: Cow<'a, [u32]>,
@@ -582,6 +583,25 @@ mod presentation_effect_influence_tests {
 }
 
 impl<'a> ResolvedNativeFrameScene<'a> {
+    pub(crate) fn for_window_preview(
+        server: &'a OwnCompositorServer,
+        source: oblivion_one::compositor::WindowPreviewSource,
+    ) -> ResolvedNativeFrameScene<'static> {
+        // Start from an empty capture scene: no wallpaper, occluding windows,
+        // lifecycle replay, workspace transforms, or unrelated effects.
+        let mut scene = Self::for_synchronous_output_reconfiguration(server).into_owned();
+        scene.window_preview = Some(oblivion_one::compositor::WindowPreviewImage {
+            width: source.width,
+            height: source.height,
+            retained_resource: source.retained_resource,
+        });
+        scene.presentation_owner_root_surface_ids =
+            Cow::Owned(vec![source.root_surface_id; source.surfaces.len()]);
+        scene.surfaces = Cow::Owned(source.surfaces);
+        scene.surface_scene_node_ids = Cow::Owned(source.scene_node_ids);
+        scene
+    }
+
     /// A synchronous modeset candidate is a conservative transition frame.
     /// It contains no client surfaces, lifecycle sample, retained-window
     /// evidence, or presentation animation. That keeps the new-size framebuffer
@@ -1112,10 +1132,12 @@ impl<'a> ResolvedNativeFrameScene<'a> {
             lifecycle_decorations,
             lifecycle_snapshot,
             window_exit_evidence,
+            window_preview: None,
         }
     }
     pub(crate) fn into_owned(self) -> ResolvedNativeFrameScene<'static> {
         ResolvedNativeFrameScene {
+            window_preview: self.window_preview,
             surfaces: Cow::Owned(self.surfaces.into_owned()),
             surface_scene_node_ids: Cow::Owned(self.surface_scene_node_ids.into_owned()),
             presentation_owner_root_surface_ids: Cow::Owned(
@@ -2825,7 +2847,11 @@ fn project_egl_scene_draw_request<'a>(
     surface_resource_sync_states: Vec<SurfaceResourceSyncState>,
     frame_id: Option<u64>,
 ) -> EglSceneDrawRequest<'a> {
+    let (width, height) = scene
+        .window_preview
+        .map_or((width, height), |image| (image.width, image.height));
     EglSceneDrawRequest {
+        window_preview: scene.window_preview,
         width,
         height,
         surfaces: scene.surfaces.as_ref(),

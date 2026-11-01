@@ -10,6 +10,7 @@ use super::*;
 pub struct AstreaScreenCapturePending {
     pub capture: astrea_screen_capture_v1::AstreaScreenCaptureV1,
     pub output_id: OutputId,
+    pub window_preview: Option<WindowPreviewTarget>,
 }
 
 /// A capture request the runtime must satisfy with a rendered frame.
@@ -20,6 +21,20 @@ pub enum ScreenCaptureRequest {
 }
 
 impl ScreenCaptureRequest {
+    pub fn window_preview_target(&self) -> Option<WindowPreviewTarget> {
+        match self {
+            Self::Astrea(pending) => pending.window_preview,
+            Self::Screencopy(_) => None,
+        }
+    }
+
+    pub fn set_window_preview_size(&mut self, width: u32, height: u32) {
+        if let Self::Astrea(pending) = self
+            && let Some(target) = &mut pending.window_preview
+        {
+            target.image_size = Some((width, height));
+        }
+    }
     pub fn output_id(&self) -> OutputId {
         match self {
             Self::Astrea(pending) => pending.output_id,
@@ -98,7 +113,62 @@ impl Dispatch<astrea_screen_capture_manager_v1::AstreaScreenCaptureManagerV1, ()
                 }
                 state.astrea_screen_captures.insert(
                     client_id.clone(),
-                    AstreaScreenCapturePending { capture, output_id },
+                    AstreaScreenCapturePending {
+                        capture,
+                        output_id,
+                        window_preview: None,
+                    },
+                );
+            }
+            astrea_screen_capture_manager_v1::Request::CaptureWindow {
+                capture,
+                window_id,
+                max_width,
+                max_height,
+            } => {
+                let capture = data_init.init(capture, ());
+                if !state.astrea_shell_mutation_allowed(client) {
+                    state.post_protocol_error(
+                        client,
+                        resource,
+                        astrea_screen_capture_manager_v1::Error::Unauthorized,
+                        "client is not an authorized Astrea shell client",
+                    );
+                    return;
+                }
+                if !(1..=1024).contains(&max_width) || !(1..=1024).contains(&max_height) {
+                    capture.failed("invalid_size".to_string());
+                    return;
+                }
+                let Some(window_id) = window_id
+                    .parse::<u64>()
+                    .ok()
+                    .and_then(WindowId::from_raw)
+                    .filter(|id| state.window(*id).is_some())
+                else {
+                    capture.failed("window_gone".to_string());
+                    return;
+                };
+                let Some(output_id) = state.logical_output_ids.iter().next().copied() else {
+                    capture.failed("output_gone".to_string());
+                    return;
+                };
+                if state.astrea_screen_captures.contains_key(&client.id()) {
+                    capture.failed("busy".to_string());
+                    return;
+                }
+                state.astrea_screen_captures.insert(
+                    client.id(),
+                    AstreaScreenCapturePending {
+                        capture,
+                        output_id,
+                        window_preview: Some(WindowPreviewTarget {
+                            window_id,
+                            max_width,
+                            max_height,
+                            image_size: None,
+                        }),
+                    },
                 );
             }
         }

@@ -42,6 +42,7 @@ fn solitary_fullscreen_snapshot_matches_the_filtered_renderer_scene() {
     let snapshot = NativeSceneSnapshot::from_surfaces(&renderer_surfaces, Vec::new());
     let output_id = OutputId::from_raw(1).expect("test output id");
     let resolved_scene = ResolvedNativeFrameScene {
+        window_preview: None,
         surfaces: Cow::Owned(renderer_surfaces.clone()),
         surface_scene_node_ids: Cow::Owned(vec![SceneNodeId::from_raw(1).unwrap()]),
         presentation_owner_root_surface_ids: Cow::Owned(vec![901]),
@@ -143,6 +144,7 @@ fn freezing_a_resolved_scene_shares_shm_payload_backing() {
     let snapshot = NativeSceneSnapshot::from_surfaces(&surfaces, Vec::new());
     let output_id = OutputId::from_raw(1).expect("test output id");
     let resolved_scene = ResolvedNativeFrameScene {
+        window_preview: None,
         surfaces: Cow::Borrowed(&surfaces),
         surface_scene_node_ids: Cow::Borrowed(&[SceneNodeId::from_raw(1).unwrap()]),
         presentation_owner_root_surface_ids: Cow::Borrowed(&[901]),

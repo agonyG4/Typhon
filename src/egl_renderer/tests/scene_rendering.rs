@@ -1618,3 +1618,47 @@ fn wallpaper_echo_draws_a_second_copy_one_cell_away() {
     assert_eq!(copy.bounds.y(), wallpaper.bounds.y());
     assert_eq!(copy.visual_group, wallpaper.visual_group);
 }
+
+#[test]
+fn window_preview_renders_selected_pixels_without_the_occluding_window() {
+    let mut harness = GlesEffectTestHarness::new(32, 32);
+    let mut buffer_ids = BufferIdAllocator::default();
+    let selected = lifecycle_test_surface(9201, 100, 80, 18, 12, 0xffff_0000, &mut buffer_ids);
+    let occluder = lifecycle_test_surface(9202, 100, 80, 18, 12, 0xff00_00ff, &mut buffer_ids);
+    let window_id = oblivion_one::compositor::WindowId::from_raw(9201).unwrap();
+    let socket_name = format!("typhon-window-preview-pixels-{}", std::process::id());
+    let mut server =
+        oblivion_one::compositor::OwnCompositorServer::bind_cpu_composition(&socket_name).unwrap();
+    server.install_native_frame_test_scene(vec![selected, occluder], &[(9201, window_id)], None);
+    let source = server.window_preview_source(window_id, 9, 6).unwrap();
+    assert_eq!((source.width, source.height), (9, 6));
+    let scene = crate::native_output::ResolvedNativeFrameScene::for_window_preview(&server, source);
+    let input = crate::native_output::NativeInputState::new(32, 32);
+    let mut frame_renderer = crate::native_output::NativeFrameRenderer::default();
+    let request = frame_renderer.egl_scene_draw_request(
+        32,
+        32,
+        &scene,
+        &server,
+        &input,
+        crate::native_output::NativeCursorRenderMode::Hardware,
+        Some(OutputDamage::Full),
+    );
+    let pixels = harness
+        .renderer
+        .capture_scene(
+            &harness.egl,
+            harness.display,
+            request,
+            OutputFramebufferOrigin::BottomLeft,
+            false,
+        )
+        .unwrap();
+    assert_eq!(pixels.len(), 9 * 6 * 4);
+    for y in 0..6 {
+        for x in 0..9 {
+            let start = (y * 9 + x) * 4;
+            assert_eq!(&pixels[start..start + 4], &[255, 0, 0, 255]);
+        }
+    }
+}

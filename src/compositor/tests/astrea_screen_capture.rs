@@ -379,3 +379,94 @@ fn screen_capture_disconnect_cleans_pending_request() {
     let server = stop_controllable_test_server(commands, server_thread);
     assert!(server.state.astrea_screen_captures.is_empty());
 }
+
+#[test]
+fn window_preview_capture_is_advertised_to_shell_clients_as_version_two() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind_cpu_composition(&socket_name).unwrap();
+    let (running, server_thread) = spawn_test_server(server);
+    let connection =
+        Connection::from_socket(UnixStream::connect(runtime_socket_path(&socket_name)).unwrap())
+            .unwrap();
+    let (globals, queue) = registry_queue_init::<ScreenCaptureTestState>(&connection).unwrap();
+    let result = globals
+        .bind::<client_astrea_screen_capture_manager_v1::AstreaScreenCaptureManagerV1, _, _>(
+            &queue.handle(),
+            2..=2,
+            (),
+        );
+    running.store(false, Ordering::SeqCst);
+    server_thread.join().unwrap();
+    assert!(
+        result.is_ok(),
+        "window previews require screen capture manager version 2"
+    );
+}
+
+#[test]
+fn window_preview_requests_authenticate_the_exact_client_and_validate_targets() {
+    let socket_name = unique_socket_name();
+    let capability_path =
+        crate::compositor::astrea_shell_capability::test_capability_path(&socket_name);
+    let mut server = OwnCompositorServer::bind_cpu_composition(&socket_name).unwrap();
+    server.install_native_frame_test_scene(
+        Vec::new(),
+        &[(42, WindowId::from_raw(42).unwrap())],
+        None,
+    );
+    let capability = std::fs::read_to_string(capability_path).unwrap();
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+    let socket_path = runtime_socket_path(&socket_name);
+    let connection = Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (globals, mut queue) = registry_queue_init::<ScreenCaptureTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let auth = globals
+        .bind::<client_astrea_shell_auth_manager_v1::AstreaShellAuthManagerV1, _, _>(&qh, 1..=1, ())
+        .unwrap();
+    let manager = globals
+        .bind::<client_astrea_screen_capture_manager_v1::AstreaScreenCaptureManagerV1, _, _>(
+            &qh,
+            2..=2,
+            (),
+        )
+        .unwrap();
+    let mut state = ScreenCaptureTestState::default();
+    auth.authenticate(capability.trim().to_string());
+    queue.roundtrip(&mut state).unwrap();
+    assert!(state.authenticated);
+    let _unknown = manager.capture_window("999999".into(), 320, 200, &qh, ());
+    let _invalid_size = manager.capture_window("42".into(), 1025, 200, &qh, ());
+    queue.roundtrip(&mut state).unwrap();
+    assert_eq!(state.failed, vec!["window_gone", "invalid_size"]);
+    assert!(!pending_capture_state(&commands));
+    let accepted = manager.capture_window("42".into(), 320, 200, &qh, ());
+    queue.roundtrip(&mut state).unwrap();
+    assert!(pending_capture_state(&commands));
+    let _busy = manager.capture_window("42".into(), 320, 200, &qh, ());
+    queue.roundtrip(&mut state).unwrap();
+    assert_eq!(state.failed.last().map(String::as_str), Some("busy"));
+    accepted.destroy();
+    queue.roundtrip(&mut state).unwrap();
+    assert!(!pending_capture_state(&commands));
+
+    let foreign = Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (foreign_globals, mut foreign_queue) =
+        registry_queue_init::<ScreenCaptureTestState>(&foreign).unwrap();
+    let foreign_manager = foreign_globals
+        .bind::<client_astrea_screen_capture_manager_v1::AstreaScreenCaptureManagerV1, _, _>(
+            &foreign_queue.handle(),
+            2..=2,
+            (),
+        )
+        .unwrap();
+    let _unauthorized =
+        foreign_manager.capture_window("42".into(), 320, 200, &foreign_queue.handle(), ());
+    assert!(
+        foreign_queue
+            .roundtrip(&mut ScreenCaptureTestState::default())
+            .is_err()
+    );
+    assert!(!pending_capture_state(&commands));
+    commands.send(ServerCommand::Stop).unwrap();
+    server_thread.join().unwrap();
+}

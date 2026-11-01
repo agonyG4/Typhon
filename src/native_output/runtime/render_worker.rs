@@ -382,6 +382,15 @@ impl NativeRuntime {
         if pending.cancelled {
             return Ok(());
         }
+        if let Some(target) = pending.pending.window_preview_target()
+            && self
+                .server
+                .control_window_snapshot(target.window_id)
+                .is_none()
+        {
+            pending.pending.fail("window_gone");
+            return Ok(());
+        }
         let payload = match result {
             Ok(payload) if payload.len() == pending.dimensions.payload_len => payload,
             Ok(_) => {
