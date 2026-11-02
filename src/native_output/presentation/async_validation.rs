@@ -9,6 +9,11 @@ use oblivion_one::native::kms::{AtomicCursorVisualState, DrmFormatModifierPair};
 /// capability bit: it only proves the exact output generation, plane,
 /// framebuffer layout, acquire strategy, cursor state, and connector content
 /// type that were tested.
+///
+/// Cursor placement is part of the proof only for tearing (async) flips,
+/// which may not move other planes. Synchronous modes, AdaptiveSync included,
+/// move the cursor plane like any VSync commit, so keying them on the
+/// pointer position made every cursor move an unproven state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct CompositedPresentationValidationKey {
     pub(crate) output_id: OutputId,
@@ -43,6 +48,20 @@ impl CompositedPresentationValidationKey {
         explicit_sync_ready: bool,
         content_type: DrmContentType,
     ) -> Self {
+        let cursor_state = if presentation_mode.is_async() {
+            cursor_state
+        } else {
+            match cursor_state {
+                Some(state) => Some(AtomicCursorVisualState {
+                    x: 0,
+                    y: 0,
+                    hotspot_x: 0,
+                    hotspot_y: 0,
+                    ..state
+                }),
+                None => None,
+            }
+        };
         Self {
             output_id,
             output_generation,
@@ -137,5 +156,60 @@ mod tests {
             ..base
         };
         assert!(!unique.contains(&next_generation));
+    }
+    #[test]
+    fn synchronous_modes_ignore_cursor_placement_but_async_keeps_it() {
+        let cursor_at = |x, y| AtomicCursorVisualState {
+            visible: true,
+            x,
+            y,
+            hotspot_x: 3,
+            hotspot_y: 4,
+            width: 32,
+            height: 32,
+            framebuffer_id: Some(88),
+            image_generation: 5,
+        };
+        let key_for = |mode, cursor| {
+            CompositedPresentationValidationKey::new(
+                OutputId::from_raw(1).expect("test output id"),
+                7,
+                42,
+                43,
+                DrmFormatModifierPair {
+                    fourcc: 0x3432_5258,
+                    modifier: 0,
+                },
+                mode,
+                0,
+                true,
+                Some(cursor),
+                false,
+                false,
+                true,
+                DrmContentType::Graphics,
+            )
+        };
+        for mode in [
+            OutputPresentationMode::Vsync,
+            OutputPresentationMode::AdaptiveSync,
+        ] {
+            assert_eq!(
+                key_for(mode, cursor_at(10, 20)),
+                key_for(mode, cursor_at(900, 5))
+            );
+            let mut other_image = cursor_at(10, 20);
+            other_image.image_generation += 1;
+            assert_ne!(key_for(mode, cursor_at(10, 20)), key_for(mode, other_image));
+        }
+        for mode in [
+            OutputPresentationMode::Async,
+            OutputPresentationMode::AdaptiveAsync,
+        ] {
+            assert_ne!(
+                key_for(mode, cursor_at(10, 20)),
+                key_for(mode, cursor_at(900, 5))
+            );
+        }
     }
 }
