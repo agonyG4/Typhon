@@ -293,6 +293,9 @@ pub(super) struct LayerSurfaceRole {
     pub(super) resource: zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
     pub(super) client_pid: Option<u32>,
     pub(super) output_id: Option<u32>,
+    /// Logical output the surface is laid out on: the one the client asked
+    /// for, or the focused output when it left the choice to the compositor.
+    pub(super) output: Option<OutputId>,
     pub(super) namespace: String,
     pub(super) pending: LayerSurfaceCommitState,
     pub(super) committed: LayerSurfaceCommitState,
@@ -330,6 +333,7 @@ impl LayerSurfaceRole {
             resource,
             client_pid,
             output_id,
+            output: None,
             namespace,
             pending: state,
             committed: state,
@@ -434,7 +438,16 @@ impl CompositorState {
         let surface_id = compositor_surface_id(&surface);
         self.layer_surface_order = self.layer_surface_order.saturating_add(1);
         let output_id = output.as_ref().map(Resource::id).map(|id| id.protocol_id());
-        let role = LayerSurfaceRole::new(
+        let layout_output = output
+            .as_ref()
+            .and_then(|output| {
+                self.output_resources
+                    .iter()
+                    .find(|binding| binding.resource.id() == output.id())
+                    .map(|binding| binding.output_id)
+            })
+            .or_else(|| self.workspace_manager.focused_output());
+        let mut role = LayerSurfaceRole::new(
             surface,
             resource.clone(),
             client_pid,
@@ -444,6 +457,7 @@ impl CompositorState {
             resource.version(),
             self.layer_surface_order,
         );
+        role.output = layout_output;
         self.layer_surfaces.insert(surface_id, role);
         self.store_surface_placement(surface_id, SurfacePlacement::root());
         self.sync_scene_surface_metadata(surface_id);
@@ -492,7 +506,7 @@ impl CompositorState {
         if !self.layer_surfaces.contains_key(&surface_id) {
             return true;
         }
-        let previous_usable = self.reserved_usable_geometry();
+        let previous_usable = self.reserved_usable_geometries();
         let effects = match self.apply_captured_layer_surface_state(surface_id, captured) {
             Some(effects) => effects,
             None => {
@@ -529,7 +543,7 @@ impl CompositorState {
         if !self.layer_surfaces.contains_key(&surface_id) {
             return true;
         }
-        let previous_usable = self.reserved_usable_geometry();
+        let previous_usable = self.reserved_usable_geometries();
         let Some(effects) = self.apply_captured_layer_surface_state(surface_id, captured) else {
             return false;
         };
@@ -578,7 +592,7 @@ impl CompositorState {
         if role.mapped {
             return;
         }
-        let previous_usable = self.reserved_usable_geometry();
+        let previous_usable = self.reserved_usable_geometries();
         self.layer_surface_order = self.layer_surface_order.saturating_add(1);
         let activation_order = self.layer_surface_order;
         if let Some(role) = self.layer_surfaces.get_mut(&surface_id) {
@@ -600,7 +614,7 @@ impl CompositorState {
     }
 
     pub(in crate::compositor) fn note_layer_surface_unmapped(&mut self, surface_id: u32) {
-        let previous_usable = self.reserved_usable_geometry();
+        let previous_usable = self.reserved_usable_geometries();
         let Some(role) = self.layer_surfaces.get_mut(&surface_id) else {
             return;
         };
@@ -670,7 +684,7 @@ impl CompositorState {
         if !self.layer_surfaces.contains_key(&surface_id) {
             return;
         }
-        let previous_usable = self.reserved_usable_geometry();
+        let previous_usable = self.reserved_usable_geometries();
         self.unregister_layer_surface_popups(surface_id);
         if let Some(role) = self.layer_surfaces.get_mut(&surface_id) {
             role.mapped = false;
@@ -826,7 +840,7 @@ impl CompositorState {
     fn apply_layer_surface_commit_effects(
         &mut self,
         effects: LayerSurfaceCommitEffects,
-        previous_usable: LayerLayoutRect,
+        previous_usable: Vec<(OutputId, LayerLayoutRect)>,
         cause: LayerArrangeCause,
     ) {
         if effects.layout_changed {
@@ -975,9 +989,74 @@ impl CompositorState {
         ))
     }
 
-    fn reserved_usable_geometry(&self) -> LayerLayoutRect {
-        let mut usable = LayerLayoutRect::from_output(self.output_size);
-        let mut roles = self.layer_surfaces.values().collect::<Vec<_>>();
+    /// Live outputs in layout order. Empty only after the native output was
+    /// withdrawn, in which case layout falls back to the native output size.
+    fn layout_output_ids(&self) -> Vec<OutputId> {
+        self.logical_outputs
+            .keys()
+            .copied()
+            .filter(|output_id| self.logical_output_ids.contains(output_id))
+            .collect()
+    }
+
+    /// Full layout rectangle of an output. The native output keeps its
+    /// historical origin-anchored mode size until layout becomes per head.
+    fn output_layout_rect(&self, output_id: Option<OutputId>) -> LayerLayoutRect {
+        let native = LayerLayoutRect::from_output(self.output_size);
+        let Some(output_id) = output_id else {
+            return native;
+        };
+        if Some(output_id) == self.native_output_id() {
+            return native;
+        }
+        let Some(output) = self.logical_outputs.get(&output_id) else {
+            return native;
+        };
+        let (width, height) = output.logical_size();
+        LayerLayoutRect {
+            x: output.position.0,
+            y: output.position.1,
+            width: width.max(1) as u32,
+            height: height.max(1) as u32,
+        }
+    }
+
+    /// Output a layer surface is laid out on; surfaces whose output is gone
+    /// fall back to the native output.
+    fn layer_role_output(&self, role: &LayerSurfaceRole) -> Option<OutputId> {
+        role.output
+            .filter(|output_id| self.logical_output_ids.contains(output_id))
+            .or_else(|| {
+                self.native_output_id()
+                    .filter(|output_id| self.logical_output_ids.contains(output_id))
+            })
+    }
+
+    /// Output that lays out windows of `location`: a regular workspace's
+    /// owner, or the focused output for special workspaces.
+    pub(in crate::compositor) fn output_for_location(
+        &self,
+        location: WorkspaceLocation,
+    ) -> Option<OutputId> {
+        let owner = match location {
+            WorkspaceLocation::Regular(workspace) => {
+                self.workspace_manager.workspace_output(workspace)
+            }
+            WorkspaceLocation::Special(_) => self.workspace_manager.focused_output(),
+        };
+        owner
+            .or_else(|| self.workspace_manager.focused_output())
+            .or_else(|| self.native_output_id())
+            .filter(|output_id| self.logical_output_ids.contains(output_id))
+    }
+
+    fn reserved_usable_geometry_for(&self, output_id: Option<OutputId>) -> LayerLayoutRect {
+        let mut usable = self.output_layout_rect(output_id);
+        let mut roles = self
+            .layer_surfaces
+            .values()
+            .filter(|role| self.layer_role_output(role) == output_id)
+            .collect::<Vec<_>>();
         roles.sort_by_key(|role| (role.committed.layer, role.order));
         for role in roles {
             if !role.mapped || role.committed.exclusive_zone <= 0 {
@@ -990,6 +1069,41 @@ impl CompositorState {
         usable
     }
 
+    /// Usable geometry of the focused output.
+    fn reserved_usable_geometry(&self) -> LayerLayoutRect {
+        let output_id = self
+            .workspace_manager
+            .focused_output()
+            .filter(|output_id| self.logical_output_ids.contains(output_id))
+            .or_else(|| self.layout_output_ids().first().copied());
+        self.reserved_usable_geometry_for(output_id)
+    }
+
+    fn reserved_usable_geometries(&self) -> Vec<(OutputId, LayerLayoutRect)> {
+        self.layout_output_ids()
+            .into_iter()
+            .map(|output_id| {
+                (
+                    output_id,
+                    self.reserved_usable_geometry_for(Some(output_id)),
+                )
+            })
+            .collect()
+    }
+
+    pub(in crate::compositor) fn usable_output_geometry_for_location(
+        &self,
+        location: WorkspaceLocation,
+    ) -> OutputRect {
+        let usable = self.reserved_usable_geometry_for(self.output_for_location(location));
+        OutputRect {
+            x: f64::from(usable.x),
+            y: f64::from(usable.y),
+            width: f64::from(usable.width),
+            height: f64::from(usable.height),
+        }
+    }
+
     fn arranged_layer_geometry_for_surface(&self, target_surface_id: u32) -> Option<LayerGeometry> {
         self.arranged_layer_geometries(Some(target_surface_id))
             .remove(&target_surface_id)
@@ -999,8 +1113,27 @@ impl CompositorState {
         &self,
         include_unmapped_surface_id: Option<u32>,
     ) -> HashMap<u32, LayerGeometry> {
-        let full = LayerLayoutRect::from_output(self.output_size);
+        let outputs = self.layout_output_ids();
+        if outputs.is_empty() {
+            return self.arranged_layer_geometries_on(None, include_unmapped_surface_id);
+        }
+        let mut geometries = HashMap::new();
+        for output_id in outputs {
+            geometries.extend(
+                self.arranged_layer_geometries_on(Some(output_id), include_unmapped_surface_id),
+            );
+        }
+        geometries
+    }
+
+    fn arranged_layer_geometries_on(
+        &self,
+        output_id: Option<OutputId>,
+        include_unmapped_surface_id: Option<u32>,
+    ) -> HashMap<u32, LayerGeometry> {
+        let full = self.output_layout_rect(output_id);
         let mut usable = full;
+        let on_output = |role: &LayerSurfaceRole| self.layer_role_output(role) == output_id;
         let is_active = |surface_id: u32, role: &LayerSurfaceRole| {
             role.mapped
                 || role.initial_configure_sent
@@ -1011,7 +1144,7 @@ impl CompositorState {
             .layer_surfaces
             .iter()
             .filter_map(|(surface_id, role)| {
-                if !role.mapped {
+                if !role.mapped || !on_output(role) {
                     return None;
                 }
                 role.committed
@@ -1028,14 +1161,16 @@ impl CompositorState {
             usable.reserve(edge, state.reservation_extent(edge));
         }
 
-        let mut remaining =
-            self.layer_surfaces
-                .iter()
-                .filter_map(|(surface_id, role)| {
-                    (is_active(*surface_id, role) && !geometries.contains_key(surface_id))
-                        .then_some((*surface_id, role.committed, role.order))
-                })
-                .collect::<Vec<_>>();
+        let mut remaining = self
+            .layer_surfaces
+            .iter()
+            .filter_map(|(surface_id, role)| {
+                (on_output(role)
+                    && is_active(*surface_id, role)
+                    && !geometries.contains_key(surface_id))
+                .then_some((*surface_id, role.committed, role.order))
+            })
+            .collect::<Vec<_>>();
         remaining.sort_by_key(|(_, state, order)| (state.layer, *order));
         for (surface_id, state, _) in remaining {
             let rect = if state.exclusive_zone == -1 {
@@ -1093,11 +1228,11 @@ impl CompositorState {
 
     fn arrange_layer_surfaces_and_reconfigure_stateful_windows_from(
         &mut self,
-        previous_usable: LayerLayoutRect,
+        previous_usable: Vec<(OutputId, LayerLayoutRect)>,
         cause: LayerArrangeCause,
     ) {
         self.arrange_layer_surfaces(cause);
-        if self.reserved_usable_geometry() != previous_usable {
+        if self.reserved_usable_geometries() != previous_usable {
             let _ = self.reflow_usable_output_geometry();
         }
     }

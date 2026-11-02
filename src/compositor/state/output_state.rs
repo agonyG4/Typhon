@@ -43,6 +43,7 @@ impl CompositorState {
             self.advance_render_generation(RenderGenerationCause::OutputChange);
             self.publish_workspace_state();
         }
+        self.relayout_for_output_topology_change();
         self.reconcile_all_surface_output_memberships();
         Some(output_id)
     }
@@ -68,8 +69,16 @@ impl CompositorState {
             }
         }
         self.send_xdg_output_geometry_to_bound_outputs();
+        self.relayout_for_output_topology_change();
         self.reconcile_all_surface_output_memberships();
         true
+    }
+
+    /// Re-arranges layer surfaces and every workspace's windows after an output
+    /// appeared, disappeared or moved.
+    pub(in crate::compositor) fn relayout_for_output_topology_change(&mut self) {
+        self.reconfigure_layer_surfaces_for_output_change();
+        let _ = self.reflow_usable_output_geometry();
     }
 
     pub(in crate::compositor) fn set_output_physical_size_mm(

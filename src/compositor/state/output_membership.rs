@@ -289,6 +289,7 @@ impl CompositorState {
             let _ = self.focus_topmost_renderable_toplevel();
         }
         self.publish_workspace_state();
+        self.relayout_for_output_topology_change();
         self.scrub_empty_surface_output_memberships();
         debug_assert!(self.check_surface_output_membership_invariants());
         debug_assert!(self.check_output_binding_invariants());

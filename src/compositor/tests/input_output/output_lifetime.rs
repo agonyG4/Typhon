@@ -516,3 +516,70 @@ fn each_output_shows_its_own_workspace_and_activation_follows_ownership() {
     assert!(server.activate_workspace(workspace(2)).is_changed());
     assert_eq!(server.output_workspace(native), Some(workspace(2)));
 }
+
+#[test]
+fn windows_on_another_outputs_workspace_open_and_maximize_within_that_output() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let (reply, output_id) = mpsc::channel();
+    commands
+        .send(ServerCommand::AddLogicalOutput {
+            name: "DP-2",
+            position: (1280, 0),
+            size: (1920, 1080),
+            reply,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    output_id.recv().unwrap().expect("additional output id");
+    // Workspace 2 is shown on DP-2; activating it focuses that output.
+    commands
+        .send(ServerCommand::ActivateWorkspace { workspace: 2 })
+        .unwrap();
+    wait_for_server_commands(&commands);
+
+    let connection = Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let (surface, _xdg_surface, _toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 300, 200).unwrap();
+    surface.commit();
+    connection.flush().unwrap();
+    let mut client_state = RegistryTestState::default();
+    queue.roundtrip(&mut client_state).unwrap();
+    wait_for_server_commands(&commands);
+
+    let root_surface_id = capture_renderable_surface_snapshot(&commands)
+        .into_iter()
+        .find(|surface| surface.parent_surface_id.is_none())
+        .expect("mapped XDG root")
+        .surface_id;
+    let initial = capture_root_window_geometry(&commands, root_surface_id).expect("initial frame");
+    assert!(
+        initial.placement.local_x >= 1280,
+        "a new window on DP-2's workspace opens on DP-2: {initial:?}"
+    );
+
+    commands.send(ServerCommand::ToggleMaximizeFocused).unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut client_state).unwrap();
+    wait_for_server_commands(&commands);
+    let maximized =
+        capture_root_window_geometry(&commands, root_surface_id).expect("maximized frame");
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    assert_eq!(
+        (client_state.toplevel_width, client_state.toplevel_height),
+        (1920, 1080)
+    );
+    assert_eq!(
+        (maximized.placement.local_x, maximized.placement.local_y),
+        (1280, 0)
+    );
+}

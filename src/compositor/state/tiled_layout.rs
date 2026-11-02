@@ -64,7 +64,7 @@ impl CompositorState {
         management: crate::wm::WindowManagementState,
     ) -> bool {
         let location = management.location();
-        let root = self.layout_root_rect();
+        let root = self.layout_root_rect_for(location);
         let mut snapshots = self.layout_snapshots(location);
         let Some(window) = self.window(window_id).cloned() else {
             return false;
@@ -121,7 +121,7 @@ impl CompositorState {
             .management
             .filter(|management| management.layout() == LayoutMembership::Tiled)?;
         let location = management.location();
-        let root = self.layout_root_rect();
+        let root = self.layout_root_rect_for(location);
         let mut candidate_tree = self.tiled_layout.tree(location)?.clone();
         candidate_tree.remove(window_id).ok()?;
         let snapshots = self.candidate_layout_snapshots_for_tree(&candidate_tree);
@@ -173,9 +173,9 @@ impl CompositorState {
     }
 
     fn reflow_tiled_locations(&mut self, locations: &[WorkspaceLocation]) -> bool {
-        let root = self.layout_root_rect();
         let mut plans = Vec::with_capacity(locations.len());
         for location in locations {
+            let root = self.layout_root_rect_for(*location);
             let snapshots = self.layout_snapshots(*location);
             let Ok(plan) = self.tiled_layout.calculate(*location, root, &snapshots) else {
                 return false;
@@ -208,7 +208,7 @@ impl CompositorState {
             .tiled_layout
             .calculate(
                 location,
-                self.layout_root_rect(),
+                self.layout_root_rect_for(location),
                 &self.layout_snapshots(location),
             )
             .ok()?;
@@ -260,7 +260,7 @@ impl CompositorState {
             return false;
         };
         self.cancel_tiled_resize_for_location(location, WindowInteractionEndReason::ExplicitCancel);
-        let root = self.layout_root_rect();
+        let root = self.layout_root_rect_for(location);
         let snapshots = self.layout_snapshots(location);
         match self.tiled_layout.calculate(location, root, &snapshots) {
             Ok(solution) => {
@@ -297,7 +297,7 @@ impl CompositorState {
             return false;
         };
         let location = management.location();
-        let fallback_root = self.layout_root_rect();
+        let fallback_root = self.layout_root_rect_for(location);
         let restore = window
             .floating_geometry
             .or_else(|| {
@@ -418,9 +418,10 @@ impl CompositorState {
                 return None;
             }
         }
-        let root = self.layout_root_rect();
         let mut fallback_windows = Vec::new();
+        let mut fallback_roots = HashMap::new();
         for location in affected.iter().copied() {
+            let root = self.layout_root_rect_for(location);
             loop {
                 let tree = candidate_trees.get(&location)?;
                 let snapshots = self.candidate_layout_snapshots_for_tree(tree);
@@ -443,10 +444,12 @@ impl CompositorState {
                     return None;
                 }
                 fallback_windows.push(window_id);
+                fallback_roots.insert(window_id, root);
             }
         }
         let mut final_solutions = HashMap::new();
         for location in affected.iter().copied() {
+            let root = self.layout_root_rect_for(location);
             let tree = candidate_trees.get(&location)?;
             let snapshots = self.candidate_layout_snapshots_for_tree(tree);
             let Ok(solution) = TiledLayoutManager::calculate_tree(tree, location, root, &snapshots)
@@ -461,6 +464,10 @@ impl CompositorState {
             .iter()
             .filter_map(|window_id| {
                 let window = self.window(*window_id)?;
+                let root = fallback_roots
+                    .get(window_id)
+                    .copied()
+                    .unwrap_or_else(|| self.layout_root_rect());
                 let geometry = window
                     .floating_geometry
                     .or_else(|| self.current_visual_root_window_geometry(window.root_surface_id))
@@ -597,13 +604,13 @@ impl CompositorState {
         let locations = self.tiled_layout.locations().collect::<Vec<_>>();
         let location_count = locations.len();
         self.reconfigure_stateful_windows_for_output_size();
-        let root = self.layout_root_rect();
         let mut prepared = Vec::new();
         for location in locations {
             if !self.location_is_visible_for_layout(location) {
                 self.tiled_layout_dirty.insert(location);
                 continue;
             }
+            let root = self.layout_root_rect_for(location);
             let Some(candidate) = self.prepare_location_reflow(location, root) else {
                 let scene_effect = self.finish_layout_reflow_batch();
                 return scene_effect;
@@ -721,37 +728,51 @@ impl CompositorState {
         }
     }
 
+    /// Tiling root of the focused output.
     pub(in crate::compositor) fn layout_root_rect(&self) -> LayoutRect {
-        let usable = self.usable_output_geometry();
-        let x = if usable.x.is_finite() {
-            usable
-                .x
-                .round()
-                .clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
-        } else {
-            0
-        };
-        let y = if usable.y.is_finite() {
-            usable
-                .y
-                .round()
-                .clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
-        } else {
-            0
-        };
-        let width = if usable.width.is_finite() {
-            usable.width.round().clamp(1.0, f64::from(u32::MAX)) as u32
-        } else {
-            1
-        };
-        let height = if usable.height.is_finite() {
-            usable.height.round().clamp(1.0, f64::from(u32::MAX)) as u32
-        } else {
-            1
-        };
-        LayoutRect::new(x, y, width, height).expect("layout root dimensions are positive")
+        layout_root_rect_from(self.usable_output_geometry())
     }
 
+    /// Tiling root of the output that shows `location`.
+    pub(in crate::compositor) fn layout_root_rect_for(
+        &self,
+        location: WorkspaceLocation,
+    ) -> LayoutRect {
+        layout_root_rect_from(self.usable_output_geometry_for_location(location))
+    }
+}
+
+fn layout_root_rect_from(usable: OutputRect) -> LayoutRect {
+    let x = if usable.x.is_finite() {
+        usable
+            .x
+            .round()
+            .clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
+    } else {
+        0
+    };
+    let y = if usable.y.is_finite() {
+        usable
+            .y
+            .round()
+            .clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
+    } else {
+        0
+    };
+    let width = if usable.width.is_finite() {
+        usable.width.round().clamp(1.0, f64::from(u32::MAX)) as u32
+    } else {
+        1
+    };
+    let height = if usable.height.is_finite() {
+        usable.height.round().clamp(1.0, f64::from(u32::MAX)) as u32
+    } else {
+        1
+    };
+    LayoutRect::new(x, y, width, height).expect("layout root dimensions are positive")
+}
+
+impl CompositorState {
     pub(in crate::compositor) fn layout_snapshots(
         &self,
         location: WorkspaceLocation,

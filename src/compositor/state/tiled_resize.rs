@@ -55,7 +55,7 @@ impl CompositorState {
             .tiled_layout
             .calculate(
                 location,
-                self.layout_root_rect(),
+                self.layout_root_rect_for(location),
                 &self.layout_snapshots(location),
             )
             .ok()?;
@@ -235,7 +235,7 @@ impl CompositorState {
             crate::wm::layout::TiledLayoutManager::calculate_tree_with_ratio_overrides(
                 tree,
                 session.location,
-                self.layout_root_rect(),
+                self.layout_root_rect_for(session.location),
                 &snapshots,
                 &overrides,
             )

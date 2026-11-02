@@ -129,11 +129,22 @@ impl CompositorState {
         surface_id: u32,
         mode: ToplevelMode,
     ) -> WindowGeometry {
+        // A window on another output's workspace maximizes and goes fullscreen
+        // within that output.
+        let location = self
+            .window_id_for_surface(self.root_surface_id_for_surface(surface_id))
+            .and_then(|window_id| self.workspace_owner_window_id(window_id))
+            .and_then(|window_id| self.window(window_id))
+            .and_then(|window| window.management)
+            .map(|management| management.location());
         if mode == ToplevelMode::Maximized
             && self.target_decoration_mode_for_surface(surface_id, mode)
                 == crate::compositor::decoration::types::DecorationMode::ServerSide
         {
-            let usable = self.usable_output_geometry();
+            let usable = location.map_or_else(
+                || self.usable_output_geometry(),
+                |location| self.usable_output_geometry_for_location(location),
+            );
             let titlebar = self.decoration_theme.metrics().titlebar_height as f64;
             let titlebar = titlebar.min(usable.height).max(0.0) as u32;
             return WindowGeometry::new(
@@ -145,7 +156,48 @@ impl CompositorState {
                 (usable.height as u32).saturating_sub(titlebar),
             );
         }
-        self.window_geometry_for_mode(mode)
+        match (mode, location) {
+            (ToplevelMode::Maximized, Some(location)) => {
+                self.maximized_window_geometry_for(location)
+            }
+            (ToplevelMode::Fullscreen, Some(location)) => {
+                self.fullscreen_window_geometry_for(location)
+            }
+            _ => self.window_geometry_for_mode(mode),
+        }
+    }
+
+    pub(in crate::compositor) fn maximized_window_geometry_for(
+        &self,
+        location: crate::wm::WorkspaceLocation,
+    ) -> WindowGeometry {
+        let usable = self.usable_output_geometry_for_location(location);
+        WindowGeometry::new(
+            SurfacePlacement::absolute_root_at(usable.x as i32, usable.y as i32),
+            usable.width as u32,
+            usable.height as u32,
+        )
+    }
+
+    /// Fullscreen covers the whole output. The native output keeps its
+    /// origin-anchored mode size; other outputs use their logical rectangle.
+    pub(in crate::compositor) fn fullscreen_window_geometry_for(
+        &self,
+        location: crate::wm::WorkspaceLocation,
+    ) -> WindowGeometry {
+        let output = self
+            .output_for_location(location)
+            .filter(|output_id| Some(*output_id) != self.native_output_id())
+            .and_then(|output_id| self.logical_output(output_id));
+        let Some(output) = output else {
+            return self.fullscreen_window_geometry();
+        };
+        let (width, height) = output.logical_size();
+        WindowGeometry::new(
+            SurfacePlacement::absolute_root_at(output.position.0, output.position.1),
+            width.max(1) as u32,
+            height.max(1) as u32,
+        )
     }
 
     pub(in crate::compositor) fn maximized_window_geometry(&self) -> WindowGeometry {
