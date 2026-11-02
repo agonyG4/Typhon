@@ -4,8 +4,42 @@ const MAX_PERF_RECORDS_PER_PROCESS: u64 = 50_000;
 static PERF_RECORDS_EMITTED: AtomicU64 = AtomicU64::new(0);
 static PERF_RECORDS_SUPPRESSED: AtomicU64 = AtomicU64::new(0);
 
+static PERF_EVENT_FILTER: std::sync::OnceLock<Option<Vec<String>>> = std::sync::OnceLock::new();
+
 const fn perf_record_allowed(record: u64) -> bool {
     record < MAX_PERF_RECORDS_PER_PROCESS
+}
+
+/// `OBLIVION_ONE_PERF_LOG_EVENTS`: comma-separated event-name prefixes. When
+/// set, only matching events are logged, and the rest neither print nor count
+/// toward the per-process record cap, so a focused trace can run for hours.
+fn parse_perf_event_filter(value: Option<&str>) -> Option<Vec<String>> {
+    let prefixes = value?
+        .split(',')
+        .map(str::trim)
+        .filter(|prefix| !prefix.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    (!prefixes.is_empty()).then_some(prefixes)
+}
+
+fn perf_event_selected_by(filter: Option<&[String]>, event: &str) -> bool {
+    filter.is_none_or(|prefixes| {
+        prefixes
+            .iter()
+            .any(|prefix| event.starts_with(prefix.as_str()))
+    })
+}
+
+fn perf_event_selected(event: &str) -> bool {
+    let filter = PERF_EVENT_FILTER.get_or_init(|| {
+        parse_perf_event_filter(
+            std::env::var("OBLIVION_ONE_PERF_LOG_EVENTS")
+                .ok()
+                .as_deref(),
+        )
+    });
+    perf_event_selected_by(filter.as_deref(), event)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,7 +63,7 @@ impl NativePerfLogger {
     where
         F: FnOnce() -> Vec<NativePerfField>,
     {
-        if self.enabled {
+        if self.enabled && perf_event_selected(event) {
             let record = PERF_RECORDS_EMITTED.fetch_add(1, Ordering::Relaxed);
             if perf_record_allowed(record) {
                 println!("{}", native_perf_line(event, &fields()));
@@ -334,7 +368,7 @@ pub(crate) fn parse_proc_stat_cpu_ticks(stat: &str) -> Option<NativeProcessCpuSa
 
 #[cfg(test)]
 mod tests {
-    use super::perf_record_allowed;
+    use super::{parse_perf_event_filter, perf_event_selected_by, perf_record_allowed};
 
     #[test]
     fn perf_output_budget_is_bounded_for_high_rate_events() {
@@ -342,5 +376,35 @@ mod tests {
             .filter(|record| perf_record_allowed(*record))
             .count();
         assert_eq!(allowed, 50_000);
+    }
+
+    #[test]
+    fn perf_event_filter_selects_by_prefix_and_defaults_to_everything() {
+        assert!(perf_event_selected_by(None, "native.scheduler"));
+        let filter =
+            parse_perf_event_filter(Some(" native.vrr ,, native.output_presentation_policy "));
+        assert_eq!(
+            filter.as_deref(),
+            Some(
+                &[
+                    "native.vrr".to_owned(),
+                    "native.output_presentation_policy".to_owned()
+                ][..]
+            )
+        );
+        assert!(perf_event_selected_by(
+            filter.as_deref(),
+            "native.vrr_cadence"
+        ));
+        assert!(perf_event_selected_by(
+            filter.as_deref(),
+            "native.output_presentation_policy"
+        ));
+        assert!(!perf_event_selected_by(
+            filter.as_deref(),
+            "native.scheduler"
+        ));
+        assert_eq!(parse_perf_event_filter(Some(" , ")), None);
+        assert_eq!(parse_perf_event_filter(None), None);
     }
 }
