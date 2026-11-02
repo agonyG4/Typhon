@@ -446,6 +446,59 @@ fn variable_pageflip_consumes_exactly_its_reserved_id_after_short_and_long_inter
 }
 
 #[test]
+fn variable_pageflip_after_an_intervening_cursor_refresh_claims_the_later_opportunity() {
+    let anchor = MonotonicTimestampNs::new(1_000_000_000);
+    let mut deadline = PresentationDeadlinePlanner::new(std::time::Duration::from_nanos(6_060_606));
+    deadline.note_presented(anchor);
+    let reserved_id = deadline
+        .next_variable_opportunity_id()
+        .expect("next sequence is available");
+    let reservation = variable_reservation(
+        reserved_id,
+        anchor,
+        MonotonicTimestampNs::new(anchor.get() + 6_060_606),
+        None,
+    );
+
+    // A cursor-only commit refreshes the panel while the primary renders.
+    let cursor = deadline.prepare_presented(MonotonicTimestampNs::new(anchor.get() + 6_099_000));
+    deadline.commit_presented(cursor);
+    assert_eq!(cursor.logical_sequence(), reserved_id.sequence());
+
+    let presented_at = MonotonicTimestampNs::new(anchor.get() + 12_169_000);
+    let prepared = prepare_physical_presentation_for_reservation(
+        &deadline,
+        crate::native_output::presentation::transaction::FramePresentationReservation::Variable(
+            reservation,
+        ),
+        pageflip_timestamp(presented_at, 2_999),
+    )
+    .expect("a cursor refresh before the pageflip is not a violation");
+    assert_eq!(prepared.claim().sequence, reserved_id.sequence() + 1);
+
+    let ahead = variable_reservation(
+        oblivion_one::native::buffering::PresentationOpportunityId::new(
+            reserved_id.clock_generation(),
+            reserved_id.sequence() + 5,
+        ),
+        anchor,
+        MonotonicTimestampNs::new(anchor.get() + 6_060_606),
+        None,
+    );
+    assert!(
+        prepare_physical_presentation_for_reservation(
+            &deadline,
+            crate::native_output::presentation::transaction::FramePresentationReservation::Variable(
+                ahead,
+            ),
+            pageflip_timestamp(presented_at, 2_999),
+        )
+        .is_err(),
+        "a pageflip cannot land before the opportunity it reserved"
+    );
+}
+
+#[test]
 fn variable_render_fence_timing_never_produces_a_fixed_deadline_miss() {
     let reservation =
         crate::native_output::presentation::transaction::VariablePresentationReservation::try_new(

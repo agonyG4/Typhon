@@ -341,7 +341,15 @@ fn prepare_variable_physical_claim(
     let prepared = deadline
         .prepare_variable_presented(presented_at)
         .ok_or_else(|| io::Error::other("variable physical opportunity sequence is exhausted"))?;
-    if prepared.claim().opportunity_id() != variable.opportunity().id() {
+    let actual = prepared.claim().opportunity_id();
+    let reserved = variable.opportunity().id();
+    // Under VRR a cursor-only commit that completes between the reservation
+    // and this pageflip is a physical refresh of its own and consumes the
+    // reserved opportunity. The pageflip then lands on a later opportunity;
+    // only an earlier one or another clock generation is a violation.
+    if actual.clock_generation() != reserved.clock_generation()
+        || actual.sequence() < reserved.sequence()
+    {
         return Err(io::Error::other(
             "variable pageflip physical opportunity does not match its reservation",
         ));
