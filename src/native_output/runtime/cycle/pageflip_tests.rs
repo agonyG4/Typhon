@@ -179,7 +179,9 @@ fn variable_pageflip_rejects_physical_time_before_its_reserved_lower_bound() {
         earliest_present,
         Some(presentation_not_before),
     );
-    let materially_early = MonotonicTimestampNs::new(anchor.get() + 7_000_000);
+    // Past the panel's earliest present but 1.5 ms before the client bound,
+    // beyond what driver timestamp jitter explains.
+    let materially_early = MonotonicTimestampNs::new(anchor.get() + 6_500_000);
 
     let result = prepare_physical_presentation_for_reservation(
         &deadline,
@@ -314,17 +316,20 @@ fn variable_pageflip_tolerates_driver_timestamp_jitter_below_the_lower_bound() {
             ),
         );
 
-    // Observed on NVIDIA under VRR: 21 us early with ~1 us clock uncertainty.
-    let observed = MonotonicTimestampNs::new(earliest_present.get() - 21_012);
-    assert_eq!(
-        validate_variable_physical_time(frame_reservation, pageflip_timestamp(observed, 1_042)),
-        Ok(())
-    );
-    let a_full_millisecond_early = MonotonicTimestampNs::new(earliest_present.get() - 1_000_000);
+    // Observed on NVIDIA under VRR: 21 us and 718 us early with ~1 us clock
+    // uncertainty, both from timestamp noise rather than early scanout.
+    for early_ns in [21_012, 718_148] {
+        let observed = MonotonicTimestampNs::new(earliest_present.get() - early_ns);
+        assert_eq!(
+            validate_variable_physical_time(frame_reservation, pageflip_timestamp(observed, 1_093)),
+            Ok(())
+        );
+    }
+    let two_milliseconds_early = MonotonicTimestampNs::new(earliest_present.get() - 2_000_000);
     assert!(matches!(
         validate_variable_physical_time(
             frame_reservation,
-            pageflip_timestamp(a_full_millisecond_early, 1_042),
+            pageflip_timestamp(two_milliseconds_early, 1_093),
         ),
         Err(VariablePhysicalTimeViolation::EarlierThanLowerBound { .. })
     ));
