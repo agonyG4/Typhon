@@ -86,6 +86,11 @@ fn pageflip_identity(
 }
 
 const DRM_TIMESTAMP_QUANTIZATION_NS: u64 = 1_000;
+/// Scanout-position jitter of driver pageflip timestamps, on top of the
+/// clock-domain uncertainty above. NVIDIA 615 at 165 Hz reports single-refresh
+/// intervals of 5939-6188 us around a 6061 us period (+/-125 us), so the
+/// physical lower bound tolerates twice that before declaring a violation.
+const DRM_PAGEFLIP_TIMESTAMP_JITTER_NS: u64 = 250_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PageflipTimestampUncertainty {
@@ -196,7 +201,11 @@ fn validate_variable_physical_time(
             },
         );
     };
-    if actual_ns.saturating_add(uncertainty_ns) < required_lower_bound.get() {
+    if actual_ns
+        .saturating_add(uncertainty_ns)
+        .saturating_add(DRM_PAGEFLIP_TIMESTAMP_JITTER_NS)
+        < required_lower_bound.get()
+    {
         return Err(VariablePhysicalTimeViolation::EarlierThanLowerBound {
             actual_ns,
             required_lower_bound_ns: required_lower_bound.get(),

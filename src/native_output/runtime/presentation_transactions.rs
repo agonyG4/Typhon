@@ -108,6 +108,27 @@ pub(crate) fn effective_output_presentation(
     )
 }
 
+/// Presentation state for a cursor-only (plane delta) commit. `VRR_ENABLED`
+/// and the content type belong to primary presentation: a plane delta keeps
+/// the state of the last confirmed primary commit instead of deciding its
+/// own, so cursor motion never toggles VRR between primary frames. Async is
+/// mapped to its synchronous counterpart because cursor plane updates are not
+/// allowed in async flips.
+pub(crate) fn plane_delta_presentation(
+    confirmed: ConfirmedKmsPresentationState,
+    output_generation: u64,
+) -> (OutputPresentationMode, DrmContentType) {
+    if confirmed.output_generation != output_generation {
+        return (OutputPresentationMode::Vsync, confirmed.content_type);
+    }
+    let mode = match confirmed.mode {
+        OutputPresentationMode::Async => OutputPresentationMode::Vsync,
+        OutputPresentationMode::AdaptiveAsync => OutputPresentationMode::AdaptiveSync,
+        mode => mode,
+    };
+    (mode, confirmed.content_type)
+}
+
 pub(crate) fn take_client_cursor_presentation_feedback_batch(
     server: &mut OwnCompositorServer,
     presentation_key: Option<oblivion_one::compositor::SurfacePresentationCommitKey>,
@@ -1214,17 +1235,9 @@ pub(super) fn submit_plane_delta(
     cursor_surface_damage: Option<oblivion_one::compositor::SurfaceDamagePresentation>,
     server: &mut OwnCompositorServer,
     cursor_reveal_trace: &mut Option<CursorRevealTraceLedger>,
-    vrr_policy: VrrPolicy,
+    presentation_mode: OutputPresentationMode,
+    content_type: DrmContentType,
 ) -> NativeResult<SchedulerDecision> {
-    let (presentation_mode, content_type) = effective_output_presentation(
-        vrr_policy,
-        server,
-        desired.as_ref().is_some_and(|state| state.visible),
-        Some(kms_backend),
-        output_generation,
-        pacing_mode,
-        true,
-    );
     let cursor_capability_key = desired
         .as_ref()
         .and_then(|state| cursor.capability_key_for(state));
@@ -1567,5 +1580,51 @@ mod teardown_tests {
 
         assert_eq!(callback_cleanup_count.get(), 1);
         assert_eq!(backend_metric_updates.get(), 1);
+    }
+}
+
+#[cfg(test)]
+mod plane_delta_presentation_tests {
+    use super::*;
+
+    fn confirmed(mode: OutputPresentationMode) -> ConfirmedKmsPresentationState {
+        ConfirmedKmsPresentationState {
+            mode,
+            content_type: DrmContentType::Game,
+            output_generation: 3,
+        }
+    }
+
+    #[test]
+    fn plane_delta_keeps_confirmed_vrr_state() {
+        for mode in [
+            OutputPresentationMode::Vsync,
+            OutputPresentationMode::AdaptiveSync,
+        ] {
+            assert_eq!(
+                plane_delta_presentation(confirmed(mode), 3),
+                (mode, DrmContentType::Game)
+            );
+        }
+    }
+
+    #[test]
+    fn plane_delta_never_requests_an_async_flip() {
+        assert_eq!(
+            plane_delta_presentation(confirmed(OutputPresentationMode::Async), 3).0,
+            OutputPresentationMode::Vsync
+        );
+        assert_eq!(
+            plane_delta_presentation(confirmed(OutputPresentationMode::AdaptiveAsync), 3).0,
+            OutputPresentationMode::AdaptiveSync
+        );
+    }
+
+    #[test]
+    fn plane_delta_falls_back_to_vsync_for_a_stale_generation() {
+        assert_eq!(
+            plane_delta_presentation(confirmed(OutputPresentationMode::AdaptiveSync), 4).0,
+            OutputPresentationMode::Vsync
+        );
     }
 }

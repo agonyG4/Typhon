@@ -1107,7 +1107,7 @@ impl NativeRuntime {
                 current_software_cursor_damage,
                 runtime_plane_plan.as_ref(),
                 cursor_reveal_trace,
-                vrr_policy,
+                *confirmed_kms_presentation,
             )?
             else {
                 *queued_redraw_requested = true;

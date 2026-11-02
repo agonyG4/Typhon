@@ -301,6 +301,36 @@ fn variable_pageflip_uses_earliest_as_lower_bound_when_not_before_is_absent() {
 }
 
 #[test]
+fn variable_pageflip_tolerates_driver_timestamp_jitter_below_the_lower_bound() {
+    let anchor = MonotonicTimestampNs::new(1_000_000_000);
+    let earliest_present = MonotonicTimestampNs::new(anchor.get() + 6_060_606);
+    let frame_reservation =
+        crate::native_output::presentation::transaction::FramePresentationReservation::Variable(
+            variable_reservation(
+                oblivion_one::native::buffering::PresentationOpportunityId::new(1, 1),
+                anchor,
+                earliest_present,
+                None,
+            ),
+        );
+
+    // Observed on NVIDIA under VRR: 21 us early with ~1 us clock uncertainty.
+    let observed = MonotonicTimestampNs::new(earliest_present.get() - 21_012);
+    assert_eq!(
+        validate_variable_physical_time(frame_reservation, pageflip_timestamp(observed, 1_042)),
+        Ok(())
+    );
+    let a_full_millisecond_early = MonotonicTimestampNs::new(earliest_present.get() - 1_000_000);
+    assert!(matches!(
+        validate_variable_physical_time(
+            frame_reservation,
+            pageflip_timestamp(a_full_millisecond_early, 1_042),
+        ),
+        Err(VariablePhysicalTimeViolation::EarlierThanLowerBound { .. })
+    ));
+}
+
+#[test]
 fn monotonic_pageflip_timestamp_uncertainty_uses_bracket_and_microsecond_resolution() {
     let estimate = estimate_pageflip_timestamp(
         oblivion_one::native::drm::DrmTimestampClock::Monotonic,

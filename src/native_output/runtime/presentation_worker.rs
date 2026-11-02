@@ -7,7 +7,7 @@ use super::presentation_cursor::{
 };
 use super::presentation_transactions::{
     DirectTerminalCallbackDisposition, direct_terminal_callback_owner_leaks,
-    effective_output_presentation, present_compatibility_frame, settle_failed_output_transaction,
+    plane_delta_presentation, present_compatibility_frame, settle_failed_output_transaction,
     submit_plane_delta,
 };
 use super::*;
@@ -1217,9 +1217,11 @@ pub(super) fn present_cursor_for_presentation(
     current_software_cursor_damage: Option<NativeDamageRect>,
     plane_plan: Option<&RuntimePlanePlan>,
     cursor_reveal_trace: &mut Option<CursorRevealTraceLedger>,
-    vrr_policy: VrrPolicy,
+    confirmed_presentation: ConfirmedKmsPresentationState,
 ) -> NativeResult<Option<SchedulerDecision>> {
     let admitted_at_ns = monotonic_now_ns()?;
+    let (presentation_mode, content_type) =
+        plane_delta_presentation(confirmed_presentation, output_generation);
     let cursor_surface_damage = desired
         .as_ref()
         .filter(|state| state.visible)
@@ -1238,15 +1240,6 @@ pub(super) fn present_cursor_for_presentation(
     if worker_mode {
         let worker = worker.ok_or_else(|| io::Error::other("worker transport has no worker"))?;
         let cursor_delivery = presented_delivery_for_plan(plane_plan, &desired);
-        let (presentation_mode, content_type) = effective_output_presentation(
-            vrr_policy,
-            server,
-            desired.as_ref().is_some_and(|state| state.visible),
-            Some(kms_backend),
-            output_generation,
-            pacing_mode,
-            true,
-        );
         let trace_snapshot = if crate::pointer_debug::cursor_presentation_trace_enabled() {
             let trace_state = desired.clone().unwrap_or_else(|| {
                 let mut hidden = cursor.desired().clone();
@@ -1331,7 +1324,8 @@ pub(super) fn present_cursor_for_presentation(
         cursor_surface_damage,
         server,
         cursor_reveal_trace,
-        vrr_policy,
+        presentation_mode,
+        content_type,
     )?;
     if decision == SchedulerDecision::WaitForPageFlip {
         *last_submitted_cursor_epoch = cursor_epoch;

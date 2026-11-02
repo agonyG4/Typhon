@@ -369,7 +369,7 @@ impl NativeRuntime {
             None,
             None,
             &mut self.cursor_reveal_trace,
-            self.vrr_policy,
+            self.head.confirmed_kms_presentation,
         )?;
         if decision.is_some() {
             self.arm_runtime_deadline()?;
