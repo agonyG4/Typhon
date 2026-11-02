@@ -518,6 +518,47 @@ fn variable_claim_may_trail_but_never_precede_its_reservation() {
 }
 
 #[test]
+fn late_anchor_timestamp_excuses_a_lower_bound_violation_spanning_two_refreshes() {
+    use crate::native_output::presentation::transaction::FramePresentationReservation;
+    // Live NVIDIA sequence: presents at -12.240, -4.758 (late anchor), 0 ms.
+    let before_anchor = 1_000_000_000;
+    let anchor = MonotonicTimestampNs::new(before_anchor + 7_482_000);
+    let actual = before_anchor + 12_240_000;
+    let reservation = FramePresentationReservation::Variable(variable_reservation(
+        oblivion_one::native::buffering::PresentationOpportunityId::new(1, 2),
+        anchor,
+        MonotonicTimestampNs::new(anchor.get() + 6_060_606),
+        None,
+    ));
+    assert_eq!(variable_anchor(reservation), Some(anchor));
+    assert!(late_anchor_explains_violation(
+        reservation,
+        actual,
+        Some(before_anchor)
+    ));
+    // Two flips faster than the panel allows are a real violation.
+    assert!(!late_anchor_explains_violation(
+        reservation,
+        before_anchor + 10_000_000,
+        Some(before_anchor)
+    ));
+    // Without a predecessor there is no evidence of a late anchor.
+    assert!(!late_anchor_explains_violation(reservation, actual, None));
+    // A client not-before bound past the panel bound is never excused.
+    let client_bound = FramePresentationReservation::Variable(variable_reservation(
+        oblivion_one::native::buffering::PresentationOpportunityId::new(1, 2),
+        anchor,
+        MonotonicTimestampNs::new(anchor.get() + 6_060_606),
+        Some(MonotonicTimestampNs::new(anchor.get() + 9_000_000)),
+    ));
+    assert!(!late_anchor_explains_violation(
+        client_bound,
+        actual,
+        Some(before_anchor)
+    ));
+}
+
+#[test]
 fn variable_render_fence_timing_never_produces_a_fixed_deadline_miss() {
     let reservation =
         crate::native_output::presentation::transaction::VariablePresentationReservation::try_new(

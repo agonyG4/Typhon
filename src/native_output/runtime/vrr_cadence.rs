@@ -12,6 +12,7 @@ use crate::native_output::scanout::VariableReservationFallback;
 use oblivion_one::compositor::{OutputPresentationMode, VrrPolicy};
 
 const RECENT_INTERVALS: usize = 16;
+const RECENT_PRESENTS: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum VrrRangeSource {
@@ -166,6 +167,8 @@ pub(crate) struct VrrCadenceCounters {
 pub(crate) struct VrrCadenceRecorder {
     range: VrrRange,
     last_physical_present_ns: Option<u64>,
+    /// Latest physical presents, newest last; feeds late-anchor checks.
+    recent_presents_ns: [Option<u64>; RECENT_PRESENTS],
     last_primary_present_ns: Option<u64>,
     last_cursor_present_ns: Option<u64>,
     recent_physical_intervals: IntervalRing,
@@ -181,6 +184,7 @@ impl VrrCadenceRecorder {
         Self {
             range,
             last_physical_present_ns: None,
+            recent_presents_ns: [None; RECENT_PRESENTS],
             last_primary_present_ns: None,
             last_cursor_present_ns: None,
             recent_physical_intervals: IntervalRing::default(),
@@ -214,6 +218,16 @@ impl VrrCadenceRecorder {
     pub(crate) fn longest_interval(&self) -> Option<std::time::Duration> {
         self.longest_interval_ns()
             .map(std::time::Duration::from_nanos)
+    }
+
+    /// Latest recorded physical presentation strictly before `before_ns`.
+    pub(crate) fn latest_present_before(&self, before_ns: u64) -> Option<u64> {
+        self.recent_presents_ns
+            .iter()
+            .flatten()
+            .copied()
+            .filter(|present| *present < before_ns)
+            .max()
     }
 
     /// Records the timing domain chosen for one composited frame. Frames whose
@@ -251,6 +265,8 @@ impl VrrCadenceRecorder {
             }
         }
         self.last_physical_present_ns = Some(now);
+        self.recent_presents_ns.rotate_left(1);
+        self.recent_presents_ns[RECENT_PRESENTS - 1] = Some(now);
         match observation.kind {
             VrrPresentKind::Primary => {
                 if let Some(previous) = self.last_primary_present_ns
@@ -592,6 +608,23 @@ mod tests {
             recorder.last_fixed_fallback,
             Some(VariableReservationFallback::CommitTiming)
         );
+    }
+
+    #[test]
+    fn latest_present_before_searches_recent_presents() {
+        let mut recorder = VrrCadenceRecorder::new(VrrRange::discover(165_000, None, None));
+        assert_eq!(recorder.latest_present_before(u64::MAX), None);
+        for at in [100, 200, 300, 400, 500] {
+            recorder.observe_present(present(
+                VrrPresentKind::Primary,
+                at,
+                OutputPresentationMode::AdaptiveSync,
+            ));
+        }
+        assert_eq!(recorder.latest_present_before(450), Some(400));
+        assert_eq!(recorder.latest_present_before(400), Some(300));
+        // Only the latest four presents are retained.
+        assert_eq!(recorder.latest_present_before(200), None);
     }
 
     #[test]

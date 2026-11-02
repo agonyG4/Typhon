@@ -187,6 +187,65 @@ fn variable_presentation_lower_bound(
     )
 }
 
+/// NVIDIA occasionally stamps a VRR flip 1-2.5 ms late; the next flip, ready
+/// at the minimum interval, then looks early against that late anchor (live:
+/// intervals 7.48 + 4.76 ms, exactly two refreshes). A lower-bound violation
+/// is explained by a late anchor when the flip still lies two shortest
+/// intervals after the present before the anchor. A client not-before bound
+/// later than the panel bound is never excused.
+/// The recorder's timestamp of the anchor present may differ from the
+/// reservation anchor by clock-domain rounding; search strictly before it.
+const LATE_ANCHOR_SEARCH_MARGIN_NS: u64 = 1_000_000;
+
+fn variable_anchor(
+    reservation: crate::native_output::presentation::transaction::FramePresentationReservation,
+) -> Option<MonotonicTimestampNs> {
+    let crate::native_output::presentation::transaction::FramePresentationReservation::Variable(
+        variable,
+    ) = reservation
+    else {
+        return None;
+    };
+    match variable.timing() {
+        oblivion_one::native::presentation_timing::PresentationTiming::VrrWindow {
+            anchor, ..
+        } => Some(anchor),
+        _ => None,
+    }
+}
+
+fn late_anchor_explains_violation(
+    reservation: crate::native_output::presentation::transaction::FramePresentationReservation,
+    actual_ns: u64,
+    present_before_anchor_ns: Option<u64>,
+) -> bool {
+    let crate::native_output::presentation::transaction::FramePresentationReservation::Variable(
+        variable,
+    ) = reservation
+    else {
+        return false;
+    };
+    let oblivion_one::native::presentation_timing::PresentationTiming::VrrWindow {
+        earliest_present,
+        presentation_not_before,
+        shortest_interval,
+        ..
+    } = variable.timing()
+    else {
+        return false;
+    };
+    if presentation_not_before.is_some_and(|not_before| not_before > earliest_present) {
+        return false;
+    }
+    let Ok(shortest_ns) = u64::try_from(shortest_interval.as_nanos()) else {
+        return false;
+    };
+    present_before_anchor_ns.is_some_and(|before| {
+        actual_ns.saturating_add(DRM_PAGEFLIP_TIMESTAMP_JITTER_NS)
+            >= before.saturating_add(shortest_ns.saturating_mul(2))
+    })
+}
+
 fn validate_variable_physical_time(
     reservation: crate::native_output::presentation::transaction::FramePresentationReservation,
     timestamp: PageflipTimestampEstimate,
@@ -3140,10 +3199,21 @@ impl NativeRuntime {
                             PageflipTimestampUncertainty::Unbounded => None,
                         };
                         let reason = format!("{violation:?}");
-                        let vrr_rejected = explicit.note_variable_pageflip_violation(
-                            output_epoch.get(),
-                            compositor_receive_ns,
-                        );
+                        let late_anchor = variable_anchor(pending_identity.frame.reservation)
+                            .is_some_and(|anchor| {
+                                late_anchor_explains_violation(
+                                    pending_identity.frame.reservation,
+                                    presented_at_ns,
+                                    vrr_cadence.latest_present_before(
+                                        anchor.get().saturating_sub(LATE_ANCHOR_SEARCH_MARGIN_NS),
+                                    ),
+                                )
+                            });
+                        let vrr_rejected = !late_anchor
+                            && explicit.note_variable_pageflip_violation(
+                                output_epoch.get(),
+                                compositor_receive_ns,
+                            );
                         frame_pacing.log(
                             "vrr_physical_lower_bound_violation",
                             vec![
@@ -3159,6 +3229,7 @@ impl NativeRuntime {
                                     timestamp_uncertainty_ns,
                                 ),
                                 PacingField::str("reason", reason.clone()),
+                                PacingField::bool("late_anchor", late_anchor),
                                 PacingField::bool("vrr_rejected", vrr_rejected),
                             ],
                         );
@@ -3182,6 +3253,7 @@ impl NativeRuntime {
                                     ),
                                 ),
                                 NativePerfField::str("reason", reason),
+                                NativePerfField::bool("late_anchor", late_anchor),
                                 NativePerfField::bool("vrr_rejected", vrr_rejected),
                             ]
                         });
