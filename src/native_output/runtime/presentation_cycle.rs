@@ -1089,6 +1089,7 @@ impl NativeRuntime {
             let (cursor_target, cursor_submit_window) =
                 (opportunity.target, Some(opportunity.submit_window));
             #[rustfmt::skip] let validation_base = require_validation_base!(validation_base_context, queued_redraw_requested);
+            let cursor_pending_since_ns = cursor_output_arbitration.pending_since_ns();
             let Some(decision) = present_cursor_for_presentation(
                 worker_mode,
                 kms_commit_worker.as_ref(),
@@ -1128,6 +1129,7 @@ impl NativeRuntime {
                 *queued_redraw_requested = true;
                 return Ok(());
             };
+            vrr_cadence.note_cursor_plane_delta_submitted(cursor_pending_since_ns);
             scheduler_decision = decision;
         }
         let can_queue_worker_next = super::presentation_worker::can_queue_worker_primary(

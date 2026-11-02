@@ -45,6 +45,7 @@ Environment:
   OBLIVION_ONE_BINARY    optional release binary path (default: repo target/release/oblivion-one)
   OBLIVION_ONE_PERF_LOG  set to 1/true/debug to emit structured native perf logs
   OBLIVION_ONE_PERF_LOG_EVENTS  comma-separated event prefixes to log (e.g. native.vrr); others skip the 50k cap
+  OBLIVION_ONE_VRR_CURSOR_RETARGET=off  keep VRR cursor service on the fixed refresh grid (A/B)
   OBLIVION_ONE_LOG_FILE  native-session log path (default: ~/.local/state/oblivion-one/session.log)
   OBLIVION_ONE_LOG_ROTATE_BYTES  move the log to <log>.1 at launch when larger than N bytes (default: 33554432; 0 disables)
 

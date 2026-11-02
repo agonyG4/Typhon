@@ -176,6 +176,10 @@ pub(crate) struct VrrCadenceRecorder {
     quiescent_since_ns: Option<u64>,
     last_confirmed_vrr: Option<bool>,
     last_fixed_fallback: Option<VariableReservationFallback>,
+    /// Pending-since time of the cursor plane delta in flight.
+    cursor_submitted_pending_since_ns: Option<u64>,
+    /// Pointer-change-to-pageflip age of the latest cursor-only present.
+    last_cursor_age_ns: Option<u64>,
     counters: VrrCadenceCounters,
 }
 
@@ -192,6 +196,8 @@ impl VrrCadenceRecorder {
             quiescent_since_ns: None,
             last_confirmed_vrr: None,
             last_fixed_fallback: None,
+            cursor_submitted_pending_since_ns: None,
+            last_cursor_age_ns: None,
             counters: VrrCadenceCounters::default(),
         }
     }
@@ -228,6 +234,12 @@ impl VrrCadenceRecorder {
             .copied()
             .filter(|present| *present < before_ns)
             .max()
+    }
+
+    /// Records when the cursor change carried by a submitted cursor-only
+    /// plane delta first became pending.
+    pub(crate) fn note_cursor_plane_delta_submitted(&mut self, pending_since_ns: Option<u64>) {
+        self.cursor_submitted_pending_since_ns = pending_since_ns;
     }
 
     /// Records the timing domain chosen for one composited frame. Frames whose
@@ -286,6 +298,10 @@ impl VrrCadenceRecorder {
             }
             VrrPresentKind::CursorOnly => {
                 self.last_cursor_present_ns = Some(now);
+                self.last_cursor_age_ns = self
+                    .cursor_submitted_pending_since_ns
+                    .take()
+                    .map(|since| now.saturating_sub(since));
                 if self.quiescent_since_ns.is_none() {
                     self.quiescent_since_ns = self.last_primary_present_ns;
                 }
@@ -377,6 +393,7 @@ impl VrrCadenceRecorder {
                 self.last_cursor_present_ns.unwrap_or(0),
             ),
             NativePerfField::u64("quiescent_since_ns", self.quiescent_since_ns.unwrap_or(0)),
+            NativePerfField::u64("cursor_age_ns", self.last_cursor_age_ns.unwrap_or(0)),
             NativePerfField::bool("primary_pending", observation.primary_pending),
             NativePerfField::bool("cursor_pending", observation.cursor_pending),
             NativePerfField::bool("service_due", service_due),
@@ -625,6 +642,19 @@ mod tests {
         assert_eq!(recorder.latest_present_before(400), Some(300));
         // Only the latest four presents are retained.
         assert_eq!(recorder.latest_present_before(200), None);
+    }
+
+    #[test]
+    fn cursor_age_spans_pending_change_to_cursor_pageflip() {
+        let mut recorder = VrrCadenceRecorder::new(VrrRange::discover(165_000, None, None));
+        let mode = OutputPresentationMode::AdaptiveSync;
+        recorder.note_cursor_plane_delta_submitted(Some(1_000_000));
+        recorder.observe_present(present(VrrPresentKind::Primary, 2_000_000, mode));
+        recorder.observe_present(present(VrrPresentKind::CursorOnly, 4_500_000, mode));
+        assert_eq!(recorder.last_cursor_age_ns, Some(3_500_000));
+        // A cursor present without a recorded submission has no age.
+        recorder.observe_present(present(VrrPresentKind::CursorOnly, 9_000_000, mode));
+        assert_eq!(recorder.last_cursor_age_ns, None);
     }
 
     #[test]

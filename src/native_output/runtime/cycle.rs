@@ -354,6 +354,7 @@ impl NativeRuntime {
             output_generation: self.head.output_epoch.get(),
             crtc_id: self.head.target.crtc_id,
         };
+        let cursor_pending_since_ns = self.head.cursor_output_arbitration.pending_since_ns();
         let decision = super::presentation_worker::present_cursor_for_presentation(
             true,
             Some(worker),
@@ -390,6 +391,9 @@ impl NativeRuntime {
             self.head.confirmed_kms_presentation,
         )?;
         if decision.is_some() {
+            self.head
+                .vrr_cadence
+                .note_cursor_plane_delta_submitted(cursor_pending_since_ns);
             self.arm_runtime_deadline()?;
             return Ok(true);
         }

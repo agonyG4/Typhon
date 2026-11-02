@@ -121,6 +121,15 @@ pub(crate) fn plan_cursor_service_opportunity_with_current(
     })
 }
 
+/// `OBLIVION_ONE_VRR_CURSOR_RETARGET=off` keeps VRR cursor service on the
+/// fixed grid, for A/B latency measurement.
+fn vrr_cursor_retarget_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("OBLIVION_ONE_VRR_CURSOR_RETARGET").map_or(true, |value| value != "off")
+    })
+}
+
 /// Under VRR the panel has no refresh grid: after the last physical
 /// presentation plus the shortest interval, a cursor plane commit is
 /// presented as soon as it applies. The fixed planner still picks grid
@@ -138,6 +147,9 @@ pub(crate) fn retarget_cursor_opportunity_for_vrr(
     now: MonotonicTimestampNs,
     transport: KmsCommitWorkerTransport,
 ) -> CursorServiceOpportunity {
+    if !vrr_cursor_retarget_enabled() {
+        return opportunity;
+    }
     let replanned_after_expired_target = current_opportunity
         .is_some_and(|current| current.target.presentation_time.get() <= now.get());
     if opportunity.ordering_after_primary.is_some()
