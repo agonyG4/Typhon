@@ -700,6 +700,35 @@ fn dmabuf_v6_rejects_sampling_device_that_is_not_a_dev_t() {
 }
 
 #[test]
+fn dmabuf_creates_buffer_at_every_supported_version() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (running, server_thread) = spawn_test_server(server);
+
+    let created = (3..=6)
+        .map(|version| {
+            let (connection, mut queue, mut state, params) =
+                dmabuf_params_client(&socket_path, version);
+            let file = create_test_shm_file(&[0xffff_ffff; 4]).unwrap();
+            params.add(file.as_fd(), 0, 0, 8, 0, 0);
+            params.create(
+                2,
+                2,
+                DRM_FORMAT_ARGB8888,
+                client_zwp_linux_buffer_params_v1::Flags::empty(),
+            );
+            connection.flush().unwrap();
+            queue.roundtrip(&mut state).unwrap();
+            (version, state.dmabuf_created && !state.dmabuf_failed)
+        })
+        .collect::<Vec<_>>();
+    stop_test_server(running, server_thread);
+
+    assert_eq!(created, vec![(3, true), (4, true), (5, true), (6, true)]);
+}
+
+#[test]
 fn dmabuf_v6_creates_buffer_after_sampling_device_hint() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();
