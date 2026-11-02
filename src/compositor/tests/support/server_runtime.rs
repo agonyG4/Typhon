@@ -172,6 +172,13 @@ pub(in crate::compositor::tests) enum ServerCommand {
     },
     CapturePendingAstreaScreenCaptureOutput(Sender<Option<(OutputId, bool)>>),
     WithdrawLogicalOutput,
+    AddLogicalOutput {
+        name: &'static str,
+        position: (i32, i32),
+        size: (u32, u32),
+        reply: Sender<Option<OutputId>>,
+    },
+    WithdrawLogicalOutputId(OutputId),
     CaptureOutputLifecycle {
         surface_id: u32,
         reply: Sender<OutputLifecycleSnapshot>,
@@ -788,6 +795,18 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                                 .state
                                 .withdraw_output(&server.display.handle(), output_id);
                         }
+                    }
+                    ServerCommand::AddLogicalOutput {
+                        name,
+                        position,
+                        size,
+                        reply,
+                    } => {
+                        let _ =
+                            reply.send(server.add_logical_output(name, position, size, 1.0, 60));
+                    }
+                    ServerCommand::WithdrawLogicalOutputId(output_id) => {
+                        server.withdraw_logical_output(output_id);
                     }
                     ServerCommand::CaptureOutputLifecycle { surface_id, reply } => {
                         let compositor_surface_id = server.state.surface_resources.iter().find_map(

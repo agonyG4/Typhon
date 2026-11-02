@@ -1,6 +1,5 @@
 use wayland_server::{Resource, WEnum, protocol::wl_output};
 
-pub(super) const OUTPUT_LOGICAL_POSITION: (i32, i32) = (0, 0);
 pub(super) const OUTPUT_TRANSFORM: wl_output::Transform = wl_output::Transform::Normal;
 pub(crate) const OUTPUT_NAME: &str = "Oblivion-1";
 pub(super) const OUTPUT_DESCRIPTION: &str = "Typhon native output";
@@ -172,36 +171,73 @@ pub(super) fn logical_output_size(
     )
 }
 
-pub(super) fn send_output_description(
-    output: &wl_output::WlOutput,
-    output_size: OutputSize,
-    output_scale: OutputScale,
-    output_refresh: OutputRefreshRate,
-    physical_size_mm: (i32, i32),
-) {
-    send_output_geometry(output, physical_size_mm);
-    send_output_mode(output, output_size, output_refresh);
-    send_output_scale(output, output_scale);
+/// One output in the compositor's logical layout space.
+///
+/// Positions and the derived rectangle are logical (scene) coordinates; `size`
+/// is the current mode in physical pixels.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct LogicalOutput {
+    pub(super) name: String,
+    pub(super) description: String,
+    pub(super) position: (i32, i32),
+    pub(super) size: OutputSize,
+    pub(super) scale: OutputScale,
+    pub(super) refresh: OutputRefreshRate,
+    pub(super) physical_size_mm: (i32, i32),
+}
+
+impl LogicalOutput {
+    /// The output driven by the native runtime. Its name stays stable because
+    /// the portal share picker and user configuration refer to it.
+    pub(super) fn native() -> Self {
+        Self {
+            name: OUTPUT_NAME.to_string(),
+            description: OUTPUT_DESCRIPTION.to_string(),
+            position: (0, 0),
+            size: OutputSize::default(),
+            scale: OutputScale::default(),
+            refresh: OutputRefreshRate::default(),
+            physical_size_mm: (0, 0),
+        }
+    }
+
+    pub(super) fn logical_size(&self) -> (i32, i32) {
+        logical_output_size(self.size, self.scale, OUTPUT_TRANSFORM)
+    }
+
+    /// Whether a logical rectangle `[left, right) x [top, bottom)` overlaps the
+    /// output's logical rectangle.
+    pub(super) fn intersects(&self, left: i64, top: i64, right: i64, bottom: i64) -> bool {
+        let (x, y) = (i64::from(self.position.0), i64::from(self.position.1));
+        let (width, height) = self.logical_size();
+        left < x + i64::from(width) && top < y + i64::from(height) && right > x && bottom > y
+    }
+}
+
+pub(super) fn send_output_description(output: &wl_output::WlOutput, logical: &LogicalOutput) {
+    send_output_geometry(output, logical);
+    send_output_mode(output, logical.size, logical.refresh);
+    send_output_scale(output, logical.scale);
     if output.version() >= WL_OUTPUT_NAME_SINCE {
         let _ = output.send_event(wl_output::Event::Name {
-            name: OUTPUT_NAME.to_string(),
+            name: logical.name.clone(),
         });
     }
     if output.version() >= WL_OUTPUT_DESCRIPTION_SINCE {
         let _ = output.send_event(wl_output::Event::Description {
-            description: OUTPUT_DESCRIPTION.to_string(),
+            description: logical.description.clone(),
         });
     }
     send_output_done_if_supported(output);
 }
 
-pub(super) fn send_output_geometry(output: &wl_output::WlOutput, physical_size_mm: (i32, i32)) {
-    let (x, y) = OUTPUT_LOGICAL_POSITION;
+pub(super) fn send_output_geometry(output: &wl_output::WlOutput, logical: &LogicalOutput) {
+    let (x, y) = logical.position;
     let _ = output.send_event(wl_output::Event::Geometry {
         x,
         y,
-        physical_width: physical_size_mm.0,
-        physical_height: physical_size_mm.1,
+        physical_width: logical.physical_size_mm.0,
+        physical_height: logical.physical_size_mm.1,
         subpixel: WEnum::Value(wl_output::Subpixel::Unknown),
         make: "Oblivion".to_string(),
         model: "Native Output".to_string(),

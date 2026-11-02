@@ -917,6 +917,9 @@ impl CompositorState {
         state.native_output_id = state.output_id_allocator.allocate().ok();
         if let Some(output_id) = state.native_output_id {
             state.logical_output_ids.insert(output_id);
+            state
+                .logical_outputs
+                .insert(output_id, LogicalOutput::native());
         }
         // PresentationAnimator has its own compatibility defaults for older
         // callers. The compositor-owned control plane is authoritative for
@@ -938,6 +941,8 @@ impl CompositorState {
             self.native_output_id = self.output_id_allocator.allocate().ok();
             if let Some(output_id) = self.native_output_id {
                 self.logical_output_ids.insert(output_id);
+                self.logical_outputs
+                    .insert(output_id, self.native_logical_output());
             }
         }
         self.native_output_id
@@ -1175,6 +1180,9 @@ impl CompositorState {
         }
 
         self.output_size = output_size;
+        if let Some(native) = self.native_logical_output_mut() {
+            native.size = output_size;
+        }
         if let Some(transition) = self.workspace_presentation.transition() {
             if crate::pointer_debug::cursor_responsiveness_trace_enabled() {
                 eprintln!(
@@ -1210,6 +1218,9 @@ impl CompositorState {
         }
 
         self.output_refresh = output_refresh;
+        if let Some(native) = self.native_logical_output_mut() {
+            native.refresh = output_refresh;
+        }
         self.invalidate_surface_pacing_deadline_cache();
         self.send_output_mode_to_bound_outputs();
         true

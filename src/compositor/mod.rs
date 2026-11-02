@@ -20,7 +20,7 @@ pub use window_preview::{WindowPreviewImage, WindowPreviewSource, WindowPreviewT
 pub use screencopy::ScreencopyPending;
 use std::{
     cell::Cell,
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     fs::File,
     io,
     os::fd::{AsFd, OwnedFd},
@@ -345,8 +345,8 @@ use lifecycle_compatibility::{
     LifecycleCompatibilityAction, LifecycleCompatibilityTrace, LifecycleCompatibilityViolation,
 };
 use output::{
-    OutputScale, OutputSize, send_output_description, send_output_done_if_supported,
-    send_output_mode, send_output_scale,
+    LogicalOutput, OutputScale, OutputSize, send_output_description,
+    send_output_done_if_supported, send_output_mode, send_output_scale,
 };
 use pacing::*;
 pub use plan::*;
@@ -720,6 +720,10 @@ pub struct CompositorState {
     logical_output_ids: HashSet<OutputId>,
     // One advertised wl_output global per logical output; withdrawal removes it.
     output_globals: HashMap<OutputId, GlobalId>,
+    // Layout description of every logical output. The native output's entry
+    // mirrors the scalar `output_*` fields below, which remain the single-head
+    // view read by layout and rendering until those become per output.
+    logical_outputs: BTreeMap<OutputId, LogicalOutput>,
     pub accepted_clients: usize,
     pub xdg_toplevels: usize,
     pub xdg_popups: usize,

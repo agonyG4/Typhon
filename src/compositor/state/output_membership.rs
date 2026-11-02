@@ -139,13 +139,10 @@ impl CompositorState {
         {
             return;
         }
-        send_output_description(
-            &output,
-            self.output_size,
-            self.output_scale,
-            self.output_refresh,
-            self.output_physical_size_mm,
-        );
+        let Some(logical) = self.logical_outputs.get(&output_id) else {
+            return;
+        };
+        send_output_description(&output, logical);
         let binding = OutputBinding {
             output_id,
             client_id,
@@ -280,6 +277,7 @@ impl CompositorState {
             self.forget_output_binding(&binding.resource, "logical_output_withdrawal");
         }
         self.logical_output_ids.remove(&output_id);
+        self.logical_outputs.remove(&output_id);
         self.scrub_empty_surface_output_memberships();
         debug_assert!(self.check_surface_output_membership_invariants());
         debug_assert!(self.check_output_binding_invariants());
@@ -287,7 +285,10 @@ impl CompositorState {
 
     pub(in crate::compositor) fn send_output_mode_to_bound_outputs(&self) {
         for binding in &self.output_resources {
-            send_output_mode(&binding.resource, self.output_size, self.output_refresh);
+            let Some(logical) = self.logical_outputs.get(&binding.output_id) else {
+                continue;
+            };
+            send_output_mode(&binding.resource, logical.size, logical.refresh);
             send_output_done_if_supported(&binding.resource);
         }
         self.send_xdg_output_geometry_to_bound_outputs();
@@ -295,7 +296,10 @@ impl CompositorState {
 
     pub(in crate::compositor) fn send_output_scale_to_bound_outputs(&self) {
         for binding in &self.output_resources {
-            send_output_scale(&binding.resource, self.output_scale);
+            let Some(logical) = self.logical_outputs.get(&binding.output_id) else {
+                continue;
+            };
+            send_output_scale(&binding.resource, logical.scale);
             send_output_done_if_supported(&binding.resource);
         }
         self.send_xdg_output_geometry_to_bound_outputs();
@@ -429,30 +433,19 @@ impl CompositorState {
             .membership_surfaces_inspected
             .saturating_add(1);
         let surface_id = compositor_surface_id(surface);
-        let Some(native_output_id) = self.ensure_native_output_id() else {
+        if self.ensure_native_output_id().is_none() {
             return;
-        };
-        let overlaps = self.logical_output_ids.contains(&native_output_id)
-            && self.surface_overlaps_native_output(surface_id);
-        let was_overlapping = self
-            .surface_output_memberships
-            .entry(surface_id)
-            .or_default()
-            .physical_outputs
-            .contains(&native_output_id);
-        let mut membership_changed = was_overlapping != overlaps;
-
-        {
+        }
+        let overlapping = self.surface_overlapping_outputs(surface_id);
+        let mut membership_changed = {
             let membership = self
                 .surface_output_memberships
                 .entry(surface_id)
                 .or_default();
-            if overlaps {
-                membership.physical_outputs.insert(native_output_id);
-            } else {
-                membership.physical_outputs.remove(&native_output_id);
-            }
-        }
+            let changed = membership.physical_outputs != overlapping;
+            membership.physical_outputs.clone_from(&overlapping);
+            changed
+        };
 
         let output_bindings = self
             .output_resources
@@ -463,9 +456,29 @@ impl CompositorState {
             })
             .cloned()
             .collect::<Vec<_>>();
-        if !overlaps {
-            for binding in output_bindings {
-                let binding_id = binding.resource.id();
+        for binding in output_bindings {
+            let binding_id = binding.resource.id();
+            if overlapping.contains(&binding.output_id) {
+                let already_entered = self
+                    .surface_output_memberships
+                    .get(&surface_id)
+                    .is_some_and(|membership| membership.entered_resources.contains(&binding_id));
+                if !already_entered
+                    && self.send_surface_output_event(
+                        surface,
+                        &binding,
+                        SurfaceOutputEvent::Enter,
+                        "surface_reconciliation",
+                    )
+                {
+                    self.surface_output_memberships
+                        .entry(surface_id)
+                        .or_default()
+                        .entered_resources
+                        .insert(binding_id);
+                    membership_changed = true;
+                }
+            } else {
                 let was_entered = self
                     .surface_output_memberships
                     .get_mut(&surface_id)
@@ -480,40 +493,15 @@ impl CompositorState {
                     );
                 }
             }
-            if !membership_changed {
-                self.compliance_metrics.membership_noops =
-                    self.compliance_metrics.membership_noops.saturating_add(1);
-            }
-            self.scrub_empty_surface_output_memberships();
-            debug_assert!(self.check_surface_output_membership_invariants());
-            return;
-        }
-
-        for binding in output_bindings {
-            let binding_id = binding.resource.id();
-            let already_entered = self
-                .surface_output_memberships
-                .get(&surface_id)
-                .is_some_and(|membership| membership.entered_resources.contains(&binding_id));
-            if !already_entered
-                && self.send_surface_output_event(
-                    surface,
-                    &binding,
-                    SurfaceOutputEvent::Enter,
-                    "surface_reconciliation",
-                )
-            {
-                self.surface_output_memberships
-                    .entry(surface_id)
-                    .or_default()
-                    .entered_resources
-                    .insert(binding_id);
-                membership_changed = true;
-            }
         }
         if !membership_changed {
             self.compliance_metrics.membership_noops =
                 self.compliance_metrics.membership_noops.saturating_add(1);
+        }
+        if overlapping.is_empty() {
+            self.scrub_empty_surface_output_memberships();
+            debug_assert!(self.check_surface_output_membership_invariants());
+            return;
         }
         self.send_preferred_buffer_preferences(surface.clone());
         debug_assert!(self.check_surface_output_membership_invariants());
@@ -604,9 +592,11 @@ impl CompositorState {
         });
     }
 
-    fn surface_overlaps_native_output(&mut self, surface_id: u32) -> bool {
+    /// Logical outputs whose layout rectangle the mapped surface overlaps.
+    fn surface_overlapping_outputs(&mut self, surface_id: u32) -> HashSet<OutputId> {
+        let mut outputs = HashSet::new();
         if !self.surface_is_effectively_mapped_for_output(surface_id) {
-            return false;
+            return outputs;
         }
         self.refresh_surface_origin_cache();
         let Some(index) = self
@@ -614,19 +604,26 @@ impl CompositorState {
             .iter()
             .position(|surface| surface.surface_id == surface_id)
         else {
-            return false;
+            return outputs;
         };
         let Some((x, y)) = self.surface_origin_cache.get(index).copied() else {
-            return false;
+            return outputs;
         };
         let surface = &self.renderable_surfaces[index];
-        let output_width = i64::from(self.output_size.width);
-        let output_height = i64::from(self.output_size.height);
         let left = i64::from(x);
         let top = i64::from(y);
         let right = left.saturating_add(i64::from(surface.width));
         let bottom = top.saturating_add(i64::from(surface.height));
-        left < output_width && top < output_height && right > 0 && bottom > 0
+        outputs.extend(
+            self.logical_outputs
+                .iter()
+                .filter(|(output_id, output)| {
+                    self.logical_output_ids.contains(output_id)
+                        && output.intersects(left, top, right, bottom)
+                })
+                .map(|(output_id, _)| *output_id),
+        );
+        outputs
     }
 
     fn surface_is_effectively_mapped_for_output(&self, surface_id: u32) -> bool {

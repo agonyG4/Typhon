@@ -345,3 +345,128 @@ fn client_disconnect_forgets_output_bindings_without_withdrawing_the_output() {
 
     let _ = stop_controllable_test_server(commands, server_thread);
 }
+
+#[test]
+fn surfaces_enter_and_leave_additional_outputs_by_layout_intersection() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let connection = Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let native_output: client_wl_output::WlOutput = globals.bind(&qh, 1..=4, ()).unwrap();
+    let surface = compositor.create_surface(&qh, ());
+    assign_test_toplevel(&globals, &qh, &surface).unwrap();
+
+    let mut state = RegistryTestState::default();
+    commit_test_buffered_surface_after_initial_configure(
+        &surface,
+        &shm,
+        &qh,
+        &connection,
+        &mut queue,
+        &mut state,
+        32,
+        32,
+    )
+    .unwrap();
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    assert_eq!(state.surface_enter_count, 1);
+
+    let add_output = |name, position| {
+        let (reply, output_id) = mpsc::channel();
+        commands
+            .send(ServerCommand::AddLogicalOutput {
+                name,
+                position,
+                size: (1280, 800),
+                reply,
+            })
+            .unwrap();
+        wait_for_server_commands(&commands);
+        output_id.recv().unwrap().expect("additional output id")
+    };
+    let bind_newest_output = |queue: &mut EventQueue<RegistryTestState>,
+                              state: &mut RegistryTestState| {
+        queue.roundtrip(state).unwrap();
+        let name = globals.contents().with_list(|list| {
+            list.iter()
+                .filter(|global| global.interface == "wl_output")
+                .map(|global| global.name)
+                .max()
+                .unwrap()
+        });
+        let output: client_wl_output::WlOutput = globals.registry().bind(name, 4, &qh, ());
+        queue.roundtrip(state).unwrap();
+        output
+    };
+
+    // An output to the right of the native one: the surface does not overlap it.
+    let right_id = add_output("DP-2", (1280, 0));
+    let right_output = bind_newest_output(&mut queue, &mut state);
+    assert_eq!(state.surface_enter_count, 1);
+
+    // An output mirroring the native area: the surface overlaps it as well.
+    let mirror_id = add_output("HDMI-A-1", (0, 0));
+    let mirror_output = bind_newest_output(&mut queue, &mut state);
+    assert_eq!(state.surface_enter_count, 2);
+    assert_eq!(
+        state.surface_enter_output_ids,
+        vec![
+            native_output.id().protocol_id(),
+            mirror_output.id().protocol_id()
+        ]
+    );
+    assert_eq!(
+        globals.contents().with_list(|list| list
+            .iter()
+            .filter(|global| global.interface == "wl_output")
+            .count()),
+        3
+    );
+
+    commands
+        .send(ServerCommand::WithdrawLogicalOutputId(mirror_id))
+        .unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    assert_eq!(state.surface_leave_count, 1);
+    assert_eq!(
+        state.surface_leave_output_ids,
+        vec![mirror_output.id().protocol_id()]
+    );
+
+    let (reply, snapshot) = mpsc::channel();
+    commands
+        .send(ServerCommand::CaptureOutputLifecycle {
+            surface_id: surface.id().protocol_id(),
+            reply,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    let snapshot = snapshot.recv().unwrap();
+    assert_eq!(snapshot.logical_output_ids.len(), 2);
+    assert!(snapshot.logical_output_ids.contains(&right_id));
+    assert!(!snapshot.physical_output_ids.contains(&right_id));
+    assert_eq!(snapshot.physical_output_ids.len(), 1);
+    assert_eq!(snapshot.entered_binding_count, 1);
+    assert!(snapshot.membership_invariants_valid);
+
+    drop((
+        connection,
+        queue,
+        globals,
+        qh,
+        surface,
+        native_output,
+        right_output,
+        mirror_output,
+    ));
+    let _ = stop_controllable_test_server(commands, server_thread);
+}

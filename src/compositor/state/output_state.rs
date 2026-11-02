@@ -1,6 +1,70 @@
 use super::*;
 
 impl CompositorState {
+    /// The native output's layout entry built from the scalar output fields.
+    pub(in crate::compositor) fn native_logical_output(&self) -> LogicalOutput {
+        LogicalOutput {
+            size: self.output_size,
+            scale: self.output_scale,
+            refresh: self.output_refresh,
+            physical_size_mm: self.output_physical_size_mm,
+            ..LogicalOutput::native()
+        }
+    }
+
+    pub(in crate::compositor) fn native_logical_output_mut(
+        &mut self,
+    ) -> Option<&mut LogicalOutput> {
+        let output_id = self.native_output_id()?;
+        self.logical_outputs.get_mut(&output_id)
+    }
+
+    pub(in crate::compositor) fn logical_output(
+        &self,
+        output_id: OutputId,
+    ) -> Option<&LogicalOutput> {
+        self.logical_outputs.get(&output_id)
+    }
+
+    /// Adds a logical output next to the native one and advertises its global.
+    pub(in crate::compositor) fn add_logical_output(
+        &mut self,
+        display: &DisplayHandle,
+        output: LogicalOutput,
+    ) -> Option<OutputId> {
+        let output_id = self.output_id_allocator.allocate().ok()?;
+        self.logical_output_ids.insert(output_id);
+        self.logical_outputs.insert(output_id, output);
+        self.publish_output_global(display, output_id);
+        self.reconcile_all_surface_output_memberships();
+        Some(output_id)
+    }
+
+    /// Moves a logical output in layout space and re-announces its geometry.
+    pub(in crate::compositor) fn set_logical_output_position(
+        &mut self,
+        output_id: OutputId,
+        position: (i32, i32),
+    ) -> bool {
+        let Some(output) = self.logical_outputs.get_mut(&output_id) else {
+            return false;
+        };
+        if output.position == position {
+            return false;
+        }
+        output.position = position;
+        let output = output.clone();
+        for binding in &self.output_resources {
+            if binding.output_id == output_id {
+                output::send_output_geometry(&binding.resource, &output);
+                send_output_done_if_supported(&binding.resource);
+            }
+        }
+        self.send_xdg_output_geometry_to_bound_outputs();
+        self.reconcile_all_surface_output_memberships();
+        true
+    }
+
     pub(in crate::compositor) fn set_output_physical_size_mm(
         &mut self,
         size_mm: Option<(u32, u32)>,
@@ -16,9 +80,19 @@ impl CompositorState {
             return false;
         }
         self.output_physical_size_mm = size;
+        let Some(native_output_id) = self.native_output_id() else {
+            return true;
+        };
+        let Some(native) = self.native_logical_output_mut() else {
+            return true;
+        };
+        native.physical_size_mm = size;
+        let native = native.clone();
         for binding in &self.output_resources {
-            output::send_output_geometry(&binding.resource, size);
-            send_output_done_if_supported(&binding.resource);
+            if binding.output_id == native_output_id {
+                output::send_output_geometry(&binding.resource, &native);
+                send_output_done_if_supported(&binding.resource);
+            }
         }
         true
     }
@@ -30,6 +104,9 @@ impl CompositorState {
         }
 
         self.output_scale = output_scale;
+        if let Some(native) = self.native_logical_output_mut() {
+            native.scale = output_scale;
+        }
         self.send_output_scale_to_bound_outputs();
         self.send_fractional_scale_to_bound_surfaces();
         self.reconcile_all_surface_output_memberships();

@@ -2458,6 +2458,57 @@ impl OwnCompositorServer {
         changed
     }
 
+    /// Adds a logical output beside the native one at a logical layout position.
+    /// Its size is the mode in physical pixels; the logical extent follows the scale.
+    pub fn add_logical_output(
+        &mut self,
+        name: impl Into<String>,
+        position: (i32, i32),
+        size: (u32, u32),
+        scale_factor: f64,
+        refresh_hz: u32,
+    ) -> Option<OutputId> {
+        let name = name.into();
+        let output = super::output::LogicalOutput {
+            description: format!("Typhon output {name}"),
+            name,
+            position,
+            size: super::output::OutputSize::new(size.0, size.1),
+            scale: super::output::OutputScale::from_factor(scale_factor),
+            refresh: OutputRefreshRate::from_hz(refresh_hz),
+            physical_size_mm: (0, 0),
+        };
+        let output_id = self
+            .state
+            .add_logical_output(&self.display.handle(), output);
+        let _ = self.display.flush_clients();
+        output_id
+    }
+
+    /// Withdraws a logical output: surfaces leave it and its global is removed.
+    pub fn withdraw_logical_output(&mut self, output_id: OutputId) {
+        self.state
+            .withdraw_output(&self.display.handle(), output_id);
+        let _ = self.display.flush_clients();
+    }
+
+    pub fn set_logical_output_position(
+        &mut self,
+        output_id: OutputId,
+        position: (i32, i32),
+    ) -> bool {
+        let changed = self.state.set_logical_output_position(output_id, position);
+        let _ = self.display.flush_clients();
+        changed
+    }
+
+    /// Logical layout rectangle `(x, y, width, height)` of a live output.
+    pub fn logical_output_rect(&self, output_id: OutputId) -> Option<(i32, i32, i32, i32)> {
+        let output = self.state.logical_output(output_id)?;
+        let (width, height) = output.logical_size();
+        Some((output.position.0, output.position.1, width, height))
+    }
+
     pub fn set_output_refresh_hz(&mut self, refresh_hz: u32) -> bool {
         self.set_output_refresh_rate(OutputRefreshRate::from_hz(refresh_hz))
     }

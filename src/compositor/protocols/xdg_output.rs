@@ -1,6 +1,3 @@
-use super::super::output::{
-    OUTPUT_DESCRIPTION, OUTPUT_LOGICAL_POSITION, OUTPUT_NAME, OUTPUT_TRANSFORM, logical_output_size,
-};
 use super::super::*;
 use wayland_protocols::xdg::xdg_output::zv1::server::{zxdg_output_manager_v1, zxdg_output_v1};
 
@@ -15,18 +12,24 @@ pub(in crate::compositor) struct XdgOutputData {
 }
 
 impl CompositorState {
-    fn wl_output_is_bound(&self, output: &wl_output::WlOutput) -> bool {
-        output.is_alive()
-            && self
-                .output_resources
-                .iter()
-                .any(|binding| binding.resource.id() == output.id())
+    /// The logical output a live, bound wl_output resource describes.
+    fn bound_logical_output(&self, output: &wl_output::WlOutput) -> Option<&LogicalOutput> {
+        if !output.is_alive() {
+            return None;
+        }
+        let binding = self
+            .output_resources
+            .iter()
+            .find(|binding| binding.resource.id() == output.id())?;
+        self.logical_outputs.get(&binding.output_id)
     }
 
-    fn send_xdg_output_logical_geometry(&self, xdg_output: &zxdg_output_v1::ZxdgOutputV1) {
-        let (x, y) = OUTPUT_LOGICAL_POSITION;
-        let (width, height) =
-            logical_output_size(self.output_size, self.output_scale, OUTPUT_TRANSFORM);
+    fn send_xdg_output_logical_geometry(
+        xdg_output: &zxdg_output_v1::ZxdgOutputV1,
+        logical: &LogicalOutput,
+    ) {
+        let (x, y) = logical.position;
+        let (width, height) = logical.logical_size();
         let _ = xdg_output.send_event(zxdg_output_v1::Event::LogicalPosition { x, y });
         let _ = xdg_output.send_event(zxdg_output_v1::Event::LogicalSize { width, height });
     }
@@ -41,8 +44,8 @@ impl CompositorState {
             let Some(data) = xdg_output.data::<XdgOutputData>() else {
                 continue;
             };
-            if self.wl_output_is_bound(&data.output) {
-                self.send_xdg_output_logical_geometry(xdg_output);
+            if let Some(logical) = self.bound_logical_output(&data.output) {
+                Self::send_xdg_output_logical_geometry(xdg_output, logical);
                 send_xdg_output_done(xdg_output, &data.output);
             }
         }
@@ -98,16 +101,16 @@ impl Dispatch<zxdg_output_manager_v1::ZxdgOutputManagerV1, ()> for CompositorSta
                     .xdg_output_resources
                     .retain(|resource| resource.is_alive());
                 state.xdg_output_resources.push(xdg_output.clone());
-                if !state.wl_output_is_bound(&output) {
+                let Some(logical) = state.bound_logical_output(&output) else {
                     return;
-                }
-                state.send_xdg_output_logical_geometry(&xdg_output);
+                };
+                CompositorState::send_xdg_output_logical_geometry(&xdg_output, logical);
                 if xdg_output.version() >= XDG_OUTPUT_NAME_SINCE {
                     let _ = xdg_output.send_event(zxdg_output_v1::Event::Name {
-                        name: OUTPUT_NAME.to_string(),
+                        name: logical.name.clone(),
                     });
                     let _ = xdg_output.send_event(zxdg_output_v1::Event::Description {
-                        description: OUTPUT_DESCRIPTION.to_string(),
+                        description: logical.description.clone(),
                     });
                 }
                 send_xdg_output_done(&xdg_output, &output);
