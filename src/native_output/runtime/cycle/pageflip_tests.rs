@@ -499,6 +499,25 @@ fn variable_pageflip_after_an_intervening_cursor_refresh_claims_the_later_opport
 }
 
 #[test]
+fn variable_claim_may_trail_but_never_precede_its_reservation() {
+    use oblivion_one::native::buffering::PresentationOpportunityId;
+    let reserved = PresentationOpportunityId::new(3, 10);
+    assert!(variable_claim_honours_reservation(reserved, reserved));
+    assert!(variable_claim_honours_reservation(
+        PresentationOpportunityId::new(3, 11),
+        reserved
+    ));
+    assert!(!variable_claim_honours_reservation(
+        PresentationOpportunityId::new(3, 9),
+        reserved
+    ));
+    assert!(!variable_claim_honours_reservation(
+        PresentationOpportunityId::new(4, 10),
+        reserved
+    ));
+}
+
+#[test]
 fn variable_render_fence_timing_never_produces_a_fixed_deadline_miss() {
     let reservation =
         crate::native_output::presentation::transaction::VariablePresentationReservation::try_new(

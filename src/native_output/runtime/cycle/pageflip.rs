@@ -251,10 +251,14 @@ fn record_variable_composited_pageflip(
             "variable pageflip reservation has no VRR window",
         ));
     };
-    let opportunity_id = reservation.opportunity().id();
-    if opportunity_id.clock_generation() != clock_generation
-        || opportunity_id.sequence() != opportunity_sequence
-    {
+    let reserved_id = reservation.opportunity().id();
+    if !variable_claim_honours_reservation(
+        oblivion_one::native::buffering::PresentationOpportunityId::new(
+            clock_generation,
+            opportunity_sequence,
+        ),
+        reserved_id,
+    ) {
         return Err(io::Error::other(
             "variable pageflip telemetry opportunity identity mismatch",
         ));
@@ -277,6 +281,7 @@ fn record_variable_composited_pageflip(
                 PacingField::u64("transaction_id", frame.transaction_id.get()),
                 PacingField::u64("clock_generation", clock_generation),
                 PacingField::u64("opportunity_sequence", opportunity_sequence),
+                PacingField::u64("reserved_opportunity_sequence", reserved_id.sequence()),
                 PacingField::u64("anchor_ns", anchor.get()),
                 PacingField::u64("earliest_present_ns", earliest_present.get()),
                 PacingField::u64("preferred_present_ns", preferred_present.get()),
@@ -333,6 +338,18 @@ fn record_composited_service_costs(
     }
 }
 
+/// Under VRR a cursor-only commit that completes between a primary's
+/// reservation and its pageflip is a physical refresh of its own and consumes
+/// the reserved opportunity, so the pageflip lands on a later one. Only an
+/// earlier opportunity or another clock generation is a violation.
+fn variable_claim_honours_reservation(
+    actual: oblivion_one::native::buffering::PresentationOpportunityId,
+    reserved: oblivion_one::native::buffering::PresentationOpportunityId,
+) -> bool {
+    actual.clock_generation() == reserved.clock_generation()
+        && actual.sequence() >= reserved.sequence()
+}
+
 fn prepare_variable_physical_claim(
     deadline: &oblivion_one::native::presentation_deadline::PresentationDeadlinePlanner,
     variable: crate::native_output::presentation::transaction::VariablePresentationReservation,
@@ -341,15 +358,10 @@ fn prepare_variable_physical_claim(
     let prepared = deadline
         .prepare_variable_presented(presented_at)
         .ok_or_else(|| io::Error::other("variable physical opportunity sequence is exhausted"))?;
-    let actual = prepared.claim().opportunity_id();
-    let reserved = variable.opportunity().id();
-    // Under VRR a cursor-only commit that completes between the reservation
-    // and this pageflip is a physical refresh of its own and consumes the
-    // reserved opportunity. The pageflip then lands on a later opportunity;
-    // only an earlier one or another clock generation is a violation.
-    if actual.clock_generation() != reserved.clock_generation()
-        || actual.sequence() < reserved.sequence()
-    {
+    if !variable_claim_honours_reservation(
+        prepared.claim().opportunity_id(),
+        variable.opportunity().id(),
+    ) {
         return Err(io::Error::other(
             "variable pageflip physical opportunity does not match its reservation",
         ));
