@@ -693,12 +693,20 @@ pub(in crate::compositor::tests) fn create_dmabuf_candidate_and_expect_created(
 pub(in crate::compositor::tests) fn request_dmabuf_default_feedback(
     socket_path: &PathBuf,
 ) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
+    request_dmabuf_default_feedback_at_version(socket_path, 4)
+}
+
+pub(in crate::compositor::tests) fn request_dmabuf_default_feedback_at_version(
+    socket_path: &PathBuf,
+    version: u32,
+) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
     let stream = UnixStream::connect(socket_path)?;
     let connection = Connection::from_socket(stream)?;
     let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
     let qh = queue.handle();
 
-    let dmabuf: client_zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1 = globals.bind(&qh, 4..=4, ())?;
+    let dmabuf: client_zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1 =
+        globals.bind(&qh, version..=version, ())?;
     let _feedback = dmabuf.get_default_feedback(&qh, ());
     connection.flush()?;
 
@@ -710,13 +718,21 @@ pub(in crate::compositor::tests) fn request_dmabuf_default_feedback(
 pub(in crate::compositor::tests) fn request_dmabuf_surface_feedback(
     socket_path: &PathBuf,
 ) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
+    request_dmabuf_surface_feedback_at_version(socket_path, 4)
+}
+
+pub(in crate::compositor::tests) fn request_dmabuf_surface_feedback_at_version(
+    socket_path: &PathBuf,
+    version: u32,
+) -> Result<RegistryTestState, Box<dyn std::error::Error>> {
     let stream = UnixStream::connect(socket_path)?;
     let connection = Connection::from_socket(stream)?;
     let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection)?;
     let qh = queue.handle();
     let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ())?;
     let surface = compositor.create_surface(&qh, ());
-    let dmabuf: client_zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1 = globals.bind(&qh, 4..=4, ())?;
+    let dmabuf: client_zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1 =
+        globals.bind(&qh, version..=version, ())?;
     let _feedback = dmabuf.get_surface_feedback(&surface, &qh, ());
     connection.flush()?;
 

@@ -202,6 +202,7 @@ pub(in crate::compositor::tests) struct RegistryTestState {
     pub(in crate::compositor::tests) dmabuf_feedback_tranche_formats: bool,
     pub(in crate::compositor::tests) dmabuf_feedback_tranche_targets: Vec<Vec<u8>>,
     pub(in crate::compositor::tests) dmabuf_feedback_tranche_scanout: Vec<bool>,
+    pub(in crate::compositor::tests) dmabuf_feedback_tranche_sampling: Vec<bool>,
     pub(in crate::compositor::tests) dmabuf_feedback_tranche_indices: Vec<Vec<u8>>,
     pub(in crate::compositor::tests) dmabuf_feedback_done: bool,
     pub(in crate::compositor::tests) wl_drm_device: bool,
@@ -1820,6 +1821,13 @@ impl Dispatch<client_zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1, ()>
                     WEnum::Value(value)
                         if value.contains(
                             client_zwp_linux_dmabuf_feedback_v1::TrancheFlags::Scanout,
+                        )
+                ));
+                state.dmabuf_feedback_tranche_sampling.push(matches!(
+                    flags,
+                    WEnum::Value(value)
+                        if value.contains(
+                            client_zwp_linux_dmabuf_feedback_v1::TrancheFlags::Sampling,
                         )
                 ));
             }

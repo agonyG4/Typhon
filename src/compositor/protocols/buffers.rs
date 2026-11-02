@@ -563,6 +563,15 @@ impl Dispatch<zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1, DmabufParamsDa
                     _data_init.init(buffer_id, buffer_data);
                 }
             }
+            zwp_linux_buffer_params_v1::Request::SetSamplingDevice { device } => {
+                data.set_sampling_device(
+                    resource,
+                    &device,
+                    &mut state.compliance_metrics,
+                    &mut state.protocol_error_trace,
+                    &mut state.terminal_client_ids,
+                );
+            }
             zwp_linux_buffer_params_v1::Request::Destroy => {}
             other => {
                 let _ = other;

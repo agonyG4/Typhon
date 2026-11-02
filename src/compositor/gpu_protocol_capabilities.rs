@@ -16,7 +16,7 @@ pub enum DmabufProtocolVersion {
     None,
     V1,
     V3,
-    V4,
+    V6,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -222,7 +222,7 @@ impl GpuProtocolCapabilities {
             .filter(|format| probe.importer_formats.contains(format))
             .collect::<Vec<_>>();
         let basic_dmabuf = probe.basic_import_valid && !probe.importer_formats.is_empty();
-        let valid_v4 = probe.dmabuf_device.is_some_and(|device| {
+        let valid_v6 = probe.dmabuf_device.is_some_and(|device| {
             probe.basic_import_valid
                 && probe.feedback_main_device == Some(device)
                 && device != 0
@@ -246,9 +246,9 @@ impl GpuProtocolCapabilities {
             });
         let has_common_formats = !common_formats.is_empty();
 
-        let (dmabuf_version, dmabuf_formats, dmabuf_reason) = if valid_v4 {
+        let (dmabuf_version, dmabuf_formats, dmabuf_reason) = if valid_v6 {
             (
-                DmabufProtocolVersion::V4,
+                DmabufProtocolVersion::V6,
                 common_formats,
                 "valid main-device feedback, format table, tranches, and importer intersection"
                     .to_owned(),
@@ -446,7 +446,7 @@ impl DmabufProtocolVersion {
             Self::None => 0,
             Self::V1 => 1,
             Self::V3 => 3,
-            Self::V4 => 4,
+            Self::V6 => 6,
         }
     }
 }

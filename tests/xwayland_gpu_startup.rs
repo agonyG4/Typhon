@@ -171,10 +171,10 @@ fn empty_import_contract_disables_dmabuf() {
 }
 
 #[test]
-fn dmabuf_version_prefers_v4_only_with_complete_feedback() {
+fn dmabuf_version_prefers_v6_only_with_complete_feedback() {
     let capabilities = GpuProtocolCapabilities::from_probe(valid_probe());
 
-    assert_eq!(capabilities.dmabuf_version(), DmabufProtocolVersion::V4);
+    assert_eq!(capabilities.dmabuf_version(), DmabufProtocolVersion::V6);
 }
 
 #[test]
@@ -189,7 +189,7 @@ fn complete_feedback_without_validated_import_is_not_published() {
 }
 
 #[test]
-fn dmabuf_version_downgrades_to_v3_when_v4_feedback_is_missing() {
+fn dmabuf_version_downgrades_to_v3_when_v6_feedback_is_missing() {
     let mut probe = valid_probe();
     probe.feedback_main_device = None;
     let capabilities = GpuProtocolCapabilities::from_probe(probe);

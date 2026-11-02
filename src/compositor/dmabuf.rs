@@ -501,6 +501,11 @@ fn dmabuf_format_table_file(formats: &[EglGlesDmabufFormat]) -> io::Result<(File
     Ok((file, (formats.len() * 16) as u32))
 }
 
+/// Version 6 replaces main_device with sampling tranches.
+const DMABUF_FEEDBACK_SAMPLING_SINCE: u32 = 6;
+/// Version 5 requires every plane of one buffer to share a modifier.
+const DMABUF_UNIFORM_MODIFIER_SINCE: u32 = 5;
+
 pub(super) fn send_dmabuf_feedback_resource(
     feedback: &zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1,
 ) {
@@ -520,8 +525,11 @@ fn send_dmabuf_feedback_payload(
     feedback: &zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1,
     data: &DmabufFeedbackData,
 ) {
+    let sampling_flag = feedback.version() >= DMABUF_FEEDBACK_SAMPLING_SINCE;
     feedback.format_table(data.format_table.as_fd(), data.format_table_size);
-    feedback.main_device(data.main_device.to_ne_bytes().to_vec());
+    if !sampling_flag {
+        feedback.main_device(data.main_device.to_ne_bytes().to_vec());
+    }
     for tranche in &data.tranches {
         let tranche_indices = tranche
             .indices
@@ -529,12 +537,17 @@ fn send_dmabuf_feedback_payload(
             .copied()
             .flat_map(u16::to_ne_bytes)
             .collect::<Vec<_>>();
+        let mut flags = zwp_linux_dmabuf_feedback_v1::TrancheFlags::empty();
+        if tranche.scanout {
+            flags |= zwp_linux_dmabuf_feedback_v1::TrancheFlags::Scanout;
+        }
+        // Every tranche's formats come from the importer intersection, so a
+        // tranche on the importer device can always be sampled from.
+        if sampling_flag && tranche.target_device == data.main_device {
+            flags |= zwp_linux_dmabuf_feedback_v1::TrancheFlags::Sampling;
+        }
         feedback.tranche_target_device(tranche.target_device.to_ne_bytes().to_vec());
-        feedback.tranche_flags(if tranche.scanout {
-            zwp_linux_dmabuf_feedback_v1::TrancheFlags::Scanout
-        } else {
-            zwp_linux_dmabuf_feedback_v1::TrancheFlags::empty()
-        });
+        feedback.tranche_flags(flags);
         feedback.tranche_formats(tranche_indices);
         feedback.tranche_done();
     }
@@ -647,6 +660,21 @@ impl DmabufParamsData {
             );
             return false;
         };
+        if params.version() >= DMABUF_UNIFORM_MODIFIER_SINCE
+            && planes
+                .iter()
+                .any(|other| other.modifier != plane.modifier)
+        {
+            post_dmabuf_protocol_error(
+                metrics,
+                trace,
+                terminal_client_ids,
+                params,
+                zwp_linux_buffer_params_v1::Error::InvalidFormat,
+                "dmabuf planes do not share one modifier",
+            );
+            return false;
+        }
         let drm_format = DrmFormat::from_fourcc(format);
         if !feedback.advertises(drm_format, DrmModifier(plane.modifier))
             || !gpu_format_is_allowed(
@@ -737,6 +765,28 @@ impl DmabufParamsData {
                 );
                 None
             }
+        }
+    }
+
+    pub(super) fn set_sampling_device(
+        &self,
+        params: &zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1,
+        device: &[u8],
+        metrics: &mut CoreComplianceMetrics,
+        trace: &mut ProtocolErrorTrace,
+        terminal_client_ids: &mut std::collections::HashSet<wayland_server::backend::ClientId>,
+    ) {
+        // Imports always target the single importer device, so a valid
+        // sampling device is only a hint and needs no storage.
+        if device.len() != std::mem::size_of::<libc::dev_t>() {
+            post_dmabuf_protocol_error(
+                metrics,
+                trace,
+                terminal_client_ids,
+                params,
+                zwp_linux_buffer_params_v1::Error::InvalidDevTSize,
+                "dmabuf sampling device is not a dev_t",
+            );
         }
     }
 

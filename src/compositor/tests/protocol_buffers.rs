@@ -606,7 +606,122 @@ fn wayland_client_receives_dmabuf_v4_default_feedback() {
     assert!(state.dmabuf_feedback_main_device);
     assert!(state.dmabuf_feedback_format_table);
     assert!(state.dmabuf_feedback_tranche_formats);
+    assert_eq!(state.dmabuf_feedback_tranche_sampling, vec![false]);
     assert!(state.dmabuf_feedback_done);
+}
+
+#[test]
+fn wayland_client_receives_dmabuf_v6_default_feedback_with_sampling_tranche() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (running, server_thread) = spawn_test_server(server);
+
+    let state = request_dmabuf_default_feedback_at_version(&socket_path, 6);
+    stop_test_server(running, server_thread);
+
+    let state = state.unwrap();
+    assert!(!state.dmabuf_feedback_main_device);
+    assert!(state.dmabuf_feedback_format_table);
+    assert_eq!(state.dmabuf_feedback_tranche_scanout, vec![false]);
+    assert_eq!(state.dmabuf_feedback_tranche_sampling, vec![true]);
+    assert!(state.dmabuf_feedback_done);
+}
+
+fn dmabuf_params_client(
+    socket_path: &PathBuf,
+    version: u32,
+) -> (
+    Connection,
+    EventQueue<RegistryTestState>,
+    RegistryTestState,
+    client_zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1,
+) {
+    let connection = Connection::from_socket(UnixStream::connect(socket_path).unwrap()).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let dmabuf: client_zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1 =
+        globals.bind(&qh, version..=version, ()).unwrap();
+    let params = dmabuf.create_params(&qh, ());
+    let mut state = RegistryTestState::default();
+    queue.roundtrip(&mut state).unwrap();
+    (connection, queue, state, params)
+}
+
+#[test]
+fn dmabuf_v5_rejects_planes_with_different_modifiers() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let (connection, _queue, _state, params) = dmabuf_params_client(&socket_path, 5);
+    let first = create_test_shm_file(&[0xffff_ffff; 4]).unwrap();
+    let second = create_test_shm_file(&[0xffff_ffff; 4]).unwrap();
+    params.add(first.as_fd(), 0, 0, 8, 0, 0);
+    params.add(second.as_fd(), 1, 0, 8, 0, 1);
+    params.create(
+        2,
+        2,
+        DRM_FORMAT_ARGB8888,
+        client_zwp_linux_buffer_params_v1::Flags::empty(),
+    );
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    let error = expect_protocol_error(
+        &connection,
+        "zwp_linux_buffer_params_v1",
+        client_zwp_linux_buffer_params_v1::Error::InvalidFormat as u32,
+    );
+    commands.send(ServerCommand::Stop).unwrap();
+    server_thread.join().unwrap();
+
+    assert_eq!(error.message, "dmabuf planes do not share one modifier");
+}
+
+#[test]
+fn dmabuf_v6_rejects_sampling_device_that_is_not_a_dev_t() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let (connection, _queue, _state, params) = dmabuf_params_client(&socket_path, 6);
+    params.set_sampling_device(vec![0; 4]);
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    expect_protocol_error(
+        &connection,
+        "zwp_linux_buffer_params_v1",
+        client_zwp_linux_buffer_params_v1::Error::InvalidDevTSize as u32,
+    );
+    commands.send(ServerCommand::Stop).unwrap();
+    server_thread.join().unwrap();
+}
+
+#[test]
+fn dmabuf_v6_creates_buffer_after_sampling_device_hint() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (running, server_thread) = spawn_test_server(server);
+
+    let (connection, mut queue, mut state, params) = dmabuf_params_client(&socket_path, 6);
+    let file = create_test_shm_file(&[0xffff_ffff; 4]).unwrap();
+    params.set_sampling_device(0x1122_3344_5566_7788_u64.to_ne_bytes().to_vec());
+    params.add(file.as_fd(), 0, 0, 8, 0, 0);
+    params.create(
+        2,
+        2,
+        DRM_FORMAT_ARGB8888,
+        client_zwp_linux_buffer_params_v1::Flags::empty(),
+    );
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    stop_test_server(running, server_thread);
+
+    assert!(state.dmabuf_created);
+    assert!(!state.dmabuf_failed);
 }
 
 #[test]
@@ -884,6 +999,41 @@ fn scanout_tranche_uses_selected_drm_device() {
 }
 
 #[test]
+fn v6_scanout_tranche_on_other_device_is_not_a_sampling_tranche() {
+    let socket_name = unique_socket_name();
+    let mut server = OwnCompositorServer::bind(&socket_name).unwrap();
+    server.set_dmabuf_feedback_with_scanout_capabilities(
+        EglGlesDmabufFeedback::with_scanout_tranche(
+            [EglGlesDmabufFormat::new(
+                DrmFormat::Xrgb8888,
+                DrmModifier(0),
+            )],
+            [EglGlesDmabufFormat::new(
+                DrmFormat::Argb8888,
+                DrmModifier::LINEAR,
+            )],
+        ),
+        Some(0x1122_3344_5566_7788),
+        Some("/dev/dri/renderD128".to_string()),
+        Some(stage4_feedback_capabilities(
+            0x8877_6655_4433_2211,
+            1,
+            42,
+            [(DrmFormat::Xrgb8888.as_fourcc(), 0)],
+        )),
+    );
+    server.activate_surface_scanout_hint(1);
+    let socket_path = runtime_socket_path(&socket_name);
+    let (running, server_thread) = spawn_test_server(server);
+    let state = request_dmabuf_surface_feedback_at_version(&socket_path, 6).unwrap();
+    stop_test_server(running, server_thread);
+
+    assert!(!state.dmabuf_feedback_main_device);
+    assert_eq!(state.dmabuf_feedback_tranche_scanout, vec![true, false]);
+    assert_eq!(state.dmabuf_feedback_tranche_sampling, vec![false, true]);
+}
+
+#[test]
 fn forced_compat_feedback_has_no_target_device_mismatch() {
     let capabilities = stage4_feedback_capabilities(
         0x8877_6655_4433_2211,
@@ -913,9 +1063,10 @@ fn forced_compat_feedback_has_no_target_device_mismatch() {
     server.activate_surface_scanout_hint(1);
     let socket_path = runtime_socket_path(&socket_name);
     let (running, server_thread) = spawn_test_server(server);
-    let state = request_dmabuf_surface_feedback(&socket_path).unwrap();
+    let state = request_dmabuf_surface_feedback_at_version(&socket_path, 6).unwrap();
     stop_test_server(running, server_thread);
 
+    assert_eq!(state.dmabuf_feedback_tranche_sampling, vec![true, true]);
     assert_eq!(state.dmabuf_feedback_tranche_targets.len(), 2);
     assert!(
         state
