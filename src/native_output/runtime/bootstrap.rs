@@ -733,6 +733,9 @@ impl NativeRuntime {
                 atomic_commit_arbiter: AtomicCommitArbiter::new(),
                 output_transactions: OutputTransactionLedger::new_for_output(output_id),
                 confirmed_kms_presentation: ConfirmedKmsPresentationState::default(),
+                vrr_cadence: super::vrr_cadence::VrrCadenceRecorder::new(
+                    output_refresh_rate.refresh_millihz(),
+                ),
                 presentation_timing,
                 cursor_timing,
                 presentation_deadline,

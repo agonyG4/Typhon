@@ -2953,6 +2953,9 @@ impl NativeRuntime {
             .requalify(generation);
         self.head.output_refresh_rate =
             super::super::output::output_refresh_rate_for_mode(&target.mode);
+        self.head.vrr_cadence = super::vrr_cadence::VrrCadenceRecorder::new(
+            self.head.output_refresh_rate.refresh_millihz(),
+        );
         self.head.mode_label = format!(
             "{}x{}@{}",
             target.width,

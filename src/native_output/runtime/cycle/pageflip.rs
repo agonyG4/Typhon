@@ -2174,6 +2174,7 @@ impl NativeRuntime {
                     output_transactions,
                     presented_planes,
                     confirmed_kms_presentation,
+                    vrr_cadence,
                     presentation_deadline,
                     presentation_timing,
                     cursor_timing,
@@ -2789,6 +2790,35 @@ impl NativeRuntime {
                             ),
                             NativePerfField::u64("output_generation", output_epoch.get()),
                         ]
+                    });
+                }
+            }
+            let vrr_present_kind = if cursor_commit {
+                Some(super::super::vrr_cadence::VrrPresentKind::CursorOnly)
+            } else {
+                matches!(completion, PageFlipCompletionResult::Completed { .. })
+                    .then_some(super::super::vrr_cadence::VrrPresentKind::Primary)
+            };
+            if let Some(kind) = vrr_present_kind {
+                let pending_kind = atomic_commit_arbiter.pending_atomic_kind();
+                let observation = super::super::vrr_cadence::VrrPresentObservation {
+                    kind,
+                    presented_at_ns: u64::from(pageflip.timestamp.seconds) * 1_000_000_000
+                        + u64::from(pageflip.timestamp.microseconds) * 1_000,
+                    confirmed_mode: confirmed_kms_presentation.mode,
+                    capabilities: super::super::vrr_cadence::VrrCapabilities {
+                        policy: *vrr_policy,
+                        connector_capable: kms_backend.atomic_connector_vrr_capable(),
+                        crtc_property_available: kms_backend.atomic_crtc_vrr_property_available(),
+                    },
+                    output_generation: output_epoch.get(),
+                    primary_pending: pending_kind.is_some_and(|kind| kind.is_primary()),
+                    cursor_pending: pending_kind.is_some_and(|kind| !kind.is_primary()),
+                };
+                vrr_cadence.observe_present(observation);
+                if observation.capabilities.relevant() {
+                    perf.log("native.vrr_cadence", || {
+                        vrr_cadence.trace_fields(self.head.output_id.get(), &observation)
                     });
                 }
             }

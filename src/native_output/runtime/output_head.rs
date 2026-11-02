@@ -63,6 +63,7 @@ pub(crate) struct OutputHead {
     pub(super) output_transactions: OutputTransactionLedger,
     pub(super) presented_planes: crate::native_output::presentation::plane::PresentedPlaneSnapshot,
     pub(super) confirmed_kms_presentation: ConfirmedKmsPresentationState,
+    pub(super) vrr_cadence: super::vrr_cadence::VrrCadenceRecorder,
     pub(super) presentation_timing: KmsPresentationTimingModel,
     pub(super) cursor_timing: crate::native_output::presentation::cursor_timing::CursorTimingDomain,
     pub(super) presentation_deadline: PresentationDeadlinePlanner,
