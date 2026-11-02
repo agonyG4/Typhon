@@ -1,4 +1,4 @@
-//! VRR cadence diagnostics (VRR Cadence Governor, Phase 0).
+//! VRR cadence diagnostics (VRR Cadence Governor, Phases 0-1).
 //!
 //! Observes confirmed physical presentations per output and explains them in a
 //! `native.vrr_cadence` trace. Observation only: nothing here feeds back into
@@ -6,6 +6,7 @@
 //! service pulses, idle fallback, cursor piggybacking) stay at zero until the
 //! phase that introduces that behavior wires them.
 
+use crate::native_output::output::{EdidVrrRange, EdidVrrRangeSource};
 use crate::native_output::perf::NativePerfField;
 use oblivion_one::compositor::{OutputPresentationMode, VrrPolicy};
 
@@ -13,15 +14,59 @@ const RECENT_INTERVALS: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum VrrRangeSource {
-    /// Minimum refresh not discovered yet; maximum comes from the active mode.
+    /// Minimum refresh unknown; only the active mode's maximum is known.
     ActiveModeOnly,
+    Edid(EdidVrrRangeSource),
+    /// `OBLIVION_ONE_VRR_MIN_HZ`, for sinks with missing or wrong EDID data.
+    UserOverride,
 }
 
 impl VrrRangeSource {
-    const fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::ActiveModeOnly => "active_mode_only",
+            Self::Edid(source) => source.as_str(),
+            Self::UserOverride => "user_override",
         }
+    }
+}
+
+/// VRR window of one output in its active mode. The maximum always comes from
+/// the exact active mode; the minimum is never invented when unknown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct VrrRange {
+    pub(crate) min_hz: Option<u32>,
+    pub(crate) max_millihz: u32,
+    pub(crate) source: VrrRangeSource,
+}
+
+impl VrrRange {
+    pub(crate) fn discover(
+        active_mode_refresh_millihz: u32,
+        edid: Option<EdidVrrRange>,
+        override_min_hz: Option<u32>,
+    ) -> Self {
+        // A minimum at or above the active refresh leaves no variable window.
+        let below_active =
+            |hz: u32| hz > 0 && u64::from(hz) * 1_000 < u64::from(active_mode_refresh_millihz);
+        let (min_hz, source) = if let Some(hz) = override_min_hz.filter(|hz| below_active(*hz)) {
+            (Some(hz), VrrRangeSource::UserOverride)
+        } else if let Some(edid) = edid.filter(|edid| below_active(edid.min_hz)) {
+            (Some(edid.min_hz), VrrRangeSource::Edid(edid.source))
+        } else {
+            (None, VrrRangeSource::ActiveModeOnly)
+        };
+        Self {
+            min_hz,
+            max_millihz: active_mode_refresh_millihz,
+            source,
+        }
+    }
+
+    pub(crate) fn override_min_hz_from_environment() -> Option<u32> {
+        std::env::var("OBLIVION_ONE_VRR_MIN_HZ")
+            .ok()
+            .and_then(|value| value.trim().parse().ok())
     }
 }
 
@@ -116,9 +161,7 @@ pub(crate) struct VrrCadenceCounters {
 
 #[derive(Debug, Clone)]
 pub(crate) struct VrrCadenceRecorder {
-    range_min_hz: Option<u32>,
-    range_max_millihz: u32,
-    range_source: VrrRangeSource,
+    range: VrrRange,
     last_physical_present_ns: Option<u64>,
     last_primary_present_ns: Option<u64>,
     last_cursor_present_ns: Option<u64>,
@@ -130,11 +173,9 @@ pub(crate) struct VrrCadenceRecorder {
 }
 
 impl VrrCadenceRecorder {
-    pub(crate) fn new(active_mode_refresh_millihz: u32) -> Self {
+    pub(crate) fn new(range: VrrRange) -> Self {
         Self {
-            range_min_hz: None,
-            range_max_millihz: active_mode_refresh_millihz,
-            range_source: VrrRangeSource::ActiveModeOnly,
+            range,
             last_physical_present_ns: None,
             last_primary_present_ns: None,
             last_cursor_present_ns: None,
@@ -153,12 +194,13 @@ impl VrrCadenceRecorder {
 
     /// Shortest physical interval the panel allows (1 / max refresh).
     fn shortest_interval_ns(&self) -> Option<u64> {
-        (self.range_max_millihz > 0).then(|| 1_000_000_000_000 / u64::from(self.range_max_millihz))
+        (self.range.max_millihz > 0).then(|| 1_000_000_000_000 / u64::from(self.range.max_millihz))
     }
 
     /// Longest physical interval before the panel drops below its VRR floor.
     fn longest_interval_ns(&self) -> Option<u64> {
-        self.range_min_hz
+        self.range
+            .min_hz
             .filter(|hz| *hz > 0)
             .map(|hz| 1_000_000_000 / u64::from(hz))
     }
@@ -258,9 +300,9 @@ impl VrrCadenceRecorder {
                 "vrr_crtc_property_available",
                 observation.capabilities.crtc_property_available,
             ),
-            NativePerfField::u64("min_hz", self.range_min_hz.map_or(0, u64::from)),
-            NativePerfField::u64("max_millihz", u64::from(self.range_max_millihz)),
-            NativePerfField::str("range_source", self.range_source.as_str()),
+            NativePerfField::u64("min_hz", self.range.min_hz.map_or(0, u64::from)),
+            NativePerfField::u64("max_millihz", u64::from(self.range.max_millihz)),
+            NativePerfField::str("range_source", self.range.source.as_str()),
             NativePerfField::u64(
                 "last_physical_interval_ns",
                 self.recent_physical_intervals.last().unwrap_or(0),
@@ -368,7 +410,7 @@ mod tests {
 
     #[test]
     fn physical_and_content_intervals_are_tracked_separately() {
-        let mut recorder = VrrCadenceRecorder::new(165_000);
+        let mut recorder = VrrCadenceRecorder::new(VrrRange::discover(165_000, None, None));
         let mode = OutputPresentationMode::AdaptiveSync;
         recorder.observe_present(present(VrrPresentKind::Primary, 1_000_000, mode));
         recorder.observe_present(present(VrrPresentKind::CursorOnly, 4_000_000, mode));
@@ -388,7 +430,7 @@ mod tests {
 
     #[test]
     fn cursor_only_presents_mark_quiescence_and_count_intermediate_updates_under_vrr() {
-        let mut recorder = VrrCadenceRecorder::new(165_000);
+        let mut recorder = VrrCadenceRecorder::new(VrrRange::discover(165_000, None, None));
         let vrr = OutputPresentationMode::AdaptiveSync;
         recorder.observe_present(present(VrrPresentKind::Primary, 1_000, vrr));
         recorder.observe_present(present(VrrPresentKind::CursorOnly, 2_000, vrr));
@@ -409,7 +451,7 @@ mod tests {
 
     #[test]
     fn state_transitions_count_confirmed_vrr_changes_only() {
-        let mut recorder = VrrCadenceRecorder::new(60_000);
+        let mut recorder = VrrCadenceRecorder::new(VrrRange::discover(60_000, None, None));
         let vsync = OutputPresentationMode::Vsync;
         let vrr = OutputPresentationMode::AdaptiveSync;
         recorder.observe_present(present(VrrPresentKind::Primary, 1, vsync));
@@ -426,13 +468,13 @@ mod tests {
 
     #[test]
     fn floor_events_require_a_known_minimum_refresh() {
-        let mut recorder = VrrCadenceRecorder::new(165_000);
+        let mut recorder = VrrCadenceRecorder::new(VrrRange::discover(165_000, None, None));
         let vrr = OutputPresentationMode::AdaptiveSync;
         recorder.observe_present(present(VrrPresentKind::Primary, 0, vrr));
         recorder.observe_present(present(VrrPresentKind::Primary, 100_000_000, vrr));
         assert_eq!(recorder.counters().vrr_range_floor_events, 0);
 
-        recorder.range_min_hz = Some(48);
+        recorder.range.min_hz = Some(48);
         recorder.observe_present(present(VrrPresentKind::Primary, 200_000_000, vrr));
         assert_eq!(recorder.counters().vrr_range_floor_events, 1);
         let observation = present(VrrPresentKind::Primary, 200_000_000, vrr);
@@ -442,7 +484,7 @@ mod tests {
 
     #[test]
     fn out_of_order_timestamps_produce_no_intervals() {
-        let mut recorder = VrrCadenceRecorder::new(60_000);
+        let mut recorder = VrrCadenceRecorder::new(VrrRange::discover(60_000, None, None));
         let vsync = OutputPresentationMode::Vsync;
         recorder.observe_present(present(VrrPresentKind::Primary, 10, vsync));
         recorder.observe_present(present(VrrPresentKind::Primary, 5, vsync));
@@ -470,5 +512,43 @@ mod tests {
         observation.capabilities.policy = VrrPolicy::Off;
         assert_eq!(VrrCadenceRecorder::reason(&observation), "policy_disabled");
         assert!(!observation.capabilities.relevant());
+    }
+
+    #[test]
+    fn range_discovery_prefers_override_then_edid_and_never_invents_a_minimum() {
+        let edid = EdidVrrRange {
+            min_hz: 48,
+            max_hz: 165,
+            source: EdidVrrRangeSource::FreeSyncVsdb,
+        };
+        let range = VrrRange::discover(164_999, Some(edid), None);
+        assert_eq!(range.min_hz, Some(48));
+        assert_eq!(range.max_millihz, 164_999);
+        assert_eq!(range.source.as_str(), "edid_freesync_vsdb");
+
+        let range = VrrRange::discover(164_999, Some(edid), Some(60));
+        assert_eq!(
+            (range.min_hz, range.source),
+            (Some(60), VrrRangeSource::UserOverride)
+        );
+
+        // An override or EDID minimum at or above the active refresh is unusable.
+        let range = VrrRange::discover(48_000, Some(edid), Some(50));
+        assert_eq!(
+            (range.min_hz, range.source),
+            (None, VrrRangeSource::ActiveModeOnly)
+        );
+        assert_eq!(VrrRange::discover(60_000, None, None).min_hz, None);
+    }
+
+    #[test]
+    fn known_minimum_sets_the_longest_interval() {
+        let edid = EdidVrrRange {
+            min_hz: 48,
+            max_hz: 165,
+            source: EdidVrrRangeSource::FreeSyncVsdb,
+        };
+        let recorder = VrrCadenceRecorder::new(VrrRange::discover(165_000, Some(edid), None));
+        assert_eq!(recorder.longest_interval_ns(), Some(20_833_333));
     }
 }

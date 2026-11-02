@@ -13,6 +13,7 @@ pub(crate) struct NativeConnector {
     pub(crate) name: String,
     pub(crate) connector_id: Option<u32>,
     pub(crate) vrr_capable: Option<bool>,
+    pub(crate) edid_vrr_range: Option<EdidVrrRange>,
 }
 
 pub(crate) fn native_vrr_policy_from_environment() -> VrrPolicy {

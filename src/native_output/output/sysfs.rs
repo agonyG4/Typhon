@@ -74,6 +74,9 @@ pub(crate) fn connected_connector_from_entry(
         name,
         connector_id: read_trimmed(path.join("connector_id")).and_then(|value| value.parse().ok()),
         vrr_capable: read_bool_property(path.join("vrr_capable")),
+        edid_vrr_range: fs::read(path.join("edid"))
+            .ok()
+            .and_then(|edid| parse_edid_vrr_range(&edid)),
     })
 }
 

@@ -683,6 +683,11 @@ impl NativeRuntime {
             None
         };
         let output_hotplug = super::output_hotplug::NativeOutputHotplug::open(kms.file());
+        let vrr_range = super::vrr_cadence::VrrRange::discover(
+            output_refresh_rate.refresh_millihz(),
+            output_capabilities.edid_vrr_range,
+            super::vrr_cadence::VrrRange::override_min_hz_from_environment(),
+        );
         let mut runtime = Self {
             server,
             head: super::output_head::OutputHead {
@@ -733,9 +738,7 @@ impl NativeRuntime {
                 atomic_commit_arbiter: AtomicCommitArbiter::new(),
                 output_transactions: OutputTransactionLedger::new_for_output(output_id),
                 confirmed_kms_presentation: ConfirmedKmsPresentationState::default(),
-                vrr_cadence: super::vrr_cadence::VrrCadenceRecorder::new(
-                    output_refresh_rate.refresh_millihz(),
-                ),
+                vrr_cadence: super::vrr_cadence::VrrCadenceRecorder::new(vrr_range),
                 presentation_timing,
                 cursor_timing,
                 presentation_deadline,
@@ -1765,6 +1768,11 @@ impl NativeRuntime {
             }
             fields
         });
+        let vrr_range = super::vrr_cadence::VrrRange::discover(
+            output_refresh_rate.refresh_millihz(),
+            output_capabilities.edid_vrr_range,
+            super::vrr_cadence::VrrRange::override_min_hz_from_environment(),
+        );
         perf.log("native.vrr_capability", || {
             vec![
                 NativePerfField::str("configured_policy", vrr_policy.as_str()),
@@ -1781,6 +1789,9 @@ impl NativeRuntime {
                     kms_backend.atomic_crtc_vrr_property_available(),
                 ),
                 NativePerfField::bool("atomic_vrr_capable", kms_backend.atomic_vrr_capable()),
+                NativePerfField::u64("vrr_min_hz", vrr_range.min_hz.map_or(0, u64::from)),
+                NativePerfField::u64("vrr_max_millihz", u64::from(vrr_range.max_millihz)),
+                NativePerfField::str("vrr_range_source", vrr_range.source.as_str()),
                 NativePerfField::str("effective_mode", "vsync"),
                 NativePerfField::str(
                     "vrr_blocker",

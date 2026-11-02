@@ -916,6 +916,17 @@ impl NativeScanoutBackend {
         Ok(())
     }
 
+    /// Live connector/CRTC VRR capability, re-read after a DRM uevent.
+    pub(crate) fn refresh_vrr_capability(
+        &mut self,
+        vrr_connector_capable: bool,
+        vrr_crtc_property_available: bool,
+    ) {
+        if let Self::AtomicEglGbm(scanout) = self {
+            scanout.refresh_vrr_capability(vrr_connector_capable, vrr_crtc_property_available);
+        }
+    }
+
     pub(crate) fn rebind_output_epoch(
         &mut self,
         output_epoch: oblivion_one::native::OutputEpochId,

@@ -113,6 +113,7 @@ pub(crate) struct NativeOutputCapabilities {
     pub(crate) modes_truncated: bool,
     pub(crate) mode_inventory: NativeOutputModeInventory,
     pub(crate) sysfs_vrr_capable: Option<bool>,
+    pub(crate) edid_vrr_range: Option<EdidVrrRange>,
 }
 
 impl NativeOutputCapabilities {
@@ -120,8 +121,10 @@ impl NativeOutputCapabilities {
         if let Some(connector) = connector {
             self.connector_name.clone_from(&connector.name);
             self.sysfs_vrr_capable = connector.vrr_capable;
+            self.edid_vrr_range = connector.edid_vrr_range;
         } else {
             self.sysfs_vrr_capable = None;
+            self.edid_vrr_range = None;
         }
     }
 }
@@ -323,6 +326,7 @@ pub(crate) fn native_output_capabilities(
         modes_truncated,
         mode_inventory,
         sysfs_vrr_capable: None,
+        edid_vrr_range: None,
     }
 }
 

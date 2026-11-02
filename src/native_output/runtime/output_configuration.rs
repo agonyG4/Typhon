@@ -2953,9 +2953,12 @@ impl NativeRuntime {
             .requalify(generation);
         self.head.output_refresh_rate =
             super::super::output::output_refresh_rate_for_mode(&target.mode);
-        self.head.vrr_cadence = super::vrr_cadence::VrrCadenceRecorder::new(
-            self.head.output_refresh_rate.refresh_millihz(),
-        );
+        self.head.vrr_cadence =
+            super::vrr_cadence::VrrCadenceRecorder::new(super::vrr_cadence::VrrRange::discover(
+                self.head.output_refresh_rate.refresh_millihz(),
+                self.head.output_capabilities.edid_vrr_range,
+                super::vrr_cadence::VrrRange::override_min_hz_from_environment(),
+            ));
         self.head.mode_label = format!(
             "{}x{}@{}",
             target.width,

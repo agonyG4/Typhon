@@ -228,6 +228,7 @@ fn selected_sysfs_output_uses_connector_id_not_directory_sort_order() {
             &[],
         ),
         sysfs_vrr_capable: None,
+        edid_vrr_range: None,
     };
     capabilities.qualify_sysfs_connector(Some(&connector));
 
@@ -585,6 +586,7 @@ fn control_snapshot_vrr_state_uses_atomic_capability_and_confirmed_pageflip_stat
                 &[],
             ),
             sysfs_vrr_capable,
+            edid_vrr_range: None,
         };
         assert_eq!(capabilities.sysfs_vrr_capable, sysfs_vrr_capable);
 

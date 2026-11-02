@@ -101,6 +101,73 @@ impl NativeRuntime {
         Ok(())
     }
 
+    fn refresh_active_vrr_capability(&mut self, reason: &'static str) {
+        let before = (
+            self.kms_backend.atomic_connector_vrr_capable(),
+            self.kms_backend.atomic_crtc_vrr_property_available(),
+        );
+        if let Err(error) = self
+            .kms_backend
+            .rediscover_atomic_pipeline_for_recovery(self.kms.file().as_fd())
+        {
+            // Legacy KMS or a pipeline that changed under us: keep the old
+            // capability; head reconfiguration owns the latter.
+            if self.kms_backend.effective_kind()
+                == oblivion_one::native::kms::KmsBackendKind::Atomic
+            {
+                eprintln!(
+                    "native output hotplug: VRR capability refresh ({reason}) failed: {error}"
+                );
+            }
+            return;
+        }
+        let after = (
+            self.kms_backend.atomic_connector_vrr_capable(),
+            self.kms_backend.atomic_crtc_vrr_property_available(),
+        );
+        let selected_connector = kms_card_path(self.kms.file()).ok().and_then(|kms_path| {
+            crate::native_output::output::selected_connector_for_kms_target(
+                Some(&kms_path),
+                Path::new("/sys/class/drm"),
+                self.head.target.connector_id,
+                &self.head.output_capabilities.connector_name,
+            )
+        });
+        let edid_vrr_range = selected_connector.and_then(|connector| connector.edid_vrr_range);
+        if after == before && edid_vrr_range == self.head.output_capabilities.edid_vrr_range {
+            return;
+        }
+        self.head.scanout.refresh_vrr_capability(after.0, after.1);
+        self.head.output_capabilities.edid_vrr_range = edid_vrr_range;
+        let range = super::vrr_cadence::VrrRange::discover(
+            self.head.output_refresh_rate.refresh_millihz(),
+            edid_vrr_range,
+            super::vrr_cadence::VrrRange::override_min_hz_from_environment(),
+        );
+        self.head.vrr_cadence = super::vrr_cadence::VrrCadenceRecorder::new(range);
+        eprintln!(
+            "native output hotplug ({reason}): VRR capability connector={} crtc={} (was {} {}), range {}..{} mHz from {}",
+            after.0,
+            after.1,
+            before.0,
+            before.1,
+            range.min_hz.map_or(0, |hz| hz * 1_000),
+            range.max_millihz,
+            range.source.as_str()
+        );
+        self.perf.log("native.vrr_capability_changed", || {
+            vec![
+                NativePerfField::str("reason", reason),
+                NativePerfField::bool("drm_connector_capable", after.0),
+                NativePerfField::bool("crtc_vrr_property_available", after.1),
+                NativePerfField::bool("previous_connector_capable", before.0),
+                NativePerfField::u64("vrr_min_hz", range.min_hz.map_or(0, u64::from)),
+                NativePerfField::u64("vrr_max_millihz", u64::from(range.max_millihz)),
+                NativePerfField::str("vrr_range_source", range.source.as_str()),
+            ]
+        });
+    }
+
     pub(super) fn rescan_connector_inventory(&mut self, reason: &'static str) {
         let next = match ConnectorInventory::query(self.kms.file()) {
             Ok(inventory) => inventory,
@@ -114,6 +181,10 @@ impl NativeRuntime {
         self.output_hotplug.rescan_deferred = false;
         let delta = self.output_hotplug.inventory.diff(&next);
         self.output_hotplug.inventory = next;
+        // A sink can change its VRR capability without changing identity (an
+        // OSD Adaptive-Sync toggle renegotiates the DP link), so the live
+        // capability is re-read on every uevent, not only on inventory deltas.
+        self.refresh_active_vrr_capability(reason);
         if delta.is_empty() {
             return;
         }

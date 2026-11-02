@@ -1450,6 +1450,15 @@ impl AtomicEglGbmScanout {
             .request_direct_release(DirectReleaseProof::Unproven, false);
     }
 
+    pub(crate) fn refresh_vrr_capability(
+        &mut self,
+        vrr_connector_capable: bool,
+        vrr_crtc_property_available: bool,
+    ) {
+        self.vrr_connector_capable = vrr_connector_capable;
+        self.vrr_crtc_property_available = vrr_crtc_property_available;
+    }
+
     pub(crate) fn rebind_output_epoch(
         &mut self,
         output_epoch: crate::native_output::OutputEpochId,
