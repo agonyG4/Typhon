@@ -36,6 +36,13 @@ impl CompositorState {
         self.logical_output_ids.insert(output_id);
         self.logical_outputs.insert(output_id, output);
         self.publish_output_global(display, output_id);
+        // The new output shows a workspace that was hidden until now.
+        if self.workspace_manager.attach_output(output_id).is_some() {
+            self.workspace_presentation.clear();
+            self.rebuild_active_scene_view();
+            self.advance_render_generation(RenderGenerationCause::OutputChange);
+            self.publish_workspace_state();
+        }
         self.reconcile_all_surface_output_memberships();
         Some(output_id)
     }

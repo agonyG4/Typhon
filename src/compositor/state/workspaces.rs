@@ -67,6 +67,11 @@ impl CompositorState {
         {
             return Some("invalid_workspace_axis");
         }
+        // The slide moves the whole scene; with several outputs it would drag
+        // the other outputs' workspaces along.
+        if self.workspace_manager.outputs().nth(1).is_some() {
+            return Some("multi_output");
+        }
         if self.lifecycle_animation_has_pending_visible() {
             return Some("retained_lifecycle_active");
         }
@@ -226,7 +231,7 @@ impl CompositorState {
         selection: ActiveSceneSelection,
     ) -> bool {
         match location {
-            WorkspaceLocation::Regular(workspace) => workspace == selection.regular,
+            WorkspaceLocation::Regular(workspace) => selection.regular.contains(workspace),
             WorkspaceLocation::Special(special) => selection.special == Some(special),
         }
     }
@@ -258,7 +263,7 @@ impl CompositorState {
 
     pub(in crate::compositor) fn active_scene_selection(&self) -> ActiveSceneSelection {
         ActiveSceneSelection {
-            regular: self.active_workspace(),
+            regular: self.workspace_manager.visible_workspaces(),
             special: self.workspace_manager.visible_special_workspace(),
         }
     }
@@ -395,7 +400,7 @@ impl CompositorState {
             .management
             .is_some_and(|management| match management.location() {
                 WorkspaceLocation::Regular(workspace) => {
-                    workspace == self.active_scene_selection().regular
+                    self.active_scene_selection().regular.contains(workspace)
                 }
                 WorkspaceLocation::Special(special) => {
                     self.active_scene_selection().special == Some(special)
@@ -421,7 +426,7 @@ impl CompositorState {
         &self,
         workspace: WorkspaceId,
     ) -> bool {
-        workspace == self.active_workspace()
+        self.workspace_manager.is_visible(workspace)
             || self
                 .workspace_presentation
                 .path_contains_workspace(&self.workspace_manager, workspace)
@@ -476,7 +481,19 @@ impl CompositorState {
         &mut self,
         workspace: WorkspaceId,
     ) -> WorkspaceSwitchOutcome {
-        let previous_workspace = self.active_workspace();
+        let outcome = self.workspace_manager.activate(workspace);
+        let previous_workspace = match outcome {
+            WorkspaceSwitchOutcome::Changed { previous, .. } => previous,
+            WorkspaceSwitchOutcome::FocusedOutput { .. } => {
+                self.focus_workspace_on_focused_output();
+                return outcome;
+            }
+            WorkspaceSwitchOutcome::NoChange | WorkspaceSwitchOutcome::UnknownWorkspace => {
+                return outcome;
+            }
+        };
+        // The output that switched stopped showing `previous_workspace`; with
+        // several outputs that need not be the workspace that had focus.
         let affected_windows = self
             .desktop_windows
             .keys()
@@ -490,10 +507,6 @@ impl CompositorState {
                     })
             })
             .collect::<Vec<_>>();
-        let outcome = self.workspace_manager.activate(workspace);
-        let WorkspaceSwitchOutcome::Changed { .. } = outcome else {
-            return outcome;
-        };
         let sampled_at = AnimationTime::monotonic_now().unwrap_or(AnimationTime::from_nanos(0));
         self.begin_workspace_slide(outcome, sampled_at);
         self.refresh_frame_work_visibility();
@@ -552,6 +565,21 @@ impl CompositorState {
         }
         self.publish_workspace_state();
         outcome
+    }
+
+    /// Output focus moved to an output whose workspace was already visible:
+    /// keyboard focus follows to that workspace's topmost window.
+    fn focus_workspace_on_focused_output(&mut self) {
+        let focused_layer_surface = self.focused_surface.as_ref().is_some_and(|surface| {
+            self.layer_surfaces
+                .contains_key(&self.root_surface_id_for_surface(compositor_surface_id(surface)))
+        });
+        if !focused_layer_surface {
+            let _ = self.focus_topmost_renderable_toplevel();
+        }
+        self.mark_astrea_toplevel_structure_dirty();
+        self.queue_workspace_publication_commands();
+        self.publish_workspace_state();
     }
 
     pub(in crate::compositor) fn move_window_family_to_workspace(
@@ -787,7 +815,7 @@ impl CompositorState {
 
     fn location_is_visible_in_active_scene(&self, location: WorkspaceLocation) -> bool {
         match location {
-            WorkspaceLocation::Regular(workspace) => workspace == self.active_workspace(),
+            WorkspaceLocation::Regular(workspace) => self.workspace_manager.is_visible(workspace),
             WorkspaceLocation::Special(special) => {
                 self.workspace_manager.visible_special_workspace() == Some(special)
             }

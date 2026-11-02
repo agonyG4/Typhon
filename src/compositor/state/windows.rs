@@ -3490,6 +3490,7 @@ impl CompositorState {
 
     pub(in crate::compositor) fn topmost_renderable_toplevel_window_id(&self) -> Option<WindowId> {
         let special_visible = self.workspace_manager.visible_special_workspace().is_some();
+        let active_workspace = self.active_workspace();
         let candidates = self
             .window_stacking
             .iter()
@@ -3498,6 +3499,15 @@ impl CompositorState {
                 let window = self.window(*window_id)?;
                 if !window.is_workspace_managed()
                     || !self.window_is_visible_in_active_scene(*window_id)
+                {
+                    return None;
+                }
+                // Other outputs' workspaces are visible too, but keyboard focus
+                // stays on the focused output.
+                if window
+                    .management
+                    .and_then(|management| management.regular_workspace())
+                    .is_some_and(|workspace| workspace != active_workspace)
                 {
                     return None;
                 }

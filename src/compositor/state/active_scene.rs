@@ -1,6 +1,6 @@
 use super::*;
 use crate::presentation_animation::PresentationOpacity;
-use crate::wm::{SpecialWorkspaceId, WorkspaceId};
+use crate::wm::SpecialWorkspaceId;
 use std::time::Duration;
 
 #[derive(Debug, Clone, Copy)]
@@ -36,7 +36,8 @@ impl PendingPresentationGeometryTransaction {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::compositor) struct ActiveSceneSelection {
-    pub(in crate::compositor) regular: WorkspaceId,
+    /// Every regular workspace shown on some output.
+    pub(in crate::compositor) regular: crate::wm::VisibleWorkspaces,
     pub(in crate::compositor) special: Option<SpecialWorkspaceId>,
 }
 

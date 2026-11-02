@@ -470,3 +470,49 @@ fn surfaces_enter_and_leave_additional_outputs_by_layout_intersection() {
     ));
     let _ = stop_controllable_test_server(commands, server_thread);
 }
+
+#[test]
+fn each_output_shows_its_own_workspace_and_activation_follows_ownership() {
+    use crate::wm::{WorkspaceId, WorkspaceSwitchOutcome};
+    let workspace = |raw| WorkspaceId::new(raw).unwrap();
+    let mut server = OwnCompositorServer::bind(&unique_socket_name()).unwrap();
+    let native = server.focused_output().expect("native output is attached");
+    assert_eq!(server.output_workspace(native), Some(workspace(1)));
+
+    let right = server
+        .add_logical_output("DP-2", (1280, 0), (1920, 1080), 1.0, 60)
+        .unwrap();
+    assert_eq!(server.output_workspace(right), Some(workspace(2)));
+    assert_eq!(server.focused_output(), Some(native));
+    assert_eq!(server.active_workspace(), workspace(1));
+
+    // Workspace 2 is already on screen: only output focus moves.
+    assert_eq!(
+        server.activate_workspace(workspace(2)),
+        WorkspaceSwitchOutcome::FocusedOutput {
+            previous: workspace(1),
+            current: workspace(2),
+        }
+    );
+    assert_eq!(server.focused_output(), Some(right));
+    assert_eq!(server.output_workspace(native), Some(workspace(1)));
+
+    // Workspace 3 belongs to the native output, so it switches there.
+    assert_eq!(
+        server.activate_workspace(workspace(3)),
+        WorkspaceSwitchOutcome::Changed {
+            previous: workspace(1),
+            current: workspace(3),
+        }
+    );
+    assert_eq!(server.focused_output(), Some(native));
+    assert_eq!(server.output_workspace(right), Some(workspace(2)));
+
+    server.withdraw_logical_output(right);
+    assert_eq!(server.output_workspace(right), None);
+    assert_eq!(server.focused_output(), Some(native));
+    assert_eq!(server.active_workspace(), workspace(3));
+    // Workspace 2 now belongs to the native output and switches it.
+    assert!(server.activate_workspace(workspace(2)).is_changed());
+    assert_eq!(server.output_workspace(native), Some(workspace(2)));
+}

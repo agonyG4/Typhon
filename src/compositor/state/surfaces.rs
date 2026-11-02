@@ -920,6 +920,7 @@ impl CompositorState {
             state
                 .logical_outputs
                 .insert(output_id, LogicalOutput::native());
+            state.workspace_manager.attach_output(output_id);
         }
         // PresentationAnimator has its own compatibility defaults for older
         // callers. The compositor-owned control plane is authoritative for
@@ -943,6 +944,7 @@ impl CompositorState {
                 self.logical_output_ids.insert(output_id);
                 self.logical_outputs
                     .insert(output_id, self.native_logical_output());
+                self.workspace_manager.attach_output(output_id);
             }
         }
         self.native_output_id

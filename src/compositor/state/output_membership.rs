@@ -278,6 +278,17 @@ impl CompositorState {
         }
         self.logical_output_ids.remove(&output_id);
         self.logical_outputs.remove(&output_id);
+        let previously_focused = self.workspace_manager.focused_output();
+        self.workspace_manager.detach_output(output_id);
+        // The withdrawn output's workspace is hidden now; its windows wait on
+        // their workspace, which another output owns from here on.
+        self.workspace_presentation.clear();
+        self.rebuild_active_scene_view();
+        self.advance_render_generation(RenderGenerationCause::OutputChange);
+        if previously_focused == Some(output_id) {
+            let _ = self.focus_topmost_renderable_toplevel();
+        }
+        self.publish_workspace_state();
         self.scrub_empty_surface_output_memberships();
         debug_assert!(self.check_surface_output_membership_invariants());
         debug_assert!(self.check_output_binding_invariants());

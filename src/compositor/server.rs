@@ -1808,6 +1808,15 @@ impl OwnCompositorServer {
         self.state.active_workspace()
     }
 
+    /// The regular workspace an output currently shows.
+    pub fn output_workspace(&self, output_id: OutputId) -> Option<WorkspaceId> {
+        self.state.workspace_manager.output_workspace(output_id)
+    }
+
+    pub fn focused_output(&self) -> Option<OutputId> {
+        self.state.workspace_manager.focused_output()
+    }
+
     pub fn workspace_presentation_active(&self) -> bool {
         self.state.workspace_presentation.transition().is_some()
             || self.state.special_workspace_presentation_active()

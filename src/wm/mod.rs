@@ -10,5 +10,6 @@ pub use window::{
     LayoutMembership, WindowChromePolicy, WindowDecorationPolicy, WindowManagementState,
 };
 pub use workspace::{
-    SpecialWorkspaceToggleOutcome, WorkspaceId, WorkspaceManager, WorkspaceSwitchOutcome,
+    SpecialWorkspaceToggleOutcome, VisibleWorkspaces, WorkspaceId, WorkspaceManager,
+    WorkspaceSwitchOutcome,
 };

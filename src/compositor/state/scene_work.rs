@@ -60,7 +60,7 @@ impl SceneWorkIndex {
                 && match owner {
                     SceneWorkOwner::Global => true,
                     SceneWorkOwner::Location(crate::wm::WorkspaceLocation::Regular(workspace)) => {
-                        *workspace == selection.regular
+                        selection.regular.contains(*workspace)
                     }
                     SceneWorkOwner::Location(crate::wm::WorkspaceLocation::Special(special)) => {
                         selection.special == Some(*special)
@@ -86,7 +86,7 @@ impl SceneWorkIndex {
                 && match owner {
                     SceneWorkOwner::Global => true,
                     SceneWorkOwner::Location(WorkspaceLocation::Regular(workspace)) => {
-                        *workspace == selection.regular
+                        selection.regular.contains(*workspace)
                     }
                     SceneWorkOwner::Location(WorkspaceLocation::Special(special)) => {
                         selection.special == Some(*special)

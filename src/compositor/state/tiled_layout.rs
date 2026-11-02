@@ -831,7 +831,7 @@ impl CompositorState {
         location: WorkspaceLocation,
     ) -> bool {
         match location {
-            WorkspaceLocation::Regular(workspace) => workspace == self.active_workspace(),
+            WorkspaceLocation::Regular(workspace) => self.workspace_manager.is_visible(workspace),
             WorkspaceLocation::Special(special) => {
                 self.workspace_manager.visible_special_workspace() == Some(special)
             }
