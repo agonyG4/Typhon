@@ -3140,6 +3140,10 @@ impl NativeRuntime {
                             PageflipTimestampUncertainty::Unbounded => None,
                         };
                         let reason = format!("{violation:?}");
+                        let vrr_rejected = explicit.note_variable_pageflip_violation(
+                            output_epoch.get(),
+                            compositor_receive_ns,
+                        );
                         frame_pacing.log(
                             "vrr_physical_lower_bound_violation",
                             vec![
@@ -3155,6 +3159,7 @@ impl NativeRuntime {
                                     timestamp_uncertainty_ns,
                                 ),
                                 PacingField::str("reason", reason.clone()),
+                                PacingField::bool("vrr_rejected", vrr_rejected),
                             ],
                         );
                         perf.log("native.vrr_physical_lower_bound_violation", || {
@@ -3177,12 +3182,15 @@ impl NativeRuntime {
                                     ),
                                 ),
                                 NativePerfField::str("reason", reason),
+                                NativePerfField::bool("vrr_rejected", vrr_rejected),
                             ]
                         });
-                        explicit.reject_variable_pageflip_for_generation(output_epoch.get());
-                        if let Some(key) = output_transactions
-                            .transaction_including_terminal(transaction_id)
-                            .and_then(|record| record.descriptor().presentation_validation_key())
+                        if vrr_rejected
+                            && let Some(key) = output_transactions
+                                .transaction_including_terminal(transaction_id)
+                                .and_then(|record| {
+                                    record.descriptor().presentation_validation_key()
+                                })
                         {
                             explicit.note_composited_presentation_validation(key, false);
                         }

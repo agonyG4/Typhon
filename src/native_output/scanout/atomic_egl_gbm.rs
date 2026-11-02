@@ -359,12 +359,40 @@ pub(crate) struct AtomicRenderPhaseDurations {
     pub(crate) native_render_fence_export_ns: u64,
 }
 
+/// Lower-bound violations needed inside `VARIABLE_VIOLATION_WINDOW_NS` before
+/// VRR is rejected for an output generation. A driver that ignores the VRR
+/// lower bound violates it on every flip; NVIDIA timestamp noise produces an
+/// isolated sample now and then (one 1.04 ms outlier in ~10k flips), which
+/// must not disable VRR for the rest of the session.
+const VARIABLE_VIOLATION_STRIKES: usize = 3;
+const VARIABLE_VIOLATION_WINDOW_NS: u64 = 5_000_000_000;
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct VariablePageflipQualification {
     rejected_output_generation: Option<u64>,
+    strike_generation: u64,
+    recent_violations_ns: [Option<u64>; VARIABLE_VIOLATION_STRIKES],
 }
 
 impl VariablePageflipQualification {
+    /// Records one lower-bound violation and returns whether it rejected VRR
+    /// for `output_generation`.
+    fn note_violation(&mut self, output_generation: u64, observed_at_ns: u64) -> bool {
+        if self.strike_generation != output_generation {
+            self.strike_generation = output_generation;
+            self.recent_violations_ns = [None; VARIABLE_VIOLATION_STRIKES];
+        }
+        self.recent_violations_ns.rotate_left(1);
+        self.recent_violations_ns[VARIABLE_VIOLATION_STRIKES - 1] = Some(observed_at_ns);
+        let rejected = self.recent_violations_ns[0].is_some_and(|oldest| {
+            observed_at_ns.saturating_sub(oldest) <= VARIABLE_VIOLATION_WINDOW_NS
+        });
+        if rejected {
+            self.reject_generation(output_generation);
+        }
+        rejected
+    }
+
     fn reject_generation(&mut self, output_generation: u64) {
         self.rejected_output_generation = Some(output_generation);
     }
@@ -374,7 +402,7 @@ impl VariablePageflipQualification {
     }
 
     fn clear(&mut self) {
-        self.rejected_output_generation = None;
+        *self = Self::default();
     }
 }
 
@@ -394,6 +422,24 @@ mod variable_pageflip_qualification_tests {
 
         qualification.clear();
         assert!(!qualification.rejects_mode(OutputPresentationMode::AdaptiveSync, 7));
+    }
+
+    #[test]
+    fn isolated_violations_keep_vrr_but_a_burst_rejects_it() {
+        let second = 1_000_000_000;
+        let mut qualification = VariablePageflipQualification::default();
+        assert!(!qualification.note_violation(7, 10 * second));
+        assert!(!qualification.note_violation(7, 20 * second));
+        assert!(!qualification.note_violation(7, 30 * second));
+        assert!(!qualification.rejects_mode(OutputPresentationMode::AdaptiveSync, 7));
+
+        // A new generation starts with no strikes.
+        assert!(!qualification.note_violation(8, 30 * second + 1));
+        assert!(!qualification.note_violation(8, 31 * second));
+        assert!(!qualification.rejects_mode(OutputPresentationMode::AdaptiveSync, 8));
+
+        assert!(qualification.note_violation(8, 32 * second));
+        assert!(qualification.rejects_mode(OutputPresentationMode::AdaptiveSync, 8));
     }
 }
 
@@ -1978,11 +2024,17 @@ impl AtomicEglGbmScanout {
         }
     }
 
-    pub(crate) fn reject_variable_pageflip_for_generation(&mut self, output_generation: u64) {
-        if self.async_output_generation == output_generation {
-            self.variable_pageflip_qualification
-                .reject_generation(output_generation);
-        }
+    /// Records a VRR lower-bound violation; returns whether repeated
+    /// violations rejected VRR for the output generation.
+    pub(crate) fn note_variable_pageflip_violation(
+        &mut self,
+        output_generation: u64,
+        observed_at_ns: u64,
+    ) -> bool {
+        self.async_output_generation == output_generation
+            && self
+                .variable_pageflip_qualification
+                .note_violation(output_generation, observed_at_ns)
     }
 
     pub(crate) fn invalidate_direct_validation_cache(&mut self) {
