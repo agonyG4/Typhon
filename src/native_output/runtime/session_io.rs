@@ -696,6 +696,8 @@ impl NativeSessionIo for NativeRuntime {
             .mode_inventory
             .requalify(configuration_generation);
         self.pending_session_recovery = None;
+        // Monitors may have changed while another session owned the device.
+        self.rescan_connector_inventory("session_resume");
         Ok(())
     }
 

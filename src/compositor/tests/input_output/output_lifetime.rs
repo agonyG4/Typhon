@@ -235,9 +235,23 @@ fn logical_output_withdrawal_sends_leave_before_retiring_its_binding() {
         ]
     );
 
+    let advertised_outputs = || {
+        globals.contents().with_list(|list| {
+            list.iter()
+                .filter(|global| global.interface == "wl_output")
+                .count()
+        })
+    };
+    assert_eq!(advertised_outputs(), 1);
+
     commands.send(ServerCommand::WithdrawLogicalOutput).unwrap();
     wait_for_server_commands(&commands);
     queue.roundtrip(&mut state).unwrap();
+    assert_eq!(
+        advertised_outputs(),
+        0,
+        "withdrawal must remove the wl_output global from the registry"
+    );
     assert_eq!(state.surface_leave_count, 2);
     assert_eq!(
         state.surface_leave_output_ids,

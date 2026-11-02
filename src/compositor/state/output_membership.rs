@@ -101,13 +101,33 @@ pub(in crate::compositor) struct SurfaceOutputMembership {
 }
 
 impl CompositorState {
-    pub(in crate::compositor) fn register_output_resource(&mut self, output: wl_output::WlOutput) {
-        let Some(output_id) = self
-            .native_output_id()
-            .filter(|output_id| self.logical_output_ids.contains(output_id))
-        else {
+    pub(in crate::compositor) fn publish_output_global(
+        &mut self,
+        display: &DisplayHandle,
+        output_id: OutputId,
+    ) {
+        if !self.logical_output_ids.contains(&output_id)
+            || self.output_globals.contains_key(&output_id)
+        {
             return;
-        };
+        }
+        let global = display.create_global::<CompositorState, wl_output::WlOutput, _>(
+            crate::compositor::protocols::versions::WL_OUTPUT,
+            output_id,
+        );
+        self.output_globals.insert(output_id, global);
+    }
+
+    pub(in crate::compositor) fn register_output_resource(
+        &mut self,
+        output: wl_output::WlOutput,
+        output_id: OutputId,
+    ) {
+        // A client can bind a global that was withdrawn after the registry
+        // announced it; that binding never becomes part of the output.
+        if !self.logical_output_ids.contains(&output_id) {
+            return;
+        }
         let Some(client_id) = output.client().map(|client| client.id()) else {
             return;
         };
@@ -188,13 +208,19 @@ impl CompositorState {
         debug_assert!(self.check_output_binding_invariants());
     }
 
-    // This retires Typhon's logical and binding state but leaves the advertised wl_output global
-    // in place. The runtime has no hotplug feed today; before DRM hotplug calls this, the global
-    // needs first-class lifetime ownership so withdrawal can also remove it from the registry.
+    // Retires the logical output, its bindings and its wl_output global. The runtime observes DRM
+    // hotplug but does not retire heads yet, so only tests withdraw outputs today.
     #[allow(dead_code)]
-    pub(in crate::compositor) fn withdraw_output(&mut self, output_id: OutputId) {
+    pub(in crate::compositor) fn withdraw_output(
+        &mut self,
+        display: &DisplayHandle,
+        output_id: OutputId,
+    ) {
         if !self.logical_output_ids.contains(&output_id) {
             return;
+        }
+        if let Some(global) = self.output_globals.remove(&output_id) {
+            display.remove_global::<CompositorState>(global);
         }
         let bindings = self
             .output_resources

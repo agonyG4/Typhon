@@ -176,17 +176,17 @@ impl GlobalDispatch<wl_drm::WlDrm, ()> for CompositorState {
     }
 }
 
-impl GlobalDispatch<wl_output::WlOutput, ()> for CompositorState {
+impl GlobalDispatch<wl_output::WlOutput, OutputId> for CompositorState {
     fn bind(
         state: &mut Self,
         _handle: &DisplayHandle,
         _client: &Client,
         resource: New<wl_output::WlOutput>,
-        _global_data: &(),
+        output_id: &OutputId,
         data_init: &mut DataInit<'_, Self>,
     ) {
         let output = data_init.init(resource, ());
-        state.register_output_resource(output);
+        state.register_output_resource(output, *output_id);
     }
 }
 

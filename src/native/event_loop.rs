@@ -21,6 +21,7 @@ pub enum NativeEventSource {
     Input(u16),
     ControllerMonitor,
     ControllerDevice(u32),
+    DrmHotplug,
     Timer,
     ExplicitSyncAcquire,
     OutputRenderFence,
@@ -104,6 +105,7 @@ impl WakeReasons {
     const CONTROL: u32 = 1 << 14;
     const SYSTEM_ACTION: u32 = 1 << 21;
     const RENDER_WORKER: u32 = 1 << 22;
+    const DRM_HOTPLUG: u32 = 1 << 23;
 
     pub const fn drm(self) -> bool {
         self.0 & Self::DRM != 0
@@ -131,6 +133,10 @@ impl WakeReasons {
 
     pub const fn controller(self) -> bool {
         self.0 & Self::CONTROLLER != 0
+    }
+
+    pub const fn drm_hotplug(self) -> bool {
+        self.0 & Self::DRM_HOTPLUG != 0
     }
 
     pub const fn seat(self) -> bool {
@@ -219,6 +225,7 @@ impl WakeReasons {
             NativeEventSource::ControllerMonitor | NativeEventSource::ControllerDevice(_) => {
                 Self::CONTROLLER
             }
+            NativeEventSource::DrmHotplug => Self::DRM_HOTPLUG,
             NativeEventSource::Timer => Self::TIMER,
             NativeEventSource::ExplicitSyncAcquire => Self::EXPLICIT_SYNC_ACQUIRE,
             NativeEventSource::OutputRenderFence => Self::OUTPUT_RENDER_FENCE,
@@ -735,6 +742,13 @@ impl NativeEventLoop {
             let error_events =
                 libc::EPOLLERR as u32 | libc::EPOLLHUP as u32 | libc::EPOLLRDHUP as u32;
             if event_flags & error_events != 0 {
+                // A netlink receive-buffer overrun raises EPOLLERR. The runtime
+                // drains the socket and rescans connectors, so the overrun is
+                // a hotplug wake rather than a fatal reactor error.
+                if registration_source == NativeEventSource::DrmHotplug {
+                    reasons.insert(registration_source);
+                    continue;
+                }
                 if is_optional_controller_source(registration_source) {
                     reasons.insert(registration_source);
                     match registration_source {

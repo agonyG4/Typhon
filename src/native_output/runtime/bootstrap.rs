@@ -682,6 +682,7 @@ impl NativeRuntime {
         } else {
             None
         };
+        let output_hotplug = super::output_hotplug::NativeOutputHotplug::open(kms.file());
         let mut runtime = Self {
             server,
             output_id,
@@ -842,6 +843,7 @@ impl NativeRuntime {
             scaled_primary_probe: ScaledPrimaryProbeCache::default(),
             slow_cycle_trace: NativeSlowCycleTrace::from_env(),
             busy_loop: super::busy_loop::BusyLoopDetector::default(),
+            output_hotplug,
         };
         let finish_result: NativeResult<()> = (|| {
             if xwayland_environment_materialized {
@@ -850,6 +852,7 @@ impl NativeRuntime {
                     .record_xwayland_environment_materialization();
             }
             runtime.sync_controller_reactor_sources()?;
+            runtime.register_drm_hotplug_source()?;
             runtime.install_native_wake_plan(initial_wake_plan, scheduler_anchor_ns)?;
             runtime.attach_xwayland_private_client()?;
             Ok(())

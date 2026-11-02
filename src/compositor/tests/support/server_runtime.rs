@@ -784,7 +784,9 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                     }
                     ServerCommand::WithdrawLogicalOutput => {
                         if let Some(output_id) = server.state.native_output_id() {
-                            server.state.withdraw_output(output_id);
+                            server
+                                .state
+                                .withdraw_output(&server.display.handle(), output_id);
                         }
                     }
                     ServerCommand::CaptureOutputLifecycle { surface_id, reply } => {

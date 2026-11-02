@@ -420,7 +420,9 @@ pub(crate) const fn runtime_vrr_feature_state(
     }
 }
 
-fn drm_connector_presentation_name(connector: &drm_sys::drm_mode_get_connector) -> String {
+pub(crate) fn drm_connector_presentation_name(
+    connector: &drm_sys::drm_mode_get_connector,
+) -> String {
     let prefix = match connector.connector_type {
         drm_sys::DRM_MODE_CONNECTOR_VGA => "VGA",
         drm_sys::DRM_MODE_CONNECTOR_DVII => "DVI-I",

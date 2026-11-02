@@ -222,7 +222,6 @@ pub(super) fn register_minimum_globals(
             (),
         );
     display.create_global::<CompositorState, xdg_wm_base::XdgWmBase, _>(versions::XDG_WM_BASE, ());
-    display.create_global::<CompositorState, wl_output::WlOutput, _>(versions::WL_OUTPUT, ());
     display.create_global::<CompositorState, ext_workspace_manager_v1::ExtWorkspaceManagerV1, _>(
         versions::EXT_WORKSPACE_MANAGER_V1,
         (),

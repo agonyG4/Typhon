@@ -259,7 +259,7 @@ impl NativeWorkDomains {
         let system_action_transport =
             reasons.system_action_transport() || !wakeup.system_action_events.is_empty();
         let children = reasons.child_signal();
-        let session = reasons.seat();
+        let session = reasons.seat() || reasons.drm_hotplug();
         let xwayland = reasons.xwayland_listen()
             || reasons.xwayland_display_ready()
             || reasons.xwayland_xwm()

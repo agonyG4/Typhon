@@ -66,7 +66,7 @@ use wayland_protocols::xdg::{
 use wayland_protocols_wlr::layer_shell::v1::server::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
 use wayland_server::{
     Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource, WEnum,
-    backend::{ClientId, ObjectId},
+    backend::{ClientId, GlobalId, ObjectId},
     protocol::{
         wl_buffer, wl_callback, wl_compositor, wl_data_device, wl_data_device_manager,
         wl_data_offer, wl_data_source, wl_keyboard, wl_output, wl_pointer, wl_region, wl_seat,
@@ -718,6 +718,8 @@ pub struct CompositorState {
     native_output_id: Option<OutputId>,
     output_id_allocator: OutputIdAllocator,
     logical_output_ids: HashSet<OutputId>,
+    // One advertised wl_output global per logical output; withdrawal removes it.
+    output_globals: HashMap<OutputId, GlobalId>,
     pub accepted_clients: usize,
     pub xdg_toplevels: usize,
     pub xdg_popups: usize,

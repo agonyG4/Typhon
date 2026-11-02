@@ -641,6 +641,9 @@ impl NativeRuntime {
         self.advance_shutdown_lifecycle(&cycle)?;
         self.sync_xwayland_selection_metadata()?;
         self.sync_xwayland_dnd()?;
+        if cycle.wakeup.reasons.drm_hotplug() {
+            self.service_drm_hotplug()?;
+        }
         if !self.session.permits_output() {
             if work_domains.wayland_dispatch
                 || work_domains.astrea_publication

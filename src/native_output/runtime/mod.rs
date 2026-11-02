@@ -145,6 +145,7 @@ mod kms_worker_teardown;
 mod kms_worker_tests;
 mod metrics;
 mod output_configuration;
+mod output_hotplug;
 #[cfg(test)]
 mod physical_effect_damage_tests;
 mod plane_cycle;
@@ -892,6 +893,7 @@ pub(crate) struct NativeRuntime {
     scaled_primary_probe: crate::native_output::scanout::ScaledPrimaryProbeCache,
     slow_cycle_trace: NativeSlowCycleTrace,
     busy_loop: busy_loop::BusyLoopDetector,
+    output_hotplug: output_hotplug::NativeOutputHotplug,
 }
 
 pub(super) fn reload_trusted_effects_from_disk(

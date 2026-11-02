@@ -583,6 +583,9 @@ impl OwnCompositorServer {
             .map_err(|error| CompositorError::Bind(error.to_string()))?;
 
         let mut state = CompositorState::new(syncobj_device);
+        if let Some(output_id) = state.native_output_id() {
+            state.publish_output_global(&display.handle(), output_id);
+        }
         state.set_background_effect_enabled(renderer_capabilities.background_effect);
         if let Err(error) = state.reload_blur_policy_from_disk() {
             eprintln!(

@@ -395,7 +395,8 @@ impl ProductionOutputModel {
                 (),
             )
             .expect("output resource");
-        self.state.register_output_resource(output.clone());
+        let output_id = self.state.native_output_id().expect("native output id");
+        self.state.register_output_resource(output.clone(), output_id);
         self.bindings.insert(id, output);
     }
 
@@ -408,7 +409,7 @@ impl ProductionOutputModel {
 
     fn withdraw_output(&mut self) {
         if let Some(output_id) = self.state.native_output_id() {
-            self.state.withdraw_output(output_id);
+            self.state.withdraw_output(&self.display.handle(), output_id);
         }
         self.bindings.clear();
     }
