@@ -14,6 +14,7 @@ fn input(now: u64, not_before: Option<u64>) -> VrrWindowPlanInput {
         now: MonotonicTimestampNs::new(now),
         not_before: not_before.map(MonotonicTimestampNs::new),
         shortest_interval: Duration::from_nanos(REFRESH_165_HZ_NS),
+        longest_interval: None,
     }
 }
 
@@ -212,6 +213,7 @@ fn vrr_window_rejects_timestamp_overflow() {
         now: anchor,
         not_before: None,
         shortest_interval: Duration::from_nanos(REFRESH_165_HZ_NS),
+        longest_interval: None,
     };
 
     assert_eq!(VrrWindowPlanner::plan(input), None);
@@ -239,4 +241,21 @@ fn fixed_grid_and_vrr_window_choose_distinct_165_hz_times() {
         MonotonicTimestampNs::new(1_012_121_212)
     );
     assert_eq!(vrr_fields(vrr).1, MonotonicTimestampNs::new(1_009_400_000));
+}
+
+#[test]
+fn vrr_window_carries_a_known_minimum_refresh_and_drops_an_inverted_one() {
+    let floor_48_hz = Duration::from_nanos(20_833_333);
+    let mut known = input(1_009_400_000, None);
+    known.longest_interval = Some(floor_48_hz);
+    let (.., longest) = vrr_fields(VrrWindowPlanner::plan(known).unwrap());
+    assert_eq!(longest, Some(floor_48_hz));
+
+    let (.., longest) = vrr_fields(VrrWindowPlanner::plan(input(1_009_400_000, None)).unwrap());
+    assert_eq!(longest, None);
+
+    let mut inverted = input(1_009_400_000, None);
+    inverted.longest_interval = Some(Duration::from_nanos(REFRESH_165_HZ_NS));
+    let (.., longest) = vrr_fields(VrrWindowPlanner::plan(inverted).unwrap());
+    assert_eq!(longest, None);
 }

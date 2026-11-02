@@ -18,6 +18,9 @@ pub struct VrrWindowPlanInput {
     pub not_before: Option<MonotonicTimestampNs>,
     /// Physical interval implied by the display's maximum refresh rate.
     pub shortest_interval: Duration,
+    /// Physical interval implied by the display's minimum VRR refresh, when
+    /// known. A value not longer than `shortest_interval` is dropped.
+    pub longest_interval: Option<Duration>,
 }
 
 /// Stateless planner for the timing bounds of one VRR window.
@@ -39,6 +42,9 @@ impl VrrWindowPlanner {
             .not_before
             .map_or(input.now, |not_before| input.now.max(not_before));
         let preferred_present = earliest_present.max(logical_eligible);
+        let longest_interval = input
+            .longest_interval
+            .filter(|longest| *longest > input.shortest_interval);
 
         Some(PresentationTiming::VrrWindow {
             anchor: input.anchor,
@@ -47,7 +53,7 @@ impl VrrWindowPlanner {
             preferred_present,
             service_deadline: None,
             shortest_interval: input.shortest_interval,
-            longest_interval: None,
+            longest_interval,
         })
     }
 }

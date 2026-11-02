@@ -1,13 +1,14 @@
-//! VRR cadence diagnostics (VRR Cadence Governor, Phases 0-1).
+//! VRR cadence diagnostics (VRR Cadence Governor, Phases 0-2).
 //!
 //! Observes confirmed physical presentations per output and explains them in a
-//! `native.vrr_cadence` trace. Observation only: nothing here feeds back into
-//! scheduling, and counters for behavior that does not exist yet (VRR windows,
-//! service pulses, idle fallback, cursor piggybacking) stay at zero until the
-//! phase that introduces that behavior wires them.
+//! `native.vrr_cadence` trace. The recorded range also bounds production VRR
+//! windows (Phase 2). Counters for behavior that does not exist yet (service
+//! pulses, idle fallback, cursor piggybacking) stay at zero until the phase
+//! that introduces that behavior wires them.
 
 use crate::native_output::output::{EdidVrrRange, EdidVrrRangeSource};
 use crate::native_output::perf::NativePerfField;
+use crate::native_output::scanout::VariableReservationFallback;
 use oblivion_one::compositor::{OutputPresentationMode, VrrPolicy};
 
 const RECENT_INTERVALS: usize = 16;
@@ -148,6 +149,8 @@ impl IntervalRing {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct VrrCadenceCounters {
     pub(crate) vrr_window_opportunities: u64,
+    /// AdaptiveSync composited frames that still took a Fixed reservation.
+    pub(crate) vrr_fixed_fallback_reservations: u64,
     pub(crate) vrr_cursor_piggybacks: u64,
     pub(crate) vrr_cursor_intermediate_updates: u64,
     pub(crate) vrr_service_pulses_attempted: u64,
@@ -169,6 +172,7 @@ pub(crate) struct VrrCadenceRecorder {
     recent_content_intervals: IntervalRing,
     quiescent_since_ns: Option<u64>,
     last_confirmed_vrr: Option<bool>,
+    last_fixed_fallback: Option<VariableReservationFallback>,
     counters: VrrCadenceCounters,
 }
 
@@ -183,6 +187,7 @@ impl VrrCadenceRecorder {
             recent_content_intervals: IntervalRing::default(),
             quiescent_since_ns: None,
             last_confirmed_vrr: None,
+            last_fixed_fallback: None,
             counters: VrrCadenceCounters::default(),
         }
     }
@@ -203,6 +208,28 @@ impl VrrCadenceRecorder {
             .min_hz
             .filter(|hz| *hz > 0)
             .map(|hz| 1_000_000_000 / u64::from(hz))
+    }
+
+    /// Longest physical interval as a VRR window bound (1 / min refresh).
+    pub(crate) fn longest_interval(&self) -> Option<std::time::Duration> {
+        self.longest_interval_ns()
+            .map(std::time::Duration::from_nanos)
+    }
+
+    /// Records the timing domain chosen for one composited frame. Frames whose
+    /// output is not in steady AdaptiveSync are not VRR decisions.
+    pub(crate) fn note_composited_reservation(
+        &mut self,
+        outcome: Result<(), VariableReservationFallback>,
+    ) {
+        match outcome {
+            Ok(()) => self.counters.vrr_window_opportunities += 1,
+            Err(VariableReservationFallback::NotAdaptiveSync) => {}
+            Err(fallback) => {
+                self.counters.vrr_fixed_fallback_reservations += 1;
+                self.last_fixed_fallback = Some(fallback);
+            }
+        }
     }
 
     /// Records one confirmed physical presentation. Out-of-order timestamps
@@ -342,6 +369,15 @@ impl VrrCadenceRecorder {
             NativePerfField::u64(
                 "vrr_window_opportunities",
                 counters.vrr_window_opportunities,
+            ),
+            NativePerfField::u64(
+                "vrr_fixed_fallback_reservations",
+                counters.vrr_fixed_fallback_reservations,
+            ),
+            NativePerfField::str(
+                "last_fixed_fallback",
+                self.last_fixed_fallback
+                    .map_or("none", VariableReservationFallback::as_str),
             ),
             NativePerfField::u64("vrr_cursor_piggybacks", counters.vrr_cursor_piggybacks),
             NativePerfField::u64(
@@ -539,6 +575,23 @@ mod tests {
             (None, VrrRangeSource::ActiveModeOnly)
         );
         assert_eq!(VrrRange::discover(60_000, None, None).min_hz, None);
+    }
+
+    #[test]
+    fn composited_reservations_count_windows_and_fixed_fallbacks() {
+        let mut recorder = VrrCadenceRecorder::new(VrrRange::discover(165_000, None, None));
+        recorder.note_composited_reservation(Ok(()));
+        recorder.note_composited_reservation(Ok(()));
+        recorder.note_composited_reservation(Err(VariableReservationFallback::NotAdaptiveSync));
+        recorder.note_composited_reservation(Err(VariableReservationFallback::CommitTiming));
+
+        let counters = recorder.counters();
+        assert_eq!(counters.vrr_window_opportunities, 2);
+        assert_eq!(counters.vrr_fixed_fallback_reservations, 1);
+        assert_eq!(
+            recorder.last_fixed_fallback,
+            Some(VariableReservationFallback::CommitTiming)
+        );
     }
 
     #[test]

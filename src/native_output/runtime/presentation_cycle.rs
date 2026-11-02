@@ -315,6 +315,7 @@ impl NativeRuntime {
                     cursor_timing,
                     presentation_deadline,
                     scheduled_presentation_target,
+                    vrr_cadence,
                     render_journal,
                     adaptive_buffering,
                     triple_buffer_policy,
@@ -1760,8 +1761,11 @@ impl NativeRuntime {
                                     last_primary_presented_at_ns.map(MonotonicTimestampNs::new),
                                     MonotonicTimestampNs::new(monotonic_now_ns()?),
                                     Duration::from_nanos(output_refresh_rate.interval_ns()),
+                                    vrr_cadence.longest_interval(),
                                 );
-                                let prepared_reservation = if let Some(reservation) =
+                                vrr_cadence
+                                    .note_composited_reservation(variable_reservation.map(|_| ()));
+                                let prepared_reservation = if let Ok(reservation) =
                                     variable_reservation
                                 {
                                     PreparedCompositedReservation::Variable { reservation }

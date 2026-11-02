@@ -634,6 +634,46 @@ pub(crate) struct VariableCompositedAdmission {
     pub(crate) deferred_o1: bool,
 }
 
+/// Why an AdaptiveSync composited frame took a Fixed reservation instead of
+/// a VRR window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VariableReservationFallback {
+    /// The output is not in steady AdaptiveSync; not a VRR fallback.
+    NotAdaptiveSync,
+    ValidationPending,
+    ConfirmedStateMismatch,
+    StateTransitionRequired,
+    NotReactiveDouble,
+    CreditAboveOne,
+    RenderAhead,
+    FixedTargetOwned,
+    CommitTiming,
+    DeferredO1,
+    NoPhysicalAnchor,
+    OpportunityExhausted,
+    WindowUnplannable,
+}
+
+impl VariableReservationFallback {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotAdaptiveSync => "not_adaptive_sync",
+            Self::ValidationPending => "validation_pending",
+            Self::ConfirmedStateMismatch => "confirmed_state_mismatch",
+            Self::StateTransitionRequired => "state_transition_required",
+            Self::NotReactiveDouble => "not_reactive_double",
+            Self::CreditAboveOne => "credit_above_one",
+            Self::RenderAhead => "render_ahead",
+            Self::FixedTargetOwned => "fixed_target_owned",
+            Self::CommitTiming => "commit_timing",
+            Self::DeferredO1 => "deferred_o1",
+            Self::NoPhysicalAnchor => "no_physical_anchor",
+            Self::OpportunityExhausted => "opportunity_exhausted",
+            Self::WindowUnplannable => "window_unplannable",
+        }
+    }
+}
+
 pub(crate) fn plan_composited_variable_reservation(
     state: PreparedCompositedPresentationState,
     admission: VariableCompositedAdmission,
@@ -641,36 +681,53 @@ pub(crate) fn plan_composited_variable_reservation(
     anchor: Option<MonotonicTimestampNs>,
     now: MonotonicTimestampNs,
     shortest_interval: Duration,
-) -> Option<VariablePresentationReservation> {
-    if state.mode != OutputPresentationMode::AdaptiveSync
-        || state.validation_key.is_none()
-        || !state.validation_accepted
-        || !state.confirmed_state_matches
-        || state.presentation_state_transition_required
-        || !admission.reactive_double
-        || !admission.desired_credit_one
-        || admission.render_ahead
-        || admission.fixed_target_owned
-        || admission.commit_timing_applies
-        || admission.deferred_o1
-    {
-        return None;
+    longest_interval: Option<Duration>,
+) -> Result<VariablePresentationReservation, VariableReservationFallback> {
+    use VariableReservationFallback as Fallback;
+    let blocker = if state.mode != OutputPresentationMode::AdaptiveSync {
+        Some(Fallback::NotAdaptiveSync)
+    } else if state.validation_key.is_none() || !state.validation_accepted {
+        Some(Fallback::ValidationPending)
+    } else if !state.confirmed_state_matches {
+        Some(Fallback::ConfirmedStateMismatch)
+    } else if state.presentation_state_transition_required {
+        Some(Fallback::StateTransitionRequired)
+    } else if !admission.reactive_double {
+        Some(Fallback::NotReactiveDouble)
+    } else if !admission.desired_credit_one {
+        Some(Fallback::CreditAboveOne)
+    } else if admission.render_ahead {
+        Some(Fallback::RenderAhead)
+    } else if admission.fixed_target_owned {
+        Some(Fallback::FixedTargetOwned)
+    } else if admission.commit_timing_applies {
+        Some(Fallback::CommitTiming)
+    } else if admission.deferred_o1 {
+        Some(Fallback::DeferredO1)
+    } else {
+        None
+    };
+    if let Some(blocker) = blocker {
+        return Err(blocker);
     }
-    let anchor = anchor?;
-    let opportunity_id = deadline.next_variable_opportunity_id()?;
+    let anchor = anchor.ok_or(Fallback::NoPhysicalAnchor)?;
+    let opportunity_id = deadline
+        .next_variable_opportunity_id()
+        .ok_or(Fallback::OpportunityExhausted)?;
     let timing = VrrWindowPlanner::plan(VrrWindowPlanInput {
         anchor,
         now,
         not_before: None,
         shortest_interval,
-    })?;
-    if !matches!(timing, PresentationTiming::VrrWindow { .. }) {
-        return None;
-    }
+        longest_interval,
+    })
+    .filter(|timing| matches!(timing, PresentationTiming::VrrWindow { .. }))
+    .ok_or(Fallback::WindowUnplannable)?;
     VariablePresentationReservation::try_new(
         PresentationOpportunity::new(opportunity_id, timing),
         oblivion_one::native::presentation_deadline::PresentationTargetReason::ReactiveDouble,
     )
+    .ok_or(Fallback::WindowUnplannable)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5088,6 +5145,7 @@ mod tests {
             Some(anchor),
             now,
             interval,
+            None,
         )
         .expect("qualified steady-state AdaptiveSync is variable");
         let PresentationTiming::VrrWindow {
@@ -5141,8 +5199,9 @@ mod tests {
                     Some(anchor),
                     now,
                     interval,
+                    None,
                 )
-                .is_none()
+                .is_err()
             );
         }
 
@@ -5156,8 +5215,9 @@ mod tests {
                 Some(anchor),
                 now,
                 interval,
+                None,
             )
-            .is_none()
+            .is_err()
         );
 
         let mut excluded = [reactive_double_admission(); 6];
@@ -5167,8 +5227,16 @@ mod tests {
         excluded[3].fixed_target_owned = true;
         excluded[4].commit_timing_applies = true;
         excluded[5].deferred_o1 = true;
-        for admission in excluded {
-            assert!(
+        let reasons = [
+            VariableReservationFallback::NotReactiveDouble,
+            VariableReservationFallback::CreditAboveOne,
+            VariableReservationFallback::RenderAhead,
+            VariableReservationFallback::FixedTargetOwned,
+            VariableReservationFallback::CommitTiming,
+            VariableReservationFallback::DeferredO1,
+        ];
+        for (admission, reason) in excluded.into_iter().zip(reasons) {
+            assert_eq!(
                 plan_composited_variable_reservation(
                     prepared_adaptive_sync(Some(key), true, true, false),
                     admission,
@@ -5176,8 +5244,9 @@ mod tests {
                     Some(anchor),
                     now,
                     interval,
-                )
-                .is_none()
+                    None,
+                ),
+                Err(reason)
             );
         }
     }
