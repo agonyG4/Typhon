@@ -385,6 +385,7 @@ mod egl_resources;
 mod lifecycle_integration;
 mod rgba16f_store;
 mod scene_rendering;
+mod screencopy_blit;
 
 mod effect_session;
 mod presentation_clip;

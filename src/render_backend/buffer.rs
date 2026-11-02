@@ -67,6 +67,12 @@ impl Default for BufferIdAllocator {
 }
 
 impl BufferIdAllocator {
+    /// The id the next allocation will receive; every later buffer id is at
+    /// least this value.
+    pub fn next_id(&self) -> u64 {
+        self.next.map_or(u64::MAX, NonZeroU64::get)
+    }
+
     pub fn allocate(&mut self) -> Option<BufferIdentity> {
         let next = self.next?;
         self.next = next.get().checked_add(1).and_then(NonZeroU64::new);

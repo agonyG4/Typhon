@@ -358,6 +358,25 @@ impl AtomicEglGbmScanout {
                 return Ok(DirectScanoutAttempt::Rejected(rejection));
             }
         };
+        // A plane accepting the format and modifier does not prove the client
+        // allocated the buffer for scanout. Xwayland only asks GBM for a
+        // scanout allocation after the surface's feedback offers a scanout
+        // tranche, and NVIDIA passes TEST_ONLY for its render-only buffers
+        // while scanning them out corrupted.
+        if !server.surface_buffer_allocated_for_scanout(
+            candidate.surface_id,
+            candidate.buffer_identity.id().get(),
+        ) {
+            server.activate_surface_scanout_hint(candidate.surface_id);
+            direct_scanout_debug(format_args!(
+                "candidate deferred: surface={} buffer={} predates its scanout feedback",
+                candidate.surface_id,
+                candidate.buffer_identity.id().get(),
+            ));
+            return Ok(DirectScanoutAttempt::Fallback(
+                "scanout_allocation_unproven",
+            ));
+        }
         let effective_presentation = EffectivePresentation::decide(
             TearingPolicy::from_environment(std::env::var("OBLIVION_ONE_TEARING").ok().as_deref()),
             vrr_policy,

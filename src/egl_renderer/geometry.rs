@@ -872,7 +872,7 @@ pub(super) struct EglUvRect {
 }
 
 impl EglUvRect {
-    const FULL: Self = Self {
+    pub(super) const FULL: Self = Self {
         top_left: [0.0, 0.0],
         bottom_left: [0.0, 1.0],
         bottom_right: [1.0, 1.0],

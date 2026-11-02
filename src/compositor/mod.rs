@@ -990,6 +990,9 @@ pub struct CompositorState {
     dmabuf_kms_preferred_state: DmabufKmsPreferredState,
     dmabuf_feedback_resources: HashMap<ObjectId, LiveDmabufFeedbackResource>,
     dmabuf_surface_scanout_hints: HashSet<u32>,
+    /// First buffer id a surface can have allocated after it was sent the
+    /// scanout tranche. Older buffers were allocated for rendering only.
+    dmabuf_scanout_buffer_floors: HashMap<u32, u64>,
     dmabuf_scanout_candidate_surface: Option<u32>,
     dmabuf_feedback_updates: u64,
     dmabuf_feedback_duplicate_suppressed: u64,

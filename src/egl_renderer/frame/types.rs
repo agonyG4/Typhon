@@ -223,6 +223,16 @@ impl EglSceneFrameCommit {
     }
 }
 
+/// The cursor a cursor-overlay screencopy adds to its copies of a frame whose
+/// output shows the cursor on the hardware plane. It never reaches the output.
+#[derive(Clone, Copy)]
+pub(crate) enum CaptureCursorOverlay<'a> {
+    /// The active theme or shape cursor image at this logical pointer position.
+    Theme { x: i32, y: i32 },
+    /// The client's cursor surface.
+    Client(compositor::ClientCursorRenderState<'a>),
+}
+
 pub struct EglSceneDrawRequest<'a> {
     pub window_preview: Option<compositor::WindowPreviewImage>,
     pub width: u32,
@@ -248,6 +258,7 @@ pub struct EglSceneDrawRequest<'a> {
     pub presentation_clips: &'a [oblivion_one::presentation_animation::PresentationGroupClip],
     pub presentation_owner_root_surface_ids: &'a [u32],
     pub client_cursor: Option<compositor::ClientCursorRenderState<'a>>,
+    pub(crate) capture_cursor: Option<CaptureCursorOverlay<'a>>,
     pub(crate) current_damage: Option<OutputDamage>,
     pub(crate) surface_resource_sync_states: Vec<SurfaceResourceSyncState>,
     pub lifecycle: &'a LifecycleSceneSample,

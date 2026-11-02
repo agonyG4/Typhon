@@ -753,6 +753,7 @@ impl NativeRuntime {
             pending_render_worker_outer: None,
             pending_render_worker_completion: None,
             pending_render_worker_capture: None,
+            gpu_screencopy: Default::default(),
             pending_worker_effect_reload: None,
             pending_dmabuf_release_fence: None,
             cursor_io_worker: Some(cursor_io_worker),

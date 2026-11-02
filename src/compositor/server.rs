@@ -2221,6 +2221,11 @@ impl OwnCompositorServer {
         let _ = self.display.flush_clients();
     }
 
+    pub fn surface_buffer_allocated_for_scanout(&self, surface_id: u32, buffer_id: u64) -> bool {
+        self.state
+            .surface_buffer_allocated_for_scanout(surface_id, buffer_id)
+    }
+
     pub fn clear_surface_scanout_hint(&mut self, surface_id: u32) {
         self.state.clear_surface_scanout_hint(surface_id);
         let _ = self.display.flush_clients();

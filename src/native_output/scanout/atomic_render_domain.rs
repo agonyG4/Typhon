@@ -29,6 +29,7 @@ use crate::{
 use super::{
     AtomicRenderPhaseDurations, EXPLICIT_OUTPUT_SLOT_CAPACITY, OutputSlotId,
     output_slot::{AtomicRenderSlotDescriptor, RenderTargetRequest, validate_split_slot_pairing},
+    screencopy_destinations::ScreencopyDestinationCache,
 };
 
 const EGL_PLATFORM_GBM_KHR: egl::Enum = 0x31d7;
@@ -222,6 +223,7 @@ impl AtomicRenderDomainBootstrap {
                 gl,
                 scene,
                 native_fence_functions,
+                image_target,
                 AtomicRenderDomainInfo {
                     dmabuf_feedback,
                     egl_vendor,
@@ -234,7 +236,7 @@ impl AtomicRenderDomainBootstrap {
         })();
 
         match setup {
-            Ok((context, priority, gl, scene, native_fence_functions, info)) => {
+            Ok((context, priority, gl, scene, native_fence_functions, image_target, info)) => {
                 priority.log_startup("atomic-egl-gbm");
                 Ok((
                     AtomicRenderDomain {
@@ -243,7 +245,9 @@ impl AtomicRenderDomainBootstrap {
                         gl: Some(gl),
                         scene: Some(scene),
                         native_fence_functions,
+                        image_target,
                         pool: None,
+                        screencopy_destinations: ScreencopyDestinationCache::default(),
                         width,
                         height,
                         torn_down: false,
@@ -279,7 +283,9 @@ pub(super) struct AtomicRenderDomain {
     gl: Option<glow::Context>,
     scene: Option<GlesSceneRenderer>,
     native_fence_functions: NativeFenceFunctions,
+    image_target: GlEglImageTargetTexture2DOes,
     pool: Option<AtomicRenderPool>,
+    screencopy_destinations: ScreencopyDestinationCache,
     width: u32,
     height: u32,
     torn_down: bool,
@@ -578,6 +584,25 @@ impl AtomicRenderDomain {
                 stats,
                 lifecycle_evidence,
             } => {
+                // Blit before the fence export so the frame fence covers the
+                // client copies too.
+                let mut screencopy_targets = std::mem::take(&mut frozen_frame.screencopy_targets);
+                if !screencopy_targets.is_empty()
+                    && let (Some(gl), Some(scene)) = (self.gl.as_ref(), self.scene.as_mut())
+                {
+                    // The cursor goes into the copies only; the output keeps
+                    // showing it wherever it already is.
+                    self.screencopy_destinations.blit_targets(
+                        &native_display.egl,
+                        native_display.display,
+                        gl,
+                        self.image_target,
+                        framebuffer,
+                        (self.width, self.height),
+                        &mut screencopy_targets,
+                        |destination, region| scene.draw_capture_cursor(destination, region),
+                    );
+                }
                 self.scene
                     .as_mut()
                     .expect("live Atomic render domain owns its scene renderer")
@@ -594,6 +619,15 @@ impl AtomicRenderDomain {
                     .expect("live Atomic render domain owns its scene renderer")
                     .trace_render_fence_export_end();
                 let fence = fence_result?;
+                // The reactor reports these once the frame is presented; the
+                // render thread never waits on the fence.
+                for target in &mut screencopy_targets {
+                    match fence.duplicate_completion_fd() {
+                        Ok(completion) => target.note_rendered(frame_id, completion),
+                        Err(error) => eprintln!("screencopy fence duplication failed: {error}"),
+                    }
+                }
+                drop(screencopy_targets);
                 Ok(AtomicSlotRenderOutcome::Rendered(Box::new(
                     AtomicRenderedFrameParts {
                         slot: target.slot,
@@ -666,6 +700,13 @@ impl AtomicRenderDomain {
                     .egl
                     .make_current(native_display.display, None, None, Some(context));
             self.finish_render_work();
+            if let Some(gl) = self.gl.as_ref() {
+                self.screencopy_destinations.teardown(
+                    gl,
+                    &native_display.egl,
+                    native_display.display,
+                );
+            }
             if let (Some(pool), Some(gl)) = (self.pool.take(), self.gl.as_ref()) {
                 pool.teardown(gl, &native_display.egl, native_display.display);
             }

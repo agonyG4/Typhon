@@ -15,6 +15,6 @@ pub(in crate::egl_renderer) use planning::{
     resolve_scene_damage_authority, split_external_overlay_surfaces,
 };
 pub(crate) use types::{
-    EglFrameOutcome, EglOutputRenderTarget, EglSceneDrawRequest, EglSceneFrameCommit,
+    CaptureCursorOverlay, EglFrameOutcome, EglOutputRenderTarget, EglSceneDrawRequest, EglSceneFrameCommit,
     FrameSkipReason, GlesSceneFrameStats,
 };

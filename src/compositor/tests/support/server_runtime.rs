@@ -163,6 +163,13 @@ pub(in crate::compositor::tests) enum ServerCommand {
     },
     SetOutputPreferredTransform(u32),
     CapturePendingAstreaScreenCapture(Sender<bool>),
+    /// `(has_pending_screen_capture, has_pending_gpu_screencopy)`.
+    CapturePendingGpuScreencopy(Sender<(bool, bool)>),
+    /// Take every ready DMA-BUF screencopy; deliver them when `true`, fail them otherwise.
+    SettleGpuScreencopies {
+        deliver: bool,
+        reply: Sender<usize>,
+    },
     CapturePendingAstreaScreenCaptureOutput(Sender<Option<(OutputId, bool)>>),
     WithdrawLogicalOutput,
     CaptureOutputLifecycle {
@@ -739,6 +746,24 @@ pub(in crate::compositor::tests) fn spawn_controllable_test_server(
                     }
                     ServerCommand::CapturePendingAstreaScreenCapture(reply) => {
                         let _ = reply.send(server.has_pending_screen_capture());
+                    }
+                    ServerCommand::CapturePendingGpuScreencopy(reply) => {
+                        let _ = reply.send((
+                            server.has_pending_screen_capture(),
+                            server.has_pending_gpu_screencopy(),
+                        ));
+                    }
+                    ServerCommand::SettleGpuScreencopies { deliver, reply } => {
+                        let ready = server.take_ready_gpu_screencopies();
+                        let count = ready.len();
+                        for pending in ready {
+                            if deliver {
+                                pending.deliver_gpu_copy(None);
+                            } else {
+                                pending.fail();
+                            }
+                        }
+                        let _ = reply.send(count);
                     }
                     ServerCommand::CapturePendingAstreaScreenCaptureOutput(reply) => {
                         let output =

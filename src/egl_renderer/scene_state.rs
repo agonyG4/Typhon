@@ -50,6 +50,8 @@ pub(crate) struct SceneRenderState {
     pub(in crate::egl_renderer) cursor_commands: Vec<EglDrawCommand>,
     pub(in crate::egl_renderer) presentation_opacities: Vec<f32>,
     pub(in crate::egl_renderer) cursor_presentation_opacities: Vec<f32>,
+    /// Cursor for cursor-overlay screencopies of the current frame.
+    pub(in crate::egl_renderer) capture_cursor: Option<CursorQuad>,
     pub(in crate::egl_renderer) presentation_visual_group_opacities: HashMap<VisualGroupId, f32>,
     pub(in crate::egl_renderer) presentation_visual_group_clips: HashMap<VisualGroupId, EglRect>,
     pub(in crate::egl_renderer) presentation_visual_group_owners: HashMap<VisualGroupId, u32>,
@@ -786,68 +788,96 @@ impl SceneRenderState {
                 ));
         }
 
-        if let Some((cursor_x, cursor_y)) = visual_state.cursor
-            && let Some(cursor_size) = cursor_size
-        {
-            let (top_left_x, top_left_y) = cursor_image.top_left(cursor_x, cursor_y);
-            push_draw_command(
-                &mut self.cursor_vertices,
-                &mut self.cursor_commands,
-                EglDrawLayer::Cursor,
-                EglRect::new(
-                    top_left_x as f32,
-                    top_left_y as f32,
-                    cursor_size.0 as f32,
-                    cursor_size.1 as f32,
-                ),
-                width,
-                height,
-                framebuffer_origin,
-            );
-            self.cursor_presentation_opacities.push(1.0);
-        }
-
-        if let Some(cursor) = client_cursor {
-            let visual_target = compositor::SurfaceTargetRect::new(
-                compositor::scale_logical_coordinate(
-                    cursor.logical_x.saturating_add(cursor.surface.x),
-                    output_scale,
-                ),
-                compositor::scale_logical_coordinate(
-                    cursor.logical_y.saturating_add(cursor.surface.y),
-                    output_scale,
-                ),
-                compositor::scale_logical_extent(cursor.surface.width, output_scale),
-                compositor::scale_logical_extent(cursor.surface.height, output_scale),
-            );
-            let render_plan = compositor::surface_render_plan(cursor.surface, visual_target);
-            let uv = EglUvRect::from_surface_uv_quad(render_plan.content_uv);
+        let theme_cursor = visual_state
+            .cursor
+            .and_then(|position| theme_cursor_quad(position, cursor_image, cursor_size));
+        let client_cursor = client_cursor.map(|cursor| client_cursor_quad(cursor, output_scale));
+        for quad in theme_cursor.into_iter().chain(client_cursor) {
             push_draw_command_with_uv(
                 &mut self.cursor_vertices,
                 &mut self.cursor_commands,
-                EglDrawLayer::Surface(cursor.surface.surface_id),
-                EglRect::new(
-                    render_plan.content_target.x() as f32,
-                    render_plan.content_target.y() as f32,
-                    render_plan.content_target.width() as f32,
-                    render_plan.content_target.height() as f32,
-                ),
-                uv,
-                surface_sampling_for_plan(
-                    cursor.surface.buffer_size().width,
-                    cursor.surface.buffer_size().height,
-                    render_plan.content_target.x(),
-                    render_plan.content_target.y(),
-                    render_plan.content_target.width(),
-                    render_plan.content_target.height(),
-                    uv,
-                ),
+                quad.layer,
+                quad.rect,
+                quad.uv,
+                quad.sampling,
                 width,
                 height,
                 framebuffer_origin,
             );
             self.cursor_presentation_opacities.push(1.0);
         }
+    }
+}
+
+/// One cursor sprite in output pixels, as software cursor composition draws
+/// it. Also the source of the cursor a cursor-overlay screencopy adds to its
+/// copy while the output shows the cursor on the hardware plane.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::egl_renderer) struct CursorQuad {
+    pub(in crate::egl_renderer) layer: EglDrawLayer,
+    pub(in crate::egl_renderer) rect: EglRect,
+    pub(in crate::egl_renderer) uv: EglUvRect,
+    pub(in crate::egl_renderer) sampling: SurfaceSampling,
+}
+
+/// The theme cursor at an output-scaled pointer position, hotspot applied.
+pub(in crate::egl_renderer) fn theme_cursor_quad(
+    (cursor_x, cursor_y): (i32, i32),
+    cursor_image: &CompositorCursorImage,
+    cursor_size: Option<(u32, u32)>,
+) -> Option<CursorQuad> {
+    let cursor_size = cursor_size?;
+    let (top_left_x, top_left_y) = cursor_image.top_left(cursor_x, cursor_y);
+    Some(CursorQuad {
+        layer: EglDrawLayer::Cursor,
+        rect: EglRect::new(
+            top_left_x as f32,
+            top_left_y as f32,
+            cursor_size.0 as f32,
+            cursor_size.1 as f32,
+        ),
+        uv: EglUvRect::FULL,
+        sampling: SurfaceSampling::ScaledLinear,
+    })
+}
+
+/// A client cursor surface placed at its logical pointer position.
+pub(in crate::egl_renderer) fn client_cursor_quad(
+    cursor: compositor::ClientCursorRenderState<'_>,
+    output_scale: f64,
+) -> CursorQuad {
+    let visual_target = compositor::SurfaceTargetRect::new(
+        compositor::scale_logical_coordinate(
+            cursor.logical_x.saturating_add(cursor.surface.x),
+            output_scale,
+        ),
+        compositor::scale_logical_coordinate(
+            cursor.logical_y.saturating_add(cursor.surface.y),
+            output_scale,
+        ),
+        compositor::scale_logical_extent(cursor.surface.width, output_scale),
+        compositor::scale_logical_extent(cursor.surface.height, output_scale),
+    );
+    let render_plan = compositor::surface_render_plan(cursor.surface, visual_target);
+    let uv = EglUvRect::from_surface_uv_quad(render_plan.content_uv);
+    CursorQuad {
+        layer: EglDrawLayer::Surface(cursor.surface.surface_id),
+        rect: EglRect::new(
+            render_plan.content_target.x() as f32,
+            render_plan.content_target.y() as f32,
+            render_plan.content_target.width() as f32,
+            render_plan.content_target.height() as f32,
+        ),
+        uv,
+        sampling: surface_sampling_for_plan(
+            cursor.surface.buffer_size().width,
+            cursor.surface.buffer_size().height,
+            render_plan.content_target.x(),
+            render_plan.content_target.y(),
+            render_plan.content_target.width(),
+            render_plan.content_target.height(),
+            uv,
+        ),
     }
 }
 

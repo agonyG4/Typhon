@@ -80,6 +80,7 @@ pub(crate) fn direct_blocker(reason: &str) -> (&'static str, u64) {
         "primary_plane_format_modifier_unsupported" => {
             ("primary_plane_format_modifier_unsupported", 1 << 11)
         }
+        "scanout_allocation_unproven" => ("scanout_allocation_unproven", 1 << 12),
         _ => ("candidate_rejected", 1 << 9),
     }
 }

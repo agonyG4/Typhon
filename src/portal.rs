@@ -193,11 +193,11 @@ impl DesktopIntegration {
         let xdph = self.xdph_config_path();
         if !write_if_absent(&xdph, &xdph_config_contents(&picker))? {
             let current = fs::read_to_string(&xdph).unwrap_or_default();
-            if current == legacy_xdph_config_contents(&picker) {
+            if legacy_xdph_config_contents(&picker).contains(&current) {
                 write_if_changed(&xdph, &xdph_config_contents(&picker))?;
-            } else if !current.contains("custom_picker_binary") || !current.contains("force_shm") {
+            } else if !current.contains("custom_picker_binary") {
                 eprintln!(
-                    "oblivion-one: set `custom_picker_binary = {}` and `force_shm = true` in the screencopy block of {}",
+                    "oblivion-one: set `custom_picker_binary = {}` in the screencopy block of {}",
                     picker.display(),
                     xdph.display()
                 );
@@ -248,13 +248,12 @@ esac
     )
 }
 
-/// Typhon's screencopy copies into wl_shm only, so XDPH must not hand it
+/// Typhon's screencopy fills DMA-BUFs on the GPU, so XDPH keeps its default
 /// DMA-BUF buffers.
 pub fn xdph_config_contents(picker: &Path) -> String {
     [
         "screencopy {",
         "    allow_token_by_default = true",
-        "    force_shm = true",
         &format!("    custom_picker_binary = {}", picker.display()),
         "}",
         "",
@@ -262,16 +261,29 @@ pub fn xdph_config_contents(picker: &Path) -> String {
     .join("\n")
 }
 
-/// The first generated xdph.conf, upgraded in place because Typhon owns it.
-fn legacy_xdph_config_contents(picker: &Path) -> String {
+/// Every xdph.conf an earlier Typhon generated, upgraded in place because
+/// Typhon owns it; any other contents are the user's and stay untouched.
+fn legacy_xdph_config_contents(picker: &Path) -> [String; 2] {
+    let picker_line = format!("    custom_picker_binary = {}", picker.display());
     [
-        "screencopy {",
-        "    allow_token_by_default = true",
-        &format!("    custom_picker_binary = {}", picker.display()),
-        "}",
-        "",
+        [
+            "screencopy {",
+            "    allow_token_by_default = true",
+            &picker_line,
+            "}",
+            "",
+        ]
+        .join("\n"),
+        [
+            "screencopy {",
+            "    allow_token_by_default = true",
+            "    force_shm = true",
+            &picker_line,
+            "}",
+            "",
+        ]
+        .join("\n"),
     ]
-    .join("\n")
 }
 
 fn has_screencast_line(config: &str) -> bool {
@@ -635,25 +647,33 @@ mod tests {
                 .contains("allow_token_by_default = true")
         );
 
-        assert!(xdph_config_contents(&integration.picker_path()).contains("force_shm = true"));
-        fs::write(
-            &xdph,
-            legacy_xdph_config_contents(&integration.picker_path()),
-        )
-        .unwrap();
-        integration
-            .install()
-            .expect("upgrade generated xdph config");
-        assert_eq!(
-            fs::read_to_string(&xdph).unwrap(),
-            xdph_config_contents(&integration.picker_path())
-        );
+        assert!(!xdph_config_contents(&integration.picker_path()).contains("force_shm"));
+        for legacy in legacy_xdph_config_contents(&integration.picker_path()) {
+            fs::write(&xdph, legacy).unwrap();
+            integration
+                .install()
+                .expect("upgrade generated xdph config");
+            assert_eq!(
+                fs::read_to_string(&xdph).unwrap(),
+                xdph_config_contents(&integration.picker_path())
+            );
+        }
 
         fs::write(&xdph, "user config\n").unwrap();
         integration
             .install()
             .expect("reinstall desktop integration");
         assert_eq!(fs::read_to_string(&xdph).unwrap(), "user config\n");
+
+        let edited = format!(
+            "{}    max_fps = 30\n",
+            legacy_xdph_config_contents(&integration.picker_path())[1]
+        );
+        fs::write(&xdph, &edited).unwrap();
+        integration
+            .install()
+            .expect("reinstall desktop integration");
+        assert_eq!(fs::read_to_string(&xdph).unwrap(), edited);
         let _ = fs::remove_dir_all(root);
     }
 

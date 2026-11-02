@@ -53,8 +53,10 @@ impl<'a> FramePipeline<'a> {
     ) -> RendererResult<super::types::EglFrameOutcome> {
         self.effects.effect_resources.begin_checkpoint_frame();
 
+        self.scene.capture_cursor = None;
         let begun = self.begin_frame(&request, framebuffer_origin)?;
         self.prepare_resources(egl, egl_display, &request, &begun)?;
+        self.stage_capture_cursor(&request);
         let prepared_scene = self.prepare_scene(&mut request, &begun, framebuffer_origin);
         let mut planned = match self.plan_frame(&request, prepared_scene, buffer_age)? {
             FramePlanOutcome::Skipped(outcome) => return Ok(outcome),

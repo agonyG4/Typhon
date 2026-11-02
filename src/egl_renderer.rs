@@ -45,6 +45,7 @@ mod program;
 mod resources;
 mod scene;
 mod scene_state;
+pub(crate) mod screencopy_blit;
 
 pub(in crate::egl_renderer) use checkpoint::{
     CheckpointCausalState, EglCheckpointSceneCausalSnapshot,
@@ -89,8 +90,8 @@ pub(in crate::egl_renderer) use scene::{
 };
 
 pub(crate) use frame::{
-    EglFrameOutcome, EglOutputRenderTarget, EglSceneDrawRequest, EglSceneFrameCommit,
-    FrameSkipReason, GlesSceneFrameStats,
+    CaptureCursorOverlay, EglFrameOutcome, EglOutputRenderTarget, EglSceneDrawRequest,
+    EglSceneFrameCommit, FrameSkipReason, GlesSceneFrameStats,
 };
 pub(crate) use resources::EglImageGuard;
 
@@ -109,11 +110,12 @@ use effects::{
     EffectRuntimeCaptureSnapshot, FrameTraceSummary, RepaintPlanTraceSnapshot,
 };
 use effects::{EffectTextureFilter, EffectTextureFormat, EffectTextureKey, PooledEffectTexture};
+#[cfg(test)]
+use geometry::push_draw_command;
 use geometry::{
     EglDrawCommand, EglDrawLayer, EglLampDrawCommand, EglLampVertex, EglRect, EglTexturedVertex,
     EglUvRect, EglVisibilityDecision, MIN_VERTEX_BUFFER_BYTES, SurfaceConsumerPlan,
-    SurfaceSampling, VERTEX_STRIDE, push_draw_command, push_draw_command_with_uv,
-    surface_sampling_for_plan,
+    SurfaceSampling, VERTEX_STRIDE, push_draw_command_with_uv, surface_sampling_for_plan,
 };
 use lifecycle::{
     LifecycleCaptureSnapshot, LifecycleRenderContext, LifecycleRenderState,
@@ -399,6 +401,7 @@ impl GlesSceneRenderer {
                 cursor_commands: Vec::new(),
                 presentation_opacities: Vec::new(),
                 cursor_presentation_opacities: Vec::new(),
+                capture_cursor: None,
                 presentation_visual_group_opacities: HashMap::new(),
                 presentation_visual_group_clips: HashMap::new(),
                 presentation_visual_group_owners: HashMap::new(),
@@ -692,6 +695,8 @@ impl GlesSceneRenderer {
         self.scene_state.clear_transparent = preserve_alpha;
 
         request.current_damage = Some(OutputDamage::Full);
+        // A private capture composites its own cursor (`include_cursor`).
+        request.capture_cursor = None;
         if !include_cursor {
             request.client_cursor = None;
             request.visual_state.cursor = None;

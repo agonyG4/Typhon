@@ -13,10 +13,12 @@ use wayland_server::{
     protocol::{wl_buffer, wl_output, wl_shm},
 };
 
+use super::dmabuf::DmabufBufferData;
 use super::output::OutputSize;
 use super::presentation::{PresentationClock, PresentationTimestamp};
 use super::shm::ShmBufferData;
 use super::*;
+use crate::render_backend::buffer::{BufferIdentity, DmabufBufferHandle, DrmFormat};
 
 const XRGB8888_BYTES_PER_PIXEL: u32 = 4;
 const FRAME_DAMAGE_SINCE: u32 = 2;
@@ -56,11 +58,23 @@ pub struct ScreencopyFrameData {
     copy_requested: AtomicBool,
 }
 
+/// Destination buffer of a screencopy request.
+#[derive(Debug)]
+enum ScreencopyTarget {
+    /// Filled on the CPU from a rendered RGBA capture.
+    Shm(ShmBufferData),
+    /// Filled on the GPU by blitting the composited display frame.
+    Dmabuf {
+        handle: DmabufBufferHandle,
+        identity: BufferIdentity,
+    },
+}
+
 #[derive(Debug)]
 pub struct ScreencopyPending {
     frame: zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1,
     client_id: ClientId,
-    shm: ShmBufferData,
+    target: ScreencopyTarget,
     source: ScreencopySource,
     with_damage: bool,
     requested_generation: u64,
@@ -82,30 +96,75 @@ impl ScreencopyPending {
             || (self.source.overlay_cursor && pointer != self.requested_pointer)
     }
 
+    fn is_gpu_copy(&self) -> bool {
+        matches!(self.target, ScreencopyTarget::Dmabuf { .. })
+    }
+
+    /// The client DMA-BUF of a GPU copy request.
+    pub fn dmabuf_target(&self) -> Option<(&DmabufBufferHandle, &BufferIdentity)> {
+        match &self.target {
+            ScreencopyTarget::Dmabuf { handle, identity } => Some((handle, identity)),
+            ScreencopyTarget::Shm(_) => None,
+        }
+    }
+
+    /// Captured rectangle in output physical pixels, top-left origin:
+    /// `(x, y, width, height)`.
+    pub fn physical_region(&self) -> (u32, u32, u32, u32) {
+        let (width, height) = self.source.buffer_size();
+        self.source.region.map_or((0, 0, width, height), |region| {
+            (region.x, region.y, region.width, region.height)
+        })
+    }
+
     pub fn fail(&self) {
         self.frame.failed();
     }
 
+    /// Report a frame whose pixels the GPU has already written into the
+    /// client's DMA-BUF, stamped with the CLOCK_MONOTONIC time the copied
+    /// frame was presented, or the current time when it never was.
+    pub fn deliver_gpu_copy(self, presented_at_ns: Option<u64>) {
+        debug_assert!(self.is_gpu_copy());
+        if let Err(error) = self.send_ready_at(presented_at_ns) {
+            eprintln!("screencopy GPU copy timestamp failed: {error}");
+            self.frame.failed();
+        }
+    }
+
+    fn send_ready(&self) -> io::Result<()> {
+        self.send_ready_at(None)
+    }
+
+    fn send_ready_at(&self, presented_at_ns: Option<u64>) -> io::Result<()> {
+        let (seconds, nanoseconds) = match presented_at_ns {
+            Some(ns) => (ns / 1_000_000_000, (ns % 1_000_000_000) as u32),
+            None => {
+                let timestamp = PresentationTimestamp::from_clock(PresentationClock::Monotonic)?;
+                let (hi, lo) = timestamp.protocol_seconds();
+                (
+                    (u64::from(hi) << 32) | u64::from(lo),
+                    timestamp.nanoseconds(),
+                )
+            }
+        };
+        let (buffer_width, buffer_height) = self.source.buffer_size();
+        self.frame.flags(zwlr_screencopy_frame_v1::Flags::empty());
+        if self.with_damage && self.frame.version() >= FRAME_DAMAGE_SINCE {
+            self.frame.damage(0, 0, buffer_width, buffer_height);
+        }
+        self.frame
+            .ready((seconds >> 32) as u32, seconds as u32, nanoseconds);
+        Ok(())
+    }
+
     /// Write a captured top-left RGBA frame into the client's wl_shm buffer.
     pub fn deliver_rgba(self, rgba: &[u8], width: u32, height: u32) -> io::Result<()> {
-        match self.write_rgba(rgba, width, height) {
-            Ok(()) => match PresentationTimestamp::from_clock(PresentationClock::Monotonic) {
-                Ok(timestamp) => {
-                    let (buffer_width, buffer_height) = self.source.buffer_size();
-                    self.frame.flags(zwlr_screencopy_frame_v1::Flags::empty());
-                    if self.with_damage && self.frame.version() >= FRAME_DAMAGE_SINCE {
-                        self.frame.damage(0, 0, buffer_width, buffer_height);
-                    }
-                    let (tv_sec_hi, tv_sec_lo) = timestamp.protocol_seconds();
-                    self.frame
-                        .ready(tv_sec_hi, tv_sec_lo, timestamp.nanoseconds());
-                    Ok(())
-                }
-                Err(error) => {
-                    self.frame.failed();
-                    Err(error)
-                }
-            },
+        match self
+            .write_rgba(rgba, width, height)
+            .and_then(|()| self.send_ready())
+        {
+            Ok(()) => Ok(()),
             Err(error) => {
                 self.frame.failed();
                 Err(error)
@@ -114,6 +173,11 @@ impl ScreencopyPending {
     }
 
     fn write_rgba(&self, rgba: &[u8], width: u32, height: u32) -> io::Result<()> {
+        let ScreencopyTarget::Shm(shm) = &self.target else {
+            return Err(invalid_capture(
+                "target: DMA-BUF requests are copied on the GPU",
+            ));
+        };
         let source = self.source.output_size;
         if (width, height) != (source.width, source.height) {
             return Err(invalid_capture("screencopy source size changed"));
@@ -126,14 +190,14 @@ impl ScreencopyPending {
             .region
             .map_or((0, 0), |region| (region.x, region.y));
         let (buffer_width, buffer_height) = self.source.buffer_size();
-        let stride = u64::try_from(self.shm.stride).map_err(|_| invalid_capture("stride"))?;
+        let stride = u64::try_from(shm.stride).map_err(|_| invalid_capture("stride"))?;
         let mut row = vec![0u8; (buffer_width * XRGB8888_BYTES_PER_PIXEL) as usize];
         for row_index in 0..buffer_height {
             let span = rgba_row_span(width, origin, row_index, buffer_width);
             convert_rgba_row_to_xrgb8888(&rgba[span], &mut row);
-            let offset = u64::try_from(self.shm.offset).map_err(|_| invalid_capture("offset"))?
+            let offset = u64::try_from(shm.offset).map_err(|_| invalid_capture("offset"))?
                 + u64::from(row_index) * stride;
-            self.shm.pool.file.write_all_at(&row, offset)?;
+            shm.pool.file.write_all_at(&row, offset)?;
         }
         Ok(())
     }
@@ -322,8 +386,7 @@ impl CompositorState {
             width * XRGB8888_BYTES_PER_PIXEL,
         );
         if frame.version() >= FRAME_BUFFER_DONE_SINCE {
-            // xdg-desktop-portal-hyprland derives its PipeWire format from
-            // this event even when it then copies through wl_shm.
+            // DMA-BUF copies are blitted from the composited display frame.
             frame.linux_dmabuf(DRM_FORMAT_XRGB8888, width, height);
             frame.buffer_done();
         }
@@ -359,33 +422,47 @@ impl CompositorState {
             );
             return;
         }
-        let Some(shm) = buffer.data::<ShmBufferData>().cloned() else {
-            // linux_dmabuf is advertised for format negotiation only; a client
-            // that picks DMA-BUF gets a recoverable failure, not a disconnect.
+        let (width, height) = source.buffer_size();
+        let target = if let Some(dmabuf) = buffer.data::<DmabufBufferData>() {
+            if !screencopy_dmabuf_matches(&dmabuf.handle, width, height) {
+                self.post_protocol_error(
+                    client,
+                    resource,
+                    zwlr_screencopy_frame_v1::Error::InvalidBuffer,
+                    "screencopy DMA-BUF does not match the frame",
+                );
+                return;
+            }
+            ScreencopyTarget::Dmabuf {
+                handle: dmabuf.handle.clone(),
+                identity: dmabuf.identity.clone(),
+            }
+        } else if let Some(shm) = buffer.data::<ShmBufferData>().cloned() {
+            let format_ok = matches!(
+                shm.format,
+                WEnum::Value(wl_shm::Format::Xrgb8888 | wl_shm::Format::Argb8888)
+            );
+            let size_ok = u32::try_from(shm.width).ok() == Some(width)
+                && u32::try_from(shm.height).ok() == Some(height);
+            let stride_ok = i64::from(shm.stride) >= i64::from(width) * 4;
+            if !format_ok || !size_ok || !stride_ok || !shm.fits_in_pool() {
+                self.post_protocol_error(
+                    client,
+                    resource,
+                    zwlr_screencopy_frame_v1::Error::InvalidBuffer,
+                    "screencopy buffer does not match the frame",
+                );
+                return;
+            }
+            ScreencopyTarget::Shm(shm)
+        } else {
             resource.failed();
             return;
         };
-        let (width, height) = source.buffer_size();
-        let format_ok = matches!(
-            shm.format,
-            WEnum::Value(wl_shm::Format::Xrgb8888 | wl_shm::Format::Argb8888)
-        );
-        let size_ok = u32::try_from(shm.width).ok() == Some(width)
-            && u32::try_from(shm.height).ok() == Some(height);
-        let stride_ok = i64::from(shm.stride) >= i64::from(width) * 4;
-        if !format_ok || !size_ok || !stride_ok || !shm.fits_in_pool() {
-            self.post_protocol_error(
-                client,
-                resource,
-                zwlr_screencopy_frame_v1::Error::InvalidBuffer,
-                "screencopy buffer does not match the frame",
-            );
-            return;
-        }
         self.screencopy_pending.push_back(ScreencopyPending {
             frame: resource.clone(),
             client_id: client.id(),
-            shm,
+            target,
             source,
             with_damage,
             requested_generation: self.scene_render_generation,
@@ -393,11 +470,12 @@ impl CompositorState {
         });
     }
 
+    /// Ready wl_shm requests, served by the private re-render capture path.
     pub(in crate::compositor) fn has_ready_screencopy(&self) -> bool {
         let pointer = (self.last_pointer_x, self.last_pointer_y);
-        self.screencopy_pending
-            .iter()
-            .any(|pending| pending.is_ready(self.scene_render_generation, pointer))
+        self.screencopy_pending.iter().any(|pending| {
+            !pending.is_gpu_copy() && pending.is_ready(self.scene_render_generation, pointer)
+        })
     }
 
     pub(in crate::compositor) fn take_ready_screencopy(&mut self) -> Option<ScreencopyPending> {
@@ -406,8 +484,26 @@ impl CompositorState {
         let index = self
             .screencopy_pending
             .iter()
-            .position(|pending| pending.is_ready(generation, pointer))?;
+            .position(|pending| !pending.is_gpu_copy() && pending.is_ready(generation, pointer))?;
         self.screencopy_pending.remove(index)
+    }
+
+    /// Ready DMA-BUF requests, served from the next composited display frame.
+    pub(in crate::compositor) fn has_pending_gpu_screencopy(&self) -> bool {
+        let pointer = (self.last_pointer_x, self.last_pointer_y);
+        self.screencopy_pending.iter().any(|pending| {
+            pending.is_gpu_copy() && pending.is_ready(self.scene_render_generation, pointer)
+        })
+    }
+
+    pub(in crate::compositor) fn take_ready_gpu_screencopies(&mut self) -> Vec<ScreencopyPending> {
+        let generation = self.scene_render_generation;
+        let pointer = (self.last_pointer_x, self.last_pointer_y);
+        let (ready, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.screencopy_pending)
+            .into_iter()
+            .partition(|pending| pending.is_gpu_copy() && pending.is_ready(generation, pointer));
+        self.screencopy_pending = kept.into();
+        ready
     }
 
     pub(in crate::compositor) fn remove_screencopy_frame(
@@ -432,6 +528,23 @@ impl CompositorState {
             pending.fail();
         }
     }
+}
+
+impl OwnCompositorServer {
+    pub fn has_pending_gpu_screencopy(&self) -> bool {
+        self.state.has_pending_gpu_screencopy()
+    }
+
+    pub fn take_ready_gpu_screencopies(&mut self) -> Vec<ScreencopyPending> {
+        self.state.take_ready_gpu_screencopies()
+    }
+}
+
+fn screencopy_dmabuf_matches(handle: &DmabufBufferHandle, width: u32, height: u32) -> bool {
+    let size = handle.size();
+    (size.width, size.height) == (width, height)
+        && matches!(handle.format(), DrmFormat::Xrgb8888 | DrmFormat::Argb8888)
+        && !handle.planes().is_empty()
 }
 
 #[cfg(test)]

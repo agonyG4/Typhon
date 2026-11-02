@@ -554,6 +554,8 @@ pub(crate) struct AtomicEglGbmScanout {
     presentation_validation_accepted: HashSet<CompositedPresentationValidationKey>,
     presentation_validation_rejected: HashSet<CompositedPresentationValidationKey>,
     variable_pageflip_qualification: VariablePageflipQualification,
+    /// DMA-BUF screencopy targets waiting for the next composited frame.
+    staged_screencopy_targets: Vec<crate::native_output::gpu_screencopy::GpuScreencopyTarget>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2518,7 +2520,34 @@ impl AtomicEglGbmScanout {
             presentation_validation_accepted: HashSet::new(),
             presentation_validation_rejected: HashSet::new(),
             variable_pageflip_qualification: VariablePageflipQualification::default(),
+            staged_screencopy_targets: Vec::new(),
         })
+    }
+
+    pub(crate) fn stage_gpu_screencopy(
+        &mut self,
+        target: crate::native_output::gpu_screencopy::GpuScreencopyTarget,
+    ) {
+        self.staged_screencopy_targets.push(target);
+    }
+
+    pub(crate) fn has_staged_gpu_screencopy(&self) -> bool {
+        !self.staged_screencopy_targets.is_empty()
+    }
+
+    /// Fail every staged target that has not reached a render job.
+    pub(crate) fn clear_staged_gpu_screencopy(&mut self) {
+        self.staged_screencopy_targets.clear();
+    }
+
+    /// Targets of a frame that came back without a composited slot are
+    /// retried on the next frame a bounded number of times.
+    fn reclaim_screencopy_targets(&mut self, frozen_frame: &mut FrozenNativeRenderFrame) {
+        for mut target in frozen_frame.screencopy_targets.drain(..) {
+            if target.retry_after_unrendered_frame() {
+                self.staged_screencopy_targets.push(target);
+            }
+        }
     }
 
     pub(crate) fn create_render_fence(&self) -> io::Result<NativeRenderFence> {
@@ -3134,6 +3163,11 @@ impl AtomicEglGbmScanout {
             );
         }
         let render_snapshot_freeze_started = phase_durations.as_ref().map(|_| Instant::now());
+        let mut renderer_damage = render_damage.as_renderer_damage(self.width, self.height);
+        if self.has_staged_gpu_screencopy() && matches!(renderer_damage, OutputDamage::Empty) {
+            // A capture of an unchanged screen still needs a composited slot.
+            renderer_damage = OutputDamage::Full;
+        }
         let mut frozen_render_frame = FrozenNativeRenderFrame::freeze(
             self.width,
             self.height,
@@ -3141,8 +3175,11 @@ impl AtomicEglGbmScanout {
             &*server,
             input_state,
             cursor_mode,
-            Some(render_damage.as_renderer_damage(self.width, self.height)),
+            Some(renderer_damage),
         );
+        frozen_render_frame.screencopy_targets =
+            std::mem::take(&mut self.staged_screencopy_targets);
+        frozen_render_frame.freeze_capture_cursor_overlay(&*server, input_state, cursor_mode);
         if let (Some(durations), Some(started)) = (
             phase_durations.as_deref_mut(),
             render_snapshot_freeze_started,
@@ -3285,6 +3322,8 @@ impl AtomicEglGbmScanout {
         server: &mut OwnCompositorServer,
         output_transactions: &mut OutputTransactionLedger,
     ) -> io::Result<AtomicFrameRenderOutcome> {
+        let mut frozen_render_frame = frozen_render_frame;
+        self.reclaim_screencopy_targets(&mut frozen_render_frame);
         let AtomicRenderSettlementContext {
             slot,
             framebuffer_id,

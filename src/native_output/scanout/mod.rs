@@ -27,6 +27,7 @@ mod output_swapchain;
 mod render_worker;
 mod render_worker_panic;
 mod scaled_probe;
+mod screencopy_destinations;
 mod worker;
 
 pub(crate) use atomic_direct::*;
@@ -296,6 +297,32 @@ impl NativeScanoutBackend {
 
     pub(crate) fn render_worker_active(&self) -> bool {
         matches!(self, Self::AtomicEglGbm(scanout) if scanout.render_worker_active())
+    }
+
+    /// Stage a DMA-BUF screencopy on the next composited frame. Only the
+    /// explicit Atomic EGL/GBM renderer can blit; others hand the target
+    /// back, and dropping it fails the request.
+    pub(crate) fn stage_gpu_screencopy(
+        &mut self,
+        target: crate::native_output::gpu_screencopy::GpuScreencopyTarget,
+    ) -> Result<(), crate::native_output::gpu_screencopy::GpuScreencopyTarget> {
+        match self {
+            Self::AtomicEglGbm(scanout) => {
+                scanout.stage_gpu_screencopy(target);
+                Ok(())
+            }
+            Self::NativeEglGbm(_) | Self::Gbm(_) | Self::Dumb(_) => Err(target),
+        }
+    }
+
+    pub(crate) fn has_staged_gpu_screencopy(&self) -> bool {
+        matches!(self, Self::AtomicEglGbm(scanout) if scanout.has_staged_gpu_screencopy())
+    }
+
+    pub(crate) fn clear_staged_gpu_screencopy(&mut self) {
+        if let Self::AtomicEglGbm(scanout) = self {
+            scanout.clear_staged_gpu_screencopy();
+        }
     }
 
     pub(crate) fn try_promote_worker_output_candidate(

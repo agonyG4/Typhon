@@ -85,7 +85,10 @@ impl NativeScanoutBackend {
 
     pub(crate) fn direct_scanout_inhibited(&self) -> bool {
         match self {
-            Self::AtomicEglGbm(scanout) => scanout.direct_scanout_inhibited(),
+            // Pending DMA-BUF screencopies copy from the next composited frame.
+            Self::AtomicEglGbm(scanout) => {
+                scanout.direct_scanout_inhibited() || scanout.has_staged_gpu_screencopy()
+            }
             Self::NativeEglGbm(_) | Self::Gbm(_) | Self::Dumb(_) => true,
         }
     }

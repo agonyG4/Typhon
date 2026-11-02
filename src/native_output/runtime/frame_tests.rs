@@ -1477,3 +1477,61 @@ fn stationary_effect_damage_ignores_scene_publication_generation() {
         "real effect changes must retain damage"
     );
 }
+
+/// Only a hardware-cursor frame with a cursor-overlay screencopy target
+/// freezes a capture cursor; the output frame itself never gets one.
+#[test]
+fn capture_cursor_overlay_is_frozen_only_for_hardware_cursor_overlay_copies() {
+    use crate::egl_renderer::CaptureCursorOverlay;
+    use crate::native_output::gpu_screencopy::GpuScreencopyTarget;
+
+    let socket_name = format!("typhon-frozen-capture-cursor-{}", process::id());
+    let server = OwnCompositorServer::bind_cpu_composition(&socket_name)
+        .expect("bind compositor for capture cursor freeze");
+    let mut input_state = NativeInputState::new(1280, 800);
+    input_state.cursor_x = 41.0;
+    input_state.cursor_y = 52.0;
+    let frozen = |input_state: &NativeInputState,
+                  cursor_mode: NativeCursorRenderMode,
+                  overlay_cursor: Option<bool>| {
+        let scene = ResolvedNativeFrameScene::from_server_at(&server, AnimationTime::from_nanos(1))
+            .into_owned();
+        let mut frame = FrozenNativeRenderFrame::freeze(
+            1280,
+            800,
+            scene,
+            &server,
+            input_state,
+            cursor_mode,
+            Some(OutputDamage::Full),
+        );
+        frame.screencopy_targets = overlay_cursor
+            .into_iter()
+            .map(GpuScreencopyTarget::for_test)
+            .collect();
+        frame.freeze_capture_cursor_overlay(&server, input_state, cursor_mode);
+        frame
+    };
+    let theme_at = |frame: &mut FrozenNativeRenderFrame| {
+        let request = frame.draw_request(None).expect("frozen request");
+        match request.capture_cursor {
+            Some(CaptureCursorOverlay::Theme { x, y }) => Some((x, y)),
+            Some(CaptureCursorOverlay::Client(_)) => panic!("no client cursor surface exists"),
+            None => None,
+        }
+    };
+
+    let mut hardware = frozen(&input_state, NativeCursorRenderMode::Hardware, Some(true));
+    assert_eq!(theme_at(&mut hardware), Some((41, 52)));
+    let mut without_overlay = frozen(&input_state, NativeCursorRenderMode::Hardware, Some(false));
+    assert_eq!(theme_at(&mut without_overlay), None);
+    let mut without_targets = frozen(&input_state, NativeCursorRenderMode::Hardware, None);
+    assert_eq!(theme_at(&mut without_targets), None);
+    // A software-composited slot already contains the cursor.
+    let mut software = frozen(&input_state, NativeCursorRenderMode::Software, Some(true));
+    assert_eq!(theme_at(&mut software), None);
+
+    input_state.cursor_visible = false;
+    let mut hidden = frozen(&input_state, NativeCursorRenderMode::Hardware, Some(true));
+    assert_eq!(theme_at(&mut hidden), None);
+}

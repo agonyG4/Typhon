@@ -29,11 +29,12 @@ use super::super::{
         ResourceTelemetry, SurfaceBufferSourceDiagnostic, SurfaceDrawDiagnosticIdentity,
         SurfaceRenderBackendDiagnostic, surface::SurfaceResourceInputs,
     },
+    scene_state::{client_cursor_quad, theme_cursor_quad},
 };
 use super::{
     pipeline::FramePipeline,
     telemetry,
-    types::{EglFrameOutcome, EglSceneDrawRequest, FrameSkipReason},
+    types::{CaptureCursorOverlay, EglFrameOutcome, EglSceneDrawRequest, FrameSkipReason},
 };
 
 fn surface_draw_diagnostic_identity(surface: &RenderableSurface) -> SurfaceDrawDiagnosticIdentity {
@@ -237,10 +238,24 @@ impl FramePipeline<'_> {
                 .chain(request.lifecycle_decorations.iter()),
             request.special_workspace_dim,
         )?;
-        if frame.scaled_visual_state.cursor.is_some() {
+        let capture_theme_cursor = matches!(
+            request.capture_cursor,
+            Some(CaptureCursorOverlay::Theme { .. })
+        );
+        if frame.scaled_visual_state.cursor.is_some() || capture_theme_cursor {
             self.resources
                 .ensure_cursor_resource(self.gl, egl, egl_display, self.cursor_image)?;
         }
+        // A capture-only client cursor is realized like a composited one; the
+        // two never coexist because capture cursors are frozen only while the
+        // output shows the cursor on the hardware plane.
+        let cursor_surface = request
+            .client_cursor
+            .or(match request.capture_cursor {
+                Some(CaptureCursorOverlay::Client(cursor)) => Some(cursor),
+                _ => None,
+            })
+            .map(|cursor| cursor.surface);
         {
             let mut telemetry = ResourceTelemetry::new(&mut self.scene.frame_stats);
             self.resources.reconcile_surface_resource_lifetimes(
@@ -249,11 +264,11 @@ impl FramePipeline<'_> {
                 egl_display,
                 request.surfaces,
                 request.lifecycle_surfaces,
-                request.client_cursor.map(|cursor| cursor.surface),
+                cursor_surface,
                 &mut telemetry,
             )?;
         }
-        if let Some(cursor) = request.client_cursor.map(|cursor| cursor.surface) {
+        if let Some(cursor) = cursor_surface {
             let mut cursor_consumers = SurfaceConsumerPlan::default();
             cursor_consumers.add_surface(cursor.surface_id);
             cursor_consumers.finish();
@@ -273,6 +288,28 @@ impl FramePipeline<'_> {
             )?;
         }
         Ok(())
+    }
+
+    /// Place the cursor a cursor-overlay screencopy adds to its copies of
+    /// this frame. It is never drawn into the output.
+    pub(super) fn stage_capture_cursor(&mut self, request: &EglSceneDrawRequest<'_>) {
+        self.scene.capture_cursor = request.capture_cursor.and_then(|overlay| match overlay {
+            CaptureCursorOverlay::Theme { x, y } => compositor::scale_desktop_visual_state(
+                compositor::DesktopVisualState::with_cursor(x, y),
+                request.output_scale,
+            )
+            .cursor
+            .and_then(|position| {
+                theme_cursor_quad(
+                    position,
+                    self.cursor_image,
+                    self.resources.texture_view().cursor_size(),
+                )
+            }),
+            CaptureCursorOverlay::Client(cursor) => {
+                Some(client_cursor_quad(cursor, request.output_scale))
+            }
+        });
     }
 
     pub(super) fn prepare_scene(

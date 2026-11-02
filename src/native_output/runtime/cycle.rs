@@ -395,7 +395,10 @@ impl NativeRuntime {
             self.server.scene_render_generation(),
         );
         NativeRuntimeState {
-            scene_dirty: cycle.redraw_requested || self.server.has_pending_frame_prepare_work(),
+            scene_dirty: cycle.redraw_requested
+                || self.server.has_pending_frame_prepare_work()
+                || self.server.has_pending_gpu_screencopy()
+                || self.scanout.has_staged_gpu_screencopy(),
             visual_scene_debt,
             callback_only_frame_work_pending: self
                 .server
@@ -479,6 +482,7 @@ impl NativeRuntime {
         // always sees the settled swapchain/transaction state and current
         // compositor state.
         self.settle_pending_render_worker_completion(&mut cycle)?;
+        self.settle_gpu_screencopy()?;
         let now_ns = monotonic_now_ns()?;
         if self
             .system_action_transport
@@ -1001,6 +1005,7 @@ impl NativeRuntime {
                 oblivion_one::native::event_loop::NativeContinuationReason::ScreenCaptureBacklog,
             )?;
         }
+        self.stage_gpu_screencopy_requests(&mut cycle)?;
         let presentation_operation_plan = NativeWorkDomains::classify(
             &cycle.wakeup,
             &self.native_runtime_state(&cycle, monotonic_now_ns()?),
@@ -1030,6 +1035,7 @@ impl NativeRuntime {
             self.resource_efficiency_mut()
                 .record_presentation_planning_run();
             self.render_present_and_update_metrics(&mut cycle)?;
+            self.settle_gpu_screencopy()?;
             let metrics = self.resource_efficiency_mut();
             match cycle.work_class {
                 NativeWorkClass::PrimaryScene => {
@@ -1658,6 +1664,7 @@ impl NativeRuntime {
         });
     }
     pub(super) fn fail_pending_screen_captures(&mut self, reason: &str) {
+        self.fail_gpu_screencopy();
         if let Some(pending) = self.pending_render_worker_capture.as_mut()
             && !pending.cancelled
         {

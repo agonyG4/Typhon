@@ -2216,6 +2216,7 @@ impl NativeRuntime {
             process_supervisor: _,
             shutdown,
             cursor_reveal_trace,
+            gpu_screencopy,
             ..
         } = self;
         let scheduler_state_before = frame_scheduler.state();
@@ -3445,6 +3446,13 @@ impl NativeRuntime {
                             Ok(())
                         },
                     )?;
+                    // KMS waited on this frame's render fence, so its
+                    // screencopy blits are complete.
+                    gpu_screencopy.note_presented(
+                        completed_frame_id,
+                        presented_at_ns,
+                        compositor_receive_ns,
+                    );
                     if let Some((expected, worker_content_keys)) = direct_transition {
                         match explicit.complete_composited_transition(expected, worker_content_keys)
                         {

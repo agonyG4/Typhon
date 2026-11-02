@@ -115,14 +115,35 @@ impl CompositorState {
 
     pub(in crate::compositor) fn activate_surface_scanout_hint(&mut self, surface_id: u32) {
         if self.dmabuf_surface_scanout_hints.insert(surface_id) {
+            // Any buffer the client creates from here on can follow the
+            // scanout tranche sent below.
+            self.dmabuf_scanout_buffer_floors
+                .insert(surface_id, self.buffer_ids.next_id());
             self.reconcile_all_dmabuf_feedback_for_surface(surface_id);
         }
     }
 
     pub(in crate::compositor) fn clear_surface_scanout_hint(&mut self, surface_id: u32) {
+        self.dmabuf_scanout_buffer_floors.remove(&surface_id);
         if self.dmabuf_surface_scanout_hints.remove(&surface_id) {
             self.reconcile_all_dmabuf_feedback_for_surface(surface_id);
         }
+    }
+
+    /// Whether a surface's buffer was created after the surface was sent the
+    /// scanout tranche. A client only requests a scanout-capable allocation
+    /// (Xwayland's GBM_BO_USE_SCANOUT) once it sees that tranche; older
+    /// buffers can pass KMS validation and still scan out corrupted on NVIDIA.
+    pub(in crate::compositor) fn surface_buffer_allocated_for_scanout(
+        &self,
+        surface_id: u32,
+        buffer_id: u64,
+    ) -> bool {
+        self.dmabuf_surface_scanout_hints.contains(&surface_id)
+            && self
+                .dmabuf_scanout_buffer_floors
+                .get(&surface_id)
+                .is_some_and(|floor| buffer_id >= *floor)
     }
 
     fn reconcile_all_dmabuf_feedback_for_surface(&mut self, surface_id: u32) {
@@ -155,10 +176,16 @@ impl CompositorState {
             self.clear_surface_scanout_hint(previous_surface_id);
         }
         self.dmabuf_scanout_candidate_surface = candidate_surface_id;
+        // Offer the scanout tranche as soon as a surface could be scanned out,
+        // so the client reallocates before direct presentation is attempted.
+        if let Some(surface_id) = candidate_surface_id {
+            self.activate_surface_scanout_hint(surface_id);
+        }
     }
 
     pub(in crate::compositor) fn detach_dmabuf_surface(&mut self, surface_id: u32) {
         self.dmabuf_surface_scanout_hints.remove(&surface_id);
+        self.dmabuf_scanout_buffer_floors.remove(&surface_id);
         if self.dmabuf_scanout_candidate_surface == Some(surface_id) {
             self.dmabuf_scanout_candidate_surface = None;
         }
@@ -418,6 +445,34 @@ mod tests {
     use super::*;
     use crate::compositor::gpu_protocol_capabilities::GpuFormat;
     use crate::render_backend::egl_gles::EglGlesDmabufFormat;
+
+    #[test]
+    fn only_buffers_created_after_the_scanout_tranche_are_scanout_allocations() {
+        let mut state = CompositorState::default();
+        let before = state.allocate_buffer_identity().unwrap().id().get();
+        assert!(!state.surface_buffer_allocated_for_scanout(7, before));
+
+        // Becoming the scanout candidate offers the tranche; buffers the
+        // client already had were allocated for rendering only.
+        state.reconcile_surface_scanout_candidate(Some(7));
+        assert!(!state.surface_buffer_allocated_for_scanout(7, before));
+        let after = state.allocate_buffer_identity().unwrap().id().get();
+        assert!(state.surface_buffer_allocated_for_scanout(7, after));
+        assert!(!state.surface_buffer_allocated_for_scanout(8, after));
+
+        // Re-activating an active hint keeps the original floor.
+        state.activate_surface_scanout_hint(7);
+        assert!(state.surface_buffer_allocated_for_scanout(7, after));
+
+        // Losing candidacy withdraws the tranche, so the client falls back to
+        // render-only buffers and a later candidacy starts a new floor.
+        state.reconcile_surface_scanout_candidate(None);
+        assert!(!state.surface_buffer_allocated_for_scanout(7, after));
+        state.reconcile_surface_scanout_candidate(Some(7));
+        assert!(!state.surface_buffer_allocated_for_scanout(7, after));
+        let reallocated = state.allocate_buffer_identity().unwrap().id().get();
+        assert!(state.surface_buffer_allocated_for_scanout(7, reallocated));
+    }
 
     #[test]
     fn advertised_snapshot_summary_deduplicates_consistent_live_resources() {

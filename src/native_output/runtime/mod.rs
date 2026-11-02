@@ -134,6 +134,7 @@ mod direct_plan;
 mod dmabuf_release;
 mod frame;
 mod frame_scene_identity;
+mod gpu_screencopy_cycle;
 #[cfg(test)]
 mod frame_scene_identity_tests;
 mod input_transition_guard;
@@ -796,6 +797,9 @@ pub(crate) struct NativeRuntime {
     pending_render_worker_outer: Option<presentation_cycle::AtomicRenderOuterContinuation>,
     pending_render_worker_completion: Option<super::scanout::AtomicRenderWorkerCompletion>,
     pending_render_worker_capture: Option<render_worker::PendingWorkerCapture>,
+    gpu_screencopy: crate::native_output::gpu_screencopy::GpuScreencopyInflight<
+        oblivion_one::compositor::ScreencopyPending,
+    >,
     pending_worker_effect_reload: Option<render_worker::PendingWorkerEffectReload>,
     pending_dmabuf_release_fence: Option<(crate::native_output::scanout::RenderWorkerJobId, u64)>,
     cursor_io_worker: Option<oblivion_one::cursor_manager::CursorIoWorker>,

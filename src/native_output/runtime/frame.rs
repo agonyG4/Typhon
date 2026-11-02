@@ -2579,6 +2579,20 @@ pub(crate) struct FrozenNativeRenderFrame {
     pub(crate) identity: FrozenRenderSnapshotIdentity,
     projection_consumed: bool,
     capture_cursor: bool,
+    /// Client DMA-BUFs to fill from this frame once it is composited.
+    pub(crate) screencopy_targets: Vec<crate::native_output::gpu_screencopy::GpuScreencopyTarget>,
+    /// Cursor the `overlay_cursor` screencopy targets add to their copies.
+    capture_cursor_overlay: Option<FrozenCaptureCursor>,
+}
+
+/// The cursor a cursor-overlay screencopy adds to its copy while the output
+/// shows the cursor on the hardware plane, frozen with the frame.
+#[derive(Debug)]
+enum FrozenCaptureCursor {
+    /// The active theme or shape cursor image at this pointer position.
+    Theme { x: i32, y: i32 },
+    /// The client's cursor surface.
+    Client(Box<OwnedClientCursorRenderState>),
 }
 
 impl FrozenNativeRenderFrame {
@@ -2669,6 +2683,52 @@ impl FrozenNativeRenderFrame {
             identity,
             projection_consumed: false,
             capture_cursor: false,
+            screencopy_targets: Vec::new(),
+            capture_cursor_overlay: None,
+        }
+    }
+
+    /// Freeze the cursor this frame's `overlay_cursor` screencopy targets add
+    /// to their copies. Only a frame whose output shows the cursor on the
+    /// hardware plane needs one: a software-composited slot already holds the
+    /// cursor, and a hidden cursor (a client's null cursor, for one) stays
+    /// hidden in captures too.
+    pub(crate) fn freeze_capture_cursor_overlay(
+        &mut self,
+        server: &OwnCompositorServer,
+        input_state: &NativeInputState,
+        cursor_mode: NativeCursorRenderMode,
+    ) {
+        self.capture_cursor_overlay = None;
+        if cursor_mode != NativeCursorRenderMode::Hardware
+            || !self
+                .screencopy_targets
+                .iter()
+                .any(crate::native_output::gpu_screencopy::GpuScreencopyTarget::overlay_cursor)
+        {
+            return;
+        }
+        let cursor = resolve_native_cursor_for_server(server, input_state);
+        if !cursor.visible {
+            return;
+        }
+        self.capture_cursor_overlay = match cursor.source {
+            super::cursor_cycle::NativeResolvedCursorSource::ClientSurface => server
+                .client_cursor_render_state()
+                .map(|cursor| {
+                    FrozenCaptureCursor::Client(Box::new(
+                        OwnedClientCursorRenderState::from_render_state(cursor),
+                    ))
+                }),
+            _ => {
+                let (x, y) = input_state.cursor_position();
+                Some(FrozenCaptureCursor::Theme { x, y })
+            }
+        };
+        if let Some(FrozenCaptureCursor::Client(cursor)) = &self.capture_cursor_overlay {
+            self.surface_resource_sync_states.extend(
+                server.surface_resource_sync_states(std::iter::once(cursor.surface.surface_id)),
+            );
         }
     }
 
@@ -2699,7 +2759,7 @@ impl FrozenNativeRenderFrame {
             .client_cursor
             .as_ref()
             .map(OwnedClientCursorRenderState::as_render_state);
-        Some(project_egl_scene_draw_request(
+        let mut request = project_egl_scene_draw_request(
             self.width,
             self.height,
             scene,
@@ -2709,7 +2769,17 @@ impl FrozenNativeRenderFrame {
             self.current_damage.take(),
             std::mem::take(&mut self.surface_resource_sync_states),
             frame_id,
-        ))
+        );
+        request.capture_cursor = self
+            .capture_cursor_overlay
+            .as_ref()
+            .map(|cursor| match cursor {
+                FrozenCaptureCursor::Theme { x, y } => CaptureCursorOverlay::Theme { x: *x, y: *y },
+                FrozenCaptureCursor::Client(cursor) => {
+                    CaptureCursorOverlay::Client(cursor.as_render_state())
+                }
+            });
+        Some(request)
     }
 }
 
@@ -2873,6 +2943,7 @@ fn project_egl_scene_draw_request<'a>(
         presentation_clips: &scene.presentation.clips,
         presentation_owner_root_surface_ids: scene.presentation_owner_root_surface_ids.as_ref(),
         client_cursor,
+        capture_cursor: None,
         current_damage,
         surface_resource_sync_states,
         lifecycle: &scene.lifecycle,
