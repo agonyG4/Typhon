@@ -12,7 +12,7 @@ fn snapshot_uses_stable_ids_zero_based_coordinates_and_one_active_workspace() {
             WorkspaceId::new(4).unwrap(),
             WorkspaceId::new(7).unwrap(),
         ],
-        active,
+        crate::wm::VisibleWorkspaces::single(active),
         &occupied,
     );
 
@@ -43,7 +43,7 @@ fn snapshot_uses_stable_ids_zero_based_coordinates_and_one_active_workspace() {
             WorkspaceId::new(4).unwrap(),
             WorkspaceId::new(7).unwrap(),
         ],
-        active,
+        crate::wm::VisibleWorkspaces::single(active),
         &occupied_active,
     );
     assert!(!occupied_snapshot.workspaces[0].hidden);

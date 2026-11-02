@@ -77,6 +77,19 @@ impl CompositorState {
         }
         self.focused_surface = Some(surface.clone());
         self.focused_window_id = self.update_desktop_focus_window(new_surface_id, changed);
+        // Focusing a window shown on another output focuses that output.
+        if let Some(workspace) = self
+            .focused_window_id
+            .and_then(|window_id| self.workspace_owner_window_id(window_id))
+            .and_then(|window_id| self.window(window_id))
+            .and_then(|window| window.management)
+            .and_then(|management| management.regular_workspace())
+            && let Some(output_id) = self.workspace_manager.workspace_output(workspace)
+            && self.workspace_manager.output_workspace(output_id) == Some(workspace)
+            && self.workspace_manager.focus_output(output_id)
+        {
+            self.publish_workspace_state();
+        }
         let focus_generation = self.focus_generation;
         if desktop_window_changed
             && let Some(window_id) = self.focused_window_id

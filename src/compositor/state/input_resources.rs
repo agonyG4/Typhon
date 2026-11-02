@@ -1051,9 +1051,35 @@ impl CompositorState {
         self.last_pointer_y = y;
         if changed {
             self.update_active_drag_icon_position();
+            self.follow_pointer_to_output(x, y);
         }
         if moves_visible_cursor {
             self.advance_cursor_generation();
+        }
+    }
+
+    /// Output focus follows the pointer, so new windows and workspace
+    /// keybindings act on the output under the cursor.
+    fn follow_pointer_to_output(&mut self, x: f64, y: f64) {
+        if self.workspace_manager.outputs().nth(1).is_none() {
+            return;
+        }
+        let (x, y) = (x.floor() as i64, y.floor() as i64);
+        let Some(output_id) = self
+            .logical_outputs
+            .iter()
+            .find(|(output_id, output)| {
+                self.workspace_manager
+                    .output_workspace(**output_id)
+                    .is_some()
+                    && output.intersects(x, y, x + 1, y + 1)
+            })
+            .map(|(output_id, _)| *output_id)
+        else {
+            return;
+        };
+        if self.workspace_manager.focus_output(output_id) {
+            self.publish_workspace_state();
         }
     }
 

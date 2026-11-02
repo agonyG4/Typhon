@@ -583,3 +583,25 @@ fn windows_on_another_outputs_workspace_open_and_maximize_within_that_output() {
         (1280, 0)
     );
 }
+
+#[test]
+fn output_focus_follows_the_pointer_across_outputs() {
+    use crate::wm::WorkspaceId;
+    let mut server = OwnCompositorServer::bind(&unique_socket_name()).unwrap();
+    let native = server.focused_output().expect("native output is attached");
+    let right = server
+        .add_logical_output("DP-2", (1280, 0), (1920, 1080), 1.0, 60)
+        .unwrap();
+
+    server.update_pointer_position_without_client_dispatch(1500.0, 300.0);
+    assert_eq!(server.focused_output(), Some(right));
+    assert_eq!(server.active_workspace(), WorkspaceId::new(2).unwrap());
+
+    // Outside every output the focus stays where it was.
+    server.update_pointer_position_without_client_dispatch(4000.0, 300.0);
+    assert_eq!(server.focused_output(), Some(right));
+
+    server.update_pointer_position_without_client_dispatch(100.0, 100.0);
+    assert_eq!(server.focused_output(), Some(native));
+    assert_eq!(server.active_workspace(), WorkspaceId::new(1).unwrap());
+}

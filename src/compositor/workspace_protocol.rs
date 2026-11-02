@@ -24,7 +24,7 @@ pub(crate) struct WorkspaceProtocolSnapshot {
 impl WorkspaceProtocolSnapshot {
     pub(crate) fn from_workspace_ids(
         workspaces: impl IntoIterator<Item = crate::wm::WorkspaceId>,
-        active: crate::wm::WorkspaceId,
+        active: crate::wm::VisibleWorkspaces,
         occupied: &BTreeSet<crate::wm::WorkspaceId>,
     ) -> Self {
         Self {
@@ -35,8 +35,8 @@ impl WorkspaceProtocolSnapshot {
                     id: format!("typhon.workspace.{}", workspace.get()),
                     name: workspace.to_string(),
                     coordinates: vec![index as u32],
-                    active: workspace == active,
-                    hidden: workspace != active && !occupied.contains(&workspace),
+                    active: active.contains(workspace),
+                    hidden: !active.contains(workspace) && !occupied.contains(&workspace),
                 })
                 .collect(),
         }
@@ -477,7 +477,9 @@ impl CompositorState {
     pub(in crate::compositor) fn workspace_protocol_snapshot(&self) -> WorkspaceProtocolSnapshot {
         WorkspaceProtocolSnapshot::from_workspace_ids(
             self.workspace_manager.workspaces(),
-            self.workspace_manager.active_workspace(),
+            // One group spans every output; each output's shown workspace is
+            // active in it.
+            self.workspace_manager.visible_workspaces(),
             &self.regular_workspace_occupancy(),
         )
     }
