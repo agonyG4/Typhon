@@ -53,16 +53,16 @@ impl NativeRuntime {
         reason: DirectFallbackReason,
     ) {
         let _ = DirectFallbackTracker::start(
-            &mut self.direct_fallback_tracker,
+            &mut self.head.direct_fallback_tracker,
             transaction_id,
-            self.last_refresh_sequence,
+            self.head.last_refresh_sequence,
             reason,
         );
     }
 
     pub(crate) fn abandon_direct_fallback(&mut self) {
-        self.scanout.note_direct_fallback_cycles(0);
-        self.direct_fallback_tracker = None;
+        self.head.scanout.note_direct_fallback_cycles(0);
+        self.head.direct_fallback_tracker = None;
     }
 }
 

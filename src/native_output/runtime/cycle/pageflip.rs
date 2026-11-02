@@ -2089,7 +2089,7 @@ impl NativeRuntime {
             let xwayland_totals = self.xwayland.slow_cycle_totals();
             self.slow_cycle_trace.start_cycle_after_wake(
                 start_ns,
-                self.presentation_timing.mode().refresh_interval_ns(),
+                self.head.presentation_timing.mode().refresh_interval_ns(),
                 SlowCycleContext {
                     wake_reasons: wakeup.reasons.bits(),
                     continuation_reasons: wakeup.continuation.bits(),
@@ -2119,9 +2119,9 @@ impl NativeRuntime {
         }
         self.termination.set_phase(RuntimePhase::RuntimeCycle);
         self.retire_settled_output_terminals();
-        let deferred_worker_pageflip = self.deferred_worker_pageflip.take();
-        let deferred_worker_completion = self.deferred_worker_completion.take();
-        let worker_timeout_pending = self.worker_timeout_pending.take();
+        let deferred_worker_pageflip = self.head.deferred_worker_pageflip.take();
+        let deferred_worker_completion = self.head.deferred_worker_completion.take();
+        let worker_timeout_pending = self.head.worker_timeout_pending.take();
         self.termination.set_phase(RuntimePhase::SeatEvents);
         let disabled_observed = self.dispatch_runtime_seat_events(&wakeup)?;
         self.termination.set_phase(RuntimePhase::RuntimeCycle);
@@ -2131,7 +2131,7 @@ impl NativeRuntime {
             disabled_observed,
         );
         if resuming_recovery_wake {
-            if let Some(token) = self.output_render_fence_token.take() {
+            if let Some(token) = self.head.output_render_fence_token.take() {
                 self.event_loop.unregister(token)?;
             }
             self.termination.set_phase(RuntimePhase::SessionRecovery);
@@ -2141,31 +2141,66 @@ impl NativeRuntime {
         if self.session.permits_output()
             && (wakeup.reasons.drm()
                 || (wakeup.reasons.timer()
-                    && (self.scanout.page_flip_pending()
-                        || self.atomic_commit_arbiter.atomic_commit_pending())))
+                    && (self.head.scanout.page_flip_pending()
+                        || self.head.atomic_commit_arbiter.atomic_commit_pending())))
         {
             NativeSessionIo::observe(self, NativeIoOperation::PageflipDrain);
         }
         let perf = self.perf;
         let Self {
             server,
+            head:
+                OutputHead {
+                    target,
+                    mode_label: _,
+                    output_refresh_rate,
+                    output_epoch,
+                    scanout,
+                    cursor_render_mode: _,
+                    cursor_output_arbitration,
+                    atomic_cursor,
+                    legacy_cursor: _,
+                    output_render_fence_token,
+                    pending_output_configuration,
+                    kms_commit_worker,
+                    kms_commit_worker_transport,
+                    submitted_worker_ownership,
+                    emergency_quarantined_worker_jobs,
+                    deferred_worker_pageflip: _,
+                    deferred_worker_completion: _,
+                    worker_timeout_pending: _,
+                    frame_scheduler,
+                    atomic_commit_arbiter,
+                    output_transactions,
+                    presented_planes,
+                    confirmed_kms_presentation,
+                    presentation_deadline,
+                    presentation_timing,
+                    cursor_timing,
+                    scheduled_presentation_target,
+                    render_journal,
+                    adaptive_buffering,
+                    pending_proven_deadline_miss,
+                    last_primary_presented_at_ns,
+                    direct_fallback_tracker,
+                    last_refresh_sequence,
+                    scene_history,
+                    frame_index,
+                    mismatched_pageflip_events,
+                    stale_pageflip_events,
+                    presentation_cadence,
+                    frame_pacing,
+                    last_acquire_ready_at_ns: _,
+                    ..
+                },
             perf: _,
             kms,
             kms_backend,
-            target,
-            mode_label: _,
-            output_refresh_rate,
-            output_epoch,
             drm_timestamp_clock,
             presentation_clock,
-            scanout,
             frame_renderer: _,
             input_state: _,
             cursor_preference: _,
-            cursor_render_mode: _,
-            cursor_output_arbitration,
-            atomic_cursor,
-            legacy_cursor: _,
             input_devices: _,
             seat_session: _,
             session: _,
@@ -2175,42 +2210,11 @@ impl NativeRuntime {
             event_loop,
             dmabuf_gpu_release_registry,
             drm_reactor_token: _,
-            output_render_fence_token,
-            pending_output_configuration,
-            kms_commit_worker,
-            kms_commit_worker_transport,
-            submitted_worker_ownership,
-            emergency_quarantined_worker_jobs,
-            deferred_worker_pageflip: _,
-            deferred_worker_completion: _,
-            worker_timeout_pending: _,
-            frame_scheduler,
-            atomic_commit_arbiter,
-            output_transactions,
-            presented_planes,
-            confirmed_kms_presentation,
-            presentation_deadline,
-            presentation_timing,
-            cursor_timing,
-            scheduled_presentation_target,
-            render_journal,
-            adaptive_buffering,
             vrr_policy,
-            pending_proven_deadline_miss,
             effective_app_gpu_policy: _,
-            last_primary_presented_at_ns,
-            direct_fallback_tracker,
-            last_refresh_sequence,
-            scene_history,
             queued_redraw_requested,
-            frame_index,
             known_toplevels: _,
             pending_launches: _,
-            mismatched_pageflip_events,
-            stale_pageflip_events,
-            presentation_cadence,
-            frame_pacing,
-            last_acquire_ready_at_ns: _,
             resize_perf: _,
             pointer_constraint_backend: _,
             process_supervisor: _,
@@ -2691,8 +2695,12 @@ impl NativeRuntime {
                 {
                     let token = PageFlipToken::new(pageflip.user_data)
                         .ok_or_else(|| io::Error::other("cursor pageflip token is zero"))?;
-                    let identity =
-                        pageflip_identity(self.output_id, token, *output_epoch, target.crtc_id);
+                    let identity = pageflip_identity(
+                        self.head.output_id,
+                        token,
+                        *output_epoch,
+                        target.crtc_id,
+                    );
                     let previous_cursor = presented_planes.cursor;
                     let presented_cursor = cursor.presented_plane_state();
                     if !presented_planes.promote_bundle(
@@ -2904,7 +2912,7 @@ impl NativeRuntime {
                         }
                     }
                     let direct_pageflip_identity = pageflip_identity(
-                        self.output_id,
+                        self.head.output_id,
                         pageflip_token,
                         *output_epoch,
                         target.crtc_id,
@@ -2974,7 +2982,7 @@ impl NativeRuntime {
                         != crate::native_output::kms_worker::KmsCommitWorkerTransport::Worker
                     {
                         let identity = pageflip_identity(
-                            self.output_id,
+                            self.head.output_id,
                             pageflip_token,
                             *output_epoch,
                             target.crtc_id,
@@ -3481,7 +3489,7 @@ impl NativeRuntime {
                     let presentation_serial = swapchain.presentation_serial();
                     let framebuffer_id = explicit.framebuffer(slot)?.get();
                     let pageflip = pageflip_identity(
-                        self.output_id,
+                        self.head.output_id,
                         pageflip_token,
                         *output_epoch,
                         target.crtc_id,
@@ -3499,7 +3507,7 @@ impl NativeRuntime {
                         != crate::native_output::kms_worker::KmsCommitWorkerTransport::Worker
                     {
                         let identity = pageflip_identity(
-                            self.output_id,
+                            self.head.output_id,
                             pageflip_token,
                             *output_epoch,
                             target.crtc_id,
@@ -4178,7 +4186,7 @@ impl NativeRuntime {
                     )) = worker_promotion
                     {
                         if bundle_identity.token != pageflip_token
-                            || bundle_identity.output_id != self.output_id
+                            || bundle_identity.output_id != self.head.output_id
                             || bundle_identity.output_generation != output_epoch.get()
                             || bundle_identity.crtc_id != target.crtc_id
                         {
@@ -4189,7 +4197,7 @@ impl NativeRuntime {
                         }
                         let identity =
                             crate::native_output::presentation::plane::PlanePageflipIdentity {
-                                output_id: self.output_id,
+                                output_id: self.head.output_id,
                                 bundle_id: bundle_identity.id,
                                 token: bundle_identity.token,
                                 output_epoch: OutputEpochId::new(bundle_identity.output_generation)
@@ -4247,7 +4255,7 @@ impl NativeRuntime {
                         }
                         if let Some(worker) = kms_commit_worker.as_ref() {
                             worker.set_established_presented_base_for_output(
-                                self.output_id,
+                                self.head.output_id,
                                 presented_planes.revision,
                                 output_epoch.get(),
                                 target.crtc_id,

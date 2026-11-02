@@ -33,15 +33,17 @@ impl NativeRuntime {
             None
         };
         if first_request {
-            self.forced_shutdown_inflight = worker_inflight.or_else(|| {
+            self.head.forced_shutdown_inflight = worker_inflight.or_else(|| {
                 let pending_token = self
+                    .head
                     .atomic_commit_arbiter
                     .pending_atomic_commit()
                     .filter(|pending| {
                         matches!(pending.phase, AtomicCommitPhase::KernelSubmitted { .. })
                     })
                     .map(|pending| pending.token)?;
-                self.submitted_worker_ownership
+                self.head
+                    .submitted_worker_ownership
                     .iter()
                     .find(|ownership| ownership.job.token == pending_token)
                     .map(|ownership| super::super::kms_worker::WorkerInFlight {
@@ -56,33 +58,38 @@ impl NativeRuntime {
                     })
             });
         }
-        let worker_transport = self.kms_commit_worker_transport
+        let worker_transport = self.head.kms_commit_worker_transport
             == crate::native_output::kms_worker::KmsCommitWorkerTransport::Worker;
         let pending_pageflip_token = worker_inflight
             .map(|inflight| inflight.token.get())
             .or_else(|| {
                 if worker_transport {
-                    self.atomic_commit_arbiter
+                    self.head
+                        .atomic_commit_arbiter
                         .kernel_submitted_token()
                         .map(PageFlipToken::get)
                         .or_else(|| {
-                            self.atomic_commit_arbiter
+                            self.head
+                                .atomic_commit_arbiter
                                 .deferred_pageflip()
-                                .and_then(|_| self.atomic_commit_arbiter.worker_queued_token())
+                                .and_then(|_| self.head.atomic_commit_arbiter.worker_queued_token())
                                 .map(PageFlipToken::get)
                         })
                         .or_else(|| {
-                            self.atomic_cursor
+                            self.head
+                                .atomic_cursor
                                 .as_ref()
                                 .and_then(|cursor| cursor.pending_token().map(PageFlipToken::get))
                         })
                 } else {
-                    self.atomic_commit_arbiter
+                    self.head
+                        .atomic_commit_arbiter
                         .pending_atomic_token()
                         .map(PageFlipToken::get)
-                        .or_else(|| self.scanout.pending_page_flip_token())
+                        .or_else(|| self.head.scanout.pending_page_flip_token())
                         .or_else(|| {
-                            self.atomic_cursor
+                            self.head
+                                .atomic_cursor
                                 .as_ref()
                                 .and_then(|cursor| cursor.pending_token().map(PageFlipToken::get))
                         })
@@ -163,7 +170,7 @@ impl NativeRuntime {
             frame_submitted: false,
             presentation_admitted: false,
             present_us: 0,
-            pageflip_pending_at_tick: self.scanout.page_flip_pending(),
+            pageflip_pending_at_tick: self.head.scanout.page_flip_pending(),
             tick_us: 0,
             accepted: 0,
             redraw_requested: false,
@@ -192,10 +199,11 @@ impl NativeRuntime {
         NativeSessionIo::quiesce_kms_worker(self)?;
         NativeSessionIo::observe(self, NativeIoOperation::KmsWorkerJoin);
         NativeSessionIo::join_kms_worker(self)?;
-        let forced_identity = self.forced_shutdown_inflight.take();
-        let forced_pacing_settled = self.forced_shutdown_pacing_settled.take();
+        let forced_identity = self.head.forced_shutdown_inflight.take();
+        let forced_pacing_settled = self.head.forced_shutdown_pacing_settled.take();
         if let Some(identity) = forced_identity {
             let _ = self
+                .head
                 .frame_pacing
                 .abandon_pending_submission(identity.token.get());
         }
@@ -217,17 +225,17 @@ impl NativeRuntime {
                 )]
             });
         } else {
-            if let Some(cursor) = self.legacy_cursor.as_mut() {
+            if let Some(cursor) = self.head.legacy_cursor.as_mut() {
                 let _ = cursor.disable();
             }
             native_shutdown_debug_log("kms_restore_begin");
             NativeSessionIo::observe(self, NativeIoOperation::KmsRestore);
             native_shutdown_debug_log("kms_restore_end");
         }
-        let pageflip_pending = if self.scanout_destroyed {
+        let pageflip_pending = if self.head.scanout_destroyed {
             false
         } else {
-            self.scanout.page_flip_pending()
+            self.head.scanout.page_flip_pending()
         };
         let safety = self.establish_kms_teardown_safety();
         if let Some(identity) = forced_identity {
@@ -235,8 +243,8 @@ impl NativeRuntime {
                 self.settle_forced_shutdown_inflight(identity)?;
                 self.retire_settled_output_terminals();
             } else {
-                self.forced_shutdown_inflight = Some(identity);
-                self.forced_shutdown_pacing_settled = forced_pacing_settled;
+                self.head.forced_shutdown_inflight = Some(identity);
+                self.head.forced_shutdown_pacing_settled = forced_pacing_settled;
             }
         }
         self.perf.log("native.kms_restore", || {

@@ -11,10 +11,10 @@ impl NativeRuntime {
         cycle: &mut NativeCycleState,
     ) -> NativeResult<()> {
         if self.server.has_pending_gpu_screencopy() {
-            let (width, height) = self.scanout.dimensions();
+            let (width, height) = self.head.scanout.dimensions();
             for pending in self.server.take_ready_gpu_screencopies() {
                 let output_id = pending.output_id();
-                if output_id != self.output_id
+                if output_id != self.head.output_id
                     || !self.server.screen_capture_output_is_current(output_id)
                 {
                     pending.fail();
@@ -43,13 +43,13 @@ impl NativeRuntime {
                     self.gpu_screencopy
                         .admit(pending, buffer, identity, region, overlay_cursor);
                 // Non-Atomic backends have no composited slot to copy from.
-                if let Err(target) = self.scanout.stage_gpu_screencopy(target) {
+                if let Err(target) = self.head.scanout.stage_gpu_screencopy(target) {
                     drop(target);
                 }
             }
             self.settle_gpu_screencopy()?;
         }
-        if self.scanout.has_staged_gpu_screencopy() {
+        if self.head.scanout.has_staged_gpu_screencopy() {
             cycle.redraw_requested = true;
             self.queued_redraw_requested = true;
         }
@@ -70,7 +70,7 @@ impl NativeRuntime {
     /// and ready requests still queued in the compositor. Blitted copies whose
     /// fence already signaled are still delivered.
     pub(super) fn fail_gpu_screencopy(&mut self) {
-        self.scanout.clear_staged_gpu_screencopy();
+        self.head.scanout.clear_staged_gpu_screencopy();
         self.gpu_screencopy.fail_all();
         for pending in self.server.take_ready_gpu_screencopies() {
             pending.fail();

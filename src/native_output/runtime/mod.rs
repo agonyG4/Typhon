@@ -145,6 +145,8 @@ mod kms_worker_teardown;
 mod kms_worker_tests;
 mod metrics;
 mod output_configuration;
+mod output_head;
+use output_head::OutputHead;
 mod output_hotplug;
 #[cfg(test)]
 mod physical_effect_damage_tests;
@@ -729,36 +731,21 @@ impl KmsTeardownSafety {
 
 pub(crate) struct NativeRuntime {
     server: OwnCompositorServer,
-    output_id: OutputId,
+    // Per-output physical presentation state. One head until multi-head.
+    head: output_head::OutputHead,
     cursor_image: std::sync::Arc<oblivion_one::cursor_theme::CompositorCursorImage>,
     cursor_manager: oblivion_one::cursor_manager::CursorThemeManager,
     perf: NativePerfLogger,
-    target: NativeAppliedOutputConfiguration,
-    output_capabilities: NativeOutputCapabilities,
-    output_mode_mutation_policy: output_configuration::OutputModeMutationPolicy,
-    output_configuration_generation: OutputConfigurationGeneration,
-    output_configuration_transactions: OutputConfigurationTransactions,
-    pending_output_configuration: Option<PendingOutputConfigurationRequest>,
-    mode_label: String,
-    output_refresh_rate: oblivion_one::compositor::OutputRefreshRate,
     // Session-file lifetime is independent of the physical output pipeline.
     drm_session_generation: DrmSessionGeneration,
-    // Physical presentation lifetime; modesets and successful session recovery
-    // advance it independently of the semantic Settings generation.
-    output_epoch: OutputEpochId,
     drm_timestamp_clock: DrmTimestampClock,
     presentation_clock: PresentationClock,
-    scanout: mem::ManuallyDrop<NativeScanoutBackend>,
     kms_backend: KmsBackendSelection,
     frame_renderer: NativeFrameRenderer,
     input_state: NativeInputState,
     cursor_preference: NativeCursorPreference,
     cursor_scheduling_policy: NativeCursorSchedulingPolicy,
-    cursor_output_arbitration: NativeCursorOutputArbitration,
     direct_scanout_preference: NativeDirectScanoutPreference,
-    cursor_render_mode: NativeCursorRenderMode,
-    atomic_cursor: Option<NativeAtomicCursor>,
-    legacy_cursor: Option<NativeLegacyHardwareCursor>,
     kms: NativeDrmDevice,
     input_devices: NativeInputBackend,
     controller_manager: Option<ControllerManager>,
@@ -788,21 +775,10 @@ pub(crate) struct NativeRuntime {
     xwayland_proxy_selection_sync: xwayland::XwaylandProxySelectionSyncState,
     xwayland_client_identity: Option<oblivion_one::compositor::XwaylandClientIdentity>,
     drm_reactor_token: Option<ReactorToken>,
-    output_render_fence_token: Option<ReactorToken>,
-    kms_commit_worker: Option<super::kms_worker::KmsCommitWorkerHandle>,
-    kms_commit_worker_reactor_token: Option<ReactorToken>,
-    render_worker_reactor_token: Option<ReactorToken>,
-    render_worker_admission_stopped: bool,
-    pending_render_worker_identity: Option<super::scanout::AtomicRenderWorkerIdentity>,
-    pending_render_worker_context: Option<super::scanout::AtomicRenderSettlementContext>,
-    pending_render_worker_outer: Option<presentation_cycle::AtomicRenderOuterContinuation>,
-    pending_render_worker_completion: Option<super::scanout::AtomicRenderWorkerCompletion>,
-    pending_render_worker_capture: Option<render_worker::PendingWorkerCapture>,
     gpu_screencopy: crate::native_output::gpu_screencopy::GpuScreencopyInflight<
         oblivion_one::compositor::ScreencopyPending,
     >,
     pending_worker_effect_reload: Option<render_worker::PendingWorkerEffectReload>,
-    pending_dmabuf_release_fence: Option<(crate::native_output::scanout::RenderWorkerJobId, u64)>,
     cursor_io_worker: Option<oblivion_one::cursor_manager::CursorIoWorker>,
     cursor_io_worker_reactor_token: Option<ReactorToken>,
     pending_cursor_job: Option<PendingCursorJob>,
@@ -817,68 +793,17 @@ pub(crate) struct NativeRuntime {
     pending_output_persistence: Option<PendingOutputPersistence>,
     next_output_persistence_job_id: u64,
     output_persistence_unavailable_logged: bool,
-    output_reconfiguration_rearm_retry_deadline_ns: Option<u64>,
     output_persistence_compensation_required: bool,
     output_persistence_compensation_failed: bool,
-    kms_commit_worker_policy: super::kms_worker::KmsCommitWorkerPolicy,
-    kms_commit_worker_transport: super::kms_worker::KmsCommitWorkerTransport,
-    kms_commit_worker_startup: super::kms_worker::KmsCommitWorkerStartup,
-    worker_quarantine: KmsWorkerQuarantine,
-    emergency_quarantined_worker_jobs: Vec<super::kms_worker::KmsCommitJob>,
-    submitted_worker_ownership: Vec<super::kms_worker::KmsSubmittedOwnership>,
-    emergency_quarantined_submitted_ownership: Vec<super::kms_worker::KmsSubmittedOwnership>,
-    kms_teardown_safety: KmsTeardownSafety,
-    kms_teardown_safety_established: bool,
-    scanout_destroyed: bool,
-    deferred_worker_pageflip: Option<DrmPresentationEvent>,
-    deferred_worker_completion: Option<AtomicCommitCompletion>,
-    worker_timeout_pending: Option<(PageFlipToken, u64)>,
-    forced_shutdown_inflight: Option<super::kms_worker::WorkerInFlight>,
-    forced_shutdown_pacing_settled: Option<(
-        PageFlipToken,
-        crate::native_output::pacing::WorkerPacingTicket,
-    )>,
-    frame_scheduler: NativeFrameScheduler,
-    atomic_commit_arbiter: AtomicCommitArbiter,
-    output_transactions: OutputTransactionLedger,
-    presented_planes: crate::native_output::presentation::plane::PresentedPlaneSnapshot,
-    confirmed_kms_presentation: ConfirmedKmsPresentationState,
-    presentation_timing: KmsPresentationTimingModel,
-    cursor_timing: crate::native_output::presentation::cursor_timing::CursorTimingDomain,
-    presentation_deadline: PresentationDeadlinePlanner,
-    scheduled_presentation_target: Option<PresentationTarget>,
-    render_journal: AdaptiveRenderJournal,
-    adaptive_buffering: AdaptiveBufferingController,
-    triple_buffer_policy: AdaptiveTripleBufferPolicy,
-    pending_proven_deadline_miss: Option<(u64, ProvenDeadlineMiss)>,
     effective_app_gpu_policy: EffectiveCompositorAppGpuPolicy,
     dmabuf_feedback_compatibility: DmabufFeedbackCompatibility,
     dmabuf_feedback_compat_metrics: DmabufFeedbackCompatibilityMetrics,
-    // Logical render/coalescing baseline only. This is not evidence that the
-    // corresponding scene was physically rendered or presented.
-    last_rendered_scene_generation: u64,
-    last_direct_candidate_key: Option<DirectScanoutCandidateKey>,
-    direct_fallback_tracker: Option<cycle::direct_fallback::DirectFallbackTracker>,
-    last_refresh_sequence: u64,
-    last_submitted_cursor_epoch: u64,
-    last_primary_presented_at_ns: Option<u64>,
-    scene_history: NativeSceneHistory,
-    last_client_cursor_damage: Option<NativeClientCursorDamageState>,
-    last_software_cursor_damage: Option<NativeDamageRect>,
-    last_client_cursor_path: Option<NativeClientCursorPath>,
     queued_redraw_requested: bool,
-    render_demand_coalesced_count: u64,
-    frame_index: u64,
     known_toplevels: usize,
     pending_launches: VecDeque<NativeAppLaunchPerf>,
-    mismatched_pageflip_events: u64,
-    stale_pageflip_events: u64,
-    presentation_cadence: PresentationCadenceMetrics,
-    frame_pacing: NativeFramePacing,
     wake_authority: NativeWakeAuthorityMetrics,
     pointer_timing: NativePointerTimingTrace,
     cursor_responsiveness: cursor_responsiveness::NativeCursorResponsivenessTrace,
-    last_acquire_ready_at_ns: Option<u64>,
     resize_perf: NativeResizePerfState,
     pointer_constraint_backend: NativePointerConstraintBackend,
     process_supervisor: ChildSupervisor,
@@ -890,7 +815,6 @@ pub(crate) struct NativeRuntime {
     cursor_reveal_trace: Option<CursorRevealTraceLedger>,
     timing_scopes: std::collections::BTreeMap<&'static str, TimingSummary>,
     render_telemetry: NativeRenderTelemetry,
-    scaled_primary_probe: crate::native_output::scanout::ScaledPrimaryProbeCache,
     slow_cycle_trace: NativeSlowCycleTrace,
     busy_loop: busy_loop::BusyLoopDetector,
     output_hotplug: output_hotplug::NativeOutputHotplug,
@@ -1131,23 +1055,25 @@ impl NativeRuntime {
     }
 
     fn termination_snapshot(&self) -> TerminationSnapshot {
-        let worker = self.kms_commit_worker.as_ref();
+        let worker = self.head.kms_commit_worker.as_ref();
         let fatal_reason = worker.and_then(|worker| worker.fatal_reason_name());
         let pending_pageflip_token = self
+            .head
             .atomic_commit_arbiter
             .pending_atomic_token()
             .map(PageFlipToken::get)
-            .or_else(|| self.scanout.pending_page_flip_token())
+            .or_else(|| self.head.scanout.pending_page_flip_token())
             .or_else(|| {
-                self.atomic_cursor
+                self.head
+                    .atomic_cursor
                     .as_ref()
                     .and_then(|cursor| cursor.pending_token().map(PageFlipToken::get))
             });
         TerminationSnapshot {
-            latest_submitted_frame_id: self.scene_history.latest_submitted_frame_id(),
-            latest_presented_frame_id: self.scene_history.presented_frame_id(),
-            pageflip_pending: self.scanout.page_flip_pending()
-                || self.atomic_commit_arbiter.atomic_commit_pending()
+            latest_submitted_frame_id: self.head.scene_history.latest_submitted_frame_id(),
+            latest_presented_frame_id: self.head.scene_history.presented_frame_id(),
+            pageflip_pending: self.head.scanout.page_flip_pending()
+                || self.head.atomic_commit_arbiter.atomic_commit_pending()
                 || worker.is_some_and(|worker| worker.inflight()),
             pending_pageflip_token,
             kms_worker_present: worker.is_some(),
@@ -1158,17 +1084,19 @@ impl NativeRuntime {
             seat_state: self.session.state_name(),
             seat_session_active: self.session.permits_output() && self.seat_session.is_some(),
             active_gpu_release_leases: self.dmabuf_gpu_release_registry.active_count(),
-            active_output_transactions: self.output_transactions.active_count(),
+            active_output_transactions: self.head.output_transactions.active_count(),
             submitted_kms_ownership: self
+                .head
                 .submitted_worker_ownership
                 .len()
-                .saturating_add(self.emergency_quarantined_submitted_ownership.len()),
+                .saturating_add(self.head.emergency_quarantined_submitted_ownership.len()),
             quarantined_kms_ownership: self
+                .head
                 .worker_quarantine
                 .jobs
                 .len()
-                .saturating_add(self.emergency_quarantined_worker_jobs.len()),
-            kms_teardown_safety: self.kms_teardown_safety.as_str(),
+                .saturating_add(self.head.emergency_quarantined_worker_jobs.len()),
+            kms_teardown_safety: self.head.kms_teardown_safety.as_str(),
         }
     }
 }
@@ -1187,7 +1115,7 @@ impl Drop for NativeRuntime {
         }
         self.termination.set_phase(RuntimePhase::EmergencyCleanup);
         self.fail_pending_screen_captures("session_inactive");
-        if self.scanout.render_worker_active()
+        if self.head.scanout.render_worker_active()
             && let Err(error) = self.quiesce_render_worker_for_teardown()
         {
             self.termination.record_cleanup_error(error.as_ref());
@@ -1210,7 +1138,7 @@ impl Drop for NativeRuntime {
                 self.termination.record_cleanup_error(&error);
             }
         }
-        if let Some(token) = self.render_worker_reactor_token.take() {
+        if let Some(token) = self.head.render_worker_reactor_token.take() {
             if let Err(error) = self.event_loop.unregister(token) {
                 self.termination.record_cleanup_error(&error);
             }
@@ -1234,8 +1162,8 @@ impl Drop for NativeRuntime {
         }
         self.pending_output_persistence = None;
         self.output_configuration_persistence_worker.take();
-        if let Some(worker) = self.kms_commit_worker.take() {
-            if let Some(token) = self.kms_commit_worker_reactor_token.take() {
+        if let Some(worker) = self.head.kms_commit_worker.take() {
+            if let Some(token) = self.head.kms_commit_worker_reactor_token.take() {
                 if let Err(error) = self.event_loop.unregister(token) {
                     self.termination.record_cleanup_error(&error);
                 }
@@ -1262,7 +1190,8 @@ impl Drop for NativeRuntime {
             {
                 self.termination.record_cleanup_error(error.as_ref());
             }
-            self.worker_quarantine
+            self.head
+                .worker_quarantine
                 .cursor_sidecars
                 .extend(worker.take_pending_cursor_sidecar());
         }
@@ -1283,22 +1212,25 @@ impl Drop for NativeRuntime {
         } else {
             let _ = oblivion_one::xwayland::trace::take_recent_lifecycle_trace();
         }
-        self.frame_pacing.note_predictive_o1_current_at_shutdown();
-        if self.frame_pacing.summary_enabled() {
+        self.head
+            .frame_pacing
+            .note_predictive_o1_current_at_shutdown();
+        if self.head.frame_pacing.summary_enabled() {
             println!("{}", self.wake_authority.summary_line(&self.event_loop));
             println!(
                 "{}",
-                self.frame_pacing.summary_line(
+                self.head.frame_pacing.summary_line(
                     self.server.verbose_trace_dropped_entries(),
-                    self.presentation_deadline
+                    self.head
+                        .presentation_deadline
                         .target_identity_reuse_after_abandonment(),
                 )
             );
-            println!("{}", self.frame_pacing.content_summary_line());
-            let transaction_counters = self.output_transactions.counters();
+            println!("{}", self.head.frame_pacing.content_summary_line());
+            let transaction_counters = self.head.output_transactions.counters();
             println!(
                 "typhon presentation: event=output_transaction_summary active={} built={} ready={} submitted={} presented={} dropped={} superseded={} failed={} invalid_transitions={} duplicate_obligations={} active_peak={} history_overwrites={} accepted_terminals={} finalized_terminals={} rejected_terminals={} settlement_failures={} failure_stage_mismatches={} active_settling={} immediate_presentations={} immediate_presentation_failures={} immediate_presentations_accepted={} immediate_presentations_finalized={} compatibility_noops={} compatibility_failures={} built_composited={} built_direct={} built_plane_delta={} submitted_composited={} submitted_direct={} submitted_plane_delta={} presented_composited={} presented_direct={} presented_plane_delta={}",
-                self.output_transactions.active_count(),
+                self.head.output_transactions.active_count(),
                 transaction_counters.built,
                 transaction_counters.ready,
                 transaction_counters.submitted,
@@ -1332,8 +1264,8 @@ impl Drop for NativeRuntime {
                 transaction_counters.presented_direct,
                 transaction_counters.presented_plane_delta,
             );
-            if !self.scanout_destroyed
-                && let Some(counters) = self.scanout.explicit_output_counters()
+            if !self.head.scanout_destroyed
+                && let Some(counters) = self.head.scanout.explicit_output_counters()
             {
                 println!(
                     "typhon pacing: event=explicit_output_summary sync_file_deadline_hints_applied={} sync_file_deadline_hints_unsupported={} sync_file_deadline_hints_failed={} atomic_submissions={} atomic_in_fence_submissions={} async_userspace_fence_submissions={} atomic_out_fences_received={} atomic_out_fence_missing={} render_fence_timing_unavailable={}",
@@ -1355,21 +1287,21 @@ impl Drop for NativeRuntime {
             self.cursor_responsiveness.dump(
                 &self.presentation_trace,
                 self.server.pointer_input_metrics_snapshot(),
-                &self.cursor_output_arbitration,
+                &self.head.cursor_output_arbitration,
             );
             if let Some(writer) = self.presentation_trace_writer.as_mut() {
                 writer.shutdown(&self.presentation_trace);
             }
             termination::emit_summary(&self.termination.summary(
-                Some(self.kms_teardown_safety.as_str()),
+                Some(self.head.kms_teardown_safety.as_str()),
                 TerminationRecordStatus::Completed,
             ));
             return;
         }
-        self.presented_planes.primary = None;
-        self.confirmed_kms_presentation = ConfirmedKmsPresentationState::default();
-        if !self.scanout_destroyed
-            && let Err(error) = self.scanout.release_direct_for_target_destroyed()
+        self.head.presented_planes.primary = None;
+        self.head.confirmed_kms_presentation = ConfirmedKmsPresentationState::default();
+        if !self.head.scanout_destroyed
+            && let Err(error) = self.head.scanout.release_direct_for_target_destroyed()
         {
             eprintln!("native direct target-destroyed release was not proven safe: {error}");
             self.termination.record_cleanup_error(&error);
@@ -1377,20 +1309,21 @@ impl Drop for NativeRuntime {
             self.cursor_responsiveness.dump(
                 &self.presentation_trace,
                 self.server.pointer_input_metrics_snapshot(),
-                &self.cursor_output_arbitration,
+                &self.head.cursor_output_arbitration,
             );
             if let Some(writer) = self.presentation_trace_writer.as_mut() {
                 writer.shutdown(&self.presentation_trace);
             }
             termination::emit_summary(&self.termination.summary(
-                Some(self.kms_teardown_safety.as_str()),
+                Some(self.head.kms_teardown_safety.as_str()),
                 TerminationRecordStatus::Completed,
             ));
             return;
         }
-        let terminal_callback_transactions = self.output_transactions.active_transaction_ids();
+        let terminal_callback_transactions = self.head.output_transactions.active_transaction_ids();
         for transaction_id in terminal_callback_transactions {
-            let Some(transaction) = self.output_transactions.transaction(transaction_id) else {
+            let Some(transaction) = self.head.output_transactions.transaction(transaction_id)
+            else {
                 continue;
             };
             if !matches!(
@@ -1401,7 +1334,7 @@ impl Drop for NativeRuntime {
             }
             let obligations = transaction.descriptor().obligations();
             presentation_transactions::finish_direct_terminal_callback_cleanup(
-                self.scanout_destroyed,
+                self.head.scanout_destroyed,
                 || {
                     direct_terminal_callback_owner_leaks(
                         &mut self.server,
@@ -1411,7 +1344,8 @@ impl Drop for NativeRuntime {
                     )
                 },
                 |callback_owner_leaks| {
-                    self.scanout
+                    self.head
+                        .scanout
                         .note_direct_callback_owner_leaks(callback_owner_leaks);
                 },
             );
@@ -1420,20 +1354,20 @@ impl Drop for NativeRuntime {
         // before its normal resource drop. The proven boundary above means
         // KMS no longer references submitted resources, and scanout is
         // dropped exactly once while `kms` is still alive.
-        if !self.scanout_destroyed {
-            unsafe { mem::ManuallyDrop::drop(&mut self.scanout) };
+        if !self.head.scanout_destroyed {
+            unsafe { mem::ManuallyDrop::drop(&mut self.head.scanout) };
         }
-        self.submitted_worker_ownership.clear();
-        self.worker_quarantine.jobs.clear();
-        self.worker_quarantine.cursor_sidecars.clear();
-        self.emergency_quarantined_worker_jobs.clear();
-        self.emergency_quarantined_submitted_ownership.clear();
+        self.head.submitted_worker_ownership.clear();
+        self.head.worker_quarantine.jobs.clear();
+        self.head.worker_quarantine.cursor_sidecars.clear();
+        self.head.emergency_quarantined_worker_jobs.clear();
+        self.head.emergency_quarantined_submitted_ownership.clear();
 
         let abandoned_at = MonotonicTimestampNs::new(monotonic_now_ns().unwrap_or(0));
-        let transaction_ids = self.output_transactions.active_transaction_ids();
+        let transaction_ids = self.head.output_transactions.active_transaction_ids();
         for transaction_id in transaction_ids {
             let _ = presentation_transactions::complete_dropped_output_transaction(
-                &mut self.output_transactions,
+                &mut self.head.output_transactions,
                 transaction_id,
                 OutputTransactionDropReason::OutputDestroyed,
                 abandoned_at,
@@ -1522,13 +1456,13 @@ impl Drop for NativeRuntime {
         self.cursor_responsiveness.dump(
             &self.presentation_trace,
             self.server.pointer_input_metrics_snapshot(),
-            &self.cursor_output_arbitration,
+            &self.head.cursor_output_arbitration,
         );
         if let Some(writer) = self.presentation_trace_writer.as_mut() {
             writer.shutdown(&self.presentation_trace);
         }
         termination::emit_summary(&self.termination.summary(
-            Some(self.kms_teardown_safety.as_str()),
+            Some(self.head.kms_teardown_safety.as_str()),
             TerminationRecordStatus::Completed,
         ));
     }

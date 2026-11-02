@@ -721,19 +721,19 @@ impl NativeRuntime {
         job: KmsCommitJob,
     ) -> NativeResult<UncertainJobRetention> {
         if let Err(error) = super::kms_worker_teardown::settle_uncertain_worker_pacing(
-            &mut self.frame_pacing,
+            &mut self.head.frame_pacing,
             job.pacing_ticket,
         ) {
-            self.emergency_quarantined_worker_jobs.push(job);
+            self.head.emergency_quarantined_worker_jobs.push(job);
             return Err(error);
         }
         if matches!(job.kind, AtomicCommitKind::DirectPrimary { .. })
             && let Some(duration_ns) = job.test_only_duration_ns
         {
-            self.scanout.note_direct_test_only(duration_ns, false);
+            self.head.scanout.note_direct_test_only(duration_ns, false);
         }
-        let suspended_jobs = &mut self.worker_quarantine.jobs;
-        let emergency_jobs = &mut self.emergency_quarantined_worker_jobs;
+        let suspended_jobs = &mut self.head.worker_quarantine.jobs;
+        let emergency_jobs = &mut self.head.emergency_quarantined_worker_jobs;
         retain_uncertain_job_with_suspension(job, suspended_jobs, emergency_jobs)
     }
 
@@ -753,7 +753,7 @@ impl NativeRuntime {
     ) -> NativeResult<Option<super::super::kms_worker::WorkerInFlight>> {
         self.abandon_direct_fallback();
         let snapshot = {
-            let Some(worker) = self.kms_commit_worker.as_ref() else {
+            let Some(worker) = self.head.kms_commit_worker.as_ref() else {
                 return Ok(None);
             };
             worker.begin_shutdown_quiesce().map_err(|error| {
@@ -766,7 +766,8 @@ impl NativeRuntime {
                 OutputTransactionDropReason::SafeAbandonment,
             )?;
         }
-        self.worker_quarantine
+        self.head
+            .worker_quarantine
             .cursor_sidecars
             .extend(snapshot.pending_sidecar);
         Ok(snapshot.inflight)
@@ -774,7 +775,7 @@ impl NativeRuntime {
 
     pub(super) fn force_kms_worker_shutdown_abandon(&mut self) -> NativeResult<()> {
         self.abandon_direct_fallback();
-        let Some(worker) = self.kms_commit_worker.as_ref() else {
+        let Some(worker) = self.head.kms_commit_worker.as_ref() else {
             return Ok(());
         };
         let snapshot = worker.force_shutdown_abandon().map_err(|error| {
@@ -786,7 +787,8 @@ impl NativeRuntime {
                 OutputTransactionDropReason::SafeAbandonment,
             )?;
         }
-        self.worker_quarantine
+        self.head
+            .worker_quarantine
             .cursor_sidecars
             .extend(snapshot.pending_sidecar);
         if let Some(inflight) = snapshot.inflight {
@@ -815,8 +817,8 @@ impl NativeRuntime {
         let transaction_id = identity.transaction_id;
         let token = identity.token;
         let settled = settle_forced_shutdown_transaction_if_safe(
-            self.kms_teardown_safety,
-            &mut self.output_transactions,
+            self.head.kms_teardown_safety,
+            &mut self.head.output_transactions,
             transaction_id,
             token,
             MonotonicTimestampNs::new(monotonic_now_ns()?),
@@ -832,7 +834,7 @@ impl NativeRuntime {
             },
         )?;
         self.perf.log("native.kms_commit_worker", || {
-            let event = if !self.kms_teardown_safety.permits_release() {
+            let event = if !self.head.kms_teardown_safety.permits_release() {
                 "shutdown_transaction_retained_unproven"
             } else if settled {
                 "shutdown_transaction_dropped_safe_abandonment"
@@ -851,6 +853,7 @@ impl NativeRuntime {
 
     pub(super) fn check_kms_commit_worker_health(&mut self) -> NativeResult<()> {
         let Some(reason) = self
+            .head
             .kms_commit_worker
             .as_ref()
             .and_then(KmsCommitWorkerHandle::fatal_reason)
@@ -858,11 +861,12 @@ impl NativeRuntime {
             return Ok(());
         };
         let events = self
+            .head
             .kms_commit_worker
             .as_ref()
             .map(KmsCommitWorkerHandle::drain_events)
             .unwrap_or_default();
-        if let Some(worker) = self.kms_commit_worker.as_ref() {
+        if let Some(worker) = self.head.kms_commit_worker.as_ref() {
             worker.record_unnotified_fatal_health_check();
         }
         let mut event_error = None;
@@ -872,16 +876,21 @@ impl NativeRuntime {
             }
         }
         let fatal_jobs = self
+            .head
             .kms_commit_worker
             .as_ref()
             .map(KmsCommitWorkerHandle::take_fatal_jobs)
             .unwrap_or_default();
         let fatal_sidecar = self
+            .head
             .kms_commit_worker
             .as_ref()
             .and_then(KmsCommitWorkerHandle::take_pending_cursor_sidecar);
         let _ = handle_fatal_worker_jobs(fatal_jobs, self, FatalWorkerJobDisposition::Fail)?;
-        self.worker_quarantine.cursor_sidecars.extend(fatal_sidecar);
+        self.head
+            .worker_quarantine
+            .cursor_sidecars
+            .extend(fatal_sidecar);
         self.quarantine_after_worker_fatal()?;
         if let Some(error) = event_error {
             return Err(io::Error::other(error).into());
@@ -894,25 +903,25 @@ impl NativeRuntime {
 
     pub(super) fn quarantine_after_worker_fatal(&mut self) -> NativeResult<()> {
         self.abandon_direct_fallback();
-        self.frame_scheduler.abandon_for_session_suspend();
-        self.atomic_commit_arbiter.abandon_for_recovery();
-        self.deferred_worker_pageflip = None;
-        self.deferred_worker_completion = None;
-        self.worker_timeout_pending = None;
-        if let Some(token) = self.output_render_fence_token.take() {
+        self.head.frame_scheduler.abandon_for_session_suspend();
+        self.head.atomic_commit_arbiter.abandon_for_recovery();
+        self.head.deferred_worker_pageflip = None;
+        self.head.deferred_worker_completion = None;
+        self.head.worker_timeout_pending = None;
+        if let Some(token) = self.head.output_render_fence_token.take() {
             self.event_loop.unregister(token)?;
         }
-        self.scanout.suspend_page_flip()?;
+        self.head.scanout.suspend_page_flip()?;
         Ok(())
     }
 
     pub(super) fn restart_kms_commit_worker_after_recovery(&mut self) -> NativeResult<()> {
-        if self.kms_commit_worker_transport
+        if self.head.kms_commit_worker_transport
             != crate::native_output::kms_worker::KmsCommitWorkerTransport::Worker
         {
             return Ok(());
         }
-        if self.kms_commit_worker.is_some() {
+        if self.head.kms_commit_worker.is_some() {
             return Err(
                 io::Error::other("KMS commit worker still exists during recovery restart").into(),
             );
@@ -925,20 +934,20 @@ impl NativeRuntime {
         match KmsCommitWorkerHandle::start_atomic(submitter) {
             Ok(worker) => {
                 let quiesce_authority = worker.quiesce_authority();
-                self.kms_commit_worker = Some(worker);
+                self.head.kms_commit_worker = Some(worker);
                 if let Some(seat) = self.seat_session.as_ref() {
                     seat.install_pre_disable_quiesce_authority(Some(quiesce_authority));
                 }
                 Ok(())
             }
             Err(error)
-                if self.kms_commit_worker_policy
+                if self.head.kms_commit_worker_policy
                     == crate::native_output::kms_worker::KmsCommitWorkerPolicy::Auto =>
             {
                 eprintln!(
                     "native KMS commit worker: recovery restart failed ({error:?}); using synchronous transport"
                 );
-                self.kms_commit_worker_transport =
+                self.head.kms_commit_worker_transport =
                     crate::native_output::kms_worker::KmsCommitWorkerTransport::Synchronous;
                 if let Some(seat) = self.seat_session.as_ref() {
                     seat.install_pre_disable_quiesce_authority(None);
@@ -953,7 +962,7 @@ impl NativeRuntime {
     }
 
     pub(super) fn process_kms_worker_events(&mut self) -> NativeResult<()> {
-        let Some(worker) = self.kms_commit_worker.as_ref() else {
+        let Some(worker) = self.head.kms_commit_worker.as_ref() else {
             return Ok(());
         };
         let events = drain_worker_eventfd(worker)?;
@@ -965,16 +974,17 @@ impl NativeRuntime {
 
     fn validate_submitted_ownership(&self, ownership: &KmsSubmittedOwnership) -> NativeResult<()> {
         let job = &ownership.job;
-        if job.output_epoch != self.output_epoch
-            || self.atomic_commit_arbiter.worker_queued_token() != Some(job.token)
-            || self.atomic_commit_arbiter.worker_queued_kind() != Some(job.kind)
-            || !self.atomic_commit_arbiter.worker_job_queued()
+        if job.output_epoch != self.head.output_epoch
+            || self.head.atomic_commit_arbiter.worker_queued_token() != Some(job.token)
+            || self.head.atomic_commit_arbiter.worker_queued_kind() != Some(job.kind)
+            || !self.head.atomic_commit_arbiter.worker_job_queued()
         {
             return Err(
                 io::Error::other("worker success did not match queued Atomic ownership").into(),
             );
         }
         let transaction = self
+            .head
             .output_transactions
             .transaction(job.transaction_id)
             .ok_or_else(|| io::Error::other("worker success transaction is missing"))?;
@@ -998,7 +1008,7 @@ impl NativeRuntime {
             // compositor-side queue metadata.
             retain_complete_submitted_ownership(
                 ownership,
-                &mut self.emergency_quarantined_submitted_ownership,
+                &mut self.head.emergency_quarantined_submitted_ownership,
             );
         } else {
             if matches!(
@@ -1006,6 +1016,7 @@ impl NativeRuntime {
                 AtomicCommitKind::CompositedPrimary { .. }
             ) {
                 let compatibility_primary = self
+                    .head
                     .output_transactions
                     .transaction(ownership.job.transaction_id)
                     .is_some_and(|transaction| {
@@ -1015,10 +1026,11 @@ impl NativeRuntime {
                         )
                     });
                 let result = if compatibility_primary {
-                    self.scanout
+                    self.head
+                        .scanout
                         .suspend_abandon_worker_compatibility(ownership.job.token)
                 } else {
-                    self.scanout.suspend_abandon_worker_submission(
+                    self.head.scanout.suspend_abandon_worker_submission(
                         ownership.job.token,
                         &mut ownership.out_fence,
                     )
@@ -1031,7 +1043,7 @@ impl NativeRuntime {
             }
             retain_complete_submitted_ownership(
                 ownership,
-                &mut self.emergency_quarantined_submitted_ownership,
+                &mut self.head.emergency_quarantined_submitted_ownership,
             );
         }
         self.quarantine_after_worker_fatal()
@@ -1043,7 +1055,7 @@ impl NativeRuntime {
         };
         let completion_output_epoch = ownership.job.output_epoch.get();
         let completion_job_id = ownership.job.bundle_id.get();
-        let ownership = match retire_stale_submitted_completion(ownership, self.output_epoch) {
+        let ownership = match retire_stale_submitted_completion(ownership, self.head.output_epoch) {
             Ok(()) => {
                 self.perf
                     .log("native.kms_commit_worker.stale_completion", || {
@@ -1052,7 +1064,10 @@ impl NativeRuntime {
                                 "completion_output_epoch",
                                 completion_output_epoch,
                             ),
-                            NativePerfField::u64("current_output_epoch", self.output_epoch.get()),
+                            NativePerfField::u64(
+                                "current_output_epoch",
+                                self.head.output_epoch.get(),
+                            ),
                             NativePerfField::u64("job_id", completion_job_id),
                             NativePerfField::str(
                                 "disposition",
@@ -1067,14 +1082,14 @@ impl NativeRuntime {
         let pacing = match self.acknowledge_submitted_worker_pacing(&ownership) {
             Ok(pacing) => pacing,
             Err(error) => {
-                if let Some(worker) = self.kms_commit_worker.as_ref() {
+                if let Some(worker) = self.head.kms_commit_worker.as_ref() {
                     worker.record_result_mismatch();
                 }
                 return self.quarantine_submitted_after_pacing_error(ownership, error);
             }
         };
         let result = self.process_kms_worker_event_inner(KmsWorkerEvent::Submitted { ownership });
-        Self::finish_submitted_worker_pacing(&mut self.frame_pacing, pacing, result)
+        Self::finish_submitted_worker_pacing(&mut self.head.frame_pacing, pacing, result)
     }
 
     fn qualify_presentation_fallback_modes_after_rejection(
@@ -1120,7 +1135,8 @@ impl NativeRuntime {
                     job.content_type(),
                 )
             };
-            self.scanout
+            self.head
+                .scanout
                 .note_composited_presentation_validation(key, result.is_ok());
         }
         Ok(())
@@ -1130,18 +1146,19 @@ impl NativeRuntime {
         match event {
             KmsWorkerEvent::Submitted { ownership } => {
                 if let Err(error) = self.validate_submitted_ownership(&ownership) {
-                    if let Some(worker) = self.kms_commit_worker.as_ref() {
+                    if let Some(worker) = self.head.kms_commit_worker.as_ref() {
                         worker.record_result_mismatch();
                     }
                     self.quarantine_submitted_ownership(ownership)?;
                     return Err(error);
                 }
-                self.submitted_worker_ownership.push(ownership);
+                self.head.submitted_worker_ownership.push(ownership);
                 let ownership = self
+                    .head
                     .submitted_worker_ownership
                     .last_mut()
                     .expect("submitted ownership was just retained");
-                if let Some(worker) = self.kms_commit_worker.as_ref() {
+                if let Some(worker) = self.head.kms_commit_worker.as_ref() {
                     worker.record_submit_ack_delay(
                         monotonic_now_ns()?.saturating_sub(ownership.submit_returned_at.get()),
                     );
@@ -1155,7 +1172,8 @@ impl NativeRuntime {
                     .primary()
                     .and_then(|owner| owner.transaction.presentation_validation_key())
                 {
-                    self.scanout
+                    self.head
+                        .scanout
                         .note_composited_presentation_validation(key, true);
                 }
                 let trace_snapshot = ownership.job.owners.trace_reveal();
@@ -1177,7 +1195,7 @@ impl NativeRuntime {
                 let submit_started_at = ownership.submit_started_at.get();
                 let submit_returned_at = ownership.submit_returned_at.get();
                 record_composited_primary_worker_timing(
-                    &mut self.render_journal,
+                    &mut self.head.render_journal,
                     kind,
                     WorkerTimingJournalSample {
                         queue_residency_ns: ownership.queue_residency_ns,
@@ -1217,10 +1235,10 @@ impl NativeRuntime {
                     if ownership.job.test_policy.effective() == KmsTestOnlyPolicy::Required
                         && let Some(duration_ns) = ownership.job.test_only_duration_ns
                     {
-                        self.scanout.note_direct_test_only(duration_ns, false);
+                        self.head.scanout.note_direct_test_only(duration_ns, false);
                     }
-                    self.scanout.note_direct_real_submit_attempt(false);
-                    self.scanout.note_direct_worker_submission(
+                    self.head.scanout.note_direct_real_submit_attempt(false);
+                    self.head.scanout.note_direct_worker_submission(
                         matches!(
                             ownership.job.test_policy.effective(),
                             KmsTestOnlyPolicy::Required
@@ -1230,6 +1248,7 @@ impl NativeRuntime {
                     );
                 }
                 let transaction = self
+                    .head
                     .output_transactions
                     .transaction(transaction_id)
                     .ok_or_else(|| io::Error::other("worker success transaction is missing"))?
@@ -1254,10 +1273,11 @@ impl NativeRuntime {
                 if matches!(kind, AtomicCommitKind::CompositedPrimary { .. }) {
                     if compatibility_primary {
                         drop(out_fence);
-                        self.scanout
+                        self.head
+                            .scanout
                             .promote_worker_compatibility_submission(token)?;
                     } else {
-                        self.scanout.promote_worker_submission(
+                        self.head.scanout.promote_worker_submission(
                             token,
                             out_fence,
                             MonotonicTimestampNs::new(submit_started_at),
@@ -1272,17 +1292,18 @@ impl NativeRuntime {
                         )
                         .into());
                     };
-                    debug_assert!(!self.scanout.direct_scanout_pending());
+                    debug_assert!(!self.head.scanout.direct_scanout_pending());
                     debug_assert!(direct_primary_lease.is_some());
                     let Some(direct_primary_lease) = direct_primary_lease else {
                         let mut ownership = self
+                            .head
                             .submitted_worker_ownership
                             .pop()
                             .expect("submitted ownership was just retained");
                         ownership.out_fence = out_fence;
                         retain_complete_submitted_ownership(
                             ownership,
-                            &mut self.emergency_quarantined_submitted_ownership,
+                            &mut self.head.emergency_quarantined_submitted_ownership,
                         );
                         self.quarantine_after_worker_fatal()?;
                         return Err(io::Error::other(
@@ -1292,6 +1313,7 @@ impl NativeRuntime {
                     };
                     let Some((frame_id, protocol_batch_id)) = direct_metadata else {
                         let mut ownership = self
+                            .head
                             .submitted_worker_ownership
                             .pop()
                             .expect("submitted ownership was just retained");
@@ -1299,7 +1321,7 @@ impl NativeRuntime {
                         ownership.out_fence = out_fence;
                         retain_complete_submitted_ownership(
                             ownership,
-                            &mut self.emergency_quarantined_submitted_ownership,
+                            &mut self.head.emergency_quarantined_submitted_ownership,
                         );
                         self.quarantine_after_worker_fatal()?;
                         return Err(io::Error::other(
@@ -1318,9 +1340,10 @@ impl NativeRuntime {
                         protocol_batch_id,
                         target,
                     };
-                    if let Err(error) = self.scanout.accept_direct_submitted(submitted) {
+                    if let Err(error) = self.head.scanout.accept_direct_submitted(submitted) {
                         let SubmittedDirectPrimaryError { error, submitted } = *error;
                         let mut ownership = self
+                            .head
                             .submitted_worker_ownership
                             .pop()
                             .expect("submitted ownership was just retained");
@@ -1328,14 +1351,15 @@ impl NativeRuntime {
                         ownership.out_fence = submitted.out_fence;
                         retain_complete_submitted_ownership(
                             ownership,
-                            &mut self.emergency_quarantined_submitted_ownership,
+                            &mut self.head.emergency_quarantined_submitted_ownership,
                         );
                         self.quarantine_after_worker_fatal()?;
                         return Err(error.into());
                     }
-                    debug_assert!(self.scanout.direct_scanout_pending());
+                    debug_assert!(self.head.scanout.direct_scanout_pending());
                     if let Some(validation_key) = direct_validation_key {
-                        self.scanout
+                        self.head
+                            .scanout
                             .record_direct_validation_success(validation_key);
                     }
                     self.server
@@ -1349,7 +1373,7 @@ impl NativeRuntime {
                 if let Some(sidecar) = sidecar_owner.as_ref() {
                     prepare_frozen_cursor_presentation_for_submission(
                         &mut self.server,
-                        &mut self.output_transactions,
+                        &mut self.head.output_transactions,
                         transaction_id,
                         sidecar.transaction.id(),
                         ownership.job.output_epoch.get(),
@@ -1383,6 +1407,7 @@ impl NativeRuntime {
                                 KmsCursorUpdate::Set(state) => state.clone(),
                                 KmsCursorUpdate::Disable => {
                                     let mut hidden = self
+                                        .head
                                         .atomic_cursor
                                         .as_ref()
                                         .ok_or_else(|| {
@@ -1403,20 +1428,21 @@ impl NativeRuntime {
                             };
                             (submitted_state, sidecar.revision, sidecar.capability_key)
                         } else if matches!(kind, AtomicCommitKind::PlaneDelta { .. }) {
-                            let native_cursor = self.atomic_cursor.as_mut().ok_or_else(|| {
-                                io::Error::other("cursor worker submit has no cursor")
-                            })?;
+                            let native_cursor =
+                                self.head.atomic_cursor.as_mut().ok_or_else(|| {
+                                    io::Error::other("cursor worker submit has no cursor")
+                                })?;
                             let queued = native_cursor
                                 .take_worker_submission(transaction_id, token, cursor_epoch)
                                 .inspect_err(|_error| {
-                                    if let Some(worker) = self.kms_commit_worker.as_ref() {
+                                    if let Some(worker) = self.head.kms_commit_worker.as_ref() {
                                         worker.record_cursor_worker_epoch_mismatch();
                                     }
                                 })?;
                             let submitted_state = match cursor {
                                 KmsCursorUpdate::Set(state) => {
                                     if state != queued.visual_state {
-                                        if let Some(worker) = self.kms_commit_worker.as_ref() {
+                                        if let Some(worker) = self.head.kms_commit_worker.as_ref() {
                                             worker.record_cursor_worker_epoch_mismatch();
                                         }
                                         return Err(io::Error::other(
@@ -1440,7 +1466,7 @@ impl NativeRuntime {
                                 KmsCursorUpdate::Set(state) => state.clone(),
                                 KmsCursorUpdate::Disable => {
                                     let native_cursor =
-                                        self.atomic_cursor.as_ref().ok_or_else(|| {
+                                        self.head.atomic_cursor.as_ref().ok_or_else(|| {
                                             io::Error::other("primary cursor submit has no cursor")
                                         })?;
                                     let mut hidden = native_cursor.desired().clone();
@@ -1475,7 +1501,7 @@ impl NativeRuntime {
                                     .and_then(|owner| owner.capability_key),
                             )
                         };
-                    if let Some(native_cursor) = self.atomic_cursor.as_mut() {
+                    if let Some(native_cursor) = self.head.atomic_cursor.as_mut() {
                         if matches!(kind, AtomicCommitKind::PlaneDelta { .. })
                             && sidecar_owner.is_none()
                         {
@@ -1496,31 +1522,36 @@ impl NativeRuntime {
                             );
                         }
                     }
-                    self.last_submitted_cursor_epoch = cursor_epoch;
+                    self.head.last_submitted_cursor_epoch = cursor_epoch;
                     if matches!(kind, AtomicCommitKind::PlaneDelta { .. })
                         && sidecar_owner.is_none()
                     {
-                        self.cursor_output_arbitration.note_plane_delta_submission();
-                        self.cursor_output_arbitration.consume_submitted_epoch(
+                        self.head
+                            .cursor_output_arbitration
+                            .note_plane_delta_submission();
+                        self.head.cursor_output_arbitration.consume_submitted_epoch(
                             cursor_epoch,
                             submit_returned_at,
-                            self.frame_scheduler
+                            self.head
+                                .frame_scheduler
                                 .next_refresh_deadline_ns(submit_returned_at),
                         );
-                        if let Some(worker) = self.kms_commit_worker.as_ref() {
+                        if let Some(worker) = self.head.kms_commit_worker.as_ref() {
                             worker.record_cursor_worker_submit_confirmed();
                             worker.record_cursor_worker_arbitration_consumed();
                         }
                     } else {
-                        self.cursor_output_arbitration.consume_submitted_epoch(
+                        self.head.cursor_output_arbitration.consume_submitted_epoch(
                             cursor_epoch,
                             submit_returned_at,
-                            self.frame_scheduler
+                            self.head
+                                .frame_scheduler
                                 .next_refresh_deadline_ns(submit_returned_at),
                         );
                     }
                 }
-                self.output_transactions
+                self.head
+                    .output_transactions
                     .mark_submitted(
                         transaction_id,
                         token,
@@ -1529,7 +1560,8 @@ impl NativeRuntime {
                     .map_err(io::Error::other)?;
                 if let Some(sidecar) = sidecar_owner {
                     let sidecar_transaction_id = sidecar.transaction.id();
-                    self.output_transactions
+                    self.head
+                        .output_transactions
                         .mark_submitted(
                             sidecar_transaction_id,
                             token,
@@ -1537,21 +1569,24 @@ impl NativeRuntime {
                         )
                         .map_err(io::Error::other)?;
                     debug_assert!(
-                        self.output_transactions
+                        self.head
+                            .output_transactions
                             .transaction(transaction_id)
                             .is_some_and(|record| {
                                 matches!(record.state(), OutputTransactionState::Submitted { .. })
                             })
                     );
                     debug_assert!(
-                        self.output_transactions
+                        self.head
+                            .output_transactions
                             .transaction(sidecar_transaction_id)
                             .is_some_and(|record| {
                                 matches!(record.state(), OutputTransactionState::Submitted { .. })
                             })
                     );
                     debug_assert!(
-                        self.output_transactions
+                        self.head
+                            .output_transactions
                             .transaction(transaction_id)
                             .is_some_and(|record| {
                                 record
@@ -1562,6 +1597,7 @@ impl NativeRuntime {
                             })
                     );
                     if let Some(batch_id) = self
+                        .head
                         .output_transactions
                         .transaction(sidecar_transaction_id)
                         .and_then(|record| {
@@ -1572,20 +1608,23 @@ impl NativeRuntime {
                         })
                     {
                         debug_assert_eq!(
-                            self.output_transactions
+                            self.head
+                                .output_transactions
                                 .presentation_feedback_owner(batch_id),
                             Some(sidecar_transaction_id)
                         );
                     }
                 } else {
                     debug_assert!(
-                        self.output_transactions
+                        self.head
+                            .output_transactions
                             .transaction(transaction_id)
                             .is_some_and(|record| {
                                 matches!(record.state(), OutputTransactionState::Submitted { .. })
                             })
                     );
                     if let Some(batch_id) = self
+                        .head
                         .output_transactions
                         .transaction(transaction_id)
                         .and_then(|record| {
@@ -1596,22 +1635,26 @@ impl NativeRuntime {
                         })
                     {
                         debug_assert_eq!(
-                            self.output_transactions
+                            self.head
+                                .output_transactions
                                 .presentation_feedback_owner(batch_id),
                             Some(transaction_id)
                         );
                     }
                 }
-                self.atomic_commit_arbiter
+                self.head
+                    .atomic_commit_arbiter
                     .mark_kernel_submitted(token, submit_started_at, submit_returned_at)
                     .map_err(io::Error::other)?;
                 if compatibility_primary {
-                    self.frame_scheduler
+                    self.head
+                        .frame_scheduler
                         .confirm_kernel_submission(token.get(), submit_returned_at)
                         .map_err(io::Error::other)?;
                 }
-                let deferred_pageflip = self.atomic_commit_arbiter.deferred_pageflip();
-                let deferred_completion = self.atomic_commit_arbiter.replay_deferred_pageflip();
+                let deferred_pageflip = self.head.atomic_commit_arbiter.deferred_pageflip();
+                let deferred_completion =
+                    self.head.atomic_commit_arbiter.replay_deferred_pageflip();
                 if let Some(pageflip) = deferred_pageflip {
                     let Some(completion) = deferred_completion else {
                         return Err(io::Error::other(
@@ -1619,8 +1662,8 @@ impl NativeRuntime {
                         )
                         .into());
                     };
-                    self.deferred_worker_pageflip = Some(pageflip);
-                    self.deferred_worker_completion = Some(completion);
+                    self.head.deferred_worker_pageflip = Some(pageflip);
+                    self.head.deferred_worker_completion = Some(completion);
                 }
                 self.presentation_trace
                     .push(PresentationTransactionEvent::KmsSubmitStarted {
@@ -1645,11 +1688,11 @@ impl NativeRuntime {
                     ]
                 });
                 if matches!(kind, AtomicCommitKind::CompositedPrimary { .. })
-                    && self.output_render_fence_token.is_none()
-                    && let NativeScanoutBackend::AtomicEglGbm(explicit) = &*self.scanout
+                    && self.head.output_render_fence_token.is_none()
+                    && let NativeScanoutBackend::AtomicEglGbm(explicit) = &*self.head.scanout
                     && let Some(fd) = explicit.pending_timing_fd()
                 {
-                    self.output_render_fence_token = Some(
+                    self.head.output_render_fence_token = Some(
                         self.event_loop
                             .register(fd, NativeEventSource::OutputRenderFence)?,
                     );
@@ -1662,7 +1705,8 @@ impl NativeRuntime {
                         .primary()
                         .and_then(|owner| owner.transaction.presentation_validation_key())
                 {
-                    self.scanout
+                    self.head
+                        .scanout
                         .note_composited_presentation_validation(key, false);
                     self.qualify_presentation_fallback_modes_after_rejection(&job, key)?;
                     self.queued_redraw_requested = true;
@@ -1670,7 +1714,7 @@ impl NativeRuntime {
                 if matches!(job.kind, AtomicCommitKind::DirectPrimary { .. })
                     && let Some(duration_ns) = job.test_only_duration_ns
                 {
-                    self.scanout.note_direct_test_only(duration_ns, true);
+                    self.head.scanout.note_direct_test_only(duration_ns, true);
                 }
                 self.fail_queued_worker_job(job, error, WorkerRejectionKind::TestOnly)?;
             }
@@ -1681,7 +1725,8 @@ impl NativeRuntime {
                         .primary()
                         .and_then(|owner| owner.transaction.presentation_validation_key())
                 {
-                    self.scanout
+                    self.head
+                        .scanout
                         .note_composited_presentation_validation(key, false);
                     self.qualify_presentation_fallback_modes_after_rejection(&job, key)?;
                     self.queued_redraw_requested = true;
@@ -1690,16 +1735,16 @@ impl NativeRuntime {
                     if job.test_policy.effective() == KmsTestOnlyPolicy::Required
                         && let Some(duration_ns) = job.test_only_duration_ns
                     {
-                        self.scanout.note_direct_test_only(duration_ns, false);
+                        self.head.scanout.note_direct_test_only(duration_ns, false);
                     }
-                    self.scanout.note_direct_real_submit_attempt(true);
+                    self.head.scanout.note_direct_real_submit_attempt(true);
                 }
                 self.fail_queued_worker_job(job, error, WorkerRejectionKind::RealSubmit)?;
             }
             KmsWorkerEvent::BusyExhausted { job, error } => {
                 self.queued_redraw_requested = true;
                 if matches!(job.kind, AtomicCommitKind::DirectPrimary { .. }) {
-                    self.scanout.note_direct_real_submit_attempt(true);
+                    self.head.scanout.note_direct_real_submit_attempt(true);
                 }
                 self.fail_queued_worker_job(job, error, WorkerRejectionKind::RealSubmit)?;
             }
@@ -1707,15 +1752,17 @@ impl NativeRuntime {
                 retry_not_before_ns,
                 ..
             } => {
-                self.cursor_output_arbitration.note_kms_busy_retry();
-                self.cursor_output_arbitration
+                self.head.cursor_output_arbitration.note_kms_busy_retry();
+                self.head
+                    .cursor_output_arbitration
                     .set_retry_not_before(retry_not_before_ns);
                 if self
+                    .head
                     .atomic_commit_arbiter
                     .worker_queued_kind()
                     .is_some_and(|kind| matches!(kind, AtomicCommitKind::DirectPrimary { .. }))
                 {
-                    self.scanout.note_direct_real_submit_attempt(false);
+                    self.head.scanout.note_direct_real_submit_attempt(false);
                 }
             }
             KmsWorkerEvent::PageflipTimeout {
@@ -1724,10 +1771,10 @@ impl NativeRuntime {
                 token,
                 detected_at,
             } => {
-                if self.atomic_commit_arbiter.kernel_commit_submitted()
-                    && self.atomic_commit_arbiter.pending_atomic_token() == Some(token)
+                if self.head.atomic_commit_arbiter.kernel_commit_submitted()
+                    && self.head.atomic_commit_arbiter.pending_atomic_token() == Some(token)
                 {
-                    self.worker_timeout_pending = Some((token, detected_at));
+                    self.head.worker_timeout_pending = Some((token, detected_at));
                 }
             }
             KmsWorkerEvent::Quiesced {
@@ -1751,7 +1798,7 @@ impl NativeRuntime {
             }
             KmsWorkerEvent::CursorSidecarReturned { sidecar, reason } => {
                 let transaction_id = sidecar.transaction.id();
-                if let Some(transaction) = self.output_transactions.transaction(transaction_id)
+                if let Some(transaction) = self.head.output_transactions.transaction(transaction_id)
                     && matches!(
                         transaction.state(),
                         OutputTransactionState::Built
@@ -1772,7 +1819,7 @@ impl NativeRuntime {
                     };
                     settle_returned_cursor_sidecar(
                         &mut self.server,
-                        &mut self.output_transactions,
+                        &mut self.head.output_transactions,
                         transaction_id,
                         transfer_to_primary,
                         reason == CursorSidecarReturnReason::RequiredPrimaryPassedFreeze,
@@ -1792,7 +1839,7 @@ impl NativeRuntime {
                 let disposition = validation_base_invalidation_disposition(
                     self.session.permits_output(),
                     self.shutdown.is_shutting_down(),
-                    self.output_epoch.get(),
+                    self.head.output_epoch.get(),
                     job.output_epoch.get(),
                     reason,
                 );
@@ -1832,12 +1879,12 @@ impl NativeRuntime {
                 .into());
             }
         }
-        if self.deferred_worker_pageflip.is_none() {
+        if self.head.deferred_worker_pageflip.is_none() {
             self.validate_output_pipeline().map_err(|error| {
                 io::Error::other(format!(
                     "worker completion pipeline mismatch: generation={} crtc={} error={error}",
-                    self.output_epoch.get(),
-                    self.target.crtc_id,
+                    self.head.output_epoch.get(),
+                    self.head.target.crtc_id,
                 ))
             })?;
         }

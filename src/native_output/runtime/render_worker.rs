@@ -271,11 +271,11 @@ impl NativeRuntime {
         control_epoch: u64,
         result: Result<Option<crate::native_output::scanout::PreparedWorkerEffectReload>, String>,
     ) -> NativeResult<()> {
-        if self.pending_render_worker_identity.is_some()
-            || self.pending_render_worker_context.is_some()
-            || self.pending_render_worker_outer.is_some()
-            || self.pending_render_worker_completion.is_some()
-            || self.pending_render_worker_capture.is_some()
+        if self.head.pending_render_worker_identity.is_some()
+            || self.head.pending_render_worker_context.is_some()
+            || self.head.pending_render_worker_outer.is_some()
+            || self.head.pending_render_worker_completion.is_some()
+            || self.head.pending_render_worker_capture.is_some()
         {
             return Err(io::Error::other(
                 "effect reload completion arrived while another render continuation owns the worker",
@@ -366,7 +366,7 @@ impl NativeRuntime {
         control_epoch: u64,
         result: io::Result<Vec<u8>>,
     ) -> NativeResult<()> {
-        let Some(pending) = self.pending_render_worker_capture.take() else {
+        let Some(pending) = self.head.pending_render_worker_capture.take() else {
             return Err(io::Error::other(
                 "render worker capture completed without reactor ownership",
             )
@@ -417,17 +417,17 @@ impl NativeRuntime {
         identity: crate::native_output::scanout::AtomicRenderWorkerIdentity,
         context: crate::native_output::scanout::AtomicRenderSettlementContext,
     ) -> NativeResult<()> {
-        if self.pending_render_worker_identity.is_some()
-            || self.pending_render_worker_context.is_some()
-            || self.pending_render_worker_completion.is_some()
+        if self.head.pending_render_worker_identity.is_some()
+            || self.head.pending_render_worker_context.is_some()
+            || self.head.pending_render_worker_completion.is_some()
         {
             return Err(io::Error::other(
                 "render worker admission attempted while prior completion ownership is active",
             )
             .into());
         }
-        self.pending_render_worker_identity = Some(identity);
-        self.pending_render_worker_context = Some(context);
+        self.head.pending_render_worker_identity = Some(identity);
+        self.head.pending_render_worker_context = Some(context);
         Ok(())
     }
 
@@ -435,18 +435,20 @@ impl NativeRuntime {
         &mut self,
         cycle: &mut super::NativeCycleState,
     ) -> NativeResult<()> {
-        let Some(completion) = self.pending_render_worker_completion.take() else {
+        let Some(completion) = self.head.pending_render_worker_completion.take() else {
             return Ok(());
         };
         let context = self
+            .head
             .pending_render_worker_context
             .take()
             .ok_or_else(|| io::Error::other("worker completion lost render settlement context"))?;
         let mut outer = self
+            .head
             .pending_render_worker_outer
             .take()
             .ok_or_else(|| io::Error::other("worker completion lost presentation continuation"))?;
-        if self.pending_render_worker_identity.is_some() {
+        if self.head.pending_render_worker_identity.is_some() {
             return Err(io::Error::other(
                 "worker completion was settled before its dispatch identity was consumed",
             )
@@ -456,29 +458,33 @@ impl NativeRuntime {
         let release_safety = context.dmabuf_gpu_release_safety;
         let release_lease_id = context.dmabuf_gpu_release_lease_id;
         let expected_worker_frame =
-            ExpectedRenderWorkerFrame::from_context(&context, self.output_id);
-        let outcome = self.scanout.settle_render_worker_completion(
+            ExpectedRenderWorkerFrame::from_context(&context, self.head.output_id);
+        let outcome = self.head.scanout.settle_render_worker_completion(
             context,
             completion.frozen_frame,
             completion.result,
             completion.gpu_sampling_started,
             completion.no_visual_release_fence,
             &mut self.server,
-            &mut self.output_transactions,
+            &mut self.head.output_transactions,
         );
         let outcome = match outcome {
             Ok(outcome) => outcome,
             Err(error) => {
-                let ownership = self.scanout.explicit_output_swapchain().map(|swapchain| {
-                    RenderWorkerPhysicalOwnershipSnapshot::from_swapchain(
-                        expected_worker_frame,
-                        swapchain,
-                    )
-                });
+                let ownership = self
+                    .head
+                    .scanout
+                    .explicit_output_swapchain()
+                    .map(|swapchain| {
+                        RenderWorkerPhysicalOwnershipSnapshot::from_swapchain(
+                            expected_worker_frame,
+                            swapchain,
+                        )
+                    });
                 let disposition = settle_render_worker_failure_ownership(
-                    &mut self.frame_pacing,
+                    &mut self.head.frame_pacing,
                     expected_worker_frame,
-                    self.output_epoch,
+                    self.head.output_epoch,
                     ownership,
                     monotonic_now_ns().map_err(|clock_error| {
                         io::Error::other(format!(
@@ -493,7 +499,7 @@ impl NativeRuntime {
                 })?;
                 return Err(Box::new(io::Error::other(format!(
                     "render worker settlement failed ({error}); physical ownership disposition={disposition:?} current_output_epoch={} ownership={ownership:?} expected={expected_worker_frame:?}",
-                    self.output_epoch.get(),
+                    self.head.output_epoch.get(),
                 ))));
             }
         };
@@ -504,7 +510,7 @@ impl NativeRuntime {
                 | crate::native_output::scanout::AtomicFrameRenderOutcome::RetryPresentationState { .. }
                 | crate::native_output::scanout::AtomicFrameRenderOutcome::LifecycleFallback { .. }
         ) {
-            settle_render_worker_after_terminal_no_frame(&mut self.frame_pacing, &outcome)
+            settle_render_worker_after_terminal_no_frame(&mut self.head.frame_pacing, &outcome)
                 .map_err(io::Error::other)?;
         }
 
@@ -530,19 +536,19 @@ impl NativeRuntime {
                 super::presentation_worker::settle_atomic_nonrendered_outcome(
                     super::presentation_worker::AtomicNonRenderedOutcomeContext {
                         server: &mut self.server,
-                        frame_pacing: &mut self.frame_pacing,
-                        frame_scheduler: &mut self.frame_scheduler,
+                        frame_pacing: &mut self.head.frame_pacing,
+                        frame_scheduler: &mut self.head.frame_scheduler,
                         dmabuf_gpu_release_registry: &mut self.dmabuf_gpu_release_registry,
                         event_loop: &mut self.event_loop,
                         render_telemetry: &mut self.render_telemetry,
                         last_rendered_scene_generation:
-                            &mut self.last_rendered_scene_generation,
-                        presentation_deadline: &mut self.presentation_deadline,
+                            &mut self.head.last_rendered_scene_generation,
+                        presentation_deadline: &mut self.head.presentation_deadline,
                         scheduled_presentation_target:
-                            &mut self.scheduled_presentation_target,
+                            &mut self.head.scheduled_presentation_target,
                         queued_redraw_requested: &mut self.queued_redraw_requested,
-                        last_acquire_ready_at_ns: &mut self.last_acquire_ready_at_ns,
-                        render_demand_coalesced_count: self.render_demand_coalesced_count,
+                        last_acquire_ready_at_ns: &mut self.head.last_acquire_ready_at_ns,
+                        render_demand_coalesced_count: self.head.render_demand_coalesced_count,
                         frame_completed: &mut frame_completed,
                         perf: self.perf,
                         release_safety,
@@ -556,7 +562,7 @@ impl NativeRuntime {
             rendered @ crate::native_output::scanout::AtomicFrameRenderOutcome::Rendered {
                 ..
             } => {
-                let explicit = match &mut *self.scanout {
+                let explicit = match &mut *self.head.scanout {
                     crate::native_output::scanout::NativeScanoutBackend::AtomicEglGbm(
                         explicit,
                     ) => explicit,
@@ -571,18 +577,18 @@ impl NativeRuntime {
                     super::presentation_worker::AtomicRenderedOutcomeContext {
                         explicit,
                         server: &mut self.server,
-                        frame_pacing: &mut self.frame_pacing,
-                        frame_scheduler: &mut self.frame_scheduler,
+                        frame_pacing: &mut self.head.frame_pacing,
+                        frame_scheduler: &mut self.head.frame_scheduler,
                         dmabuf_gpu_release_registry: &mut self.dmabuf_gpu_release_registry,
                         event_loop: &mut self.event_loop,
-                        scene_history: &mut self.scene_history,
+                        scene_history: &mut self.head.scene_history,
                         presentation_trace: &mut self.presentation_trace,
                         render_telemetry: &mut self.render_telemetry,
                         frame_rendered: &mut frame_rendered,
                         release_safety,
                         release_lease_id,
                         finish_render_work_on_failure: false,
-                        atomic_commit_pending: self.atomic_commit_arbiter.atomic_commit_pending(),
+                        atomic_commit_pending: self.head.atomic_commit_arbiter.atomic_commit_pending(),
                     },
                     &mut outer,
                     rendered,
@@ -599,15 +605,15 @@ impl NativeRuntime {
                     }
                     self.server
                         .note_frame_callbacks_deferred_ready(protocol_batch_id);
-                    self.frame_pacing
+                    self.head.frame_pacing
                         .finish_render_worker_with_ready_frame(
                             settled.ready_at_ns,
                             waits_for_target,
                         )
                         .map_err(io::Error::other)?;
-                    self.frame_scheduler.note_ready_frame(None);
+                    self.head.frame_scheduler.note_ready_frame(None);
                     let owner = self
-                        .scanout
+                        .head.scanout
                         .explicit_output_swapchain()
                         .and_then(|swapchain| swapchain.ready_identity())
                         .ok_or_else(|| {
@@ -615,24 +621,24 @@ impl NativeRuntime {
                         })?;
                     match failure {
                         DeferredO1BindingFailure::IdentityMismatch => self
-                            .frame_pacing
+                            .head.frame_pacing
                             .note_predictive_unbound_abandoned_identity_physical(Some(owner)),
                         DeferredO1BindingFailure::GenerationMismatch => self
-                            .frame_pacing
+                            .head.frame_pacing
                             .note_predictive_unbound_abandoned_generation_physical(Some(owner)),
                     }
-                    match &mut *self.scanout {
+                    match &mut *self.head.scanout {
                         crate::native_output::scanout::NativeScanoutBackend::AtomicEglGbm(
                             explicit,
                         ) => super::cycle::abandon_overtaken_ready(
                             explicit,
                             owner,
-                            self.output_epoch,
-                            &mut self.scene_history,
-                            &mut self.frame_pacing,
-                            &mut self.frame_scheduler,
+                            self.head.output_epoch,
+                            &mut self.head.scene_history,
+                            &mut self.head.frame_pacing,
+                            &mut self.head.frame_scheduler,
                             &mut self.server,
-                            &mut self.output_transactions,
+                            &mut self.head.output_transactions,
                             MonotonicTimestampNs::new(settled.ready_at_ns),
                         )?,
                         _ => {
@@ -651,15 +657,15 @@ impl NativeRuntime {
                     self.server
                         .note_frame_callbacks_deferred_ready(protocol_batch_id);
                     handoff_render_worker_ready(
-                        &mut self.frame_pacing,
-                        &mut self.frame_scheduler,
+                        &mut self.head.frame_pacing,
+                        &mut self.head.frame_scheduler,
                         settled.ready_at_ns,
                         waits_for_target,
                         outer.render_ahead,
                     )
                     .map_err(io::Error::other)?;
                 }
-                self.frame_pacing.log(
+                self.head.frame_pacing.log(
                     "render_complete",
                     vec![
                         PacingField::u64("frame_id", frame_id),
@@ -677,7 +683,7 @@ impl NativeRuntime {
                         PacingField::bool("render_ahead", outer.render_ahead),
                     ],
                 );
-                self.last_rendered_scene_generation = outer.scene_generation;
+                self.head.last_rendered_scene_generation = outer.scene_generation;
                 let _ = (
                     outer.output_epoch.get(),
                     outer.cursor_epoch,
@@ -696,25 +702,25 @@ impl NativeRuntime {
         &mut self,
         identity: crate::native_output::scanout::AtomicRenderWorkerIdentity,
     ) {
-        if self.pending_render_worker_identity != Some(identity) {
+        if self.head.pending_render_worker_identity != Some(identity) {
             return;
         }
-        self.pending_render_worker_identity = None;
-        self.pending_render_worker_context.take();
-        self.pending_render_worker_outer.take();
-        self.pending_render_worker_completion.take();
+        self.head.pending_render_worker_identity = None;
+        self.head.pending_render_worker_context.take();
+        self.head.pending_render_worker_outer.take();
+        self.head.pending_render_worker_completion.take();
     }
 
     pub(super) fn process_render_worker_events(&mut self) -> NativeResult<()> {
         loop {
-            let event = self.scanout.try_take_render_worker_event()?;
+            let event = self.head.scanout.try_take_render_worker_event()?;
             let Some(event) = event else {
                 return Ok(());
             };
             match event {
                 crate::native_output::scanout::AtomicRenderWorkerEvent::Rendered(completion) => {
                     let identity = completion.identity();
-                    if !identity.belongs_to_output_epoch(self.output_epoch) {
+                    if !identity.belongs_to_output_epoch(self.head.output_epoch) {
                         self.perf.log("native.render_worker.stale_completion", || {
                             vec![
                                 NativePerfField::u64(
@@ -723,7 +729,7 @@ impl NativeRuntime {
                                 ),
                                 NativePerfField::u64(
                                     "current_output_epoch",
-                                    self.output_epoch.get(),
+                                    self.head.output_epoch.get(),
                                 ),
                                 NativePerfField::u64("job_id", completion.job_id.get()),
                                 NativePerfField::u64("frame_id", completion.frame_id),
@@ -736,30 +742,30 @@ impl NativeRuntime {
                         drop(completion);
                         continue;
                     }
-                    if self.pending_render_worker_capture.is_some() {
+                    if self.head.pending_render_worker_capture.is_some() {
                         return Err(io::Error::other(
                             "render completion arrived while a capture continuation owns the worker",
                         )
                         .into());
                     }
-                    if self.pending_render_worker_completion.is_some() {
+                    if self.head.pending_render_worker_completion.is_some() {
                         return Err(io::Error::other(
                             "render worker produced a second completion before reactor settlement",
                         )
                         .into());
                     }
-                    let expected = self.pending_render_worker_identity.take().ok_or_else(|| {
+                    let expected = self.head.pending_render_worker_identity.take().ok_or_else(|| {
                         io::Error::other(
                             "render worker completion arrived without an executing continuation",
                         )
                     })?;
-                    if self.pending_render_worker_context.is_none() {
+                    if self.head.pending_render_worker_context.is_none() {
                         return Err(io::Error::other(
                             "render worker completion arrived without reactor settlement evidence",
                         )
                         .into());
                     }
-                    let outer = self.pending_render_worker_outer.as_ref().ok_or_else(|| {
+                    let outer = self.head.pending_render_worker_outer.as_ref().ok_or_else(|| {
                         io::Error::other(
                             "render worker completion arrived without outer presentation evidence",
                         )
@@ -776,7 +782,7 @@ impl NativeRuntime {
                     let completion_observed_at_ns = monotonic_now_ns()?;
                     if super::presentation_cycle::render_worker_received_visual_demand(
                         outer.coalesced_demand_count_at_dispatch,
-                        self.render_demand_coalesced_count,
+                        self.head.render_demand_coalesced_count,
                     ) {
                         self.queued_redraw_requested = true;
                     }
@@ -856,11 +862,11 @@ impl NativeRuntime {
                             ),
                             NativePerfField::u64(
                                 "render_demand_coalesced_count",
-                                self.render_demand_coalesced_count,
+                                self.head.render_demand_coalesced_count,
                             ),
                         ]
                     });
-                    self.pending_render_worker_completion = Some(completion);
+                    self.head.pending_render_worker_completion = Some(completion);
                     self.event_loop.request_continuation(
                         oblivion_one::native::event_loop::NativeContinuationReason::FrameScheduler,
                     )?;
@@ -869,11 +875,11 @@ impl NativeRuntime {
                     identity,
                     result,
                 } => {
-                    if self.pending_render_worker_identity.is_some()
-                        || self.pending_render_worker_context.is_some()
-                        || self.pending_render_worker_outer.is_some()
-                        || self.pending_render_worker_completion.is_some()
-                        || self.pending_render_worker_capture.is_some()
+                    if self.head.pending_render_worker_identity.is_some()
+                        || self.head.pending_render_worker_context.is_some()
+                        || self.head.pending_render_worker_outer.is_some()
+                        || self.head.pending_render_worker_completion.is_some()
+                        || self.head.pending_render_worker_capture.is_some()
                         || self.pending_worker_effect_reload.is_some()
                     {
                         return Err(io::Error::other(
@@ -899,10 +905,10 @@ impl NativeRuntime {
                     control_epoch,
                     result,
                 } => {
-                    if self.pending_render_worker_identity.is_some()
-                        || self.pending_render_worker_context.is_some()
-                        || self.pending_render_worker_outer.is_some()
-                        || self.pending_render_worker_completion.is_some()
+                    if self.head.pending_render_worker_identity.is_some()
+                        || self.head.pending_render_worker_context.is_some()
+                        || self.head.pending_render_worker_outer.is_some()
+                        || self.head.pending_render_worker_completion.is_some()
                     {
                         return Err(io::Error::other(
                             "capture completion arrived while a frame continuation owns the worker",

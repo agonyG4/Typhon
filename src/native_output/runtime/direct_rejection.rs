@@ -33,7 +33,7 @@ impl NativeRuntime {
         error: AtomicKmsError,
         rejection_kind: WorkerRejectionKind,
     ) -> NativeResult<()> {
-        if let Some(worker) = self.kms_commit_worker.as_ref() {
+        if let Some(worker) = self.head.kms_commit_worker.as_ref() {
             worker.record_worker_pacing_pre_submit_rejection();
         }
         let rejection_policy = direct_rejection_policy(rejection_kind);
@@ -48,30 +48,35 @@ impl NativeRuntime {
             .as_ref()
             .map(|lease| lease.validation_key());
         let obligations = self
+            .head
             .output_transactions
             .transaction(job.transaction_id)
             .ok_or_else(|| io::Error::other("rejected direct transaction is missing"))?
             .descriptor()
             .obligations();
         if !self
+            .head
             .frame_pacing
             .cancel_worker_submission(job.pacing_ticket)
         {
-            self.worker_quarantine.jobs.push(job);
+            self.head.worker_quarantine.jobs.push(job);
             return Err(io::Error::other("direct rejection pacing identity mismatch").into());
         }
         if self
+            .head
             .atomic_commit_arbiter
             .reject_worker_queued(job.token)
             .is_none()
         {
-            self.worker_quarantine.jobs.push(job);
+            self.head.worker_quarantine.jobs.push(job);
             return Err(io::Error::other("direct rejection Atomic identity mismatch").into());
         }
         if rejection_policy.invalidate_validation_key
             && let Some(validation_key) = validation_key
         {
-            self.scanout.invalidate_direct_validation(validation_key);
+            self.head
+                .scanout
+                .invalidate_direct_validation(validation_key);
         }
         let direct_job = job;
         let callback_owner_leaks = direct_terminal_callback_owner_leaks(
@@ -81,7 +86,7 @@ impl NativeRuntime {
             DirectTerminalCallbackDisposition::Retryable,
         );
         let settlement = settle_failed_output_transaction(
-            &mut self.output_transactions,
+            &mut self.head.output_transactions,
             direct_job.transaction_id,
             OutputTransactionFailureStage::KmsSubmit,
             MonotonicTimestampNs::new(monotonic_now_ns()?),
@@ -96,12 +101,12 @@ impl NativeRuntime {
             },
         );
         if let Err(error) = settlement {
-            self.worker_quarantine.jobs.push(direct_job);
+            self.head.worker_quarantine.jobs.push(direct_job);
             return Err(error);
         }
         if let Some(sidecar_transaction_id) = sidecar_transaction_id {
             settle_failed_output_transaction(
-                &mut self.output_transactions,
+                &mut self.head.output_transactions,
                 sidecar_transaction_id,
                 OutputTransactionFailureStage::KmsSubmit,
                 MonotonicTimestampNs::new(monotonic_now_ns()?),
@@ -113,14 +118,15 @@ impl NativeRuntime {
                 },
             )?;
         }
-        self.scanout
+        self.head
+            .scanout
             .note_direct_callback_owner_leaks(callback_owner_leaks);
-        debug_assert!(!self.scanout.direct_scanout_pending());
-        self.scanout.note_direct_rejection(
+        debug_assert!(!self.head.scanout.direct_scanout_pending());
+        self.head.scanout.note_direct_rejection(
             rejection_kind == WorkerRejectionKind::TestOnly,
             combined_cursor,
         );
-        self.scanout.note_direct_blocker(match rejection_kind {
+        self.head.scanout.note_direct_blocker(match rejection_kind {
             WorkerRejectionKind::TestOnly => "test_only_rejected",
             WorkerRejectionKind::RealSubmit => "real_submit_rejected",
         });
@@ -132,7 +138,7 @@ impl NativeRuntime {
             },
         );
         if rejection_policy.request_composited_redraw {
-            self.scanout.note_direct_fallback_redraw();
+            self.head.scanout.note_direct_fallback_redraw();
             self.queued_redraw_requested = true;
         }
         self.perf.log("native.kms_commit_worker", || {

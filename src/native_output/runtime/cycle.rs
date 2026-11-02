@@ -188,94 +188,98 @@ impl NativeRuntime {
         cycle: &NativeCycleState,
     ) -> NativeResult<bool> {
         if self.cursor_scheduling_policy != NativeCursorSchedulingPolicy::Auto
-            || self.kms_commit_worker_transport
+            || self.head.kms_commit_worker_transport
                 != crate::native_output::kms_worker::KmsCommitWorkerTransport::Worker
             || !self.shutdown.is_running()
             || !self.session.permits_output()
-            || self.pending_output_configuration.is_some()
-            || self.scanout.ready_frame_queued()
-            || self.atomic_commit_arbiter.atomic_commit_pending()
+            || self.head.pending_output_configuration.is_some()
+            || self.head.scanout.ready_frame_queued()
+            || self.head.atomic_commit_arbiter.atomic_commit_pending()
         {
             return Ok(false);
         }
-        let Some(cursor) = self.atomic_cursor.as_mut() else {
+        let Some(cursor) = self.head.atomic_cursor.as_mut() else {
             return Ok(false);
         };
-        if self.cursor_render_mode != NativeCursorRenderMode::Hardware
+        if self.head.cursor_render_mode != NativeCursorRenderMode::Hardware
             || cursor.pending_token().is_some()
-            || !self.cursor_output_arbitration.pending()
+            || !self.head.cursor_output_arbitration.pending()
             || !cursor.needs_submission_for(Some(cursor.desired()))
             || (cursor.desired().visible && cursor.desired().framebuffer_id.is_none())
         {
             return Ok(false);
         }
-        let Some(worker) = self.kms_commit_worker.as_ref() else {
+        let Some(worker) = self.head.kms_commit_worker.as_ref() else {
             return Ok(false);
         };
 
         let now_ns = monotonic_now_ns()?;
         let now = MonotonicTimestampNs::new(now_ns);
-        let pending_target = super::planner::pending_fixed_target_for_scanout(&self.scanout)?;
+        let pending_target = super::planner::pending_fixed_target_for_scanout(&self.head.scanout)?;
         let cursor_dispatch_budget_ns = worker.dispatch_budget_ns(
             crate::native_output::kms_worker::KmsServiceClass::CursorPlaneDelta,
-            self.output_epoch.get(),
+            self.head.output_epoch.get(),
         );
         let candidate = super::planner::plan_cursor_service_opportunity_with_current(
-            &self.presentation_deadline,
-            &self.cursor_timing,
+            &self.head.presentation_deadline,
+            &self.head.cursor_timing,
             now,
             super::planner::cursor_primary_ordering_target(
-                self.scheduled_presentation_target,
+                self.head.scheduled_presentation_target,
                 pending_target,
             ),
             cursor_dispatch_budget_ns,
-            self.cursor_output_arbitration.service_opportunity(),
+            self.head.cursor_output_arbitration.service_opportunity(),
             crate::native_output::kms_worker::KmsCommitWorkerTransport::Worker,
         );
         if let Some(candidate) = candidate {
-            if self.cursor_output_arbitration.pending()
-                && self.cursor_output_arbitration.desired_epoch() == cursor.desired_epoch()
+            if self.head.cursor_output_arbitration.pending()
+                && self.head.cursor_output_arbitration.desired_epoch() == cursor.desired_epoch()
             {
-                self.cursor_output_arbitration
+                self.head
+                    .cursor_output_arbitration
                     .reconcile_pending_service_opportunity(candidate, now_ns);
             } else {
-                self.cursor_output_arbitration
+                self.head
+                    .cursor_output_arbitration
                     .request_hardware_for_opportunity(cursor.desired_epoch(), now_ns, candidate);
             }
         } else if !self
+            .head
             .cursor_output_arbitration
             .planning_retry_ns()
             .is_some_and(|retry_ns| retry_ns > now_ns)
         {
             // Do not fall through to a stale physical target when current
             // presentation authorities cannot produce a valid opportunity.
-            self.cursor_output_arbitration
+            self.head
+                .cursor_output_arbitration
                 .request_hardware_for_planning_retry(
                     cursor.desired_epoch(),
                     now_ns,
-                    self.frame_scheduler.next_refresh_deadline_ns(now_ns),
+                    self.head.frame_scheduler.next_refresh_deadline_ns(now_ns),
                 );
         }
-        let Some(opportunity) = self.cursor_output_arbitration.service_opportunity() else {
+        let Some(opportunity) = self.head.cursor_output_arbitration.service_opportunity() else {
             return Ok(false);
         };
         let attachable_primary = worker.attachable_primary(
-            self.output_epoch.get(),
-            self.target.crtc_id,
+            self.head.output_epoch.get(),
+            self.head.target.crtc_id,
             opportunity.target,
         );
         let independent_kms_admission = worker.admission_available()
             && worker.queue_depth() == 0
             && !worker.submission_active()
             && !worker.inflight();
-        let queued_kind = self.atomic_commit_arbiter.worker_queued_kind();
-        let submitted_kind = self.atomic_commit_arbiter.kernel_submitted_kind();
+        let queued_kind = self.head.atomic_commit_arbiter.worker_queued_kind();
+        let submitted_kind = self.head.atomic_commit_arbiter.kernel_submitted_kind();
         let primary_state = NativeCursorPrimaryState {
             primary_scene_work_pending: self.queued_redraw_requested
                 || self.server.has_pending_frame_prepare_work()
-                || self.frame_scheduler.visual_work_queued(),
+                || self.head.frame_scheduler.visual_work_queued(),
             ready_primary_carrier_attachable: attachable_primary.is_some(),
-            primary_target_owned: self.scanout.ready_frame_queued(),
+            primary_target_owned: self.head.scanout.ready_frame_queued(),
             primary_worker_queued: queued_kind.is_some_and(|kind| {
                 matches!(
                     kind,
@@ -292,6 +296,7 @@ impl NativeRuntime {
             }),
             independent_kms_admission,
             physical_admission: self
+                .head
                 .cursor_output_arbitration
                 .physical_admission_for_transport(
                     crate::native_output::kms_worker::KmsCommitWorkerTransport::Worker,
@@ -302,7 +307,7 @@ impl NativeRuntime {
         let hardware_usable =
             !desired.visible || desired.framebuffer_id.is_some() || cursor.current().visible;
         let disposition = super::frame::cursor_output_disposition_for_primary_state(
-            &mut self.cursor_output_arbitration,
+            &mut self.head.cursor_output_arbitration,
             NativeCursorSchedulingPolicy::Auto,
             now_ns,
             primary_state,
@@ -310,11 +315,11 @@ impl NativeRuntime {
         );
         self.cursor_responsiveness.record_arbitration_evidence(
             cycle.cursor_motion_sample_id,
-            self.output_id,
+            self.head.output_id,
             Some(cursor.desired_epoch()),
             now_ns,
             NativeCursorSchedulingPolicy::Auto,
-            &self.cursor_output_arbitration,
+            &self.head.cursor_output_arbitration,
             primary_state,
             Some(opportunity),
             disposition,
@@ -326,40 +331,40 @@ impl NativeRuntime {
         let cursor_epoch = cursor.desired_epoch();
         let mut effective_cursor = Some(desired.clone());
         let validation_base = crate::native_output::kms_worker::KmsValidationBase::Presented {
-            output_id: self.output_id,
-            snapshot: self.presented_planes,
-            output_generation: self.output_epoch.get(),
-            crtc_id: self.target.crtc_id,
+            output_id: self.head.output_id,
+            snapshot: self.head.presented_planes,
+            output_generation: self.head.output_epoch.get(),
+            crtc_id: self.head.target.crtc_id,
         };
         let decision = super::presentation_worker::present_cursor_for_presentation(
             true,
             Some(worker),
             &self.kms_backend,
             cursor,
-            &mut self.cursor_timing,
+            &mut self.head.cursor_timing,
             Some(desired),
-            &mut self.atomic_commit_arbiter,
-            &mut self.output_transactions,
+            &mut self.head.atomic_commit_arbiter,
+            &mut self.head.output_transactions,
             &mut self.presentation_trace,
             opportunity.target,
             Some(opportunity.submit_window),
-            self.target.crtc_id,
-            self.output_epoch.get(),
+            self.head.target.crtc_id,
+            self.head.output_epoch.get(),
             super::planner::pacing_mode_for_target(Some(opportunity.target)),
             cursor_epoch,
             validation_base,
-            &mut self.last_submitted_cursor_epoch,
-            &mut self.cursor_output_arbitration,
-            &mut self.frame_scheduler,
+            &mut self.head.last_submitted_cursor_epoch,
+            &mut self.head.cursor_output_arbitration,
+            &mut self.head.frame_scheduler,
             now_ns,
             self.perf,
             false,
-            &mut self.cursor_render_mode,
+            &mut self.head.cursor_render_mode,
             &mut self.server,
             &mut effective_cursor,
             &mut self.queued_redraw_requested,
-            &mut self.last_client_cursor_damage,
-            &mut self.last_software_cursor_damage,
+            &mut self.head.last_client_cursor_damage,
+            &mut self.head.last_software_cursor_damage,
             None,
             None,
             None,
@@ -373,17 +378,19 @@ impl NativeRuntime {
         // Admission can become unavailable between the lane snapshot and the
         // worker reservation. Back off until the next refresh while retaining
         // the original freshness deadline and pending cursor age.
-        self.cursor_output_arbitration
-            .set_retry_not_before(self.frame_scheduler.next_refresh_deadline_ns(now_ns));
+        self.head
+            .cursor_output_arbitration
+            .set_retry_not_before(self.head.frame_scheduler.next_refresh_deadline_ns(now_ns));
         Ok(false)
     }
 
     fn queued_visual_work_deadline_due(&self, now_ns: u64) -> bool {
         let scheduled_target_due = self
+            .head
             .scheduled_presentation_target
             .is_some_and(|target| target.render_start_deadline.get() <= now_ns);
-        if self.frame_scheduler.visual_work_queued() {
-            scheduled_target_due || self.scheduled_presentation_target.is_none()
+        if self.head.frame_scheduler.visual_work_queued() {
+            scheduled_target_due || self.head.scheduled_presentation_target.is_none()
         } else {
             self.queued_redraw_requested
         }
@@ -391,21 +398,21 @@ impl NativeRuntime {
 
     fn native_runtime_state(&self, cycle: &NativeCycleState, now_ns: u64) -> NativeRuntimeState {
         let visual_scene_debt = super::commit_timing::logical_scene_changed(
-            self.last_rendered_scene_generation,
+            self.head.last_rendered_scene_generation,
             self.server.scene_render_generation(),
         );
         NativeRuntimeState {
             scene_dirty: cycle.redraw_requested
                 || self.server.has_pending_frame_prepare_work()
                 || self.server.has_pending_gpu_screencopy()
-                || self.scanout.has_staged_gpu_screencopy(),
+                || self.head.scanout.has_staged_gpu_screencopy(),
             visual_scene_debt,
             callback_only_frame_work_pending: self
                 .server
                 .has_only_pending_surface_frame_callbacks(),
             visual_work_deadline_due: self.queued_visual_work_deadline_due(now_ns),
-            cursor_only_due: self.cursor_output_arbitration.pending()
-                && self.cursor_output_arbitration.due(now_ns),
+            cursor_only_due: self.head.cursor_output_arbitration.pending()
+                && self.head.cursor_output_arbitration.due(now_ns),
             screen_capture_pending: self.server.has_pending_screen_capture(),
             explicit_sync_service_due: cycle.wakeup.reasons.explicit_sync_acquire()
                 || !cycle.wakeup.explicit_sync_acquire_tokens.is_empty()
@@ -455,7 +462,7 @@ impl NativeRuntime {
             return;
         }
         super::planner::plan_commit_timing_targets(
-            &self.presentation_deadline,
+            &self.head.presentation_deadline,
             &mut self.server,
             MonotonicTimestampNs::new(now_ns),
         );
@@ -543,7 +550,8 @@ impl NativeRuntime {
         }
         self.service_due_dmabuf_release_retry(now_ns)?;
         self.server.set_commit_debug_pageflip_pending(
-            self.scanout.page_flip_pending() || self.atomic_commit_arbiter.atomic_commit_pending(),
+            self.head.scanout.page_flip_pending()
+                || self.head.atomic_commit_arbiter.atomic_commit_pending(),
         );
         let mut signal_shutdown_requested = false;
         if work_domains.children || self.shutdown.state() == ShutdownState::StoppingChildren {
@@ -812,12 +820,14 @@ impl NativeRuntime {
         self.service_keyboard_persistence_completions(&cycle.wakeup)?;
         self.service_output_persistence_completions(&cycle.wakeup)?;
         let output_configuration_cycle = output_configuration_cycle_is_due(
-            self.pending_output_configuration.is_some(),
-            self.output_configuration_transactions
+            self.head.pending_output_configuration.is_some(),
+            self.head
+                .output_configuration_transactions
                 .deadline_ns()
                 .is_some_and(|deadline| deadline <= monotonic_now_ns().unwrap_or(0)),
             self.output_persistence_compensation_required,
-            self.output_reconfiguration_rearm_retry_deadline_ns
+            self.head
+                .output_reconfiguration_rearm_retry_deadline_ns
                 .is_some_and(|deadline| deadline <= monotonic_now_ns().unwrap_or(0)),
         );
         if output_configuration_cycle {
@@ -888,7 +898,7 @@ impl NativeRuntime {
             self.finish_slow_cycle(&cycle, render_attempted)?;
             return Ok(());
         }
-        if output_configuration_cycle || self.pending_output_configuration.is_some() {
+        if output_configuration_cycle || self.head.pending_output_configuration.is_some() {
             self.arm_runtime_deadline()?;
             self.finish_slow_cycle(&cycle, render_attempted)?;
             return Ok(());
@@ -1000,8 +1010,8 @@ impl NativeRuntime {
         if capture_service_attempted
             && screen_capture_backlog_needs_immediate_continuation(
                 self.server.has_pending_screen_capture(),
-                self.scanout.render_worker_active(),
-                self.scanout.render_worker_busy(),
+                self.head.scanout.render_worker_active(),
+                self.head.scanout.render_worker_busy(),
             )
         {
             self.event_loop.request_continuation(
@@ -1068,12 +1078,16 @@ impl NativeRuntime {
                 .record_presentation_planning_skip();
         }
         let visual_scene_debt = super::commit_timing::logical_scene_changed(
-            self.last_rendered_scene_generation,
+            self.head.last_rendered_scene_generation,
             self.server.scene_render_generation(),
         );
         let cursor_temporal_work = self
+            .head
             .cursor_output_arbitration
-            .has_future_wake_requirement(monotonic_now_ns()?, self.kms_commit_worker_transport);
+            .has_future_wake_requirement(
+                monotonic_now_ns()?,
+                self.head.kms_commit_worker_transport,
+            );
         if super::wake_plan::cycle_tail_requires_runtime_wake_plan(
             presentation_work,
             self.input_epoch.backlog_pending(),
@@ -1105,6 +1119,7 @@ impl NativeRuntime {
     ) -> NativeResult<()> {
         let maintenance_now = std::time::Instant::now();
         let scratch_maintenance_due = self
+            .head
             .scanout
             .next_effect_scratch_maintenance_deadline()
             .is_some_and(|deadline| deadline <= maintenance_now);
@@ -1118,7 +1133,7 @@ impl NativeRuntime {
                 .enabled()
                 .then(monotonic_now_ns)
                 .transpose()?;
-            self.scanout.maintain_effect_scratch(maintenance_now)?;
+            self.head.scanout.maintain_effect_scratch(maintenance_now)?;
             if let Some(start_ns) = phase_start_ns {
                 self.slow_cycle_trace.record_phase(
                     SlowCyclePhase::PostWakeMaintenance,
@@ -1133,6 +1148,7 @@ impl NativeRuntime {
             return Ok(());
         }
         let (kms_queue_depth, kms_worker_active) = self
+            .head
             .kms_commit_worker
             .as_ref()
             .map(|worker| (worker.queue_depth(), worker.submission_active()))
@@ -1155,7 +1171,7 @@ impl NativeRuntime {
             render_attempted,
             cycle.frame_rendered,
             cycle.frame_submitted,
-            cycle.pageflip_pending_at_tick || self.scanout.page_flip_pending(),
+            cycle.pageflip_pending_at_tick || self.head.scanout.page_flip_pending(),
             kms_queue_depth,
             kms_worker_active,
         );
@@ -1257,7 +1273,7 @@ impl NativeRuntime {
                                 ),
                                 NativePerfField::bool(
                                     "scanout_pageflip_pending",
-                                    self.scanout.page_flip_pending(),
+                                    self.head.scanout.page_flip_pending(),
                                 ),
                             ]
                         });
@@ -1328,6 +1344,7 @@ impl NativeRuntime {
             control_timeout_deadline_ns: control_timeout_deadline
                 .filter(|deadline| *deadline > now_ns),
             output_configuration_deadline_ns: self
+                .head
                 .output_configuration_transactions
                 .deadline_ns()
                 .filter(|deadline| *deadline > now_ns),
@@ -1358,6 +1375,7 @@ impl NativeRuntime {
             system_action_transport_deadline_ns: system_action_transport_deadline
                 .filter(|deadline| *deadline > now_ns),
             output_configuration_deadline_ns: self
+                .head
                 .output_configuration_transactions
                 .deadline_ns()
                 .filter(|deadline| *deadline > now_ns),
@@ -1522,7 +1540,7 @@ impl NativeRuntime {
         self.perf.log("native.session_suspend", || {
             vec![
                 NativePerfField::str("pageflip_policy", "quarantine_until_recovery_modeset"),
-                NativePerfField::bool("pageflip_pending", self.scanout.page_flip_pending()),
+                NativePerfField::bool("pageflip_pending", self.head.scanout.page_flip_pending()),
                 NativePerfField::str("explicit_sync_policy", "park_and_rearm"),
             ]
         });
@@ -1554,7 +1572,7 @@ impl NativeRuntime {
     }
 
     fn finish_native_session_recovery(&mut self) -> NativeResult<()> {
-        self.render_worker_admission_stopped = false;
+        self.head.render_worker_admission_stopped = false;
         self.session.finish_resume();
         self.reconcile_dmem_foreground();
         oblivion_one::native::scheduling_qos::reacquire_current_reactor_after_session_resume()
@@ -1567,7 +1585,7 @@ impl NativeRuntime {
         if let Some(token) = self.drm_reactor_token.take() {
             let _ = self.event_loop.unregister(token);
         }
-        if let Some(token) = self.output_render_fence_token.take() {
+        if let Some(token) = self.head.output_render_fence_token.take() {
             let _ = self.event_loop.unregister(token);
         }
         if let Ok(parked) = self
@@ -1576,7 +1594,7 @@ impl NativeRuntime {
         {
             self.parked_acquire_watches.extend(parked);
         }
-        if let Some(mut cursor) = self.legacy_cursor.take() {
+        if let Some(mut cursor) = self.head.legacy_cursor.take() {
             cursor.disarm_drm_cleanup();
         }
         self.pending_session_recovery = None;
@@ -1619,7 +1637,7 @@ impl NativeRuntime {
                 &request.acquire,
             );
         }
-        self.output_reconfiguration_rearm_retry_deadline_ns = None;
+        self.head.output_reconfiguration_rearm_retry_deadline_ns = None;
         Ok(())
     }
     fn dispatch_suspended_sources(&mut self, cycle: &NativeCycleState) -> NativeResult<()> {
@@ -1659,7 +1677,7 @@ impl NativeRuntime {
                 NativePerfField::str("from", from),
                 NativePerfField::str("to", to),
                 NativePerfField::str("reason", reason),
-                NativePerfField::bool("pageflip_pending", self.scanout.page_flip_pending()),
+                NativePerfField::bool("pageflip_pending", self.head.scanout.page_flip_pending()),
                 NativePerfField::str("shutdown_state", self.shutdown.state().as_str()),
                 NativePerfField::str("drm_backend", self.kms.kind().as_str()),
                 NativePerfField::str("input_backend", self.input_devices.kind().as_str()),
@@ -1668,7 +1686,7 @@ impl NativeRuntime {
     }
     pub(super) fn fail_pending_screen_captures(&mut self, reason: &str) {
         self.fail_gpu_screencopy();
-        if let Some(pending) = self.pending_render_worker_capture.as_mut()
+        if let Some(pending) = self.head.pending_render_worker_capture.as_mut()
             && !pending.cancelled
         {
             pending.pending.fail(reason);
@@ -1696,8 +1714,8 @@ impl NativeRuntime {
             return Ok(());
         }
         if screen_capture_waits_for_render_worker(
-            self.scanout.render_worker_active(),
-            self.scanout.render_worker_busy(),
+            self.head.scanout.render_worker_active(),
+            self.head.scanout.render_worker_busy(),
         ) {
             // Keep the protocol request in the compositor backlog until the
             // serialized renderer command slot is available. The completion
@@ -1714,12 +1732,12 @@ impl NativeRuntime {
             pending.fail("output_gone");
             return Ok(());
         }
-        if !self.scanout.supports_gpu_buffer_protocols() {
+        if !self.head.scanout.supports_gpu_buffer_protocols() {
             pending.fail("unsupported");
             return Ok(());
         }
 
-        let (width, height) = self.scanout.dimensions();
+        let (width, height) = self.head.scanout.dimensions();
         let mut dimensions = match CaptureDimensions::checked(width, height) {
             Ok(dimensions) => dimensions,
             Err(_) => {
@@ -1750,13 +1768,13 @@ impl NativeRuntime {
             ResolvedNativeFrameScene::from_server(&self.server).into_owned()
         };
         let include_cursor = pending.overlay_cursor();
-        let cursor_mode = self.cursor_render_mode.for_capture(
+        let cursor_mode = self.head.cursor_render_mode.for_capture(
             include_cursor,
             self.server.client_cursor_render_state().is_some(),
         );
-        if self.scanout.render_worker_active() {
+        if self.head.scanout.render_worker_active() {
             let job_id = super::render_worker::next_render_worker_job_id()?;
-            let frozen_frame = match &*self.scanout {
+            let frozen_frame = match &*self.head.scanout {
                 crate::native_output::scanout::NativeScanoutBackend::AtomicEglGbm(scanout) => {
                     scanout.freeze_capture_frame(
                         resolved_scene,
@@ -1772,6 +1790,7 @@ impl NativeRuntime {
                 }
             };
             let control_epoch = match self
+                .head
                 .scanout
                 .dispatch_render_worker_capture(job_id, frozen_frame)
             {
@@ -1782,23 +1801,24 @@ impl NativeRuntime {
                     return Ok(());
                 }
             };
-            if self.pending_render_worker_capture.is_some() {
+            if self.head.pending_render_worker_capture.is_some() {
                 pending.fail("render_failed");
                 return Err(io::Error::other(
                     "render worker admitted a second capture continuation",
                 )
                 .into());
             }
-            self.pending_render_worker_capture = Some(super::render_worker::PendingWorkerCapture {
-                job_id,
-                control_epoch,
-                pending,
-                dimensions,
-                cancelled: false,
-            });
+            self.head.pending_render_worker_capture =
+                Some(super::render_worker::PendingWorkerCapture {
+                    job_id,
+                    control_epoch,
+                    pending,
+                    dimensions,
+                    cancelled: false,
+                });
             return Ok(());
         }
-        let payload = match self.scanout.capture_scene(
+        let payload = match self.head.scanout.capture_scene(
             resolved_scene,
             &self.server,
             &self.input_state,
@@ -1833,37 +1853,41 @@ impl NativeRuntime {
         let perf = self.perf;
         let Self {
             server,
+            head:
+                OutputHead {
+                    target,
+                    mode_label,
+                    output_epoch,
+                    scanout,
+                    cursor_render_mode,
+                    legacy_cursor,
+                    frame_scheduler,
+                    scene_history: _,
+                    frame_index,
+                    mismatched_pageflip_events,
+                    stale_pageflip_events,
+                    presentation_cadence: _,
+                    last_acquire_ready_at_ns,
+                    ..
+                },
             perf: _,
             kms,
             kms_backend,
-            target,
-            mode_label,
-            output_epoch,
             drm_timestamp_clock,
             presentation_clock,
-            scanout,
             frame_renderer,
             input_state,
             cursor_preference,
-            cursor_render_mode,
-            legacy_cursor,
             input_devices,
             acquire_notifier,
             acquire_watches,
             parked_acquire_watches: _,
             event_loop,
             drm_reactor_token: _,
-            frame_scheduler,
             effective_app_gpu_policy,
-            scene_history: _,
             queued_redraw_requested,
-            frame_index,
             known_toplevels,
             pending_launches,
-            mismatched_pageflip_events,
-            stale_pageflip_events,
-            presentation_cadence: _,
-            last_acquire_ready_at_ns,
             resize_perf,
             pointer_constraint_backend,
             seat_session: _,

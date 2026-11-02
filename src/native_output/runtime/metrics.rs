@@ -263,25 +263,26 @@ fn worker_timing_snapshot(snapshot: WorkerTimingSnapshot) -> WorkerTimingPerform
 
 impl NativeRuntime {
     pub(super) fn performance_snapshot(&self) -> PerformanceSnapshot {
-        let buffering = self.frame_pacing.buffering_metrics();
-        let pacing = self.frame_pacing.timing_metrics();
+        let buffering = self.head.frame_pacing.buffering_metrics();
+        let pacing = self.head.frame_pacing.timing_metrics();
         let worker = self
+            .head
             .kms_commit_worker
             .as_ref()
             .map_or_else(WorkerMetricsSnapshot::default, |worker| {
                 worker.metrics_snapshot()
             });
-        let presentation_timing = self.presentation_timing;
+        let presentation_timing = self.head.presentation_timing;
         let presentation_timing_snapshot = presentation_timing.snapshot();
         let diagnostic_now_ns = monotonic_now_ns().unwrap_or(0);
-        let cursor_timing_snapshot = self.cursor_timing.snapshot(diagnostic_now_ns);
-        let cursor_prepare_budget_ns = self.cursor_timing.preparation_budget_ns();
+        let cursor_timing_snapshot = self.head.cursor_timing.snapshot(diagnostic_now_ns);
+        let cursor_prepare_budget_ns = self.head.cursor_timing.preparation_budget_ns();
         let primary_dispatch_budget_ns = worker
             .timing
             .primary_dispatch_budget_ns
             .max(crate::native_output::kms_worker::DISPATCH_GUARD_NS);
         let cursor_dispatch_generation_matches =
-            worker.timing.cursor_dispatch_generation == self.output_epoch.get();
+            worker.timing.cursor_dispatch_generation == self.head.output_epoch.get();
         let cursor_dispatch_budget_ns = if cursor_dispatch_generation_matches {
             worker.timing.cursor_dispatch_budget_ns
         } else {
@@ -293,11 +294,12 @@ impl NativeRuntime {
         } else {
             0
         };
-        let service_prediction = self.render_journal.prediction_with_kms_guard(
+        let service_prediction = self.head.render_journal.prediction_with_kms_guard(
             Duration::from_nanos(presentation_timing.mode().refresh_interval_ns()),
             presentation_timing.apply_guard_ns(),
         );
         let exact_parallel_diagnostics = self
+            .head
             .render_journal
             .exact_parallel_diagnostics(presentation_timing.mode().refresh_interval_ns());
         let compositor_cpu_render =
@@ -305,9 +307,9 @@ impl NativeRuntime {
         let mut gpu_residency = crate::gpu_residency::GpuResidencySnapshot::from_renderer(
             self.render_telemetry.gpu_residency,
         );
-        gpu_residency.set_domain(self.scanout.gpu_residency_domain_snapshot());
-        gpu_residency.direct_import_cache = self.scanout.direct_import_cache_diagnostics();
-        if let Some(scratch) = self.scanout.effect_scratch_residency_snapshot() {
+        gpu_residency.set_domain(self.head.scanout.gpu_residency_domain_snapshot());
+        gpu_residency.direct_import_cache = self.head.scanout.direct_import_cache_diagnostics();
+        if let Some(scratch) = self.head.scanout.effect_scratch_residency_snapshot() {
             gpu_residency.set_domain(scratch.domain_snapshot());
         }
         gpu_residency.recompute_totals();
@@ -326,8 +328,8 @@ impl NativeRuntime {
             repaint: self.render_telemetry.control_snapshot(),
             buffering: build_buffering_performance_snapshot(
                 buffering,
-                &self.adaptive_buffering,
-                self.presentation_deadline.pre_render_abandoned(),
+                &self.head.adaptive_buffering,
+                self.head.presentation_deadline.pre_render_abandoned(),
                 &service_prediction,
                 exact_parallel_diagnostics,
             ),
@@ -457,16 +459,19 @@ impl NativeRuntime {
         now_ns: u64,
     ) -> NativeResult<NativeSchedulerWakeRequirement> {
         let predicted_total_cost = Duration::from_nanos(
-            self.render_journal
+            self.head
+                .render_journal
                 .prediction_with_kms_guard(
-                    Duration::from_nanos(self.presentation_timing.mode().refresh_interval_ns()),
-                    self.presentation_timing.apply_guard_ns(),
+                    Duration::from_nanos(
+                        self.head.presentation_timing.mode().refresh_interval_ns(),
+                    ),
+                    self.head.presentation_timing.apply_guard_ns(),
                 )
                 .total_cost_ns,
         );
         let pageflip_timeout_owner: NativePageflipTimeoutOwner =
-            self.kms_commit_worker_transport.into();
-        let explicit_output = matches!(&*self.scanout, NativeScanoutBackend::AtomicEglGbm(_));
+            self.head.kms_commit_worker_transport.into();
+        let explicit_output = matches!(&*self.head.scanout, NativeScanoutBackend::AtomicEglGbm(_));
         if explicit_output {
             let pipeline = self
                 .validate_output_pipeline()
@@ -474,34 +479,39 @@ impl NativeRuntime {
                     io::Error::other(format!("wake pipeline validation failed: {error:?}"))
                 })?
                 .ok_or_else(|| io::Error::other("explicit output has no pipeline snapshot"))?;
-            let worker_mode = self.kms_commit_worker_transport == KmsCommitWorkerTransport::Worker;
+            let worker_mode =
+                self.head.kms_commit_worker_transport == KmsCommitWorkerTransport::Worker;
             let worker_queue_available = worker_mode
-                && self.atomic_commit_arbiter.worker_slot_available()
+                && self.head.atomic_commit_arbiter.worker_slot_available()
                 && self
+                    .head
                     .kms_commit_worker
                     .as_ref()
                     .is_some_and(|worker| worker.admission_available());
             let render_ahead_allowed =
-                self.adaptive_buffering.desired_credit() > 1 && pipeline.triple_capable();
-            let decision = self.frame_scheduler.decision_with_pipeline_diagnostics(
-                ExplicitAtomicSchedulerContext {
-                    now: MonotonicTimestampNs::new(now_ns),
-                    predicted_total_cost,
-                    presentation_target: self.scheduled_presentation_target,
-                    render_ahead_allowed,
-                    worker_queue_available,
-                },
-                &pipeline,
-            );
+                self.head.adaptive_buffering.desired_credit() > 1 && pipeline.triple_capable();
+            let decision = self
+                .head
+                .frame_scheduler
+                .decision_with_pipeline_diagnostics(
+                    ExplicitAtomicSchedulerContext {
+                        now: MonotonicTimestampNs::new(now_ns),
+                        predicted_total_cost,
+                        presentation_target: self.head.scheduled_presentation_target,
+                        render_ahead_allowed,
+                        worker_queue_available,
+                    },
+                    &pipeline,
+                );
             let can_queue_worker_next = super::presentation_worker::can_queue_worker_primary(
                 worker_mode,
                 decision.action,
                 Some(&pipeline),
-                self.kms_commit_worker.as_ref(),
+                self.head.kms_commit_worker.as_ref(),
             );
             let action = apply_atomic_commit_lane_guard(
                 decision.action,
-                self.atomic_commit_arbiter.atomic_commit_pending(),
+                self.head.atomic_commit_arbiter.atomic_commit_pending(),
                 can_queue_worker_next,
             );
             let scheduler_deadline = (action == decision.action)
@@ -515,46 +525,49 @@ impl NativeRuntime {
         }
 
         let decision = self
+            .head
             .frame_scheduler
             .decision_with_context(SchedulerFrameContext {
-                pacing_mode: self.adaptive_buffering.pacing_mode(),
+                pacing_mode: self.head.adaptive_buffering.pacing_mode(),
                 capabilities: SchedulerCapabilities::legacy(),
-                presentation_target: self.scheduled_presentation_target,
+                presentation_target: self.head.scheduled_presentation_target,
                 predicted_total_cost,
                 now: MonotonicTimestampNs::new(now_ns),
-                render_target_available: self.scanout.render_target_available(),
+                render_target_available: self.head.scanout.render_target_available(),
                 render_ahead_allowed: false,
-                ready_frame_present: self.frame_scheduler.ready_frame_queued(),
+                ready_frame_present: self.head.frame_scheduler.ready_frame_queued(),
                 ready_target_current: true,
                 worker_queue_available: false,
             });
         let deadline = match decision {
             SchedulerDecision::WaitForRefresh => {
-                if let Some(target) = self.frame_scheduler.ready_target() {
+                if let Some(target) = self.head.frame_scheduler.ready_target() {
                     (now_ns < target.submit_not_before().get()).then_some(SchedulerWakeDeadline {
                         kind: SchedulerWakeDeadlineKind::SubmitNotBefore,
                         at_ns: target.submit_not_before().get(),
                     })
-                } else if self.frame_scheduler.visual_work_queued() {
-                    self.scheduled_presentation_target
+                } else if self.head.frame_scheduler.visual_work_queued() {
+                    self.head
+                        .scheduled_presentation_target
                         .filter(|target| now_ns < target.render_start_deadline.get())
                         .map(|target| SchedulerWakeDeadline {
                             kind: SchedulerWakeDeadlineKind::RenderStart,
                             at_ns: target.render_start_deadline.get(),
                         })
                 } else {
-                    self.frame_scheduler
-                        .next_deadline_ns()
-                        .map(|at_ns| SchedulerWakeDeadline {
+                    self.head.frame_scheduler.next_deadline_ns().map(|at_ns| {
+                        SchedulerWakeDeadline {
                             kind: SchedulerWakeDeadlineKind::ProtocolRefresh,
                             at_ns,
-                        })
+                        }
+                    })
                 }
             }
             // Buffer and page-flip ownership is external readiness.  Preserve
             // only the genuine page-flip watchdog; never reuse a visual
             // target deadline as a poll for either owner.
             SchedulerDecision::WaitForBuffer | SchedulerDecision::WaitForPageFlip => self
+                .head
                 .frame_scheduler
                 .page_flip_watchdog_deadline_ns()
                 .map(|at_ns| SchedulerWakeDeadline {
@@ -618,10 +631,10 @@ impl NativeRuntime {
         cycle: &NativeCycleState,
         scheduler_decision: SchedulerDecision,
     ) -> NativeResult<()> {
-        if let Some(worker) = self.kms_commit_worker.as_ref() {
+        if let Some(worker) = self.head.kms_commit_worker.as_ref() {
             worker.record_runtime_queue_state(
-                usize::from(self.atomic_commit_arbiter.worker_job_queued()),
-                self.atomic_commit_arbiter.kernel_commit_submitted(),
+                usize::from(self.head.atomic_commit_arbiter.worker_job_queued()),
+                self.head.atomic_commit_arbiter.kernel_commit_submitted(),
             );
         }
         let perf = self.perf;
@@ -635,12 +648,13 @@ impl NativeRuntime {
                 xwm_commands_per_cycle_max,
             ) = self.xwayland.xwayland_timing_snapshot();
             let fullscreen = self.server.fullscreen_render_plan_metrics();
-            let transaction_counters = self.output_transactions.counters();
-            let presented = self.scanout.direct_scanout_presented_info();
-            let submitted = self.scanout.direct_scanout_submitted_info();
+            let transaction_counters = self.head.output_transactions.counters();
+            let presented = self.head.scanout.direct_scanout_presented_info();
+            let submitted = self.head.scanout.direct_scanout_submitted_info();
             // Queued identity belongs to the Atomic arbiter; physical resources
             // are reported separately from DirectPrimaryOwnership below.
             let direct_pending = self
+                .head
                 .atomic_commit_arbiter
                 .pending_atomic_kind()
                 .is_some_and(|kind| matches!(kind, AtomicCommitKind::DirectPrimary { .. }));
@@ -673,20 +687,29 @@ impl NativeRuntime {
                     self.dmabuf_feedback_compat_metrics
                         .scanout_target_normalization_rejections,
                 ),
-                NativePerfField::str("state_after", format!("{:?}", self.frame_scheduler.state())),
-                NativePerfField::bool("pageflip_pending", self.frame_scheduler.page_flip_pending()),
+                NativePerfField::str(
+                    "state_after",
+                    format!("{:?}", self.head.frame_scheduler.state()),
+                ),
+                NativePerfField::bool(
+                    "pageflip_pending",
+                    self.head.frame_scheduler.page_flip_pending(),
+                ),
                 NativePerfField::bool(
                     "ready_frame_queued",
-                    self.frame_scheduler.ready_frame_queued(),
+                    self.head.frame_scheduler.ready_frame_queued(),
                 ),
-                NativePerfField::bool("scanout_ready_frame", self.scanout.ready_frame_queued()),
+                NativePerfField::bool(
+                    "scanout_ready_frame",
+                    self.head.scanout.ready_frame_queued(),
+                ),
                 NativePerfField::bool(
                     "visual_work_queued",
-                    self.frame_scheduler.visual_work_queued(),
+                    self.head.frame_scheduler.visual_work_queued(),
                 ),
                 NativePerfField::bool(
                     "protocol_work_queued",
-                    self.frame_scheduler.protocol_work_queued(),
+                    self.head.frame_scheduler.protocol_work_queued(),
                 ),
                 NativePerfField::bool("frame_rendered", cycle.frame_rendered),
                 NativePerfField::bool("frame_submitted", cycle.frame_submitted),
@@ -694,7 +717,7 @@ impl NativeRuntime {
                 NativePerfField::bool("presentation_admitted", cycle.presentation_admitted),
                 NativePerfField::u64(
                     "last_rendered_scene_generation",
-                    self.last_rendered_scene_generation,
+                    self.head.last_rendered_scene_generation,
                 ),
                 NativePerfField::u64(
                     "scene_render_generation",
@@ -703,38 +726,43 @@ impl NativeRuntime {
                 NativePerfField::bool(
                     "visual_scene_debt",
                     super::commit_timing::logical_scene_changed(
-                        self.last_rendered_scene_generation,
+                        self.head.last_rendered_scene_generation,
                         self.server.scene_render_generation(),
                     ),
                 ),
                 NativePerfField::u64(
                     "watchdog_timeout_count",
-                    self.frame_scheduler.watchdog_timeout_count(),
+                    self.head.frame_scheduler.watchdog_timeout_count(),
                 ),
                 NativePerfField::u64(
                     "atomic_commits_submitted_total",
-                    self.atomic_commit_arbiter.atomic_commits_submitted_total(),
+                    self.head
+                        .atomic_commit_arbiter
+                        .atomic_commits_submitted_total(),
                 ),
                 NativePerfField::u64(
                     "atomic_commits_completed_total",
-                    self.atomic_commit_arbiter.atomic_commits_completed_total(),
+                    self.head
+                        .atomic_commit_arbiter
+                        .atomic_commits_completed_total(),
                 ),
                 NativePerfField::u64(
                     "atomic_commit_watchdog_timeouts_total",
-                    self.atomic_commit_arbiter
+                    self.head
+                        .atomic_commit_arbiter
                         .atomic_commit_watchdog_timeouts_total(),
                 ),
                 NativePerfField::u64(
                     "atomic_cursor_watchdog_timeouts",
-                    self.atomic_commit_arbiter.cursor_watchdog_timeouts(),
+                    self.head.atomic_commit_arbiter.cursor_watchdog_timeouts(),
                 ),
                 NativePerfField::u64(
                     "atomic_primary_watchdog_timeouts",
-                    self.atomic_commit_arbiter.primary_watchdog_timeouts(),
+                    self.head.atomic_commit_arbiter.primary_watchdog_timeouts(),
                 ),
                 NativePerfField::str(
                     "kms_commit_transport",
-                    match self.kms_commit_worker_transport {
+                    match self.head.kms_commit_worker_transport {
                         crate::native_output::kms_worker::KmsCommitWorkerTransport::Synchronous => {
                             "sync"
                         }
@@ -745,77 +773,94 @@ impl NativeRuntime {
                 ),
                 NativePerfField::usize(
                     "worker_queue_depth",
-                    self.kms_commit_worker
+                    self.head
+                        .kms_commit_worker
                         .as_ref()
                         .map_or(0, |worker| worker.queue_depth()),
                 ),
                 NativePerfField::bool(
                     "worker_inflight",
-                    self.kms_commit_worker
+                    self.head
+                        .kms_commit_worker
                         .as_ref()
                         .is_some_and(|worker| worker.inflight()),
                 ),
                 NativePerfField::bool(
                     "worker_submit_active",
-                    self.kms_commit_worker
+                    self.head
+                        .kms_commit_worker
                         .as_ref()
                         .is_some_and(|worker| worker.submission_active()),
                 ),
                 NativePerfField::u64("cursor_pageflip_early_returns", 0),
                 NativePerfField::u64(
                     "cursor_response_windows_opened",
-                    self.cursor_output_arbitration.response_windows_opened(),
+                    self.head
+                        .cursor_output_arbitration
+                        .response_windows_opened(),
                 ),
                 NativePerfField::u64(
                     "cursor_changes_coalesced",
-                    self.cursor_output_arbitration.changes_coalesced(),
+                    self.head.cursor_output_arbitration.changes_coalesced(),
                 ),
                 NativePerfField::u64(
                     "plane_delta_plans",
-                    self.cursor_output_arbitration.plane_delta_plans(),
+                    self.head.cursor_output_arbitration.plane_delta_plans(),
                 ),
                 NativePerfField::u64(
                     "plane_delta_submissions",
-                    self.cursor_output_arbitration.plane_delta_submissions(),
+                    self.head
+                        .cursor_output_arbitration
+                        .plane_delta_submissions(),
                 ),
                 NativePerfField::u64(
                     "plane_delta_deferred_for_primary",
-                    self.cursor_output_arbitration
+                    self.head
+                        .cursor_output_arbitration
                         .plane_delta_deferred_for_primary(),
                 ),
                 NativePerfField::u64(
                     "cursor_state_piggybacked",
-                    self.cursor_output_arbitration.cursor_state_piggybacked(),
+                    self.head
+                        .cursor_output_arbitration
+                        .cursor_state_piggybacked(),
                 ),
                 NativePerfField::u64(
                     "cursor_idle_hardware_updates",
-                    self.cursor_output_arbitration.idle_hardware_updates(),
+                    self.head.cursor_output_arbitration.idle_hardware_updates(),
                 ),
                 NativePerfField::u64(
                     "cursor_idle_software_updates",
-                    self.cursor_output_arbitration.idle_software_updates(),
+                    self.head.cursor_output_arbitration.idle_software_updates(),
                 ),
                 NativePerfField::bool(
                     "cursor_response_window_open",
-                    self.cursor_output_arbitration.pending(),
+                    self.head.cursor_output_arbitration.pending(),
                 ),
                 NativePerfField::u64(
                     "cursor_response_deadline_ns",
-                    self.cursor_output_arbitration.deadline_ns().unwrap_or(0),
+                    self.head
+                        .cursor_output_arbitration
+                        .deadline_ns()
+                        .unwrap_or(0),
                 ),
                 NativePerfField::str(
                     "atomic_pending_commit_kind",
-                    self.atomic_commit_arbiter
+                    self.head
+                        .atomic_commit_arbiter
                         .pending_atomic_kind()
                         .map(|kind| format!("{kind:?}"))
                         .unwrap_or_else(|| "none".to_string()),
                 ),
                 NativePerfField::u64(
                     "mismatched_pageflip_events",
-                    self.mismatched_pageflip_events,
+                    self.head.mismatched_pageflip_events,
                 ),
-                NativePerfField::u64("stale_pageflip_events", self.stale_pageflip_events),
-                NativePerfField::u64("presentations", self.presentation_cadence.presentations()),
+                NativePerfField::u64("stale_pageflip_events", self.head.stale_pageflip_events),
+                NativePerfField::u64(
+                    "presentations",
+                    self.head.presentation_cadence.presentations(),
+                ),
                 NativePerfField::usize("presentation_trace_events", self.presentation_trace.len()),
                 NativePerfField::u64(
                     "presentation_trace_dropped",
@@ -829,7 +874,7 @@ impl NativeRuntime {
                 NativePerfField::u64("xwm_commands_per_cycle_max", xwm_commands_per_cycle_max),
                 NativePerfField::u64(
                     "presentation_sequence_gaps",
-                    self.presentation_cadence.sequence_gaps(),
+                    self.head.presentation_cadence.sequence_gaps(),
                 ),
                 NativePerfField::bool("fullscreen_active", fullscreen.fullscreen_active),
                 NativePerfField::str(
@@ -893,7 +938,7 @@ impl NativeRuntime {
                 self.xwayland
                     .xwayland_override_redirect_stack_snapshots_emitted(),
             ));
-            if let Some(worker) = self.kms_commit_worker.as_ref() {
+            if let Some(worker) = self.head.kms_commit_worker.as_ref() {
                 let metrics = worker.metrics_snapshot();
                 fields.extend([
                     NativePerfField::u64("worker_jobs_enqueued", metrics.jobs_enqueued),
@@ -1080,8 +1125,8 @@ impl NativeRuntime {
                 ),
                 NativePerfField::bool(
                     "atomic_cursor_hardware_active",
-                    self.atomic_cursor.is_some()
-                        && self.cursor_render_mode == NativeCursorRenderMode::Hardware,
+                    self.head.atomic_cursor.is_some()
+                        && self.head.cursor_render_mode == NativeCursorRenderMode::Hardware,
                 ),
                 NativePerfField::str("direct_scanout_policy", direct_scanout_policy),
                 NativePerfField::str(
@@ -1090,24 +1135,26 @@ impl NativeRuntime {
                 ),
                 NativePerfField::bool(
                     "direct_scanout_active",
-                    self.presented_planes
+                    self.head
+                        .presented_planes
                         .primary
                         .is_some_and(|assignment| assignment.is_direct()),
                 ),
                 NativePerfField::bool("direct_scanout_pending", direct_pending),
                 NativePerfField::bool(
                     "direct_scanout_fallback_active",
-                    self.direct_fallback_tracker.is_some(),
+                    self.head.direct_fallback_tracker.is_some(),
                 ),
                 NativePerfField::str(
                     "direct_scanout_first_blocker",
-                    self.scanout
+                    self.head
+                        .scanout
                         .direct_scanout_counters()
                         .and_then(|counters| counters.first_blocker)
                         .unwrap_or("none"),
                 ),
             ]);
-            if let Some(pending) = self.atomic_commit_arbiter.pending_atomic_commit() {
+            if let Some(pending) = self.head.atomic_commit_arbiter.pending_atomic_commit() {
                 fields.extend([
                     NativePerfField::u64("atomic_pending_token", pending.token.get()),
                     NativePerfField::u64("atomic_pending_crtc", u64::from(pending.crtc_id)),
@@ -1120,14 +1167,14 @@ impl NativeRuntime {
                 ]);
             }
             if let Some((_buffer, _framebuffer, format, modifier)) =
-                self.scanout.direct_scanout_info()
+                self.head.scanout.direct_scanout_info()
             {
                 fields.extend([
                     NativePerfField::u64("direct_scanout_format", u64::from(format)),
                     NativePerfField::u64("direct_scanout_modifier", modifier),
                 ]);
             }
-            if let Some(counters) = self.scanout.direct_scanout_counters() {
+            if let Some(counters) = self.head.scanout.direct_scanout_counters() {
                 fields.extend([
                     NativePerfField::u64(
                         "direct_scanout_candidate_checks",
@@ -1322,7 +1369,7 @@ impl NativeRuntime {
                 ]);
             }
             if scaled_primary_probe_enabled() {
-                let counters = self.scaled_primary_probe.counters();
+                let counters = self.head.scaled_primary_probe.counters();
                 fields.extend([
                     NativePerfField::u64(
                         "scaled_primary_probe_candidate_observations",
@@ -1384,7 +1431,7 @@ impl NativeRuntime {
                     submitted.map_or_else(|| "none".to_string(), |value| value.3.to_string()),
                 ),
             ]);
-            if let Some(cursor) = self.atomic_cursor.as_ref() {
+            if let Some(cursor) = self.head.atomic_cursor.as_ref() {
                 fields.extend([
                     NativePerfField::u64(
                         "atomic_cursor_image_uploads",
@@ -1452,12 +1499,13 @@ impl NativeRuntime {
             .current_scheduler_wake_requirement(now_ns)?
             .deadline()
             .map(|deadline| deadline.at_ns);
-        self.frame_pacing.note_deadline_state(
+        self.head.frame_pacing.note_deadline_state(
             scheduler_decision,
             now_ns,
             scheduler_deadline,
             None,
-            self.frame_scheduler.ready_frame_queued() || self.scanout.ready_frame_queued(),
+            self.head.frame_scheduler.ready_frame_queued()
+                || self.head.scanout.ready_frame_queued(),
             cycle.wakeup.reasons.timer(),
         );
         self.arm_runtime_deadline()?;

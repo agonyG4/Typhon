@@ -752,7 +752,7 @@ impl NativeRuntime {
     pub(super) fn validate_output_pipeline(
         &self,
     ) -> Result<Option<OutputPipelineSnapshot>, PipelineSnapshotError> {
-        let Some(swapchain) = self.scanout.explicit_output_swapchain() else {
+        let Some(swapchain) = self.head.scanout.explicit_output_swapchain() else {
             return Ok(None);
         };
         let capability = if swapchain.is_poisoned() {
@@ -761,17 +761,17 @@ impl NativeRuntime {
             TripleCapability::Capable
         };
         let snapshot = build_output_pipeline_snapshot_with_presented(
-            self.output_epoch.get(),
-            self.target.crtc_id,
-            self.adaptive_buffering.pacing_mode(),
-            self.adaptive_buffering.desired_credit(),
+            self.head.output_epoch.get(),
+            self.head.target.crtc_id,
+            self.head.adaptive_buffering.pacing_mode(),
+            self.head.adaptive_buffering.desired_credit(),
             swapchain,
-            &self.output_transactions,
-            &self.atomic_commit_arbiter,
-            self.scanout.explicit_presented_direct_ownership(),
-            self.scheduled_presentation_target,
+            &self.head.output_transactions,
+            &self.head.atomic_commit_arbiter,
+            self.head.scanout.explicit_presented_direct_ownership(),
+            self.head.scheduled_presentation_target,
             capability,
-            self.presented_planes,
+            self.head.presented_planes,
         )?;
         Ok(Some(snapshot))
     }

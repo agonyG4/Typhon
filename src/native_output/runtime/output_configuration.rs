@@ -319,15 +319,18 @@ impl PendingOutputConfigurationRequest {
 impl NativeRuntime {
     pub(super) fn rebase_output_epoch_frame_lanes(&mut self, now_ns: u64) {
         debug_assert!(
-            !self.frame_pacing.has_unsettled_output_frame_ownership(),
+            !self
+                .head
+                .frame_pacing
+                .has_unsettled_output_frame_ownership(),
             "scheduler/pacing rebase requires old output ownership to be terminal"
         );
-        debug_assert!(!self.frame_scheduler.ready_frame_queued());
-        debug_assert!(!self.frame_scheduler.page_flip_pending());
-        debug_assert!(!self.frame_scheduler.worker_submission_queued());
-        self.frame_pacing.rebase_after_output_epoch();
-        self.frame_scheduler = NativeFrameScheduler::new_with_refresh_interval_ns(
-            self.output_refresh_rate.interval_ns(),
+        debug_assert!(!self.head.frame_scheduler.ready_frame_queued());
+        debug_assert!(!self.head.frame_scheduler.page_flip_pending());
+        debug_assert!(!self.head.frame_scheduler.worker_submission_queued());
+        self.head.frame_pacing.rebase_after_output_epoch();
+        self.head.frame_scheduler = NativeFrameScheduler::new_with_refresh_interval_ns(
+            self.head.output_refresh_rate.interval_ns(),
             now_ns,
         );
     }
@@ -336,24 +339,29 @@ impl NativeRuntime {
         &mut self,
         now_ns: u64,
     ) -> NativeResult<()> {
-        if self.output_transactions.active_count() != 0 {
+        if self.head.output_transactions.active_count() != 0 {
             return Err(io::Error::other(
                 "session output epoch still owns active output transactions",
             )
             .into());
         }
-        if let Some(physical_identity) = self.frame_pacing.unsubmitted_physical_identity() {
-            self.frame_pacing
+        if let Some(physical_identity) = self.head.frame_pacing.unsubmitted_physical_identity() {
+            self.head
+                .frame_pacing
                 .terminalize_unsubmitted_physical_frame(physical_identity)
                 .map_err(io::Error::other)?;
-        } else if self.frame_pacing.active.is_some() {
-            self.frame_pacing
+        } else if self.head.frame_pacing.active.is_some() {
+            self.head
+                .frame_pacing
                 .complete_unsubmitted_render_without_visual_change();
         }
-        if self.frame_pacing.has_unsettled_output_frame_ownership()
-            || self.frame_scheduler.ready_frame_queued()
-            || self.frame_scheduler.page_flip_pending()
-            || self.frame_scheduler.worker_submission_queued()
+        if self
+            .head
+            .frame_pacing
+            .has_unsettled_output_frame_ownership()
+            || self.head.frame_scheduler.ready_frame_queued()
+            || self.head.frame_scheduler.page_flip_pending()
+            || self.head.frame_scheduler.worker_submission_queued()
         {
             return Err(io::Error::other(
                 "session output epoch retained frame ownership before rebase",
@@ -369,14 +377,14 @@ impl NativeRuntime {
         identity: AtomicRenderCandidateIdentity,
         result: io::Result<(Box<AtomicRenderedFrameParts>, AtomicRenderDomainInfo)>,
     ) -> NativeResult<()> {
-        let Some(mut pending) = self.pending_output_configuration.take() else {
+        let Some(mut pending) = self.head.pending_output_configuration.take() else {
             return Err(io::Error::other(
                 "render candidate completion arrived without output-configuration ownership",
             )
             .into());
         };
         let Some(candidate_state) = pending.candidate.take() else {
-            self.pending_output_configuration = Some(pending);
+            self.head.pending_output_configuration = Some(pending);
             return Err(io::Error::other(
                 "render candidate completion arrived outside candidate preparation",
             )
@@ -391,7 +399,7 @@ impl NativeRuntime {
             }
             other => {
                 pending.candidate = Some(other);
-                self.pending_output_configuration = Some(pending);
+                self.head.pending_output_configuration = Some(pending);
                 return Err(io::Error::other(
                     "render candidate completion arrived outside candidate preparation",
                 )
@@ -400,7 +408,7 @@ impl NativeRuntime {
         };
         if !candidate.identity().matches(identity) {
             pending.candidate = Some(CandidateScanoutState::WorkerPreparing { candidate, cursor });
-            self.pending_output_configuration = Some(pending);
+            self.head.pending_output_configuration = Some(pending);
             return Err(io::Error::other(
                 "render candidate completion identity does not match output configuration",
             )
@@ -411,7 +419,7 @@ impl NativeRuntime {
                 Ok((_frame, _render_info)) => {
                     pending.candidate =
                         Some(CandidateScanoutState::WorkerDiscardQueued { candidate, detail });
-                    self.pending_output_configuration = Some(pending);
+                    self.head.pending_output_configuration = Some(pending);
                 }
                 Err(error) => {
                     candidate.worker_domain_destroyed();
@@ -432,7 +440,7 @@ impl NativeRuntime {
                 if frame.slot != identity.slot {
                     pending.candidate =
                         Some(CandidateScanoutState::WorkerPreparing { candidate, cursor });
-                    self.pending_output_configuration = Some(pending);
+                    self.head.pending_output_configuration = Some(pending);
                     return Err(io::Error::other(
                         "render candidate completed for the wrong physical slot",
                     )
@@ -443,7 +451,7 @@ impl NativeRuntime {
                     .readiness_fd()
                     .ok_or_else(|| io::Error::other("candidate render fence has no readiness fd"))?
                     .as_raw_fd();
-                self.output_render_fence_token = Some(
+                self.head.output_render_fence_token = Some(
                     self.event_loop
                         .register(fd, NativeEventSource::OutputRenderFence)?,
                 );
@@ -453,7 +461,7 @@ impl NativeRuntime {
                     render_info,
                     cursor,
                 });
-                self.pending_output_configuration = Some(pending);
+                self.head.pending_output_configuration = Some(pending);
             }
             Err(error) => {
                 candidate.worker_domain_destroyed();
@@ -471,7 +479,7 @@ impl NativeRuntime {
         &mut self,
         identity: AtomicRenderCandidateIdentity,
     ) -> NativeResult<()> {
-        let Some(mut pending) = self.pending_output_configuration.take() else {
+        let Some(mut pending) = self.head.pending_output_configuration.take() else {
             return Err(io::Error::other(
                 "render candidate promotion acknowledgement has no output request",
             )
@@ -485,7 +493,7 @@ impl NativeRuntime {
             committed_at_ns,
         }) = pending.candidate.take()
         else {
-            self.pending_output_configuration = Some(pending);
+            self.head.pending_output_configuration = Some(pending);
             return Err(io::Error::other(
                 "render candidate promotion acknowledgement arrived in the wrong state",
             )
@@ -499,7 +507,7 @@ impl NativeRuntime {
                 cursor,
                 committed_at_ns,
             });
-            self.pending_output_configuration = Some(pending);
+            self.head.pending_output_configuration = Some(pending);
             return Err(io::Error::other(
                 "render candidate promotion identity does not match output request",
             )
@@ -512,7 +520,7 @@ impl NativeRuntime {
             cursor,
             committed_at_ns,
         });
-        self.pending_output_configuration = Some(pending);
+        self.head.pending_output_configuration = Some(pending);
         self.event_loop.request_continuation(
             oblivion_one::native::event_loop::NativeContinuationReason::FrameScheduler,
         )?;
@@ -523,7 +531,7 @@ impl NativeRuntime {
         &mut self,
         identity: AtomicRenderCandidateIdentity,
     ) -> NativeResult<()> {
-        let Some(mut pending) = self.pending_output_configuration.take() else {
+        let Some(mut pending) = self.head.pending_output_configuration.take() else {
             return Err(io::Error::other(
                 "render candidate discard acknowledgement has no output request",
             )
@@ -534,7 +542,7 @@ impl NativeRuntime {
             detail,
         }) = pending.candidate.take()
         else {
-            self.pending_output_configuration = Some(pending);
+            self.head.pending_output_configuration = Some(pending);
             return Err(io::Error::other(
                 "render candidate discard acknowledgement arrived in the wrong state",
             )
@@ -542,7 +550,7 @@ impl NativeRuntime {
         };
         if !candidate.identity().matches(identity) {
             pending.candidate = Some(CandidateScanoutState::WorkerDiscarding { candidate, detail });
-            self.pending_output_configuration = Some(pending);
+            self.head.pending_output_configuration = Some(pending);
             return Err(io::Error::other(
                 "render candidate discard identity does not match output request",
             )
@@ -1116,7 +1124,7 @@ impl NativeRuntime {
         quiesced_epoch: QuiescedOutputEpoch,
         commit_started_at_ns: u64,
     ) -> Result<u64, String> {
-        if quiesced_epoch.output_epoch() != self.output_epoch {
+        if quiesced_epoch.output_epoch() != self.head.output_epoch {
             return Err("quiescence proof belongs to a stale output epoch".into());
         }
         let commit_started = Instant::now();
@@ -1132,24 +1140,25 @@ impl NativeRuntime {
     }
 
     fn output_mode_mutation_support(&self) -> Result<(), OutputModeMutationBlocker> {
-        let rollback_failed =
-            self.output_configuration_transactions
-                .active()
-                .is_some_and(|transaction| {
-                    matches!(
-                        transaction.phase,
-                        OutputConfigurationTransactionPhase::RollbackFailed { .. }
-                    )
-                });
+        let rollback_failed = self
+            .head
+            .output_configuration_transactions
+            .active()
+            .is_some_and(|transaction| {
+                matches!(
+                    transaction.phase,
+                    OutputConfigurationTransactionPhase::RollbackFailed { .. }
+                )
+            });
         output_mode_mutation_support(
             OUTPUT_MODE_SELECTION_RUNTIME_QUALIFIED,
-            self.output_mode_mutation_policy,
+            self.head.output_mode_mutation_policy,
             OutputModeMutationRuntimeEvidence {
                 atomic_kms: self.kms_backend.effective_kind()
                     == oblivion_one::native::kms::KmsBackendKind::Atomic,
-                exact_mode_count: self.output_capabilities.mode_inventory.entries().len(),
-                scanout_kind: self.scanout.kind(),
-                scanout_available: !self.scanout_destroyed,
+                exact_mode_count: self.head.output_capabilities.mode_inventory.entries().len(),
+                scanout_kind: self.head.scanout.kind(),
+                scanout_available: !self.head.scanout_destroyed,
                 persistence_available: self
                     .output_configuration_persistence_worker
                     .as_ref()
@@ -1168,13 +1177,13 @@ impl NativeRuntime {
             .map_or("none", OutputModeMutationBlocker::as_str);
         eprintln!(
             "native display mutation: policy={} production_qualified={} effective={} blocker={} kms={} scanout={} exact_modes={}",
-            self.output_mode_mutation_policy.as_str(),
+            self.head.output_mode_mutation_policy.as_str(),
             OUTPUT_MODE_SELECTION_RUNTIME_QUALIFIED,
             blocker == "none",
             blocker,
             self.kms_backend.effective_kind().as_str(),
-            self.scanout.kind().as_str(),
-            self.output_capabilities.mode_inventory.entries().len(),
+            self.head.scanout.kind().as_str(),
+            self.head.output_capabilities.mode_inventory.entries().len(),
         );
     }
 
@@ -1184,8 +1193,8 @@ impl NativeRuntime {
         request_id: u64,
         target: NativeAppliedOutputConfiguration,
     ) {
-        let previous = self.target;
-        self.pending_output_configuration = Some(PendingOutputConfigurationRequest::new(
+        let previous = self.head.target;
+        self.head.pending_output_configuration = Some(PendingOutputConfigurationRequest::new(
             Some((token, request_id)),
             OutputConfigurationOperation::TemporaryApply { previous },
             target,
@@ -1228,6 +1237,7 @@ impl NativeRuntime {
         match command {
             ControlCommand::OutputsConfigureConfirm => {
                 let config = match self
+                    .head
                     .output_configuration_transactions
                     .begin_confirm(transaction_id, now_ns)
                 {
@@ -1251,11 +1261,10 @@ impl NativeRuntime {
                     }) {
                     Ok(bytes) => bytes,
                     Err(error) => {
-                        let _ = self.output_configuration_transactions.complete_confirm(
-                            transaction_id,
-                            false,
-                            now_ns,
-                        );
+                        let _ = self
+                            .head
+                            .output_configuration_transactions
+                            .complete_confirm(transaction_id, false, now_ns);
                         let mut response = ControlResponse::failure(
                             request_id,
                             ControlError::new(
@@ -1277,11 +1286,10 @@ impl NativeRuntime {
                 ) {
                     Ok(()) => None,
                     Err(error) => {
-                        let _ = self.output_configuration_transactions.complete_confirm(
-                            transaction_id,
-                            false,
-                            now_ns,
-                        );
+                        let _ = self
+                            .head
+                            .output_configuration_transactions
+                            .complete_confirm(transaction_id, false, now_ns);
                         Some(ControlResponse::failure(
                             request_id,
                             ControlError::new(
@@ -1295,6 +1303,7 @@ impl NativeRuntime {
             }
             ControlCommand::OutputsConfigureRevert => {
                 let target = match self
+                    .head
                     .output_configuration_transactions
                     .begin_revert(transaction_id)
                 {
@@ -1309,11 +1318,12 @@ impl NativeRuntime {
                         ));
                     }
                 };
-                self.pending_output_configuration = Some(PendingOutputConfigurationRequest::new(
-                    Some((token, request_id)),
-                    OutputConfigurationOperation::Rollback { transaction_id },
-                    target,
-                ));
+                self.head.pending_output_configuration =
+                    Some(PendingOutputConfigurationRequest::new(
+                        Some((token, request_id)),
+                        OutputConfigurationOperation::Rollback { transaction_id },
+                        target,
+                    ));
                 None
             }
             _ => Some(ControlResponse::failure(
@@ -1330,18 +1340,19 @@ impl NativeRuntime {
         &self,
         target: NativeAppliedOutputConfiguration,
     ) -> io::Result<PersistedOutputConfiguration> {
-        let physical_size_mm =
-            self.output_capabilities
-                .physical_size_mm
-                .as_ref()
-                .and_then(|size| {
-                    Some(PersistedOutputPhysicalSize {
-                        width_mm: size.width_mm,
-                        height_mm: size.height_mm,
-                    })
-                });
+        let physical_size_mm = self
+            .head
+            .output_capabilities
+            .physical_size_mm
+            .as_ref()
+            .and_then(|size| {
+                Some(PersistedOutputPhysicalSize {
+                    width_mm: size.width_mm,
+                    height_mm: size.height_mm,
+                })
+            });
         Ok(PersistedOutputConfiguration::from_native_mode(
-            self.output_capabilities.connector_name.clone(),
+            self.head.output_capabilities.connector_name.clone(),
             physical_size_mm,
             &target.mode,
             target.color_depth,
@@ -1410,11 +1421,14 @@ impl NativeRuntime {
             }
             match pending.purpose {
                 OutputPersistencePurpose::Confirm { transaction_id } => {
-                    match self.output_configuration_transactions.complete_confirm(
-                        transaction_id,
-                        completion.result.is_ok(),
-                        monotonic_now_ns()?,
-                    ) {
+                    match self
+                        .head
+                        .output_configuration_transactions
+                        .complete_confirm(
+                            transaction_id,
+                            completion.result.is_ok(),
+                            monotonic_now_ns()?,
+                        ) {
                         OutputConfigurationConfirmCompletion::Confirmed => {
                             self.queue_output_snapshot_response(pending.response)?;
                         }
@@ -1462,11 +1476,10 @@ impl NativeRuntime {
             return Ok(());
         };
         if let OutputPersistencePurpose::Confirm { transaction_id } = pending.purpose {
-            let _ = self.output_configuration_transactions.complete_confirm(
-                transaction_id,
-                false,
-                monotonic_now_ns()?,
-            );
+            let _ = self
+                .head
+                .output_configuration_transactions
+                .complete_confirm(transaction_id, false, monotonic_now_ns()?);
             self.queue_output_error_response(
                 pending.response,
                 oblivion_one::control::ControlErrorCode::OutputPersistFailed,
@@ -1519,17 +1532,18 @@ impl NativeRuntime {
     ) -> NativeResult<()> {
         if let Err(error) = super::cycle::validate_reconfiguration_frame_ownership_with_arbiter(
             explicit,
-            self.output_epoch,
-            self.target.crtc_id,
-            &self.scene_history,
-            &self.frame_pacing,
-            &self.frame_scheduler,
-            &self.atomic_commit_arbiter,
-            &self.output_transactions,
+            self.head.output_epoch,
+            self.head.target.crtc_id,
+            &self.head.scene_history,
+            &self.head.frame_pacing,
+            &self.head.frame_scheduler,
+            &self.head.atomic_commit_arbiter,
+            &self.head.output_transactions,
         ) {
             let swapchain = explicit.swapchain()?;
             let physical_ready = swapchain.ready_identity();
             let scheduler_target_identity = self
+                .head
                 .frame_scheduler
                 .ready_target()
                 .map(|target| target.identity());
@@ -1537,13 +1551,15 @@ impl NativeRuntime {
                 .and_then(|owner| owner.fixed_target())
                 .map(|target| target.identity());
             let transaction = physical_ready.and_then(|owner| {
-                self.output_transactions
+                self.head
+                    .output_transactions
                     .transaction(owner.transaction_id)
                     .map(|record| (owner.transaction_id, record.state().kind()))
             });
             let worker_queued = swapchain.worker_queued_identity();
             let worker_transaction = worker_queued.and_then(|owner| {
-                self.output_transactions
+                self.head
+                    .output_transactions
                     .transaction(owner.frame.transaction_id)
                     .map(|record| {
                         (
@@ -1553,7 +1569,7 @@ impl NativeRuntime {
                         )
                     })
             });
-            let worker_pacing_ticket = self.frame_pacing.worker_reservation_ticket();
+            let worker_pacing_ticket = self.head.frame_pacing.worker_reservation_ticket();
             let worker_ticket = worker_pacing_ticket.map(|ticket| {
                 (
                     ticket,
@@ -1577,12 +1593,17 @@ impl NativeRuntime {
             let worker_scene = worker_queued.map(|owner| {
                 (
                     owner.token,
-                    self.scene_history.submitted_identity(owner.token.get()),
+                    self.head
+                        .scene_history
+                        .submitted_identity(owner.token.get()),
                 )
             });
-            let pacing_lane = physical_ready
-                .and_then(|owner| self.frame_pacing.unsubmitted_physical_frame_lane(owner));
-            let worker_snapshot = self.kms_commit_worker.as_ref().map(|worker| {
+            let pacing_lane = physical_ready.and_then(|owner| {
+                self.head
+                    .frame_pacing
+                    .unsubmitted_physical_frame_lane(owner)
+            });
+            let worker_snapshot = self.head.kms_commit_worker.as_ref().map(|worker| {
                 (
                     worker.queue_depth(),
                     worker.inflight(),
@@ -1590,27 +1611,29 @@ impl NativeRuntime {
                 )
             });
             let arbiter_snapshot = (
-                self.atomic_commit_arbiter.worker_queued_token(),
-                self.atomic_commit_arbiter.worker_queued_kind(),
-                self.atomic_commit_arbiter.kernel_submitted_token(),
-                self.atomic_commit_arbiter.kernel_submitted_kind(),
-                self.atomic_commit_arbiter
+                self.head.atomic_commit_arbiter.worker_queued_token(),
+                self.head.atomic_commit_arbiter.worker_queued_kind(),
+                self.head.atomic_commit_arbiter.kernel_submitted_token(),
+                self.head.atomic_commit_arbiter.kernel_submitted_kind(),
+                self.head
+                    .atomic_commit_arbiter
                     .worker_queued_commit()
                     .map(|commit| commit.phase),
-                self.atomic_commit_arbiter
+                self.head
+                    .atomic_commit_arbiter
                     .kernel_submitted_commit()
                     .map(|commit| commit.phase),
             );
             return Err(io::Error::other(format!(
                 "{error}; output ownership diagnostic: output_epoch={} scheduler_ready={} worker_queued_present={} worker_queued_frame_id={worker_queued_frame_id:?} worker_queued_token={worker_queued_token:?} worker_ticket_present={worker_ticket_present} worker_ticket_reservation_id={worker_ticket_reservation_id:?} worker_ticket_frame_id={worker_ticket_frame_id:?} worker_ticket_ready_submit={worker_ticket_ready_submit:?} worker_ticket_physical_frame_id={worker_ticket_physical_frame_id:?} scheduler_target_identity={scheduler_target_identity:?} physical_target_identity={physical_target_identity:?} latest_submitted_frame_id={:?} latest_presented_frame_id={:?} physical_ready={physical_ready:?} scene_ready={:?} ready_transaction={transaction:?} pacing_identity={:?} pacing_lane={pacing_lane:?} scheduler_target={:?} worker_queued={worker_queued:?} worker_transaction={worker_transaction:?} worker_ticket={worker_ticket:?} worker_scene={worker_scene:?} swapchain_submitted={:?} arbiter_queued=(token={:?},kind={:?},phase={:?}) arbiter_submitted=(token={:?},kind={:?},phase={:?}) kms_worker={worker_snapshot:?}",
-                self.output_epoch.get(),
-                self.frame_scheduler.ready_frame_queued(),
+                self.head.output_epoch.get(),
+                self.head.frame_scheduler.ready_frame_queued(),
                 worker_queued_present,
-                self.scene_history.latest_submitted_frame_id(),
-                self.scene_history.presented_frame_id(),
-                self.scene_history.ready_frame_identity(),
-                self.frame_pacing.unsubmitted_physical_identity(),
-                self.frame_scheduler.ready_target(),
+                self.head.scene_history.latest_submitted_frame_id(),
+                self.head.scene_history.presented_frame_id(),
+                self.head.scene_history.ready_frame_identity(),
+                self.head.frame_pacing.unsubmitted_physical_identity(),
+                self.head.frame_scheduler.ready_target(),
                 swapchain.pending_identity(),
                 arbiter_snapshot.0,
                 arbiter_snapshot.1,
@@ -1628,8 +1651,8 @@ impl NativeRuntime {
     /// names the candidate state and the boundary owners that hold it.
     pub(crate) fn report_stalled_output_configuration(&mut self, now_ns: u64) {
         let boundary = self.native_output_reconfiguration_boundary();
-        let render_worker_busy = self.scanout.render_worker_busy();
-        let Some(pending) = self.pending_output_configuration.as_mut() else {
+        let render_worker_busy = self.head.scanout.render_worker_busy();
+        let Some(pending) = self.head.pending_output_configuration.as_mut() else {
             return;
         };
         let waiting_since_ns = *pending.waiting_since_ns.get_or_insert(now_ns);
@@ -1664,24 +1687,29 @@ impl NativeRuntime {
         if !self.parked_acquire_watches.is_empty() {
             self.rearm_output_acquire_watches(now_ns);
         }
-        if self.pending_output_configuration.is_none()
+        if self.head.pending_output_configuration.is_none()
             && let Some((transaction_id, target)) = self
+                .head
                 .output_configuration_transactions
                 .begin_expired_rollback(now_ns)
         {
-            self.pending_output_configuration = Some(PendingOutputConfigurationRequest::new(
+            self.head.pending_output_configuration = Some(PendingOutputConfigurationRequest::new(
                 None,
                 OutputConfigurationOperation::Rollback { transaction_id },
                 target,
             ));
         }
 
-        if self.pending_output_configuration.is_none()
+        if self.head.pending_output_configuration.is_none()
             && self.output_persistence_compensation_required
             && self.pending_output_persistence.is_none()
-            && self.output_configuration_transactions.active().is_none()
+            && self
+                .head
+                .output_configuration_transactions
+                .active()
+                .is_none()
         {
-            let current = self.persisted_output_configuration(self.target)?;
+            let current = self.persisted_output_configuration(self.head.target)?;
             if let Ok(bytes) = current.encode() {
                 if let Err(error) = OutputConfigurationRuntime::begin_persistence(
                     self,
@@ -1699,7 +1727,7 @@ impl NativeRuntime {
             }
         }
 
-        let Some(mut pending) = self.pending_output_configuration.take() else {
+        let Some(mut pending) = self.head.pending_output_configuration.take() else {
             return Ok(OutputConfigurationAdvance::Completed);
         };
         let candidate_render_fence_owned = pending.waiting_on_render_fence();
@@ -1723,38 +1751,38 @@ impl NativeRuntime {
                 || in_flight.atomic_commit_arbiter_owned
                 || in_flight.direct_scanout_pageflip_owned
             {
-                self.pending_output_configuration = Some(pending);
+                self.head.pending_output_configuration = Some(pending);
                 return Ok(OutputConfigurationAdvance::Waiting);
             }
-            if let NativeScanoutBackend::AtomicEglGbm(explicit) = &*self.scanout {
+            if let NativeScanoutBackend::AtomicEglGbm(explicit) = &*self.head.scanout {
                 self.validate_output_configuration_ready_ownership(explicit)?;
             }
             let boundary = self.native_output_reconfiguration_boundary();
             if boundary.is_safe_to_retire_unsubmitted_ready_frame() {
                 self.abandon_unsubmitted_output_frame()?;
             }
-            if let NativeScanoutBackend::AtomicEglGbm(explicit) = &*self.scanout {
+            if let NativeScanoutBackend::AtomicEglGbm(explicit) = &*self.head.scanout {
                 self.validate_output_configuration_ready_ownership(explicit)?;
             }
             if !self
                 .native_output_reconfiguration_boundary()
                 .is_safe_with_candidate_render_fence(candidate_render_fence_owned)
             {
-                self.pending_output_configuration = Some(pending);
+                self.head.pending_output_configuration = Some(pending);
                 return Ok(OutputConfigurationAdvance::Waiting);
             }
         }
 
         if pending.candidate.is_none() {
-            if self.scanout.render_worker_active() && self.scanout.render_worker_busy() {
-                self.pending_output_configuration = Some(pending);
+            if self.head.scanout.render_worker_active() && self.head.scanout.render_worker_busy() {
+                self.head.pending_output_configuration = Some(pending);
                 return Ok(OutputConfigurationAdvance::Waiting);
             }
             match self.prepare_output_configuration_candidate(&pending.target) {
                 Ok(candidate) => pending.candidate = Some(candidate),
                 Err(error) => {
                     if error.kind() == io::ErrorKind::WouldBlock {
-                        self.pending_output_configuration = Some(pending);
+                        self.head.pending_output_configuration = Some(pending);
                         return Ok(OutputConfigurationAdvance::Waiting);
                     }
                     self.fail_pending_output_configuration(pending, error.to_string())?;
@@ -1773,7 +1801,11 @@ impl NativeRuntime {
                 unreachable!()
             };
             let identity = candidate.identity();
-            match self.scanout.try_discard_worker_output_candidate(identity) {
+            match self
+                .head
+                .scanout
+                .try_discard_worker_output_candidate(identity)
+            {
                 Ok(true) => {
                     pending.candidate =
                         Some(CandidateScanoutState::WorkerDiscarding { candidate, detail });
@@ -1785,11 +1817,11 @@ impl NativeRuntime {
                 Err(error) => {
                     pending.candidate =
                         Some(CandidateScanoutState::WorkerDiscardQueued { candidate, detail });
-                    self.pending_output_configuration = Some(pending);
+                    self.head.pending_output_configuration = Some(pending);
                     return Err(error.into());
                 }
             }
-            self.pending_output_configuration = Some(pending);
+            self.head.pending_output_configuration = Some(pending);
             return Ok(OutputConfigurationAdvance::Waiting);
         }
 
@@ -1808,7 +1840,11 @@ impl NativeRuntime {
                 unreachable!()
             };
             let identity = candidate.identity();
-            match self.scanout.try_promote_worker_output_candidate(identity) {
+            match self
+                .head
+                .scanout
+                .try_promote_worker_output_candidate(identity)
+            {
                 Ok(true) => {
                     pending.candidate = Some(CandidateScanoutState::WorkerPromoting {
                         candidate,
@@ -1835,11 +1871,11 @@ impl NativeRuntime {
                         cursor,
                         committed_at_ns,
                     });
-                    self.pending_output_configuration = Some(pending);
+                    self.head.pending_output_configuration = Some(pending);
                     return Err(error.into());
                 }
             }
-            self.pending_output_configuration = Some(pending);
+            self.head.pending_output_configuration = Some(pending);
             return Ok(OutputConfigurationAdvance::Waiting);
         }
 
@@ -1879,7 +1915,7 @@ impl NativeRuntime {
                     | CandidateScanoutState::WorkerPromoted { .. }
             )
         ) {
-            self.pending_output_configuration = Some(pending);
+            self.head.pending_output_configuration = Some(pending);
             return Ok(OutputConfigurationAdvance::Waiting);
         }
 
@@ -1894,10 +1930,10 @@ impl NativeRuntime {
                 _ => false,
             };
             if !ready {
-                self.pending_output_configuration = Some(pending);
+                self.head.pending_output_configuration = Some(pending);
                 return Ok(OutputConfigurationAdvance::Waiting);
             }
-            if let Some(token) = self.output_render_fence_token.take() {
+            if let Some(token) = self.head.output_render_fence_token.take() {
                 self.event_loop.unregister(token)?;
             }
             let CandidateScanoutState::RenderingFence { mut scanout, frame } = pending
@@ -1949,10 +1985,10 @@ impl NativeRuntime {
                 _ => false,
             };
             if !ready {
-                self.pending_output_configuration = Some(pending);
+                self.head.pending_output_configuration = Some(pending);
                 return Ok(OutputConfigurationAdvance::Waiting);
             }
-            if let Some(token) = self.output_render_fence_token.take() {
+            if let Some(token) = self.head.output_render_fence_token.take() {
                 self.event_loop.unregister(token)?;
             }
             let Some(CandidateScanoutState::WorkerRenderingFence {
@@ -2034,7 +2070,7 @@ impl NativeRuntime {
             }
             other => {
                 pending.candidate = Some(other);
-                self.pending_output_configuration = Some(pending);
+                self.head.pending_output_configuration = Some(pending);
                 return Ok(OutputConfigurationAdvance::Waiting);
             }
         };
@@ -2053,6 +2089,7 @@ impl NativeRuntime {
 
     pub(super) fn quiesce_worker_output_candidate_step(&mut self) -> NativeResult<bool> {
         let Some(candidate) = self
+            .head
             .pending_output_configuration
             .as_ref()
             .and_then(|pending| pending.candidate.as_ref())
@@ -2070,6 +2107,7 @@ impl NativeRuntime {
             CandidateScanoutState::WorkerRenderingFence { .. }
             | CandidateScanoutState::WorkerReady { .. } => {
                 let pending = self
+                    .head
                     .pending_output_configuration
                     .take()
                     .expect("candidate state came from a pending output request");
@@ -2111,8 +2149,8 @@ impl NativeRuntime {
             modeset,
             cursor,
         });
-        if self.scanout.render_worker_busy() {
-            self.pending_output_configuration = Some(pending);
+        if self.head.scanout.render_worker_busy() {
+            self.head.pending_output_configuration = Some(pending);
             return Ok(OutputConfigurationAdvance::Waiting);
         }
         let Some(CandidateScanoutState::WorkerReady {
@@ -2140,7 +2178,11 @@ impl NativeRuntime {
             self.fail_pending_output_configuration(pending, format!("TEST_ONLY: {error}"))?;
             return Ok(OutputConfigurationAdvance::Waiting);
         }
-        if !self.scanout.can_retire_direct_after_synchronous_modeset() {
+        if !self
+            .head
+            .scanout
+            .can_retire_direct_after_synchronous_modeset()
+        {
             pending.candidate = Some(CandidateScanoutState::WorkerReady {
                 candidate,
                 frame,
@@ -2158,14 +2200,16 @@ impl NativeRuntime {
         let prepared_transaction = match pending.operation {
             OutputConfigurationOperation::TemporaryApply { previous } => {
                 let next_generation = self
+                    .head
                     .output_configuration_generation
                     .get()
                     .wrapping_add(1)
                     .max(1);
                 match self
+                    .head
                     .output_configuration_transactions
                     .prepare_temporary_apply(
-                        format!("output-{}", self.output_id.get()),
+                        format!("output-{}", self.head.output_id.get()),
                         previous,
                         pending.target,
                         next_generation,
@@ -2197,7 +2241,8 @@ impl NativeRuntime {
             Ok(parked) => self.parked_acquire_watches.extend(parked),
             Err(error) => {
                 if let Some(prepared) = prepared_transaction {
-                    self.output_configuration_transactions
+                    self.head
+                        .output_configuration_transactions
                         .cancel_prepared_temporary_apply(prepared);
                 }
                 self.rearm_output_acquire_watches(now_ns);
@@ -2217,7 +2262,8 @@ impl NativeRuntime {
             Ok(epoch) => epoch,
             Err(detail) => {
                 if let Some(prepared) = prepared_transaction {
-                    self.output_configuration_transactions
+                    self.head
+                        .output_configuration_transactions
                         .cancel_prepared_temporary_apply(prepared);
                 }
                 self.rearm_output_acquire_watches(now_ns);
@@ -2244,7 +2290,8 @@ impl NativeRuntime {
             Ok(committed_at_ns) => committed_at_ns,
             Err(error) => {
                 if let Some(prepared) = prepared_transaction {
-                    self.output_configuration_transactions
+                    self.head
+                        .output_configuration_transactions
                         .cancel_prepared_temporary_apply(prepared);
                 }
                 self.rearm_output_acquire_watches(commit_started_at_ns);
@@ -2269,7 +2316,7 @@ impl NativeRuntime {
             cursor,
             committed_at_ns,
         });
-        self.pending_output_configuration = Some(pending);
+        self.head.pending_output_configuration = Some(pending);
         self.event_loop.request_continuation(
             oblivion_one::native::event_loop::NativeContinuationReason::FrameScheduler,
         )?;
@@ -2295,6 +2342,7 @@ impl NativeRuntime {
         )?;
         if let Some(prepared) = pending.prepared_transaction.take() {
             let transaction_id = self
+                .head
                 .output_configuration_transactions
                 .finalize_temporary_apply(prepared, committed_at_ns);
             self.perf.log("native.output_configuration_applied", || {
@@ -2302,10 +2350,10 @@ impl NativeRuntime {
                     NativePerfField::u64("transaction_id", transaction_id.get()),
                     NativePerfField::u64(
                         "configuration_generation",
-                        self.output_configuration_generation.get(),
+                        self.head.output_configuration_generation.get(),
                     ),
-                    NativePerfField::u64("width", u64::from(self.target.width)),
-                    NativePerfField::u64("height", u64::from(self.target.height)),
+                    NativePerfField::u64("width", u64::from(self.head.target.width)),
+                    NativePerfField::u64("height", u64::from(self.head.target.height)),
                 ]
             });
             self.queue_output_snapshot_response_after_commit(pending.response);
@@ -2318,7 +2366,8 @@ impl NativeRuntime {
                     .into());
                 }
                 OutputConfigurationOperation::Rollback { transaction_id } => {
-                    self.output_configuration_transactions
+                    self.head
+                        .output_configuration_transactions
                         .finalize_committed_rollback(transaction_id);
                     if self.pending_output_persistence.as_ref().is_some_and(|job| {
                         matches!(job.purpose, OutputPersistencePurpose::Confirm { .. })
@@ -2330,10 +2379,10 @@ impl NativeRuntime {
                             vec![
                                 NativePerfField::u64(
                                     "configuration_generation",
-                                    self.output_configuration_generation.get(),
+                                    self.head.output_configuration_generation.get(),
                                 ),
-                                NativePerfField::u64("width", u64::from(self.target.width)),
-                                NativePerfField::u64("height", u64::from(self.target.height)),
+                                NativePerfField::u64("width", u64::from(self.head.target.width)),
+                                NativePerfField::u64("height", u64::from(self.head.target.height)),
                             ]
                         });
                     self.queue_output_snapshot_response_after_commit(pending.response);
@@ -2346,7 +2395,7 @@ impl NativeRuntime {
 
     fn rearm_output_acquire_watches(&mut self, now_ns: u64) {
         if self.parked_acquire_watches.is_empty() {
-            self.output_reconfiguration_rearm_retry_deadline_ns = None;
+            self.head.output_reconfiguration_rearm_retry_deadline_ns = None;
             return;
         }
         match self.acquire_watches.rearm_parked_requests(
@@ -2363,12 +2412,12 @@ impl NativeRuntime {
                         &request.acquire,
                     );
                 }
-                self.output_reconfiguration_rearm_retry_deadline_ns = None;
+                self.head.output_reconfiguration_rearm_retry_deadline_ns = None;
             }
             Err(failure) => {
                 let (error, parked) = failure.into_parts();
                 self.parked_acquire_watches = parked;
-                self.output_reconfiguration_rearm_retry_deadline_ns =
+                self.head.output_reconfiguration_rearm_retry_deadline_ns =
                     Some(now_ns.saturating_add(10_000_000));
                 self.perf.log("native.output_acquire_rearm_deferred", || {
                     vec![NativePerfField::str("error", error.to_string())]
@@ -2391,80 +2440,89 @@ impl NativeRuntime {
 
     fn native_output_reconfiguration_boundary(&self) -> NativeOutputReconfigurationBoundary {
         let worker_in_flight_owned = self
+            .head
             .kms_commit_worker
             .as_ref()
             .is_some_and(|worker| worker.submission_active() || worker.inflight())
-            || self.forced_shutdown_inflight.is_some();
+            || self.head.forced_shutdown_inflight.is_some();
         let worker_queued_next_owned = self
+            .head
             .kms_commit_worker
             .as_ref()
             .is_some_and(|worker| worker.queue_depth() > 0)
-            || !self.worker_quarantine.jobs.is_empty()
-            || !self.worker_quarantine.cursor_sidecars.is_empty()
-            || !self.submitted_worker_ownership.is_empty()
-            || !self.emergency_quarantined_worker_jobs.is_empty()
-            || !self.emergency_quarantined_submitted_ownership.is_empty()
-            || self.forced_shutdown_pacing_settled.is_some();
+            || !self.head.worker_quarantine.jobs.is_empty()
+            || !self.head.worker_quarantine.cursor_sidecars.is_empty()
+            || !self.head.submitted_worker_ownership.is_empty()
+            || !self.head.emergency_quarantined_worker_jobs.is_empty()
+            || !self
+                .head
+                .emergency_quarantined_submitted_ownership
+                .is_empty()
+            || self.head.forced_shutdown_pacing_settled.is_some();
         let explicit_sync_watch_owned = self.acquire_watches.metrics().active_eventfd_watches > 0
             || self.acquire_watches.metrics().active_fallback_watches > 0;
         NativeOutputReconfigurationBoundary {
-            main_thread_pageflip_owned: self.scanout.page_flip_pending(),
+            main_thread_pageflip_owned: self.head.scanout.page_flip_pending(),
             worker_in_flight_owned,
             worker_queued_next_owned,
-            atomic_commit_arbiter_owned: self.atomic_commit_arbiter.atomic_commit_pending(),
-            presentation_transaction_owned: self.output_transactions.active_count() > 0,
-            direct_scanout_pageflip_owned: self.scanout.direct_scanout_pending(),
-            cursor_plane_work_owned: self.atomic_cursor.as_ref().is_some_and(|cursor| {
+            atomic_commit_arbiter_owned: self.head.atomic_commit_arbiter.atomic_commit_pending(),
+            presentation_transaction_owned: self.head.output_transactions.active_count() > 0,
+            direct_scanout_pageflip_owned: self.head.scanout.direct_scanout_pending(),
+            cursor_plane_work_owned: self.head.atomic_cursor.as_ref().is_some_and(|cursor| {
                 cursor.pending_token().is_some() || cursor.worker_queued_submission().is_some()
-            }) || self.cursor_output_arbitration.pending()
+            }) || self.head.cursor_output_arbitration.pending()
                 || self.pending_cursor_job.is_some(),
-            pacing_worker_reservation_owned: self.frame_pacing.worker_reservation_present(),
-            output_render_fence_owned: self.output_render_fence_token.is_some(),
-            deferred_worker_event_owned: self.deferred_worker_pageflip.is_some()
-                || self.deferred_worker_completion.is_some()
-                || self.worker_timeout_pending.is_some()
-                || self.pending_render_worker_identity.is_some()
-                || self.pending_render_worker_context.is_some()
-                || self.pending_render_worker_outer.is_some()
-                || self.pending_render_worker_completion.is_some()
-                || self.pending_render_worker_capture.is_some()
+            pacing_worker_reservation_owned: self.head.frame_pacing.worker_reservation_present(),
+            output_render_fence_owned: self.head.output_render_fence_token.is_some(),
+            deferred_worker_event_owned: self.head.deferred_worker_pageflip.is_some()
+                || self.head.deferred_worker_completion.is_some()
+                || self.head.worker_timeout_pending.is_some()
+                || self.head.pending_render_worker_identity.is_some()
+                || self.head.pending_render_worker_context.is_some()
+                || self.head.pending_render_worker_outer.is_some()
+                || self.head.pending_render_worker_completion.is_some()
+                || self.head.pending_render_worker_capture.is_some()
                 || self.pending_worker_effect_reload.is_some()
-                || self.pending_dmabuf_release_fence.is_some(),
+                || self.head.pending_dmabuf_release_fence.is_some(),
             explicit_sync_watch_owned,
             parked_explicit_sync_obligation_owned: !self.parked_acquire_watches.is_empty(),
         }
     }
 
     fn abandon_unsubmitted_output_frame(&mut self) -> NativeResult<()> {
-        if let NativeScanoutBackend::AtomicEglGbm(explicit) = &mut *self.scanout {
+        if let NativeScanoutBackend::AtomicEglGbm(explicit) = &mut *self.head.scanout {
             super::cycle::terminalize_unsubmitted_frame_for_reconfiguration(
                 explicit,
-                self.output_epoch,
-                &mut self.scene_history,
-                &mut self.frame_pacing,
-                &mut self.frame_scheduler,
+                self.head.output_epoch,
+                &mut self.head.scene_history,
+                &mut self.head.frame_pacing,
+                &mut self.head.frame_scheduler,
                 &mut self.server,
-                &mut self.output_transactions,
+                &mut self.head.output_transactions,
                 MonotonicTimestampNs::new(monotonic_now_ns()?),
             )?;
             super::cycle::recover_or_arm_suspended_output_ownership(
                 explicit,
                 &mut self.event_loop,
-                &mut self.output_render_fence_token,
+                &mut self.head.output_render_fence_token,
             )?;
             return Ok(());
         }
-        if !self.scanout.ready_frame_queued() {
+        if !self.head.scanout.ready_frame_queued() {
             return Ok(());
         }
-        if !self.scanout.abandon_unsubmitted_compatibility_ready()? {
+        if !self
+            .head
+            .scanout
+            .abandon_unsubmitted_compatibility_ready()?
+        {
             return Err(io::Error::other("compatibility READY ownership disappeared").into());
         }
-        self.scene_history.discard_ready();
-        if !self.frame_pacing.abandon_ready_frame() {
-            self.frame_pacing.cancel_unsubmitted_render();
+        self.head.scene_history.discard_ready();
+        if !self.head.frame_pacing.abandon_ready_frame() {
+            self.head.frame_pacing.cancel_unsubmitted_render();
         }
-        self.frame_scheduler.discard_ready_frame();
+        self.head.frame_scheduler.discard_ready_frame();
         Ok(())
     }
 
@@ -2472,7 +2530,7 @@ impl NativeRuntime {
         &self,
         target: &NativeAppliedOutputConfiguration,
     ) -> Option<AtomicCursorVisualState> {
-        let mut state = self.atomic_cursor.as_ref()?.current().clone();
+        let mut state = self.head.atomic_cursor.as_ref()?.current().clone();
         let (x, y) = self.input_state.cursor_position();
         state.x = x.clamp(0, target.width.saturating_sub(1) as i32);
         state.y = y.clamp(0, target.height.saturating_sub(1) as i32);
@@ -2483,17 +2541,21 @@ impl NativeRuntime {
         &mut self,
         target: &NativeAppliedOutputConfiguration,
     ) -> io::Result<CandidateScanoutState> {
-        let output_epoch = self.output_epoch.next();
+        let output_epoch = self.head.output_epoch.next();
         let generation = output_epoch.get();
         let cursor = self.candidate_cursor_state(target);
-        let scanout_kind = self.scanout.kind();
-        let render_worker_active = self.scanout.render_worker_active();
-        let reuse_decision =
-            same_storage_reuse_decision(&self.target, target, scanout_kind, render_worker_active);
+        let scanout_kind = self.head.scanout.kind();
+        let render_worker_active = self.head.scanout.render_worker_active();
+        let reuse_decision = same_storage_reuse_decision(
+            &self.head.target,
+            target,
+            scanout_kind,
+            render_worker_active,
+        );
         eprintln!(
             "{}",
             same_storage_reuse_decision_diagnostic_line(
-                &self.target,
+                &self.head.target,
                 target,
                 scanout_kind,
                 render_worker_active,
@@ -2509,11 +2571,11 @@ impl NativeRuntime {
                 None
             }
             SameStorageReuseDecision::Eligible => {
-                let lookup = match &*self.scanout {
+                let lookup = match &*self.head.scanout {
                     NativeScanoutBackend::AtomicEglGbm(explicit) => explicit
                         .current_compositor_framebuffer_for_same_storage_modeset(
-                            self.target.width,
-                            self.target.height,
+                            self.head.target.width,
+                            self.head.target.height,
                         ),
                     _ => Ok(ReusableAtomicCompositorFramebufferLookup::Unavailable(
                         ReusableStorageUnavailableReason::GenericStorageUnavailable,
@@ -2553,7 +2615,7 @@ impl NativeRuntime {
         };
 
         if let Some(reusable) = reusable {
-            let NativeScanoutBackend::AtomicEglGbm(explicit) = &mut *self.scanout else {
+            let NativeScanoutBackend::AtomicEglGbm(explicit) = &mut *self.head.scanout else {
                 unreachable!("reuse eligibility requires explicit Atomic EGL/GBM scanout")
             };
             if let Err(error) = explicit.queue_presented_damage_history_invalidation() {
@@ -2588,14 +2650,14 @@ impl NativeRuntime {
                 }
             };
             let old_refresh_millihz =
-                super::super::output::output_refresh_rate_for_mode(&self.target.mode)
+                super::super::output::output_refresh_rate_for_mode(&self.head.target.mode)
                     .refresh_millihz();
             let new_refresh_millihz =
                 super::super::output::output_refresh_rate_for_mode(&target.mode).refresh_millihz();
             self.perf
                 .log("native.output_configuration_storage_reuse", || {
                     vec![
-                        NativePerfField::u64("old_mode_id", u64::from(self.target.mode_id)),
+                        NativePerfField::u64("old_mode_id", u64::from(self.head.target.mode_id)),
                         NativePerfField::u64("target_mode_id", u64::from(target.mode_id)),
                         NativePerfField::u64("old_refresh_millihz", u64::from(old_refresh_millihz)),
                         NativePerfField::u64(
@@ -2622,13 +2684,13 @@ impl NativeRuntime {
             candidate_route_diagnostic_line("replacement", replacement_reason, unavailable_reason,)
         );
 
-        let pool_generation = match &*self.scanout {
+        let pool_generation = match &*self.head.scanout {
             NativeScanoutBackend::AtomicEglGbm(explicit) => explicit.next_pool_generation()?,
             _ => generation,
         };
-        let output_id = self.output_id;
-        let current_format = self.scanout.scanout_format();
-        if let NativeScanoutBackend::AtomicEglGbm(explicit) = &mut *self.scanout
+        let output_id = self.head.output_id;
+        let current_format = self.head.scanout.scanout_format();
+        if let NativeScanoutBackend::AtomicEglGbm(explicit) = &mut *self.head.scanout
             && explicit.render_worker_active()
         {
             if explicit.render_worker_busy() {
@@ -2653,7 +2715,7 @@ impl NativeRuntime {
                     .into_owned();
             let mut candidate_input_state = self.input_state.clone();
             candidate_input_state.reconfigure_output_bounds(target.width, target.height);
-            let candidate_cursor_mode = match self.cursor_render_mode {
+            let candidate_cursor_mode = match self.head.cursor_render_mode {
                 NativeCursorRenderMode::SoftwareClient => NativeCursorRenderMode::Software,
                 mode => mode,
             };
@@ -2681,7 +2743,7 @@ impl NativeRuntime {
                 pool_generation,
                 target.color_depth,
                 job_id,
-                self.frame_index.wrapping_add(1).max(1),
+                self.head.frame_index.wrapping_add(1).max(1),
                 frozen_frame,
                 (*material_generation).clone(),
                 (*effect_generation).clone(),
@@ -2689,13 +2751,13 @@ impl NativeRuntime {
             )?;
             return Ok(CandidateScanoutState::WorkerPreparing { candidate, cursor });
         }
-        let mut scanout = match self.scanout.kind() {
+        let mut scanout = match self.head.scanout.kind() {
             NativeScanoutKind::AtomicEglGbmExplicit => {
                 let connector = ConnectorId::new(target.connector_id)
                     .ok_or_else(|| io::Error::other("connector ID is zero"))?;
                 let crtc = CrtcId::new(target.crtc_id)
                     .ok_or_else(|| io::Error::other("CRTC ID is zero"))?;
-                let format = self.scanout.scanout_format();
+                let format = self.head.scanout.scanout_format();
                 let discovery = KmsBackendSelection::discover_atomic_pipeline(
                     self.kms.file().as_fd(),
                     connector,
@@ -2745,7 +2807,7 @@ impl NativeRuntime {
         let mut candidate_input_state = self.input_state.clone();
         candidate_input_state.reconfigure_output_bounds(target.width, target.height);
         let cursor = self.candidate_cursor_state(target);
-        let candidate_cursor_mode = match self.cursor_render_mode {
+        let candidate_cursor_mode = match self.head.cursor_render_mode {
             NativeCursorRenderMode::SoftwareClient => NativeCursorRenderMode::Software,
             mode => mode,
         };
@@ -2768,7 +2830,7 @@ impl NativeRuntime {
                 let mut gpu_sampling_started = false;
                 match explicit.render_to_slot(
                     render_target,
-                    self.frame_index.wrapping_add(1).max(1),
+                    self.head.frame_index.wrapping_add(1).max(1),
                     &mut frozen_candidate,
                     &mut gpu_sampling_started,
                     None,
@@ -2782,7 +2844,7 @@ impl NativeRuntime {
                                 io::Error::other("candidate render fence has no readiness fd")
                             })?
                             .as_raw_fd();
-                        self.output_render_fence_token = Some(
+                        self.head.output_render_fence_token = Some(
                             self.event_loop
                                 .register(fd, NativeEventSource::OutputRenderFence)?,
                         );
@@ -2843,10 +2905,10 @@ impl NativeRuntime {
         now_ns: u64,
     ) {
         candidate_scanout.finish_initial_scanout();
-        self.scanout.retire_direct_after_synchronous_modeset();
-        std::mem::swap(&mut *self.scanout, candidate_scanout);
+        self.head.scanout.retire_direct_after_synchronous_modeset();
+        std::mem::swap(&mut *self.head.scanout, candidate_scanout);
 
-        self.publish_new_output_epoch(target, self.output_epoch.next(), cursor, now_ns);
+        self.publish_new_output_epoch(target, self.head.output_epoch.next(), cursor, now_ns);
     }
 
     fn publish_worker_output_configuration(
@@ -2858,15 +2920,15 @@ impl NativeRuntime {
         cursor: Option<AtomicCursorVisualState>,
         now_ns: u64,
     ) -> NativeResult<()> {
-        self.scanout.retire_direct_after_synchronous_modeset();
-        let NativeScanoutBackend::AtomicEglGbm(explicit) = &mut *self.scanout else {
+        self.head.scanout.retire_direct_after_synchronous_modeset();
+        let NativeScanoutBackend::AtomicEglGbm(explicit) = &mut *self.head.scanout else {
             return Err(io::Error::other(
                 "worker output candidate lost its explicit Atomic scanout owner",
             )
             .into());
         };
         explicit.adopt_worker_output_candidate(candidate, frame, render_info)?;
-        self.publish_new_output_epoch(target, self.output_epoch.next(), cursor, now_ns);
+        self.publish_new_output_epoch(target, self.head.output_epoch.next(), cursor, now_ns);
         Ok(())
     }
 
@@ -2877,27 +2939,29 @@ impl NativeRuntime {
         cursor: Option<AtomicCursorVisualState>,
         now_ns: u64,
     ) {
-        self.target = target;
+        self.head.target = target;
         // A 10-bit request falls back to 8-bit when the live swapchain could
         // not negotiate it; the snapshot must report what is actually scanned out.
-        self.target.color_depth = self.scanout.output_color_depth();
-        self.output_epoch = output_epoch;
-        self.scanout.bind_output_epoch(output_epoch);
+        self.head.target.color_depth = self.head.scanout.output_color_depth();
+        self.head.output_epoch = output_epoch;
+        self.head.scanout.bind_output_epoch(output_epoch);
         self.acquire_watches.set_output_epoch(output_epoch);
-        let generation = self.output_configuration_generation.advance();
-        self.output_capabilities
+        let generation = self.head.output_configuration_generation.advance();
+        self.head
+            .output_capabilities
             .mode_inventory
             .requalify(generation);
-        self.output_refresh_rate = super::super::output::output_refresh_rate_for_mode(&target.mode);
-        self.mode_label = format!(
+        self.head.output_refresh_rate =
+            super::super::output::output_refresh_rate_for_mode(&target.mode);
+        self.head.mode_label = format!(
             "{}x{}@{}",
             target.width,
             target.height,
-            self.output_refresh_rate.rounded_hz()
+            self.head.output_refresh_rate.rounded_hz()
         );
         self.server.set_output_size(target.width, target.height);
         self.server
-            .set_output_refresh_rate(self.output_refresh_rate);
+            .set_output_refresh_rate(self.head.output_refresh_rate);
         let input_effect = self
             .input_state
             .reconfigure_output_bounds(target.width, target.height);
@@ -2906,7 +2970,7 @@ impl NativeRuntime {
         if let Some((x, y)) = input_effect.cursor_position {
             self.server.send_pointer_motion(f64::from(x), f64::from(y));
         }
-        if let Some(runtime_cursor) = self.atomic_cursor.as_mut() {
+        if let Some(runtime_cursor) = self.head.atomic_cursor.as_mut() {
             runtime_cursor.reconfigure_output_identity(
                 output_epoch.get(),
                 target.crtc_id,
@@ -2920,73 +2984,76 @@ impl NativeRuntime {
                 resolve_native_cursor_for_server(&self.server, &self.input_state).visible,
             );
         }
-        let cursor_plane_state = self.atomic_cursor.as_ref().map_or_else(
+        let cursor_plane_state = self.head.atomic_cursor.as_ref().map_or_else(
             crate::native_output::presentation::plane::PresentedCursorState::hidden,
             |cursor| cursor.presented_plane_state(),
         );
-        self.presented_planes
+        self.head
+            .presented_planes
             .rebase_after_synchronous_modeset(cursor_plane_state);
         // The KMS worker outlives the modeset, so its established base still
         // names the old epoch's presented revision. Every new-epoch job would
         // be invalidated and re-planned against that stale base forever.
-        if let Some(worker) = self.kms_commit_worker.as_ref() {
+        if let Some(worker) = self.head.kms_commit_worker.as_ref() {
             worker.set_established_presented_base_for_output(
-                self.output_id,
-                self.presented_planes.revision,
+                self.head.output_id,
+                self.head.presented_planes.revision,
                 output_epoch.get(),
                 target.crtc_id,
             );
         }
-        self.confirmed_kms_presentation = ConfirmedKmsPresentationState::default();
+        self.head.confirmed_kms_presentation = ConfirmedKmsPresentationState::default();
         // Validation keys are tied to the output's KMS geometry and plane
         // state. Drop any qualification carried by the replacement scanout
         // before allowing direct promotion on the next ordinary frame.
-        self.scanout.invalidate_direct_validation_cache();
-        self.last_direct_candidate_key = None;
-        self.scene_history
+        self.head.scanout.invalidate_direct_validation_cache();
+        self.head.last_direct_candidate_key = None;
+        self.head
+            .scene_history
             .reset_composited_history_for_output_epoch();
-        self.last_client_cursor_damage = None;
-        self.last_software_cursor_damage = None;
-        self.last_client_cursor_path = None;
-        self.last_submitted_cursor_epoch = self
+        self.head.last_client_cursor_damage = None;
+        self.head.last_software_cursor_damage = None;
+        self.head.last_client_cursor_path = None;
+        self.head.last_submitted_cursor_epoch = self
+            .head
             .atomic_cursor
             .as_ref()
             .map_or(0, |cursor| cursor.desired_epoch());
-        self.presentation_timing.reconfigure(
-            KmsModeTiming::from_mode(&target.mode, self.output_refresh_rate.interval_ns()),
+        self.head.presentation_timing.reconfigure(
+            KmsModeTiming::from_mode(&target.mode, self.head.output_refresh_rate.interval_ns()),
             output_epoch.get(),
         );
-        self.cursor_timing.reconfigure(
-            KmsModeTiming::from_mode(&target.mode, self.output_refresh_rate.interval_ns()),
+        self.head.cursor_timing.reconfigure(
+            KmsModeTiming::from_mode(&target.mode, self.head.output_refresh_rate.interval_ns()),
             output_epoch.get(),
         );
-        let interval = Duration::from_nanos(self.output_refresh_rate.interval_ns());
-        self.presentation_deadline.invalidate(interval);
-        self.scheduled_presentation_target = None;
+        let interval = Duration::from_nanos(self.head.output_refresh_rate.interval_ns());
+        self.head.presentation_deadline.invalidate(interval);
+        self.head.scheduled_presentation_target = None;
         self.server.invalidate_commit_timing_targets();
         self.rebase_output_epoch_frame_lanes(now_ns);
-        self.render_journal.reset();
-        self.adaptive_buffering.reset();
-        self.pending_proven_deadline_miss = None;
-        self.direct_fallback_tracker = None;
+        self.head.render_journal.reset();
+        self.head.adaptive_buffering.reset();
+        self.head.pending_proven_deadline_miss = None;
+        self.head.direct_fallback_tracker = None;
         self.queued_redraw_requested = true;
         super::queue_visual_work_after_synchronous_modeset(
-            &mut self.frame_pacing,
-            &mut self.frame_scheduler,
+            &mut self.head.frame_pacing,
+            &mut self.head.frame_scheduler,
             now_ns,
             self.server.scene_render_generation(),
         );
-        if let NativeScanoutBackend::AtomicEglGbm(explicit) = &*self.scanout {
+        if let NativeScanoutBackend::AtomicEglGbm(explicit) = &*self.head.scanout {
             debug_assert!(
                 super::cycle::validate_reconfiguration_frame_ownership_with_arbiter(
                     explicit,
                     output_epoch,
-                    self.target.crtc_id,
-                    &self.scene_history,
-                    &self.frame_pacing,
-                    &self.frame_scheduler,
-                    &self.atomic_commit_arbiter,
-                    &self.output_transactions,
+                    self.head.target.crtc_id,
+                    &self.head.scene_history,
+                    &self.head.frame_pacing,
+                    &self.head.frame_scheduler,
+                    &self.head.atomic_commit_arbiter,
+                    &self.head.output_transactions,
                 )
                 .is_ok()
             );
@@ -3004,7 +3071,7 @@ impl NativeRuntime {
                 | CandidateScanoutState::WorkerCancelAfterPrepare { candidate, .. } => {
                     pending.candidate =
                         Some(CandidateScanoutState::WorkerCancelAfterPrepare { candidate, detail });
-                    self.pending_output_configuration = Some(pending);
+                    self.head.pending_output_configuration = Some(pending);
                     return Ok(());
                 }
                 CandidateScanoutState::WorkerRenderingFence {
@@ -3013,17 +3080,17 @@ impl NativeRuntime {
                     render_info,
                     cursor,
                 } => {
-                    if let Some(token) = self.output_render_fence_token.take()
+                    if let Some(token) = self.head.output_render_fence_token.take()
                         && let Err(error) = self.event_loop.unregister(token)
                     {
-                        self.output_render_fence_token = Some(token);
+                        self.head.output_render_fence_token = Some(token);
                         pending.candidate = Some(CandidateScanoutState::WorkerRenderingFence {
                             candidate,
                             frame,
                             render_info,
                             cursor,
                         });
-                        self.pending_output_configuration = Some(pending);
+                        self.head.pending_output_configuration = Some(pending);
                         return Err(error.into());
                     }
                     drop(frame);
@@ -3044,14 +3111,14 @@ impl NativeRuntime {
                 queued @ CandidateScanoutState::WorkerDiscardQueued { .. }
                 | queued @ CandidateScanoutState::WorkerDiscarding { .. } => {
                     pending.candidate = Some(queued);
-                    self.pending_output_configuration = Some(pending);
+                    self.head.pending_output_configuration = Some(pending);
                     return Ok(());
                 }
                 promoted @ CandidateScanoutState::WorkerPromotionQueued { .. }
                 | promoted @ CandidateScanoutState::WorkerPromoting { .. }
                 | promoted @ CandidateScanoutState::WorkerPromoted { .. } => {
                     pending.candidate = Some(promoted);
-                    self.pending_output_configuration = Some(pending);
+                    self.head.pending_output_configuration = Some(pending);
                     return Err(io::Error::other(
                         "output configuration cannot be failed after KMS committed a worker candidate",
                     )
@@ -3085,6 +3152,7 @@ impl NativeRuntime {
             }
             OutputConfigurationOperation::Rollback { transaction_id } => {
                 let _ = self
+                    .head
                     .output_configuration_transactions
                     .fail_rollback(transaction_id, "output_rollback_failed");
                 self.perf
@@ -3111,18 +3179,22 @@ impl NativeRuntime {
         detail: String,
     ) -> NativeResult<()> {
         let identity = candidate.identity();
-        let state = match self.scanout.try_discard_worker_output_candidate(identity) {
+        let state = match self
+            .head
+            .scanout
+            .try_discard_worker_output_candidate(identity)
+        {
             Ok(true) => CandidateScanoutState::WorkerDiscarding { candidate, detail },
             Ok(false) => CandidateScanoutState::WorkerDiscardQueued { candidate, detail },
             Err(error) => {
                 pending.candidate =
                     Some(CandidateScanoutState::WorkerDiscardQueued { candidate, detail });
-                self.pending_output_configuration = Some(pending);
+                self.head.pending_output_configuration = Some(pending);
                 return Err(error.into());
             }
         };
         pending.candidate = Some(state);
-        self.pending_output_configuration = Some(pending);
+        self.head.pending_output_configuration = Some(pending);
         Ok(())
     }
 }
@@ -3144,7 +3216,9 @@ impl OutputConfigurationRuntime for NativeRuntime {
     }
 
     fn direct_scanout_retirement_safe(&mut self) -> bool {
-        self.scanout.can_retire_direct_after_synchronous_modeset()
+        self.head
+            .scanout
+            .can_retire_direct_after_synchronous_modeset()
     }
 
     fn reserve_confirmation_transaction(
@@ -3156,13 +3230,15 @@ impl OutputConfigurationRuntime for NativeRuntime {
             return Ok(None);
         };
         let next_generation = self
+            .head
             .output_configuration_generation
             .get()
             .wrapping_add(1)
             .max(1);
-        self.output_configuration_transactions
+        self.head
+            .output_configuration_transactions
             .prepare_temporary_apply(
-                format!("output-{}", self.output_id.get()),
+                format!("output-{}", self.head.output_id.get()),
                 previous,
                 target,
                 next_generation,
@@ -3172,7 +3248,8 @@ impl OutputConfigurationRuntime for NativeRuntime {
     }
 
     fn cancel_confirmation_reservation(&mut self, reservation: Self::ConfirmationReservation) {
-        self.output_configuration_transactions
+        self.head
+            .output_configuration_transactions
             .cancel_prepared_temporary_apply(reservation);
     }
 
@@ -3186,44 +3263,48 @@ impl OutputConfigurationRuntime for NativeRuntime {
     }
 
     fn quiesce_old_output_epoch(&mut self) -> Result<QuiescedOutputEpoch, String> {
-        if let NativeScanoutBackend::AtomicEglGbm(explicit) = &*self.scanout {
+        if let NativeScanoutBackend::AtomicEglGbm(explicit) = &*self.head.scanout {
             super::cycle::validate_reconfiguration_frame_ownership_with_arbiter(
                 explicit,
-                self.output_epoch,
-                self.target.crtc_id,
-                &self.scene_history,
-                &self.frame_pacing,
-                &self.frame_scheduler,
-                &self.atomic_commit_arbiter,
-                &self.output_transactions,
+                self.head.output_epoch,
+                self.head.target.crtc_id,
+                &self.head.scene_history,
+                &self.head.frame_pacing,
+                &self.head.frame_scheduler,
+                &self.head.atomic_commit_arbiter,
+                &self.head.output_transactions,
             )
             .map_err(|error| error.to_string())?;
         }
         let boundary = self.native_output_reconfiguration_boundary();
-        let epoch =
-            QuiescedOutputEpoch::from_boundary(self.output_epoch, boundary).ok_or_else(|| {
+        let epoch = QuiescedOutputEpoch::from_boundary(self.head.output_epoch, boundary)
+            .ok_or_else(|| {
                 format!(
                     "old output epoch {} is not quiesced: {boundary:?}",
-                    self.output_epoch.get()
+                    self.head.output_epoch.get()
                 )
             })?;
-        if self.scanout.ready_frame_queued() {
+        if self.head.scanout.ready_frame_queued() {
             return Err("old output epoch still owns an unsubmitted physical READY frame".into());
         }
-        if let NativeScanoutBackend::AtomicEglGbm(explicit) = &*self.scanout
+        if let NativeScanoutBackend::AtomicEglGbm(explicit) = &*self.head.scanout
             && explicit
                 .has_suspended_output_ownership()
                 .map_err(|error| error.to_string())?
         {
             return Err("old output epoch still owns a suspended physical frame".into());
         }
-        if self.frame_pacing.has_unsettled_output_frame_ownership() {
+        if self
+            .head
+            .frame_pacing
+            .has_unsettled_output_frame_ownership()
+        {
             return Err("old output epoch still owns pacing frame state".into());
         }
-        if self.frame_scheduler.ready_frame_queued() {
+        if self.head.frame_scheduler.ready_frame_queued() {
             return Err("old output epoch still owns scheduler READY state".into());
         }
-        if self.scene_history.has_ready_frame() {
+        if self.head.scene_history.has_ready_frame() {
             return Err("old output epoch still owns scene-history READY state".into());
         }
         Ok(epoch)
@@ -3279,11 +3360,13 @@ impl OutputConfigurationRuntime for NativeRuntime {
             OutputConfigurationOperation::TemporaryApply { .. } => {
                 let reservation =
                     reservation.expect("temporary apply reservation is held through real commit");
-                self.output_configuration_transactions
+                self.head
+                    .output_configuration_transactions
                     .finalize_temporary_apply(reservation, committed_at_ns);
             }
             OutputConfigurationOperation::Rollback { transaction_id } => {
-                self.output_configuration_transactions
+                self.head
+                    .output_configuration_transactions
                     .finalize_committed_rollback(transaction_id);
                 if self.pending_output_persistence.as_ref().is_some_and(|job| {
                     matches!(job.purpose, OutputPersistencePurpose::Confirm { .. })
@@ -3310,10 +3393,10 @@ impl OutputConfigurationRuntime for NativeRuntime {
                 self.publish_output_configuration(target, &mut scanout, cursor, committed_at_ns);
             }
             OutputConfigurationTransitionCandidate::AdoptedReuse { cursor } => {
-                self.scanout.retire_direct_after_synchronous_modeset();
+                self.head.scanout.retire_direct_after_synchronous_modeset();
                 self.publish_new_output_epoch(
                     target,
-                    self.output_epoch.next(),
+                    self.head.output_epoch.next(),
                     cursor,
                     committed_at_ns,
                 );
@@ -3323,6 +3406,7 @@ impl OutputConfigurationRuntime for NativeRuntime {
         match operation {
             OutputConfigurationOperation::TemporaryApply { .. } => {
                 let transaction_id = self
+                    .head
                     .output_configuration_transactions
                     .active()
                     .expect("temporary apply transaction was finalized before publication")
@@ -3332,10 +3416,10 @@ impl OutputConfigurationRuntime for NativeRuntime {
                         NativePerfField::u64("transaction_id", transaction_id.get()),
                         NativePerfField::u64(
                             "configuration_generation",
-                            self.output_configuration_generation.get(),
+                            self.head.output_configuration_generation.get(),
                         ),
-                        NativePerfField::u64("width", u64::from(self.target.width)),
-                        NativePerfField::u64("height", u64::from(self.target.height)),
+                        NativePerfField::u64("width", u64::from(self.head.target.width)),
+                        NativePerfField::u64("height", u64::from(self.head.target.height)),
                     ]
                 });
             }
@@ -3345,10 +3429,10 @@ impl OutputConfigurationRuntime for NativeRuntime {
                         vec![
                             NativePerfField::u64(
                                 "configuration_generation",
-                                self.output_configuration_generation.get(),
+                                self.head.output_configuration_generation.get(),
                             ),
-                            NativePerfField::u64("width", u64::from(self.target.width)),
-                            NativePerfField::u64("height", u64::from(self.target.height)),
+                            NativePerfField::u64("width", u64::from(self.head.target.width)),
+                            NativePerfField::u64("height", u64::from(self.head.target.height)),
                         ]
                     });
             }

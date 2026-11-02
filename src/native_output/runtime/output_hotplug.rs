@@ -126,7 +126,7 @@ impl NativeRuntime {
         for entry in &delta.changed {
             eprintln!("native output hotplug ({reason}): sink changed {entry}");
         }
-        let active_connector = self.target.connector_id;
+        let active_connector = self.head.target.connector_id;
         if delta.touches(active_connector) {
             let still_connected = self
                 .output_hotplug

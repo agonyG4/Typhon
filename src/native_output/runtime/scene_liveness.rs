@@ -13,7 +13,7 @@ impl NativeRuntime {
     pub(super) fn arm_runtime_deadline(&mut self) -> NativeResult<()> {
         let now_ns = monotonic_now_ns()?;
         let pageflip_timeout_owner: NativePageflipTimeoutOwner =
-            self.kms_commit_worker_transport.into();
+            self.head.kms_commit_worker_transport.into();
         self.dmabuf_gpu_release_registry.update_retry_for_work(
             self.server.deferred_dmabuf_release_count(),
             self.server.retryable_deferred_dmabuf_release_count(),
@@ -29,6 +29,7 @@ impl NativeRuntime {
         let system_action_transport_deadline = self.system_action_transport.next_deadline_ns();
         let scratch_deadline_now = std::time::Instant::now();
         let scratch_maintenance_deadline_ns = self
+            .head
             .scanout
             .next_effect_scratch_maintenance_deadline()
             .map(|deadline| {
@@ -50,11 +51,11 @@ impl NativeRuntime {
                 });
         let scheduler_wake_requirement = self.current_scheduler_wake_requirement(now_ns)?;
         let scheduler_wake_requirement = gate_scheduler_for_output_configuration(
-            self.pending_output_configuration.is_some(),
+            self.head.pending_output_configuration.is_some(),
             scheduler_wake_requirement,
         );
         let visual_scene_debt = super::commit_timing::logical_scene_changed(
-            self.last_rendered_scene_generation,
+            self.head.last_rendered_scene_generation,
             self.server.scene_render_generation(),
         );
         // An in-flight render-worker job wakes the reactor through its event
@@ -62,10 +63,10 @@ impl NativeRuntime {
         // render re-requested an immediate continuation and the reactor spun
         // for the whole render, up to ~1 s while a game saturated the GPU.
         let scene_visual_debt_has_external_wake_owner = scene_visual_debt_has_external_wake_owner(
-            self.scanout.page_flip_pending(),
-            self.atomic_commit_arbiter.atomic_commit_pending(),
-            self.output_render_fence_token.is_some(),
-            self.scanout.render_worker_busy(),
+            self.head.scanout.page_flip_pending(),
+            self.head.atomic_commit_arbiter.atomic_commit_pending(),
+            self.head.output_render_fence_token.is_some(),
+            self.head.scanout.render_worker_busy(),
         );
         let scene_visual_debt_continuation = visual_scene_debt
             && scheduler_wake_requirement.is_none()
@@ -75,19 +76,24 @@ impl NativeRuntime {
             primary_deadline: None,
             scheduler_wake_requirement,
             atomic_commit_watchdog_deadline_ns: atomic_commit_watchdog_deadline_for_timeout_owner(
-                self.atomic_commit_arbiter.watchdog_deadline_ns(),
+                self.head.atomic_commit_arbiter.watchdog_deadline_ns(),
                 pageflip_timeout_owner,
             ),
             explicit_sync_fallback_deadline_ns: self.acquire_watches.next_fallback_deadline_ns(),
             xwayland_timeout_deadline_ns: self.xwayland.next_deadline_ns(),
-            cursor_response_deadline_ns: self.cursor_output_arbitration.wake_deadline_ns(now_ns),
+            cursor_response_deadline_ns: self
+                .head
+                .cursor_output_arbitration
+                .wake_deadline_ns(now_ns),
             cursor_planning_deadline_ns: self
+                .head
                 .cursor_output_arbitration
                 .planning_retry_wake_deadline_ns(now_ns),
-            cursor_sync_admission_deadline_ns: (self.kms_commit_worker_transport
+            cursor_sync_admission_deadline_ns: (self.head.kms_commit_worker_transport
                 == crate::native_output::kms_worker::KmsCommitWorkerTransport::Synchronous)
                 .then(|| {
-                    self.cursor_output_arbitration
+                    self.head
+                        .cursor_output_arbitration
                         .synchronous_physical_admission_wake_deadline_ns(now_ns)
                 })
                 .flatten(),
@@ -96,8 +102,8 @@ impl NativeRuntime {
             system_action_transport_deadline_ns: system_action_transport_deadline
                 .filter(|deadline| *deadline > now_ns),
             output_configuration_deadline_ns: match (
-                self.output_configuration_transactions.deadline_ns(),
-                self.output_reconfiguration_rearm_retry_deadline_ns,
+                self.head.output_configuration_transactions.deadline_ns(),
+                self.head.output_reconfiguration_rearm_retry_deadline_ns,
             ) {
                 (Some(transaction), Some(retry)) => Some(transaction.min(retry)),
                 (transaction, retry) => transaction.or(retry),
@@ -165,11 +171,11 @@ impl NativeRuntime {
             {
                 "continuation:scene_visual_debt"
             } else if scene_visual_debt_has_external_wake_owner {
-                if self.scanout.page_flip_pending() {
+                if self.head.scanout.page_flip_pending() {
                     "external:pageflip"
-                } else if self.atomic_commit_arbiter.atomic_commit_pending() {
+                } else if self.head.atomic_commit_arbiter.atomic_commit_pending() {
                     "external:atomic_commit"
-                } else if self.scanout.render_worker_busy() {
+                } else if self.head.scanout.render_worker_busy() {
                     "external:render_worker"
                 } else {
                     "external:render_fence"
@@ -181,7 +187,7 @@ impl NativeRuntime {
                 vec![
                     NativePerfField::u64(
                         "last_rendered_scene_generation",
-                        self.last_rendered_scene_generation,
+                        self.head.last_rendered_scene_generation,
                     ),
                     NativePerfField::u64(
                         "scene_render_generation",

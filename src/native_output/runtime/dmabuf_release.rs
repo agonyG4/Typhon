@@ -976,7 +976,7 @@ pub(crate) fn arm_composited_dmabuf_release(
 impl super::NativeRuntime {
     pub(super) fn retire_settled_output_terminals(&mut self) {
         retire_settled_output_terminals(
-            &mut self.output_transactions,
+            &mut self.head.output_transactions,
             &mut self.dmabuf_gpu_release_registry,
         );
     }
@@ -988,7 +988,7 @@ impl super::NativeRuntime {
         result: io::Result<NativeRenderFence>,
     ) -> super::NativeResult<()> {
         if !release_fence_completion_matches(
-            self.pending_dmabuf_release_fence,
+            self.head.pending_dmabuf_release_fence,
             job_id,
             control_epoch,
         ) {
@@ -997,7 +997,7 @@ impl super::NativeRuntime {
             )
             .into());
         }
-        self.pending_dmabuf_release_fence = None;
+        self.head.pending_dmabuf_release_fence = None;
         let now_ns = oblivion_one::native::event_loop::monotonic_now_ns()?;
         let proof_retry_failure = match result {
             Ok(fence) => register_deferred_release_fence(
@@ -1050,10 +1050,10 @@ impl super::NativeRuntime {
             retry_service_decision(deferred_count, retryable_count),
             DmabufReleaseRetryServiceDecision::ServiceProofRequired
         ) {
-            let atomic_release_state = match &*self.scanout {
+            let atomic_release_state = match &*self.head.scanout {
                 crate::native_output::scanout::NativeScanoutBackend::AtomicEglGbm(explicit) => {
                     Some((
-                        dmabuf_gpu_release_safety(explicit, self.kms_commit_worker.as_ref()),
+                        dmabuf_gpu_release_safety(explicit, self.head.kms_commit_worker.as_ref()),
                         explicit.render_worker_active(),
                         explicit.render_worker_busy(),
                     ))
@@ -1064,15 +1064,15 @@ impl super::NativeRuntime {
                 Some((safety, true, _)) if !safety.permits_compositor_gpu_release() => {
                     proof_retry_failure = Some(DmabufReleaseRetryReason::DirectKmsOwnershipBlocked);
                 }
-                Some((_, true, _)) if self.pending_dmabuf_release_fence.is_some() => {
+                Some((_, true, _)) if self.head.pending_dmabuf_release_fence.is_some() => {
                     proof_service_suppressed = true;
                 }
                 Some((_, true, _))
-                    if self.pending_render_worker_identity.is_some()
-                        || self.pending_render_worker_context.is_some()
-                        || self.pending_render_worker_outer.is_some()
-                        || self.pending_render_worker_completion.is_some()
-                        || self.pending_render_worker_capture.is_some()
+                    if self.head.pending_render_worker_identity.is_some()
+                        || self.head.pending_render_worker_context.is_some()
+                        || self.head.pending_render_worker_outer.is_some()
+                        || self.head.pending_render_worker_completion.is_some()
+                        || self.head.pending_render_worker_capture.is_some()
                         || self.pending_worker_effect_reload.is_some() =>
                 {
                     proof_retry_failure = Some(DmabufReleaseRetryReason::NoGpuProofAvailable);
@@ -1082,9 +1082,9 @@ impl super::NativeRuntime {
                 }
                 Some((_, true, false)) => {
                     let job_id = super::render_worker::next_render_worker_job_id()?;
-                    match self.scanout.dispatch_deferred_release_fence(job_id)? {
+                    match self.head.scanout.dispatch_deferred_release_fence(job_id)? {
                         Some(control_epoch) => {
-                            self.pending_dmabuf_release_fence = Some((job_id, control_epoch));
+                            self.head.pending_dmabuf_release_fence = Some((job_id, control_epoch));
                             proof_service_suppressed = true;
                         }
                         None => {
@@ -1098,7 +1098,7 @@ impl super::NativeRuntime {
                         proof_retry_failure =
                             Some(DmabufReleaseRetryReason::DirectKmsOwnershipBlocked);
                     } else {
-                        let release_fence = match &*self.scanout {
+                        let release_fence = match &*self.head.scanout {
                             crate::native_output::scanout::NativeScanoutBackend::AtomicEglGbm(
                                 explicit,
                             ) => explicit.create_render_fence(),

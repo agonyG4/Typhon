@@ -90,17 +90,22 @@ pub(super) fn record_forced_shutdown_inflight(
     inflight: super::super::kms_worker::WorkerInFlight,
 ) -> bool {
     let pacing_cleared = if let Some(ticket) = inflight.pacing_ticket {
-        runtime.frame_pacing.cancel_worker_submission(Some(ticket))
+        runtime
+            .head
+            .frame_pacing
+            .cancel_worker_submission(Some(ticket))
             || runtime
+                .head
                 .frame_pacing
                 .abandon_pending_submission(inflight.token.get())
     } else {
         runtime
+            .head
             .frame_pacing
             .abandon_pending_submission(inflight.token.get())
     };
-    runtime.forced_shutdown_inflight = Some(inflight);
-    runtime.forced_shutdown_pacing_settled = pacing_cleared
+    runtime.head.forced_shutdown_inflight = Some(inflight);
+    runtime.head.forced_shutdown_pacing_settled = pacing_cleared
         .then_some(inflight.pacing_ticket)
         .flatten()
         .map(|ticket| (inflight.token, ticket));
@@ -161,7 +166,10 @@ impl NativeRuntime {
                     "cursor-only worker submission unexpectedly carried pacing ownership",
                 );
                 if let Some(ticket) = ownership.job.pacing_ticket
-                    && !self.frame_pacing.abandon_worker_submission(Some(ticket))
+                    && !self
+                        .head
+                        .frame_pacing
+                        .abandon_worker_submission(Some(ticket))
                 {
                     return Err(io::Error::other(format!(
                         "{error}; exact worker pacing reservation {} could not be abandoned",
@@ -185,7 +193,11 @@ impl NativeRuntime {
             Some(pacing_mode) => pacing_mode,
             None => {
                 let error = io::Error::other("submitted worker job has no primary pacing owner");
-                if !self.frame_pacing.abandon_worker_submission(Some(ticket)) {
+                if !self
+                    .head
+                    .frame_pacing
+                    .abandon_worker_submission(Some(ticket))
+                {
                     return Err(io::Error::other(format!(
                         "{error}; exact worker pacing reservation {} could not be abandoned",
                         ticket.reservation_id().get()
@@ -196,7 +208,8 @@ impl NativeRuntime {
             }
         };
         let token = ownership.job.token;
-        self.frame_pacing
+        self.head
+            .frame_pacing
             .note_worker_submit_exact(
                 Some(ticket),
                 token.get(),
@@ -204,7 +217,7 @@ impl NativeRuntime {
                 pacing_mode,
             )
             .map_err(io::Error::other)?;
-        if let Some(worker) = self.kms_commit_worker.as_ref() {
+        if let Some(worker) = self.head.kms_commit_worker.as_ref() {
             worker.record_worker_pacing_submit_confirmed();
         }
         Ok(Some(SubmittedWorkerPacingState { token }))
@@ -251,6 +264,7 @@ impl NativeRuntime {
         }
         match &mut job.primary {
             KmsPrimaryUpdate::Framebuffer { in_fence, .. } => self
+                .head
                 .scanout
                 .restore_worker_queued_submission_fence(job.token, in_fence)
                 .map_err(Into::into),
@@ -260,17 +274,17 @@ impl NativeRuntime {
 
     fn retain_returned_worker_job(&mut self, mut job: KmsCommitJob) -> NativeResult<()> {
         let pacing_result =
-            settle_returned_worker_pacing(&mut self.frame_pacing, job.pacing_ticket);
+            settle_returned_worker_pacing(&mut self.head.frame_pacing, job.pacing_ticket);
         let fence_result = self.restore_pre_submit_worker_fence(&mut job);
         if let Err(error) = pacing_result {
-            self.emergency_quarantined_worker_jobs.push(job);
+            self.head.emergency_quarantined_worker_jobs.push(job);
             return Err(error);
         }
         if let Err(error) = fence_result {
-            self.emergency_quarantined_worker_jobs.push(job);
+            self.head.emergency_quarantined_worker_jobs.push(job);
             return Err(error);
         }
-        self.worker_quarantine.jobs.push(job);
+        self.head.worker_quarantine.jobs.push(job);
         Ok(())
     }
 
@@ -281,7 +295,7 @@ impl NativeRuntime {
         let Some(ticket) = ownership.job.pacing_ticket else {
             return Ok(());
         };
-        if self.forced_shutdown_pacing_settled == Some((ownership.job.token, ticket)) {
+        if self.head.forced_shutdown_pacing_settled == Some((ownership.job.token, ticket)) {
             return Ok(());
         }
         let pacing_mode = ownership
@@ -291,7 +305,7 @@ impl NativeRuntime {
             .map(|owner| owner.transaction.pacing_mode())
             .ok_or_else(|| io::Error::other("submitted worker job has no primary pacing owner"))?;
         settle_submitted_worker_pacing(
-            &mut self.frame_pacing,
+            &mut self.head.frame_pacing,
             Some(ticket),
             ownership.job.token.get(),
             ownership.submit_returned_at.get(),
@@ -334,7 +348,8 @@ impl NativeRuntime {
                         first_error = Some(error);
                     }
                 }
-                self.worker_quarantine
+                self.head
+                    .worker_quarantine
                     .cursor_sidecars
                     .extend(returned_sidecar);
                 first_error.map_or(Ok(()), Err)
@@ -350,7 +365,7 @@ impl NativeRuntime {
         if !self.session.permits_output() {
             return Ok(None);
         }
-        if self.kms_commit_worker.is_some() {
+        if self.head.kms_commit_worker.is_some() {
             return Err(io::Error::other(
                 "cannot destroy KMS target while commit worker is running",
             )
@@ -359,24 +374,24 @@ impl NativeRuntime {
         if let Some(token) = self.drm_reactor_token.take() {
             self.event_loop.unregister(token)?;
         }
-        if let Some(token) = self.output_render_fence_token.take() {
+        if let Some(token) = self.head.output_render_fence_token.take() {
             self.event_loop.unregister(token)?;
         }
-        if !self.scanout_destroyed {
-            self.scanout.disarm_drm_cleanup();
+        if !self.head.scanout_destroyed {
+            self.head.scanout.disarm_drm_cleanup();
         }
-        if let Some(mut cursor) = self.atomic_cursor.take() {
+        if let Some(mut cursor) = self.head.atomic_cursor.take() {
             cursor.disarm_drm_cleanup();
         }
-        if let Some(mut cursor) = self.legacy_cursor.take() {
+        if let Some(mut cursor) = self.head.legacy_cursor.take() {
             cursor.disarm_drm_cleanup();
         }
-        if !self.scanout_destroyed {
+        if !self.head.scanout_destroyed {
             // SAFETY: worker termination has already completed. DRM cleanup
             // is disarmed before dropping scanout resources, and the target
             // fd is closed immediately afterward as the destruction proof.
-            unsafe { std::mem::ManuallyDrop::drop(&mut self.scanout) };
-            self.scanout_destroyed = true;
+            unsafe { std::mem::ManuallyDrop::drop(&mut self.head.scanout) };
+            self.head.scanout_destroyed = true;
         }
         self.kms_backend.disarm_drm_io();
         Ok(self
@@ -386,10 +401,10 @@ impl NativeRuntime {
     }
 
     pub(super) fn establish_kms_teardown_safety(&mut self) -> KmsTeardownSafety {
-        if self.kms_teardown_safety_established {
-            return self.kms_teardown_safety;
+        if self.head.kms_teardown_safety_established {
+            return self.head.kms_teardown_safety;
         }
-        self.kms_teardown_safety_established = true;
+        self.head.kms_teardown_safety_established = true;
         let proof = if self.session.permits_output() {
             match self.kms_backend.restore() {
                 Ok(outcome) => {
@@ -418,20 +433,20 @@ impl NativeRuntime {
             None
         };
         let safety = classify_kms_teardown_safety(proof);
-        self.kms_teardown_safety = safety;
+        self.head.kms_teardown_safety = safety;
         if !safety.permits_release() {
-            if !self.scanout_destroyed {
-                self.scanout.retain_direct_for_unproven_teardown();
+            if !self.head.scanout_destroyed {
+                self.head.scanout.retain_direct_for_unproven_teardown();
             }
             self.server.disarm_shutdown_releases();
-            if !self.scanout_destroyed {
-                self.scanout.disarm_drm_cleanup();
+            if !self.head.scanout_destroyed {
+                self.head.scanout.disarm_drm_cleanup();
             }
             self.kms_backend.disarm_drm_io();
-            if let Some(cursor) = self.atomic_cursor.as_mut() {
+            if let Some(cursor) = self.head.atomic_cursor.as_mut() {
                 cursor.disarm_drm_cleanup();
             }
-            if let Some(cursor) = self.legacy_cursor.as_mut() {
+            if let Some(cursor) = self.head.legacy_cursor.as_mut() {
                 cursor.disarm_drm_cleanup();
             }
         }
@@ -440,22 +455,26 @@ impl NativeRuntime {
 
     pub(super) fn retain_unproven_teardown_ownership(&mut self) {
         self.server.disarm_shutdown_releases();
-        if !self.scanout_destroyed {
-            self.scanout.disarm_drm_cleanup();
+        if !self.head.scanout_destroyed {
+            self.head.scanout.disarm_drm_cleanup();
         }
         self.kms_backend.disarm_drm_io();
-        if let Some(cursor) = self.atomic_cursor.as_mut() {
+        if let Some(cursor) = self.head.atomic_cursor.as_mut() {
             cursor.disarm_drm_cleanup();
         }
-        if let Some(cursor) = self.legacy_cursor.as_mut() {
+        if let Some(cursor) = self.head.legacy_cursor.as_mut() {
             cursor.disarm_drm_cleanup();
         }
-        std::mem::forget(std::mem::take(&mut self.submitted_worker_ownership));
-        std::mem::forget(std::mem::take(&mut self.worker_quarantine.jobs));
-        std::mem::forget(std::mem::take(&mut self.worker_quarantine.cursor_sidecars));
-        std::mem::forget(std::mem::take(&mut self.emergency_quarantined_worker_jobs));
+        std::mem::forget(std::mem::take(&mut self.head.submitted_worker_ownership));
+        std::mem::forget(std::mem::take(&mut self.head.worker_quarantine.jobs));
         std::mem::forget(std::mem::take(
-            &mut self.emergency_quarantined_submitted_ownership,
+            &mut self.head.worker_quarantine.cursor_sidecars,
+        ));
+        std::mem::forget(std::mem::take(
+            &mut self.head.emergency_quarantined_worker_jobs,
+        ));
+        std::mem::forget(std::mem::take(
+            &mut self.head.emergency_quarantined_submitted_ownership,
         ));
     }
 
@@ -519,7 +538,8 @@ impl NativeRuntime {
                             returned_job_error = Some(error);
                         }
                     }
-                    self.worker_quarantine
+                    self.head
+                        .worker_quarantine
                         .cursor_sidecars
                         .extend(returned_sidecar);
                     returned_job_error.map_or(Ok(()), Err)

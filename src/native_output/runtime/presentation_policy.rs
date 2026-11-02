@@ -45,17 +45,17 @@ impl PresentationPolicyError {
 impl NativeRuntime {
     pub(super) fn presentation_policy_snapshot(&self) -> PresentationPolicySnapshot {
         PresentationPolicySnapshot {
-            triple_buffering: self.triple_buffer_policy.as_str().to_string(),
-            buffering_mode: self.adaptive_buffering.mode().as_str().to_string(),
-            kms_worker: self.kms_commit_worker_policy.as_str().to_string(),
-            kms_worker_transport: self.kms_commit_worker_transport.as_str().to_string(),
+            triple_buffering: self.head.triple_buffer_policy.as_str().to_string(),
+            buffering_mode: self.head.adaptive_buffering.mode().as_str().to_string(),
+            kms_worker: self.head.kms_commit_worker_policy.as_str().to_string(),
+            kms_worker_transport: self.head.kms_commit_worker_transport.as_str().to_string(),
             held_commits: if crate::native_output::kms_worker::held_commits_late_latch() {
                 "late_latch"
             } else {
                 "immediate"
             }
             .to_string(),
-            credit_grant: if self.adaptive_buffering.sustained_overlap_grants() {
+            credit_grant: if self.head.adaptive_buffering.sustained_overlap_grants() {
                 "sustained"
             } else {
                 "ceiling"
@@ -100,17 +100,18 @@ impl NativeRuntime {
             self.set_kms_commit_worker_policy(worker)?;
         }
         if let Some(sustained) = sustained_grants {
-            self.adaptive_buffering
+            self.head
+                .adaptive_buffering
                 .set_sustained_overlap_grants(sustained);
         }
         if let Some(late_latch) = held_late_latch {
             crate::native_output::kms_worker::set_held_commits_late_latch(late_latch);
         }
         if let Some(triple) = triple
-            && triple != self.triple_buffer_policy
+            && triple != self.head.triple_buffer_policy
         {
-            self.triple_buffer_policy = triple;
-            self.adaptive_buffering.set_policy(triple);
+            self.head.triple_buffer_policy = triple;
+            self.head.adaptive_buffering.set_policy(triple);
             self.queued_redraw_requested = true;
         }
         Ok(())
@@ -132,7 +133,7 @@ impl NativeRuntime {
                 KmsCommitWorkerTransport::Worker
             }
         };
-        if transport != self.kms_commit_worker_transport {
+        if transport != self.head.kms_commit_worker_transport {
             if !self.kms_transport_quiescent() {
                 return Err(PresentationPolicyError::KmsWorkerBusy);
             }
@@ -140,36 +141,38 @@ impl NativeRuntime {
                 KmsCommitWorkerTransport::Synchronous => self.stop_kms_commit_worker()?,
                 KmsCommitWorkerTransport::Worker => self.start_kms_commit_worker_at_runtime()?,
             }
-            self.kms_commit_worker_transport = transport;
+            self.head.kms_commit_worker_transport = transport;
             // Timing evidence gathered on the other transport no longer
             // describes the submit path.
-            self.adaptive_buffering.reset();
+            self.head.adaptive_buffering.reset();
             self.queued_redraw_requested = true;
         }
-        self.kms_commit_worker_policy = policy;
+        self.head.kms_commit_worker_policy = policy;
         Ok(())
     }
 
     /// No commit, pageflip or worker hand-off is outstanding, so the submit
     /// transport can change without orphaning a completion.
     fn kms_transport_quiescent(&self) -> bool {
-        !self.atomic_commit_arbiter.atomic_commit_pending()
-            && !self.scanout.page_flip_pending()
-            && self.deferred_worker_pageflip.is_none()
-            && self.deferred_worker_completion.is_none()
-            && self.worker_timeout_pending.is_none()
+        !self.head.atomic_commit_arbiter.atomic_commit_pending()
+            && !self.head.scanout.page_flip_pending()
+            && self.head.deferred_worker_pageflip.is_none()
+            && self.head.deferred_worker_completion.is_none()
+            && self.head.worker_timeout_pending.is_none()
             && self
+                .head
                 .atomic_cursor
                 .as_ref()
                 .is_none_or(|cursor| cursor.pending_token().is_none())
             && self
+                .head
                 .kms_commit_worker
                 .as_ref()
                 .is_none_or(|worker| !worker.submission_active() && worker.queue_depth() == 0)
     }
 
     fn stop_kms_commit_worker(&mut self) -> Result<(), PresentationPolicyError> {
-        let Some(worker) = self.kms_commit_worker.as_ref() else {
+        let Some(worker) = self.head.kms_commit_worker.as_ref() else {
             return Ok(());
         };
         worker.request_quiesce();
@@ -177,7 +180,7 @@ impl NativeRuntime {
         // seat's quiesce authority and settles any events left behind.
         session_io::NativeSessionIo::join_kms_worker(self)
             .map_err(|_| PresentationPolicyError::KmsWorkerJoinFailed)?;
-        self.kms_commit_worker_startup = KmsCommitWorkerStartup::IntentionallySynchronous;
+        self.head.kms_commit_worker_startup = KmsCommitWorkerStartup::IntentionallySynchronous;
         Ok(())
     }
 
@@ -192,10 +195,10 @@ impl NativeRuntime {
         // Seed the presented base as a runtime modeset does; the worker
         // would otherwise adopt whatever base its first job names.
         worker.set_established_presented_base_for_output(
-            self.output_id,
-            self.presented_planes.revision,
-            self.output_epoch.get(),
-            self.target.crtc_id,
+            self.head.output_id,
+            self.head.presented_planes.revision,
+            self.head.output_epoch.get(),
+            self.head.target.crtc_id,
         );
         let token = self
             .event_loop
@@ -204,9 +207,9 @@ impl NativeRuntime {
         if let Some(seat) = self.seat_session.as_ref() {
             seat.install_pre_disable_quiesce_authority(Some(worker.quiesce_authority()));
         }
-        self.kms_commit_worker_reactor_token = Some(token);
-        self.kms_commit_worker = Some(worker);
-        self.kms_commit_worker_startup = KmsCommitWorkerStartup::WorkerStarted;
+        self.head.kms_commit_worker_reactor_token = Some(token);
+        self.head.kms_commit_worker = Some(worker);
+        self.head.kms_commit_worker_startup = KmsCommitWorkerStartup::WorkerStarted;
         Ok(())
     }
 }

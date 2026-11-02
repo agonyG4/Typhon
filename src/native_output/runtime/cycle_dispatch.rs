@@ -1104,7 +1104,9 @@ impl NativeRuntime {
             match self.server.set_material_configuration(configuration) {
                 Ok(snapshot) => {
                     let generation = self.server.trusted_effect_registry().current();
-                    self.scanout.publish_material_effect_generation(&generation);
+                    self.head
+                        .scanout
+                        .publish_material_effect_generation(&generation);
                     self.queued_redraw_requested = true;
                     return Some(material_snapshot_response(request.id, snapshot));
                 }
@@ -1283,11 +1285,11 @@ impl NativeRuntime {
                     ),
                 ));
             }
-            if self.scanout.render_worker_active() {
-                if self.render_worker_admission_stopped
+            if self.head.scanout.render_worker_active() {
+                if self.head.render_worker_admission_stopped
                     || !super::render_worker::effect_reload_admission_available(
                         true,
-                        self.scanout.render_worker_busy(),
+                        self.head.scanout.render_worker_busy(),
                         self.pending_worker_effect_reload.is_some(),
                     )
                 {
@@ -1311,6 +1313,7 @@ impl NativeRuntime {
                 };
                 let previous_generation = self.server.trusted_effect_registry().current();
                 match self
+                    .head
                     .scanout
                     .dispatch_render_worker_effect_reload(job_id, previous_generation)
                 {
@@ -1343,7 +1346,7 @@ impl NativeRuntime {
                 }
             }
             let snapshot = match super::reload_trusted_effects_from_disk(
-                &mut self.scanout,
+                &mut self.head.scanout,
                 &mut self.server,
             ) {
                 Ok(Some(snapshot)) => {
@@ -1442,7 +1445,7 @@ impl NativeRuntime {
                         .min(u128::from(u64::MAX)) as u64,
                     session_state: self.session.control_state(),
                     shutdown_state: self.shutdown.state().as_str().to_string(),
-                    output_count: if self.scanout_destroyed { 0 } else { 1 },
+                    output_count: if self.head.scanout_destroyed { 0 } else { 1 },
                     mapped_window_count: mapped,
                     minimized_window_count: minimized,
                     active_window: self
@@ -1471,7 +1474,7 @@ impl NativeRuntime {
             }
             ControlCommand::Performance => serde_json::to_value(self.performance_snapshot()),
             ControlCommand::Doctor => {
-                let output_available = !self.scanout_destroyed;
+                let output_available = !self.head.scanout_destroyed;
                 let session_severity = self.session.doctor_severity();
                 let direct_state = self.direct_scanout_state();
                 // Scene analysis is intentionally a doctor-only snapshot, not frame-loop state.
@@ -1489,7 +1492,7 @@ impl NativeRuntime {
                 let effects = self
                     .server
                     .direct_scanout_effect_doctor_details(&direct_scene_analysis);
-                let scanout_capabilities = self.scanout.dmabuf_scanout_capabilities();
+                let scanout_capabilities = self.head.scanout.dmabuf_scanout_capabilities();
                 let direct_scene = DirectScanoutDoctorScene::from_analysis(
                     &direct_scene_analysis,
                     semantic_solitary_fullscreen,
@@ -1498,22 +1501,23 @@ impl NativeRuntime {
                     &effects,
                 );
                 let direct_runtime = DirectScanoutDoctorRuntime {
-                    direct_pending: self.scanout.direct_scanout_pending(),
-                    direct_inhibited: self.scanout.direct_scanout_inhibited(),
-                    worker_transport: self.kms_commit_worker_transport.as_str(),
+                    direct_pending: self.head.scanout.direct_scanout_pending(),
+                    direct_inhibited: self.head.scanout.direct_scanout_inhibited(),
+                    worker_transport: self.head.kms_commit_worker_transport.as_str(),
                     worker_running: self
+                        .head
                         .kms_commit_worker
                         .as_ref()
                         .is_some_and(|worker| worker.fatal_reason().is_none()),
-                    atomic_commit_pending: self.atomic_commit_arbiter.atomic_commit_pending(),
-                    ready_frame_queued: self.scanout.ready_frame_queued(),
-                    output_render_in_progress: self.scanout.output_render_in_progress(),
+                    atomic_commit_pending: self.head.atomic_commit_arbiter.atomic_commit_pending(),
+                    ready_frame_queued: self.head.scanout.ready_frame_queued(),
+                    output_render_in_progress: self.head.scanout.output_render_in_progress(),
                     pending_interactive_visual_work: self
                         .server
                         .has_pending_interactive_visual_work(),
                     session_active: self.session.permits_output(),
                 };
-                let direct_counters = self.scanout.direct_scanout_counters();
+                let direct_counters = self.head.scanout.direct_scanout_counters();
                 let direct_detail = format_direct_scanout_doctor_detail(
                     &direct_scene,
                     direct_state,
@@ -1601,7 +1605,7 @@ impl NativeRuntime {
                     doctor_check(
                         "renderer.backend",
                         DoctorSeverity::Ok,
-                        self.scanout.kind().as_str(),
+                        self.head.scanout.kind().as_str(),
                     ),
                     doctor_check(
                         "output.mode",
@@ -1610,12 +1614,12 @@ impl NativeRuntime {
                         } else {
                             DoctorSeverity::Error
                         },
-                        self.mode_label.clone(),
+                        self.head.mode_label.clone(),
                     ),
                     doctor_check(
                         "cursor.backend",
                         DoctorSeverity::Ok,
-                        self.cursor_render_mode.as_str(),
+                        self.head.cursor_render_mode.as_str(),
                     ),
                     doctor_check(
                         "cursor.configuration",
@@ -1671,16 +1675,16 @@ impl NativeRuntime {
                     doctor_check(
                         "kms_worker.state",
                         kms_worker_doctor_severity(
-                            self.kms_commit_worker_policy,
-                            self.kms_commit_worker_transport,
-                            self.kms_commit_worker_startup,
-                            self.kms_commit_worker.is_some(),
+                            self.head.kms_commit_worker_policy,
+                            self.head.kms_commit_worker_transport,
+                            self.head.kms_commit_worker_startup,
+                            self.head.kms_commit_worker.is_some(),
                         ),
                         format!(
                             "policy={} transport={} startup={}",
-                            self.kms_commit_worker_policy.as_str(),
-                            self.kms_commit_worker_transport.as_str(),
-                            self.kms_commit_worker_startup.as_str()
+                            self.head.kms_commit_worker_policy.as_str(),
+                            self.head.kms_commit_worker_transport.as_str(),
+                            self.head.kms_commit_worker_startup.as_str()
                         ),
                     ),
                     doctor_check_with_detail(
@@ -1699,16 +1703,17 @@ impl NativeRuntime {
                     doctor_check(
                         "triple_buffering.state",
                         oblivion_one::native::adaptive_buffering::triple_buffering_doctor_severity(
-                            self.triple_buffer_policy,
-                            self.adaptive_buffering.mode(),
-                            self.adaptive_buffering
+                            self.head.triple_buffer_policy,
+                            self.head.adaptive_buffering.mode(),
+                            self.head
+                                .adaptive_buffering
                                 .force_unavailable_blocker()
                                 .is_some(),
                         ),
                         format!(
                             "policy={} mode={}",
-                            self.triple_buffer_policy.as_str(),
-                            self.adaptive_buffering.mode().as_str()
+                            self.head.triple_buffer_policy.as_str(),
+                            self.head.adaptive_buffering.mode().as_str()
                         ),
                     ),
                     doctor_check(
@@ -2045,12 +2050,12 @@ impl NativeRuntime {
     }
 
     fn cursor_backend_snapshot(&self) -> oblivion_one::control_snapshots::CursorBackendSnapshot {
-        if self.scanout_destroyed {
+        if self.head.scanout_destroyed {
             oblivion_one::control_snapshots::CursorBackendSnapshot::Unavailable
         } else if !resolve_native_cursor_for_server(&self.server, &self.input_state).visible {
             oblivion_one::control_snapshots::CursorBackendSnapshot::Hidden
         } else {
-            match self.cursor_render_mode {
+            match self.head.cursor_render_mode {
                 NativeCursorRenderMode::Hardware => {
                     oblivion_one::control_snapshots::CursorBackendSnapshot::Hardware
                 }
@@ -2063,7 +2068,7 @@ impl NativeRuntime {
 
     fn cursor_configuration_doctor_severity(&self) -> DoctorSeverity {
         cursor_configuration_doctor_severity(
-            !self.scanout_destroyed,
+            !self.head.scanout_destroyed,
             true,
             true,
             self.cursor_manager.active_configuration()
@@ -2084,7 +2089,9 @@ impl NativeRuntime {
             .animated_frame(base, std::time::Instant::now());
         self.frame_renderer
             .set_cursor_image(self.cursor_image.clone());
-        self.scanout.set_cursor_image(self.cursor_image.clone());
+        self.head
+            .scanout
+            .set_cursor_image(self.cursor_image.clone());
         oblivion_one::cursor_theme::install_shared_compositor_cursor(self.cursor_image.clone());
         self.queued_redraw_requested = true;
     }
@@ -2105,23 +2112,42 @@ impl NativeRuntime {
         let perf = self.perf;
         let Self {
             server,
-            output_id,
+            head:
+                OutputHead {
+                    output_id,
+                    target,
+                    mode_label,
+                    output_epoch,
+                    scanout,
+                    cursor_render_mode,
+                    atomic_cursor,
+                    legacy_cursor,
+                    kms_commit_worker,
+                    cursor_output_arbitration,
+                    frame_scheduler,
+                    output_refresh_rate,
+                    presentation_timing,
+                    cursor_timing,
+                    presentation_deadline,
+                    scheduled_presentation_target,
+                    render_journal,
+                    scene_history: _,
+                    frame_index,
+                    mismatched_pageflip_events,
+                    stale_pageflip_events,
+                    presentation_cadence: _,
+                    last_acquire_ready_at_ns,
+                    ..
+                },
             perf: _,
             kms,
             kms_backend,
-            target,
-            mode_label,
-            output_epoch,
             drm_timestamp_clock,
             presentation_clock,
-            scanout,
             frame_renderer,
             input_state,
             cursor_preference,
             cursor_scheduling_policy,
-            cursor_render_mode,
-            atomic_cursor,
-            legacy_cursor,
             input_devices,
             input_batch,
             input_epoch,
@@ -2131,25 +2157,10 @@ impl NativeRuntime {
             event_loop,
             system_action_transport,
             drm_reactor_token: _,
-            kms_commit_worker,
-            cursor_output_arbitration,
-            frame_scheduler,
-            output_refresh_rate,
-            presentation_timing,
-            cursor_timing,
-            presentation_deadline,
-            scheduled_presentation_target,
-            render_journal,
             effective_app_gpu_policy,
-            scene_history: _,
             queued_redraw_requested,
-            frame_index,
             known_toplevels,
             pending_launches,
-            mismatched_pageflip_events,
-            stale_pageflip_events,
-            presentation_cadence: _,
-            last_acquire_ready_at_ns,
             resize_perf,
             pointer_constraint_backend,
             process_supervisor,
@@ -2741,7 +2752,7 @@ impl NativeRuntime {
                     cursor_primary_ordering_target(*scheduled_presentation_target, pending_target),
                     cursor_dispatch_budget_ns,
                     cursor_output_arbitration.service_opportunity(),
-                    self.kms_commit_worker_transport,
+                    self.head.kms_commit_worker_transport,
                 )
             } else {
                 None
@@ -4535,6 +4546,7 @@ impl NativeRuntime {
     pub(super) fn control_output_list_snapshot(&self) -> OutputListSnapshot {
         let now_ns = oblivion_one::native::event_loop::monotonic_now_ns().unwrap_or(0);
         let transaction = self
+            .head
             .output_configuration_transactions
             .active()
             .map(|transaction| {
@@ -4554,6 +4566,7 @@ impl NativeRuntime {
                     }
                 };
                 let remaining_ms = self
+                    .head
                     .output_configuration_transactions
                     .remaining_ms(now_ns)
                     .unwrap_or(0);
@@ -4567,12 +4580,12 @@ impl NativeRuntime {
                 }
             });
         OutputListSnapshot {
-            outputs: if self.scanout_destroyed {
+            outputs: if self.head.scanout_destroyed {
                 Vec::new()
             } else {
                 vec![self.control_output_snapshot()]
             },
-            total: if self.scanout_destroyed { 0 } else { 1 },
+            total: if self.head.scanout_destroyed { 0 } else { 1 },
             truncated: false,
             transaction,
         }
@@ -4594,23 +4607,27 @@ impl NativeRuntime {
                 ));
             }
         };
-        let output_id = format!("output-{}", self.output_id.get());
-        let mutation_busy = self.pending_output_configuration.is_some()
-            || self.output_configuration_transactions.active().is_some()
-            || !self.output_configuration_transactions.can_begin()
+        let output_id = format!("output-{}", self.head.output_id.get());
+        let mutation_busy = self.head.pending_output_configuration.is_some()
+            || self
+                .head
+                .output_configuration_transactions
+                .active()
+                .is_some()
+            || !self.head.output_configuration_transactions.can_begin()
             || self.pending_output_persistence.is_some()
             || self.output_persistence_compensation_required;
         let target = match validate_output_configuration_change(
             &args,
             &output_id,
-            !self.scanout_destroyed,
-            self.target,
-            self.output_configuration_generation,
-            &self.output_capabilities.modes,
-            &self.output_capabilities.mode_inventory,
+            !self.head.scanout_destroyed,
+            self.head.target,
+            self.head.output_configuration_generation,
+            &self.head.output_capabilities.modes,
+            &self.head.output_capabilities.mode_inventory,
             mutation_busy,
             self.mode_selection_supported(),
-            &self.scanout.supported_color_depths(),
+            &self.head.scanout.supported_color_depths(),
         ) {
             Ok(target) => target,
             Err(error) => {
@@ -4640,18 +4657,20 @@ impl NativeRuntime {
     pub(super) fn direct_scanout_state(&self) -> FeatureState {
         crate::native_output::scanout::direct_scanout_feature_state(
             self.direct_scanout_preference.enabled(),
-            self.scanout_destroyed,
-            self.presented_planes
+            self.head.scanout_destroyed,
+            self.head
+                .presented_planes
                 .primary
                 .is_some_and(PresentedPrimaryAssignment::is_direct),
             matches!(
-                &*self.scanout,
+                &*self.head.scanout,
                 crate::native_output::scanout::NativeScanoutBackend::AtomicEglGbm(_)
             ),
-            self.kms_commit_worker_transport
+            self.head.kms_commit_worker_transport
                 == crate::native_output::kms_worker::KmsCommitWorkerTransport::Worker,
-            self.kms_commit_worker.is_some(),
-            self.kms_commit_worker
+            self.head.kms_commit_worker.is_some(),
+            self.head
+                .kms_commit_worker
                 .as_ref()
                 .is_some_and(|worker| worker.fatal_reason().is_none()),
             self.session.permits_output(),
@@ -4661,33 +4680,34 @@ impl NativeRuntime {
     fn control_output_snapshot(&self) -> OutputSnapshot {
         let direct_state = self.direct_scanout_state();
         OutputSnapshot {
-            id: format!("output-{}", self.output_id.get()),
-            name: self.output_capabilities.connector_name.clone(),
+            id: format!("output-{}", self.head.output_id.get()),
+            name: self.head.output_capabilities.connector_name.clone(),
             make: None,
             model: None,
             serial: None,
-            enabled: !self.scanout_destroyed,
-            current_mode: (!self.scanout_destroyed).then_some(ModeSnapshot {
-                id: self.target.mode_id,
-                width: self.target.width,
-                height: self.target.height,
-                refresh_millihz: self.output_refresh_rate.refresh_millihz(),
+            enabled: !self.head.scanout_destroyed,
+            current_mode: (!self.head.scanout_destroyed).then_some(ModeSnapshot {
+                id: self.head.target.mode_id,
+                width: self.head.target.width,
+                height: self.head.target.height,
+                refresh_millihz: self.head.output_refresh_rate.refresh_millihz(),
             }),
-            physical_size_mm: self.output_capabilities.physical_size_mm.clone(),
-            configuration_generation: self.output_configuration_generation.get(),
-            scale_milli: self.target.scale_milli,
-            transform: self.target.transform,
-            color_depth_bits: self.target.color_depth.bits(),
+            physical_size_mm: self.head.output_capabilities.physical_size_mm.clone(),
+            configuration_generation: self.head.output_configuration_generation.get(),
+            scale_milli: self.head.target.scale_milli,
+            transform: self.head.target.transform,
+            color_depth_bits: self.head.target.color_depth.bits(),
             mutation_capabilities: OutputMutationCapabilitiesSnapshot {
                 mode_selection_supported: self.mode_selection_supported(),
                 color_depth_bits: if self.mode_selection_supported() {
-                    self.scanout
+                    self.head
+                        .scanout
                         .supported_color_depths()
                         .into_iter()
                         .map(OutputColorDepth::bits)
                         .collect()
                 } else {
-                    vec![self.target.color_depth.bits()]
+                    vec![self.head.target.color_depth.bits()]
                 },
                 scale: ScaleMutationCapabilitySnapshot {
                     supported: false,
@@ -4709,15 +4729,16 @@ impl NativeRuntime {
             vrr: FeatureStateSnapshot {
                 state: runtime_vrr_feature_state(
                     self.kms_backend.atomic_vrr_capable(),
-                    self.confirmed_kms_presentation
-                        .vrr_request_confirmed_for(self.output_epoch.get()),
+                    self.head
+                        .confirmed_kms_presentation
+                        .vrr_request_confirmed_for(self.head.output_epoch.get()),
                 ),
             },
             direct_scanout: FeatureStateSnapshot {
                 state: direct_state,
             },
-            modes: self.output_capabilities.modes.clone(),
-            modes_truncated: self.output_capabilities.modes_truncated,
+            modes: self.head.output_capabilities.modes.clone(),
+            modes_truncated: self.head.output_capabilities.modes_truncated,
         }
     }
 }

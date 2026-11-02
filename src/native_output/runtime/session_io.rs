@@ -266,14 +266,14 @@ impl NativeSessionIo for NativeRuntime {
     }
 
     fn quiesce_render_worker(&mut self) -> NativeResult<()> {
-        self.render_worker_admission_stopped = true;
-        if !self.scanout.render_worker_active() {
+        self.head.render_worker_admission_stopped = true;
+        if !self.head.scanout.render_worker_active() {
             return Ok(());
         }
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         loop {
-            while self.scanout.render_worker_busy() {
+            while self.head.scanout.render_worker_busy() {
                 let now = std::time::Instant::now();
                 if now >= deadline {
                     return Err(io::Error::new(
@@ -282,7 +282,7 @@ impl NativeSessionIo for NativeRuntime {
                     )
                     .into());
                 }
-                let Some(fd) = self.scanout.render_worker_event_fd() else {
+                let Some(fd) = self.head.scanout.render_worker_event_fd() else {
                     return Err(io::Error::other(
                         "active render worker has no registered completion eventfd",
                     )
@@ -314,26 +314,26 @@ impl NativeSessionIo for NativeRuntime {
                 }
                 self.process_render_worker_events()?;
                 let mut cycle =
-                    NativeCycleState::for_worker_quiescence(self.scanout.page_flip_pending());
+                    NativeCycleState::for_worker_quiescence(self.head.scanout.page_flip_pending());
                 self.settle_pending_render_worker_completion(&mut cycle)?;
             }
 
-            if self.pending_render_worker_completion.is_some() {
+            if self.head.pending_render_worker_completion.is_some() {
                 let mut cycle =
-                    NativeCycleState::for_worker_quiescence(self.scanout.page_flip_pending());
+                    NativeCycleState::for_worker_quiescence(self.head.scanout.page_flip_pending());
                 self.settle_pending_render_worker_completion(&mut cycle)?;
             }
             if !self.quiesce_worker_output_candidate_step()? {
                 break;
             }
         }
-        if self.pending_render_worker_identity.is_some()
-            || self.pending_render_worker_context.is_some()
-            || self.pending_render_worker_outer.is_some()
-            || self.pending_render_worker_completion.is_some()
-            || self.pending_render_worker_capture.is_some()
+        if self.head.pending_render_worker_identity.is_some()
+            || self.head.pending_render_worker_context.is_some()
+            || self.head.pending_render_worker_outer.is_some()
+            || self.head.pending_render_worker_completion.is_some()
+            || self.head.pending_render_worker_capture.is_some()
             || self.pending_worker_effect_reload.is_some()
-            || self.pending_dmabuf_release_fence.is_some()
+            || self.head.pending_dmabuf_release_fence.is_some()
         {
             return Err(io::Error::other(
                 "render worker quiesced with reactor continuation ownership still pending",
@@ -345,20 +345,20 @@ impl NativeSessionIo for NativeRuntime {
 
     fn quiesce_kms_worker(&mut self) -> NativeResult<()> {
         let _ = self.check_kms_commit_worker_health();
-        if let Some(worker) = self.kms_commit_worker.as_ref() {
+        if let Some(worker) = self.head.kms_commit_worker.as_ref() {
             worker.request_quiesce();
         }
         Ok(())
     }
 
     fn join_kms_worker(&mut self) -> NativeResult<()> {
-        let Some(worker) = self.kms_commit_worker.take() else {
+        let Some(worker) = self.head.kms_commit_worker.take() else {
             return Ok(());
         };
         if let Some(seat) = self.seat_session.as_ref() {
             seat.install_pre_disable_quiesce_authority(None);
         }
-        if let Some(token) = self.kms_commit_worker_reactor_token.take() {
+        if let Some(token) = self.head.kms_commit_worker_reactor_token.take() {
             self.event_loop.unregister(token)?;
         }
         worker.join().map_err(|error| {
@@ -372,7 +372,8 @@ impl NativeSessionIo for NativeRuntime {
             }
         }
         self.defer_fatal_worker_jobs_for_teardown(worker.take_fatal_jobs())?;
-        self.worker_quarantine
+        self.head
+            .worker_quarantine
             .cursor_sidecars
             .extend(worker.take_pending_cursor_sidecar());
         if let Some(error) = event_error {
@@ -383,19 +384,19 @@ impl NativeSessionIo for NativeRuntime {
 
     fn quarantine_pageflip(&mut self) -> NativeResult<()> {
         self.abandon_direct_fallback();
-        self.frame_scheduler.abandon_for_session_suspend();
-        self.atomic_commit_arbiter.abandon_for_recovery();
-        self.deferred_worker_pageflip = None;
-        self.deferred_worker_completion = None;
-        self.cursor_output_arbitration.clear_pending();
-        if let Some(cursor) = self.atomic_cursor.as_mut() {
+        self.head.frame_scheduler.abandon_for_session_suspend();
+        self.head.atomic_commit_arbiter.abandon_for_recovery();
+        self.head.deferred_worker_pageflip = None;
+        self.head.deferred_worker_completion = None;
+        self.head.cursor_output_arbitration.clear_pending();
+        if let Some(cursor) = self.head.atomic_cursor.as_mut() {
             cursor.abandon_pageflip_for_recovery();
         }
-        if let Some(token) = self.output_render_fence_token.take() {
+        if let Some(token) = self.head.output_render_fence_token.take() {
             self.event_loop.unregister(token)?;
         }
-        self.scene_history.discard_unpresented();
-        self.scanout.suspend_page_flip()?;
+        self.head.scene_history.discard_unpresented();
+        self.head.scanout.suspend_page_flip()?;
         Ok(())
     }
 
@@ -407,10 +408,10 @@ impl NativeSessionIo for NativeRuntime {
     }
 
     fn retire_hardware_cursor_for_session(&mut self) -> NativeResult<()> {
-        if let Some(cursor) = self.atomic_cursor.as_mut() {
+        if let Some(cursor) = self.head.atomic_cursor.as_mut() {
             cursor.suspend_for_session();
         }
-        if let Some(mut cursor) = self.legacy_cursor.take() {
+        if let Some(mut cursor) = self.head.legacy_cursor.take() {
             cursor.disarm_drm_cleanup();
         }
         Ok(())
@@ -423,17 +424,17 @@ impl NativeSessionIo for NativeRuntime {
                 .rediscover_atomic_pipeline_for_recovery(self.kms.file().as_fd())?;
         }
         let drm_session_generation = allocate_native_drm_session_generation();
-        let output_epoch = self.output_epoch.next();
+        let output_epoch = self.head.output_epoch.next();
         let output_generation = output_epoch.get();
-        let recovery = self.scanout.prepare_session_recovery()?;
+        let recovery = self.head.scanout.prepare_session_recovery()?;
         let framebuffer = recovery.framebuffer_id();
-        let _prepared_cursor_state = if self.atomic_cursor.is_some() {
+        let _prepared_cursor_state = if self.head.atomic_cursor.is_some() {
             let atomic = self.kms_backend.atomic().ok_or_else(|| {
                 io::Error::other("Atomic cursor exists without an Atomic KMS backend")
             })?;
             match atomic.discovery().cursor_plane.clone() {
                 Some(plane) => {
-                    if let Some(cursor) = self.atomic_cursor.as_mut() {
+                    if let Some(cursor) = self.head.atomic_cursor.as_mut() {
                         Some(cursor.prepare_for_recovery(
                             self.kms.file(),
                             plane,
@@ -452,10 +453,10 @@ impl NativeSessionIo for NativeRuntime {
                         )
                         .into());
                     }
-                    if let Some(mut cursor) = self.atomic_cursor.take() {
+                    if let Some(mut cursor) = self.head.atomic_cursor.take() {
                         cursor.disarm_drm_cleanup();
                     }
-                    self.cursor_render_mode = NativeCursorRenderMode::Software;
+                    self.head.cursor_render_mode = NativeCursorRenderMode::Software;
                     None
                 }
             }
@@ -464,17 +465,22 @@ impl NativeSessionIo for NativeRuntime {
         };
         let effective_cursor_visible =
             resolve_native_cursor_for_server(&self.server, &self.input_state).visible;
-        let cursor_kms_state = self.atomic_cursor.as_ref().and_then(|cursor| {
-            effective_atomic_cursor_state(cursor, self.cursor_render_mode, effective_cursor_visible)
-                .kms_state()
-                .cloned()
+        let cursor_kms_state = self.head.atomic_cursor.as_ref().and_then(|cursor| {
+            effective_atomic_cursor_state(
+                cursor,
+                self.head.cursor_render_mode,
+                effective_cursor_visible,
+            )
+            .kms_state()
+            .cloned()
         });
         self.kms_backend
             .recover_with_cursor(framebuffer, cursor_kms_state.as_ref())?;
-        if let Some(cursor) = self.atomic_cursor.as_mut() {
+        if let Some(cursor) = self.head.atomic_cursor.as_mut() {
             cursor.mark_synchronous_modeset_submitted(cursor_kms_state.as_ref());
         }
         let cursor = self
+            .head
             .atomic_cursor
             .as_ref()
             .map(NativeAtomicCursor::presented_plane_state)
@@ -482,7 +488,7 @@ impl NativeSessionIo for NativeRuntime {
                 crate::native_output::presentation::plane::PresentedCursorState::hidden,
             );
         self.pending_session_recovery = Some(PendingSessionRecovery {
-            output_id: self.output_id,
+            output_id: self.head.output_id,
             scanout: recovery,
             drm_session_generation,
             output_epoch,
@@ -493,7 +499,7 @@ impl NativeSessionIo for NativeRuntime {
                 NativePerfField::str("completion", "synchronous_modeset"),
                 NativePerfField::str("kms_backend", self.kms_backend.effective_kind().as_str()),
                 NativePerfField::u64("framebuffer", u64::from(framebuffer.get())),
-                NativePerfField::u64("output_id", self.output_id.get()),
+                NativePerfField::u64("output_id", self.head.output_id.get()),
                 NativePerfField::u64("prepared_session_generation", drm_session_generation.get()),
                 NativePerfField::u64("prepared_output_epoch", output_epoch.get()),
             ]
@@ -502,14 +508,14 @@ impl NativeSessionIo for NativeRuntime {
     }
 
     fn abort_recovery_for_session_suspend(&mut self) -> NativeResult<()> {
-        if let Some(token) = self.output_render_fence_token.take()
+        if let Some(token) = self.head.output_render_fence_token.take()
             && let Err(error) = self.event_loop.unregister(token)
         {
-            self.output_render_fence_token = Some(token);
+            self.head.output_render_fence_token = Some(token);
             return Err(error.into());
         }
         self.pending_session_recovery = None;
-        if let Some(cursor) = self.atomic_cursor.as_mut() {
+        if let Some(cursor) = self.head.atomic_cursor.as_mut() {
             cursor.suspend_for_session();
         }
         Ok(())
@@ -519,20 +525,24 @@ impl NativeSessionIo for NativeRuntime {
         let recovery = self.pending_session_recovery.as_ref().ok_or_else(|| {
             io::Error::other("session recovery completion has no prepared framebuffer")
         })?;
-        let recovery_progress = self.scanout.complete_session_recovery(recovery.scanout)?;
+        let recovery_progress = self
+            .head
+            .scanout
+            .complete_session_recovery(recovery.scanout)?;
         if recovery_progress != NativeSessionRecoveryProgress::Complete {
             return Ok(recovery_progress);
         }
-        self.confirmed_kms_presentation = ConfirmedKmsPresentationState::default();
-        self.submitted_worker_ownership.clear();
-        self.worker_quarantine.jobs.clear();
-        self.worker_quarantine.cursor_sidecars.clear();
-        self.emergency_quarantined_worker_jobs.clear();
-        self.emergency_quarantined_submitted_ownership.clear();
+        self.head.confirmed_kms_presentation = ConfirmedKmsPresentationState::default();
+        self.head.submitted_worker_ownership.clear();
+        self.head.worker_quarantine.jobs.clear();
+        self.head.worker_quarantine.cursor_sidecars.clear();
+        self.head.emergency_quarantined_worker_jobs.clear();
+        self.head.emergency_quarantined_submitted_ownership.clear();
         let abandoned_at = MonotonicTimestampNs::new(monotonic_now_ns()?);
-        let transaction_ids = self.output_transactions.active_transaction_ids();
+        let transaction_ids = self.head.output_transactions.active_transaction_ids();
         for transaction_id in transaction_ids.iter().copied() {
-            let Some(transaction) = self.output_transactions.transaction(transaction_id) else {
+            let Some(transaction) = self.head.output_transactions.transaction(transaction_id)
+            else {
                 continue;
             };
             if !matches!(
@@ -547,10 +557,11 @@ impl NativeSessionIo for NativeRuntime {
                 transaction.descriptor().obligations(),
                 DirectTerminalCallbackDisposition::Abandoned,
             );
-            self.scanout
+            self.head
+                .scanout
                 .note_direct_callback_owner_leaks(callback_owner_leaks);
         }
-        let output_transactions = &mut self.output_transactions;
+        let output_transactions = &mut self.head.output_transactions;
         let server = &mut self.server;
         for transaction_id in transaction_ids {
             complete_dropped_output_transaction(
@@ -574,10 +585,11 @@ impl NativeSessionIo for NativeRuntime {
         let recovery = self
             .pending_session_recovery
             .expect("session recovery remains pending until generation rebind");
-        validate_pending_session_recovery_output(self.output_id, recovery.output_id)?;
-        let snapshot_revision_before = self.presented_planes.revision;
+        validate_pending_session_recovery_output(self.head.output_id, recovery.output_id)?;
+        let snapshot_revision_before = self.head.presented_planes.revision;
         let (had_presented_primary, primary_kind) =
-            self.presented_planes
+            self.head
+                .presented_planes
                 .primary
                 .map_or((false, "none"), |primary| {
                     (
@@ -589,11 +601,12 @@ impl NativeSessionIo for NativeRuntime {
                         },
                     )
                 });
-        self.presented_planes
+        self.head
+            .presented_planes
             .rebase_after_synchronous_modeset(recovery.cursor);
         self.perf.log("native.output_epoch_barrier", || {
             vec![
-                NativePerfField::u64("old_output_epoch", self.output_epoch.get()),
+                NativePerfField::u64("old_output_epoch", self.head.output_epoch.get()),
                 NativePerfField::u64("new_output_epoch", recovery.output_epoch.get()),
                 NativePerfField::u64(
                     "old_session_generation",
@@ -621,7 +634,7 @@ impl NativeSessionIo for NativeRuntime {
                     "snapshot_revision_before",
                     snapshot_revision_before.get(),
                 ),
-                NativePerfField::u64("snapshot_revision_after", self.presented_planes.revision.get()),
+                NativePerfField::u64("snapshot_revision_after", self.head.presented_planes.revision.get()),
             ]
         });
         Ok(NativeSessionRecoveryProgress::Complete)
@@ -630,10 +643,11 @@ impl NativeSessionIo for NativeRuntime {
     fn register_suspended_recovery_fence(
         &mut self,
     ) -> NativeResult<NativeSessionRecoveryFenceRegistration> {
-        if self.output_render_fence_token.is_some() {
+        if self.head.output_render_fence_token.is_some() {
             return Ok(NativeSessionRecoveryFenceRegistration::Registered);
         }
         let Some(fd) = self
+            .head
             .scanout
             .explicit_output_swapchain()
             .map(|swapchain| swapchain.suspended_fence_fd())
@@ -642,7 +656,7 @@ impl NativeSessionIo for NativeRuntime {
         else {
             return Ok(NativeSessionRecoveryFenceRegistration::AlreadySignaled);
         };
-        self.output_render_fence_token = Some(
+        self.head.output_render_fence_token = Some(
             self.event_loop
                 .register(fd, NativeEventSource::OutputRenderFence)?,
         );
@@ -654,23 +668,29 @@ impl NativeSessionIo for NativeRuntime {
             .pending_session_recovery
             .ok_or_else(|| io::Error::other("session recovery has no prepared generation"))?;
         let output_epoch = recovery.output_epoch;
-        self.presentation_timing.reconfigure(
-            KmsModeTiming::from_mode(&self.target.mode, self.output_refresh_rate.interval_ns()),
+        self.head.presentation_timing.reconfigure(
+            KmsModeTiming::from_mode(
+                &self.head.target.mode,
+                self.head.output_refresh_rate.interval_ns(),
+            ),
             output_epoch.get(),
         );
-        self.cursor_timing.reconfigure(
-            KmsModeTiming::from_mode(&self.target.mode, self.output_refresh_rate.interval_ns()),
+        self.head.cursor_timing.reconfigure(
+            KmsModeTiming::from_mode(
+                &self.head.target.mode,
+                self.head.output_refresh_rate.interval_ns(),
+            ),
             output_epoch.get(),
         );
         self.abandon_direct_fallback();
-        self.scanout.rebind_output_epoch(
+        self.head.scanout.rebind_output_epoch(
             output_epoch,
             recovery.drm_session_generation,
             self.kms_backend.atomic_connector_vrr_capable(),
             self.kms_backend.atomic_crtc_vrr_property_available(),
         )?;
         self.settle_and_rebase_session_output_frame_lanes(monotonic_now_ns()?)?;
-        self.output_epoch = output_epoch;
+        self.head.output_epoch = output_epoch;
         self.drm_session_generation = recovery.drm_session_generation;
         self.observe(NativeIoOperation::RenderWorkerRebindAcknowledged);
         Ok(())
@@ -683,16 +703,17 @@ impl NativeSessionIo for NativeRuntime {
             .output_epoch;
         if !apply_native_scanout_feedback(
             &mut self.server,
-            &self.scanout,
+            &self.head.scanout,
             self.dmabuf_feedback_compatibility.target_device_override(),
         ) {
-            self.scanout.note_dmabuf_feedback_unchanged_rebuild();
+            self.head.scanout.note_dmabuf_feedback_unchanged_rebuild();
         }
         self.acquire_watches.set_output_epoch(output_epoch);
         self.restart_kms_commit_worker_after_recovery()?;
         self.rearm_parked_acquire_watches()?;
-        let configuration_generation = self.output_configuration_generation.advance();
-        self.output_capabilities
+        let configuration_generation = self.head.output_configuration_generation.advance();
+        self.head
+            .output_capabilities
             .mode_inventory
             .requalify(configuration_generation);
         self.pending_session_recovery = None;
@@ -705,9 +726,9 @@ impl NativeSessionIo for NativeRuntime {
         if self.cursor_preference == NativeCursorPreference::Software {
             return Ok(());
         }
-        if let Some(cursor) = self.atomic_cursor.as_mut() {
-            cursor.rearm_generation(self.output_epoch.get());
-            self.cursor_render_mode = NativeCursorRenderMode::Hardware;
+        if let Some(cursor) = self.head.atomic_cursor.as_mut() {
+            cursor.rearm_generation(self.head.output_epoch.get());
+            self.head.cursor_render_mode = NativeCursorRenderMode::Hardware;
             return Ok(());
         }
         if self.kms_backend.effective_kind() == KmsBackendKind::Atomic {
@@ -717,12 +738,12 @@ impl NativeSessionIo for NativeRuntime {
                 )
                 .into());
             }
-            self.cursor_render_mode = NativeCursorRenderMode::Software;
+            self.head.cursor_render_mode = NativeCursorRenderMode::Software;
             return Ok(());
         }
         match NativeLegacyHardwareCursor::create(
             self.kms.file(),
-            self.target.crtc_id,
+            self.head.target.crtc_id,
             &self.cursor_image,
         ) {
             Ok(mut cursor) => {
@@ -732,15 +753,15 @@ impl NativeSessionIo for NativeRuntime {
                 if resolved_cursor.visible && resolved_cursor.source.legacy_hardware_eligible() {
                     cursor.enable().and_then(|()| cursor.move_to(x, y))?;
                 }
-                self.legacy_cursor = Some(cursor);
-                self.cursor_render_mode = NativeCursorRenderMode::Hardware;
+                self.head.legacy_cursor = Some(cursor);
+                self.head.cursor_render_mode = NativeCursorRenderMode::Hardware;
             }
             Err(error) if self.cursor_preference == NativeCursorPreference::Hardware => {
                 return Err(error.into());
             }
             Err(error) => {
                 eprintln!("native cursor: session recovery fell back to software: {error}");
-                self.cursor_render_mode = NativeCursorRenderMode::Software;
+                self.head.cursor_render_mode = NativeCursorRenderMode::Software;
             }
         }
         Ok(())
@@ -751,8 +772,8 @@ impl NativeSessionIo for NativeRuntime {
             self.event_loop
                 .register(self.kms.file().as_raw_fd(), NativeEventSource::Drm)?,
         );
-        if let Some(worker) = self.kms_commit_worker.as_ref() {
-            self.kms_commit_worker_reactor_token = Some(
+        if let Some(worker) = self.head.kms_commit_worker.as_ref() {
+            self.head.kms_commit_worker_reactor_token = Some(
                 self.event_loop
                     .register(worker.event_fd(), NativeEventSource::KmsCommitWorker)?,
             );
@@ -761,13 +782,13 @@ impl NativeSessionIo for NativeRuntime {
     }
 
     fn rearm_scheduler(&mut self) -> NativeResult<()> {
-        let refresh_interval = Duration::from_nanos(self.output_refresh_rate.interval_ns());
-        self.presentation_deadline.invalidate(refresh_interval);
-        self.scheduled_presentation_target = None;
+        let refresh_interval = Duration::from_nanos(self.head.output_refresh_rate.interval_ns());
+        self.head.presentation_deadline.invalidate(refresh_interval);
+        self.head.scheduled_presentation_target = None;
         self.server.invalidate_commit_timing_targets();
-        self.render_journal.reset();
-        self.adaptive_buffering.reset();
-        self.pending_proven_deadline_miss = None;
+        self.head.render_journal.reset();
+        self.head.adaptive_buffering.reset();
+        self.head.pending_proven_deadline_miss = None;
         self.queued_redraw_requested = true;
         self.arm_runtime_deadline()
     }
@@ -792,12 +813,12 @@ impl NativeSessionIo for NativeRuntime {
     }
 
     fn disarm_drm_destructors(&mut self) {
-        self.scanout.disarm_drm_cleanup();
+        self.head.scanout.disarm_drm_cleanup();
         self.kms_backend.disarm_drm_io();
-        if let Some(cursor) = self.atomic_cursor.as_mut() {
+        if let Some(cursor) = self.head.atomic_cursor.as_mut() {
             cursor.disarm_drm_cleanup();
         }
-        if let Some(cursor) = self.legacy_cursor.as_mut() {
+        if let Some(cursor) = self.head.legacy_cursor.as_mut() {
             cursor.disarm_drm_cleanup();
         }
     }
