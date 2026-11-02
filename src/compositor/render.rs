@@ -6774,6 +6774,7 @@ mod tests {
             requested_size: 2,
             theme: "test".to_string(),
             source: None,
+            animation: Arc::from([]),
         });
         let mut renderer = DesktopSceneRenderer::with_cursor_image(image);
         let mut frame = vec![0; 8 * 8];

@@ -6,6 +6,7 @@ use std::{
     io::Read,
     path::PathBuf,
     sync::{Arc, OnceLock, RwLock},
+    time::{Duration, Instant},
 };
 
 #[cfg(test)]
@@ -24,6 +25,9 @@ pub const MAX_CURSOR_FRAME_PIXELS: usize = 1024 * 1024;
 pub const MAX_CURSOR_FRAMES_PER_FILE: usize = 256;
 pub const MAX_CURSOR_UNIQUE_IMAGES: usize = 6;
 pub const MAX_CURSOR_TOTAL_FRAME_PIXELS: usize = MAX_CURSOR_UNIQUE_IMAGES * MAX_CURSOR_FRAME_PIXELS;
+/// Floor for XCursor frame delays so a theme with tiny or zero delays cannot
+/// turn the cursor into a busy-loop wake source.
+pub const MIN_CURSOR_FRAME_DELAY_MS: u32 = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CompositorCursorShape {
@@ -186,6 +190,15 @@ pub struct CompositorCursorImage {
     pub(crate) requested_size: u32,
     pub(crate) theme: String,
     pub(crate) source: Option<PathBuf>,
+    /// Every frame of an animated XCursor at the selected nominal size, in
+    /// playback order. Empty for static cursors; the image itself then shows.
+    pub(crate) animation: Arc<[CursorAnimationFrame]>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CursorAnimationFrame {
+    pub image: Arc<CompositorCursorImage>,
+    pub delay_ms: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -296,6 +309,7 @@ impl CompositorCursorImage {
             requested_size: width.max(height),
             theme: "test".to_string(),
             source: None,
+            animation: Arc::from([]),
         })
     }
 
@@ -327,7 +341,12 @@ impl CompositorCursorImage {
             requested_size: DEFAULT_CURSOR_SIZE,
             theme: "builtin".to_string(),
             source: None,
+            animation: Arc::from([]),
         }
+    }
+
+    pub fn is_animated(&self) -> bool {
+        self.animation.len() > 1
     }
 
     pub fn top_left(&self, pointer_x: i32, pointer_y: i32) -> (i32, i32) {
@@ -581,9 +600,15 @@ fn load_alias_image(
                 .ok_or(CursorThemeLoadError::CursorFileInvalid)?;
             let image = select_nearest_frame(&frames, requested_size)
                 .map_err(|_| CursorThemeLoadError::CursorFileInvalid)?;
-            compositor_image_from_frame(image, theme_name, requested_size, source_path.clone())
-                .map(Arc::new)
-                .map_err(|_| CursorThemeLoadError::CursorFileInvalid)
+            animated_image_from_frames(
+                &frames,
+                image,
+                theme_name,
+                requested_size,
+                source_path.clone(),
+            )
+            .map(Arc::new)
+            .map_err(|_| CursorThemeLoadError::CursorFileInvalid)
         });
         cache.insert(source_path, parsed.clone());
         parsed
@@ -816,6 +841,103 @@ fn select_nearest_frame(frames: &[Image], requested_size: u32) -> Result<Image, 
         .ok_or_else(|| "cursor file has no image frames".to_string())
 }
 
+/// Builds the displayed image from the selected frame and, when the file holds
+/// more than one frame at that nominal size, attaches the full frame sequence.
+fn animated_image_from_frames(
+    frames: &[Image],
+    selected: Image,
+    theme_name: &str,
+    requested_size: u32,
+    source: PathBuf,
+) -> Result<CompositorCursorImage, String> {
+    let nominal_size = selected.size;
+    let sequence = frames
+        .iter()
+        .filter(|frame| frame.size == nominal_size)
+        .collect::<Vec<_>>();
+    let mut image =
+        compositor_image_from_frame(selected, theme_name, requested_size, source.clone())?;
+    if sequence.len() > 1 {
+        let animation = sequence
+            .into_iter()
+            .map(|frame| {
+                compositor_image_from_frame(
+                    frame.clone(),
+                    theme_name,
+                    requested_size,
+                    source.clone(),
+                )
+                .map(|image| CursorAnimationFrame {
+                    image: Arc::new(image),
+                    delay_ms: frame.delay.max(MIN_CURSOR_FRAME_DELAY_MS),
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        image.animation = Arc::from(animation);
+    }
+    Ok(image)
+}
+
+/// Plays the frame sequence of the cursor image currently on screen. The
+/// clock restarts whenever a different base image is shown, so a fresh
+/// `wait` cursor always begins at its first frame.
+#[derive(Debug, Default)]
+pub struct CursorAnimationClock {
+    base: Option<Arc<CompositorCursorImage>>,
+    started_at: Option<Instant>,
+    next_deadline: Option<Instant>,
+}
+
+impl CursorAnimationClock {
+    pub fn frame(
+        &mut self,
+        base: Arc<CompositorCursorImage>,
+        now: Instant,
+    ) -> Arc<CompositorCursorImage> {
+        if !base.is_animated() {
+            self.base = None;
+            self.started_at = None;
+            self.next_deadline = None;
+            return base;
+        }
+        let started_at = match (&self.base, self.started_at) {
+            (Some(current), Some(started_at)) if Arc::ptr_eq(current, &base) => started_at,
+            _ => {
+                self.base = Some(base.clone());
+                self.started_at = Some(now);
+                now
+            }
+        };
+        let total_ms = base
+            .animation
+            .iter()
+            .map(|frame| u64::from(frame.delay_ms))
+            .sum::<u64>()
+            .max(1);
+        let elapsed_ms = u64::try_from(now.saturating_duration_since(started_at).as_millis())
+            .unwrap_or(u64::MAX)
+            % total_ms;
+        let mut frame_end_ms = 0_u64;
+        for frame in base.animation.iter() {
+            frame_end_ms += u64::from(frame.delay_ms);
+            if elapsed_ms < frame_end_ms {
+                self.next_deadline = Some(now + Duration::from_millis(frame_end_ms - elapsed_ms));
+                return frame.image.clone();
+            }
+        }
+        self.next_deadline = None;
+        base
+    }
+
+    pub fn next_deadline(&self) -> Option<Instant> {
+        self.next_deadline
+    }
+
+    pub fn is_due(&self, now: Instant) -> bool {
+        self.next_deadline.is_some_and(|deadline| deadline <= now)
+    }
+}
+
 fn compositor_image_from_frame(
     frame: Image,
     theme_name: &str,
@@ -860,6 +982,7 @@ fn compositor_image_from_frame(
         requested_size,
         theme: theme_name.to_string(),
         source: Some(source),
+        animation: Arc::from([]),
     })
 }
 
@@ -1251,6 +1374,113 @@ mod tests {
         let image = fixture.load("Theme", 27);
         assert_eq!((image.width, image.height), (32, 32));
         assert_eq!((image.pixels_argb8888[0] >> 16) & 0xff, 32);
+    }
+
+    #[test]
+    fn frames_at_the_selected_size_form_the_animation_sequence() {
+        let fixture = CursorFixture::new();
+        fixture.write_theme("Theme", None);
+        fixture.write_cursor_raw(
+            "Theme",
+            "left_ptr",
+            cursor_file(&[
+                (16, 16, 1, 1, 10),
+                (16, 16, 1, 1, 20),
+                (16, 16, 1, 1, 30),
+                (32, 32, 2, 2, 99),
+            ]),
+        );
+
+        let image = fixture.load("Theme", 16);
+        assert!(image.is_animated());
+        let shades = image
+            .animation
+            .iter()
+            .map(|frame| (frame.image.pixels_argb8888[0] >> 16) & 0xff)
+            .collect::<Vec<_>>();
+        assert_eq!(shades, [10, 20, 30]);
+        assert_eq!((image.pixels_argb8888[0] >> 16) & 0xff, 10);
+        assert!(
+            image
+                .animation
+                .iter()
+                .all(|frame| frame.delay_ms == MIN_CURSOR_FRAME_DELAY_MS)
+        );
+    }
+
+    #[test]
+    fn single_frame_cursor_is_static() {
+        let fixture = CursorFixture::new();
+        fixture.write_theme("Theme", None);
+        fixture.write_cursor("Theme", "left_ptr", &[16], 16, 16, 1, 1);
+
+        assert!(!fixture.load("Theme", 16).is_animated());
+    }
+
+    fn animated_test_image(delays_ms: &[u32]) -> Arc<CompositorCursorImage> {
+        let frame = |shade: u32| {
+            Arc::new(CompositorCursorImage::from_argb8888(vec![shade], 1, 1, 0, 0).unwrap())
+        };
+        let mut base = CompositorCursorImage::from_argb8888(vec![0], 1, 1, 0, 0).unwrap();
+        base.animation = delays_ms
+            .iter()
+            .enumerate()
+            .map(|(index, delay_ms)| CursorAnimationFrame {
+                image: frame(index as u32 + 1),
+                delay_ms: *delay_ms,
+            })
+            .collect::<Vec<_>>()
+            .into();
+        Arc::new(base)
+    }
+
+    #[test]
+    fn animation_clock_advances_by_frame_delay_and_wraps() {
+        let base = animated_test_image(&[30, 50]);
+        let mut clock = CursorAnimationClock::default();
+        let start = Instant::now();
+
+        assert_eq!(clock.frame(base.clone(), start).pixels_argb8888, [1]);
+        assert_eq!(
+            clock.next_deadline(),
+            Some(start + Duration::from_millis(30))
+        );
+        assert!(!clock.is_due(start + Duration::from_millis(29)));
+        assert!(clock.is_due(start + Duration::from_millis(30)));
+
+        let second = start + Duration::from_millis(30);
+        assert_eq!(clock.frame(base.clone(), second).pixels_argb8888, [2]);
+        assert_eq!(
+            clock.next_deadline(),
+            Some(start + Duration::from_millis(80))
+        );
+
+        let wrapped = start + Duration::from_millis(85);
+        assert_eq!(clock.frame(base, wrapped).pixels_argb8888, [1]);
+        assert_eq!(
+            clock.next_deadline(),
+            Some(start + Duration::from_millis(110))
+        );
+    }
+
+    #[test]
+    fn animation_clock_restarts_for_a_new_base_and_idles_for_static_cursors() {
+        let first = animated_test_image(&[30, 50]);
+        let second = animated_test_image(&[30, 50]);
+        let mut clock = CursorAnimationClock::default();
+        let start = Instant::now();
+        clock.frame(first, start);
+
+        let later = start + Duration::from_millis(40);
+        assert_eq!(clock.frame(second, later).pixels_argb8888, [1]);
+        assert_eq!(
+            clock.next_deadline(),
+            Some(later + Duration::from_millis(30))
+        );
+
+        let still = Arc::new(CompositorCursorImage::builtin_fallback());
+        assert!(Arc::ptr_eq(&clock.frame(still.clone(), later), &still));
+        assert_eq!(clock.next_deadline(), None);
     }
 
     #[test]

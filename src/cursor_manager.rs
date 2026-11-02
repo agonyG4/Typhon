@@ -7,8 +7,9 @@ use crate::control_snapshots::{
 };
 use crate::cursor_persistence::{CursorConfigurationStore, CursorPersistenceError};
 use crate::cursor_theme::{
-    CompositorCursorImage, CompositorCursorShape, CursorConfiguration, CursorShapeImages,
-    CursorThemeLoadError, default_cursor_configuration, load_protocol_shape_image,
+    CompositorCursorImage, CompositorCursorShape, CursorAnimationClock, CursorConfiguration,
+    CursorShapeImages, CursorThemeLoadError, default_cursor_configuration,
+    load_protocol_shape_image,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
@@ -161,6 +162,7 @@ pub struct CursorThemeManager {
     retired: VecDeque<RetiredCursorGeneration>,
     protocol_shape_cache: HashMap<ProtocolCursorShape, Arc<CompositorCursorImage>>,
     protocol_shape_fallbacks: HashSet<ProtocolCursorShape>,
+    animation: CursorAnimationClock,
     diagnostics: CursorDiagnostics,
 }
 
@@ -184,6 +186,7 @@ impl CursorThemeManager {
             retired: VecDeque::new(),
             protocol_shape_cache: HashMap::new(),
             protocol_shape_fallbacks: HashSet::new(),
+            animation: CursorAnimationClock::default(),
             diagnostics: CursorDiagnostics::default(),
         }
     }
@@ -374,6 +377,23 @@ impl CursorThemeManager {
             self.protocol_shape_cache.insert(shape, image.clone());
         }
         image
+    }
+
+    /// The frame of `base` to show at `now`; static cursors pass through.
+    pub fn animated_frame(
+        &mut self,
+        base: Arc<CompositorCursorImage>,
+        now: std::time::Instant,
+    ) -> Arc<CompositorCursorImage> {
+        self.animation.frame(base, now)
+    }
+
+    pub fn next_animation_deadline(&self) -> Option<std::time::Instant> {
+        self.animation.next_deadline()
+    }
+
+    pub fn animation_frame_due(&self, now: std::time::Instant) -> bool {
+        self.animation.is_due(now)
     }
 
     #[cfg(test)]

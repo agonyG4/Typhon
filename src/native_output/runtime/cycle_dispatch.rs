@@ -2077,8 +2077,11 @@ impl NativeRuntime {
         if !change.published {
             return;
         }
-        self.cursor_image =
+        let base =
             super::presentation_cursor::active_cursor_image(&self.server, &mut self.cursor_manager);
+        self.cursor_image = self
+            .cursor_manager
+            .animated_frame(base, std::time::Instant::now());
         self.frame_renderer
             .set_cursor_image(self.cursor_image.clone());
         self.scanout.set_cursor_image(self.cursor_image.clone());

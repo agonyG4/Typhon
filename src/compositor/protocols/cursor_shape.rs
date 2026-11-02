@@ -94,23 +94,23 @@ impl TryFrom<u32> for ProtocolCursorShape {
 impl ProtocolCursorShape {
     pub(crate) const fn aliases(self) -> &'static [&'static str] {
         match self {
-            Self::Default => &["default", "left_ptr", "arrow"],
+            Self::Default => &["default", "left_ptr", "arrow", "top_left_arrow"],
             Self::ContextMenu => &["context-menu", "context_menu"],
-            Self::Help => &["help"],
-            Self::Pointer => &["pointer", "left_ptr", "default", "arrow"],
-            Self::Progress => &["progress"],
-            Self::Wait => &["wait"],
-            Self::Cell => &["cell"],
-            Self::Crosshair => &["crosshair"],
-            Self::Text => &["text", "ibeam"],
+            Self::Help => &["help", "question_arrow", "whats_this", "left_ptr_help"],
+            Self::Pointer => &["pointer", "hand2", "pointing_hand", "hand1", "hand"],
+            Self::Progress => &["progress", "left_ptr_watch", "half-busy"],
+            Self::Wait => &["wait", "watch", "clock"],
+            Self::Cell => &["cell", "plus"],
+            Self::Crosshair => &["crosshair", "cross", "tcross"],
+            Self::Text => &["text", "xterm", "ibeam"],
             Self::VerticalText => &["vertical-text", "vertical_text"],
-            Self::Alias => &["alias"],
-            Self::Copy => &["copy"],
+            Self::Alias => &["alias", "dnd-link", "link"],
+            Self::Copy => &["copy", "dnd-copy"],
             Self::Move => &["move", "fleur", "all-scroll"],
-            Self::NoDrop => &["no-drop", "no_drop"],
-            Self::NotAllowed => &["not-allowed", "not_allowed"],
-            Self::Grab => &["grab"],
-            Self::Grabbing => &["grabbing"],
+            Self::NoDrop => &["no-drop", "no_drop", "dnd-none", "dnd-no-drop"],
+            Self::NotAllowed => &["not-allowed", "not_allowed", "crossed_circle", "forbidden"],
+            Self::Grab => &["grab", "openhand"],
+            Self::Grabbing => &["grabbing", "closedhand", "dnd-move"],
             Self::EResize => &["e-resize", "right_side"],
             Self::NResize => &["n-resize", "top_side"],
             Self::NeResize => &["ne-resize", "top_right_corner"],
@@ -119,15 +119,25 @@ impl ProtocolCursorShape {
             Self::SeResize => &["se-resize", "bottom_right_corner"],
             Self::SwResize => &["sw-resize", "bottom_left_corner"],
             Self::WResize => &["w-resize", "left_side"],
-            Self::EwResize => &["ew-resize", "size_hor", "sb_h_double_arrow"],
-            Self::NsResize => &["ns-resize", "size_ver", "sb_v_double_arrow"],
+            Self::EwResize => &[
+                "ew-resize",
+                "size_hor",
+                "sb_h_double_arrow",
+                "h_double_arrow",
+            ],
+            Self::NsResize => &[
+                "ns-resize",
+                "size_ver",
+                "sb_v_double_arrow",
+                "v_double_arrow",
+            ],
             Self::NeswResize => &["nesw-resize", "size_bdiag"],
             Self::NwseResize => &["nwse-resize", "size_fdiag"],
-            Self::ColResize => &["col-resize", "vertical-text"],
-            Self::RowResize => &["row-resize", "h_double_arrow"],
+            Self::ColResize => &["col-resize", "split_h", "sb_h_double_arrow", "ew-resize"],
+            Self::RowResize => &["row-resize", "split_v", "sb_v_double_arrow", "ns-resize"],
             Self::AllScroll => &["all-scroll", "fleur"],
-            Self::ZoomIn => &["zoom-in"],
-            Self::ZoomOut => &["zoom-out"],
+            Self::ZoomIn => &["zoom-in", "zoom_in"],
+            Self::ZoomOut => &["zoom-out", "zoom_out"],
             Self::DndAsk => &["dnd-ask", "dnd_ask"],
             Self::AllResize => &["all-resize", "all_resize"],
         }
@@ -295,7 +305,7 @@ mod tests {
     fn protocol_cursor_shape_has_stable_aliases_for_theme_lookup() {
         assert_eq!(
             ProtocolCursorShape::try_from(4).unwrap().aliases(),
-            &["pointer", "left_ptr", "default", "arrow"]
+            &["pointer", "hand2", "pointing_hand", "hand1", "hand"]
         );
         assert!(
             ProtocolCursorShape::try_from(35)

@@ -761,6 +761,11 @@ impl NativeRuntime {
             false
         };
         cycle.redraw_requested |= pacing_visual_work;
+        // An animated theme cursor advances on its own frame deadline; the
+        // presentation step swaps in the next frame image.
+        cycle.redraw_requested |= self
+            .cursor_manager
+            .animation_frame_due(std::time::Instant::now());
         let post_service_state = self.native_runtime_state(&cycle, monotonic_now_ns()?);
         cycle.work_class =
             NativeWorkDomains::from_wakeup(&cycle.wakeup, &post_service_state).work_class;

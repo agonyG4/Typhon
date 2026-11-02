@@ -42,9 +42,10 @@ pub(crate) enum NativeDeadlineOwner {
     OutputConfiguration,
     KeyboardRepeat,
     ScratchMaintenance,
+    CursorAnimation,
 }
 
-const DEADLINE_OWNER_COUNT: usize = 15;
+const DEADLINE_OWNER_COUNT: usize = 16;
 
 const fn deadline_owner_index(owner: NativeDeadlineOwner) -> usize {
     match owner {
@@ -63,6 +64,7 @@ const fn deadline_owner_index(owner: NativeDeadlineOwner) -> usize {
         NativeDeadlineOwner::CursorPlanningRetry => 12,
         NativeDeadlineOwner::CursorSynchronousAdmission => 13,
         NativeDeadlineOwner::ScratchMaintenance => 14,
+        NativeDeadlineOwner::CursorAnimation => 15,
     }
 }
 
@@ -119,6 +121,7 @@ pub(crate) struct NativeWakePlanInputs {
     pub(crate) output_configuration_deadline_ns: Option<u64>,
     pub(crate) keyboard_repeat_deadline_ns: Option<u64>,
     pub(crate) scratch_maintenance_deadline_ns: Option<u64>,
+    pub(crate) cursor_animation_deadline_ns: Option<u64>,
     pub(crate) input_backlog: bool,
     pub(crate) astrea_publication: bool,
     pub(crate) commit_timing_planning: bool,
@@ -261,7 +264,8 @@ impl NativeWakeAuthorityMetrics {
                     NativeDeadlineOwner::ControlTimeout => {
                         self.deadline_owner_control = self.deadline_owner_control.saturating_add(1)
                     }
-                    NativeDeadlineOwner::SystemActionTransport => {}
+                    NativeDeadlineOwner::SystemActionTransport
+                    | NativeDeadlineOwner::CursorAnimation => {}
                     NativeDeadlineOwner::SurfacePacing => {
                         self.deadline_owner_surface_pacing =
                             self.deadline_owner_surface_pacing.saturating_add(1)
@@ -406,6 +410,15 @@ pub(crate) fn build_native_wake_plan(inputs: NativeWakePlanInputs) -> NativeWake
             .scratch_maintenance_deadline_ns
             .map(|at_ns| NativeDeadline {
                 owner: NativeDeadlineOwner::ScratchMaintenance,
+                at_ns,
+            }),
+    );
+    deadline = earliest_deadline(
+        deadline,
+        inputs
+            .cursor_animation_deadline_ns
+            .map(|at_ns| NativeDeadline {
+                owner: NativeDeadlineOwner::CursorAnimation,
                 at_ns,
             }),
     );
@@ -846,7 +859,7 @@ mod tests {
         metrics.observe_plan(plan, 80, None, None);
         let index = deadline_owner_index(NativeDeadlineOwner::KeyboardRepeat);
 
-        assert_eq!(DEADLINE_OWNER_COUNT, 14);
+        assert_eq!(DEADLINE_OWNER_COUNT, 16);
         assert_eq!(metrics.deadline_owner_keyboard_repeat, 1);
         assert_eq!(metrics.past_deadline_arms_by_owner[index], 1);
         assert_eq!(metrics.stale_deadline_arms_by_owner[index], 0);
@@ -1467,6 +1480,24 @@ mod tests {
             Some(NativeDeadline {
                 owner: NativeDeadlineOwner::ScratchMaintenance,
                 at_ns: 50,
+            })
+        );
+    }
+
+    #[test]
+    fn cursor_animation_deadline_arms_the_runtime_timer_when_it_is_earliest() {
+        let plan = build_native_wake_plan(NativeWakePlanInputs {
+            now_ns: 10,
+            scratch_maintenance_deadline_ns: Some(80),
+            cursor_animation_deadline_ns: Some(40),
+            ..NativeWakePlanInputs::default()
+        });
+
+        assert_eq!(
+            plan.deadline,
+            Some(NativeDeadline {
+                owner: NativeDeadlineOwner::CursorAnimation,
+                at_ns: 40,
             })
         );
     }

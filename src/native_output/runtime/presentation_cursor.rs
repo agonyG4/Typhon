@@ -39,7 +39,8 @@ pub(super) fn synchronize_active_cursor_image(
     queued_redraw_requested: &mut bool,
 ) {
     cursor_manager.collect_retired_generations();
-    let image = active_cursor_image(server, cursor_manager);
+    let base = active_cursor_image(server, cursor_manager);
+    let image = cursor_manager.animated_frame(base, std::time::Instant::now());
     if !std::sync::Arc::ptr_eq(cursor_image, &image) {
         *cursor_image = image.clone();
         frame_renderer.set_cursor_image(image.clone());

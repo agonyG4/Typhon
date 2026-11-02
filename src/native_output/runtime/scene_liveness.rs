@@ -38,6 +38,16 @@ impl NativeRuntime {
                     now_ns,
                 )
             });
+        let cursor_animation_deadline_ns =
+            self.cursor_manager
+                .next_animation_deadline()
+                .map(|deadline| {
+                    super::wake_plan::instant_deadline_to_monotonic_ns(
+                        deadline,
+                        scratch_deadline_now,
+                        now_ns,
+                    )
+                });
         let scheduler_wake_requirement = self.current_scheduler_wake_requirement(now_ns)?;
         let scheduler_wake_requirement = gate_scheduler_for_output_configuration(
             self.pending_output_configuration.is_some(),
@@ -100,6 +110,7 @@ impl NativeRuntime {
                 .then(|| self.input_state.keyboard_repeat_deadline_ns())
                 .flatten(),
             scratch_maintenance_deadline_ns,
+            cursor_animation_deadline_ns,
             input_backlog: self.input_epoch.backlog_pending(),
             astrea_publication: self.server.has_pending_astrea_toplevel_publication(),
             commit_timing_planning: self.server.has_pending_commit_timing_planning(),
@@ -141,6 +152,7 @@ impl NativeRuntime {
                     NativeDeadlineOwner::OutputConfiguration => "deadline:output_configuration",
                     NativeDeadlineOwner::KeyboardRepeat => "deadline:keyboard_repeat",
                     NativeDeadlineOwner::ScratchMaintenance => "deadline:scratch_maintenance",
+                    NativeDeadlineOwner::CursorAnimation => "deadline:cursor_animation",
                 }
             } else if plan
                 .continuation
