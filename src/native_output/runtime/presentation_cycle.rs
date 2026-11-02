@@ -537,7 +537,21 @@ impl NativeRuntime {
             cursor_dispatch_budget_ns,
             cursor_output_arbitration.service_opportunity(),
             *kms_commit_worker_transport,
-        );
+        )
+        .map(|candidate| {
+            if confirmed_kms_presentation.vrr_request_confirmed_for(output_epoch.get()) {
+                super::planner::retarget_cursor_opportunity_for_vrr(
+                    presentation_deadline,
+                    cursor_timing,
+                    candidate,
+                    cursor_output_arbitration.service_opportunity(),
+                    scheduler_now,
+                    *kms_commit_worker_transport,
+                )
+            } else {
+                candidate
+            }
+        });
         let cursor_service_opportunity = (*cursor_scheduling_policy
             == super::frame::NativeCursorSchedulingPolicy::Auto)
             .then_some(cursor_target_opportunity)

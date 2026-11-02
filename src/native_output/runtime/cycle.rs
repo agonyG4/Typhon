@@ -231,7 +231,25 @@ impl NativeRuntime {
             cursor_dispatch_budget_ns,
             self.head.cursor_output_arbitration.service_opportunity(),
             crate::native_output::kms_worker::KmsCommitWorkerTransport::Worker,
-        );
+        )
+        .map(|candidate| {
+            if self
+                .head
+                .confirmed_kms_presentation
+                .vrr_request_confirmed_for(self.head.output_epoch.get())
+            {
+                super::planner::retarget_cursor_opportunity_for_vrr(
+                    &self.head.presentation_deadline,
+                    &self.head.cursor_timing,
+                    candidate,
+                    self.head.cursor_output_arbitration.service_opportunity(),
+                    now,
+                    crate::native_output::kms_worker::KmsCommitWorkerTransport::Worker,
+                )
+            } else {
+                candidate
+            }
+        });
         if let Some(candidate) = candidate {
             if self.head.cursor_output_arbitration.pending()
                 && self.head.cursor_output_arbitration.desired_epoch() == cursor.desired_epoch()

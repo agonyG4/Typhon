@@ -121,6 +121,73 @@ pub(crate) fn plan_cursor_service_opportunity_with_current(
     })
 }
 
+/// Under VRR the panel has no refresh grid: after the last physical
+/// presentation plus the shortest interval, a cursor plane commit is
+/// presented as soon as it applies. The fixed planner still picks grid
+/// points, so a cursor that becomes pending just after one grid point waited
+/// for the next (live trace: cursor updates clustered at 6.06 and 12.12 ms
+/// after the previous flip). Retarget an unordered cursor opportunity to the
+/// earliest physically valid time; its sequence is the one the completion
+/// will claim. An opportunity ordered after a primary, or replanned after an
+/// expired cursor target, keeps its grid target and ordering.
+pub(crate) fn retarget_cursor_opportunity_for_vrr(
+    planner: &PresentationDeadlinePlanner,
+    timing: &CursorTimingDomain,
+    opportunity: CursorServiceOpportunity,
+    current_opportunity: Option<CursorServiceOpportunity>,
+    now: MonotonicTimestampNs,
+    transport: KmsCommitWorkerTransport,
+) -> CursorServiceOpportunity {
+    let replanned_after_expired_target = current_opportunity
+        .is_some_and(|current| current.target.presentation_time.get() <= now.get());
+    if opportunity.ordering_after_primary.is_some()
+        || replanned_after_expired_target
+        || opportunity.target.reason != PresentationTargetReason::ReactiveDouble
+    {
+        return opportunity;
+    }
+    let Some(last_presented_at) = planner.last_presented_at() else {
+        return opportunity;
+    };
+    let selection_lead_ns = match transport {
+        KmsCommitWorkerTransport::Worker => 1,
+        KmsCommitWorkerTransport::Synchronous => opportunity.apply_guard_ns,
+    };
+    let refresh_ns =
+        u64::try_from(opportunity.target.refresh_interval.as_nanos()).unwrap_or(u64::MAX);
+    let earliest = now
+        .get()
+        .saturating_add(selection_lead_ns)
+        .max(last_presented_at.get().saturating_add(refresh_ns));
+    if earliest >= opportunity.target.presentation_time.get() {
+        return opportunity;
+    }
+    let presentation_time = MonotonicTimestampNs::new(earliest);
+    let claim = planner.prepare_presented(presentation_time).claim();
+    let target = PresentationTarget {
+        sequence: claim.sequence,
+        presentation_time,
+        physical_claim: claim,
+        selection_evidence: oblivion_one::native::presentation_deadline::TargetSelectionEvidence {
+            earliest_feasible_sequence: claim.sequence,
+            binding: false,
+        },
+        ..opportunity.target
+    };
+    let submit_window = cursor_submit_window(
+        target,
+        timing,
+        opportunity.dispatch_budget_ns,
+        opportunity.apply_guard_ns,
+    );
+    CursorServiceOpportunity {
+        target,
+        submit_window,
+        service_deadline_ns: earliest.saturating_sub(opportunity.total_lead_ns),
+        ..opportunity
+    }
+}
+
 fn cursor_submit_window(
     target: PresentationTarget,
     timing: &CursorTimingDomain,
@@ -1577,6 +1644,85 @@ mod tests {
         assert!(!arbitration.pending());
         assert_eq!(arbitration.plane_delta_plans(), 1);
         assert_eq!(arbitration.plane_delta_submissions(), 1);
+    }
+
+    #[test]
+    fn vrr_cursor_opportunity_leaves_the_fixed_grid_only_when_unordered() {
+        const REFRESH_NS: u64 = 1_000_000_000 / 165;
+        let anchor = MonotonicTimestampNs::new(3_000_000_000);
+        let mut planner = PresentationDeadlinePlanner::new(Duration::from_nanos(REFRESH_NS));
+        planner.note_presented(anchor);
+        let timing = CursorTimingDomain::new(
+            KmsModeTiming::from_mode(&drm_mode_modeinfo::default(), REFRESH_NS),
+            7,
+        );
+        let worker = KmsCommitWorkerTransport::Worker;
+
+        // Pending 8 ms after the last flip: the grid waits for 12.12 ms, VRR
+        // presents at the next apply.
+        let late = MonotonicTimestampNs::new(anchor.get() + 8_000_000);
+        let grid = plan_cursor_service_opportunity(&planner, &timing, late, None, 500_000)
+            .expect("grid opportunity");
+        assert_eq!(
+            grid.target.presentation_time.get(),
+            anchor.get() + 2 * REFRESH_NS
+        );
+        let vrr = retarget_cursor_opportunity_for_vrr(&planner, &timing, grid, None, late, worker);
+        assert_eq!(vrr.target.presentation_time.get(), late.get() + 1);
+        assert_eq!(
+            vrr.target.physical_claim(),
+            planner
+                .prepare_presented(vrr.target.presentation_time)
+                .claim()
+        );
+        assert!(vrr.target.sequence < grid.target.sequence);
+        assert!(vrr.service_deadline_ns <= late.get());
+        assert_eq!(
+            vrr.submit_window.commit_complete_deadline_ns(),
+            cursor_submit_window(vrr.target, &timing, 500_000, grid.apply_guard_ns)
+                .commit_complete_deadline_ns()
+        );
+
+        // Inside the shortest interval the panel cannot refresh earlier than
+        // the first grid point, so nothing changes.
+        let early = MonotonicTimestampNs::new(anchor.get() + 2_000_000);
+        let grid = plan_cursor_service_opportunity(&planner, &timing, early, None, 500_000)
+            .expect("grid opportunity");
+        assert_eq!(
+            retarget_cursor_opportunity_for_vrr(&planner, &timing, grid, None, early, worker),
+            grid
+        );
+
+        // Ordering after a primary and replanning an expired cursor target
+        // keep the grid target.
+        let late_grid = plan_cursor_service_opportunity(&planner, &timing, late, None, 500_000)
+            .expect("grid opportunity");
+        let ordered = CursorServiceOpportunity {
+            ordering_after_primary: Some(late_grid.target),
+            ..late_grid
+        };
+        assert_eq!(
+            retarget_cursor_opportunity_for_vrr(&planner, &timing, ordered, None, late, worker),
+            ordered
+        );
+        let expired = CursorServiceOpportunity {
+            target: PresentationTarget {
+                presentation_time: anchor,
+                ..late_grid.target
+            },
+            ..late_grid
+        };
+        assert_eq!(
+            retarget_cursor_opportunity_for_vrr(
+                &planner,
+                &timing,
+                late_grid,
+                Some(expired),
+                late,
+                worker
+            ),
+            late_grid
+        );
     }
 
     #[test]

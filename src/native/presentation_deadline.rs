@@ -357,6 +357,11 @@ impl PresentationDeadlinePlanner {
         })
     }
 
+    /// Timestamp of the latest committed physical presentation.
+    pub const fn last_presented_at(&self) -> Option<MonotonicTimestampNs> {
+        self.last_presented_at
+    }
+
     /// Returns the identity candidate for the next variable physical
     /// presentation without reserving or consuming it.
     pub fn next_variable_opportunity_id(&self) -> Option<PresentationOpportunityId> {
