@@ -986,6 +986,8 @@ fn special_workspace_visibility_controls_fullscreen_composition() {
     assert_eq!(opened_metrics.owner_root_surface_id, Some(surface_ids[2]));
     assert!(opened_metrics.fullscreen_composition_active);
     assert!(!opened_metrics.solitary_tree_active);
+    // A special-workspace application is content of its own.
+    assert!(!opened_metrics.cadence_owner_active);
     assert!(!opened_native_ids.contains(&surface_ids[0]));
     assert!(opened_native_ids.contains(&surface_ids[1]));
     assert!(opened_native_ids.contains(&surface_ids[2]));
@@ -1013,6 +1015,7 @@ fn special_workspace_visibility_controls_fullscreen_composition() {
     let closed_metrics = capture_fullscreen_render_plan_metrics(&commands);
     assert!(closed_metrics.fullscreen_composition_active);
     assert!(closed_metrics.solitary_tree_active);
+    assert!(closed_metrics.cadence_owner_active);
     let closed_native_ids = capture_native_frame_surface_ids(&commands);
     assert!(!closed_native_ids.contains(&surface_ids[0]));
     assert!(closed_native_ids.contains(&surface_ids[2]));

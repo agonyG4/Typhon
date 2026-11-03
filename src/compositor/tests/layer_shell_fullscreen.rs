@@ -175,6 +175,8 @@ fn non_occluding_fullscreen_preserves_underlays_without_exposing_input() {
         .expect("fullscreen owner should be renderable");
     assert!(metrics.fullscreen_composition_active);
     assert!(!metrics.solitary_tree_active);
+    // A translucent owner composes the desktop below it: no cadence owner.
+    assert!(!metrics.cadence_owner_active);
     assert_eq!(metrics.fullscreen_allowed_layer_roots, 1);
     assert_eq!(metrics.fullscreen_culled_layer_roots, 1);
     assert!(presented.contains(&owner_id));
@@ -421,6 +423,7 @@ fn preserve_alpha_fullscreen_replacement_keeps_background_and_bottom_composed_wi
     assert!(eligibility.fully_opaque);
     assert!(metrics.fullscreen_composition_active);
     assert!(!metrics.solitary_tree_active);
+    assert!(!metrics.cadence_owner_active);
     assert!(!metrics.wallpaper_culled);
     assert_eq!(metrics.fullscreen_culled_layer_roots, 0);
     assert!(presented.contains(&background_id));
@@ -698,7 +701,12 @@ fn notification_overlay_survives_workspace_switch_and_stays_above_fullscreen() {
     );
     let scanout = capture_direct_scanout_scene_analysis(&commands);
     assert!(scanout.candidate.is_none());
-    assert!(capture_fullscreen_render_plan_metrics(&commands).fullscreen_composition_active);
+    let overlay_metrics = capture_fullscreen_render_plan_metrics(&commands);
+    assert!(overlay_metrics.fullscreen_composition_active);
+    // The overlay breaks direct scanout but is secondary work: the owner
+    // still sets the cadence, so VRR stays on.
+    assert!(!overlay_metrics.solitary_tree_active);
+    assert!(overlay_metrics.cadence_owner_active);
 
     commands
         .send(ServerCommand::ActivateWorkspace { workspace: 2 })

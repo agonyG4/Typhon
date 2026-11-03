@@ -893,6 +893,7 @@ impl NativeRuntime {
                     fullscreen.fullscreen_transition_pending,
                 ),
                 NativePerfField::bool("solitary_tree_active", fullscreen.solitary_tree_active),
+                NativePerfField::bool("cadence_owner_active", fullscreen.cadence_owner_active),
                 NativePerfField::usize(
                     "fullscreen_culled_surfaces",
                     fullscreen.culled_surface_count,

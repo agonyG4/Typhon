@@ -23,6 +23,16 @@ pub enum FullscreenAboveFullscreenReason {
 }
 
 impl FullscreenAboveFullscreenReason {
+    /// Shell overlays, notifications and drag icons are secondary work: they
+    /// sit above a fullscreen owner without competing with it as content, so
+    /// the owner keeps setting the output cadence (and keeps VRR).
+    pub const fn is_secondary_work(self) -> bool {
+        matches!(
+            self,
+            Self::ApplicationNotification | Self::LayerOverlay | Self::DragIcon
+        )
+    }
+
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::SpecialWorkspaceApplication => "special_workspace_application",
@@ -65,6 +75,9 @@ pub struct FullscreenCompositionPlan {
     pub culled_layer_roots: usize,
     pub culled_surface_count: usize,
     pub solitary_owner_only: bool,
+    /// The owner is the only content: whatever else is visible is its own
+    /// family, popups or secondary work above it.
+    pub cadence_owner_only: bool,
     pub above_fullscreen_reason: Option<FullscreenAboveFullscreenReason>,
 }
 
@@ -155,6 +168,9 @@ pub struct FullscreenRenderPlanMetrics {
     pub fullscreen_composition_active: bool,
     pub fullscreen_transition_pending: bool,
     pub solitary_tree_active: bool,
+    /// The fullscreen owner sets the output cadence: only secondary work is
+    /// visible beside it. VRR follows this, not `solitary_tree_active`.
+    pub cadence_owner_active: bool,
     pub culled_surface_count: usize,
     pub wallpaper_culled: bool,
     pub visible_overlay_count: usize,

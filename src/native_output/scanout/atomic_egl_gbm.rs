@@ -1843,7 +1843,7 @@ impl AtomicEglGbmScanout {
                 ..AsyncEligibility::default()
             },
             VrrEligibility {
-                auto_candidate: metrics.solitary_tree_active,
+                auto_candidate: metrics.cadence_owner_active,
                 backend_capable: true,
                 connector_capable: self.vrr_connector_capable,
                 crtc_property_available: self.vrr_crtc_property_available,

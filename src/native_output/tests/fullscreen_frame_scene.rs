@@ -58,6 +58,7 @@ fn solitary_fullscreen_snapshot_matches_the_filtered_renderer_scene() {
             fullscreen_composition_active: true,
             fullscreen_transition_pending: false,
             solitary_tree_active: true,
+            cadence_owner_active: true,
             culled_surface_count: 1,
             wallpaper_culled: true,
             visible_overlay_count: 0,

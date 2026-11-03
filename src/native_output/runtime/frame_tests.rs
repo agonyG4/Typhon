@@ -1073,6 +1073,7 @@ fn finalized_snapshot_contains_all_dynamic_metadata_fields() {
         fullscreen_composition_active: true,
         fullscreen_transition_pending: false,
         solitary_tree_active: false,
+        cadence_owner_active: false,
         culled_surface_count: 3,
         wallpaper_culled: true,
         visible_overlay_count: 2,

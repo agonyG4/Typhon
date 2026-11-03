@@ -64,7 +64,7 @@ pub(crate) fn effective_output_presentation(
             ..AsyncEligibility::default()
         },
         VrrEligibility {
-            auto_candidate: metrics.solitary_tree_active,
+            auto_candidate: metrics.cadence_owner_active,
             backend_capable: kms_backend
                 .is_some_and(|kms| kms.effective_kind() == KmsBackendKind::Atomic),
             connector_capable: kms_backend

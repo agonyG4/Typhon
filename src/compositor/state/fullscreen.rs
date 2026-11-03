@@ -443,6 +443,7 @@ impl CompositorState {
             return plan;
         }
 
+        let mut competing_content_above = false;
         let mut seen_roots = HashSet::new();
         for surface in self.active_scene_surfaces() {
             let root_surface_id = self.presentation_owner_root_for_surface(surface.surface_id);
@@ -460,6 +461,7 @@ impl CompositorState {
                         plan.allowed_application_roots.push(root_surface_id);
                     }
                     plan.above_fullscreen_reason.get_or_insert(reason);
+                    competing_content_above |= !reason.is_secondary_work();
                 }
                 FullscreenRootClassification::CulledByFullscreen(_) => {
                     // Root counts are filled after composition underlays have
@@ -537,6 +539,8 @@ impl CompositorState {
             && plan.allowed_application_roots.is_empty()
             && plan.allowed_layer_roots.is_empty()
             && plan.composition_underlay_roots.is_empty();
+        plan.cadence_owner_only =
+            !competing_content_above && plan.composition_underlay_roots.is_empty();
         plan
     }
 
@@ -837,6 +841,7 @@ impl CompositorState {
                 .owner_root_surface_id
                 .is_some_and(|owner| self.presentation_animation_pending_for_root(owner)),
             solitary_tree_active: plan.solitary_owner_only,
+            cadence_owner_active: plan.cadence_owner_only,
             culled_surface_count: plan.culled_surface_count,
             wallpaper_culled,
             visible_overlay_count: self.visible_fullscreen_overlay_count(),
