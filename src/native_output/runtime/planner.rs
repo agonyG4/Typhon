@@ -121,6 +121,44 @@ pub(crate) fn plan_cursor_service_opportunity_with_current(
     })
 }
 
+/// Runtime entry point for cursor service planning: every caller that feeds
+/// the cursor arbitration must use it, because the arbitration keeps the
+/// first opportunity of a pending epoch. With a confirmed VRR request the
+/// opportunity leaves the fixed grid (see `retarget_cursor_opportunity_for_vrr`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn plan_runtime_cursor_service_opportunity(
+    planner: &PresentationDeadlinePlanner,
+    timing: &CursorTimingDomain,
+    now: MonotonicTimestampNs,
+    primary_target: Option<PresentationTarget>,
+    kms_dispatch_budget_ns: u64,
+    current_opportunity: Option<CursorServiceOpportunity>,
+    transport: KmsCommitWorkerTransport,
+    vrr_confirmed: bool,
+) -> Option<CursorServiceOpportunity> {
+    let opportunity = plan_cursor_service_opportunity_with_current(
+        planner,
+        timing,
+        now,
+        primary_target,
+        kms_dispatch_budget_ns,
+        current_opportunity,
+        transport,
+    )?;
+    Some(if vrr_confirmed {
+        retarget_cursor_opportunity_for_vrr(
+            planner,
+            timing,
+            opportunity,
+            current_opportunity,
+            now,
+            transport,
+        )
+    } else {
+        opportunity
+    })
+}
+
 /// `OBLIVION_ONE_VRR_CURSOR_RETARGET=off` keeps VRR cursor service on the
 /// fixed grid, for A/B latency measurement.
 fn vrr_cursor_retarget_enabled() -> bool {
@@ -1735,6 +1773,35 @@ mod tests {
             ),
             late_grid
         );
+    }
+
+    #[test]
+    fn runtime_cursor_planning_retargets_only_with_a_confirmed_vrr_request() {
+        const REFRESH_NS: u64 = 1_000_000_000 / 165;
+        let anchor = MonotonicTimestampNs::new(3_000_000_000);
+        let mut planner = PresentationDeadlinePlanner::new(Duration::from_nanos(REFRESH_NS));
+        planner.note_presented(anchor);
+        let timing = CursorTimingDomain::new(
+            KmsModeTiming::from_mode(&drm_mode_modeinfo::default(), REFRESH_NS),
+            7,
+        );
+        let late = MonotonicTimestampNs::new(anchor.get() + 8_000_000);
+        let worker = KmsCommitWorkerTransport::Worker;
+        let plan = |vrr| {
+            plan_runtime_cursor_service_opportunity(
+                &planner, &timing, late, None, 500_000, None, worker, vrr,
+            )
+            .expect("cursor opportunity")
+        };
+        assert_eq!(
+            plan(false),
+            plan_cursor_service_opportunity(&planner, &timing, late, None, 500_000).unwrap()
+        );
+        assert_eq!(
+            plan(true),
+            retarget_cursor_opportunity_for_vrr(&planner, &timing, plan(false), None, late, worker)
+        );
+        assert!(plan(true).target.presentation_time < plan(false).target.presentation_time);
     }
 
     #[test]

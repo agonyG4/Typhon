@@ -1,7 +1,7 @@
 use super::cursor_cycle::{apply_cursor_position, resolve_native_cursor_for_server};
 use super::planner::{
     cursor_primary_ordering_target, pending_fixed_target_for_scanout,
-    plan_cursor_service_opportunity_with_current,
+    plan_runtime_cursor_service_opportunity,
 };
 use super::*;
 
@@ -2745,7 +2745,7 @@ impl NativeRuntime {
                     },
                 );
                 let pending_target = pending_fixed_target_for_scanout(scanout)?;
-                plan_cursor_service_opportunity_with_current(
+                plan_runtime_cursor_service_opportunity(
                     presentation_deadline,
                     cursor_timing,
                     now,
@@ -2753,6 +2753,9 @@ impl NativeRuntime {
                     cursor_dispatch_budget_ns,
                     cursor_output_arbitration.service_opportunity(),
                     self.head.kms_commit_worker_transport,
+                    self.head
+                        .confirmed_kms_presentation
+                        .vrr_request_confirmed_for(output_epoch.get()),
                 )
             } else {
                 None

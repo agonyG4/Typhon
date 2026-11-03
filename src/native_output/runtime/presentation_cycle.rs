@@ -11,7 +11,7 @@ use super::frame::{
 use super::planner::{
     NativePresentationPath, NativePresentationPlanInput, cursor_primary_ordering_target,
     fresh_composited_reactive_target, pacing_mode_for_target, pending_fixed_target_for_scanout,
-    plan_cursor_service_opportunity_with_current, plan_native_presentation_path,
+    plan_native_presentation_path, plan_runtime_cursor_service_opportunity,
     plan_visual_target_for_budget, prepare_presentation_target, reactive_or_commit_timing_target,
 };
 use super::presentation_cursor::*;
@@ -529,7 +529,7 @@ impl NativeRuntime {
                 )
             },
         );
-        let cursor_target_opportunity = plan_cursor_service_opportunity_with_current(
+        let cursor_target_opportunity = plan_runtime_cursor_service_opportunity(
             presentation_deadline,
             cursor_timing,
             scheduler_now,
@@ -537,21 +537,8 @@ impl NativeRuntime {
             cursor_dispatch_budget_ns,
             cursor_output_arbitration.service_opportunity(),
             *kms_commit_worker_transport,
-        )
-        .map(|candidate| {
-            if confirmed_kms_presentation.vrr_request_confirmed_for(output_epoch.get()) {
-                super::planner::retarget_cursor_opportunity_for_vrr(
-                    presentation_deadline,
-                    cursor_timing,
-                    candidate,
-                    cursor_output_arbitration.service_opportunity(),
-                    scheduler_now,
-                    *kms_commit_worker_transport,
-                )
-            } else {
-                candidate
-            }
-        });
+            confirmed_kms_presentation.vrr_request_confirmed_for(output_epoch.get()),
+        );
         let cursor_service_opportunity = (*cursor_scheduling_policy
             == super::frame::NativeCursorSchedulingPolicy::Auto)
             .then_some(cursor_target_opportunity)
