@@ -164,9 +164,13 @@ impl IntervalRing {
 /// A content pause longer than this starts a fresh cadence estimate.
 const GATE_IDLE_GAP_NS: u64 = 250_000_000;
 /// Consecutive primary intervals examined for instability under VRR.
-const GATE_UNSTABLE_WINDOW: usize = 8;
-/// Large interval changes within the window that close the gate.
-const GATE_UNSTABLE_CHANGES: usize = 3;
+const GATE_UNSTABLE_WINDOW: usize = 12;
+/// Intervals far from the window median that close the gate. A once-a-second
+/// extra frame (a panel clock) adds one or two; bursty UI swings nearly all.
+const GATE_UNSTABLE_DEVIATIONS: usize = 4;
+/// Intervals after VRR engages that still carry the fixed-to-VRR switch: the
+/// frame delayed by the switch and its catch-up.
+const GATE_SETTLE_INTERVALS: usize = 3;
 const GATE_INITIAL_BACKOFF_NS: u64 = 2_000_000_000;
 const GATE_MAX_BACKOFF_NS: u64 = 60_000_000_000;
 /// The gate staying open this long resets the reopen backoff.
@@ -178,8 +182,9 @@ const GATE_BACKOFF_RESET_NS: u64 = 30_000_000_000;
 /// animation: 10-27 ms on the CRS24B) flickers under VRR. KWin plans the
 /// same policy: VRR only while the refresh rate is reasonably stable.
 ///
-/// The gate closes when, under VRR, the primary intervals keep changing by
-/// more than 20%. It reopens only after an exponential backoff and only for
+/// The gate closes when, under VRR, the primary intervals keep straying more
+/// than 20% from their median; the intervals the fixed-to-VRR switch itself
+/// distorts do not count. It reopens only after an exponential backoff and only for
 /// content that, under fixed refresh, holds a stable cadence slower than
 /// the panel; content already at the maximum refresh gains nothing from VRR
 /// and is exactly the callback-driven UI that turns irregular under it.
@@ -191,6 +196,8 @@ pub(crate) struct DesktopCadenceGate {
     reopen_not_before_ns: u64,
     backoff_ns: u64,
     opened_at_ns: Option<u64>,
+    /// VRR intervals still to skip after opening.
+    settle_remaining: usize,
 }
 
 impl Default for DesktopCadenceGate {
@@ -202,14 +209,15 @@ impl Default for DesktopCadenceGate {
             reopen_not_before_ns: 0,
             backoff_ns: GATE_INITIAL_BACKOFF_NS,
             opened_at_ns: None,
+            settle_remaining: 0,
         }
     }
 }
 
-/// Returns whether two consecutive frame intervals differ enough to change
-/// panel brightness: more than 20% and more than 2 ms.
-fn interval_change_is_large(previous: u64, next: u64) -> bool {
-    previous.abs_diff(next) > (previous.min(next) / 5).max(2_000_000)
+/// Returns whether two frame intervals differ enough to change panel
+/// brightness: more than 20% and more than 2 ms.
+fn interval_change_is_large(a: u64, b: u64) -> bool {
+    a.abs_diff(b) > (a.min(b) / 5).max(2_000_000)
 }
 
 impl DesktopCadenceGate {
@@ -227,21 +235,36 @@ impl DesktopCadenceGate {
             self.intervals.clear();
             return None;
         }
-        self.intervals.push(interval);
         if self.open {
-            if !vrr_active || self.intervals.len < GATE_UNSTABLE_WINDOW {
+            // Judge only VRR intervals, and not those the switch itself
+            // distorted.
+            if !vrr_active {
+                self.intervals.clear();
+                self.settle_remaining = GATE_SETTLE_INTERVALS;
                 return None;
             }
-            let recent: Vec<u64> = self
+            if self.settle_remaining > 0 {
+                self.settle_remaining -= 1;
+                return None;
+            }
+            self.intervals.push(interval);
+            if self.intervals.len < GATE_UNSTABLE_WINDOW {
+                return None;
+            }
+            let mut recent = IntervalRing::default();
+            for interval in self
                 .intervals
                 .chronological()
                 .skip(self.intervals.len - GATE_UNSTABLE_WINDOW)
-                .collect();
-            let large_changes = recent
-                .windows(2)
-                .filter(|pair| interval_change_is_large(pair[0], pair[1]))
+            {
+                recent.push(interval);
+            }
+            let median = recent.median()?;
+            let deviations = recent
+                .iter()
+                .filter(|interval| interval_change_is_large(median, *interval))
                 .count();
-            if large_changes < GATE_UNSTABLE_CHANGES {
+            if deviations < GATE_UNSTABLE_DEVIATIONS {
                 return None;
             }
             if self
@@ -257,6 +280,7 @@ impl DesktopCadenceGate {
             self.intervals.clear();
             return Some(false);
         }
+        self.intervals.push(interval);
         if now < self.reopen_not_before_ns || self.intervals.len < RECENT_INTERVALS {
             return None;
         }
@@ -272,6 +296,7 @@ impl DesktopCadenceGate {
         }
         self.open = true;
         self.opened_at_ns = Some(now);
+        self.settle_remaining = GATE_SETTLE_INTERVALS;
         self.intervals.clear();
         Some(true)
     }
@@ -895,6 +920,8 @@ mod tests {
             false,
         );
         assert_eq!(flips, [true]);
+        let (now, flips) = feed(&mut gate, now, &steady, true);
+        assert!(flips.is_empty());
         // The next close doubles the backoff.
         let mut now = now;
         let mut closed_at = None;
@@ -909,6 +936,44 @@ mod tests {
             gate.reopen_not_before_ns,
             closed_at + 2 * GATE_INITIAL_BACKOFF_NS
         );
+    }
+
+    #[test]
+    fn desktop_gate_survives_the_vrr_switch_and_a_once_a_second_extra_frame() {
+        let ms = 1_000_000;
+        let us = 1_000;
+        let mut gate = DesktopCadenceGate::default();
+        // 30 fps under fixed 165 Hz: five and six refreshes.
+        let fixed: Vec<u64> = (0..20)
+            .map(|i| if i % 2 == 0 { 5 } else { 6 } * REFRESH_165)
+            .collect();
+        let (now, flips) = feed(&mut gate, 1_000_000_000, &fixed, false);
+        assert_eq!(flips, [true]);
+        // Live CRS24B trace: one more fixed frame, the frame the switch
+        // delayed, its catch-up, then 30 fps with a stray frame.
+        let (now, flips) = feed(&mut gate, now, &[36 * ms + 370 * us], false);
+        assert!(flips.is_empty());
+        let switch = [
+            54 * ms + 550 * us,
+            7 * ms + 530 * us,
+            44 * ms + 220 * us,
+            34 * ms + 960 * us,
+            33 * ms + 270 * us,
+            35 * ms,
+            16 * ms + 590 * us,
+            34 * ms + 930 * us,
+        ];
+        let (mut now, flips) = feed(&mut gate, now, &switch, true);
+        assert!(flips.is_empty());
+        // Ten seconds of 30 fps with a panel clock adding a frame each second.
+        for _ in 0..10 {
+            let mut second = vec![33 * ms + 333 * us; 28];
+            second.extend([12 * ms, 21 * ms + 333 * us]);
+            let flips;
+            (now, flips) = feed(&mut gate, now, &second, true);
+            assert!(flips.is_empty());
+        }
+        assert!(gate.open());
     }
 
     #[test]
