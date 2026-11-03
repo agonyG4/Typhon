@@ -609,7 +609,13 @@ impl NativeRuntime {
         let was_held = secondary_hold.held();
         let held_until_ns = repaint_decision
             .repaint
-            .then(|| secondary_hold.hold_until_ns(pacing_now_ns, secondary_hold_eligible))
+            .then(|| {
+                secondary_hold.hold_until_ns(
+                    pacing_now_ns,
+                    secondary_hold_eligible,
+                    render_generation,
+                )
+            })
             .flatten();
         if let Some(held_until_ns) = held_until_ns {
             if !was_held {
@@ -634,7 +640,7 @@ impl NativeRuntime {
             }
         } else if repaint_decision.repaint {
             let held_since_ns = secondary_hold.held_since_ns();
-            if let Some(release) = secondary_hold.note_admitted() {
+            if let Some(release) = secondary_hold.note_admitted(render_generation) {
                 perf.log("native.vrr_secondary_hold", || {
                     vec![
                         NativePerfField::str("action", release.as_str()),

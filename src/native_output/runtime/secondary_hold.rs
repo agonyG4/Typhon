@@ -51,6 +51,8 @@ pub(crate) struct SecondaryFrameHold {
     owner_sequence: u64,
     /// Owner content commit included in the latest admitted repaint.
     admitted_sequence: u64,
+    /// Scene render generation of the latest admitted repaint.
+    admitted_generation: u64,
     last_owner_change_ns: Option<u64>,
     intervals: [u64; OWNER_INTERVALS],
     interval_count: usize,
@@ -104,11 +106,21 @@ impl SecondaryFrameHold {
         Some(sorted[sorted.len() / 2])
     }
 
-    /// Decides a pending repaint. Returns the time to hold it until when only
-    /// secondary work changed and the owner's next frame is still expected.
-    pub(crate) fn hold_until_ns(&mut self, now_ns: u64, eligible: bool) -> Option<u64> {
+    /// Decides a pending repaint of scene `generation`. Returns the time to
+    /// hold it until when only secondary work changed and the owner's next
+    /// frame is still expected. A repaint of the generation already admitted
+    /// (seen again before its render lands) is not secondary work.
+    pub(crate) fn hold_until_ns(
+        &mut self,
+        now_ns: u64,
+        eligible: bool,
+        generation: u64,
+    ) -> Option<u64> {
         let hold = (|| {
-            if !eligible || self.owner_sequence != self.admitted_sequence {
+            if !eligible
+                || self.owner_sequence != self.admitted_sequence
+                || generation == self.admitted_generation
+            {
                 return None;
             }
             let last_owner_change_ns = self.last_owner_change_ns?;
@@ -126,8 +138,10 @@ impl SecondaryFrameHold {
         hold
     }
 
-    /// Records an admitted repaint; returns how a hold, if any, ended.
-    pub(crate) fn note_admitted(&mut self) -> Option<SecondaryHoldRelease> {
+    /// Records an admitted repaint of scene `generation`; returns how a
+    /// hold, if any, ended.
+    pub(crate) fn note_admitted(&mut self, generation: u64) -> Option<SecondaryHoldRelease> {
+        self.admitted_generation = generation;
         self.held_since_ns = None;
         let release = self.held_until_ns.take().map(|_| {
             if self.owner_sequence != self.admitted_sequence {
@@ -171,13 +185,14 @@ mod tests {
     const MS: u64 = 1_000_000;
     const FRAME_60: u64 = 16_666_667;
 
-    /// A 60 fps owner with `frames` content commits, starting at `start`.
+    /// A 60 fps owner with `frames` content commits, starting at `start`;
+    /// each repaint renders a new scene generation (its timestamp).
     fn owner_at_60(hold: &mut SecondaryFrameHold, start: u64, frames: u64) -> u64 {
         let mut now = start;
         for sequence in 1..=frames {
             hold.observe_owner(now, Some((7, sequence)));
-            assert_eq!(hold.hold_until_ns(now, true), None);
-            hold.note_admitted();
+            assert_eq!(hold.hold_until_ns(now, true, now), None);
+            hold.note_admitted(now);
             now += FRAME_60;
         }
         now - FRAME_60
@@ -191,14 +206,26 @@ mod tests {
         // owner's next expected frame plus slack.
         let overlay = last + 4 * MS;
         hold.observe_owner(overlay, Some((7, 8)));
-        let until = hold.hold_until_ns(overlay, true).expect("held");
+        let until = hold.hold_until_ns(overlay, true, overlay).expect("held");
         assert_eq!(until, last + FRAME_60 + HOLD_SLACK_NS);
         assert_eq!(hold.wake_deadline_ns(overlay), Some(until));
+        assert_eq!(hold.held_since_ns(), Some(overlay));
         // The owner commits on time: the repaint goes out with both.
         let next = last + FRAME_60;
         hold.observe_owner(next, Some((7, 9)));
-        assert_eq!(hold.hold_until_ns(next, true), None);
-        assert_eq!(hold.note_admitted(), Some(SecondaryHoldRelease::Owner));
+        assert_eq!(hold.hold_until_ns(next, true, next), None);
+        assert_eq!(hold.note_admitted(next), Some(SecondaryHoldRelease::Owner));
+        assert!(!hold.held());
+        assert_eq!(hold.held_since_ns(), None);
+    }
+
+    #[test]
+    fn the_admitted_generation_seen_again_before_its_render_is_not_held() {
+        let mut hold = SecondaryFrameHold::default();
+        let last = owner_at_60(&mut hold, 1_000 * MS, 8);
+        // The owner's frame was admitted at `last` as generation `last`; the
+        // next cycle still sees that scene as unrendered.
+        assert_eq!(hold.hold_until_ns(last + MS / 2, true, last), None);
         assert!(!hold.held());
     }
 
@@ -206,24 +233,32 @@ mod tests {
     fn a_late_owner_releases_the_secondary_frame_at_the_deadline() {
         let mut hold = SecondaryFrameHold::default();
         let last = owner_at_60(&mut hold, 1_000 * MS, 8);
-        let until = hold.hold_until_ns(last + 4 * MS, true).expect("held");
-        assert_eq!(hold.hold_until_ns(until, true), None);
-        assert_eq!(hold.note_admitted(), Some(SecondaryHoldRelease::Deadline));
+        let overlay = last + 4 * MS;
+        let until = hold.hold_until_ns(overlay, true, overlay).expect("held");
+        assert_eq!(hold.hold_until_ns(until, true, overlay), None);
+        assert_eq!(
+            hold.note_admitted(overlay),
+            Some(SecondaryHoldRelease::Deadline)
+        );
         // A paused owner never holds again until it resumes its cadence.
-        assert_eq!(hold.hold_until_ns(until + 30 * MS, true), None);
+        let later = until + 30 * MS;
+        assert_eq!(hold.hold_until_ns(later, true, later), None);
     }
 
     #[test]
     fn no_hold_without_a_trusted_owner_cadence_or_eligibility() {
         let mut hold = SecondaryFrameHold::default();
         let last = owner_at_60(&mut hold, 1_000 * MS, 3);
-        assert_eq!(hold.hold_until_ns(last + 4 * MS, true), None);
+        assert_eq!(hold.hold_until_ns(last + 4 * MS, true, last + 4 * MS), None);
         let mut hold = SecondaryFrameHold::default();
         let last = owner_at_60(&mut hold, 1_000 * MS, 8);
-        assert_eq!(hold.hold_until_ns(last + 4 * MS, false), None);
+        assert_eq!(
+            hold.hold_until_ns(last + 4 * MS, false, last + 4 * MS),
+            None
+        );
         // Losing the cadence owner forgets everything.
         hold.observe_owner(last + 5 * MS, None);
-        assert_eq!(hold.hold_until_ns(last + 6 * MS, true), None);
+        assert_eq!(hold.hold_until_ns(last + 6 * MS, true, last + 6 * MS), None);
     }
 
     #[test]
@@ -232,12 +267,12 @@ mod tests {
         let mut now = 1_000 * MS;
         for sequence in 1..=8 {
             hold.observe_owner(now, Some((7, sequence)));
-            hold.note_admitted();
+            hold.note_admitted(now);
             now += 80 * MS;
         }
         let last = now - 80 * MS;
         assert_eq!(
-            hold.hold_until_ns(last + MS, true),
+            hold.hold_until_ns(last + MS, true, last + MS),
             Some(last + MAX_HOLD_NS)
         );
     }
@@ -247,6 +282,6 @@ mod tests {
         let mut hold = SecondaryFrameHold::default();
         let last = owner_at_60(&mut hold, 1_000 * MS, 8);
         hold.observe_owner(last + MS, Some((9, 100)));
-        assert_eq!(hold.hold_until_ns(last + 2 * MS, true), None);
+        assert_eq!(hold.hold_until_ns(last + 2 * MS, true, last + 2 * MS), None);
     }
 }
