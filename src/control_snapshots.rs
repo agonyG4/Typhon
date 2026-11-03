@@ -1096,6 +1096,7 @@ pub struct PresentationPolicySnapshot {
     pub kms_worker_transport: String,
     pub held_commits: String,
     pub credit_grant: String,
+    pub render_start: String,
 }
 
 /// Whether the per-transaction presentation trace is being written.

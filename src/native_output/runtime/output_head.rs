@@ -68,6 +68,9 @@ pub(crate) struct OutputHead {
     pub(super) cursor_timing: crate::native_output::presentation::cursor_timing::CursorTimingDomain,
     pub(super) presentation_deadline: PresentationDeadlinePlanner,
     pub(super) scheduled_presentation_target: Option<PresentationTarget>,
+    /// Advisory late-latch target of a queued fixed-refresh render; it only
+    /// delays render start and is recomputed every cycle.
+    pub(super) render_latch_target: Option<PresentationTarget>,
     pub(super) render_journal: AdaptiveRenderJournal,
     pub(super) adaptive_buffering: AdaptiveBufferingController,
     pub(super) triple_buffer_policy: AdaptiveTripleBufferPolicy,

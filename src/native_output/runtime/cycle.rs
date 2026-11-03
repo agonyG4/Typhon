@@ -392,12 +392,12 @@ impl NativeRuntime {
     }
 
     fn queued_visual_work_deadline_due(&self, now_ns: u64) -> bool {
-        let scheduled_target_due = self
+        let target = self
             .head
             .scheduled_presentation_target
-            .is_some_and(|target| target.render_start_deadline.get() <= now_ns);
+            .or(self.head.render_latch_target);
         if self.head.frame_scheduler.visual_work_queued() {
-            scheduled_target_due || self.head.scheduled_presentation_target.is_none()
+            target.is_none_or(|target| target.render_start_deadline.get() <= now_ns)
         } else {
             self.queued_redraw_requested
         }

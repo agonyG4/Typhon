@@ -10,9 +10,10 @@ use super::frame::{
 };
 use super::planner::{
     NativePresentationPath, NativePresentationPlanInput, cursor_primary_ordering_target,
-    fresh_composited_reactive_target, pacing_mode_for_target, pending_fixed_target_for_scanout,
-    plan_native_presentation_path, plan_runtime_cursor_service_opportunity,
-    plan_visual_target_for_budget, prepare_presentation_target, reactive_or_commit_timing_target,
+    fresh_composited_reactive_target, late_latched_render_target, pacing_mode_for_target,
+    pending_fixed_target_for_scanout, plan_native_presentation_path,
+    plan_runtime_cursor_service_opportunity, plan_visual_target_for_budget,
+    prepare_presentation_target, reactive_or_commit_timing_target, render_start_late_latch,
 };
 use super::presentation_cursor::*;
 use super::presentation_direct::{
@@ -315,6 +316,7 @@ impl NativeRuntime {
                     cursor_timing,
                     presentation_deadline,
                     scheduled_presentation_target,
+                    render_latch_target,
                     vrr_cadence,
                     render_journal,
                     adaptive_buffering,
@@ -754,6 +756,25 @@ impl NativeRuntime {
             *triple_buffer_policy == AdaptiveTripleBufferPolicy::Force,
             *scheduled_presentation_target,
         );
+        // Fixed refresh, nothing in flight: start the render late enough
+        // that it still makes the refresh it would get now.
+        *render_latch_target = (explicit_output
+            && render_start_late_latch()
+            && !reactive_presentation_candidate
+            && !confirmed_kms_presentation.vrr_request_confirmed_for(output_epoch.get())
+            && scheduled_presentation_target.is_none()
+            && pending_target.is_none()
+            && frame_scheduler.visual_work_queued())
+        .then(|| {
+            late_latched_render_target(
+                presentation_deadline,
+                scheduler_now,
+                predicted_total_cost,
+                prediction.p90_recent_render_ns,
+                presentation_timing.apply_guard_ns(),
+            )
+        })
+        .flatten();
         let pacing_mode = if reactive_presentation_candidate {
             NativeOutputPacingMode::ReactiveDouble
         } else {
@@ -827,7 +848,8 @@ impl NativeRuntime {
                 ExplicitAtomicSchedulerContext {
                     now: scheduler_now,
                     predicted_total_cost: Duration::from_nanos(prediction.total_cost_ns),
-                    presentation_target: *scheduled_presentation_target,
+                    presentation_target: scheduled_presentation_target
+                        .or(*render_latch_target),
                     render_ahead_allowed,
                     worker_queue_available,
                 },

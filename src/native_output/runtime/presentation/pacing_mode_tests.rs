@@ -1,5 +1,6 @@
 use super::super::planner::{
-    fresh_composited_reactive_target, plan_scheduled_target_for_budget,
+    RENDER_LATCH_MARGIN_NS, fresh_composited_reactive_target, late_latched_render_target,
+    plan_scheduled_target_for_budget,
     plan_scheduled_target_for_mode, plan_visual_target_for_budget,
     reactive_or_commit_timing_target, visual_target_deadline_for_mode,
 };
@@ -275,6 +276,66 @@ fn direct_scanout_generic_target_keeps_next_refresh_under_sticky_risk() {
 
     assert_eq!(target.sequence, 2);
     assert!(target.predicted_unreachable);
+}
+
+#[test]
+fn late_latch_starts_the_render_its_cost_before_the_same_refresh() {
+    let planner = fresh_reactive_planner();
+    let now = MonotonicTimestampNs::new(FRESH_REACTIVE_ANCHOR_NS + 300_000);
+    let cost = Duration::from_millis(3);
+    let immediate = fresh_composited_reactive_target(
+        &planner,
+        None,
+        now,
+        cost,
+        2_000_000,
+        FRESH_REACTIVE_APPLY_GUARD_NS,
+    )
+    .expect("immediate target");
+    let latched = late_latched_render_target(
+        &planner,
+        now,
+        cost,
+        2_000_000,
+        FRESH_REACTIVE_APPLY_GUARD_NS,
+    )
+    .expect("latched target");
+
+    assert_eq!(latched.sequence, immediate.sequence);
+    assert_eq!(latched.presentation_time, immediate.presentation_time);
+    assert_eq!(
+        latched.render_start_deadline.get(),
+        FRESH_REACTIVE_ANCHOR_NS + FRESH_REACTIVE_REFRESH_NS - 3_000_000 - RENDER_LATCH_MARGIN_NS
+    );
+    assert!(latched.render_start_deadline > now);
+}
+
+#[test]
+fn late_latch_starts_now_when_the_cost_fills_the_refresh_or_timing_is_estimated() {
+    let planner = fresh_reactive_planner();
+    let now = MonotonicTimestampNs::new(FRESH_REACTIVE_ANCHOR_NS + 300_000);
+    assert_eq!(
+        late_latched_render_target(
+            &planner,
+            now,
+            Duration::from_nanos(FRESH_REACTIVE_REFRESH_NS),
+            2_000_000,
+            FRESH_REACTIVE_APPLY_GUARD_NS,
+        ),
+        None
+    );
+    let bootstrap =
+        PresentationDeadlinePlanner::new(Duration::from_nanos(FRESH_REACTIVE_REFRESH_NS));
+    assert_eq!(
+        late_latched_render_target(
+            &bootstrap,
+            now,
+            Duration::from_millis(1),
+            500_000,
+            FRESH_REACTIVE_APPLY_GUARD_NS,
+        ),
+        None
+    );
 }
 
 #[test]

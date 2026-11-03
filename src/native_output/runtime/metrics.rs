@@ -497,7 +497,10 @@ impl NativeRuntime {
                     ExplicitAtomicSchedulerContext {
                         now: MonotonicTimestampNs::new(now_ns),
                         predicted_total_cost,
-                        presentation_target: self.head.scheduled_presentation_target,
+                        presentation_target: self
+                            .head
+                            .scheduled_presentation_target
+                            .or(self.head.render_latch_target),
                         render_ahead_allowed,
                         worker_queue_available,
                     },

@@ -785,6 +785,7 @@ impl NativeSessionIo for NativeRuntime {
         let refresh_interval = Duration::from_nanos(self.head.output_refresh_rate.interval_ns());
         self.head.presentation_deadline.invalidate(refresh_interval);
         self.head.scheduled_presentation_target = None;
+        self.head.render_latch_target = None;
         self.server.invalidate_commit_timing_targets();
         self.head.render_journal.reset();
         self.head.adaptive_buffering.reset();

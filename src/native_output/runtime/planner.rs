@@ -396,6 +396,68 @@ pub(super) fn fresh_composited_reactive_target(
     }
 }
 
+/// Margin past the predicted cost a late-latched render keeps before its
+/// refresh. The predicted cost already carries the wake and KMS guards.
+pub(super) const RENDER_LATCH_MARGIN_NS: u64 = 250_000;
+
+/// 0 = environment not read yet, 1 = late, 2 = immediate.
+static RENDER_START_POLICY: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Whether fixed-refresh renders start as late as their predicted cost allows.
+/// `OBLIVION_ONE_RENDER_START=immediate` starts them as soon as work arrives.
+pub(crate) fn render_start_late_latch() -> bool {
+    use std::sync::atomic::Ordering;
+    match RENDER_START_POLICY.load(Ordering::Relaxed) {
+        0 => {
+            let late = std::env::var("OBLIVION_ONE_RENDER_START")
+                .map_or(true, |value| value != "immediate");
+            set_render_start_late_latch(late);
+            late
+        }
+        policy => policy == 1,
+    }
+}
+
+pub(crate) fn set_render_start_late_latch(late: bool) {
+    RENDER_START_POLICY.store(
+        if late { 1 } else { 2 },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// Late-latch a fresh fixed-refresh composited render: keep the refresh the
+/// render would get now, but start it only `predicted_total_cost` plus a
+/// margin before that refresh. Client content and frame callbacks then sit
+/// closer to scanout. None when starting now is already due.
+pub(super) fn late_latched_render_target(
+    planner: &PresentationDeadlinePlanner,
+    now: MonotonicTimestampNs,
+    predicted_total_cost: Duration,
+    recent_render_floor_ns: u64,
+    apply_guard_ns: u64,
+) -> Option<PresentationTarget> {
+    let mut target = fresh_composited_reactive_target(
+        planner,
+        None,
+        now,
+        predicted_total_cost,
+        recent_render_floor_ns,
+        apply_guard_ns,
+    )?;
+    if target.estimated {
+        return None;
+    }
+    let lead_ns = u64::try_from(predicted_total_cost.as_nanos())
+        .unwrap_or(u64::MAX)
+        .saturating_add(RENDER_LATCH_MARGIN_NS);
+    let start_ns = target.presentation_time.get().saturating_sub(lead_ns);
+    if start_ns <= now.get() {
+        return None;
+    }
+    target.render_start_deadline = MonotonicTimestampNs::new(start_ns);
+    Some(target)
+}
+
 #[cfg(test)]
 pub(super) fn plan_scheduled_target_for_mode(
     planner: &mut PresentationDeadlinePlanner,

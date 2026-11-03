@@ -743,6 +743,7 @@ impl NativeRuntime {
                 cursor_timing,
                 presentation_deadline,
                 scheduled_presentation_target,
+                render_latch_target: None,
                 render_journal,
                 adaptive_buffering,
                 triple_buffer_policy,

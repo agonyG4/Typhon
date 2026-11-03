@@ -3036,6 +3036,7 @@ impl NativeRuntime {
         let interval = Duration::from_nanos(self.head.output_refresh_rate.interval_ns());
         self.head.presentation_deadline.invalidate(interval);
         self.head.scheduled_presentation_target = None;
+        self.head.render_latch_target = None;
         self.server.invalidate_commit_timing_targets();
         self.rebase_output_epoch_frame_lanes(now_ns);
         self.head.render_journal.reset();
