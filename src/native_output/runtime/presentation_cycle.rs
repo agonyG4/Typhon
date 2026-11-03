@@ -616,12 +616,15 @@ impl NativeRuntime {
         let tearing_policy = oblivion_one::compositor::TearingPolicy::from_environment(
             std::env::var("OBLIVION_ONE_TEARING").ok().as_deref(),
         );
-        let solitary_fullscreen = server.fullscreen_render_plan_metrics().solitary_tree_active;
+        let fullscreen_metrics = server.fullscreen_render_plan_metrics();
+        let solitary_fullscreen = fullscreen_metrics.solitary_tree_active;
         let surface_async_hint = server
             .fullscreen_tree_presentation_metadata()
             .is_some_and(|metadata| metadata.hint.is_async());
+        // VRR follows the cadence owner (secondary overlays allowed); tearing
+        // still needs a solitary tree.
         let adaptive_sync_candidate = kms_backend.atomic_vrr_capable()
-            && vrr_policy.allows_adaptive_sync(solitary_fullscreen);
+            && vrr_policy.allows_adaptive_sync(fullscreen_metrics.cadence_owner_active);
         let async_candidate =
             tearing_policy.allows_async_request() && solitary_fullscreen && surface_async_hint;
         let reactive_presentation_candidate =
