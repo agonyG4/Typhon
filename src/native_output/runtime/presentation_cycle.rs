@@ -600,14 +600,15 @@ impl NativeRuntime {
         let secondary_hold = vrr_cadence.secondary_hold_mut();
         secondary_hold.observe_owner(pacing_now_ns, server.fullscreen_cadence_owner_content());
         // A solitary owner has no secondary work beside it to hold (its own
-        // follow-up commits and direct scanout bump the scene too).
+        // follow-up commits and direct scanout bump the scene too). A redraw
+        // queued by a render that received demand while in flight is held
+        // like any other: live, that demand was the overlay's next frame.
         let secondary_hold_eligible = super::secondary_hold::secondary_hold_enabled()
             && !server.fullscreen_render_plan_metrics().solitary_tree_active
             && confirmed_kms_presentation.vrr_request_confirmed_for(output_epoch.get())
             && !cursor_work_pending
             && !effect_demand.continuous_visible
             && !server.workspace_presentation_active()
-            && !*queued_redraw_requested
             && !frame_scheduler.visual_work_queued();
         let was_held = secondary_hold.held();
         let held_until_ns = repaint_decision
