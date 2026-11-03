@@ -599,7 +599,10 @@ impl NativeRuntime {
         }
         let secondary_hold = vrr_cadence.secondary_hold_mut();
         secondary_hold.observe_owner(pacing_now_ns, server.fullscreen_cadence_owner_content());
+        // A solitary owner has no secondary work beside it to hold (its own
+        // follow-up commits and direct scanout bump the scene too).
         let secondary_hold_eligible = super::secondary_hold::secondary_hold_enabled()
+            && !server.fullscreen_render_plan_metrics().solitary_tree_active
             && confirmed_kms_presentation.vrr_request_confirmed_for(output_epoch.get())
             && !cursor_work_pending
             && !effect_demand.continuous_visible
