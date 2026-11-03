@@ -334,6 +334,8 @@ pub(crate) struct VrrCadenceRecorder {
     /// Pending-since time of the cursor plane delta in flight.
     cursor_submitted_pending_since_ns: Option<u64>,
     desktop_gate: DesktopCadenceGate,
+    /// Holds secondary-only frames for a fullscreen cadence owner.
+    secondary_hold: super::secondary_hold::SecondaryFrameHold,
     /// Pointer-change-to-pageflip age of the latest cursor-only present.
     last_cursor_age_ns: Option<u64>,
     counters: VrrCadenceCounters,
@@ -354,6 +356,7 @@ impl VrrCadenceRecorder {
             last_fixed_fallback: None,
             cursor_submitted_pending_since_ns: None,
             desktop_gate: DesktopCadenceGate::default(),
+            secondary_hold: super::secondary_hold::SecondaryFrameHold::default(),
             last_cursor_age_ns: None,
             counters: VrrCadenceCounters::default(),
         }
@@ -397,6 +400,14 @@ impl VrrCadenceRecorder {
     /// solitary fullscreen tree.
     pub(crate) const fn desktop_cadence_unstable(&self) -> bool {
         !self.desktop_gate.open()
+    }
+
+    pub(crate) const fn secondary_hold(&self) -> &super::secondary_hold::SecondaryFrameHold {
+        &self.secondary_hold
+    }
+
+    pub(crate) fn secondary_hold_mut(&mut self) -> &mut super::secondary_hold::SecondaryFrameHold {
+        &mut self.secondary_hold
     }
 
     /// Records when the cursor change carried by a submitted cursor-only

@@ -2215,6 +2215,10 @@ impl OwnCompositorServer {
         self.state.fullscreen_render_plan_metrics()
     }
 
+    pub fn fullscreen_cadence_owner_content(&self) -> Option<(u32, u64)> {
+        self.state.fullscreen_cadence_owner_content()
+    }
+
     pub fn direct_scanout_solitary_fullscreen(&self, root_surface_id: u32) -> bool {
         let metrics = self.state.fullscreen_render_plan_metrics();
         metrics.fullscreen_composition_active

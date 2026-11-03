@@ -185,6 +185,7 @@ mod slow_cycle;
 mod system_action_io;
 mod termination;
 pub(crate) use termination::format_error_chain;
+mod secondary_hold;
 mod vrr_cadence;
 mod wake_plan;
 mod window_exit_frame;

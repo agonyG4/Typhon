@@ -854,6 +854,23 @@ impl CompositorState {
         }
     }
 
+    /// The fullscreen cadence owner's root and the newest commit sequence
+    /// among its presented surfaces, while only secondary work sits beside it.
+    pub(in crate::compositor) fn fullscreen_cadence_owner_content(&self) -> Option<(u32, u64)> {
+        let plan = self.fullscreen_composition_plan();
+        if !plan.cadence_owner_only {
+            return None;
+        }
+        let owner = plan.owner_root_surface_id?;
+        let sequence = self
+            .active_scene_surfaces()
+            .iter()
+            .filter(|surface| self.presentation_owner_root_for_surface(surface.surface_id) == owner)
+            .map(|surface| surface.commit_sequence.get())
+            .max()?;
+        Some((owner, sequence))
+    }
+
     pub(in crate::compositor) fn fullscreen_render_plan_metrics(
         &self,
     ) -> FullscreenRenderPlanMetrics {

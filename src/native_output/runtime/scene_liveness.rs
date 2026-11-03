@@ -68,9 +68,17 @@ impl NativeRuntime {
             self.head.output_render_fence_token.is_some(),
             self.head.scanout.render_worker_busy(),
         );
+        // A held secondary-only repaint is owned by its hold deadline (or by
+        // the fullscreen owner's next commit), not an immediate continuation.
+        let secondary_hold_deadline_ns = self
+            .head
+            .vrr_cadence
+            .secondary_hold()
+            .wake_deadline_ns(now_ns);
         let scene_visual_debt_continuation = visual_scene_debt
             && scheduler_wake_requirement.is_none()
-            && !scene_visual_debt_has_external_wake_owner;
+            && !scene_visual_debt_has_external_wake_owner
+            && secondary_hold_deadline_ns.is_none();
         let plan = build_native_wake_plan(NativeWakePlanInputs {
             now_ns,
             primary_deadline: None,
@@ -117,6 +125,7 @@ impl NativeRuntime {
                 .flatten(),
             scratch_maintenance_deadline_ns,
             cursor_animation_deadline_ns,
+            secondary_hold_deadline_ns,
             input_backlog: self.input_epoch.backlog_pending(),
             astrea_publication: self.server.has_pending_astrea_toplevel_publication(),
             commit_timing_planning: self.server.has_pending_commit_timing_planning(),
@@ -159,6 +168,7 @@ impl NativeRuntime {
                     NativeDeadlineOwner::KeyboardRepeat => "deadline:keyboard_repeat",
                     NativeDeadlineOwner::ScratchMaintenance => "deadline:scratch_maintenance",
                     NativeDeadlineOwner::CursorAnimation => "deadline:cursor_animation",
+                    NativeDeadlineOwner::SecondaryHold => "deadline:secondary_hold",
                 }
             } else if plan
                 .continuation

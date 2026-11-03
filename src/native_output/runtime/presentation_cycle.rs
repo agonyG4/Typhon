@@ -597,7 +597,37 @@ impl NativeRuntime {
                 monotonic_now_ns()?,
             );
         }
-        if repaint_decision.repaint {
+        let secondary_hold = vrr_cadence.secondary_hold_mut();
+        secondary_hold.observe_owner(pacing_now_ns, server.fullscreen_cadence_owner_content());
+        let secondary_hold_eligible = super::secondary_hold::secondary_hold_enabled()
+            && confirmed_kms_presentation.vrr_request_confirmed_for(output_epoch.get())
+            && !cursor_work_pending
+            && !effect_demand.continuous_visible
+            && !server.workspace_presentation_active()
+            && !*queued_redraw_requested
+            && !frame_scheduler.visual_work_queued();
+        let was_held = secondary_hold.held();
+        let held_until_ns = repaint_decision
+            .repaint
+            .then(|| secondary_hold.hold_until_ns(pacing_now_ns, secondary_hold_eligible))
+            .flatten();
+        if let Some(held_until_ns) = held_until_ns {
+            if !was_held {
+                let owner_interval_ns = secondary_hold.owner_interval_ns();
+                perf.log("native.vrr_secondary_hold", || {
+                    vec![
+                        NativePerfField::str("action", "hold"),
+                        NativePerfField::u64("hold_ns", held_until_ns - pacing_now_ns),
+                        NativePerfField::u64("owner_interval_ns", owner_interval_ns),
+                    ]
+                });
+            }
+        } else if repaint_decision.repaint {
+            if let Some(release) = secondary_hold.note_admitted() {
+                perf.log("native.vrr_secondary_hold", || {
+                    vec![NativePerfField::str("action", release.as_str())]
+                });
+            }
             admit_repaint_visual_work(
                 frame_pacing,
                 frame_scheduler,
