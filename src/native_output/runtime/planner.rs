@@ -403,14 +403,16 @@ pub(super) const RENDER_LATCH_MARGIN_NS: u64 = 250_000;
 /// 0 = environment not read yet, 1 = late, 2 = immediate.
 static RENDER_START_POLICY: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
-/// Whether fixed-refresh renders start as late as their predicted cost allows.
-/// `OBLIVION_ONE_RENDER_START=immediate` starts them as soon as work arrives.
+/// Whether fixed-refresh renders start as late as their predicted cost allows
+/// (`OBLIVION_ONE_RENDER_START=late`). Off by default: measured on 2026-11-03
+/// it cut client latency p50 by ~1 ms but turned the render spikes the old
+/// slack absorbed into 3-8 late refreshes per 10 s in steady workloads.
 pub(crate) fn render_start_late_latch() -> bool {
     use std::sync::atomic::Ordering;
     match RENDER_START_POLICY.load(Ordering::Relaxed) {
         0 => {
             let late = std::env::var("OBLIVION_ONE_RENDER_START")
-                .map_or(true, |value| value != "immediate");
+                .is_ok_and(|value| value == "late");
             set_render_start_late_latch(late);
             late
         }

@@ -47,7 +47,7 @@ Environment:
   OBLIVION_ONE_PERF_LOG_EVENTS  comma-separated event prefixes to log (e.g. native.vrr); others skip the 50k cap
   OBLIVION_ONE_VRR_CURSOR_RETARGET=off  keep VRR cursor service on the fixed refresh grid (A/B)
   OBLIVION_ONE_VRR_SECONDARY_HOLD=off  present overlay-only frames at once instead of with the fullscreen owner (A/B)
-  OBLIVION_ONE_RENDER_START=immediate  start fixed-refresh renders when work arrives instead of late-latched (A/B; live: astreactl presentation set start=)
+  OBLIVION_ONE_RENDER_START=late  late-latch fixed-refresh render start to the predicted cost (A/B; live: astreactl presentation set start=)
   OBLIVION_ONE_LOG_FILE  native-session log path (default: ~/.local/state/oblivion-one/session.log)
   OBLIVION_ONE_LOG_ROTATE_BYTES  move the log to <log>.1 at launch when larger than N bytes (default: 33554432; 0 disables)
 
