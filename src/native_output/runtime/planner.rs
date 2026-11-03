@@ -146,14 +146,7 @@ pub(crate) fn plan_runtime_cursor_service_opportunity(
         transport,
     )?;
     Some(if vrr_confirmed {
-        retarget_cursor_opportunity_for_vrr(
-            planner,
-            timing,
-            opportunity,
-            current_opportunity,
-            now,
-            transport,
-        )
+        retarget_cursor_opportunity_for_vrr(planner, timing, opportunity, current_opportunity, now)
     } else {
         opportunity
     })
@@ -174,16 +167,19 @@ fn vrr_cursor_retarget_enabled() -> bool {
 /// points, so a cursor that becomes pending just after one grid point waited
 /// for the next (live trace: cursor updates clustered at 6.06 and 12.12 ms
 /// after the previous flip). Retarget an unordered cursor opportunity to the
-/// earliest physically valid time; its sequence is the one the completion
-/// will claim. An opportunity ordered after a primary, or replanned after an
-/// expired cursor target, keeps its grid target and ordering.
+/// earliest time the commit can physically land: after the shortest
+/// interval, and no sooner than the full preparation/dispatch/apply lead
+/// from now, so the target outlives the submission it schedules (a target
+/// of `now` expired on the next planning pass and was replaced by a grid
+/// one). Its sequence is the one the completion will claim. An opportunity
+/// ordered after a primary, or replanned after an expired cursor target,
+/// keeps its grid target and ordering.
 pub(crate) fn retarget_cursor_opportunity_for_vrr(
     planner: &PresentationDeadlinePlanner,
     timing: &CursorTimingDomain,
     opportunity: CursorServiceOpportunity,
     current_opportunity: Option<CursorServiceOpportunity>,
     now: MonotonicTimestampNs,
-    transport: KmsCommitWorkerTransport,
 ) -> CursorServiceOpportunity {
     if !vrr_cursor_retarget_enabled() {
         return opportunity;
@@ -199,15 +195,11 @@ pub(crate) fn retarget_cursor_opportunity_for_vrr(
     let Some(last_presented_at) = planner.last_presented_at() else {
         return opportunity;
     };
-    let selection_lead_ns = match transport {
-        KmsCommitWorkerTransport::Worker => 1,
-        KmsCommitWorkerTransport::Synchronous => opportunity.apply_guard_ns,
-    };
     let refresh_ns =
         u64::try_from(opportunity.target.refresh_interval.as_nanos()).unwrap_or(u64::MAX);
     let earliest = now
         .get()
-        .saturating_add(selection_lead_ns)
+        .saturating_add(opportunity.total_lead_ns.max(1))
         .max(last_presented_at.get().saturating_add(refresh_ns));
     if earliest >= opportunity.target.presentation_time.get() {
         return opportunity;
@@ -1706,10 +1698,9 @@ mod tests {
             KmsModeTiming::from_mode(&drm_mode_modeinfo::default(), REFRESH_NS),
             7,
         );
-        let worker = KmsCommitWorkerTransport::Worker;
 
         // Pending 8 ms after the last flip: the grid waits for 12.12 ms, VRR
-        // presents at the next apply.
+        // presents as soon as the cursor lead allows.
         let late = MonotonicTimestampNs::new(anchor.get() + 8_000_000);
         let grid = plan_cursor_service_opportunity(&planner, &timing, late, None, 500_000)
             .expect("grid opportunity");
@@ -1717,16 +1708,21 @@ mod tests {
             grid.target.presentation_time.get(),
             anchor.get() + 2 * REFRESH_NS
         );
-        let vrr = retarget_cursor_opportunity_for_vrr(&planner, &timing, grid, None, late, worker);
-        assert_eq!(vrr.target.presentation_time.get(), late.get() + 1);
+        let vrr = retarget_cursor_opportunity_for_vrr(&planner, &timing, grid, None, late);
+        assert_eq!(
+            vrr.target.presentation_time.get(),
+            late.get() + grid.total_lead_ns
+        );
         assert_eq!(
             vrr.target.physical_claim(),
             planner
                 .prepare_presented(vrr.target.presentation_time)
                 .claim()
         );
-        assert!(vrr.target.sequence < grid.target.sequence);
-        assert!(vrr.service_deadline_ns <= late.get());
+        assert!(vrr.target.presentation_time < grid.target.presentation_time);
+        // Due at once, and the target outlives the planning pass.
+        assert_eq!(vrr.service_deadline_ns, late.get());
+        assert!(vrr.target.presentation_time.get() > late.get());
         assert_eq!(
             vrr.submit_window.commit_complete_deadline_ns(),
             cursor_submit_window(vrr.target, &timing, 500_000, grid.apply_guard_ns)
@@ -1739,7 +1735,7 @@ mod tests {
         let grid = plan_cursor_service_opportunity(&planner, &timing, early, None, 500_000)
             .expect("grid opportunity");
         assert_eq!(
-            retarget_cursor_opportunity_for_vrr(&planner, &timing, grid, None, early, worker),
+            retarget_cursor_opportunity_for_vrr(&planner, &timing, grid, None, early),
             grid
         );
 
@@ -1752,7 +1748,7 @@ mod tests {
             ..late_grid
         };
         assert_eq!(
-            retarget_cursor_opportunity_for_vrr(&planner, &timing, ordered, None, late, worker),
+            retarget_cursor_opportunity_for_vrr(&planner, &timing, ordered, None, late),
             ordered
         );
         let expired = CursorServiceOpportunity {
@@ -1763,14 +1759,7 @@ mod tests {
             ..late_grid
         };
         assert_eq!(
-            retarget_cursor_opportunity_for_vrr(
-                &planner,
-                &timing,
-                late_grid,
-                Some(expired),
-                late,
-                worker
-            ),
+            retarget_cursor_opportunity_for_vrr(&planner, &timing, late_grid, Some(expired), late),
             late_grid
         );
     }
@@ -1799,7 +1788,7 @@ mod tests {
         );
         assert_eq!(
             plan(true),
-            retarget_cursor_opportunity_for_vrr(&planner, &timing, plan(false), None, late, worker)
+            retarget_cursor_opportunity_for_vrr(&planner, &timing, plan(false), None, late)
         );
         assert!(plan(true).target.presentation_time < plan(false).target.presentation_time);
     }
