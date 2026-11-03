@@ -614,18 +614,36 @@ impl NativeRuntime {
         if let Some(held_until_ns) = held_until_ns {
             if !was_held {
                 let owner_interval_ns = secondary_hold.owner_interval_ns();
+                let since_owner_ns = secondary_hold
+                    .last_owner_change_ns()
+                    .map_or(0, |owner_ns| pacing_now_ns.saturating_sub(owner_ns));
+                let render_worker_busy = scanout.render_worker_busy();
                 perf.log("native.vrr_secondary_hold", || {
                     vec![
                         NativePerfField::str("action", "hold"),
+                        NativePerfField::u64("at_ns", pacing_now_ns),
                         NativePerfField::u64("hold_ns", held_until_ns - pacing_now_ns),
+                        NativePerfField::u64("since_owner_ns", since_owner_ns),
                         NativePerfField::u64("owner_interval_ns", owner_interval_ns),
+                        NativePerfField::bool("scene_changed", scene_changed),
+                        NativePerfField::bool("redraw_requested", primary_redraw_requested),
+                        NativePerfField::bool("pending_frame_work", pending_frame_work),
+                        NativePerfField::bool("render_worker_busy", render_worker_busy),
                     ]
                 });
             }
         } else if repaint_decision.repaint {
+            let held_since_ns = secondary_hold.held_since_ns();
             if let Some(release) = secondary_hold.note_admitted() {
                 perf.log("native.vrr_secondary_hold", || {
-                    vec![NativePerfField::str("action", release.as_str())]
+                    vec![
+                        NativePerfField::str("action", release.as_str()),
+                        NativePerfField::u64("at_ns", pacing_now_ns),
+                        NativePerfField::u64(
+                            "held_ns",
+                            held_since_ns.map_or(0, |since| pacing_now_ns.saturating_sub(since)),
+                        ),
+                    ]
                 });
             }
             admit_repaint_visual_work(

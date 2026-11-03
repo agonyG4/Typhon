@@ -56,6 +56,7 @@ pub(crate) struct SecondaryFrameHold {
     interval_count: usize,
     next_interval: usize,
     held_until_ns: Option<u64>,
+    held_since_ns: Option<u64>,
 }
 
 impl SecondaryFrameHold {
@@ -117,6 +118,9 @@ impl SecondaryFrameHold {
             (now_ns < until).then_some(until)
         })();
         if hold.is_some() {
+            if self.held_until_ns.is_none() {
+                self.held_since_ns = Some(now_ns);
+            }
             self.held_until_ns = hold;
         }
         hold
@@ -124,6 +128,7 @@ impl SecondaryFrameHold {
 
     /// Records an admitted repaint; returns how a hold, if any, ended.
     pub(crate) fn note_admitted(&mut self) -> Option<SecondaryHoldRelease> {
+        self.held_since_ns = None;
         let release = self.held_until_ns.take().map(|_| {
             if self.owner_sequence != self.admitted_sequence {
                 SecondaryHoldRelease::Owner
@@ -142,6 +147,16 @@ impl SecondaryFrameHold {
 
     pub(crate) const fn held(&self) -> bool {
         self.held_until_ns.is_some()
+    }
+
+    /// When the current hold began.
+    pub(crate) const fn held_since_ns(&self) -> Option<u64> {
+        self.held_since_ns
+    }
+
+    /// When the owner's newest content was first observed.
+    pub(crate) const fn last_owner_change_ns(&self) -> Option<u64> {
+        self.last_owner_change_ns
     }
 
     pub(crate) fn owner_interval_ns(&self) -> u64 {
