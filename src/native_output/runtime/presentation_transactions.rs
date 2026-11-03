@@ -74,6 +74,8 @@ pub(crate) fn effective_output_presentation(
             output_generation_qualified: output_generation != 0,
             exact_kms_qualified: true,
             transition_supported: true,
+            // The compatibility path has no VRR cadence recorder.
+            cadence_unstable: false,
         },
     );
     NativePerfLogger::from_env().log("native.output_presentation_policy", || {

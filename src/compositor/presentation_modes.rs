@@ -255,6 +255,9 @@ pub enum VrrBlocker {
     OutputGenerationUnqualified,
     ExactKmsQualificationRejected,
     UnsupportedTransition,
+    /// `On` outside a solitary fullscreen tree, while the desktop content
+    /// cadence is too irregular for VRR (refresh swings flicker the panel).
+    UnstableCadence,
 }
 
 impl VrrBlocker {
@@ -268,6 +271,7 @@ impl VrrBlocker {
             Self::OutputGenerationUnqualified => "output_generation_unqualified",
             Self::ExactKmsQualificationRejected => "exact_kms_qualification_rejected",
             Self::UnsupportedTransition => "unsupported_transition",
+            Self::UnstableCadence => "unstable_cadence",
         }
     }
 }
@@ -321,6 +325,9 @@ pub struct VrrEligibility {
     pub output_generation_qualified: bool,
     pub exact_kms_qualified: bool,
     pub transition_supported: bool,
+    /// The desktop cadence gate is closed; blocks `On` outside the Auto
+    /// candidate. A solitary fullscreen tree keeps VRR regardless.
+    pub cadence_unstable: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -379,6 +386,8 @@ impl EffectivePresentation {
             Some(VrrBlocker::PolicyDisabled)
         } else if matches!(vrr_policy, VrrPolicy::Auto) && !vrr_eligibility.auto_candidate {
             Some(VrrBlocker::AutoCandidateIneligible)
+        } else if !vrr_eligibility.auto_candidate && vrr_eligibility.cadence_unstable {
+            Some(VrrBlocker::UnstableCadence)
         } else if !vrr_eligibility.backend_capable {
             Some(VrrBlocker::BackendCapabilityUnavailable)
         } else if !vrr_eligibility.connector_capable {
@@ -735,6 +744,7 @@ mod vrr_phase1_regression_tests {
             output_generation_qualified: true,
             exact_kms_qualified: true,
             transition_supported: true,
+            cadence_unstable: false,
         }
     }
 
@@ -787,6 +797,30 @@ mod vrr_phase1_regression_tests {
         assert_eq!(both_failed.mode, OutputPresentationMode::Vsync);
         assert!(both_failed.vrr_blocker.is_some());
         assert!(both_failed.async_blocker.is_some());
+    }
+
+    #[test]
+    fn unstable_cadence_blocks_desktop_vrr_but_not_solitary_fullscreen() {
+        let decide = |auto_candidate| {
+            EffectivePresentation::decide(
+                TearingPolicy::Off,
+                VrrPolicy::On,
+                SurfacePresentationMetadata::default(),
+                AsyncEligibility::default(),
+                VrrEligibility {
+                    auto_candidate,
+                    cadence_unstable: true,
+                    ..vrr_eligible()
+                },
+            )
+        };
+        let desktop = decide(false);
+        assert_eq!(desktop.mode, OutputPresentationMode::Vsync);
+        assert_eq!(desktop.vrr_blocker, Some(VrrBlocker::UnstableCadence));
+
+        let fullscreen = decide(true);
+        assert_eq!(fullscreen.mode, OutputPresentationMode::AdaptiveSync);
+        assert_eq!(fullscreen.vrr_blocker, None);
     }
 
     #[test]

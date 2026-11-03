@@ -593,6 +593,9 @@ pub(crate) struct AtomicEglGbmScanout {
     async_format_capable: bool,
     vrr_connector_capable: bool,
     vrr_crtc_property_available: bool,
+    /// Desktop cadence gate from the VRR cadence recorder; see
+    /// `DesktopCadenceGate`. Starts closed: desktop VRR waits for evidence.
+    desktop_vrr_cadence_unstable: bool,
     connector_content_types: HashSet<DrmContentType>,
     async_crtc_id: u32,
     async_primary_plane_id: u32,
@@ -1562,6 +1565,10 @@ impl AtomicEglGbmScanout {
         self.vrr_crtc_property_available = vrr_crtc_property_available;
     }
 
+    pub(crate) fn set_desktop_vrr_cadence_unstable(&mut self, unstable: bool) {
+        self.desktop_vrr_cadence_unstable = unstable;
+    }
+
     pub(crate) fn rebind_output_epoch(
         &mut self,
         output_epoch: crate::native_output::OutputEpochId,
@@ -1843,6 +1850,7 @@ impl AtomicEglGbmScanout {
                 output_generation_qualified: self.async_output_generation == output_generation,
                 exact_kms_qualified: true,
                 transition_supported: true,
+                cadence_unstable: self.desktop_vrr_cadence_unstable,
             },
         );
         (content_type, effective)
@@ -2617,6 +2625,7 @@ impl AtomicEglGbmScanout {
                     .vrr_capable_value
                     .is_some_and(|value| value != 0),
             vrr_crtc_property_available: discovery.pipeline.crtc_props.vrr_enabled.is_some(),
+            desktop_vrr_cadence_unstable: true,
             connector_content_types: [
                 DrmContentType::Graphics,
                 DrmContentType::Photo,

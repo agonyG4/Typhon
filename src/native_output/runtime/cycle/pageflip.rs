@@ -2906,6 +2906,10 @@ impl NativeRuntime {
                     cursor_pending: pending_kind.is_some_and(|kind| !kind.is_primary()),
                 };
                 vrr_cadence.observe_present(observation);
+                if let NativeScanoutBackend::AtomicEglGbm(explicit) = &mut **scanout {
+                    explicit
+                        .set_desktop_vrr_cadence_unstable(vrr_cadence.desktop_cadence_unstable());
+                }
                 if observation.capabilities.relevant() {
                     perf.log("native.vrr_cadence", || {
                         vrr_cadence.trace_fields(self.head.output_id.get(), &observation)

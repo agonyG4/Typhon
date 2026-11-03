@@ -139,11 +139,141 @@ impl IntervalRing {
         self.values[..self.len].iter().copied()
     }
 
+    /// Intervals oldest first.
+    fn chronological(&self) -> impl Iterator<Item = u64> + '_ {
+        let start = if self.len < RECENT_INTERVALS {
+            0
+        } else {
+            self.next
+        };
+        (0..self.len).map(move |offset| self.values[(start + offset) % RECENT_INTERVALS])
+    }
+
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+
     fn median(&self) -> Option<u64> {
         let mut sorted = self.values;
         let sorted = &mut sorted[..self.len];
         sorted.sort_unstable();
         sorted.get(self.len / 2).copied()
+    }
+}
+
+/// A content pause longer than this starts a fresh cadence estimate.
+const GATE_IDLE_GAP_NS: u64 = 250_000_000;
+/// Consecutive primary intervals examined for instability under VRR.
+const GATE_UNSTABLE_WINDOW: usize = 8;
+/// Large interval changes within the window that close the gate.
+const GATE_UNSTABLE_CHANGES: usize = 3;
+const GATE_INITIAL_BACKOFF_NS: u64 = 2_000_000_000;
+const GATE_MAX_BACKOFF_NS: u64 = 60_000_000_000;
+/// The gate staying open this long resets the reopen backoff.
+const GATE_BACKOFF_RESET_NS: u64 = 30_000_000_000;
+
+/// Decides whether `VRR=on` may drive the desktop (outside a solitary
+/// fullscreen tree). Many panels change brightness with the refresh
+/// interval, so desktop content whose frame times swing (bursty UI
+/// animation: 10-27 ms on the CRS24B) flickers under VRR. KWin plans the
+/// same policy: VRR only while the refresh rate is reasonably stable.
+///
+/// The gate closes when, under VRR, the primary intervals keep changing by
+/// more than 20%. It reopens only after an exponential backoff and only for
+/// content that, under fixed refresh, holds a stable cadence slower than
+/// the panel; content already at the maximum refresh gains nothing from VRR
+/// and is exactly the callback-driven UI that turns irregular under it.
+#[derive(Debug, Clone)]
+pub(crate) struct DesktopCadenceGate {
+    open: bool,
+    intervals: IntervalRing,
+    last_primary_ns: Option<u64>,
+    reopen_not_before_ns: u64,
+    backoff_ns: u64,
+    opened_at_ns: Option<u64>,
+}
+
+impl Default for DesktopCadenceGate {
+    fn default() -> Self {
+        Self {
+            open: false,
+            intervals: IntervalRing::default(),
+            last_primary_ns: None,
+            reopen_not_before_ns: 0,
+            backoff_ns: GATE_INITIAL_BACKOFF_NS,
+            opened_at_ns: None,
+        }
+    }
+}
+
+/// Returns whether two consecutive frame intervals differ enough to change
+/// panel brightness: more than 20% and more than 2 ms.
+fn interval_change_is_large(previous: u64, next: u64) -> bool {
+    previous.abs_diff(next) > (previous.min(next) / 5).max(2_000_000)
+}
+
+impl DesktopCadenceGate {
+    pub(crate) const fn open(&self) -> bool {
+        self.open
+    }
+
+    /// Feeds one primary present; returns `Some(open)` when the gate flips.
+    fn observe_primary(&mut self, now: u64, vrr_active: bool, refresh_ns: u64) -> Option<bool> {
+        let previous = self.last_primary_ns.replace(now);
+        let interval = previous
+            .filter(|previous| now > *previous)
+            .map(|previous| now - previous)?;
+        if interval > GATE_IDLE_GAP_NS {
+            self.intervals.clear();
+            return None;
+        }
+        self.intervals.push(interval);
+        if self.open {
+            if !vrr_active || self.intervals.len < GATE_UNSTABLE_WINDOW {
+                return None;
+            }
+            let recent: Vec<u64> = self
+                .intervals
+                .chronological()
+                .skip(self.intervals.len - GATE_UNSTABLE_WINDOW)
+                .collect();
+            let large_changes = recent
+                .windows(2)
+                .filter(|pair| interval_change_is_large(pair[0], pair[1]))
+                .count();
+            if large_changes < GATE_UNSTABLE_CHANGES {
+                return None;
+            }
+            if self
+                .opened_at_ns
+                .is_some_and(|opened| now.saturating_sub(opened) >= GATE_BACKOFF_RESET_NS)
+            {
+                self.backoff_ns = GATE_INITIAL_BACKOFF_NS;
+            }
+            self.open = false;
+            self.opened_at_ns = None;
+            self.reopen_not_before_ns = now.saturating_add(self.backoff_ns);
+            self.backoff_ns = self.backoff_ns.saturating_mul(2).min(GATE_MAX_BACKOFF_NS);
+            self.intervals.clear();
+            return Some(false);
+        }
+        if now < self.reopen_not_before_ns || self.intervals.len < RECENT_INTERVALS {
+            return None;
+        }
+        let median = self.intervals.median()?;
+        let tolerance = (median / 5).max(refresh_ns.saturating_add(1_000_000));
+        let stable = self
+            .intervals
+            .iter()
+            .all(|interval| interval.abs_diff(median) <= tolerance);
+        let slower_than_panel = median.saturating_mul(2) >= refresh_ns.saturating_mul(3);
+        if !(stable && slower_than_panel) {
+            return None;
+        }
+        self.open = true;
+        self.opened_at_ns = Some(now);
+        self.intervals.clear();
+        Some(true)
     }
 }
 
@@ -178,6 +308,7 @@ pub(crate) struct VrrCadenceRecorder {
     last_fixed_fallback: Option<VariableReservationFallback>,
     /// Pending-since time of the cursor plane delta in flight.
     cursor_submitted_pending_since_ns: Option<u64>,
+    desktop_gate: DesktopCadenceGate,
     /// Pointer-change-to-pageflip age of the latest cursor-only present.
     last_cursor_age_ns: Option<u64>,
     counters: VrrCadenceCounters,
@@ -197,6 +328,7 @@ impl VrrCadenceRecorder {
             last_confirmed_vrr: None,
             last_fixed_fallback: None,
             cursor_submitted_pending_since_ns: None,
+            desktop_gate: DesktopCadenceGate::default(),
             last_cursor_age_ns: None,
             counters: VrrCadenceCounters::default(),
         }
@@ -234,6 +366,12 @@ impl VrrCadenceRecorder {
             .copied()
             .filter(|present| *present < before_ns)
             .max()
+    }
+
+    /// Whether the desktop cadence gate currently blocks `VRR=on` outside a
+    /// solitary fullscreen tree.
+    pub(crate) const fn desktop_cadence_unstable(&self) -> bool {
+        !self.desktop_gate.open()
     }
 
     /// Records when the cursor change carried by a submitted cursor-only
@@ -281,6 +419,16 @@ impl VrrCadenceRecorder {
         self.recent_presents_ns[RECENT_PRESENTS - 1] = Some(now);
         match observation.kind {
             VrrPresentKind::Primary => {
+                if let Some(refresh_ns) = self.shortest_interval_ns() {
+                    match self
+                        .desktop_gate
+                        .observe_primary(now, vrr_active, refresh_ns)
+                    {
+                        Some(false) => self.counters.vrr_idle_fixed_fallback_entries += 1,
+                        Some(true) => self.counters.vrr_idle_fixed_fallback_exits += 1,
+                        None => {}
+                    }
+                }
                 if let Some(previous) = self.last_primary_present_ns
                     && now > previous
                 {
@@ -394,6 +542,14 @@ impl VrrCadenceRecorder {
             ),
             NativePerfField::u64("quiescent_since_ns", self.quiescent_since_ns.unwrap_or(0)),
             NativePerfField::u64("cursor_age_ns", self.last_cursor_age_ns.unwrap_or(0)),
+            NativePerfField::str(
+                "desktop_cadence_gate",
+                if self.desktop_gate.open() {
+                    "open"
+                } else {
+                    "closed"
+                },
+            ),
             NativePerfField::bool("primary_pending", observation.primary_pending),
             NativePerfField::bool("cursor_pending", observation.cursor_pending),
             NativePerfField::bool("service_due", service_due),
@@ -655,6 +811,128 @@ mod tests {
         // A cursor present without a recorded submission has no age.
         recorder.observe_present(present(VrrPresentKind::CursorOnly, 9_000_000, mode));
         assert_eq!(recorder.last_cursor_age_ns, None);
+    }
+
+    const REFRESH_165: u64 = 6_060_606;
+
+    /// Feeds primary presents at the given intervals; returns the last flip.
+    fn feed(
+        gate: &mut DesktopCadenceGate,
+        start: u64,
+        intervals: &[u64],
+        vrr: bool,
+    ) -> (u64, Vec<bool>) {
+        let mut now = start;
+        let mut flips = Vec::new();
+        for interval in intervals {
+            now += interval;
+            if let Some(open) = gate.observe_primary(now, vrr, REFRESH_165) {
+                flips.push(open);
+            }
+        }
+        (now, flips)
+    }
+
+    #[test]
+    fn desktop_gate_opens_for_stable_content_slower_than_the_panel() {
+        let mut gate = DesktopCadenceGate::default();
+        assert!(!gate.open());
+        // 60 fps under fixed 165 Hz alternates two and three refreshes.
+        let video: Vec<u64> = (0..20)
+            .map(|i| {
+                if i % 3 == 0 {
+                    3 * REFRESH_165
+                } else {
+                    2 * REFRESH_165
+                }
+            })
+            .collect();
+        let (_, flips) = feed(&mut gate, 1_000_000_000, &[0], false);
+        assert!(flips.is_empty());
+        let (_, flips) = feed(&mut gate, 1_000_000_000, &video, false);
+        assert_eq!(flips, [true]);
+        assert!(gate.open());
+    }
+
+    #[test]
+    fn desktop_gate_stays_closed_for_content_at_the_panel_maximum() {
+        let mut gate = DesktopCadenceGate::default();
+        let (_, flips) = feed(&mut gate, 1_000_000_000, &[REFRESH_165; 64], false);
+        assert!(flips.is_empty());
+        assert!(!gate.open());
+    }
+
+    #[test]
+    fn desktop_gate_closes_on_swinging_vrr_intervals_and_backs_off() {
+        let ms = 1_000_000;
+        let steady = [16 * ms + 666_667; 20];
+        let swinging = [
+            10 * ms,
+            27 * ms,
+            12 * ms,
+            25 * ms,
+            11 * ms,
+            26 * ms,
+            13 * ms,
+            24 * ms,
+        ];
+        let mut gate = DesktopCadenceGate::default();
+        let (now, flips) = feed(&mut gate, 1_000_000_000, &steady, false);
+        assert_eq!(flips, [true]);
+        // A steady VRR cadence keeps it open.
+        let (now, flips) = feed(&mut gate, now, &steady, true);
+        assert!(flips.is_empty());
+        let (now, flips) = feed(&mut gate, now, &swinging, true);
+        assert_eq!(flips, [false]);
+        let closed_at = now;
+        // Stable slow content inside the 2 s backoff does not reopen it.
+        let (now, flips) = feed(&mut gate, now, &steady, false);
+        assert!(flips.is_empty() && now < closed_at + GATE_INITIAL_BACKOFF_NS);
+        let (now, flips) = feed(
+            &mut gate,
+            closed_at + GATE_INITIAL_BACKOFF_NS,
+            &steady,
+            false,
+        );
+        assert_eq!(flips, [true]);
+        // The next close doubles the backoff.
+        let mut now = now;
+        let mut closed_at = None;
+        for interval in swinging {
+            now += interval;
+            if gate.observe_primary(now, true, REFRESH_165) == Some(false) {
+                closed_at = Some(now);
+            }
+        }
+        let closed_at = closed_at.expect("swinging VRR intervals close the gate again");
+        assert_eq!(
+            gate.reopen_not_before_ns,
+            closed_at + 2 * GATE_INITIAL_BACKOFF_NS
+        );
+    }
+
+    #[test]
+    fn desktop_gate_ignores_idle_gaps() {
+        let ms = 1_000_000;
+        let mut gate = DesktopCadenceGate::default();
+        let mut intervals = vec![16 * ms + 666_667; 10];
+        intervals.push(2_000 * ms);
+        intervals.extend([16 * ms + 666_667; 10]);
+        let (_, flips) = feed(&mut gate, 1_000_000_000, &intervals, false);
+        // Ten intervals on each side of the pause never form a full window.
+        assert!(flips.is_empty());
+    }
+
+    #[test]
+    fn interval_ring_iterates_oldest_first_after_wrapping() {
+        let mut ring = IntervalRing::default();
+        for value in 1..=20 {
+            ring.push(value);
+        }
+        assert_eq!(
+            ring.chronological().collect::<Vec<_>>(),
+            (5..=20).collect::<Vec<_>>()
+        );
     }
 
     #[test]

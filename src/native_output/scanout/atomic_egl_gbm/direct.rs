@@ -425,6 +425,7 @@ impl AtomicEglGbmScanout {
                 output_generation_qualified: candidate.generation == self.direct.output_epoch.get(),
                 exact_kms_qualified: true,
                 transition_supported: true,
+                cadence_unstable: self.desktop_vrr_cadence_unstable,
             },
         );
         let mut presentation_mode = effective_presentation.mode;
