@@ -12,6 +12,11 @@ const MAX_ADAPTIVE_APPLY_GUARD_NS: u64 = 3_000_000;
 /// commits returning 0.2-0.4 ms before the target vblank missed ~1%, and none
 /// of ~7500 returning >= 0.5 ms before it missed.
 const MIN_ADAPTIVE_APPLY_GUARD_NS: u64 = 300_000;
+/// Distance a late-latched render keeps beyond its predicted cost.
+pub(crate) const RENDER_LATCH_BASE_MARGIN_NS: u64 = 250_000;
+/// The learned latch margin halves every this long without a readiness miss.
+const RENDER_LATCH_HALF_LIFE_NS: u64 = 2_000_000_000;
+const MAX_RENDER_LATCH_EXTRA_NS: u64 = 3_000_000;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct KmsModeTimingKey {
@@ -364,6 +369,9 @@ pub(crate) struct KmsPresentationTimingModel {
     dispatch_misses: u64,
     apply_guard_misses: u64,
     unreachable_targets: u64,
+    /// Latch margin learned from late renders, as of `render_latch_raised_at_ns`.
+    render_latch_extra_ns: u64,
+    render_latch_raised_at_ns: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -399,7 +407,35 @@ impl KmsPresentationTimingModel {
             dispatch_misses: 0,
             apply_guard_misses: 0,
             unreachable_targets: 0,
+            render_latch_extra_ns: 0,
+            render_latch_raised_at_ns: 0,
         }
+    }
+
+    fn render_latch_extra_at(self, now_ns: u64) -> u64 {
+        let elapsed = now_ns.saturating_sub(self.render_latch_raised_at_ns) as f64;
+        (self.render_latch_extra_ns as f64 * 0.5_f64.powf(elapsed / RENDER_LATCH_HALF_LIFE_NS as f64))
+            as u64
+    }
+
+    /// How far beyond its predicted cost a late-latched render starts. Like
+    /// KWin's commit safety margin it jumps by the lateness of a late render
+    /// and then decays, so a GPU clock phase that produces render spikes
+    /// widens the latch instead of repeating the miss.
+    pub(crate) fn render_latch_margin_ns(self, now_ns: u64) -> u64 {
+        RENDER_LATCH_BASE_MARGIN_NS.saturating_add(self.render_latch_extra_at(now_ns))
+    }
+
+    /// Records a composited frame whose render became ready `lateness_ns`
+    /// after its commit deadline.
+    pub(crate) fn note_render_readiness_lateness(&mut self, at_ns: u64, lateness_ns: u64) {
+        let cap = MAX_RENDER_LATCH_EXTRA_NS.min(self.mode.refresh_interval_ns() / 2);
+        self.render_latch_extra_ns = self
+            .render_latch_extra_at(at_ns)
+            .saturating_add(lateness_ns)
+            .saturating_add(RENDER_LATCH_BASE_MARGIN_NS)
+            .min(cap);
+        self.render_latch_raised_at_ns = at_ns;
     }
 
     pub(crate) const fn mode(self) -> KmsModeTiming {
@@ -649,6 +685,33 @@ mod tests {
         assert_eq!(
             KmsPresentationOutcome::classify(&window, Some(81), 90, 4, 5),
             KmsPresentationOutcome::RenderReadinessMiss
+        );
+    }
+
+    #[test]
+    fn render_latch_margin_jumps_on_a_late_render_and_halves_per_half_life() {
+        let timing = KmsModeTiming::from_mode(&mode(325_000, 2200, 1125), 6_060_606);
+        let mut model = KmsPresentationTimingModel::new(timing, 7);
+        let start = 10_000_000_000;
+        assert_eq!(model.render_latch_margin_ns(start), RENDER_LATCH_BASE_MARGIN_NS);
+
+        model.note_render_readiness_lateness(start, 600_000);
+        let raised = 600_000 + RENDER_LATCH_BASE_MARGIN_NS;
+        assert_eq!(
+            model.render_latch_margin_ns(start),
+            RENDER_LATCH_BASE_MARGIN_NS + raised
+        );
+        let halved = model.render_latch_margin_ns(start + RENDER_LATCH_HALF_LIFE_NS);
+        assert!(halved.abs_diff(RENDER_LATCH_BASE_MARGIN_NS + raised / 2) <= 1);
+
+        // Misses accumulate on the decayed value, bounded by 3 ms or half a
+        // refresh.
+        for step in 1..=10 {
+            model.note_render_readiness_lateness(start + step, 2_000_000);
+        }
+        assert_eq!(
+            model.render_latch_margin_ns(start + 10),
+            RENDER_LATCH_BASE_MARGIN_NS + MAX_RENDER_LATCH_EXTRA_NS
         );
     }
 

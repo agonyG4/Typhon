@@ -772,6 +772,7 @@ impl NativeRuntime {
                 predicted_total_cost,
                 prediction.p90_recent_render_ns,
                 presentation_timing.apply_guard_ns(),
+                presentation_timing.render_latch_margin_ns(scheduler_now.get()),
             )
         })
         .flatten();

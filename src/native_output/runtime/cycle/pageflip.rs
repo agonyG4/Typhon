@@ -3765,6 +3765,14 @@ impl NativeRuntime {
                             actual_logical_sequence,
                         ))
                     };
+                    if outcome == Some(KmsPresentationOutcome::RenderReadinessMiss) {
+                        presentation_timing.note_render_readiness_lateness(
+                            presented_at.get(),
+                            readiness.observation_lateness_ns(
+                                submit_window.commit_complete_deadline_ns(),
+                            ),
+                        );
+                    }
                     let mut apply_guard_observation = None;
                     if let Some(outcome) = outcome {
                         if let Some(mode_key) = submit_window.mode_key() {

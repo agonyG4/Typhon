@@ -396,10 +396,6 @@ pub(super) fn fresh_composited_reactive_target(
     }
 }
 
-/// Margin past the predicted cost a late-latched render keeps before its
-/// refresh. The predicted cost already carries the wake and KMS guards.
-pub(super) const RENDER_LATCH_MARGIN_NS: u64 = 250_000;
-
 /// 0 = environment not read yet, 1 = late, 2 = immediate.
 static RENDER_START_POLICY: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
@@ -428,8 +424,9 @@ pub(crate) fn set_render_start_late_latch(late: bool) {
 }
 
 /// Late-latch a fresh fixed-refresh composited render: keep the refresh the
-/// render would get now, but start it only `predicted_total_cost` plus a
-/// margin before that refresh. Client content and frame callbacks then sit
+/// render would get now, but start it only `predicted_total_cost` plus
+/// `margin_ns` before that refresh. The predicted cost already carries the
+/// wake and KMS guards. Client content and frame callbacks then sit
 /// closer to scanout. None when starting now is already due.
 pub(super) fn late_latched_render_target(
     planner: &PresentationDeadlinePlanner,
@@ -437,6 +434,7 @@ pub(super) fn late_latched_render_target(
     predicted_total_cost: Duration,
     recent_render_floor_ns: u64,
     apply_guard_ns: u64,
+    margin_ns: u64,
 ) -> Option<PresentationTarget> {
     let mut target = fresh_composited_reactive_target(
         planner,
@@ -451,7 +449,7 @@ pub(super) fn late_latched_render_target(
     }
     let lead_ns = u64::try_from(predicted_total_cost.as_nanos())
         .unwrap_or(u64::MAX)
-        .saturating_add(RENDER_LATCH_MARGIN_NS);
+        .saturating_add(margin_ns);
     let start_ns = target.presentation_time.get().saturating_sub(lead_ns);
     if start_ns <= now.get() {
         return None;

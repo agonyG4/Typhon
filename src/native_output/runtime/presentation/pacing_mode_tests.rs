@@ -1,6 +1,5 @@
 use super::super::planner::{
-    RENDER_LATCH_MARGIN_NS, fresh_composited_reactive_target, late_latched_render_target,
-    plan_scheduled_target_for_budget,
+    fresh_composited_reactive_target, late_latched_render_target, plan_scheduled_target_for_budget,
     plan_scheduled_target_for_mode, plan_visual_target_for_budget,
     reactive_or_commit_timing_target, visual_target_deadline_for_mode,
 };
@@ -298,6 +297,7 @@ fn late_latch_starts_the_render_its_cost_before_the_same_refresh() {
         cost,
         2_000_000,
         FRESH_REACTIVE_APPLY_GUARD_NS,
+        250_000,
     )
     .expect("latched target");
 
@@ -305,7 +305,7 @@ fn late_latch_starts_the_render_its_cost_before_the_same_refresh() {
     assert_eq!(latched.presentation_time, immediate.presentation_time);
     assert_eq!(
         latched.render_start_deadline.get(),
-        FRESH_REACTIVE_ANCHOR_NS + FRESH_REACTIVE_REFRESH_NS - 3_000_000 - RENDER_LATCH_MARGIN_NS
+        FRESH_REACTIVE_ANCHOR_NS + FRESH_REACTIVE_REFRESH_NS - 3_000_000 - 250_000
     );
     assert!(latched.render_start_deadline > now);
 }
@@ -321,6 +321,7 @@ fn late_latch_starts_now_when_the_cost_fills_the_refresh_or_timing_is_estimated(
             Duration::from_nanos(FRESH_REACTIVE_REFRESH_NS),
             2_000_000,
             FRESH_REACTIVE_APPLY_GUARD_NS,
+            250_000,
         ),
         None
     );
@@ -333,6 +334,7 @@ fn late_latch_starts_now_when_the_cost_fills_the_refresh_or_timing_is_estimated(
             Duration::from_millis(1),
             500_000,
             FRESH_REACTIVE_APPLY_GUARD_NS,
+            250_000,
         ),
         None
     );
