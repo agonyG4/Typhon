@@ -160,8 +160,9 @@ pub use dmabuf::{
 };
 use dmabuf::{
     DmabufBufferData, DmabufFeedbackBinding, DmabufFeedbackData, DmabufFeedbackResourceData,
-    DmabufFeedbackScope, DmabufFeedbackSnapshot, DmabufParamsData, LiveDmabufFeedbackResource,
-    PendingDmabufPlane, send_dmabuf_feedback_resource, send_dmabuf_format_modifiers,
+    DmabufFeedbackScope, DmabufFeedbackSnapshot, DmabufParamsData,
+    LEGACY_DMABUF_MAIN_DEVICE_EXECUTABLES, LiveDmabufFeedbackResource, PendingDmabufPlane,
+    executable_matches, send_dmabuf_feedback_resource, send_dmabuf_format_modifiers,
     send_wl_drm_capabilities,
 };
 #[doc(hidden)]
@@ -991,6 +992,8 @@ pub struct CompositorState {
     dmabuf_feedback: EglGlesDmabufFeedback,
     dmabuf_main_device: u64,
     dmabuf_main_device_path: Option<String>,
+    /// Executable names that still get `main_device` at linux-dmabuf v6.
+    legacy_dmabuf_main_device_executables: Vec<String>,
     dmabuf_scanout_capabilities: Option<DirectScanoutFeedbackCapabilities>,
     dmabuf_scanout_target_device_override: Option<u64>,
     dmabuf_kms_preferred_state: DmabufKmsPreferredState,

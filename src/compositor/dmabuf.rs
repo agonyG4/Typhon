@@ -306,6 +306,25 @@ impl DmabufFeedbackBinding {
 
 pub(super) struct DmabufFeedbackResourceData {
     pub(super) binding: Arc<Mutex<DmabufFeedbackBinding>>,
+    /// Keep sending the v6-deprecated `main_device` event to this resource.
+    pub(super) legacy_main_device: bool,
+}
+
+/// Clients that bind linux-dmabuf at the advertised version (6) but still
+/// build their buffer device from `main_device`. xdg-desktop-portal-hyprland
+/// 1.5 discards every tranche without it and falls back to wl_shm screencast
+/// buffers, which turns each captured frame into a full re-render plus an
+/// 8 MB CPU readback.
+pub(super) const LEGACY_DMABUF_MAIN_DEVICE_EXECUTABLES: &[&str] = &["xdg-desktop-portal-hyprland"];
+
+/// Whether the executable at `exe` (a `/proc/<pid>/exe` target) is one of
+/// `executables`; a binary replaced on disk reads as `name (deleted)`.
+pub(super) fn executable_matches(exe: &std::path::Path, executables: &[String]) -> bool {
+    let Some(name) = exe.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let name = name.strip_suffix(" (deleted)").unwrap_or(name);
+    executables.iter().any(|candidate| candidate == name)
 }
 
 #[derive(Debug)]
@@ -518,16 +537,17 @@ pub(super) fn send_dmabuf_feedback_resource(
     let Some(data) = binding.payload.as_ref() else {
         return;
     };
-    send_dmabuf_feedback_payload(feedback, data);
+    send_dmabuf_feedback_payload(feedback, data, resource_data.legacy_main_device);
 }
 
 fn send_dmabuf_feedback_payload(
     feedback: &zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1,
     data: &DmabufFeedbackData,
+    legacy_main_device: bool,
 ) {
     let sampling_flag = feedback.version() >= DMABUF_FEEDBACK_SAMPLING_SINCE;
     feedback.format_table(data.format_table.as_fd(), data.format_table_size);
-    if !sampling_flag {
+    if !sampling_flag || legacy_main_device {
         feedback.main_device(data.main_device.to_ne_bytes().to_vec());
     }
     for tranche in &data.tranches {
@@ -875,6 +895,20 @@ pub(super) struct PendingDmabufPlane {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_main_device_matches_executable_name_even_after_replacement() {
+        let executables = vec!["xdg-desktop-portal-hyprland".to_string()];
+        let matches = |exe: &str| executable_matches(std::path::Path::new(exe), &executables);
+        assert!(matches("/usr/lib/xdg-desktop-portal-hyprland"));
+        assert!(matches("/usr/lib/xdg-desktop-portal-hyprland (deleted)"));
+        assert!(!matches("/usr/lib/xdg-desktop-portal-hyprland-helper"));
+        assert!(!matches("/usr/lib/xdg-desktop-portal-gnome"));
+        assert!(!executable_matches(
+            std::path::Path::new("/usr/lib/xdg-desktop-portal-hyprland"),
+            &[]
+        ));
+    }
 
     #[test]
     fn scanout_tranche_is_preferred_and_render_tranche_is_not_scanout() {

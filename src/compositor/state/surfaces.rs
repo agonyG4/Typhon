@@ -901,6 +901,10 @@ impl CompositorState {
             dmabuf_feedback: EglGlesDmabufFeedback::default(),
             dmabuf_main_device: 0,
             dmabuf_main_device_path: None,
+            legacy_dmabuf_main_device_executables: LEGACY_DMABUF_MAIN_DEVICE_EXECUTABLES
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect(),
             dmabuf_scanout_capabilities: None,
             dmabuf_scanout_target_device_override: None,
             syncobj_device,

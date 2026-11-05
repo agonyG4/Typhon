@@ -611,6 +611,33 @@ fn wayland_client_receives_dmabuf_v4_default_feedback() {
 }
 
 #[test]
+fn legacy_v6_client_still_receives_dmabuf_main_device() {
+    // xdg-desktop-portal-hyprland binds v6 but builds its buffer device from
+    // main_device; without it the screencast falls back to wl_shm.
+    let socket_name = unique_socket_name();
+    let mut server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let test_executable = std::env::current_exe().unwrap();
+    server.state.legacy_dmabuf_main_device_executables = vec![
+        test_executable
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned(),
+    ];
+    let socket_path = runtime_socket_path(&socket_name);
+    let (running, server_thread) = spawn_test_server(server);
+
+    let state = request_dmabuf_default_feedback_at_version(&socket_path, 6);
+    stop_test_server(running, server_thread);
+
+    let state = state.unwrap();
+    assert!(state.dmabuf_feedback_main_device);
+    assert!(state.dmabuf_feedback_format_table);
+    assert_eq!(state.dmabuf_feedback_tranche_sampling, vec![true]);
+    assert!(state.dmabuf_feedback_done);
+}
+
+#[test]
 fn wayland_client_receives_dmabuf_v6_default_feedback_with_sampling_tranche() {
     let socket_name = unique_socket_name();
     let server = OwnCompositorServer::bind(&socket_name).unwrap();

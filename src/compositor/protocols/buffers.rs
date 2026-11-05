@@ -380,11 +380,11 @@ fn post_wl_drm_protocol_error(
 impl Dispatch<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1, ()> for CompositorState {
     fn request(
         state: &mut Self,
-        _client: &Client,
+        client: &Client,
         resource: &zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1,
         request: zwp_linux_dmabuf_v1::Request,
         _data: &(),
-        _dhandle: &DisplayHandle,
+        dhandle: &DisplayHandle,
         data_init: &mut DataInit<'_, Self>,
     ) {
         match request {
@@ -393,14 +393,24 @@ impl Dispatch<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1, ()> for CompositorState {
             }
             zwp_linux_dmabuf_v1::Request::Destroy => {}
             zwp_linux_dmabuf_v1::Request::GetDefaultFeedback { id } => {
-                create_dmabuf_feedback_resource(state, id, DmabufFeedbackScope::Default, data_init);
+                let legacy_main_device =
+                    state.client_needs_legacy_dmabuf_main_device(client, dhandle);
+                create_dmabuf_feedback_resource(
+                    state,
+                    id,
+                    DmabufFeedbackScope::Default,
+                    legacy_main_device,
+                    data_init,
+                );
             }
             zwp_linux_dmabuf_v1::Request::GetSurfaceFeedback { id, surface } => {
                 let scope = surface
                     .data::<SurfaceData>()
                     .map(|data| DmabufFeedbackScope::Surface(data.surface_id()))
                     .unwrap_or(DmabufFeedbackScope::InertSurface);
-                create_dmabuf_feedback_resource(state, id, scope, data_init);
+                let legacy_main_device =
+                    state.client_needs_legacy_dmabuf_main_device(client, dhandle);
+                create_dmabuf_feedback_resource(state, id, scope, legacy_main_device, data_init);
             }
             other => {
                 let _ = other;
@@ -414,10 +424,31 @@ impl Dispatch<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1, ()> for CompositorState {
     }
 }
 
+impl CompositorState {
+    /// A client from `legacy_dmabuf_main_device_executables` that bound
+    /// linux-dmabuf v6 still needs the deprecated `main_device` event; see
+    /// [`LEGACY_DMABUF_MAIN_DEVICE_EXECUTABLES`].
+    fn client_needs_legacy_dmabuf_main_device(
+        &self,
+        client: &Client,
+        dhandle: &DisplayHandle,
+    ) -> bool {
+        if self.legacy_dmabuf_main_device_executables.is_empty() {
+            return false;
+        }
+        let Ok(credentials) = client.get_credentials(dhandle) else {
+            return false;
+        };
+        std::fs::read_link(format!("/proc/{}/exe", credentials.pid))
+            .is_ok_and(|exe| executable_matches(&exe, &self.legacy_dmabuf_main_device_executables))
+    }
+}
+
 fn create_dmabuf_feedback_resource(
     state: &mut CompositorState,
     id: New<zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1>,
     scope: DmabufFeedbackScope,
+    legacy_main_device: bool,
     data_init: &mut DataInit<'_, CompositorState>,
 ) {
     let snapshot = state
@@ -440,7 +471,13 @@ fn create_dmabuf_feedback_resource(
         eprintln!("oblivion-one compositor: failed to materialize dmabuf feedback");
         return;
     };
-    let feedback = data_init.init(id, DmabufFeedbackResourceData { binding });
+    let feedback = data_init.init(
+        id,
+        DmabufFeedbackResourceData {
+            binding,
+            legacy_main_device,
+        },
+    );
     state.register_dmabuf_feedback_resource(&feedback);
     send_dmabuf_feedback_resource(&feedback);
 }
