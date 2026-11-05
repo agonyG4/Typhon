@@ -120,7 +120,7 @@ fn run(args: Vec<String>) -> Result<u8, AstreactlError> {
             }
             "-h" | "--help" => {
                 println!(
-                    "astreactl [global options] <version|status|doctor|performance|outputs|windows|activewindow|window decoration-policy ID server|client-preference|keyboard config|keyboard configure|keyboard layout|keyboard next|keyboard previous|keyboard set INDEX|cursor ...|decoration ...|effects reload|blur ...|animation get|animation set JSON|presentation get|presentation set triple=MODE worker=MODE|presentation trace start PATH|presentation trace stop|wallpaper ...>"
+                    "astreactl [global options] <version|status|doctor|performance|outputs|windows|activewindow|window decoration-policy ID server|client-preference|keyboard config|keyboard configure|keyboard layout|keyboard next|keyboard previous|keyboard set INDEX|cursor ...|decoration ...|effects reload|effects planner legacy|regional|blur ...|animation get|animation set JSON|presentation get|presentation set triple=MODE worker=MODE|presentation trace start PATH|presentation trace stop|wallpaper ...>"
                 );
                 return Ok(0);
             }
@@ -814,8 +814,21 @@ fn parse_effects_command(
     if positionals.len() == 1 && positionals[0] == "reload" {
         return Ok(("effects", "effects.reload", serde_json::json!({})));
     }
+    if positionals.len() == 2 && positionals[0] == "planner" {
+        let planner = positionals[1].as_str();
+        if planner != "legacy" && planner != "regional" {
+            return Err(AstreactlError::Usage(
+                "effects planner must be legacy or regional".to_string(),
+            ));
+        }
+        return Ok((
+            "effects",
+            "effects.planner.set",
+            serde_json::json!({"planner": planner}),
+        ));
+    }
     Err(AstreactlError::Usage(
-        "effects command requires reload".to_string(),
+        "effects command requires reload or planner legacy|regional".to_string(),
     ))
 }
 

@@ -101,7 +101,7 @@ when the variable is unset.
 | `TYPHON_EFFECT_CANONICAL_BLUR_SEMANTICS` | `canonical`, `legacy` | `canonical` | Unrecognized values fall back to `legacy`. |
 | `TYPHON_EFFECT_TERMINAL_BLUR_FUSION` | `on`, `off` | `on` | Fuses the terminal Kawase passes. Unrecognized values fall back to `off`. Disabled while `TYPHON_EFFECT_DEBUG_KAWASE_MODE=full`. |
 | `TYPHON_EFFECT_CHECKPOINT_DEPENDENCY_PRUNING` | `on`, `off` | `off` | Newer path, off by default. Unrecognized values fall back to `off`. |
-| `TYPHON_EFFECT_DEMAND_PLANNER` | `legacy`, `regional` | `legacy` | Unrecognized values fall back to `legacy`. |
+| `TYPHON_EFFECT_DEMAND_PLANNER` | `legacy`, `regional` | `legacy` | Unrecognized values fall back to `legacy`. `astreactl effects planner legacy\|regional` switches it at runtime. |
 | `TYPHON_EFFECT_PRECOMPUTED_WINDOW_BLUR` | `off`, `on` | `off` | See [Shared window blur](#shared-window-blur). |
 | `TYPHON_EFFECT_RESOURCE_BUDGET_MIB`, `TYPHON_EFFECT_CHECKPOINT_CACHE_BUDGET_MIB` | positive integer MiB | built-in budgets | See [Resource limits and diagnostics](#resource-limits-and-diagnostics). |
 

@@ -1,4 +1,7 @@
-use std::sync::OnceLock;
+use std::sync::{
+    OnceLock,
+    atomic::{AtomicU8, Ordering},
+};
 
 use super::{
     CompiledFrameGraph, EffectDemandPlanStats, EffectPassExecutionDemand, EffectRegion,
@@ -52,10 +55,31 @@ pub fn parse_effect_demand_planner_policy(value: Option<&str>) -> ParsedEffectDe
     }
 }
 
+const PLANNER_OVERRIDE_UNSET: u8 = 0;
+const PLANNER_OVERRIDE_LEGACY: u8 = 1;
+const PLANNER_OVERRIDE_REGIONAL: u8 = 2;
+
+static PLANNER_OVERRIDE: AtomicU8 = AtomicU8::new(PLANNER_OVERRIDE_UNSET);
+
+/// Runtime override of the demand planner (`astreactl effects planner`),
+/// taking precedence over `TYPHON_EFFECT_DEMAND_PLANNER` for later frames.
+pub fn set_effect_demand_planner_policy(policy: EffectDemandPlannerPolicy) {
+    let value = match policy {
+        EffectDemandPlannerPolicy::Legacy => PLANNER_OVERRIDE_LEGACY,
+        EffectDemandPlannerPolicy::Regional => PLANNER_OVERRIDE_REGIONAL,
+    };
+    PLANNER_OVERRIDE.store(value, Ordering::Relaxed);
+}
+
 pub fn configured_effect_demand_planner_policy() -> EffectDemandPlannerPolicy {
     static POLICY: OnceLock<EffectDemandPlannerPolicy> = OnceLock::new();
     static WARNED_UNKNOWN: OnceLock<()> = OnceLock::new();
 
+    match PLANNER_OVERRIDE.load(Ordering::Relaxed) {
+        PLANNER_OVERRIDE_LEGACY => return EffectDemandPlannerPolicy::Legacy,
+        PLANNER_OVERRIDE_REGIONAL => return EffectDemandPlannerPolicy::Regional,
+        _ => {}
+    }
     *POLICY.get_or_init(|| {
         let value = std::env::var(EFFECT_DEMAND_PLANNER_ENV).ok();
         let parsed = parse_effect_demand_planner_policy(value.as_deref());

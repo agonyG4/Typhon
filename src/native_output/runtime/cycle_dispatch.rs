@@ -175,6 +175,12 @@ fn settle_native_pointer_constraint_backend_requests(
 struct EmptyCursorArgs {}
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EffectsPlannerArgs {
+    planner: String,
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct OutputConfigureArgs {
     version: u8,
@@ -1274,6 +1280,28 @@ impl NativeRuntime {
                     }
                 },
             );
+        }
+        if command == ControlCommand::EffectsPlannerSet {
+            let policy = serde_json::from_value::<EffectsPlannerArgs>(request.args)
+                .ok()
+                .map(|args| {
+                    oblivion_one::effects::parse_effect_demand_planner_policy(Some(&args.planner))
+                })
+                .filter(|parsed| !parsed.unknown_value);
+            let Some(parsed) = policy else {
+                return Some(ControlResponse::failure(
+                    request.id,
+                    ControlError::new(
+                        ControlErrorCode::InvalidArgument,
+                        "effects planner must be legacy or regional",
+                    ),
+                ));
+            };
+            oblivion_one::effects::set_effect_demand_planner_policy(parsed.policy);
+            return Some(ControlResponse::success(
+                request.id,
+                serde_json::json!({"planner": parsed.policy.as_str()}),
+            ));
         }
         if command == ControlCommand::EffectsReload {
             if serde_json::from_value::<EmptyCursorArgs>(request.args).is_err() {

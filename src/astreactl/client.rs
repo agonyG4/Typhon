@@ -137,6 +137,10 @@ fn decode_command_result(
             .map(AstreactlResult::DecorationThemes),
         "effects.reload" => serde_json::from_value::<TrustedEffectsReloadSnapshot>(value)
             .map(AstreactlResult::TrustedEffects),
+        "effects.planner.set" => {
+            serde_json::from_value::<crate::control_snapshots::EffectsPlannerSnapshot>(value)
+                .map(AstreactlResult::EffectsPlanner)
+        }
         "blur.status" | "blur.reload" => {
             serde_json::from_value::<crate::blur_policy::BlurPolicySnapshot>(value)
                 .map(AstreactlResult::Blur)

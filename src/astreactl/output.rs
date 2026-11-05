@@ -184,6 +184,9 @@ pub fn human(result: &AstreactlResult) -> String {
             snapshot.generation,
             snapshot.effect_count,
         ),
+        AstreactlResult::EffectsPlanner(snapshot) => {
+            format!("Planner: {}", sanitize_terminal_text(&snapshot.planner))
+        }
         AstreactlResult::Blur(snapshot) => format!(
             "Enabled: {}\nRenderer: {}\nGeneration: {}\nWayland: {}\nXWayland: {}\nAuto fullscreen: {}\nLayer default: {}\nRules: {}/{}\nActive assignments: {}\nSources: client={} wayland_auto={} window_rule={} layer_rule={}\nConfig: {}\nLast error: {}",
             snapshot.enabled,

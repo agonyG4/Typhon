@@ -1099,6 +1099,14 @@ pub struct PresentationPolicySnapshot {
     pub render_start: String,
 }
 
+/// The effect demand planner selected at runtime.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct EffectsPlannerSnapshot {
+    pub planner: String,
+}
+
 /// Whether the per-transaction presentation trace is being written.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1125,6 +1133,7 @@ pub enum AstreactlResult {
     DecorationTheme(DecorationThemeSnapshot),
     DecorationThemes(DecorationThemeListSnapshot),
     TrustedEffects(TrustedEffectsReloadSnapshot),
+    EffectsPlanner(EffectsPlannerSnapshot),
     Blur(crate::blur_policy::BlurPolicySnapshot),
     Animation(crate::animation_control::AnimationControlSnapshot),
     PresentationPolicy(PresentationPolicySnapshot),
