@@ -115,6 +115,10 @@ impl GpuScreencopyTarget {
         self.blitted = true;
     }
 
+    pub(crate) const fn is_blitted(&self) -> bool {
+        self.blitted
+    }
+
     /// The blit was submitted in output frame `frame_id`, completed by `fence`.
     pub(crate) fn note_rendered(&mut self, frame_id: u64, fence: OwnedFd) {
         if self.blitted {

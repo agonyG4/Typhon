@@ -603,6 +603,15 @@ impl AtomicRenderDomain {
                         |destination, region| scene.draw_capture_cursor(destination, region),
                     );
                 }
+                // A copy whose blit failed goes back to the frozen frame, so
+                // settlement restages it for the next frame (bounded) rather
+                // than failing it: xdg-desktop-portal-hyprland stops its
+                // stream on the first `failed`.
+                let (blitted, unblitted): (Vec<_>, Vec<_>) = screencopy_targets
+                    .into_iter()
+                    .partition(|target| target.is_blitted());
+                let mut screencopy_targets = blitted;
+                frozen_frame.screencopy_targets = unblitted;
                 self.scene
                     .as_mut()
                     .expect("live Atomic render domain owns its scene renderer")

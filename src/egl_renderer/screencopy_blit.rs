@@ -181,6 +181,13 @@ pub(crate) fn blit_framebuffer_region(
     let (x, y) = (to_i32(region.x)?, to_i32(region.y)?);
     let (width, height) = (to_i32(region.width)?, to_i32(region.height)?);
     unsafe {
+        // An error left pending by earlier frame work would otherwise be
+        // reported as a failed blit.
+        for _ in 0..8 {
+            if gl.get_error() == glow::NO_ERROR {
+                break;
+            }
+        }
         let previous_read = gl.get_parameter_framebuffer(glow::READ_FRAMEBUFFER_BINDING);
         let previous_draw = gl.get_parameter_framebuffer(glow::DRAW_FRAMEBUFFER_BINDING);
         let scissor = gl.is_enabled(glow::SCISSOR_TEST);
