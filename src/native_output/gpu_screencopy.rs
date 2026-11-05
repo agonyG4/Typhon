@@ -5,8 +5,11 @@
 //! finished slot into each client buffer before exporting the frame's render
 //! fence. The render thread never waits for that fence: a blitted target
 //! reports its frame id and a duplicate of the fence, and the reactor sends
-//! `ready` when that frame is presented, since KMS has waited on the same
-//! fence by then.
+//! `ready` as soon as that fence signals (the reactor already wakes on the
+//! frame's render fence), or at the frame's pageflip if that comes first.
+//! Waiting for the pageflip cost a refresh per capture: a request arriving
+//! just after a vblank misses the composite already under way, so its frame
+//! presents two refreshes later.
 //!
 //! Every target reports exactly once through [`GpuScreencopyCompletions`] when
 //! it is dropped, so a target lost on any error or teardown path fails its
@@ -212,19 +215,27 @@ impl<R: GpuScreencopyRequest> GpuScreencopyInflight<R> {
         }
     }
 
-    /// Fail unblitted targets, queue blitted ones for presentation, and use
-    /// the fence fallback for any that waited too long. Returns the number of
-    /// protocol events sent since the previous call, for flushing.
+    /// Fail unblitted targets, deliver blitted ones whose render fence has
+    /// signaled, and use the fence fallback for any that waited too long.
+    /// Returns the number of protocol events sent since the previous call,
+    /// for flushing.
     pub(crate) fn settle(&mut self, now_ns: u64) -> usize {
         self.collect(now_ns);
-        let (expired, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut self.awaiting)
-            .into_iter()
-            .partition(|entry| now_ns.saturating_sub(entry.since_ns) >= PRESENTATION_WAIT_NS);
-        self.awaiting = waiting;
-        for entry in expired {
-            self.fallback(entry);
+        for entry in std::mem::take(&mut self.awaiting) {
+            if fence_signaled(&entry.fence) {
+                self.deliver(entry.id, None);
+            } else if now_ns.saturating_sub(entry.since_ns) >= PRESENTATION_WAIT_NS {
+                self.fail(entry.id);
+            } else {
+                self.awaiting.push(entry);
+            }
         }
         std::mem::take(&mut self.unflushed_events)
+    }
+
+    /// Requests whose copies are blitted or staged but not yet reported.
+    pub(crate) fn has_outstanding(&self) -> bool {
+        !self.requests.is_empty()
     }
 
     /// Output frame `frame_id` reached the screen at `presented_at_ns`
@@ -502,9 +513,10 @@ mod tests {
         let mut inflight = GpuScreencopyInflight::default();
         rendered(admit(&mut inflight, &outcomes, 1, false), 2, true);
         rendered(admit(&mut inflight, &outcomes, 2, false), 3, false);
-        inflight.settle(0);
-        assert!(outcomes.sorted().is_empty());
-        assert_eq!(inflight.settle(PRESENTATION_WAIT_NS), 2);
+        // A signaled fence delivers without waiting for the pageflip.
+        assert_eq!(inflight.settle(0), 1);
+        assert_eq!(outcomes.sorted(), [(1, None, true)]);
+        assert_eq!(inflight.settle(PRESENTATION_WAIT_NS), 1);
         assert_eq!(outcomes.sorted(), [(1, None, true), (2, None, false)]);
 
         // A report for a frame already presented cannot wait for it.

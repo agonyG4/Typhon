@@ -47,6 +47,10 @@ impl NativeRuntime {
                     drop(target);
                 }
             }
+        }
+        // Blitted copies are delivered once their render fence signals; the
+        // reactor wakes on that fence, so settle every cycle while any wait.
+        if self.gpu_screencopy.has_outstanding() {
             self.settle_gpu_screencopy()?;
         }
         if self.head.scanout.has_staged_gpu_screencopy() {
