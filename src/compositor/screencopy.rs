@@ -26,7 +26,7 @@ const FRAME_BUFFER_DONE_SINCE: u32 = 3;
 const DRM_FORMAT_XRGB8888: u32 = 0x3432_5258;
 
 /// Physical-pixel rectangle inside the output.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct ScreencopyRegion {
     pub(crate) x: u32,
     pub(crate) y: u32,
@@ -49,6 +49,21 @@ impl ScreencopySource {
             |region| (region.width, region.height),
         )
     }
+}
+
+/// One capture stream of a client: the same output and region.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct ScreencopyStreamKey {
+    client_id: ClientId,
+    output_id: OutputId,
+    region: Option<ScreencopyRegion>,
+}
+
+/// Scene state the last copy taken for a stream was made from.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ScreencopyBaseline {
+    scene_generation: u64,
+    pointer: (f64, f64),
 }
 
 #[derive(Debug)]
@@ -77,8 +92,8 @@ pub struct ScreencopyPending {
     target: ScreencopyTarget,
     source: ScreencopySource,
     with_damage: bool,
-    requested_generation: u64,
-    requested_pointer: (f64, f64),
+    /// What this stream last received; `None` before its first copy.
+    baseline: Option<ScreencopyBaseline>,
 }
 
 impl ScreencopyPending {
@@ -90,10 +105,29 @@ impl ScreencopyPending {
         self.source.overlay_cursor
     }
 
+    /// `copy_with_damage` waits for damage since the stream's last copy,
+    /// not since this request: a client that re-requests a few ms after
+    /// `ready` (xdg-desktop-portal-hyprland waits at least 6 ms) would
+    /// otherwise skip whatever was committed in between and lose a refresh
+    /// per frame. Hyprland and wlroots likewise copy on the next frame.
     pub(crate) fn is_ready(&self, scene_generation: u64, pointer: (f64, f64)) -> bool {
-        !self.with_damage
-            || scene_generation != self.requested_generation
-            || (self.source.overlay_cursor && pointer != self.requested_pointer)
+        copy_is_ready(
+            self.with_damage,
+            self.source.overlay_cursor,
+            self.baseline,
+            ScreencopyBaseline {
+                scene_generation,
+                pointer,
+            },
+        )
+    }
+
+    fn stream_key(&self) -> ScreencopyStreamKey {
+        ScreencopyStreamKey {
+            client_id: self.client_id.clone(),
+            output_id: self.source.output_id,
+            region: self.source.region,
+        }
     }
 
     fn is_gpu_copy(&self) -> bool {
@@ -201,6 +235,19 @@ impl ScreencopyPending {
         }
         Ok(())
     }
+}
+
+fn copy_is_ready(
+    with_damage: bool,
+    overlay_cursor: bool,
+    baseline: Option<ScreencopyBaseline>,
+    current: ScreencopyBaseline,
+) -> bool {
+    let Some(baseline) = baseline.filter(|_| with_damage) else {
+        return true;
+    };
+    current.scene_generation != baseline.scene_generation
+        || (overlay_cursor && current.pointer != baseline.pointer)
 }
 
 /// Byte range of one cropped row inside a full-width top-left RGBA frame.
@@ -459,15 +506,19 @@ impl CompositorState {
             resource.failed();
             return;
         };
-        self.screencopy_pending.push_back(ScreencopyPending {
+        let mut pending = ScreencopyPending {
             frame: resource.clone(),
             client_id: client.id(),
             target,
             source,
             with_damage,
-            requested_generation: self.scene_render_generation,
-            requested_pointer: (self.last_pointer_x, self.last_pointer_y),
-        });
+            baseline: None,
+        };
+        pending.baseline = self
+            .screencopy_baselines
+            .get(&pending.stream_key())
+            .copied();
+        self.screencopy_pending.push_back(pending);
     }
 
     /// Ready wl_shm requests, served by the private re-render capture path.
@@ -485,7 +536,21 @@ impl CompositorState {
             .screencopy_pending
             .iter()
             .position(|pending| !pending.is_gpu_copy() && pending.is_ready(generation, pointer))?;
-        self.screencopy_pending.remove(index)
+        let pending = self.screencopy_pending.remove(index)?;
+        self.note_screencopy_taken(&pending);
+        Some(pending)
+    }
+
+    /// The copy of `pending` shows the current scene; later requests of its
+    /// stream wait for damage past this point.
+    fn note_screencopy_taken(&mut self, pending: &ScreencopyPending) {
+        self.screencopy_baselines.insert(
+            pending.stream_key(),
+            ScreencopyBaseline {
+                scene_generation: self.scene_render_generation,
+                pointer: (self.last_pointer_x, self.last_pointer_y),
+            },
+        );
     }
 
     /// Ready DMA-BUF requests, served from the next composited display frame.
@@ -503,6 +568,9 @@ impl CompositorState {
             .into_iter()
             .partition(|pending| pending.is_gpu_copy() && pending.is_ready(generation, pointer));
         self.screencopy_pending = kept.into();
+        for pending in &ready {
+            self.note_screencopy_taken(pending);
+        }
         ready
     }
 
@@ -517,6 +585,8 @@ impl CompositorState {
     pub(in crate::compositor) fn clear_screencopy_client(&mut self, client_id: &ClientId) {
         self.screencopy_pending
             .retain(|pending| pending.client_id != *client_id);
+        self.screencopy_baselines
+            .retain(|key, _| key.client_id != *client_id);
     }
 
     pub(in crate::compositor) fn fail_screencopy_for_output(&mut self, output_id: OutputId) {
@@ -524,6 +594,8 @@ impl CompositorState {
             .into_iter()
             .partition(|pending| pending.output_id() == output_id);
         self.screencopy_pending = kept.into();
+        self.screencopy_baselines
+            .retain(|key, _| key.output_id != output_id);
         for pending in failed {
             pending.fail();
         }
@@ -550,6 +622,25 @@ fn screencopy_dmabuf_matches(handle: &DmabufBufferHandle, width: u32, height: u3
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn copy_with_damage_waits_only_for_damage_since_the_last_copy() {
+        let at = |scene_generation, pointer| ScreencopyBaseline {
+            scene_generation,
+            pointer,
+        };
+        let last = Some(at(5, (1.0, 1.0)));
+        // First copy of a stream: nothing to compare against.
+        assert!(copy_is_ready(true, false, None, at(5, (1.0, 1.0))));
+        // Committed after the last copy, before this request: ready.
+        assert!(copy_is_ready(true, false, last, at(6, (1.0, 1.0))));
+        assert!(!copy_is_ready(true, false, last, at(5, (1.0, 1.0))));
+        // Pointer motion only counts when the cursor is in the copy.
+        assert!(!copy_is_ready(true, false, last, at(5, (2.0, 1.0))));
+        assert!(copy_is_ready(true, true, last, at(5, (2.0, 1.0))));
+        // Plain copy never waits.
+        assert!(copy_is_ready(false, false, last, at(5, (1.0, 1.0))));
+    }
 
     #[test]
     fn rgba_row_converts_to_little_endian_xrgb() {

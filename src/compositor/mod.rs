@@ -1044,6 +1044,8 @@ pub struct CompositorState {
     astrea_shell_authenticated_clients: HashSet<ClientId>,
     astrea_screen_captures: HashMap<ClientId, AstreaScreenCapturePending>,
     screencopy_pending: VecDeque<ScreencopyPending>,
+    /// Last copy taken per screencopy stream, for `copy_with_damage`.
+    screencopy_baselines: HashMap<screencopy::ScreencopyStreamKey, screencopy::ScreencopyBaseline>,
     wlr_toplevel_managers: Vec<wlr_foreign_toplevel::WlrToplevelManagerBinding>,
     astrea_shell_client_pids: HashSet<u32>,
     // Start-time identity for the selection exception; PID alone is reusable.
