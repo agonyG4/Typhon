@@ -196,10 +196,7 @@ fn terminal_composite_shader_preserves_kawase_material_and_presentation_order() 
         );
     }
     for tap in ["vec2(-offset.x * 2.0, 0.0)", "result /= 12.0;"] {
-        assert!(
-            shader.contains(tap),
-            "missing legacy Kawase tap {tap}"
-        );
+        assert!(shader.contains(tap), "missing legacy Kawase tap {tap}");
     }
     assert!(shader.contains("floor(output_position - u_effect_input_domain.xy)"));
     assert!(shader.contains("vec2 effect_local_uv ="));

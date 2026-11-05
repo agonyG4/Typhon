@@ -39,6 +39,8 @@ pub(in crate::egl_renderer) struct EffectRuntime {
     pub(in crate::egl_renderer) effect_delta_seconds: f32,
     pub(in crate::egl_renderer) effect_output_scale: f32,
     pub(in crate::egl_renderer) capture_in_progress: bool,
+    /// Retained output decisions for the frame graph being planned.
+    pub(in crate::egl_renderer) retained_output_plan: Option<super::RetainedOutputPlan>,
     #[cfg(test)]
     pub(in crate::egl_renderer) fail_next_dependency_free_replay_capture: bool,
 }
@@ -154,6 +156,7 @@ impl EffectRuntime {
             effect_delta_seconds: 0.0,
             effect_output_scale: 1.0,
             capture_in_progress: false,
+            retained_output_plan: None,
             #[cfg(test)]
             fail_next_dependency_free_replay_capture: false,
         })

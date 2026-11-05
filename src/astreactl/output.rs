@@ -187,6 +187,13 @@ pub fn human(result: &AstreactlResult) -> String {
         AstreactlResult::EffectsPlanner(snapshot) => {
             format!("Planner: {}", sanitize_terminal_text(&snapshot.planner))
         }
+        AstreactlResult::EffectsRetained(snapshot) => format!(
+            "Retained outputs: {}\nGraphs: {}\nHits: {}/{}",
+            if snapshot.enabled { "on" } else { "off" },
+            snapshot.graphs,
+            snapshot.hits,
+            snapshot.candidates,
+        ),
         AstreactlResult::Blur(snapshot) => format!(
             "Enabled: {}\nRenderer: {}\nGeneration: {}\nWayland: {}\nXWayland: {}\nAuto fullscreen: {}\nLayer default: {}\nRules: {}/{}\nActive assignments: {}\nSources: client={} wayland_auto={} window_rule={} layer_rule={}\nConfig: {}\nLast error: {}",
             snapshot.enabled,

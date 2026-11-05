@@ -113,8 +113,14 @@ pub(crate) use replay::replay_capture_region_layout;
 use replay::*;
 mod checkpoint;
 use checkpoint::*;
+mod retained;
 #[cfg(test)]
 pub(crate) use checkpoint::{checkpoint_causal_stability_plan, checkpoint_update_rects_for_test};
+pub(crate) use retained::{
+    RetainedOutputPlan, plan_retained_effect_outputs, retained_effect_output_counters,
+    set_retained_effect_outputs_enabled,
+};
+use retained::{retained_output_plan_for_graph, retained_trace};
 
 mod shaders;
 #[cfg(test)]

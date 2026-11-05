@@ -181,6 +181,13 @@ struct EffectsPlannerArgs {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EffectsRetainedArgs {
+    #[serde(default)]
+    enabled: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct OutputConfigureArgs {
     version: u8,
@@ -1301,6 +1308,31 @@ impl NativeRuntime {
             return Some(ControlResponse::success(
                 request.id,
                 serde_json::json!({"planner": parsed.policy.as_str()}),
+            ));
+        }
+        if command == ControlCommand::EffectsRetained {
+            let Ok(args) = serde_json::from_value::<EffectsRetainedArgs>(request.args) else {
+                return Some(ControlResponse::failure(
+                    request.id,
+                    ControlError::new(
+                        ControlErrorCode::InvalidArgument,
+                        "effects retained takes an optional enabled boolean",
+                    ),
+                ));
+            };
+            if let Some(enabled) = args.enabled {
+                crate::egl_renderer::set_retained_effect_outputs_enabled(enabled);
+            }
+            let (enabled, graphs, hits, candidates) =
+                crate::egl_renderer::retained_effect_output_counters();
+            return Some(ControlResponse::success(
+                request.id,
+                serde_json::json!({
+                    "enabled": enabled,
+                    "graphs": graphs,
+                    "hits": hits,
+                    "candidates": candidates,
+                }),
             ));
         }
         if command == ControlCommand::EffectsReload {

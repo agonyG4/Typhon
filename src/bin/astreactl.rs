@@ -120,7 +120,7 @@ fn run(args: Vec<String>) -> Result<u8, AstreactlError> {
             }
             "-h" | "--help" => {
                 println!(
-                    "astreactl [global options] <version|status|doctor|performance|outputs|windows|activewindow|window decoration-policy ID server|client-preference|keyboard config|keyboard configure|keyboard layout|keyboard next|keyboard previous|keyboard set INDEX|cursor ...|decoration ...|effects reload|effects planner legacy|regional|blur ...|animation get|animation set JSON|presentation get|presentation set triple=MODE worker=MODE|presentation trace start PATH|presentation trace stop|wallpaper ...>"
+                    "astreactl [global options] <version|status|doctor|performance|outputs|windows|activewindow|window decoration-policy ID server|client-preference|keyboard config|keyboard configure|keyboard layout|keyboard next|keyboard previous|keyboard set INDEX|cursor ...|decoration ...|effects reload|effects planner legacy|regional|effects retained [on|off]|blur ...|animation get|animation set JSON|presentation get|presentation set triple=MODE worker=MODE|presentation trace start PATH|presentation trace stop|wallpaper ...>"
                 );
                 return Ok(0);
             }
@@ -827,8 +827,25 @@ fn parse_effects_command(
             serde_json::json!({"planner": planner}),
         ));
     }
+    if positionals.first().map(String::as_str) == Some("retained") && positionals.len() <= 2 {
+        let enabled = match positionals.get(1).map(String::as_str) {
+            None => serde_json::Value::Null,
+            Some("on") => serde_json::Value::Bool(true),
+            Some("off") => serde_json::Value::Bool(false),
+            Some(_) => {
+                return Err(AstreactlError::Usage(
+                    "effects retained takes on or off".to_string(),
+                ));
+            }
+        };
+        return Ok((
+            "effects",
+            "effects.retained",
+            serde_json::json!({"enabled": enabled}),
+        ));
+    }
     Err(AstreactlError::Usage(
-        "effects command requires reload or planner legacy|regional".to_string(),
+        "effects command requires reload, planner legacy|regional or retained [on|off]".to_string(),
     ))
 }
 

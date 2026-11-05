@@ -280,6 +280,59 @@ fn capture_terminal_stage_probe(
     capture_result
 }
 
+/// Moves a Composite's freshly rendered input into the retained output cache.
+/// A texture that was already retained keeps its earlier valid pixels; a new
+/// one is valid only where this frame rendered it.
+fn retain_composite_input(
+    renderer: &mut EffectExecutionContext<'_>,
+    candidate: &super::retained::RetainedOutputCandidate,
+    textures: &mut std::collections::HashMap<GraphTextureId, GraphTextureBinding>,
+    produced: &mut std::collections::HashMap<GraphTextureId, EffectRegion>,
+) -> RendererResult<()> {
+    let Some(binding) = textures.remove(&candidate.texture) else {
+        return Ok(());
+    };
+    let rendered = produced.remove(&candidate.texture).unwrap_or_default();
+    let resources = &mut renderer.runtime.effect_resources;
+    match binding.ownership() {
+        crate::egl_renderer::effects::resources::GraphTextureBindingOwnership::RetainedOutput => {
+            let prior = resources
+                .retained_effect_output(candidate.instance)
+                .map(|(_, valid)| valid.clone())
+                .unwrap_or_default();
+            // Never let the bounded region coalesce to a bounding box: that
+            // would claim pixels this texture never received.
+            let valid = if prior.rects().len() + rendered.rects().len() <= MAX_EFFECT_REGION_RECTS {
+                prior.union(&rendered)
+            } else {
+                rendered
+            };
+            if let Some(texture) = resources.store_retained_effect_output(
+                candidate.instance,
+                candidate.identity.clone(),
+                binding.into_texture(),
+                valid,
+            )? {
+                resources.release(texture)?;
+            }
+        }
+        crate::egl_renderer::effects::resources::GraphTextureBindingOwnership::FrameTransient => {
+            if let Some(texture) = resources.store_retained_effect_output(
+                candidate.instance,
+                candidate.identity.clone(),
+                binding.into_texture(),
+                rendered,
+            )? {
+                resources.release(texture)?;
+            }
+        }
+        _ => {
+            textures.insert(candidate.texture, binding);
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn scene_advance_reason(
     pass: &CompiledRenderPass,
     scene_baseline_authority: SceneBaselineAuthority,
@@ -390,6 +443,35 @@ pub(super) fn execute_graph_passes_inner(
     // Validity belongs to this graph execution and logical texture ID. A
     // pooled physical allocation never carries validity into this map.
     let mut valid_regions = std::collections::HashMap::<GraphTextureId, EffectRegion>::new();
+    let retained_plan = retained_output_plan_for_graph(renderer.runtime, graph);
+    let mut retained_produced = std::collections::HashMap::<GraphTextureId, EffectRegion>::new();
+    if let Some(plan) = retained_plan.as_ref() {
+        retained_trace(plan, renderer.runtime);
+        for candidate in plan
+            .candidates
+            .iter()
+            .filter(|candidate| candidate.hit || candidate.reuse_texture)
+        {
+            if textures.contains_key(&candidate.texture) {
+                continue;
+            }
+            let Some((texture, _valid)) = renderer
+                .runtime
+                .effect_resources
+                .retained_effect_output(candidate.instance)
+            else {
+                continue;
+            };
+            #[cfg(any(debug_assertions, test))]
+            if candidate.hit {
+                valid_regions.insert(candidate.texture, _valid.clone());
+            }
+            textures.insert(
+                candidate.texture,
+                GraphTextureBinding::retained_output(texture.clone()),
+            );
+        }
+    }
     let framebuffer_capture = scene_baseline_authority == SceneBaselineAuthority::ReplayRequired
         && repaint_plan.is_some()
         && debug_config.capture_mode() == EffectDebugCaptureMode::Framebuffer;
@@ -1709,6 +1791,18 @@ pub(super) fn execute_graph_passes_inner(
                         capture_plan,
                     ),
                 );
+            }
+            if let Some(plan) = retained_plan.as_ref() {
+                if let Some(output) = pass.output
+                    && plan.is_candidate_texture(output)
+                {
+                    retained_produced.insert(output, execution_damage.region.clone());
+                }
+                if let Some(candidate) = plan.candidate_for_composite(pass.id)
+                    && !candidate.hit
+                {
+                    retain_composite_input(renderer, candidate, textures, &mut retained_produced)?;
+                }
             }
             release_dead_graph_textures(
                 &mut renderer.runtime.effect_resources,

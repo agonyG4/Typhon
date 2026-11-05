@@ -141,6 +141,10 @@ fn decode_command_result(
             serde_json::from_value::<crate::control_snapshots::EffectsPlannerSnapshot>(value)
                 .map(AstreactlResult::EffectsPlanner)
         }
+        "effects.retained" => {
+            serde_json::from_value::<crate::control_snapshots::EffectsRetainedSnapshot>(value)
+                .map(AstreactlResult::EffectsRetained)
+        }
         "blur.status" | "blur.reload" => {
             serde_json::from_value::<crate::blur_policy::BlurPolicySnapshot>(value)
                 .map(AstreactlResult::Blur)

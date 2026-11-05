@@ -65,6 +65,10 @@ pub(crate) use executor::{
     TerminalDiagnosticStage,
 };
 pub(crate) use executor::{EffectExecutionSelection, EffectExecutionStats};
+pub(crate) use executor::{
+    RetainedOutputPlan, plan_retained_effect_outputs, retained_effect_output_counters,
+    set_retained_effect_outputs_enabled,
+};
 #[cfg(test)]
 pub(crate) use executor::{
     capture_output_rects_to_graph_texture_shader_copy, checkpoint_update_rects_for_test,

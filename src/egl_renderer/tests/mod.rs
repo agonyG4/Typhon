@@ -383,6 +383,7 @@ mod effect_replay;
 mod egl_config;
 mod egl_resources;
 mod lifecycle_integration;
+mod retained_outputs;
 mod rgba16f_store;
 mod scene_rendering;
 mod screencopy_blit;

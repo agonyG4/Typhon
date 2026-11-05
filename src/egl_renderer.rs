@@ -52,6 +52,7 @@ pub(in crate::egl_renderer) use checkpoint::{
 };
 #[cfg(test)]
 pub(crate) use effects::replay_capture_region_layout;
+pub(crate) use effects::{retained_effect_output_counters, set_retained_effect_outputs_enabled};
 pub(crate) use egl_support::{
     CreatedGlesContext, EglContextPriorityPolicy, EglSwapBuffersWithDamage,
     choose_native_egl_config, choose_surfaceless_egl_config, create_compositor_gles_context,

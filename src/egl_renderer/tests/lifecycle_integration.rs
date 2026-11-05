@@ -316,7 +316,9 @@ fn egl_lifecycle_lamp_below_canonical_opaque_window_respects_painter_order() {
     // Nothing was drawn, so the preview must be transparent rather than the
     // output's opaque black: translucent windows would otherwise turn black.
     assert!(
-        live_preview.chunks_exact(4).all(|pixel| pixel == [0, 0, 0, 0]),
+        live_preview
+            .chunks_exact(4)
+            .all(|pixel| pixel == [0, 0, 0, 0]),
         "a window preview is composited onto transparency: {:?}",
         &live_preview[..16]
     );
@@ -3385,6 +3387,11 @@ fn egl_lifecycle_background_blur_renders_retained_content_on_top_left_scanout() 
         .effect_runtime
         .effect_resources
         .checkpoint_cache_stats();
+    let (retained_outputs, _) = harness
+        .renderer
+        .effect_runtime
+        .effect_resources
+        .retained_effect_output_stats();
     assert_eq!(
         harness
             .renderer
@@ -3392,8 +3399,10 @@ fn egl_lifecycle_background_blur_renders_retained_content_on_top_left_scanout() 
             .effect_resources
             .metrics()
             .checked_out_texture_count,
-        harness.renderer.lifecycle.resolved_visual_resource_count() + checkpoint_entries,
-        "both graphs release every temporary lease; only retained visuals and checkpoint cache entries remain checked out"
+        harness.renderer.lifecycle.resolved_visual_resource_count()
+            + checkpoint_entries
+            + retained_outputs,
+        "both graphs release every temporary lease; only retained visuals, checkpoint cache entries and retained effect outputs remain checked out"
     );
 
     let texture = harness

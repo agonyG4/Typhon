@@ -898,7 +898,21 @@ impl FramePipeline<'_> {
         );
         let effect_selection = match (&planned.execution_plan, &planned.effect_execution_demand) {
             (FrameExecutionPlan::EffectGraph(graph), Some(demand)) => {
-                let selection = super::super::effects::select_effect_execution(graph, demand);
+                let mut selection = super::super::effects::select_effect_execution(graph, demand);
+                if planned.precomputed_backdrop.is_none() {
+                    super::super::effects::plan_retained_effect_outputs(
+                        self.scene,
+                        self.effects,
+                        graph,
+                        demand,
+                        &mut selection,
+                    );
+                } else {
+                    self.effects.retained_output_plan = None;
+                    self.effects
+                        .effect_resources
+                        .clear_retained_effect_outputs();
+                }
                 debug_assert_eq!(
                     self.scene.capture_metadata_generation,
                     self.scene.scene_command_topology_generation,

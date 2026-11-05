@@ -1107,6 +1107,17 @@ pub struct EffectsPlannerSnapshot {
     pub planner: String,
 }
 
+/// Retained effect outputs: switch state and cumulative counters.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct EffectsRetainedSnapshot {
+    pub enabled: bool,
+    pub graphs: u64,
+    pub hits: u64,
+    pub candidates: u64,
+}
+
 /// Whether the per-transaction presentation trace is being written.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1134,6 +1145,7 @@ pub enum AstreactlResult {
     DecorationThemes(DecorationThemeListSnapshot),
     TrustedEffects(TrustedEffectsReloadSnapshot),
     EffectsPlanner(EffectsPlannerSnapshot),
+    EffectsRetained(EffectsRetainedSnapshot),
     Blur(crate::blur_policy::BlurPolicySnapshot),
     Animation(crate::animation_control::AnimationControlSnapshot),
     PresentationPolicy(PresentationPolicySnapshot),

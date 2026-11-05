@@ -369,6 +369,9 @@ pub(crate) enum GraphTextureBindingOwnership {
     FrameTransient,
     CheckpointCache,
     PrecomputedBackdropAlias,
+    /// Owned by the retained effect output cache; never returned to the pool
+    /// by graph texture release.
+    RetainedOutput,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -392,11 +395,26 @@ impl GraphTextureBinding {
         }
     }
 
+    pub(crate) fn retained_output(texture: PooledEffectTexture) -> Self {
+        Self {
+            texture,
+            ownership: GraphTextureBindingOwnership::RetainedOutput,
+        }
+    }
+
+    pub(crate) fn ownership(&self) -> GraphTextureBindingOwnership {
+        self.ownership
+    }
+
     pub(crate) fn precomputed_backdrop_alias(texture: PooledEffectTexture) -> Self {
         Self {
             texture,
             ownership: GraphTextureBindingOwnership::PrecomputedBackdropAlias,
         }
+    }
+
+    pub(crate) fn into_texture(self) -> PooledEffectTexture {
+        self.texture
     }
 
     pub(crate) fn into_transient(self) -> Option<PooledEffectTexture> {
@@ -419,6 +437,47 @@ impl Deref for GraphTextureBinding {
     fn deref(&self) -> &Self::Target {
         &self.texture
     }
+}
+
+/// Total bytes the retained effect output cache may hold. Retained textures
+/// stay checked out of the pool, so checkpoint admission already sees them.
+pub(crate) const RETAINED_EFFECT_OUTPUT_BUDGET_BYTES: u64 = 32 * 1024 * 1024;
+
+/// What a retained effect output was rendered for: the instance semantics and
+/// the exact texture layout the composite samples.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct RetainedEffectOutputIdentity {
+    pub(crate) semantic_signature: u64,
+    pub(crate) texture: GraphTexturePlan,
+}
+
+impl RetainedEffectOutputIdentity {
+    pub(crate) fn new(semantic_signature: u64, texture: &GraphTexturePlan) -> Self {
+        let mut texture = texture.clone();
+        // Graph-local ids and lifetimes change every compile; the layout does not.
+        texture.id = GraphTextureId::new(1).expect("non-zero texture id");
+        texture.first_use = None;
+        texture.last_use = None;
+        Self {
+            semantic_signature,
+            texture,
+        }
+    }
+}
+
+/// The last pre-composite texture of an effect instance, kept across frames
+/// while the causal stability plan proves the instance output unchanged.
+#[derive(Debug)]
+struct RetainedEffectOutput {
+    texture: PooledEffectTexture,
+    identity: RetainedEffectOutputIdentity,
+    /// Logical texture region holding current pixels.
+    valid: oblivion_one::effects::EffectRegion,
+    frame_serial: u64,
+    bytes: u64,
+    /// Invalidated this frame: still bound by graphs already planned for this
+    /// frame, dropped by the next refresh.
+    expired: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -748,6 +807,7 @@ pub(crate) struct EffectGlResourceCache {
     checkpoint_frame_serial: u64,
     checkpoint_causal_baseline: Option<CheckpointCacheCausalBaseline>,
     precomputed_backdrop: Option<(PrecomputedBackdropCacheKey, PooledEffectTexture)>,
+    retained_outputs: HashMap<EffectInstanceId, RetainedEffectOutput>,
     scratch_residency_publisher:
         Option<std::sync::Arc<crate::gpu_residency::AtomicEffectScratchResidencySnapshot>>,
 }
@@ -775,6 +835,7 @@ impl EffectGlResourceCache {
             checkpoint_frame_serial: 0,
             checkpoint_causal_baseline: None,
             precomputed_backdrop: None,
+            retained_outputs: HashMap::new(),
             scratch_residency_publisher: None,
         })
     }
@@ -1289,14 +1350,128 @@ impl EffectGlResourceCache {
     pub(crate) fn invalidate_checkpoint_capture_contents(&mut self) {
         self.invalidate_checkpoint_causal_state();
         self.clear_precomputed_backdrop();
+        self.expire_retained_effect_outputs();
         for cached in self.checkpoint_captures.values_mut() {
             cached.last_populated_frame_serial = None;
         }
     }
 
+    /// Retained outputs stop being reused from the next frame on. Their
+    /// textures stay owned until then: graphs planned for this frame removed
+    /// the passes that would rebuild them and still composite from them.
+    pub(crate) fn expire_retained_effect_outputs(&mut self) {
+        for entry in self.retained_outputs.values_mut() {
+            entry.expired = true;
+        }
+    }
+
+    pub(crate) fn clear_retained_effect_outputs(&mut self) {
+        let entries = std::mem::take(&mut self.retained_outputs);
+        for entry in entries.into_values() {
+            let _ = self.release(entry.texture);
+        }
+    }
+
+    /// Keeps only entries proven current: refreshed on the previous (or this)
+    /// frame, not expired, and accepted by `keep` (causally unchanged, same identity). Every other
+    /// entry is released.
+    pub(crate) fn refresh_retained_effect_outputs(
+        &mut self,
+        mut keep: impl FnMut(EffectInstanceId, &RetainedEffectOutputIdentity) -> bool,
+    ) {
+        let frame_serial = self.checkpoint_frame_serial;
+        let stale = self
+            .retained_outputs
+            .iter()
+            .filter(|(id, entry)| {
+                entry.expired
+                    || (entry.frame_serial != frame_serial
+                        && entry.frame_serial.checked_add(1) != Some(frame_serial))
+                    || !keep(**id, &entry.identity)
+            })
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>();
+        for id in stale {
+            if let Some(entry) = self.retained_outputs.remove(&id) {
+                let _ = self.release(entry.texture);
+            }
+        }
+        for entry in self.retained_outputs.values_mut() {
+            entry.frame_serial = frame_serial;
+        }
+    }
+
+    /// The retained texture and its valid region, when refreshed this frame.
+    pub(crate) fn retained_effect_output(
+        &self,
+        instance: EffectInstanceId,
+    ) -> Option<(&PooledEffectTexture, &oblivion_one::effects::EffectRegion)> {
+        self.retained_outputs
+            .get(&instance)
+            .filter(|entry| entry.frame_serial == self.checkpoint_frame_serial)
+            .map(|entry| (&entry.texture, &entry.valid))
+    }
+
+    /// Records `texture` as the instance's retained output with `valid`
+    /// current pixels. A different previously retained texture is released.
+    /// Returns the texture when it cannot be retained (over budget); the
+    /// caller then releases it as a frame transient.
+    pub(crate) fn store_retained_effect_output(
+        &mut self,
+        instance: EffectInstanceId,
+        identity: RetainedEffectOutputIdentity,
+        texture: PooledEffectTexture,
+        valid: oblivion_one::effects::EffectRegion,
+    ) -> Result<Option<PooledEffectTexture>, EffectResourceError> {
+        let frame_serial = self.checkpoint_frame_serial;
+        if let Some(entry) = self.retained_outputs.get_mut(&instance)
+            && entry.texture == texture
+        {
+            entry.identity = identity;
+            entry.valid = valid;
+            entry.frame_serial = frame_serial;
+            return Ok(None);
+        }
+        if let Some(previous) = self.retained_outputs.remove(&instance) {
+            self.release(previous.texture)?;
+        }
+        let bytes = texture_key(&identity.texture).estimated_bytes()?;
+        let retained_bytes = self
+            .retained_outputs
+            .values()
+            .map(|entry| entry.bytes)
+            .sum::<u64>();
+        if retained_bytes.saturating_add(bytes) > RETAINED_EFFECT_OUTPUT_BUDGET_BYTES {
+            return Ok(Some(texture));
+        }
+        self.retained_outputs.insert(
+            instance,
+            RetainedEffectOutput {
+                texture,
+                identity,
+                valid,
+                frame_serial,
+                bytes,
+                expired: false,
+            },
+        );
+        Ok(None)
+    }
+
+    pub(crate) fn retained_effect_output_stats(&self) -> (usize, u64) {
+        (
+            self.retained_outputs.len(),
+            self.retained_outputs
+                .values()
+                .map(|entry| entry.bytes)
+                .sum(),
+        )
+    }
+
     pub(crate) fn clear_checkpoint_capture_cache(&mut self) {
         self.invalidate_checkpoint_causal_state();
         self.clear_precomputed_backdrop();
+        self.expire_retained_effect_outputs();
         let entries = std::mem::take(&mut self.checkpoint_captures);
         for cached in entries.into_values() {
             let _ = self.release(cached.texture);
@@ -1567,6 +1742,7 @@ impl EffectGlResourceCache {
 
     pub(crate) fn destroy(&mut self, gl: &glow::Context) {
         self.clear_checkpoint_capture_cache();
+        self.clear_retained_effect_outputs();
         let texture_ids = self.gl_textures.keys().copied().collect::<Vec<_>>();
         for id in texture_ids {
             self.delete_effect_texture(gl, id);
