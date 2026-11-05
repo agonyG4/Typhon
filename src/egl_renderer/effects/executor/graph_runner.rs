@@ -914,7 +914,13 @@ pub(super) fn execute_graph_passes_inner(
                 }
                 scene_cursor = next_cursor.max(scene_cursor);
             }
-            if is_direct_framebuffer_capture(pass, scene_baseline_authority, debug_config) {
+            // The checkpoint source validity proof only feeds the effect trace
+            // and the debug invariant check. Release frames skip it: with
+            // regional demand its region algebra is quadratic in the demanded
+            // rect count and dominated render-thread CPU for stacked blurs.
+            if (cfg!(any(debug_assertions, test)) || renderer.runtime.effect_trace.enabled())
+                && is_direct_framebuffer_capture(pass, scene_baseline_authority, debug_config)
+            {
                 let regional_pass_demand = demand.has_pass_plan()
                     && demand.plan_stats().planner_policy
                         == oblivion_one::effects::EffectDemandPlannerPolicy::Regional
