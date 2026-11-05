@@ -1158,38 +1158,45 @@ fn replay_capture_region_layout_reports_materialization_and_execution_regions() 
 }
 
 #[test]
-fn replay_capture_region_layout_reports_bounded_overflow_and_bbox_fallback() {
+fn replay_capture_region_layout_resolves_covered_strips_exactly() {
     let mut output_rects = Vec::new();
     for index in 0..oblivion_one::effects::MAX_EFFECT_REGION_RECTS.saturating_sub(1) {
         output_rects.push(OutputRect::new(0, index as i32 * 2, 1_000, 1));
     }
-    output_rects.push(OutputRect::new(
-        0,
-        0,
-        1_000,
-        (oblivion_one::effects::MAX_EFFECT_REGION_RECTS as u32)
-            .saturating_mul(2)
-            .saturating_sub(1),
-    ));
+    let cover_height = (oblivion_one::effects::MAX_EFFECT_REGION_RECTS as u32)
+        .saturating_mul(2)
+        .saturating_sub(1);
+    output_rects.push(OutputRect::new(0, 0, 1_000, cover_height));
+
+    let layout = replay_capture_region_layout(&output_rects);
+
+    assert_eq!(layout.materialization_rects, output_rects.len());
+    assert!(!layout.disjoint_overflowed);
+    assert_eq!(layout.execution_regions, 1);
+    assert_eq!(
+        layout.execution_region.rects(),
+        &[oblivion_one::effects::EffectRect::new(0, 0, 1_000, cover_height).unwrap()]
+    );
+}
+
+#[test]
+fn replay_capture_region_layout_reports_bounded_overflow_and_bbox_fallback() {
+    // Crossing strips need far more than MAX_EFFECT_REGION_RECTS disjoint
+    // rects, so the layout falls back to the bounding box.
+    let half = oblivion_one::effects::MAX_EFFECT_REGION_RECTS / 2;
+    let mut output_rects = Vec::new();
+    for index in 0..half {
+        output_rects.push(OutputRect::new(0, index as i32 * 4, 1_000, 1));
+        output_rects.push(OutputRect::new(index as i32 * 4, 0, 1, 1_000));
+    }
 
     let layout = replay_capture_region_layout(&output_rects);
 
     assert_eq!(layout.materialization_rects, output_rects.len());
     assert!(layout.disjoint_overflowed);
     assert_eq!(layout.execution_regions, 1);
-    assert_eq!(layout.execution_region.rects().len(), 1);
     assert_eq!(
         layout.execution_region.bounding_rect(),
-        Some(
-            oblivion_one::effects::EffectRect::new(
-                0,
-                0,
-                1_000,
-                (oblivion_one::effects::MAX_EFFECT_REGION_RECTS as u32)
-                    .saturating_mul(2)
-                    .saturating_sub(1),
-            )
-            .unwrap(),
-        )
+        Some(oblivion_one::effects::EffectRect::new(0, 0, 1_000, 1_000).unwrap())
     );
 }

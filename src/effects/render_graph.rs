@@ -1549,6 +1549,7 @@ fn map_region_to_input_texture(
     }
 
     let mut result = EffectRegion::empty();
+    let mut bounds: Option<EffectRect> = None;
     for requested in demanded_output.rects() {
         let Some(output_coverage) = logical_rect_to_physical_coverage(*requested, output) else {
             continue;
@@ -1589,8 +1590,14 @@ fn map_region_to_input_texture(
             right,
             bottom,
         };
-        result.push(physical_coverage_to_logical_rect(required, input)?);
-        result.bounding_rect()?;
+        let mapped = physical_coverage_to_logical_rect(required, input)?;
+        // Same overflow check as recomputing the whole bounding rect after
+        // every push, without the quadratic rescan.
+        bounds = Some(match bounds {
+            Some(bounds) => bounds.union(mapped)?,
+            None => mapped,
+        });
+        result.push_covering(mapped);
     }
     Some(result)
 }

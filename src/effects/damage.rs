@@ -50,7 +50,7 @@ impl EffectRect {
         })
     }
 
-    fn union(self, other: Self) -> Option<Self> {
+    pub(crate) fn union(self, other: Self) -> Option<Self> {
         let left = self.x.min(other.x);
         let top = self.y.min(other.y);
         let right = self.right().max(other.right());
@@ -77,6 +77,14 @@ impl EffectRect {
             )
             .expect("clipped expansion of valid effect rectangles must be valid")
         })
+    }
+
+    /// Whether `other` lies entirely inside this rect.
+    pub fn contains_rect(self, other: Self) -> bool {
+        other.x >= self.x
+            && other.y >= self.y
+            && other.right() <= self.right()
+            && other.bottom() <= self.bottom()
     }
 
     pub fn contains_point(self, x: i32, y: i32) -> bool {
@@ -194,6 +202,23 @@ impl EffectRegion {
         }
         self.rects.clear();
         self.rects.push(bounds);
+    }
+
+    /// Like [`Self::push`], but treats the region as a coverage set: a rect
+    /// already covered adds nothing, and rects the new one covers are
+    /// dropped. Used where expanded sampling footprints produce many nested
+    /// rects, so later region operations stay small.
+    pub fn push_covering(&mut self, rect: EffectRect) {
+        if self.conservative_full
+            || self
+                .rects
+                .iter()
+                .any(|existing| existing.contains_rect(rect))
+        {
+            return;
+        }
+        self.rects.retain(|existing| !rect.contains_rect(*existing));
+        self.push(rect);
     }
 
     pub fn contains_point(&self, x: i32, y: i32) -> bool {
@@ -351,62 +376,99 @@ impl EffectRegion {
             };
         }
 
-        let mut disjoint = Vec::with_capacity(self.rects.len());
+        let rects = &self.rects;
         let mut duplicate_rects_removed: usize = 0;
-        let mut overlap_fragments_generated: usize = 0;
-        // Reused across sources: this runs per frame over up to
-        // MAX_EFFECT_REGION_RECTS rects, so per-pair allocation dominated.
-        let mut fragments = Vec::with_capacity(4);
-        let mut next = Vec::with_capacity(4);
+        let mut overlapping = false;
+        for (index, rect) in rects.iter().enumerate() {
+            for earlier in &rects[..index] {
+                if earlier == rect {
+                    duplicate_rects_removed += 1;
+                    overlapping = true;
+                } else if !overlapping && earlier.intersect(*rect).is_some() {
+                    overlapping = true;
+                }
+            }
+        }
+        if !overlapping {
+            return BoundedRegionDisjointification {
+                region: self.clone(),
+                overflowed: false,
+                duplicate_rects_removed: 0,
+                overlap_fragments_generated: 0,
+            };
+        }
 
-        for source in &self.rects {
-            if disjoint.contains(source) {
-                duplicate_rects_removed += 1;
+        // Sweep horizontal bands between consecutive rect edges. Within a
+        // band the covering x-intervals are merged, and a band whose intervals
+        // match the band directly above extends those rects instead of adding
+        // new ones. The result has exactly the input coverage, each pixel once.
+        let mut edges = Vec::with_capacity(rects.len() * 2);
+        for rect in rects {
+            edges.push(rect.y);
+            edges.push(rect.bottom());
+        }
+        edges.sort_unstable();
+        edges.dedup();
+
+        let mut disjoint: Vec<EffectRect> = Vec::with_capacity(rects.len());
+        let mut intervals: Vec<(i32, i32)> = Vec::with_capacity(rects.len());
+        let mut previous: Vec<(i32, i32)> = Vec::with_capacity(rects.len());
+        let mut previous_start = 0;
+        let mut previous_bottom = None;
+        for band in edges.windows(2) {
+            let (top, bottom) = (band[0], band[1]);
+            intervals.clear();
+            for rect in rects {
+                if rect.y <= top && rect.bottom() >= bottom {
+                    intervals.push((rect.x, rect.right()));
+                }
+            }
+            if intervals.is_empty() {
+                previous.clear();
+                previous_bottom = None;
                 continue;
             }
-
-            fragments.clear();
-            fragments.push(*source);
-            for represented in &disjoint {
-                if fragments.is_empty() {
-                    break;
+            intervals.sort_unstable();
+            let mut merged = 0;
+            for index in 1..intervals.len() {
+                let (left, right) = intervals[index];
+                if left <= intervals[merged].1 {
+                    intervals[merged].1 = intervals[merged].1.max(right);
+                } else {
+                    merged += 1;
+                    intervals[merged] = (left, right);
                 }
-                next.clear();
-                for &fragment in &fragments {
-                    let pieces = subtract_effect_rect(fragment, *represented);
-                    let pieces = pieces.as_slice();
-                    if pieces.len() != 1 || pieces.first() != Some(&fragment) {
-                        overlap_fragments_generated =
-                            overlap_fragments_generated.saturating_add(pieces.len());
-                    }
-                    for &piece in pieces {
-                        if next.len() == MAX_EFFECT_REGION_RECTS {
-                            return BoundedRegionDisjointification {
-                                region: Self::empty(),
-                                overflowed: true,
-                                duplicate_rects_removed,
-                                overlap_fragments_generated,
-                            };
-                        }
-                        next.push(piece);
-                    }
-                }
-                std::mem::swap(&mut fragments, &mut next);
             }
-
-            for &fragment in &fragments {
-                if disjoint.len() == MAX_EFFECT_REGION_RECTS {
+            intervals.truncate(merged + 1);
+            let height = (bottom - top) as u32;
+            if previous_bottom == Some(top) && previous == intervals {
+                for rect in &mut disjoint[previous_start..] {
+                    rect.height += height;
+                }
+            } else {
+                if disjoint.len() + intervals.len() > MAX_EFFECT_REGION_RECTS {
                     return BoundedRegionDisjointification {
                         region: Self::empty(),
                         overflowed: true,
                         duplicate_rects_removed,
-                        overlap_fragments_generated,
+                        overlap_fragments_generated: disjoint.len() + intervals.len(),
                     };
                 }
-                disjoint.push(fragment);
+                previous_start = disjoint.len();
+                for &(left, right) in &intervals {
+                    disjoint.push(EffectRect {
+                        x: left,
+                        y: top,
+                        width: (right - left) as u32,
+                        height,
+                    });
+                }
+                std::mem::swap(&mut previous, &mut intervals);
             }
+            previous_bottom = Some(bottom);
         }
 
+        let overlap_fragments_generated = disjoint.len();
         BoundedRegionDisjointification {
             region: Self {
                 rects: disjoint,
@@ -943,17 +1005,13 @@ mod tests {
         assert!(!result.overflowed);
         assert_eq!(result.duplicate_rects_removed, 0);
         assert!(result.overlap_fragments_generated > 0);
+        // The horizontal band merges both rects into one exact cover.
         assert_eq!(
             result.region.rects(),
-            &[first, EffectRect::new(10, 0, 5, 10).unwrap()]
+            &[EffectRect::new(0, 0, 15, 10).unwrap()]
         );
         assert!(result.region.contains_point(5, 5));
         assert!(result.region.contains_point(14, 5));
-        assert!(
-            result.region.rects()[0]
-                .intersect(result.region.rects()[1])
-                .is_none()
-        );
     }
 
     #[test]
@@ -1206,5 +1264,86 @@ mod tests {
         let candidate = EffectRegion::from_rect(EffectRect::new(0, 0, 10, 10).unwrap());
         assert!(candidate.subtract(&candidate).is_empty());
         assert_eq!(candidate.subtract(&EffectRegion::empty()), candidate);
+    }
+
+    fn test_rects(seed: u64, count: usize) -> Vec<EffectRect> {
+        let mut state = seed;
+        let mut next = move |modulo: u64| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) % modulo
+        };
+        (0..count)
+            .map(|_| {
+                EffectRect::new(
+                    next(48) as i32,
+                    next(48) as i32,
+                    1 + next(24) as u32,
+                    1 + next(24) as u32,
+                )
+                .unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn band_disjointification_matches_coverage_without_overlap() {
+        for seed in 0..200 {
+            let mut region = EffectRegion::empty();
+            for rect in test_rects(seed, 1 + (seed % 12) as usize) {
+                region.push(rect);
+            }
+            let result = region.disjoint_bounded();
+            assert!(!result.overflowed);
+            let rects = result.region.rects();
+            for (index, rect) in rects.iter().enumerate() {
+                for other in &rects[index + 1..] {
+                    assert!(rect.intersect(*other).is_none(), "seed {seed}");
+                }
+            }
+            for y in -1..74 {
+                for x in -1..74 {
+                    assert_eq!(
+                        result.region.contains_point(x, y),
+                        region.contains_point(x, y),
+                        "seed {seed} at {x},{y}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn band_disjointification_keeps_disjoint_input_unchanged() {
+        let mut region = EffectRegion::from_rect(EffectRect::new(0, 0, 4, 4).unwrap());
+        region.push(EffectRect::new(10, 10, 4, 4).unwrap());
+        let result = region.disjoint_bounded();
+        assert_eq!(result.region, region);
+        assert_eq!(result.overlap_fragments_generated, 0);
+    }
+
+    #[test]
+    fn push_covering_keeps_coverage_and_drops_nested_rects() {
+        for seed in 0..200 {
+            let rects = test_rects(seed, 1 + (seed % 16) as usize);
+            let mut plain = EffectRegion::empty();
+            let mut covering = EffectRegion::empty();
+            for rect in &rects {
+                plain.push(*rect);
+                covering.push_covering(*rect);
+            }
+            assert!(covering.rects().len() <= plain.rects().len());
+            for (index, rect) in covering.rects().iter().enumerate() {
+                for (other_index, other) in covering.rects().iter().enumerate() {
+                    assert!(index == other_index || !rect.contains_rect(*other));
+                }
+            }
+            for y in -1..74 {
+                for x in -1..74 {
+                    assert_eq!(covering.contains_point(x, y), plain.contains_point(x, y));
+                }
+            }
+        }
     }
 }
