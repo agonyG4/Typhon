@@ -56,6 +56,18 @@ impl CompositorState {
         2 * self.logical_output_ids.len().max(1)
     }
 
+    /// Logical layout rectangle `(x, y, width, height)` the presenting head
+    /// shows, or `None` while a single logical output shows the whole scene.
+    pub(in crate::compositor) fn presenting_output_viewport(&self) -> Option<(i32, i32, i32, i32)> {
+        if !self.frame_callbacks_are_output_scoped() {
+            return None;
+        }
+        let output_id = self.presenting_output.or(self.native_output_id)?;
+        let output = self.logical_output(output_id)?;
+        let (width, height) = output.logical_size();
+        Some((output.position.0, output.position.1, width, height))
+    }
+
     fn frame_callbacks_are_output_scoped(&self) -> bool {
         self.logical_output_ids.len() > 1
     }
@@ -302,5 +314,24 @@ mod tests {
     fn frame_batch_capacity_scales_with_outputs() {
         let harness = Harness::new();
         assert_eq!(harness.state.frame_batch_capacity(), 4);
+    }
+
+    #[test]
+    fn presenting_viewport_is_the_presenting_head_rect() {
+        let mut harness = Harness::new();
+        assert_eq!(
+            harness.state.presenting_output_viewport(),
+            Some((0, 0, 1920, 1080))
+        );
+        harness.state.enter_output_presentation(harness.second);
+        assert_eq!(
+            harness.state.presenting_output_viewport(),
+            Some((1920, 0, 1920, 1080))
+        );
+        harness.state.enter_output_presentation(harness.native);
+        assert_eq!(
+            harness.state.presenting_output_viewport(),
+            Some((0, 0, 1920, 1080))
+        );
     }
 }

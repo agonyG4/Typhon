@@ -155,6 +155,12 @@ impl OwnCompositorServer {
         self.state.enter_output_presentation(output_id);
     }
 
+    /// Logical layout rectangle of the head being presented, or `None` while
+    /// a single logical output shows the whole scene.
+    pub fn presenting_output_viewport(&self) -> Option<(i32, i32, i32, i32)> {
+        self.state.presenting_output_viewport()
+    }
+
     pub fn has_prepared_frame_batch(&self) -> bool {
         self.state.legacy_prepared_frame_batch.is_some()
     }

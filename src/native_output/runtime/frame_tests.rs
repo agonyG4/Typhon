@@ -699,6 +699,47 @@ fn workspace_translation_moves_frame_geometry_without_changing_client_extent() {
 }
 
 #[test]
+fn each_head_resolves_only_its_windows_in_head_local_space() {
+    let socket_name = format!("typhon-frame-head-projection-{}", process::id());
+    let mut server = OwnCompositorServer::bind_cpu_composition(&socket_name)
+        .expect("bind compositor for head projection regression");
+    server.set_output_size(1920, 1080);
+    server.install_native_frame_test_scene(
+        vec![
+            test_surface(811, 320, 200, SurfacePlacement::absolute_root_at(100, 100)),
+            test_surface(812, 640, 360, SurfacePlacement::absolute_root_at(2400, 200)),
+            test_surface(813, 400, 300, SurfacePlacement::absolute_root_at(1800, 500)),
+        ],
+        &[
+            (811, WindowId::from_raw(811).expect("primary window id")),
+            (812, WindowId::from_raw(812).expect("tv window id")),
+            (813, WindowId::from_raw(813).expect("spanning window id")),
+        ],
+        None,
+    );
+    let native = server.native_output_id().expect("native output");
+    let tv = server
+        .add_logical_output("HDMI-A-2", (1920, 0), (3840, 2160), 1.0, 60)
+        .expect("tv output");
+
+    let primary = ResolvedNativeFrameScene::from_server_at(&server, AnimationTime::from_nanos(1));
+    assert_eq!(primary.surface_ids().collect::<Vec<_>>(), [811, 813]);
+    assert_eq!(
+        oblivion_one::compositor::surface_origins(primary.surfaces.as_ref()),
+        [(100, 100), (1800, 500)]
+    );
+
+    server.enter_output_presentation(tv);
+    let secondary = ResolvedNativeFrameScene::from_server_at(&server, AnimationTime::from_nanos(1));
+    assert_eq!(secondary.surface_ids().collect::<Vec<_>>(), [812, 813]);
+    assert_eq!(
+        oblivion_one::compositor::surface_origins(secondary.surfaces.as_ref()),
+        [(480, 200), (-120, 500)]
+    );
+    server.enter_output_presentation(native);
+}
+
+#[test]
 fn workspace_cell_clip_intersects_an_existing_presentation_clip() {
     let output_id = oblivion_one::core::OutputId::from_raw(1).expect("test output id");
     let root_surface_id = 912;

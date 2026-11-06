@@ -30,6 +30,7 @@ use super::frame_scene_identity::{
     assert_surface_owner_alignment, assert_surface_scene_node_alignment,
     filter_surface_scene_nodes_with_owners, finalize_snapshot,
 };
+use super::head_viewport::{NativeHeadViewport, retain_aligned, translate_frame_surfaces};
 use super::planner::CursorServiceOpportunity;
 use super::window_exit_frame::resolve_window_exit_frame_parts;
 
@@ -117,7 +118,7 @@ pub(crate) struct ResolvedNativeFrameScene<'a> {
     pub(crate) window_exit_evidence: Vec<WindowExitFrameEvidence>,
 }
 
-fn translate_workspace_frame_surfaces<'a>(
+pub(super) fn translate_workspace_frame_surfaces<'a>(
     surfaces: Cow<'a, [RenderableSurface]>,
     presentation_owner_roots: &[u32],
     translations_by_owner_root: &HashMap<u32, (f64, f64)>,
@@ -689,6 +690,9 @@ impl<'a> ResolvedNativeFrameScene<'a> {
     ) -> Self {
         let (canonical_surfaces, canonical_scene_nodes, fullscreen_plan, visibility) =
             server.native_frame_renderable_surfaces_with_scene_nodes_and_composition_plan();
+        let head_viewport = server
+            .presenting_output_viewport()
+            .and_then(NativeHeadViewport::from_logical_rect);
         let workspace_frame_scene = server.workspace_frame_presentation_scene_at(at);
         let workspace_presentation_sample = workspace_frame_scene
             .as_ref()
@@ -889,6 +893,14 @@ impl<'a> ResolvedNativeFrameScene<'a> {
                     decoration.translated_by_logical_offset(*translation_x, *translation_y);
             }
         }
+        let head_translation = head_viewport.map_or((0, 0), NativeHeadViewport::translation);
+        let surfaces = translate_frame_surfaces(surfaces, head_translation);
+        if head_translation != (0, 0) {
+            let (dx, dy) = head_translation;
+            for decoration in &mut decorations {
+                *decoration = decoration.translated_by_logical_offset(f64::from(dx), f64::from(dy));
+            }
+        }
         let targets = exit_parts.targets;
         let mut presentation = exit_parts.presentation;
         merge_workspace_presentation_clips(&mut presentation, &workspace_clips_by_owner_root);
@@ -897,16 +909,59 @@ impl<'a> ResolvedNativeFrameScene<'a> {
             &mut presentation,
             &special_presence_by_owner_root,
         );
-        let canonical_surface_ids = exit_parts
+        let mut canonical_surface_ids = exit_parts
             .canonical_surface_ids
             .into_iter()
             .filter(|surface_id| semantic_canonical_surface_ids.contains(surface_id))
             .collect::<HashSet<_>>();
         let canonical_key_by_surface = exit_parts.canonical_key_by_surface;
-        let presentation_snapshot = PresentationFrameSnapshot::from_sample_with_presented_windows(
-            &presentation,
-            server.presented_window_geometries_for_targets(&presentation, &targets),
-        );
+        // Cull windows this head does not show before anything is derived
+        // from the frame surfaces: rendered surfaces take presentation
+        // feedback and damage.
+        let mut culled_surface_ids = HashSet::new();
+        let (
+            surfaces,
+            all_canonical_ordered_surfaces,
+            all_canonical_ordered_nodes,
+            all_canonical_ordered_owners,
+        ) = match head_viewport {
+            Some(viewport) => {
+                let culled_owner_roots = viewport.culled_owner_roots(
+                    surfaces.as_ref(),
+                    all_canonical_ordered_owners.as_ref(),
+                    &presentation,
+                );
+                let keep = all_canonical_ordered_owners
+                    .iter()
+                    .map(|owner_root| !culled_owner_roots.contains(owner_root))
+                    .collect::<Vec<_>>();
+                culled_surface_ids.extend(
+                    surfaces
+                        .iter()
+                        .zip(&keep)
+                        .filter(|(_, keep)| !**keep)
+                        .map(|(surface, _)| surface.surface_id),
+                );
+                canonical_surface_ids.retain(|surface_id| !culled_surface_ids.contains(surface_id));
+                decorations.retain(|decoration| {
+                    !culled_owner_roots.contains(&decoration.root_surface_id())
+                });
+                (
+                    retain_aligned(surfaces, &keep),
+                    retain_aligned(all_canonical_ordered_surfaces, &keep),
+                    retain_aligned(all_canonical_ordered_nodes, &keep),
+                    retain_aligned(all_canonical_ordered_owners, &keep),
+                )
+            }
+            None => (
+                surfaces,
+                all_canonical_ordered_surfaces,
+                all_canonical_ordered_nodes,
+                all_canonical_ordered_owners,
+            ),
+        };
+        let presented_windows =
+            server.presented_window_geometries_for_targets(&presentation, &targets);
         let lifecycle_snapshot = LifecycleFrameSnapshot::from_sample(&lifecycle);
         let popup_surface_ids = frame_popup_surface_ids;
         let external_overlay_surface_ids = server.external_overlay_surface_ids(&lifecycle);
@@ -975,6 +1030,21 @@ impl<'a> ResolvedNativeFrameScene<'a> {
             surface_id.is_none_or(|surface_id| !exit_surface_ids.contains(&surface_id))
         });
         effect_instances.extend(server.window_exit_effects_for_presentation(&presentation, &exits));
+        let presented_windows = match head_viewport {
+            Some(viewport) => {
+                effect_instances = effect_instances
+                    .into_iter()
+                    .filter_map(|instance| viewport.project_effect(instance, &culled_surface_ids))
+                    .collect();
+                viewport.project_presentation(&mut presentation);
+                viewport.project_presented_windows(presented_windows)
+            }
+            None => presented_windows,
+        };
+        let presentation_snapshot = PresentationFrameSnapshot::from_sample_with_presented_windows(
+            &presentation,
+            presented_windows,
+        );
         let effects = ResolvedEffectScene::new(canonical_effects.generation, effect_instances);
         let mut snapshot =
             NativeSceneSnapshot::from_surfaces_with_scene_nodes_and_presentation_owners(
@@ -987,7 +1057,10 @@ impl<'a> ResolvedNativeFrameScene<'a> {
                     .collect(),
                 popup_surface_ids.as_ref(),
             );
-        let (output_width, output_height) = server.output_dimensions();
+        let (output_width, output_height) = head_viewport.map_or_else(
+            || server.output_dimensions(),
+            NativeHeadViewport::dimensions,
+        );
         let physical_effect_damage = EffectRect::new(0, 0, output_width, output_height)
             .map(|output_bounds| {
                 freeze_native_effect_damage(&effects, &effect_registry_generation, output_bounds)
@@ -1096,6 +1169,21 @@ impl<'a> ResolvedNativeFrameScene<'a> {
                 &canonical_visual_root_surface_ids,
             )
         });
+        let (lifecycle_surfaces, lifecycle_decorations) = if head_translation == (0, 0) {
+            (lifecycle_surfaces, lifecycle_decorations)
+        } else {
+            let (dx, dy) = head_translation;
+            (
+                translate_frame_surfaces(Cow::Owned(lifecycle_surfaces), head_translation)
+                    .into_owned(),
+                lifecycle_decorations
+                    .iter()
+                    .map(|decoration| {
+                        decoration.translated_by_logical_offset(f64::from(dx), f64::from(dy))
+                    })
+                    .collect(),
+            )
+        };
         let window_exit_evidence = exits
             .iter()
             .map(|exit| WindowExitFrameEvidence {

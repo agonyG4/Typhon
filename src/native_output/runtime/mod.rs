@@ -135,6 +135,7 @@ mod dmabuf_release;
 mod frame;
 mod frame_scene_identity;
 mod gpu_screencopy_cycle;
+mod head_viewport;
 #[cfg(test)]
 mod frame_scene_identity_tests;
 mod input_transition_guard;
