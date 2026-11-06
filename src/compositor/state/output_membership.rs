@@ -610,11 +610,20 @@ impl CompositorState {
         let Some((left, top, right, bottom)) = self.surface_layout_rect(surface_id) else {
             return outputs;
         };
+        // A layer surface lives on the output it was created for. Its
+        // placement can trail that choice (it sits at the origin until the
+        // first arrangement), and an enter for another output makes Qt move
+        // the window to that screen and recreate it there on the next map.
+        let layer_output = self
+            .layer_surfaces
+            .get(&self.root_surface_id_for_surface(surface_id))
+            .map(|role| self.layer_role_output(role));
         outputs.extend(
             self.logical_outputs
                 .iter()
                 .filter(|(output_id, output)| {
                     self.logical_output_ids.contains(output_id)
+                        && layer_output.is_none_or(|layer_output| layer_output == Some(**output_id))
                         && output.intersects(left, top, right, bottom)
                 })
                 .map(|(output_id, _)| *output_id),

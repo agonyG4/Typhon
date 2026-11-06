@@ -633,13 +633,16 @@ fn layer_surface_on_a_second_output_is_placed_inside_that_output() {
     let layer_shell: client_zwlr_layer_shell_v1::ZwlrLayerShellV1 =
         globals.bind(&qh, 4..=4, ()).unwrap();
     // The output added last is the second head.
-    let second_output_name = globals.contents().with_list(|list| {
+    let output_names = globals.contents().with_list(|list| {
         list.iter()
             .filter(|global| global.interface == "wl_output")
             .map(|global| global.name)
-            .max()
-            .expect("wl_output globals")
+            .collect::<Vec<_>>()
     });
+    let primary_output_name = *output_names.iter().min().expect("wl_output globals");
+    let second_output_name = *output_names.iter().max().expect("wl_output globals");
+    let _primary_output: client_wl_output::WlOutput =
+        globals.registry().bind(primary_output_name, 4, &qh, ());
     let second_output: client_wl_output::WlOutput =
         globals.registry().bind(second_output_name, 4, &qh, ());
     let surface = compositor.create_surface(&qh, ());
@@ -671,5 +674,17 @@ fn layer_surface_on_a_second_output_is_placed_inside_that_output() {
     assert!(
         (1280..1280 + 1920).contains(&placed.origin_x),
         "a layer surface bound to the second output is placed inside it: {placed:?}"
+    );
+    // Toolkits move a window to the screen it enters; the surface must only
+    // ever enter the output it was created for.
+    assert!(!state.surface_enter_output_ids.is_empty());
+    assert!(
+        state
+            .surface_enter_output_ids
+            .iter()
+            .all(|output| *output == second_output.id().protocol_id()),
+        "the layer surface enters only its own output: {:?} (second output {})",
+        state.surface_enter_output_ids,
+        second_output.id().protocol_id(),
     );
 }

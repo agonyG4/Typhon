@@ -1023,7 +1023,10 @@ impl CompositorState {
 
     /// Output a layer surface is laid out on; surfaces whose output is gone
     /// fall back to the native output.
-    fn layer_role_output(&self, role: &LayerSurfaceRole) -> Option<OutputId> {
+    pub(in crate::compositor) fn layer_role_output(
+        &self,
+        role: &LayerSurfaceRole,
+    ) -> Option<OutputId> {
         role.output
             .filter(|output_id| self.logical_output_ids.contains(output_id))
             .or_else(|| {
@@ -1203,6 +1206,9 @@ impl CompositorState {
                 surface_id,
                 SurfacePlacement::absolute_root_at(geometry.x, geometry.y),
             );
+            // Output membership follows the arranged position, not the
+            // origin the surface held before its first arrangement.
+            self.reconcile_surface_tree_output_memberships(surface_id);
             if self.layer_surface_needs_size_configure(surface_id, geometry) {
                 self.send_layer_surface_configure(
                     surface_id,
