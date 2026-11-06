@@ -161,6 +161,14 @@ impl OwnCompositorServer {
         self.state.presenting_output_viewport()
     }
 
+    /// Output the head being presented shows: the native output unless a
+    /// secondary head entered its presentation.
+    pub fn presenting_output_id(&self) -> Option<OutputId> {
+        self.state
+            .presenting_output
+            .or(self.state.native_output_id())
+    }
+
     pub fn has_prepared_frame_batch(&self) -> bool {
         self.state.legacy_prepared_frame_batch.is_some()
     }

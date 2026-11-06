@@ -1041,10 +1041,19 @@ impl<'a> ResolvedNativeFrameScene<'a> {
             }
             None => presented_windows,
         };
-        let presentation_snapshot = PresentationFrameSnapshot::from_sample_with_presented_windows(
-            &presentation,
-            presented_windows,
-        );
+        let mut presentation_snapshot =
+            PresentationFrameSnapshot::from_sample_with_presented_windows(
+                &presentation,
+                presented_windows,
+            );
+        // The sample is stamped with the native output. A secondary head's
+        // snapshot is head-local and culled, so it must carry its own output:
+        // the server keeps only native presentations as the authority for
+        // hit testing, window moves and animation acknowledgement.
+        let presenting_output_id = server.presenting_output_id();
+        if let Some(output_id) = presenting_output_id {
+            presentation_snapshot.output_id = output_id;
+        }
         let effects = ResolvedEffectScene::new(canonical_effects.generation, effect_instances);
         let mut snapshot =
             NativeSceneSnapshot::from_surfaces_with_scene_nodes_and_presentation_owners(
@@ -1167,7 +1176,7 @@ impl<'a> ResolvedNativeFrameScene<'a> {
             .iter()
             .map(|surface| surface.visual_root_surface_id)
             .collect::<Vec<_>>();
-        let canonical_scene_evidence = server.native_output_id().and_then(|output_id| {
+        let canonical_scene_evidence = presenting_output_id.and_then(|output_id| {
             PresentedCanonicalSceneSnapshot::capture(
                 output_id,
                 render_generation,
@@ -2811,13 +2820,13 @@ impl FrozenNativeRenderFrame {
             return;
         }
         self.capture_cursor_overlay = match cursor.source {
-            super::cursor_cycle::NativeResolvedCursorSource::ClientSurface => server
-                .client_cursor_render_state()
-                .map(|cursor| {
+            super::cursor_cycle::NativeResolvedCursorSource::ClientSurface => {
+                server.client_cursor_render_state().map(|cursor| {
                     FrozenCaptureCursor::Client(Box::new(
                         OwnedClientCursorRenderState::from_render_state(cursor),
                     ))
-                }),
+                })
+            }
             _ => {
                 let (x, y) = input_state.cursor_position();
                 Some(FrozenCaptureCursor::Theme { x, y })

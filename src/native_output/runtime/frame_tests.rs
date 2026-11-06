@@ -740,6 +740,73 @@ fn each_head_resolves_only_its_windows_in_head_local_space() {
 }
 
 #[test]
+fn secondary_head_presentation_does_not_replace_native_input_geometry() {
+    let socket_name = format!("typhon-frame-head-publication-{}", process::id());
+    let mut server = OwnCompositorServer::bind_cpu_composition(&socket_name)
+        .expect("bind compositor for head publication regression");
+    server.set_output_size(1920, 1080);
+    server.install_native_frame_test_scene(
+        vec![
+            test_surface(821, 320, 200, SurfacePlacement::absolute_root_at(100, 100)),
+            test_surface(822, 640, 360, SurfacePlacement::absolute_root_at(2400, 200)),
+        ],
+        &[
+            (821, WindowId::from_raw(821).expect("primary window id")),
+            (822, WindowId::from_raw(822).expect("tv window id")),
+        ],
+        None,
+    );
+    let native = server.native_output_id().expect("native output");
+    let tv = server
+        .add_logical_output("HDMI-A-2", (1920, 0), (1920, 1080), 1.0, 60)
+        .expect("tv output");
+
+    let resolve = |server: &OwnCompositorServer, at| {
+        let scene = ResolvedNativeFrameScene::from_server_at(server, AnimationTime::from_nanos(at));
+        (
+            scene.presentation_snapshot.clone(),
+            scene.lifecycle_snapshot.clone(),
+            scene.canonical_scene_evidence.clone(),
+        )
+    };
+    let publish = |server: &mut OwnCompositorServer,
+                   frame_id,
+                   (presentation, lifecycle, canonical): &(
+        oblivion_one::presentation_animation::PresentationFrameSnapshot,
+        oblivion_one::window_lifecycle_animation::LifecycleFrameSnapshot,
+        Option<oblivion_one::compositor::PresentedCanonicalSceneSnapshot>,
+    )| {
+        server.publish_presented_frame(oblivion_one::compositor::PresentedFramePublication {
+            frame_id,
+            presentation,
+            lifecycle,
+            lifecycle_scene: oblivion_one::compositor::PresentedLifecycleScene::Initial,
+            canonical_scene: canonical.as_ref(),
+            window_exits: &[],
+        });
+    };
+
+    let primary = resolve(&server, 1);
+    assert_eq!(primary.0.output_id, native);
+    publish(&mut server, 1, &primary);
+    let before = server.presented_window_geometry(821);
+    assert!(
+        before.is_some(),
+        "the primary publishes its window geometry"
+    );
+
+    server.enter_output_presentation(tv);
+    let secondary = resolve(&server, 2);
+    assert_eq!(secondary.0.output_id, tv);
+    publish(&mut server, 2, &secondary);
+    server.enter_output_presentation(native);
+
+    // The TV's head-local, culled snapshot must not become the geometry the
+    // primary's pointer hits and window moves are resolved against.
+    assert_eq!(server.presented_window_geometry(821), before);
+}
+
+#[test]
 fn workspace_cell_clip_intersects_an_existing_presentation_clip() {
     let output_id = oblivion_one::core::OutputId::from_raw(1).expect("test output id");
     let root_surface_id = 912;
