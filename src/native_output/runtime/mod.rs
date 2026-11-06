@@ -179,6 +179,7 @@ mod render_worker;
 mod resource_efficiency;
 mod scene_history;
 mod scene_liveness;
+mod secondary_head;
 mod session;
 mod session_io;
 mod shutdown;

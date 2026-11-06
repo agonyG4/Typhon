@@ -157,6 +157,7 @@ fn build_native_kms_startup_plan(
     }
 }
 struct NativeRuntimeBootstrapTail {
+    secondary_heads: Vec<crate::native_output::output::NativeSecondaryHeadPlan>,
     server: OwnCompositorServer,
     output_id: OutputId,
     keyboard_store: KeyboardConfigurationStore,
@@ -199,6 +200,7 @@ impl NativeRuntime {
         termination: &mut Option<NativeTerminationJournal>,
     ) -> NativeResult<Self> {
         let NativeRuntimeBootstrapTail {
+            secondary_heads,
             mut server,
             output_id,
             keyboard_store,
@@ -865,6 +867,7 @@ impl NativeRuntime {
             }
             runtime.sync_controller_reactor_sources()?;
             runtime.register_drm_hotplug_source()?;
+            runtime.bring_up_secondary_heads(secondary_heads);
             runtime.install_native_wake_plan(initial_wake_plan, scheduler_anchor_ns)?;
             runtime.attach_xwayland_private_client()?;
             Ok(())
@@ -1037,14 +1040,14 @@ impl NativeRuntime {
             target.mode.vrefresh,
             mode_preference.as_str()
         );
-        // Phase 4a: plan every other connected connector as a head. Only the
-        // primary is driven until the runtime holds more than one head.
-        match plan_secondary_heads(kms.file(), &target) {
+        // Plan every other connected connector as a head; the runtime drives
+        // them once the primary is up.
+        let secondary_heads = match plan_secondary_heads(kms.file(), &target) {
             Ok(plan) => {
                 for head in &plan.secondaries {
                     let secondary = &head.selection.target;
                     println!(
-                        "native output head plan: {} connector {} crtc {} {}x{}@{}Hz at ({}, {}); not driven yet",
+                        "native output head plan: {} connector {} crtc {} {}x{}@{}Hz at ({}, {})",
                         head.selection.capabilities.connector_name,
                         secondary.connector_id,
                         secondary.crtc_id,
@@ -1061,9 +1064,18 @@ impl NativeRuntime {
                         connector.connector_name, connector.reason
                     );
                 }
+                if super::secondary_head::secondary_heads_enabled() {
+                    plan.secondaries
+                } else {
+                    println!("native output head plan: secondary heads disabled");
+                    Vec::new()
+                }
             }
-            Err(error) => eprintln!("native output head plan failed: {error}"),
-        }
+            Err(error) => {
+                eprintln!("native output head plan failed: {error}");
+                Vec::new()
+            }
+        };
         perf.log("native.kms", || {
             vec![
                 NativePerfField::u64("connector", u64::from(target.connector_id)),
@@ -1840,6 +1852,7 @@ impl NativeRuntime {
         });
         Self::finish_bootstrap(
             NativeRuntimeBootstrapTail {
+                secondary_heads,
                 server,
                 output_id,
                 keyboard_store,
