@@ -225,26 +225,47 @@ impl NativeHeadViewport {
 /// live run shows whether the head repaints and which surfaces reach it.
 pub(crate) fn log_head_scene(
     viewport: NativeHeadViewport,
-    surfaces: usize,
+    surfaces: &[RenderableSurface],
     culled: usize,
     decorations: usize,
     effects: usize,
+    global_effects: usize,
 ) {
     static RESOLVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let count = RESOLVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if count < 40 || count % 600 == 0 {
         println!(
-            "native output head scene: origin=({}, {}) size={}x{} resolve={} surfaces={} culled={} decorations={} effects={}",
+            "native output head scene: origin=({}, {}) size={}x{} resolve={} surfaces={} culled={} decorations={} effects={}/{}",
             viewport.x,
             viewport.y,
             viewport.width,
             viewport.height,
             count,
-            surfaces,
+            surfaces.len(),
             culled,
             decorations,
             effects,
+            global_effects,
         );
+        if count < 4 || count % 600 == 0 {
+            let origins = oblivion_one::compositor::surface_origins(surfaces);
+            for (surface, (x, y)) in surfaces.iter().zip(origins) {
+                println!(
+                    "native output head scene surface: id={} origin=({x}, {y}) size={}x{} parent={:?} buffer={}",
+                    surface.surface_id,
+                    surface.width,
+                    surface.height,
+                    surface.placement.parent_surface_id,
+                    if surface.dmabuf_handle().is_some() {
+                        "dmabuf"
+                    } else if surface.cpu_pixels().is_some() {
+                        "shm"
+                    } else {
+                        "none"
+                    },
+                );
+            }
+        }
     }
 }
 

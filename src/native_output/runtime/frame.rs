@@ -1119,10 +1119,11 @@ impl<'a> ResolvedNativeFrameScene<'a> {
         if let Some(viewport) = head_viewport.filter(|viewport| viewport.is_translated()) {
             super::head_viewport::log_head_scene(
                 viewport,
-                surfaces.len(),
+                surfaces.as_ref(),
                 culled_surface_ids.len(),
                 decorations.len(),
                 effects.instances.len(),
+                effect_scene_visible_instances,
             );
         }
         let canonical_presented_surfaces = canonical_frame_surfaces
