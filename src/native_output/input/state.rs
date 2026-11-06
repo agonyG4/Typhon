@@ -6,12 +6,25 @@ struct PointerButtonPressState {
     delivery: Option<NativePointerButtonDelivery>,
 }
 
+/// The native view of the input state saved while a secondary head presents.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct NativeInputHeadView {
+    cursor_x: f64,
+    cursor_y: f64,
+    output_width: u32,
+    output_height: u32,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct NativeInputState {
     pub(crate) output_width: u32,
     pub(crate) output_height: u32,
     pub(crate) cursor_x: f64,
     pub(crate) cursor_y: f64,
+    /// Logical rectangles `(x, y, width, height)` of the other outputs the
+    /// pointer may enter; the native output is always `(0, 0)` sized
+    /// `output_width` x `output_height`.
+    secondary_pointer_regions: Vec<(i32, i32, u32, u32)>,
     pub(crate) keyboard_shortcuts_inhibited: bool,
     keyboard_shortcut_inhibition_generation: u64,
     pub(crate) pointer_constraint: NativePointerConstraintState,
@@ -48,6 +61,7 @@ impl NativeInputState {
             output_height: output_height.max(1),
             cursor_x: f64::from(output_width.max(1)) / 2.0,
             cursor_y: f64::from(output_height.max(1)) / 2.0,
+            secondary_pointer_regions: Vec::new(),
             keyboard_shortcuts_inhibited: false,
             keyboard_shortcut_inhibition_generation: 0,
             pointer_constraint: NativePointerConstraintState::None,
@@ -69,6 +83,86 @@ impl NativeInputState {
         }
     }
 
+    /// Whether the cursor lies on the output whose view the input state
+    /// currently has: the native output, or a secondary head while it
+    /// presents through [`Self::enter_head_view`].
+    pub(crate) fn cursor_on_output(&self) -> bool {
+        (0.0..f64::from(self.output_width)).contains(&self.cursor_x)
+            && (0.0..f64::from(self.output_height)).contains(&self.cursor_y)
+    }
+
+    /// Shows the cursor in a secondary head's local space for that head's
+    /// presentation: positions shift by the head origin and bounds become
+    /// the head size. [`Self::leave_head_view`] restores the native view.
+    pub(crate) fn enter_head_view(
+        &mut self,
+        (x, y, width, height): (i32, i32, u32, u32),
+    ) -> NativeInputHeadView {
+        let saved = NativeInputHeadView {
+            cursor_x: self.cursor_x,
+            cursor_y: self.cursor_y,
+            output_width: self.output_width,
+            output_height: self.output_height,
+        };
+        self.cursor_x -= f64::from(x);
+        self.cursor_y -= f64::from(y);
+        self.output_width = width.max(1);
+        self.output_height = height.max(1);
+        saved
+    }
+
+    pub(crate) fn leave_head_view(&mut self, saved: NativeInputHeadView) {
+        self.cursor_x = saved.cursor_x;
+        self.cursor_y = saved.cursor_y;
+        self.output_width = saved.output_width;
+        self.output_height = saved.output_height;
+    }
+
+    /// Replaces the other outputs the pointer may cross into and pulls the
+    /// cursor back inside the layout when its output went away.
+    pub(crate) fn set_secondary_pointer_regions(
+        &mut self,
+        regions: Vec<(i32, i32, u32, u32)>,
+    ) -> NativeInputEffect {
+        self.secondary_pointer_regions = regions
+            .into_iter()
+            .filter(|(_, _, width, height)| *width > 0 && *height > 0)
+            .collect();
+        let position = self.clamp_to_pointer_layout(self.cursor_x, self.cursor_y);
+        let mut effect = NativeInputEffect::default();
+        if (position.x, position.y) != (self.cursor_x, self.cursor_y) {
+            self.cursor_x = position.x;
+            self.cursor_y = position.y;
+            effect.mark_cursor_moved(self.cursor_x, self.cursor_y);
+        }
+        effect
+    }
+
+    /// The point of the output layout nearest `(x, y)`: unchanged inside any
+    /// output, otherwise clamped into the closest one.
+    pub(crate) fn clamp_to_pointer_layout(&self, x: f64, y: f64) -> CompositorOutputPosition {
+        let native = (0, 0, self.output_width, self.output_height);
+        let mut best: Option<(f64, CompositorOutputPosition)> = None;
+        for (left, top, width, height) in
+            std::iter::once(native).chain(self.secondary_pointer_regions.iter().copied())
+        {
+            let left = f64::from(left);
+            let top = f64::from(top);
+            let clamped = CompositorOutputPosition {
+                x: x.clamp(left, left + f64::from(width.max(1) - 1)),
+                y: y.clamp(top, top + f64::from(height.max(1) - 1)),
+            };
+            let distance = (clamped.x - x).powi(2) + (clamped.y - y).powi(2);
+            if distance == 0.0 {
+                return clamped;
+            }
+            if best.is_none_or(|(best_distance, _)| distance < best_distance) {
+                best = Some((distance, clamped));
+            }
+        }
+        best.map_or(CompositorOutputPosition { x, y }, |(_, position)| position)
+    }
+
     pub(crate) fn reconfigure_output_bounds(
         &mut self,
         output_width: u32,
@@ -76,11 +170,19 @@ impl NativeInputState {
     ) -> NativeInputEffect {
         self.output_width = output_width.max(1);
         self.output_height = output_height.max(1);
+        let locked_anchor = match &self.pointer_constraint {
+            NativePointerConstraintState::Locked { anchor } => {
+                Some(self.clamp_to_pointer_layout(anchor.x, anchor.y))
+            }
+            _ => None,
+        };
         match &mut self.pointer_constraint {
             NativePointerConstraintState::None => {}
             NativePointerConstraintState::Locked { anchor } => {
-                anchor.x = anchor.x.clamp(0.0, f64::from(self.output_width - 1));
-                anchor.y = anchor.y.clamp(0.0, f64::from(self.output_height - 1));
+                if let Some(clamped) = locked_anchor {
+                    anchor.x = clamped.x;
+                    anchor.y = clamped.y;
+                }
             }
             NativePointerConstraintState::Confined { region } => {
                 *region = region.clipped_to_output(self.output_width, self.output_height);
@@ -88,10 +190,7 @@ impl NativeInputState {
         }
         let position = self
             .pointer_constraint
-            .constrain_position(CompositorOutputPosition {
-                x: self.cursor_x.clamp(0.0, f64::from(self.output_width - 1)),
-                y: self.cursor_y.clamp(0.0, f64::from(self.output_height - 1)),
-            });
+            .constrain_position(self.clamp_to_pointer_layout(self.cursor_x, self.cursor_y));
         self.cursor_x = position.x;
         self.cursor_y = position.y;
         let mut effect = NativeInputEffect::default();
@@ -261,8 +360,9 @@ impl NativeInputState {
         &mut self,
         position: CompositorOutputPosition,
     ) -> NativeInputEffect {
-        self.cursor_x = position.x.clamp(0.0, f64::from(self.output_width - 1));
-        self.cursor_y = position.y.clamp(0.0, f64::from(self.output_height - 1));
+        let position = self.clamp_to_pointer_layout(position.x, position.y);
+        self.cursor_x = position.x;
+        self.cursor_y = position.y;
         let mut effect = NativeInputEffect::default();
         effect.mark_cursor_moved(self.cursor_x, self.cursor_y);
         effect
@@ -997,10 +1097,10 @@ impl NativeInputState {
         if let Some(relative) = sample.relative {
             effect.relative_motion = (!relative.is_zero()).then_some(relative);
             if !self.pointer_constraint.locked() {
-                let proposed = CompositorOutputPosition {
-                    x: (self.cursor_x + relative.dx).clamp(0.0, f64::from(self.output_width - 1)),
-                    y: (self.cursor_y + relative.dy).clamp(0.0, f64::from(self.output_height - 1)),
-                };
+                let proposed = self.clamp_to_pointer_layout(
+                    self.cursor_x + relative.dx,
+                    self.cursor_y + relative.dy,
+                );
                 let constrained = self.pointer_constraint.constrain_position(proposed);
                 self.cursor_x = constrained.x;
                 self.cursor_y = constrained.y;
@@ -1009,10 +1109,7 @@ impl NativeInputState {
         if let Some((x, y)) = sample.absolute
             && !self.pointer_constraint.locked()
         {
-            let proposed = CompositorOutputPosition {
-                x: x.clamp(0.0, f64::from(self.output_width - 1)),
-                y: y.clamp(0.0, f64::from(self.output_height - 1)),
-            };
+            let proposed = self.clamp_to_pointer_layout(x, y);
             let constrained = self.pointer_constraint.constrain_position(proposed);
             self.cursor_x = constrained.x;
             self.cursor_y = constrained.y;

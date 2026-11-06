@@ -764,6 +764,10 @@ pub struct CompositorState {
     presented_presentation: Option<PresentationFrameSnapshot>,
     presented_canonical_scene: Option<PresentedCanonicalSceneSnapshot>,
     presented_window_geometries: Vec<PresentedWindowGeometry>,
+    /// Windows each secondary head last presented, in global logical space
+    /// and sorted by root surface. They stand in for windows the native head
+    /// does not show, so pointer input reaches windows on other outputs.
+    secondary_presented_window_geometries: HashMap<OutputId, Vec<PresentedWindowGeometry>>,
     presented_presentation_frame_id: u64,
     scene_work_index: SceneWorkIndex,
     pub(in crate::compositor) tiled_layout: TiledLayoutManager,

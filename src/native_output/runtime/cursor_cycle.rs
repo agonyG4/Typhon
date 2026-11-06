@@ -223,6 +223,18 @@ pub(crate) fn native_cursor_source_input(
     server: &OwnCompositorServer,
     input_state: &NativeInputState,
 ) -> NativeCursorSourceInput {
+    if !input_state.cursor_on_output() {
+        // The pointer is on another output: this head shows no cursor.
+        return NativeCursorSourceInput {
+            interaction_override_active: false,
+            wayland_dnd_active: false,
+            client_explicitly_hidden: true,
+            client_surface_active: false,
+            client_surface_content_active: false,
+            client_shape_active: false,
+            theme_fallback_visible: false,
+        };
+    }
     NativeCursorSourceInput {
         interaction_override_active: server.interaction_cursor_override_active(),
         wayland_dnd_active: server.wayland_pointer_dnd_cursor_active(),

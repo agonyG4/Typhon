@@ -735,10 +735,56 @@ impl CompositorState {
         &self,
         root_surface_id: u32,
     ) -> Option<PresentedWindowGeometry> {
-        self.presented_window_geometries
-            .binary_search_by_key(&root_surface_id, PresentedWindowGeometry::root_surface_id)
-            .ok()
-            .map(|index| self.presented_window_geometries[index])
+        let find = |geometries: &[PresentedWindowGeometry]| {
+            geometries
+                .binary_search_by_key(&root_surface_id, PresentedWindowGeometry::root_surface_id)
+                .ok()
+                .map(|index| geometries[index])
+        };
+        find(&self.presented_window_geometries).or_else(|| {
+            self.secondary_presented_window_geometries
+                .iter()
+                .filter(|(output_id, _)| self.logical_output_ids.contains(output_id))
+                .find_map(|(_, geometries)| find(geometries))
+        })
+    }
+
+    /// Keeps a secondary head's presented windows, moved from its head-local
+    /// space back to the global layout.
+    pub(in crate::compositor) fn record_secondary_presented_windows(
+        &mut self,
+        presentation: &PresentationFrameSnapshot,
+    ) {
+        let output_id = presentation.output_id;
+        let Some(output) = self.logical_outputs.get(&output_id) else {
+            self.secondary_presented_window_geometries
+                .remove(&output_id);
+            return;
+        };
+        let (origin_x, origin_y) = output.position;
+        let mut geometries = presentation
+            .presented_windows
+            .iter()
+            .map(|window| {
+                let rect = window.presented_rect();
+                let global = crate::presentation_animation::PresentationRect::new(
+                    rect.x() + f64::from(origin_x),
+                    rect.y() + f64::from(origin_y),
+                    rect.width(),
+                    rect.height(),
+                )
+                .unwrap_or(rect);
+                PresentedWindowGeometry::with_scene_node(
+                    window.scene_node_id(),
+                    window.root_surface_id(),
+                    global,
+                )
+            })
+            .collect::<Vec<_>>();
+        geometries.sort_by_key(PresentedWindowGeometry::root_surface_id);
+        geometries.dedup_by_key(|window| window.root_surface_id());
+        self.secondary_presented_window_geometries
+            .insert(output_id, geometries);
     }
 
     fn presented_input_projection_changed(

@@ -190,6 +190,7 @@ impl CompositorState {
             .native_output_id()
             .expect("native presentation requires allocated logical OutputId");
         if publication.presentation.output_id != expected_output_id {
+            self.record_secondary_presented_windows(publication.presentation);
             return;
         }
         if publication

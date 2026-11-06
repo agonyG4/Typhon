@@ -46,6 +46,26 @@ impl NativeRuntime {
                 }
             }
         }
+        self.publish_secondary_pointer_regions();
+    }
+
+    /// Lets the pointer cross into every parked head's logical rectangle.
+    pub(super) fn publish_secondary_pointer_regions(&mut self) {
+        let regions = self
+            .parked_heads
+            .iter()
+            .filter_map(|head| self.server.logical_output_rect(head.output_id))
+            .filter_map(|(x, y, width, height)| {
+                Some((
+                    x,
+                    y,
+                    u32::try_from(width).ok()?,
+                    u32::try_from(height).ok()?,
+                ))
+            })
+            .collect::<Vec<_>>();
+        println!("native output pointer layout: secondary regions {regions:?}");
+        let _ = self.input_state.set_secondary_pointer_regions(regions);
     }
 
     fn bring_up_secondary_head(
@@ -151,8 +171,10 @@ impl NativeRuntime {
         );
 
         // Initial frame and blocking modeset of this head's own pipeline.
-        // Secondary heads draw no cursor: the pointer stays on the primary.
-        let cursor_render_mode = NativeCursorRenderMode::Hardware;
+        // Secondary heads have no cursor plane: they draw the cursor while
+        // the pointer is on them (the input state gives them a head-local
+        // view while they present).
+        let cursor_render_mode = NativeCursorRenderMode::Software;
         let NativeScanoutBackend::AtomicEglGbm(explicit) = &mut scanout else {
             unreachable!("secondary heads use explicit Atomic EGL/GBM scanout");
         };
@@ -169,6 +191,18 @@ impl NativeRuntime {
         )?;
         let initial_damage = NativeOutputDamage::full_output(target.width, target.height);
         let initial_scene = ResolvedNativeFrameScene::from_server(&self.server).into_owned();
+        let head_view = self
+            .server
+            .logical_output_rect(output_id)
+            .and_then(|(x, y, width, height)| {
+                Some((
+                    x,
+                    y,
+                    u32::try_from(width).ok()?,
+                    u32::try_from(height).ok()?,
+                ))
+            })
+            .map(|rect| self.input_state.enter_head_view(rect));
         let frozen_initial = FrozenNativeRenderFrame::freeze(
             target.width,
             target.height,
@@ -178,6 +212,9 @@ impl NativeRuntime {
             cursor_render_mode,
             Some(initial_damage.as_renderer_damage(target.width, target.height)),
         );
+        if let Some(saved) = head_view {
+            self.input_state.leave_head_view(saved);
+        }
         let initial_render_target = explicit.render_target_request(slot)?;
         let (initial_outcome, frozen_initial) =
             explicit.render_initial_frame(initial_render_target, 0, frozen_initial)?;

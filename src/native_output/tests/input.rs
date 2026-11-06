@@ -4732,3 +4732,47 @@ fn libinput_v120_conversion_does_not_create_discrete_finger_or_continuous_steps(
     assert_eq!(finger.discrete, None);
     assert_eq!(continuous.discrete, None);
 }
+
+#[test]
+fn pointer_crosses_into_a_secondary_output_and_clamps_to_the_layout() {
+    let mut input = NativeInputState::new(1920, 1080);
+    let _ = input.set_secondary_pointer_regions(vec![(1920, 0, 1920, 1080)]);
+    let _ = input.restore_cursor_position(CompositorOutputPosition { x: 1900.0, y: 500.0 });
+
+    let _ = input.handle_pointer_motion_delta(100.0, 0.0);
+    assert_eq!(input.cursor_position(), (2000, 500));
+
+    // Past the right edge of the layout the pointer stops on the last pixel.
+    let _ = input.handle_pointer_motion_delta(5000.0, 0.0);
+    assert_eq!(input.cursor_position(), (3839, 500));
+
+    // Without the secondary output the pointer stays on the native one.
+    let _ = input.set_secondary_pointer_regions(Vec::new());
+    assert_eq!(input.cursor_position(), (1919, 500));
+}
+
+#[test]
+fn pointer_off_every_output_moves_to_the_nearest_one() {
+    let mut input = NativeInputState::new(1920, 1080);
+    // A shorter output to the right leaves a dead corner below it.
+    let _ = input.set_secondary_pointer_regions(vec![(1920, 0, 1280, 720)]);
+    let _ = input.restore_cursor_position(CompositorOutputPosition { x: 2500.0, y: 700.0 });
+    let _ = input.handle_pointer_motion_delta(0.0, 200.0);
+    assert_eq!(input.cursor_position(), (2500, 719));
+}
+
+#[test]
+fn head_view_reports_the_cursor_only_on_the_output_under_it() {
+    let mut input = NativeInputState::new(1920, 1080);
+    let _ = input.set_secondary_pointer_regions(vec![(1920, 0, 1920, 1080)]);
+    let _ = input.restore_cursor_position(CompositorOutputPosition { x: 2000.0, y: 40.0 });
+    assert!(!input.cursor_on_output(), "the native head hides the cursor");
+
+    let saved = input.enter_head_view((1920, 0, 1920, 1080));
+    assert!(input.cursor_on_output(), "the secondary head shows it");
+    assert_eq!(input.cursor_position(), (80, 40));
+    input.leave_head_view(saved);
+
+    assert_eq!(input.cursor_position(), (2000, 40));
+    assert!(!input.cursor_on_output());
+}

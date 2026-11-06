@@ -804,6 +804,13 @@ fn secondary_head_presentation_does_not_replace_native_input_geometry() {
     // The TV's head-local, culled snapshot must not become the geometry the
     // primary's pointer hits and window moves are resolved against.
     assert_eq!(server.presented_window_geometry(821), before);
+    // A window only the TV shows takes the TV's geometry, back in global
+    // space, so the pointer can reach it there.
+    let tv_window = server
+        .presented_window_geometry(822)
+        .expect("the TV's window has presented geometry");
+    assert_eq!(tv_window.presented_rect().x(), 2400.0);
+    assert_eq!(tv_window.presented_rect().y(), 200.0);
 }
 
 #[test]

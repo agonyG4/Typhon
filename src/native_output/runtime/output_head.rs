@@ -120,7 +120,25 @@ impl NativeRuntime {
     ) -> R {
         std::mem::swap(&mut self.head, &mut self.parked_heads[index]);
         self.server.enter_output_presentation(self.head.output_id);
+        // The cursor pipeline reads the input state in output-local space;
+        // give it this head's view so its cursor draws where the pointer is
+        // and hides while the pointer is on another output.
+        let head_view = self
+            .server
+            .logical_output_rect(self.head.output_id)
+            .and_then(|(x, y, width, height)| {
+                Some((
+                    x,
+                    y,
+                    u32::try_from(width).ok()?,
+                    u32::try_from(height).ok()?,
+                ))
+            })
+            .map(|rect| self.input_state.enter_head_view(rect));
         let result = f(self);
+        if let Some(saved) = head_view {
+            self.input_state.leave_head_view(saved);
+        }
         std::mem::swap(&mut self.head, &mut self.parked_heads[index]);
         self.server.enter_output_presentation(self.head.output_id);
         result

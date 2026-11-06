@@ -216,6 +216,7 @@ impl CompositorState {
         if !self.logical_output_ids.contains(&output_id) {
             return;
         }
+        self.secondary_presented_window_geometries.remove(&output_id);
         if let Some(global) = self.output_globals.remove(&output_id) {
             display.remove_global::<CompositorState>(global);
         }
