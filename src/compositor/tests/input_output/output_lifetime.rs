@@ -605,3 +605,71 @@ fn output_focus_follows_the_pointer_across_outputs() {
     assert_eq!(server.focused_output(), Some(native));
     assert_eq!(server.active_workspace(), WorkspaceId::new(1).unwrap());
 }
+
+#[test]
+fn layer_surface_on_a_second_output_is_placed_inside_that_output() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (commands, server_thread) = spawn_controllable_test_server(server);
+
+    let (reply, output_id) = mpsc::channel();
+    commands
+        .send(ServerCommand::AddLogicalOutput {
+            name: "HDMI-A-2",
+            position: (1280, 0),
+            size: (1920, 1080),
+            reply,
+        })
+        .unwrap();
+    wait_for_server_commands(&commands);
+    output_id.recv().unwrap().expect("additional output id");
+
+    let connection = Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let layer_shell: client_zwlr_layer_shell_v1::ZwlrLayerShellV1 =
+        globals.bind(&qh, 4..=4, ()).unwrap();
+    // The output added last is the second head.
+    let second_output_name = globals.contents().with_list(|list| {
+        list.iter()
+            .filter(|global| global.interface == "wl_output")
+            .map(|global| global.name)
+            .max()
+            .expect("wl_output globals")
+    });
+    let second_output: client_wl_output::WlOutput =
+        globals.registry().bind(second_output_name, 4, &qh, ());
+    let surface = compositor.create_surface(&qh, ());
+    let layer_surface = layer_shell.get_layer_surface(
+        &surface,
+        Some(&second_output),
+        client_zwlr_layer_shell_v1::Layer::Background,
+        "second-output-wallpaper".to_string(),
+        &qh,
+        (),
+    );
+    layer_surface.set_size(200, 100);
+    let mut state = RegistryTestState::default();
+    surface.commit();
+    connection.flush().unwrap();
+    queue.roundtrip(&mut state).unwrap();
+    commit_test_buffered_surface(&surface, &shm, &qh, 200, 100).unwrap();
+    connection.flush().unwrap();
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+    wait_for_server_commands(&commands);
+
+    let placed = capture_renderable_surface_snapshot(&commands)
+        .into_iter()
+        .find(|snapshot| (snapshot.width, snapshot.height) == (200, 100))
+        .expect("layer surface is renderable");
+    let _server = stop_controllable_test_server(commands, server_thread);
+
+    assert!(
+        (1280..1280 + 1920).contains(&placed.origin_x),
+        "a layer surface bound to the second output is placed inside it: {placed:?}"
+    );
+}

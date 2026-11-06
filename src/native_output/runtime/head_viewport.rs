@@ -221,6 +221,33 @@ impl NativeHeadViewport {
     }
 }
 
+/// Logs the first frames a translated head resolves, then one in 600, so a
+/// live run shows whether the head repaints and which surfaces reach it.
+pub(crate) fn log_head_scene(
+    viewport: NativeHeadViewport,
+    surfaces: usize,
+    culled: usize,
+    decorations: usize,
+    effects: usize,
+) {
+    static RESOLVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let count = RESOLVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if count < 40 || count % 600 == 0 {
+        println!(
+            "native output head scene: origin=({}, {}) size={}x{} resolve={} surfaces={} culled={} decorations={} effects={}",
+            viewport.x,
+            viewport.y,
+            viewport.width,
+            viewport.height,
+            count,
+            surfaces,
+            culled,
+            decorations,
+            effects,
+        );
+    }
+}
+
 /// Moves every surface by `(dx, dy)`: roots become absolute at their moved
 /// origins, children stay relative to their parents.
 pub(crate) fn translate_frame_surfaces<'a>(

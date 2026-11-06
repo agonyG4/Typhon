@@ -1116,6 +1116,15 @@ impl<'a> ResolvedNativeFrameScene<'a> {
             note_snapshot_finalization();
             note_identity_computation();
         }
+        if let Some(viewport) = head_viewport.filter(|viewport| viewport.is_translated()) {
+            super::head_viewport::log_head_scene(
+                viewport,
+                surfaces.len(),
+                culled_surface_ids.len(),
+                decorations.len(),
+                effects.instances.len(),
+            );
+        }
         let canonical_presented_surfaces = canonical_frame_surfaces
             .iter()
             .filter(|surface| canonical_surface_ids.contains(&surface.surface_id))

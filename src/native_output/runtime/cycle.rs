@@ -1170,6 +1170,18 @@ impl NativeRuntime {
                 if work {
                     runtime.render_present_and_update_metrics(parked_cycle)?;
                 }
+                static PARKED_PRESENTS: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                let logged = PARKED_PRESENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if logged < 60 || logged % 1200 == 0 {
+                    println!(
+                        "native output head present: output={:?} admitted={} redraw={} frame_index={}",
+                        runtime.head.output_id,
+                        work,
+                        parked_cycle.redraw_requested,
+                        runtime.head.frame_index,
+                    );
+                }
                 Ok(work)
             })?;
         }
