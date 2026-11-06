@@ -1651,3 +1651,42 @@ fn capture_cursor_overlay_is_frozen_only_for_hardware_cursor_overlay_copies() {
     let mut hidden = frozen(&input_state, NativeCursorRenderMode::Hardware, Some(true));
     assert_eq!(theme_at(&mut hidden), None);
 }
+
+#[test]
+fn culled_windows_do_not_shift_the_visual_group_of_shown_effects() {
+    let socket_name = format!("typhon-frame-head-effect-order-{}", process::id());
+    let mut server = OwnCompositorServer::bind_cpu_composition(&socket_name)
+        .expect("bind compositor for head effect order regression");
+    server.set_output_size(1920, 1080);
+    // The TV window sits below the primary window in the stack.
+    server.install_native_frame_test_scene(
+        vec![
+            test_surface(831, 640, 360, SurfacePlacement::absolute_root_at(2400, 200)),
+            test_surface(832, 320, 200, SurfacePlacement::absolute_root_at(100, 100)),
+        ],
+        &[
+            (831, WindowId::from_raw(831).expect("tv window id")),
+            (832, WindowId::from_raw(832).expect("primary window id")),
+        ],
+        None,
+    );
+    assert!(server.install_native_frame_test_effect(
+        832,
+        EffectAnchor::BeforeSurface(832),
+        oblivion_one::effects::builtin_background_blur_program_id(),
+        EffectRegion::from_rect(EffectRect::new(0, 0, 320, 200).unwrap()),
+    ));
+    let _tv = server
+        .add_logical_output("HDMI-A-2", (1920, 0), (1920, 1080), 1.0, 60)
+        .expect("tv output");
+
+    let primary = ResolvedNativeFrameScene::from_server_at(&server, AnimationTime::from_nanos(1));
+    assert_eq!(primary.surface_ids().collect::<Vec<_>>(), [832]);
+    assert_eq!(primary.effects.instances.len(), 1);
+    // The primary draws one window, so its blur belongs to the first group;
+    // numbering it against the unculled stack put it after the window.
+    assert_eq!(
+        primary.effects.instances[0].visual_group,
+        oblivion_one::compositor::VisualStackGroup::id_for_order(0),
+    );
+}

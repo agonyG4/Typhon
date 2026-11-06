@@ -919,6 +919,7 @@ impl<'a> ResolvedNativeFrameScene<'a> {
         // from the frame surfaces: rendered surfaces take presentation
         // feedback and damage.
         let mut culled_surface_ids = HashSet::new();
+        let mut culled_owner_roots = HashSet::new();
         let (
             surfaces,
             all_canonical_ordered_surfaces,
@@ -926,7 +927,7 @@ impl<'a> ResolvedNativeFrameScene<'a> {
             all_canonical_ordered_owners,
         ) = match head_viewport {
             Some(viewport) => {
-                let culled_owner_roots = viewport.culled_owner_roots(
+                culled_owner_roots = viewport.culled_owner_roots(
                     surfaces.as_ref(),
                     all_canonical_ordered_owners.as_ref(),
                     &presentation,
@@ -990,10 +991,28 @@ impl<'a> ResolvedNativeFrameScene<'a> {
         // full scene and filtering afterwards numbered a dominant fullscreen
         // owner's blur by the unculled scene, so it sorted after the owner and
         // drew over it once the Super+F animation settled.
+        // Effect order (visual group, group and surface order) indexes the
+        // surface list it is resolved against, and the renderer derives its
+        // groups from the surfaces this head draws: resolve against the same
+        // culled list, or effects of a later group land on the wrong window.
+        let (effect_surfaces, effect_owner_roots) = if culled_owner_roots.is_empty() {
+            (
+                Cow::Borrowed(frame_surfaces.as_ref()),
+                Cow::Borrowed(frame_owner_roots.as_ref()),
+            )
+        } else {
+            let (surfaces, owners): (Vec<_>, Vec<_>) = frame_surfaces
+                .iter()
+                .zip(frame_owner_roots.iter())
+                .filter(|(_, owner_root)| !culled_owner_roots.contains(*owner_root))
+                .map(|(surface, owner_root)| (surface.clone(), *owner_root))
+                .unzip();
+            (Cow::Owned(surfaces), Cow::Owned(owners))
+        };
         let frame_effect_source = FrameEffectSceneInput {
-            surfaces: frame_surfaces.as_ref(),
+            surfaces: effect_surfaces.as_ref(),
             popup_surface_ids: popup_surface_ids.as_ref(),
-            presentation_owner_roots: frame_owner_roots.as_ref(),
+            presentation_owner_roots: effect_owner_roots.as_ref(),
             workspace_by_owner_root: &workspace_by_owner_root,
             workspace_sample: workspace_presentation_sample.as_ref(),
             special_workspace_dim,
