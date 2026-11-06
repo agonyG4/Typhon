@@ -8,8 +8,10 @@
 //!
 //! Secondary heads draw no cursor yet (the pointer stays on the primary until
 //! the union clamp lands), and a head that fails to come up is withdrawn
-//! without affecting the primary. `TYPHON_SECONDARY_HEADS=0` keeps the
-//! runtime single-head.
+//! without affecting the primary. Secondary heads are opt-in with
+//! `TYPHON_SECONDARY_HEADS=1` until input, focus, and workspace switching
+//! work across outputs: with a second output attached the pointer cannot
+//! reach it, yet workspaces and keyboard focus already follow it.
 
 use super::kms_worker_startup::start_kms_commit_worker;
 use super::*;
@@ -17,7 +19,7 @@ use oblivion_one::native::kms::{AtomicKmsError, AtomicKmsErrorKind};
 use std::os::fd::AsFd;
 
 pub(super) fn secondary_heads_enabled() -> bool {
-    std::env::var_os("TYPHON_SECONDARY_HEADS").is_none_or(|value| value != "0")
+    std::env::var_os("TYPHON_SECONDARY_HEADS").is_some_and(|value| value == "1")
 }
 
 impl NativeRuntime {
