@@ -2241,6 +2241,7 @@ impl NativeRuntime {
             server,
             head:
                 OutputHead {
+                    kms_backend,
                     target,
                     mode_label: _,
                     output_refresh_rate,
@@ -2286,7 +2287,6 @@ impl NativeRuntime {
                 },
             perf: _,
             kms,
-            kms_backend,
             drm_timestamp_clock,
             presentation_clock,
             frame_renderer: _,

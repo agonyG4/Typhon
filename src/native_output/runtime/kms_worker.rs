@@ -927,6 +927,7 @@ impl NativeRuntime {
             );
         }
         let submitter = self
+            .head
             .kms_backend
             .atomic()
             .ok_or_else(|| io::Error::other("worker transport has no Atomic backend"))?
@@ -1108,7 +1109,7 @@ impl NativeRuntime {
             KmsCursorUpdate::Disable => (true, None),
             KmsCursorUpdate::Set(state) => (true, Some(state)),
         };
-        let submitter = self.kms_backend.atomic_commit_submitter().ok_or_else(|| {
+        let submitter = self.head.kms_backend.atomic_commit_submitter().ok_or_else(|| {
             io::Error::other("presentation fallback validation requires Atomic KMS")
         })?;
         let test_token = PageFlipToken::new(allocate_native_page_flip_token())

@@ -419,8 +419,8 @@ impl NativeSessionIo for NativeRuntime {
 
     fn recover_kms_pipeline(&mut self) -> NativeResult<()> {
         self.abandon_direct_fallback();
-        if self.kms_backend.effective_kind() == KmsBackendKind::Atomic {
-            self.kms_backend
+        if self.head.kms_backend.effective_kind() == KmsBackendKind::Atomic {
+            self.head.kms_backend
                 .rediscover_atomic_pipeline_for_recovery(self.kms.file().as_fd())?;
         }
         let drm_session_generation = allocate_native_drm_session_generation();
@@ -429,7 +429,7 @@ impl NativeSessionIo for NativeRuntime {
         let recovery = self.head.scanout.prepare_session_recovery()?;
         let framebuffer = recovery.framebuffer_id();
         let _prepared_cursor_state = if self.head.atomic_cursor.is_some() {
-            let atomic = self.kms_backend.atomic().ok_or_else(|| {
+            let atomic = self.head.kms_backend.atomic().ok_or_else(|| {
                 io::Error::other("Atomic cursor exists without an Atomic KMS backend")
             })?;
             match atomic.discovery().cursor_plane.clone() {
@@ -474,7 +474,7 @@ impl NativeSessionIo for NativeRuntime {
             .kms_state()
             .cloned()
         });
-        self.kms_backend
+        self.head.kms_backend
             .recover_with_cursor(framebuffer, cursor_kms_state.as_ref())?;
         if let Some(cursor) = self.head.atomic_cursor.as_mut() {
             cursor.mark_synchronous_modeset_submitted(cursor_kms_state.as_ref());
@@ -497,7 +497,7 @@ impl NativeSessionIo for NativeRuntime {
         self.perf.log("native.session_recovery", || {
             vec![
                 NativePerfField::str("completion", "synchronous_modeset"),
-                NativePerfField::str("kms_backend", self.kms_backend.effective_kind().as_str()),
+                NativePerfField::str("kms_backend", self.head.kms_backend.effective_kind().as_str()),
                 NativePerfField::u64("framebuffer", u64::from(framebuffer.get())),
                 NativePerfField::u64("output_id", self.head.output_id.get()),
                 NativePerfField::u64("prepared_session_generation", drm_session_generation.get()),
@@ -686,8 +686,8 @@ impl NativeSessionIo for NativeRuntime {
         self.head.scanout.rebind_output_epoch(
             output_epoch,
             recovery.drm_session_generation,
-            self.kms_backend.atomic_connector_vrr_capable(),
-            self.kms_backend.atomic_crtc_vrr_property_available(),
+            self.head.kms_backend.atomic_connector_vrr_capable(),
+            self.head.kms_backend.atomic_crtc_vrr_property_available(),
         )?;
         self.settle_and_rebase_session_output_frame_lanes(monotonic_now_ns()?)?;
         self.head.output_epoch = output_epoch;
@@ -731,7 +731,7 @@ impl NativeSessionIo for NativeRuntime {
             self.head.cursor_render_mode = NativeCursorRenderMode::Hardware;
             return Ok(());
         }
-        if self.kms_backend.effective_kind() == KmsBackendKind::Atomic {
+        if self.head.kms_backend.effective_kind() == KmsBackendKind::Atomic {
             if self.cursor_preference == NativeCursorPreference::Hardware {
                 return Err(io::Error::other(
                     "Atomic hardware cursor was not available during session recovery",
@@ -815,7 +815,7 @@ impl NativeSessionIo for NativeRuntime {
 
     fn disarm_drm_destructors(&mut self) {
         self.head.scanout.disarm_drm_cleanup();
-        self.kms_backend.disarm_drm_io();
+        self.head.kms_backend.disarm_drm_io();
         if let Some(cursor) = self.head.atomic_cursor.as_mut() {
             cursor.disarm_drm_cleanup();
         }

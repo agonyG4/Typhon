@@ -393,7 +393,7 @@ impl NativeRuntime {
             unsafe { std::mem::ManuallyDrop::drop(&mut self.head.scanout) };
             self.head.scanout_destroyed = true;
         }
-        self.kms_backend.disarm_drm_io();
+        self.head.kms_backend.disarm_drm_io();
         Ok(self
             .kms
             .destroy_target()
@@ -406,7 +406,7 @@ impl NativeRuntime {
         }
         self.head.kms_teardown_safety_established = true;
         let proof = if self.session.permits_output() {
-            match self.kms_backend.restore() {
+            match self.head.kms_backend.restore() {
                 Ok(outcome) => {
                     eprintln!("native KMS teardown reached a safe boundary: {outcome:?}");
                     proof_from_restoration(outcome)
@@ -442,7 +442,7 @@ impl NativeRuntime {
             if !self.head.scanout_destroyed {
                 self.head.scanout.disarm_drm_cleanup();
             }
-            self.kms_backend.disarm_drm_io();
+            self.head.kms_backend.disarm_drm_io();
             if let Some(cursor) = self.head.atomic_cursor.as_mut() {
                 cursor.disarm_drm_cleanup();
             }
@@ -458,7 +458,7 @@ impl NativeRuntime {
         if !self.head.scanout_destroyed {
             self.head.scanout.disarm_drm_cleanup();
         }
-        self.kms_backend.disarm_drm_io();
+        self.head.kms_backend.disarm_drm_io();
         if let Some(cursor) = self.head.atomic_cursor.as_mut() {
             cursor.disarm_drm_cleanup();
         }

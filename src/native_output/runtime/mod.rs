@@ -742,7 +742,6 @@ pub(crate) struct NativeRuntime {
     drm_session_generation: DrmSessionGeneration,
     drm_timestamp_clock: DrmTimestampClock,
     presentation_clock: PresentationClock,
-    kms_backend: KmsBackendSelection,
     frame_renderer: NativeFrameRenderer,
     input_state: NativeInputState,
     cursor_preference: NativeCursorPreference,

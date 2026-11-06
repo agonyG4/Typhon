@@ -249,7 +249,7 @@ impl NativeRuntime {
         }
         self.perf.log("native.kms_restore", || {
             vec![
-                NativePerfField::str("backend", self.kms_backend.effective_kind().as_str()),
+                NativePerfField::str("backend", self.head.kms_backend.effective_kind().as_str()),
                 NativePerfField::str("outcome", safety.as_str()),
                 NativePerfField::str("shutdown_pageflip", reason.as_str()),
                 NativePerfField::bool("pageflip_pending", pageflip_pending),

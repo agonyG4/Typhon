@@ -288,6 +288,7 @@ impl NativeRuntime {
             server,
             head:
                 OutputHead {
+                    kms_backend,
                     output_id,
                     target,
                     mode_label,
@@ -346,7 +347,6 @@ impl NativeRuntime {
             cursor_manager,
             perf: _,
             kms,
-            kms_backend,
             drm_session_generation,
             drm_timestamp_clock: _,
             presentation_clock: _,

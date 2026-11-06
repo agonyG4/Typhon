@@ -1128,7 +1128,7 @@ impl NativeRuntime {
             return Err("quiescence proof belongs to a stale output epoch".into());
         }
         let commit_started = Instant::now();
-        self.kms_backend
+        self.head.kms_backend
             .commit_runtime_modeset_candidate(modeset)
             .map_err(|error| error.to_string())?;
         Ok(commit_started_at_ns
@@ -1154,7 +1154,7 @@ impl NativeRuntime {
             OUTPUT_MODE_SELECTION_RUNTIME_QUALIFIED,
             self.head.output_mode_mutation_policy,
             OutputModeMutationRuntimeEvidence {
-                atomic_kms: self.kms_backend.effective_kind()
+                atomic_kms: self.head.kms_backend.effective_kind()
                     == oblivion_one::native::kms::KmsBackendKind::Atomic,
                 exact_mode_count: self.head.output_capabilities.mode_inventory.entries().len(),
                 scanout_kind: self.head.scanout.kind(),
@@ -1181,7 +1181,7 @@ impl NativeRuntime {
             OUTPUT_MODE_SELECTION_RUNTIME_QUALIFIED,
             blocker == "none",
             blocker,
-            self.kms_backend.effective_kind().as_str(),
+            self.head.kms_backend.effective_kind().as_str(),
             self.head.scanout.kind().as_str(),
             self.head.output_capabilities.mode_inventory.entries().len(),
         );
@@ -1953,7 +1953,7 @@ impl NativeRuntime {
             let framebuffer = explicit.framebuffer(frame.slot)?;
             explicit.promote_initial_presented(frame.slot, frame.scene_commit)?;
             let cursor = self.candidate_cursor_state(&pending.target);
-            let modeset = match self.kms_backend.prepare_runtime_modeset_candidate(
+            let modeset = match self.head.kms_backend.prepare_runtime_modeset_candidate(
                 pending.target.mode,
                 pending.target.width,
                 pending.target.height,
@@ -2001,7 +2001,7 @@ impl NativeRuntime {
                 unreachable!()
             };
             let framebuffer = candidate.framebuffer(frame.slot)?;
-            let modeset = match self.kms_backend.prepare_runtime_modeset_candidate(
+            let modeset = match self.head.kms_backend.prepare_runtime_modeset_candidate(
                 pending.target.mode,
                 pending.target.width,
                 pending.target.height,
@@ -2165,6 +2165,7 @@ impl NativeRuntime {
         };
 
         if let Err(error) = self
+            .head
             .kms_backend
             .test_runtime_modeset_candidate(&mut modeset)
         {
@@ -2306,7 +2307,7 @@ impl NativeRuntime {
                 return Ok(OutputConfigurationAdvance::Waiting);
             }
         };
-        self.kms_backend
+        self.head.kms_backend
             .adopt_committed_runtime_modeset_candidate(modeset);
         pending.prepared_transaction = prepared_transaction;
         pending.candidate = Some(CandidateScanoutState::WorkerPromotionQueued {
@@ -2626,6 +2627,7 @@ impl NativeRuntime {
                 return Err(error);
             }
             let modeset = match self
+                .head
                 .kms_backend
                 .prepare_runtime_modeset_candidate(
                     target.mode,
@@ -2872,6 +2874,7 @@ impl NativeRuntime {
                     let framebuffer = FramebufferId::new(scanout.fb_id())
                         .ok_or_else(|| io::Error::other("candidate framebuffer ID is zero"))?;
                     let modeset = self
+                        .head
                         .kms_backend
                         .prepare_runtime_modeset_candidate(
                             target.mode,
@@ -3217,7 +3220,7 @@ impl OutputConfigurationRuntime for NativeRuntime {
             | OutputConfigurationTransitionCandidate::ReadyReuse { modeset, .. } => modeset,
             _ => return Err("output candidate is not ready for TEST_ONLY".to_string()),
         };
-        self.kms_backend
+        self.head.kms_backend
             .test_runtime_modeset_candidate(modeset)
             .map_err(|error| format!("TEST_ONLY: {error}"))
     }
@@ -3344,12 +3347,12 @@ impl OutputConfigurationRuntime for NativeRuntime {
                 modeset,
                 cursor,
             } => {
-                self.kms_backend
+                self.head.kms_backend
                     .adopt_committed_runtime_modeset_candidate(modeset);
                 OutputConfigurationTransitionCandidate::AdoptedReplacement { scanout, cursor }
             }
             OutputConfigurationTransitionCandidate::ReadyReuse { modeset, cursor } => {
-                self.kms_backend
+                self.head.kms_backend
                     .adopt_committed_runtime_modeset_candidate(modeset);
                 OutputConfigurationTransitionCandidate::AdoptedReuse { cursor }
             }

@@ -103,16 +103,17 @@ impl NativeRuntime {
 
     fn refresh_active_vrr_capability(&mut self, reason: &'static str) {
         let before = (
-            self.kms_backend.atomic_connector_vrr_capable(),
-            self.kms_backend.atomic_crtc_vrr_property_available(),
+            self.head.kms_backend.atomic_connector_vrr_capable(),
+            self.head.kms_backend.atomic_crtc_vrr_property_available(),
         );
         if let Err(error) = self
+            .head
             .kms_backend
             .rediscover_atomic_pipeline_for_recovery(self.kms.file().as_fd())
         {
             // Legacy KMS or a pipeline that changed under us: keep the old
             // capability; head reconfiguration owns the latter.
-            if self.kms_backend.effective_kind()
+            if self.head.kms_backend.effective_kind()
                 == oblivion_one::native::kms::KmsBackendKind::Atomic
             {
                 eprintln!(
@@ -122,8 +123,8 @@ impl NativeRuntime {
             return;
         }
         let after = (
-            self.kms_backend.atomic_connector_vrr_capable(),
-            self.kms_backend.atomic_crtc_vrr_property_available(),
+            self.head.kms_backend.atomic_connector_vrr_capable(),
+            self.head.kms_backend.atomic_crtc_vrr_property_available(),
         );
         let selected_connector = kms_card_path(self.kms.file()).ok().and_then(|kms_path| {
             crate::native_output::output::selected_connector_for_kms_target(

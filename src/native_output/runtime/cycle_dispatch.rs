@@ -1660,7 +1660,7 @@ impl NativeRuntime {
                     doctor_check(
                         "kms.backend",
                         DoctorSeverity::Ok,
-                        self.kms_backend.effective_kind().as_str(),
+                        self.head.kms_backend.effective_kind().as_str(),
                     ),
                     doctor_check(
                         "renderer.backend",
@@ -1778,11 +1778,11 @@ impl NativeRuntime {
                     ),
                     doctor_check(
                         "vrr.state",
-                        vrr_doctor_severity(self.vrr_policy, self.kms_backend.atomic_vrr_capable()),
+                        vrr_doctor_severity(self.vrr_policy, self.head.kms_backend.atomic_vrr_capable()),
                         format!(
                             "policy={} atomic_capable={}",
                             self.vrr_policy.as_str(),
-                            self.kms_backend.atomic_vrr_capable()
+                            self.head.kms_backend.atomic_vrr_capable()
                         ),
                     ),
                 ];
@@ -2174,6 +2174,7 @@ impl NativeRuntime {
             server,
             head:
                 OutputHead {
+                    kms_backend,
                     output_id,
                     target,
                     mode_label,
@@ -2201,7 +2202,6 @@ impl NativeRuntime {
                 },
             perf: _,
             kms,
-            kms_backend,
             drm_timestamp_clock,
             presentation_clock,
             frame_renderer,
@@ -4788,10 +4788,10 @@ impl NativeRuntime {
             },
             position: PositionSnapshot { x: 0, y: 0 },
             focused: true,
-            backend: self.kms_backend.effective_kind().as_str().to_string(),
+            backend: self.head.kms_backend.effective_kind().as_str().to_string(),
             vrr: FeatureStateSnapshot {
                 state: runtime_vrr_feature_state(
-                    self.kms_backend.atomic_vrr_capable(),
+                    self.head.kms_backend.atomic_vrr_capable(),
                     self.head
                         .confirmed_kms_presentation
                         .vrr_request_confirmed_for(self.head.output_epoch.get()),

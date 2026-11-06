@@ -343,7 +343,7 @@ impl NativeRuntime {
         let decision = super::presentation_worker::present_cursor_for_presentation(
             true,
             Some(worker),
-            &self.kms_backend,
+            &self.head.kms_backend,
             cursor,
             &mut self.head.cursor_timing,
             Some(desired),
@@ -1862,6 +1862,7 @@ impl NativeRuntime {
             server,
             head:
                 OutputHead {
+                    kms_backend,
                     target,
                     mode_label,
                     output_epoch,
@@ -1879,7 +1880,6 @@ impl NativeRuntime {
                 },
             perf: _,
             kms,
-            kms_backend,
             drm_timestamp_clock,
             presentation_clock,
             frame_renderer,

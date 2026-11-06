@@ -1123,7 +1123,7 @@ impl NativeRuntime {
             fields.extend([
                 NativePerfField::bool(
                     "atomic_cursor_plane_available",
-                    self.kms_backend
+                    self.head.kms_backend
                         .atomic()
                         .is_some_and(|atomic| atomic.discovery().cursor_plane.is_some()),
                 ),

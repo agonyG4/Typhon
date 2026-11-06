@@ -7,6 +7,8 @@ use super::*;
 pub(crate) struct OutputHead {
     pub(super) output_id: OutputId,
     pub(super) target: NativeAppliedOutputConfiguration,
+    /// Atomic/legacy KMS pipeline bound to this head's connector and CRTC.
+    pub(super) kms_backend: KmsBackendSelection,
     pub(super) output_capabilities: NativeOutputCapabilities,
     pub(super) output_mode_mutation_policy: output_configuration::OutputModeMutationPolicy,
     pub(super) output_configuration_generation: OutputConfigurationGeneration,

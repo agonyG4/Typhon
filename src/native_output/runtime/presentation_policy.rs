@@ -141,7 +141,7 @@ impl NativeRuntime {
         &mut self,
         policy: KmsCommitWorkerPolicy,
     ) -> Result<(), PresentationPolicyError> {
-        let atomic = self.kms_backend.effective_kind() == KmsBackendKind::Atomic;
+        let atomic = self.head.kms_backend.effective_kind() == KmsBackendKind::Atomic;
         let transport = match (policy, atomic) {
             (KmsCommitWorkerPolicy::Off, _) | (KmsCommitWorkerPolicy::Auto, false) => {
                 KmsCommitWorkerTransport::Synchronous
@@ -206,6 +206,7 @@ impl NativeRuntime {
 
     fn start_kms_commit_worker_at_runtime(&mut self) -> Result<(), PresentationPolicyError> {
         let submitter = self
+            .head
             .kms_backend
             .atomic()
             .ok_or(PresentationPolicyError::KmsWorkerUnsupported)?

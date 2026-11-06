@@ -693,6 +693,7 @@ impl NativeRuntime {
             head: super::output_head::OutputHead {
                 output_id,
                 target,
+                kms_backend,
                 output_capabilities,
                 output_mode_mutation_policy,
                 output_configuration_generation: OutputConfigurationGeneration::initial(),
@@ -771,7 +772,6 @@ impl NativeRuntime {
             cursor_manager,
             perf,
             kms,
-            kms_backend,
             drm_session_generation,
             drm_timestamp_clock,
             presentation_clock,
