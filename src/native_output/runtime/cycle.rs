@@ -490,12 +490,17 @@ impl NativeRuntime {
     }
 
     fn run_cycle(&mut self) -> NativeResult<()> {
-        let mut cycle = self.wait_for_events_and_pageflips()?;
+        let (mut cycle, mut parked_cycles) = self.wait_for_events_and_pageflips()?;
         // A worker completion returns ownership to the reactor before any
         // planner can admit work for this cycle. The planner below therefore
         // always sees the settled swapchain/transaction state and current
         // compositor state.
         self.settle_pending_render_worker_completion(&mut cycle)?;
+        for (index, parked_cycle) in parked_cycles.iter_mut().enumerate() {
+            self.with_parked_head(index, |runtime| {
+                runtime.settle_pending_render_worker_completion(parked_cycle)
+            })?;
+        }
         self.settle_gpu_screencopy()?;
         let now_ns = monotonic_now_ns()?;
         if self
@@ -1084,17 +1089,19 @@ impl NativeRuntime {
             self.resource_efficiency_mut()
                 .record_presentation_planning_skip();
         }
-        let visual_scene_debt = super::commit_timing::logical_scene_changed(
-            self.head.last_rendered_scene_generation,
-            self.server.scene_render_generation(),
-        );
-        let cursor_temporal_work = self
-            .head
-            .cursor_output_arbitration
-            .has_future_wake_requirement(
-                monotonic_now_ns()?,
-                self.head.kms_commit_worker_transport,
-            );
+        let parked_presentation_work = self.present_parked_heads(
+            &mut parked_cycles,
+            &cycle,
+            prepare_outcome.visual_work_created,
+        )?;
+        let presentation_work = presentation_work || parked_presentation_work;
+        let (mut visual_scene_debt, mut cursor_temporal_work) = self.head_cycle_tail_wake_work()?;
+        for index in 0..self.parked_head_count() {
+            let (debt, cursor) =
+                self.with_parked_head(index, |runtime| runtime.head_cycle_tail_wake_work())?;
+            visual_scene_debt |= debt;
+            cursor_temporal_work |= cursor;
+        }
         if super::wake_plan::cycle_tail_requires_runtime_wake_plan(
             presentation_work,
             self.input_epoch.backlog_pending(),
@@ -1117,6 +1124,56 @@ impl NativeRuntime {
         }
         self.finish_slow_cycle(&cycle, render_attempted)?;
         Ok(())
+    }
+
+    /// Per head: whether the cycle tail must arm a wake for scene debt this
+    /// head has not rendered yet, or for its cursor temporal work.
+    fn head_cycle_tail_wake_work(&self) -> NativeResult<(bool, bool)> {
+        let visual_scene_debt = super::commit_timing::logical_scene_changed(
+            self.head.last_rendered_scene_generation,
+            self.server.scene_render_generation(),
+        );
+        let cursor_temporal_work = self
+            .head
+            .cursor_output_arbitration
+            .has_future_wake_requirement(
+                monotonic_now_ns()?,
+                self.head.kms_commit_worker_transport,
+            );
+        Ok((visual_scene_debt, cursor_temporal_work))
+    }
+
+    /// Runs presentation planning for each parked head with the scene work
+    /// the global phase produced. Returns whether any head was admitted.
+    fn present_parked_heads(
+        &mut self,
+        parked_cycles: &mut [NativeCycleState],
+        primary_cycle: &NativeCycleState,
+        visual_work_created: bool,
+    ) -> NativeResult<bool> {
+        let mut admitted = false;
+        for (index, parked_cycle) in parked_cycles.iter_mut().enumerate() {
+            parked_cycle.redraw_requested |= primary_cycle.redraw_requested;
+            parked_cycle.shutdown_requested |= primary_cycle.shutdown_requested;
+            admitted |= self.with_parked_head(index, |runtime| -> NativeResult<bool> {
+                let state = runtime.native_runtime_state(parked_cycle, monotonic_now_ns()?);
+                parked_cycle.work_class =
+                    NativeWorkDomains::from_wakeup(&parked_cycle.wakeup, &state).work_class;
+                let work = NativeWorkDomains::classify(&parked_cycle.wakeup, &state)
+                    .operation_plan()
+                    .presentation_admitted(
+                        parked_cycle.redraw_requested,
+                        parked_cycle.frame_completed,
+                        visual_work_created,
+                    );
+                parked_cycle.presentation_admitted = work;
+                if work {
+                    runtime.render_present_and_update_metrics(parked_cycle)?;
+                }
+                Ok(work)
+            })?;
+        }
+        Ok(admitted)
     }
 
     fn finish_slow_cycle(

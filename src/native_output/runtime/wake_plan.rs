@@ -105,6 +105,24 @@ pub(crate) struct NativeWakePlan {
     pub(crate) deadline: Option<NativeDeadline>,
 }
 
+impl NativeWakePlan {
+    /// Combines two heads' plans: every continuation reason, earliest deadline.
+    pub(crate) fn merge(self, other: Self) -> Self {
+        let deadline = match (self.deadline, other.deadline) {
+            (Some(left), Some(right)) => Some(if right.at_ns < left.at_ns {
+                right
+            } else {
+                left
+            }),
+            (left, right) => left.or(right),
+        };
+        Self {
+            continuation: self.continuation.union(other.continuation),
+            deadline,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct NativeWakePlanInputs {
     pub(crate) now_ns: u64,

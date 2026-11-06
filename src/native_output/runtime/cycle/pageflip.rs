@@ -2156,7 +2156,44 @@ fn should_continue_resuming_recovery(
 
 impl NativeRuntime {
     #[allow(clippy::collapsible_if)]
-    pub(super) fn wait_for_events_and_pageflips(&mut self) -> NativeResult<NativeCycleState> {
+    /// Waits for the reactor and settles every head: the active head's cycle
+    /// state is returned first, then one per parked head in order.
+    pub(super) fn wait_for_events_and_pageflips(
+        &mut self,
+    ) -> NativeResult<(NativeCycleState, Vec<NativeCycleState>)> {
+        let (wakeup, slow_cycle_start_ns) = self.wait_for_runtime_events()?;
+        self.process_head_worker_events(&wakeup)?;
+        for index in 0..self.parked_head_count() {
+            self.with_parked_head(index, |runtime| runtime.process_head_worker_events(&wakeup))?;
+        }
+        let (disabled_observed, resuming_recovery_wake) =
+            self.dispatch_seat_and_session_recovery(&wakeup)?;
+        let parked_wakeup = (self.parked_head_count() > 0).then(|| wakeup.clone());
+        let cycle = self.settle_head_pageflips(
+            wakeup,
+            slow_cycle_start_ns,
+            disabled_observed,
+            resuming_recovery_wake,
+        )?;
+        let mut parked_cycles = Vec::with_capacity(self.parked_head_count());
+        if let Some(wakeup) = parked_wakeup {
+            for index in 0..self.parked_head_count() {
+                parked_cycles.push(self.with_parked_head(index, |runtime| {
+                    runtime.settle_head_pageflips(
+                        wakeup.clone(),
+                        None,
+                        disabled_observed,
+                        resuming_recovery_wake,
+                    )
+                })?);
+            }
+        }
+        Ok((cycle, parked_cycles))
+    }
+
+    /// Global: blocks in the reactor and services wake bookkeeping that is not
+    /// owned by any output head.
+    fn wait_for_runtime_events(&mut self) -> NativeResult<(NativeWakeup, Option<u64>)> {
         self.termination.set_phase(RuntimePhase::ReactorWait);
         let wakeup = self.event_loop.wait()?;
         self.termination.set_phase(RuntimePhase::RuntimeCycle);
@@ -2197,6 +2234,12 @@ impl NativeRuntime {
             None
         };
         self.service_dmabuf_gpu_releases(&wakeup.dmabuf_gpu_release_tokens)?;
+        Ok((wakeup, slow_cycle_start_ns))
+    }
+
+    /// Per head: KMS and render worker acknowledgments establish physical
+    /// ownership before seat events and pageflip validation run.
+    pub(super) fn process_head_worker_events(&mut self, wakeup: &NativeWakeup) -> NativeResult<()> {
         self.termination.set_phase(RuntimePhase::KmsWorker);
         self.check_kms_commit_worker_health()?;
         if wakeup.reasons.kms_commit_worker() || wakeup.reasons.drm() {
@@ -2209,9 +2252,22 @@ impl NativeRuntime {
         }
         self.termination.set_phase(RuntimePhase::RuntimeCycle);
         self.retire_settled_output_terminals();
-        let deferred_worker_pageflip = self.head.deferred_worker_pageflip.take();
-        let deferred_worker_completion = self.head.deferred_worker_completion.take();
-        let worker_timeout_pending = self.head.worker_timeout_pending.take();
+        // Handed to this head's pageflip settlement. Kept out of the deferred
+        // fields so a session suspend during seat dispatch cannot clear them,
+        // exactly as when they were locals of one function.
+        self.head.cycle_worker_handoff = Some((
+            self.head.deferred_worker_pageflip.take(),
+            self.head.deferred_worker_completion.take(),
+            self.head.worker_timeout_pending.take(),
+        ));
+        Ok(())
+    }
+
+    /// Global: seat events and resuming session recovery.
+    fn dispatch_seat_and_session_recovery(
+        &mut self,
+        wakeup: &NativeWakeup,
+    ) -> NativeResult<(bool, bool)> {
         self.termination.set_phase(RuntimePhase::SeatEvents);
         let disabled_observed = self.dispatch_runtime_seat_events(&wakeup)?;
         self.termination.set_phase(RuntimePhase::RuntimeCycle);
@@ -2228,6 +2284,20 @@ impl NativeRuntime {
             self.continue_native_session_recovery()?;
             self.termination.set_phase(RuntimePhase::RuntimeCycle);
         }
+        Ok((disabled_observed, resuming_recovery_wake))
+    }
+
+    /// Per head: drains and validates this head's pageflip completion and
+    /// produces the cycle state its presentation step consumes.
+    pub(super) fn settle_head_pageflips(
+        &mut self,
+        wakeup: NativeWakeup,
+        slow_cycle_start_ns: Option<u64>,
+        disabled_observed: bool,
+        resuming_recovery_wake: bool,
+    ) -> NativeResult<NativeCycleState> {
+        let (deferred_worker_pageflip, deferred_worker_completion, worker_timeout_pending) =
+            self.head.cycle_worker_handoff.take().unwrap_or_default();
         if self.session.permits_output()
             && (wakeup.reasons.drm()
                 || (wakeup.reasons.timer()
@@ -2312,6 +2382,8 @@ impl NativeRuntime {
             shutdown,
             cursor_reveal_trace,
             gpu_screencopy,
+            parked_heads,
+            pageflip_inbox,
             ..
         } = self;
         let scheduler_state_before = frame_scheduler.state();
@@ -2466,17 +2538,34 @@ impl NativeRuntime {
                     || atomic_commit_arbiter.atomic_commit_pending()
                     || shutdown.state() == ShutdownState::Draining));
         let pageflip_drain = if should_drain_pageflips {
-            scanout
-                .drain_page_flip_events(kms.file().as_raw_fd(), kms_backend.effective_kind())
-                .map_err(|error| {
-                    native_runtime_error(
-                        NativeRuntimeStage::DrainPageFlipEvents,
-                        scanout.kind(),
-                        target.crtc_id,
-                        *frame_index,
-                        error,
-                    )
-                })?
+            let scanout_kind = scanout.kind();
+            let drain_error = |error| {
+                native_runtime_error(
+                    NativeRuntimeStage::DrainPageFlipEvents,
+                    scanout_kind,
+                    target.crtc_id,
+                    *frame_index,
+                    error,
+                )
+            };
+            if matches!(**scanout, NativeScanoutBackend::AtomicEglGbm(_)) {
+                pageflip_inbox.extend(
+                    drain_drm_page_flip_events(kms.file().as_raw_fd()).map_err(drain_error)?,
+                );
+                let other_head_crtcs = parked_heads
+                    .iter()
+                    .map(|head| head.target.crtc_id)
+                    .collect::<Vec<_>>();
+                super::pageflip_inbox::take_head_pageflip(
+                    pageflip_inbox,
+                    target.crtc_id,
+                    &other_head_crtcs,
+                )
+            } else {
+                scanout
+                    .drain_page_flip_events(kms.file().as_raw_fd(), kms_backend.effective_kind())
+                    .map_err(drain_error)?
+            }
         } else {
             NativePageFlipDrain::default()
         };

@@ -55,6 +55,12 @@ pub(crate) struct OutputHead {
     pub(super) deferred_worker_pageflip: Option<DrmPresentationEvent>,
     pub(super) deferred_worker_completion: Option<AtomicCommitCompletion>,
     pub(super) worker_timeout_pending: Option<(PageFlipToken, u64)>,
+    /// Deferred worker events taken for this cycle's pageflip settlement.
+    pub(super) cycle_worker_handoff: Option<(
+        Option<DrmPresentationEvent>,
+        Option<AtomicCommitCompletion>,
+        Option<(PageFlipToken, u64)>,
+    )>,
     pub(super) forced_shutdown_inflight: Option<super::super::kms_worker::WorkerInFlight>,
     pub(super) forced_shutdown_pacing_settled: Option<(
         PageFlipToken,
@@ -97,4 +103,24 @@ pub(crate) struct OutputHead {
     pub(super) frame_pacing: NativeFramePacing,
     pub(super) last_acquire_ready_at_ns: Option<u64>,
     pub(super) scaled_primary_probe: crate::native_output::scanout::ScaledPrimaryProbeCache,
+}
+
+impl NativeRuntime {
+    pub(super) fn parked_head_count(&self) -> usize {
+        self.parked_heads.len()
+    }
+
+    /// Runs `f` with parked head `index` swapped into `self.head`, so the
+    /// per-head cycle phases written against `self.head` drive that head.
+    /// `f` must not add or remove parked heads.
+    pub(super) fn with_parked_head<R>(
+        &mut self,
+        index: usize,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        std::mem::swap(&mut self.head, &mut self.parked_heads[index]);
+        let result = f(self);
+        std::mem::swap(&mut self.head, &mut self.parked_heads[index]);
+        result
+    }
 }

@@ -12,6 +12,18 @@ pub(super) const fn scene_visual_debt_has_external_wake_owner(
 impl NativeRuntime {
     pub(super) fn arm_runtime_deadline(&mut self) -> NativeResult<()> {
         let now_ns = monotonic_now_ns()?;
+        let mut plan = self.head_runtime_wake_plan(now_ns)?;
+        for index in 0..self.parked_head_count() {
+            let parked =
+                self.with_parked_head(index, |runtime| runtime.head_runtime_wake_plan(now_ns))?;
+            plan = plan.merge(parked);
+        }
+        self.install_native_wake_plan(plan, now_ns)
+    }
+
+    /// Wake plan for the active head plus the global deadlines; heads are
+    /// merged by `arm_runtime_deadline`.
+    fn head_runtime_wake_plan(&mut self, now_ns: u64) -> NativeResult<NativeWakePlan> {
         let pageflip_timeout_owner: NativePageflipTimeoutOwner =
             self.head.kms_commit_worker_transport.into();
         self.dmabuf_gpu_release_registry.update_retry_for_work(
@@ -208,7 +220,7 @@ impl NativeRuntime {
                 ]
             });
         }
-        self.install_native_wake_plan(plan, now_ns)
+        Ok(plan)
     }
 }
 

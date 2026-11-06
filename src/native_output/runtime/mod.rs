@@ -148,6 +148,7 @@ mod output_configuration;
 mod output_head;
 use output_head::OutputHead;
 mod output_hotplug;
+mod pageflip_inbox;
 #[cfg(test)]
 mod physical_effect_damage_tests;
 mod plane_cycle;
@@ -735,6 +736,12 @@ pub(crate) struct NativeRuntime {
     server: OwnCompositorServer,
     // Per-output physical presentation state. One head until multi-head.
     head: output_head::OutputHead,
+    // Secondary heads. Each runs the per-head cycle phases while swapped into
+    // `head`; see `with_parked_head`.
+    parked_heads: Vec<output_head::OutputHead>,
+    // Atomic pageflip events drained from the shared DRM fd, waiting for the
+    // head that owns their CRTC.
+    pageflip_inbox: Vec<DrmPresentationEvent>,
     cursor_image: std::sync::Arc<oblivion_one::cursor_theme::CompositorCursorImage>,
     cursor_manager: oblivion_one::cursor_manager::CursorThemeManager,
     perf: NativePerfLogger,
