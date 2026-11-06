@@ -1034,6 +1034,33 @@ impl NativeRuntime {
             target.mode.vrefresh,
             mode_preference.as_str()
         );
+        // Phase 4a: plan every other connected connector as a head. Only the
+        // primary is driven until the runtime holds more than one head.
+        match plan_secondary_heads(kms.file(), &target) {
+            Ok(plan) => {
+                for head in &plan.secondaries {
+                    let secondary = &head.selection.target;
+                    println!(
+                        "native output head plan: {} connector {} crtc {} {}x{}@{}Hz at ({}, {}); not driven yet",
+                        head.selection.capabilities.connector_name,
+                        secondary.connector_id,
+                        secondary.crtc_id,
+                        secondary.width,
+                        secondary.height,
+                        secondary.mode.vrefresh,
+                        head.position.0,
+                        head.position.1,
+                    );
+                }
+                for connector in &plan.unplanned {
+                    println!(
+                        "native output head plan: {} left without a head ({})",
+                        connector.connector_name, connector.reason
+                    );
+                }
+            }
+            Err(error) => eprintln!("native output head plan failed: {error}"),
+        }
         perf.log("native.kms", || {
             vec![
                 NativePerfField::u64("connector", u64::from(target.connector_id)),

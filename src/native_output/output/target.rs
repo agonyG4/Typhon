@@ -338,7 +338,7 @@ pub(crate) fn project_native_output_modes(
         .project()
 }
 
-fn native_mode_identity_eq(
+pub(crate) fn native_mode_identity_eq(
     left: &drm_sys::drm_mode_modeinfo,
     right: &drm_sys::drm_mode_modeinfo,
 ) -> bool {
