@@ -143,6 +143,27 @@ pub(crate) fn select_secondary_head_mode(
     .or(Some(*preferred))
 }
 
+/// `TYPHON_SECONDARY_MODE=WxH` or `WxH@HZ` picks the secondary heads' mode
+/// when the sink offers it, e.g. to stay inside a link the sink only accepts
+/// at lower bandwidth. Unset, unparsable or unoffered falls back to the
+/// preferred mode.
+fn secondary_head_mode_override() -> Option<(u32, u32, Option<u32>)> {
+    parse_secondary_head_mode(&std::env::var("TYPHON_SECONDARY_MODE").ok()?)
+}
+
+fn parse_secondary_head_mode(value: &str) -> Option<(u32, u32, Option<u32>)> {
+    let (size, refresh) = match value.trim().split_once('@') {
+        Some((size, refresh)) => (size, Some(refresh.trim().parse().ok()?)),
+        None => (value.trim(), None),
+    };
+    let (width, height) = size.split_once('x')?;
+    Some((
+        width.trim().parse().ok()?,
+        height.trim().parse().ok()?,
+        refresh,
+    ))
+}
+
 /// A secondary head ready to be brought up: target, capabilities and layout.
 #[derive(Debug, Clone)]
 pub(crate) struct NativeSecondaryHeadPlan {
@@ -205,7 +226,13 @@ pub(crate) fn plan_secondary_heads(
         if connector.connection != 1 {
             continue;
         }
-        let Some(mode) = select_secondary_head_mode(&modes) else {
+        let mode_override = secondary_head_mode_override();
+        let Some(mode) = mode_override
+            .and_then(|(width, height, refresh_hz)| {
+                select_exact_kms_mode(&modes, width, height, refresh_hz)
+            })
+            .or_else(|| select_secondary_head_mode(&modes))
+        else {
             plan.unplanned.push(NativeUnplannedConnector {
                 connector_name: drm_connector_presentation_name(&connector),
                 reason: "no_usable_mode",
@@ -394,6 +421,15 @@ mod tests {
         let selected = select_secondary_head_mode(&modes).expect("mode");
         assert_eq!((selected.hdisplay, selected.vrefresh), (2560, 144));
         assert!(select_secondary_head_mode(&[]).is_none());
+        assert_eq!(
+            parse_secondary_head_mode("1920x1080@60"),
+            Some((1920, 1080, Some(60)))
+        );
+        assert_eq!(
+            parse_secondary_head_mode("3840x2160"),
+            Some((3840, 2160, None))
+        );
+        assert_eq!(parse_secondary_head_mode("4k"), None);
     }
 
     #[test]
