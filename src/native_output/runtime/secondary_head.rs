@@ -133,12 +133,14 @@ impl NativeRuntime {
         )?;
         let mut scanout = NativeScanoutBackend::from_atomic_explicit(explicit);
         target.color_depth = scanout.output_color_depth();
+        // A render worker received the current registry generation when the
+        // pool was created; only the synchronous renderer is published here.
         if !scanout.render_worker_active() {
             scanout.publish_material_effect_generation(&effect_generation);
+            scanout
+                .publish_effect_registry_generation((*effect_generation).clone())
+                .map_err(io::Error::other)?;
         }
-        scanout
-            .publish_effect_registry_generation((*effect_generation).clone())
-            .map_err(io::Error::other)?;
         let mode_label = format!(
             "{}x{}@{}",
             target.width,
