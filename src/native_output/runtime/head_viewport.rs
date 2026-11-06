@@ -235,7 +235,8 @@ pub(crate) fn log_head_scene(
     let count = RESOLVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if count < 40 || count % 600 == 0 {
         println!(
-            "native output head scene: origin=({}, {}) size={}x{} resolve={} surfaces={} culled={} decorations={} effects={}/{}",
+            "native output head scene: t={} origin=({}, {}) size={}x{} resolve={} surfaces={} culled={} decorations={} effects={}/{}",
+            oblivion_one::native::event_loop::monotonic_now_ns().map_or(0, |ns| ns / 1_000_000),
             viewport.x,
             viewport.y,
             viewport.width,

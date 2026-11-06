@@ -461,7 +461,13 @@ impl CompositorState {
         self.layer_surfaces.insert(surface_id, role);
         self.store_surface_placement(surface_id, SurfacePlacement::root());
         self.sync_scene_surface_metadata(surface_id);
-        layer_shell_debug_log(|| format!("create surface={surface_id}"));
+        layer_shell_debug_log(|| {
+            let role = self.layer_surfaces.get(&surface_id);
+            format!(
+                "create surface={surface_id} output={layout_output:?} wl_output={output_id:?} namespace={}",
+                role.map_or("", |role| role.namespace.as_str()),
+            )
+        });
     }
 
     pub(in crate::compositor) fn capture_layer_surface_commit_state(
@@ -610,7 +616,14 @@ impl CompositorState {
         }
         self.reorder_layer_surfaces_by_committed_stack();
         self.reconcile_idle_inhibition();
-        layer_shell_debug_log(|| format!("map surface={surface_id}"));
+        layer_shell_debug_log(|| {
+            let role = self.layer_surfaces.get(&surface_id);
+            format!(
+                "map surface={surface_id} output={:?} namespace={}",
+                role.and_then(|role| role.output),
+                role.map_or("", |role| role.namespace.as_str()),
+            )
+        });
     }
 
     pub(in crate::compositor) fn note_layer_surface_unmapped(&mut self, surface_id: u32) {
@@ -1571,6 +1584,7 @@ pub(super) fn layer_shell_debug_log(message: impl FnOnce() -> String) {
     if std::env::var_os("OBLIVION_ONE_LAYER_SHELL_DEBUG").as_deref()
         == Some(std::ffi::OsStr::new("1"))
     {
-        eprintln!("oblivion-one layer-shell: {}", message());
+        let now_ms = crate::native::event_loop::monotonic_now_ns().map_or(0, |ns| ns / 1_000_000);
+        eprintln!("oblivion-one layer-shell: t={now_ms} {}", message());
     }
 }
