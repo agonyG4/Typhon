@@ -378,7 +378,7 @@ impl CompositorState {
         presentation_samples: Option<&HashSet<SurfacePresentationCommitKey>>,
     ) -> CompositorFrameBatchId {
         assert!(
-            self.frame_batches.len() < 2,
+            self.frame_batches.len() < self.frame_batch_capacity(),
             "compositor frame batch registry exceeds pending plus ready capacity"
         );
         self.next_frame_batch_id = self
@@ -389,18 +389,21 @@ impl CompositorState {
             NonZeroU64::new(self.next_frame_batch_id)
                 .expect("compositor frame batch IDs start at one"),
         );
-        let deferred = std::mem::take(&mut self.deferred_dmabuf_buffer_releases);
-        let mut dmabuf_releases_to_complete_on_present = Vec::with_capacity(deferred.len());
-        let mut current_deferred = Vec::new();
-        for obligation in deferred {
-            if self.dmabuf_release_token_is_active(&obligation) {
-                current_deferred.push(obligation);
-            } else {
-                dmabuf_releases_to_complete_on_present.push(obligation);
+        let mut dmabuf_releases_to_complete_on_present = Vec::new();
+        if self.presenting_output_owns_dmabuf_releases() {
+            let deferred = std::mem::take(&mut self.deferred_dmabuf_buffer_releases);
+            dmabuf_releases_to_complete_on_present.reserve(deferred.len());
+            let mut current_deferred = Vec::new();
+            for obligation in deferred {
+                if self.dmabuf_release_token_is_active(&obligation) {
+                    current_deferred.push(obligation);
+                } else {
+                    dmabuf_releases_to_complete_on_present.push(obligation);
+                }
             }
+            self.deferred_dmabuf_buffer_releases = current_deferred;
+            dmabuf_releases_to_complete_on_present.append(&mut self.pending_dmabuf_buffer_releases);
         }
-        self.deferred_dmabuf_buffer_releases = current_deferred;
-        dmabuf_releases_to_complete_on_present.append(&mut self.pending_dmabuf_buffer_releases);
         let callbacks = self.take_visible_pending_frame_callbacks();
         let callback_count = callbacks.len();
         let (mut callback_timing, callback_timing_ambiguous) =

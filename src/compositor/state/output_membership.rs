@@ -607,25 +607,9 @@ impl CompositorState {
     /// Logical outputs whose layout rectangle the mapped surface overlaps.
     fn surface_overlapping_outputs(&mut self, surface_id: u32) -> HashSet<OutputId> {
         let mut outputs = HashSet::new();
-        if !self.surface_is_effectively_mapped_for_output(surface_id) {
-            return outputs;
-        }
-        self.refresh_surface_origin_cache();
-        let Some(index) = self
-            .renderable_surfaces
-            .iter()
-            .position(|surface| surface.surface_id == surface_id)
-        else {
+        let Some((left, top, right, bottom)) = self.surface_layout_rect(surface_id) else {
             return outputs;
         };
-        let Some((x, y)) = self.surface_origin_cache.get(index).copied() else {
-            return outputs;
-        };
-        let surface = &self.renderable_surfaces[index];
-        let left = i64::from(x);
-        let top = i64::from(y);
-        let right = left.saturating_add(i64::from(surface.width));
-        let bottom = top.saturating_add(i64::from(surface.height));
         outputs.extend(
             self.logical_outputs
                 .iter()
@@ -636,6 +620,31 @@ impl CompositorState {
                 .map(|(output_id, _)| *output_id),
         );
         outputs
+    }
+
+    /// Logical layout rectangle `(left, top, right, bottom)` of a mapped surface.
+    pub(in crate::compositor) fn surface_layout_rect(
+        &mut self,
+        surface_id: u32,
+    ) -> Option<(i64, i64, i64, i64)> {
+        if !self.surface_is_effectively_mapped_for_output(surface_id) {
+            return None;
+        }
+        self.refresh_surface_origin_cache();
+        let index = self
+            .renderable_surfaces
+            .iter()
+            .position(|surface| surface.surface_id == surface_id)?;
+        let (x, y) = self.surface_origin_cache.get(index).copied()?;
+        let surface = &self.renderable_surfaces[index];
+        let left = i64::from(x);
+        let top = i64::from(y);
+        Some((
+            left,
+            top,
+            left.saturating_add(i64::from(surface.width)),
+            top.saturating_add(i64::from(surface.height)),
+        ))
     }
 
     fn surface_is_effectively_mapped_for_output(&self, surface_id: u32) -> bool {

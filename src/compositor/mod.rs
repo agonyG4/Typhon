@@ -955,6 +955,16 @@ pub struct CompositorState {
     next_legacy_output_frame_id: u64,
     legacy_prepared_frame_batch: Option<CompositorFrameBatchId>,
     legacy_submitted_frame_batch: Option<CompositorFrameBatchId>,
+    // Output whose head is presenting (`None` = native) and the other
+    // outputs' prepared/submitted batch slots; see state/output_presentation.rs.
+    presenting_output: Option<OutputId>,
+    parked_output_frame_slots: HashMap<
+        Option<OutputId>,
+        (
+            Option<CompositorFrameBatchId>,
+            Option<CompositorFrameBatchId>,
+        ),
+    >,
     pending_surface_presentation_feedbacks: HashMap<u32, Vec<RequestedPresentationFeedback>>,
     frame_clock_start: Option<Instant>,
     next_configure_serial: u32,

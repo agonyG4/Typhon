@@ -46,6 +46,7 @@ mod lifecycle_surface_snapshot;
 #[cfg(test)]
 mod lifecycle_surface_snapshot_tests;
 mod output_membership;
+mod output_presentation;
 mod output_state;
 mod override_redirect_stack;
 mod pointer_constraint_region;

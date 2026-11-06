@@ -150,8 +150,7 @@ impl CompositorState {
     pub(in crate::compositor) fn take_visible_pending_frame_callbacks(
         &mut self,
     ) -> Vec<wl_callback::WlCallback> {
-        self.visible_pending_frame_callback_count = 0;
-        std::mem::take(&mut self.visible_pending_frame_callbacks)
+        self.take_presenting_output_frame_callbacks()
     }
 
     pub(in crate::compositor) fn refresh_frame_work_visibility(&mut self) {

@@ -148,6 +148,13 @@ impl OwnCompositorServer {
     }
 
     #[doc(hidden)]
+    /// Makes `output_id` the presenting output: its prepared/submitted frame
+    /// batch slots become the ones every frame-batch call below operates on,
+    /// and frame callbacks are captured only for surfaces it owns.
+    pub fn enter_output_presentation(&mut self, output_id: OutputId) {
+        self.state.enter_output_presentation(output_id);
+    }
+
     pub fn has_prepared_frame_batch(&self) -> bool {
         self.state.legacy_prepared_frame_batch.is_some()
     }

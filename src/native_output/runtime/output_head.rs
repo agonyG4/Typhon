@@ -119,8 +119,10 @@ impl NativeRuntime {
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
         std::mem::swap(&mut self.head, &mut self.parked_heads[index]);
+        self.server.enter_output_presentation(self.head.output_id);
         let result = f(self);
         std::mem::swap(&mut self.head, &mut self.parked_heads[index]);
+        self.server.enter_output_presentation(self.head.output_id);
         result
     }
 }
