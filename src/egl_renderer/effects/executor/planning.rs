@@ -350,6 +350,21 @@ pub(super) fn pass_output_texture_domain(
         })
 }
 
+/// The capture pixels a checkpoint source must prove valid: the bounding box
+/// of the capture's planned region within its texture domain. A Dual Kawase
+/// domain may extend past that box to the output lattice; the extra pixels lie
+/// beyond the effect's sampling footprint and carry no validity requirement.
+pub(super) fn capture_required_domain(
+    graph: &CompiledFrameGraph,
+    pass: &CompiledRenderPass,
+) -> EffectRegion {
+    let domain = pass_output_texture_domain(graph, pass);
+    match pass.damage.bounding_rect() {
+        Some(planned) => domain.intersect_rect(planned),
+        None => domain,
+    }
+}
+
 pub(super) fn checkpoint_dependency_influence_region(
     graph: &CompiledFrameGraph,
     pass: &CompiledRenderPass,

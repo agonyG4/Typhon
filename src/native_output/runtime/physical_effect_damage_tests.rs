@@ -401,6 +401,7 @@ fn removed_and_introduced_effects_cover_frozen_sample_and_output_footprints() {
             bottom: 2,
             left: 2,
         },
+        grid_alignment: 1,
     };
     let previous = NativeEffectDamageFrameSnapshot {
         registry_generation: 0,
@@ -1151,14 +1152,15 @@ fn ordered_backdrop_preserves_cascading_lower_blur_influence() {
         .aggregate_footprint
         .sample_radius_x;
     let damage = ordered_backdrop_transition(old, new);
+    // Two cascaded footprints around the 2x2 source, clipped to the 1000x800 output.
+    let reach = 2 * radius as i32;
+    let left = (500 - reach).max(0);
+    let top = (400 - reach).max(0);
+    let right = (502 + reach).min(1000);
+    let bottom = (402 + reach).min(800);
     assert!(output_damage_covers(
         &damage,
-        OutputRect::new(
-            500 - 2 * radius as i32,
-            400 - 2 * radius as i32,
-            2 + 4 * radius,
-            2 + 4 * radius
-        )
+        OutputRect::new(left, top, (right - left) as u32, (bottom - top) as u32)
     ));
 }
 

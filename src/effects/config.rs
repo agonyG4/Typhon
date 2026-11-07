@@ -696,6 +696,7 @@ fn parse_footprint(value: Option<&Value>) -> Result<EffectFootprint, EffectConfi
         sample_radius_x: parse_u32(required(object, "sample_radius_x")?, "sample_radius_x")?,
         sample_radius_y: parse_u32(required(object, "sample_radius_y")?, "sample_radius_y")?,
         output_outsets: parse_outsets(object.get("outsets"))?,
+        grid_alignment: 1,
     })
 }
 

@@ -137,6 +137,7 @@ fn effect_with_shader(
                 sample_radius_x: 0,
                 sample_radius_y: 0,
                 output_outsets: EffectOutsets::ZERO,
+                grid_alignment: 1,
             },
             uniforms: vec![uniform.clone()],
             auxiliary_inputs: Vec::new(),

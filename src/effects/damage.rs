@@ -657,6 +657,48 @@ pub fn effect_output_influence_region(
     )
 }
 
+/// Snap `rect` outward to the output-anchored `alignment` lattice, clamped to
+/// the output. Used for multi-resolution capture domains so their texel grid
+/// stays fixed on screen while the effect region resizes or moves by less than
+/// one lattice cell. Pixels added this way lie beyond the effect's sampling
+/// footprint, so they never influence visible output and stay out of the
+/// damage and dependency plan.
+pub fn align_domain_to_output_lattice(
+    rect: EffectRect,
+    alignment: u32,
+    output_bounds: EffectRect,
+) -> EffectRect {
+    if alignment <= 1 {
+        return rect;
+    }
+    let step = i64::from(alignment);
+    let snap_down = |value: i64, origin: i64| origin + (value - origin).div_euclid(step) * step;
+    let snap_up =
+        |value: i64, origin: i64| origin + (value - origin + step - 1).div_euclid(step) * step;
+    let (origin_x, origin_y) = (i64::from(output_bounds.x), i64::from(output_bounds.y));
+    let left = snap_down(i64::from(rect.x), origin_x).max(origin_x);
+    let top = snap_down(i64::from(rect.y), origin_y).max(origin_y);
+    let right = snap_up(i64::from(rect.right()), origin_x)
+        .min(i64::from(output_bounds.right()))
+        .max(i64::from(rect.right()));
+    let bottom = snap_up(i64::from(rect.bottom()), origin_y)
+        .min(i64::from(output_bounds.bottom()))
+        .max(i64::from(rect.bottom()));
+    let left = left.min(i64::from(rect.x));
+    let top = top.min(i64::from(rect.y));
+    match (
+        i32::try_from(left),
+        i32::try_from(top),
+        u32::try_from(right - left),
+        u32::try_from(bottom - top),
+    ) {
+        (Ok(x), Ok(y), Ok(width), Ok(height)) => {
+            EffectRect::new(x, y, width, height).unwrap_or(rect)
+        }
+        _ => rect,
+    }
+}
+
 pub fn plan_effect_damage(
     footprint: EffectFootprint,
     visible_region: &EffectRegion,
@@ -820,6 +862,7 @@ mod tests {
                 top: 30,
                 bottom: 40,
             },
+            grid_alignment: 1,
         };
         let visible = EffectRegion::from_rect(EffectRect::new(100, 100, 100, 100).unwrap());
 
@@ -848,6 +891,60 @@ mod tests {
         );
         assert!(plan.dependency_region.contains_point(100, 100));
         assert!(!plan.dependency_region.contains_point(92, 92));
+    }
+
+    #[test]
+    fn aligned_domain_stays_on_the_output_lattice_while_the_region_grows() {
+        let bounds = EffectRect::new(0, 0, 2560, 1440).unwrap();
+        let footprint = EffectFootprint::symmetric(37).with_grid_alignment(16);
+        let domains: Vec<_> = (300..=316)
+            .map(|height| {
+                let visible =
+                    EffectRegion::from_rect(EffectRect::new(981, 361, 600, height).unwrap());
+                let plan = plan_effect_damage(footprint, &visible, &EffectRegion::empty(), bounds);
+                let capture = plan.capture_region.bounding_rect().unwrap();
+                let domain =
+                    align_domain_to_output_lattice(capture, footprint.grid_alignment, bounds);
+                assert!(domain.contains_rect(capture));
+                domain
+            })
+            .collect();
+        for domain in &domains {
+            assert_eq!(
+                (
+                    domain.x % 16,
+                    domain.y % 16,
+                    domain.width % 16,
+                    domain.height % 16
+                ),
+                (0, 0, 0, 0),
+                "{domain:?}"
+            );
+        }
+        // Growth inside one lattice cell keeps the domain, and so the blur
+        // grid, unchanged; the origin never moves.
+        assert!(domains.windows(2).filter(|pair| pair[0] != pair[1]).count() <= 2);
+        assert!(
+            domains
+                .iter()
+                .all(|domain| (domain.x, domain.y) == (domains[0].x, domains[0].y))
+        );
+    }
+
+    #[test]
+    fn aligned_domain_clamps_to_output_edges() {
+        let bounds = EffectRect::new(100, 50, 1000, 701).unwrap();
+        let rect = EffectRect::new(105, 700, 30, 40).unwrap();
+        assert_eq!(
+            align_domain_to_output_lattice(rect, 16, bounds),
+            EffectRect::new(100, 690, 48, 61).unwrap()
+        );
+        assert_eq!(align_domain_to_output_lattice(rect, 1, bounds), rect);
+        let on_lattice = EffectRect::new(116, 66, 32, 16).unwrap();
+        assert_eq!(
+            align_domain_to_output_lattice(on_lattice, 16, bounds),
+            on_lattice
+        );
     }
 
     #[test]

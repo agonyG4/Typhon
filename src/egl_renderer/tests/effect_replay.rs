@@ -271,7 +271,24 @@ fn terminal_builtin_blur_scene(
     material: oblivion_one::material::EffectiveMaterial,
     coverage: Option<oblivion_one::effects::EffectCoverage>,
 ) -> (ResolvedEffectScene, oblivion_one::effects::EffectRegistry) {
-    let program = oblivion_one::effects::builtin_background_material_program(material);
+    terminal_builtin_blur_scene_with_passes(
+        rect,
+        visual_group,
+        material,
+        coverage,
+        oblivion_one::effects::BUILTIN_MATERIAL_BLUR_PASSES,
+    )
+}
+
+fn terminal_builtin_blur_scene_with_passes(
+    rect: EffectRect,
+    visual_group: VisualGroupId,
+    material: oblivion_one::material::EffectiveMaterial,
+    coverage: Option<oblivion_one::effects::EffectCoverage>,
+    passes: u8,
+) -> (ResolvedEffectScene, oblivion_one::effects::EffectRegistry) {
+    let program =
+        oblivion_one::effects::builtin_background_material_program_with_passes(material, passes);
     let program_id = program.program.id;
     let mut registry = oblivion_one::effects::EffectRegistry::empty();
     registry
@@ -2785,7 +2802,13 @@ fn precomputed_baseline_safety_scene(
     exact_region: EffectRect,
     candidate_regions: [EffectRect; 2],
 ) -> (ResolvedEffectScene, oblivion_one::effects::EffectRegistry) {
-    let program = oblivion_one::effects::builtin_background_blur_program();
+    // The safety geometry is tuned to the two-level material footprint.
+    let program = oblivion_one::effects::builtin_background_material_program_with_passes(
+        oblivion_one::material::MaterialConfiguration::default()
+            .effective()
+            .expect("default material validates"),
+        2,
+    );
     let program_id = program.program.id;
     let mut registry = oblivion_one::effects::EffectRegistry::empty();
     registry.insert(program).expect("built-in blur registry");
@@ -3102,7 +3125,12 @@ fn precomputed_baseline_only_scene_content_matches_exact_gles_pixels() {
             b_visual_group: b_group,
         },
     );
-    let program = oblivion_one::effects::builtin_background_blur_program();
+    let program = oblivion_one::effects::builtin_background_material_program_with_passes(
+        oblivion_one::material::MaterialConfiguration::default()
+            .effective()
+            .expect("default material validates"),
+        2,
+    );
     let program_id = program.program.id;
     let mut registry = oblivion_one::effects::EffectRegistry::empty();
     registry.insert(program).expect("built-in blur registry");
@@ -3848,7 +3876,7 @@ fn moving_blur_domain_reuses_real_gles_resources() {
         fallback_reason: None,
         ..RepaintPlan::default()
     };
-    let mut first_dimensions = None;
+    let mut dimensions_by_domain_size = std::collections::HashMap::new();
     let mut first_allocation_count = None;
     let mut warm_checkpoint_entries = None;
     let mut warm_checkpoint_bytes_max = 0;
@@ -3937,6 +3965,12 @@ fn moving_blur_domain_reuses_real_gles_resources() {
             u32::try_from(expected_bottom - expected_top).expect("capture height"),
         )
         .expect("expected capture domain");
+        // The domain then snaps outward to the coarsest level's 4 px lattice.
+        let expected_capture = oblivion_one::effects::align_domain_to_output_lattice(
+            expected_capture,
+            4,
+            output_bounds,
+        );
         for texture in &graph.textures {
             assert!(texture.width > 0 && texture.height > 0);
             if texture.source != GraphTextureSource::Output {
@@ -3954,10 +3988,13 @@ fn moving_blur_domain_reuses_real_gles_resources() {
             && expected_right == x + 32 + capture_radius_x
             && expected_bottom == y + 24 + capture_radius_y;
         if interior {
-            if let Some(first) = &first_dimensions {
+            // Translation alone never changes texture dimensions for a given
+            // lattice-aligned domain size.
+            let key = (expected_capture.width, expected_capture.height);
+            if let Some(first) = dimensions_by_domain_size.get(&key) {
                 assert_eq!(first, &dimensions, "translation changed texture dimensions");
             } else {
-                first_dimensions = Some(dimensions);
+                dimensions_by_domain_size.insert(key, dimensions);
             }
         }
 
@@ -4013,8 +4050,13 @@ fn moving_blur_domain_reuses_real_gles_resources() {
         }
         assert_eq!(metrics.eviction_count, 0, "translation evicted a resource");
         // Clipped domains at the output edges produce more distinct texture
-        // sizes than the old 24 px reach; the pool saturates at 40 by step 12.
-        assert!(metrics.cached_texture_count <= 40);
+        // sizes than the old 24 px reach, and lattice snapping adds edge
+        // variants; the pool saturates at 44.
+        assert!(
+            metrics.cached_texture_count <= 44,
+            "cached={}",
+            metrics.cached_texture_count
+        );
     }
 
     let effect_resources = &mut harness.renderer.effect_runtime.effect_resources;
@@ -4096,7 +4138,7 @@ fn moving_visual_group_blur_replays_only_background_below_target() {
         (32, 32),
         (184, 144),
     ];
-    let mut first_dimensions = None;
+    let mut dimensions_by_domain_size = std::collections::HashMap::new();
     let mut warm_allocation_count = None;
     let mut warm_checkpoint_entries = None;
     let mut warm_checkpoint_bytes_max = 0;
@@ -4196,6 +4238,12 @@ fn moving_visual_group_blur_replays_only_background_below_target() {
             u32::try_from(expected_bottom - expected_top).expect("capture height"),
         )
         .expect("expected capture domain");
+        // The domain then snaps outward to the coarsest level's 4 px lattice.
+        let expected_capture = oblivion_one::effects::align_domain_to_output_lattice(
+            expected_capture,
+            4,
+            output_bounds,
+        );
         assert_eq!(capture.domain, expected_capture, "step {step}");
         let dimensions = graph
             .textures
@@ -4208,10 +4256,13 @@ fn moving_visual_group_blur_replays_only_background_below_target() {
             && expected_right == x + 32 + capture_radius_x
             && expected_bottom == y + 24 + capture_radius_y;
         if interior {
-            if let Some(first) = &first_dimensions {
+            // Translation alone never changes texture dimensions for a given
+            // lattice-aligned domain size.
+            let key = (expected_capture.width, expected_capture.height);
+            if let Some(first) = dimensions_by_domain_size.get(&key) {
                 assert_eq!(first, &dimensions, "translation changed texture dimensions");
             } else {
-                first_dimensions = Some(dimensions);
+                dimensions_by_domain_size.insert(key, dimensions);
             }
         }
 
@@ -4267,7 +4318,12 @@ fn moving_visual_group_blur_replays_only_background_below_target() {
         }
         assert_eq!(metrics.eviction_count, 0, "translation evicted a resource");
         // Steady state is 48 cached textures with the 88 px Dual Kawase reach.
-        assert!(metrics.cached_texture_count <= 48);
+        // Lattice-snapped edge domains add size variants; the pool saturates at 52.
+        assert!(
+            metrics.cached_texture_count <= 52,
+            "cached={}",
+            metrics.cached_texture_count
+        );
     }
 
     let effect_resources = &mut harness.renderer.effect_runtime.effect_resources;
@@ -5312,10 +5368,12 @@ fn canonical_partial_repair_matches_full_render_for_staged_and_fused_paths() {
 #[test]
 fn canonical_noise_seed_fields_are_origin_and_translation_independent() {
     // Leave room for the conservative aggregate capture halo on every side so
-    // the two translated captures have equal, unclipped physical domains.
+    // the two translated captures have equal, unclipped physical domains. The
+    // two-level material's capture domain snaps to a 4 px output lattice, so
+    // the translation stays on that lattice.
     let output_size = (401, 321);
     let first_rect = EffectRect::new(128, 120, 101, 75).expect("first translated domain");
-    let translated_rect = EffectRect::new(140, 129, 101, 75).expect("translated domain");
+    let translated_rect = EffectRect::new(140, 128, 101, 75).expect("translated domain");
     let material = oblivion_one::material::EffectiveMaterial {
         blur: 0.42,
         saturation: 0.31,
@@ -5324,9 +5382,14 @@ fn canonical_noise_seed_fields_are_origin_and_translation_independent() {
     let first_group = VisualGroupId::new(180).expect("first noise group");
     let translated_group = VisualGroupId::new(181).expect("translated noise group");
     let (first_scene, first_registry) =
-        terminal_builtin_blur_scene(first_rect, first_group, material, None);
-    let (translated_scene, translated_registry) =
-        terminal_builtin_blur_scene(translated_rect, translated_group, material, None);
+        terminal_builtin_blur_scene_with_passes(first_rect, first_group, material, None, 2);
+    let (translated_scene, translated_registry) = terminal_builtin_blur_scene_with_passes(
+        translated_rect,
+        translated_group,
+        material,
+        None,
+        2,
+    );
     let bounds = EffectRect::new(0, 0, output_size.0, output_size.1).expect("output bounds");
     let first_graph = terminal_graph_variant(&first_scene, &first_registry, bounds, false);
     let translated_graph =
@@ -5876,4 +5939,102 @@ fn replay_blur_composite_leaves_pixels_outside_the_repaint_unchanged() {
         changed_outside_repair, 0,
         "a partial frame must not change pixels outside its repaint"
     );
+}
+
+/// Render a full frame of a background-only pattern blurred over `rect` and
+/// return the RGBA8 readback (bottom-left origin rows).
+fn render_pattern_blur_frame(rect: EffectRect, passes: u8) -> Vec<u8> {
+    let (width, height) = (320_u32, 240_u32);
+    let output_bounds = EffectRect::new(0, 0, width, height).expect("output bounds");
+    let mut harness = GlesEffectTestHarness::new(width, height);
+    let mut background = Vec::with_capacity(width as usize * height as usize * 4);
+    for y in 0..height {
+        for x in 0..width {
+            // High-contrast strokes, like text behind a translucent panel.
+            let ink = (x * 7 + y * 13) % 23 < 3 || (x / 5 + y / 3) % 11 == 0;
+            let value: u8 = if ink { 16 } else { 236 };
+            background.extend_from_slice(&[value, value, value.saturating_sub(20), 255]);
+        }
+    }
+    harness
+        .renderer
+        .resources
+        .test_create_surface_texture(&harness.gl, 7, width, height, Some(&background))
+        .expect("pattern background texture creates");
+    harness.renderer.scene_state.vertices.clear();
+    harness.renderer.scene_state.commands.clear();
+    push_draw_command(
+        &mut harness.renderer.scene_state.vertices,
+        &mut harness.renderer.scene_state.commands,
+        EglDrawLayer::Surface(7),
+        EglRect::new(0.0, 0.0, width as f32, height as f32),
+        width,
+        height,
+        OutputFramebufferOrigin::BottomLeft,
+    );
+    harness.renderer.scene_state.scene_geometry_dirty = true;
+    let (scene, registry) = moving_blur_scene_with_spec(rect, 4.0, passes, 1.0);
+    harness.renderer.set_effect_registry(registry.clone());
+    let plan = oblivion_one::effects::compile_frame_execution_plan(
+        &scene,
+        &EffectRegion::from_rect(output_bounds),
+        output_bounds,
+        &registry,
+    )
+    .expect("pattern blur graph compiles");
+    let oblivion_one::effects::FrameExecutionPlan::EffectGraph(graph) = plan else {
+        panic!("pattern blur must compile to an effect graph");
+    };
+    execute_diagnostic_frame(
+        &mut harness,
+        &graph,
+        &diagnostic_repaint_plan_for_repairs_in_size(&[], true, (width, height)),
+        EffectRegion::from_rect(output_bounds),
+        true,
+        effects::EffectDebugConfig::new(
+            effects::EffectDebugCaptureMode::Replay,
+            effects::EffectDebugKawaseMode::Partial,
+        ),
+    );
+    read_diagnostic_pixels(&harness)
+}
+
+#[test]
+fn growing_blur_region_keeps_blurred_pixels_on_a_fixed_screen_grid() {
+    // A top-anchored panel growing by a few pixels (Spotlight's results list
+    // animating its height) must not shift the Kawase sampling grid: pixels
+    // well inside both regions blur to identical values.
+    let (width, height) = (320_usize, 240_usize);
+    for passes in [2_u8, 3] {
+        let base = render_pattern_blur_frame(
+            EffectRect::new(121, 33, 77, 90).expect("base panel"),
+            passes,
+        );
+        for grow in 1..=3_u32 {
+            let grown = render_pattern_blur_frame(
+                EffectRect::new(121, 33, 77, 90 + grow).expect("grown panel"),
+                passes,
+            );
+            let mut differing = 0;
+            let mut max_delta = 0_u8;
+            // Logical rows 33..123 are storage rows height-123..height-33.
+            for storage_y in (height - 123)..(height - 33) {
+                for x in 121..198 {
+                    let index = (storage_y * width + x) * 4;
+                    for channel in 0..3 {
+                        let delta = base[index + channel].abs_diff(grown[index + channel]);
+                        if delta != 0 {
+                            differing += 1;
+                            max_delta = max_delta.max(delta);
+                        }
+                    }
+                }
+            }
+            assert_eq!(
+                (differing, max_delta),
+                (0, 0),
+                "passes={passes} grow={grow}: blurred pixels moved with the region size"
+            );
+        }
+    }
 }

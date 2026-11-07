@@ -944,6 +944,7 @@ mod tests {
                     sample_radius_x: 0,
                     sample_radius_y: 0,
                     output_outsets: super::super::EffectOutsets::ZERO,
+                    grid_alignment: 1,
                 },
                 uniforms: vec![super::super::EffectUniformBinding {
                     parameter: super::super::EffectParameterId::new(2).unwrap(),

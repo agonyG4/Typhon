@@ -224,13 +224,14 @@ pub(crate) fn execute_precomputed_backdrop_build(
     };
 
     let execution_result = (|| {
-        if build.blur.passes != 2
+        if build.blur.passes == 0
+            || build.stages.len() != 1 + 2 * usize::from(build.blur.passes)
             || build.capture.working_space
                 != oblivion_one::effects::EffectWorkingSpace::OutputEncodedSrgb
             || build.working_space != oblivion_one::effects::EffectWorkingSpace::LinearSrgb
         {
             return Err(io::Error::other(
-                "precomputed backdrop build does not match the canonical two-pass working spaces",
+                "precomputed backdrop build does not match its Kawase depth or canonical working spaces",
             )
             .into());
         }

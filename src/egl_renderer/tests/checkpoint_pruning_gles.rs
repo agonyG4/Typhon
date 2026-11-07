@@ -3,7 +3,7 @@ use oblivion_one::compositor::{EffectAnchorScope, ResolvedEffectScene};
 use oblivion_one::effects::{
     EffectDemandPlannerPolicy, EffectInstanceId, EffectRect, EffectRegion, EffectRegistry,
     FrameExecutionCompileOptions, FrameExecutionPlan, RenderPassKind,
-    builtin_background_material_program, compile_frame_execution_variants_with_options,
+    builtin_background_material_program_with_passes, compile_frame_execution_variants_with_options,
 };
 use oblivion_one::material::MaterialConfiguration;
 
@@ -29,8 +29,10 @@ fn pruning_fixture(second_x: i32) -> NativeThreeCheckpointFixture {
 }
 
 fn material_registry() -> EffectRegistry {
-    let program =
-        builtin_background_material_program(MaterialConfiguration::default().effective().unwrap());
+    let program = builtin_background_material_program_with_passes(
+        MaterialConfiguration::default().effective().unwrap(),
+        2,
+    );
     let mut registry = EffectRegistry::empty();
     registry.insert(program).unwrap();
     registry

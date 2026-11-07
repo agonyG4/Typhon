@@ -638,6 +638,7 @@ fn blend_propagates_each_source_and_custom_fragment_uses_declared_footprint() {
                         sample_radius_x: 4,
                         sample_radius_y: 7,
                         output_outsets: EffectOutsets::ZERO,
+                        grid_alignment: 1,
                     },
                     uniforms: Vec::new(),
                     auxiliary_inputs: Vec::new(),

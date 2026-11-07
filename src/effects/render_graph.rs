@@ -149,10 +149,23 @@ pub fn builtin_background_blur_program() -> ValidatedEffectProgram {
     )
 }
 
+/// Dual Kawase depth of the builtin background material.
+pub const BUILTIN_MATERIAL_BLUR_PASSES: u8 = 4;
+
 /// Construct the one canonical background material graph from the compositor's
 /// semantic snapshot. Radius and stage details remain Typhon-owned renderer policy.
 pub fn builtin_background_material_program(
     material: crate::material::EffectiveMaterial,
+) -> ValidatedEffectProgram {
+    builtin_background_material_program_with_passes(material, BUILTIN_MATERIAL_BLUR_PASSES)
+}
+
+/// The builtin material graph at an explicit Kawase depth. Production always
+/// uses [`BUILTIN_MATERIAL_BLUR_PASSES`]; fixtures whose geometry is tuned to a
+/// particular sampling footprint pin their own depth.
+pub fn builtin_background_material_program_with_passes(
+    material: crate::material::EffectiveMaterial,
+    passes: u8,
 ) -> ValidatedEffectProgram {
     let source = EffectNodeId::new(1).expect("builtin source node id is non-zero");
     let blur = EffectNodeId::new(2).expect("builtin blur node id is non-zero");
@@ -161,8 +174,10 @@ pub fn builtin_background_material_program(
     // Renderer-specific radius is deliberately derived here, behind the Typhon
     // material boundary. Public controls stay normalized and renderer-neutral.
     // The radius is in half-texel units (the Dual Kawase half-pixel convention),
-    // so it is kept small: the canonical path uses 2 passes, and larger offsets
-    // alias into the blocky grid artifacts.
+    // so it is kept small: larger offsets alias into blocky grid artifacts.
+    // Blur strength comes from depth instead: four levels give a ~45 px sigma
+    // at full blur, matching Hyprland's `size 5, passes 4` (~43 px); two levels
+    // stopped at ~11 px and let backdrop text show through.
     let radius = 1.5 + material.blur * 2.5;
     let saturation_factor = material.saturation;
     let desaturation = 1.0 - saturation_factor;
@@ -197,7 +212,7 @@ pub fn builtin_background_material_program(
             EffectNode::dual_kawase(
                 blur,
                 source,
-                DualKawaseBlurSpec::new(radius, 2, 1.0)
+                DualKawaseBlurSpec::new(radius, passes, 1.0)
                     .expect("builtin blur specification must validate"),
             ),
             EffectNode::color_matrix(saturation, blur, color_matrix)
@@ -465,13 +480,13 @@ pub struct CompiledPrecomputedBackdropPlan {
 
 /// Frame-shared work that materializes one synthesized-window backdrop.
 /// Stages intentionally carry no ordinary effect-instance identity.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct CompiledPrecomputedBackdropBuild {
     pub capture: PrecomputedBackdropCapturePlan,
     pub blur: DualKawaseBlurSpec,
     pub output_bounds: EffectRect,
     pub working_space: EffectWorkingSpace,
-    pub stages: [PrecomputedBackdropBuildStage; 5],
+    pub stages: Vec<PrecomputedBackdropBuildStage>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -521,29 +536,25 @@ pub fn compile_precomputed_backdrop_build(
 ) -> CompiledPrecomputedBackdropBuild {
     let processing_width = scaled_dimension(output_bounds.width, plan.blur.scale);
     let processing_height = scaled_dimension(output_bounds.height, plan.blur.scale);
-    let stages = [
-        PrecomputedBackdropBuildStage::SceneCaptureReplay,
-        PrecomputedBackdropBuildStage::KawaseDownsample {
-            level: 1,
-            width: ceil_div(processing_width, 2),
-            height: ceil_div(processing_height, 2),
-        },
-        PrecomputedBackdropBuildStage::KawaseDownsample {
-            level: 2,
-            width: ceil_div(processing_width, 4),
-            height: ceil_div(processing_height, 4),
-        },
-        PrecomputedBackdropBuildStage::KawaseUpsample {
-            level: 1,
-            width: ceil_div(processing_width, 2),
-            height: ceil_div(processing_height, 2),
-        },
-        PrecomputedBackdropBuildStage::KawaseUpsample {
-            level: 2,
-            width: processing_width,
-            height: processing_height,
-        },
-    ];
+    let passes = plan.blur.passes;
+    let mut stages = Vec::with_capacity(1 + 2 * usize::from(passes));
+    stages.push(PrecomputedBackdropBuildStage::SceneCaptureReplay);
+    for level in 1..=passes {
+        let divisor = 1_u32 << level.min(31);
+        stages.push(PrecomputedBackdropBuildStage::KawaseDownsample {
+            level,
+            width: ceil_div(processing_width, divisor),
+            height: ceil_div(processing_height, divisor),
+        });
+    }
+    for level in 1..=passes {
+        let divisor = 1_u32 << (passes - level).min(31);
+        stages.push(PrecomputedBackdropBuildStage::KawaseUpsample {
+            level,
+            width: ceil_div(processing_width, divisor),
+            height: ceil_div(processing_height, divisor),
+        });
+    }
     CompiledPrecomputedBackdropBuild {
         capture: PrecomputedBackdropCapturePlan {
             domain: output_bounds,
@@ -2623,7 +2634,7 @@ fn canonical_builtin_blur_spec(program: &ValidatedEffectProgram) -> Option<DualK
         return None;
     }
     match &blur.kind {
-        EffectNodeKind::DualKawaseBlur(spec) if spec.passes == 2 => Some(*spec),
+        EffectNodeKind::DualKawaseBlur(spec) if spec.passes >= 1 => Some(*spec),
         _ => None,
     }
 }
@@ -3229,7 +3240,11 @@ fn compile_instance(
                         EffectWorkingSpace::LinearSrgb,
                     ),
                     EffectSource::Backdrop => {
-                        let domain = capture_damage.bounding_rect().unwrap_or(output_bounds);
+                        let domain = super::damage::align_domain_to_output_lattice(
+                            capture_damage.bounding_rect().unwrap_or(output_bounds),
+                            program.aggregate_footprint.grid_alignment,
+                            output_bounds,
+                        );
                         (
                             domain,
                             domain.width,
@@ -3821,7 +3836,7 @@ mod tests {
                 .iter()
                 .filter(|pass| pass.kind == RenderPassKind::DualKawaseDownsample)
                 .count(),
-            30
+            60
         );
         assert_eq!(
             exact
@@ -3829,7 +3844,7 @@ mod tests {
                 .iter()
                 .filter(|pass| pass.kind == RenderPassKind::DualKawaseUpsample)
                 .count(),
-            30
+            60
         );
         assert_eq!(
             exact
@@ -3888,10 +3903,10 @@ mod tests {
         assert_eq!(plan.baseline_anchor, scene.instances[0].anchor);
         assert_eq!(plan.baseline_scene_order, scene.instances[0].scene_order);
         assert_eq!(plan.capture_domain, bounds);
-        assert_eq!(plan.build_passes, 5);
+        assert_eq!(plan.build_passes, 9);
         assert_eq!(plan.consumers.len(), 15);
         let build = compile_precomputed_backdrop_build(&plan, bounds);
-        assert_eq!(build.stages.len(), 5);
+        assert_eq!(build.stages.len(), 9);
         assert_eq!(
             build.stages,
             [
@@ -3906,13 +3921,33 @@ mod tests {
                     width: 600,
                     height: 150,
                 },
+                PrecomputedBackdropBuildStage::KawaseDownsample {
+                    level: 3,
+                    width: 300,
+                    height: 75,
+                },
+                PrecomputedBackdropBuildStage::KawaseDownsample {
+                    level: 4,
+                    width: 150,
+                    height: 38,
+                },
                 PrecomputedBackdropBuildStage::KawaseUpsample {
                     level: 1,
+                    width: 300,
+                    height: 75,
+                },
+                PrecomputedBackdropBuildStage::KawaseUpsample {
+                    level: 2,
+                    width: 600,
+                    height: 150,
+                },
+                PrecomputedBackdropBuildStage::KawaseUpsample {
+                    level: 3,
                     width: 1_200,
                     height: 300,
                 },
                 PrecomputedBackdropBuildStage::KawaseUpsample {
-                    level: 2,
+                    level: 4,
                     width: 2_400,
                     height: 600,
                 },
@@ -9191,7 +9226,7 @@ mod tests {
         let off = compile_terminal_fusion_variant(15, bounds, false);
         let on = compile_terminal_fusion_variant(15, bounds, true);
 
-        assert_eq!(off.stats.passes, 105);
+        assert_eq!(off.stats.passes, 165);
         assert_eq!(
             off.passes
                 .iter()
@@ -9204,14 +9239,14 @@ mod tests {
                 .iter()
                 .filter(|pass| pass.kind == RenderPassKind::DualKawaseDownsample)
                 .count(),
-            30
+            60
         );
         assert_eq!(
             off.passes
                 .iter()
                 .filter(|pass| pass.kind == RenderPassKind::DualKawaseUpsample)
                 .count(),
-            30
+            60
         );
         assert_eq!(
             off.passes
@@ -9231,7 +9266,7 @@ mod tests {
         assert_eq!(off.stats.terminal_blur_fusions, 0);
         assert_eq!(off.stats.terminal_blur_passes_elided, 0);
 
-        assert_eq!(on.stats.passes, 75);
+        assert_eq!(on.stats.passes, 135);
         assert_eq!(
             on.passes
                 .iter()
@@ -9244,14 +9279,14 @@ mod tests {
                 .iter()
                 .filter(|pass| pass.kind == RenderPassKind::DualKawaseDownsample)
                 .count(),
-            30
+            60
         );
         assert_eq!(
             on.passes
                 .iter()
                 .filter(|pass| pass.kind == RenderPassKind::DualKawaseUpsample)
                 .count(),
-            15
+            45
         );
         assert_eq!(
             on.passes
@@ -9281,8 +9316,8 @@ mod tests {
                 })
                 .count()
         };
-        assert_eq!(live_intermediate_lifetimes(&off), 75);
-        assert_eq!(live_intermediate_lifetimes(&on), 45);
+        assert_eq!(live_intermediate_lifetimes(&off), 135);
+        assert_eq!(live_intermediate_lifetimes(&on), 105);
         assert!(on.stats.peak_live_intermediates <= off.stats.peak_live_intermediates);
     }
 
@@ -9306,6 +9341,10 @@ mod tests {
                 RenderPassKind::SceneCapture,
                 RenderPassKind::DualKawaseDownsample,
                 RenderPassKind::DualKawaseDownsample,
+                RenderPassKind::DualKawaseDownsample,
+                RenderPassKind::DualKawaseDownsample,
+                RenderPassKind::DualKawaseUpsample,
+                RenderPassKind::DualKawaseUpsample,
                 RenderPassKind::DualKawaseUpsample,
                 RenderPassKind::DualKawaseUpsample,
                 RenderPassKind::Fragment,
@@ -9318,6 +9357,10 @@ mod tests {
                 RenderPassKind::SceneCapture,
                 RenderPassKind::DualKawaseDownsample,
                 RenderPassKind::DualKawaseDownsample,
+                RenderPassKind::DualKawaseDownsample,
+                RenderPassKind::DualKawaseDownsample,
+                RenderPassKind::DualKawaseUpsample,
+                RenderPassKind::DualKawaseUpsample,
                 RenderPassKind::DualKawaseUpsample,
                 RenderPassKind::Composite,
             ]

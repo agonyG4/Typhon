@@ -197,24 +197,25 @@ pub(in crate::egl_renderer::tests) fn render_native_stacked_candidate_with_mode(
         .find(|texture| Some(texture.id) == b_capture.output)
         .expect("native B capture texture");
     // Capture domains are the effect rect expanded by the Dual Kawase sampling
-    // reach (radius 4, 2 passes, scale 1 => 88 px), clipped to the 1920x1080
-    // output. Dock A (90,144,952,889): x 2..1130, y 56..1080 (clipped).
+    // reach (radius 4, 2 passes, scale 1 => 88 px), snapped outward to the
+    // 4 px output lattice of the coarsest level, clipped to the 1920x1080
+    // output. Dock A (90,144,952,889): x 2..1130 -> 0..1132, y 56..1080.
     if fixture.effect_b.id == 2 {
         assert_eq!(
             a_texture.domain,
-            EffectRect::new(2, 56, 1128, 1024).expect("native A capture domain")
+            EffectRect::new(0, 56, 1132, 1024).expect("native A capture domain")
         );
-        // Dock B (786,1000,348,56): x 698..1222, y 912..1080 (clipped).
+        // Dock B (786,1000,348,56): x 698..1222 -> 696..1224, y 912..1080.
         assert_eq!(
             b_texture.domain,
-            EffectRect::new(698, 912, 524, 168).expect("native B capture domain")
+            EffectRect::new(696, 912, 528, 168).expect("native B capture domain")
         );
     }
-    // TopBar B (24,24,72,17): x 0..184 and y 0..129 after left/top clipping.
+    // TopBar B (24,24,72,17): x 0..184 and y 0..129 -> 0..132 after clipping.
     if fixture.effect_b.id == 12 {
         assert_eq!(
             b_texture.domain,
-            EffectRect::new(0, 0, 184, 129).expect("native TopBar capture domain")
+            EffectRect::new(0, 0, 184, 132).expect("native TopBar capture domain")
         );
     }
     let a_instance = graph
@@ -222,7 +223,15 @@ pub(in crate::egl_renderer::tests) fn render_native_stacked_candidate_with_mode(
         .iter()
         .find(|instance| instance.id == a_id)
         .expect("native A compiled instance");
-    let b_required_region = EffectRegion::from_rect(b_texture.domain);
+    // B requires its capture region; its texture domain may extend past it
+    // to the output lattice, but that padding is outside B's sampling reach.
+    let b_required_region = graph
+        .instances
+        .iter()
+        .find(|instance| instance.id == b_id)
+        .expect("native B compiled instance")
+        .capture_region
+        .clone();
     let dependency_required_region =
         b_required_region.intersect(&a_instance.output_influence_region);
     assert!(
@@ -642,9 +651,17 @@ pub(in crate::egl_renderer::tests) fn assert_native_three_checkpoint_replay_evid
         })
         .expect("B checkpoint replay boundary");
     assert!(trace_field_u64(b_begin, "pending_checkpoint_requirements") >= 1);
+    // Satisfying C never grows the active work. On this 160x120 output B's
+    // lattice-aligned capture domain already spans the whole output, so the
+    // work cannot shrink; the pending-requirement counts above prove the
+    // suffix advanced.
     assert!(
         trace_field_u64(c_satisfied, "active_work_pixels")
-            < trace_field_u64(c_begin, "active_work_pixels")
+            <= trace_field_u64(c_begin, "active_work_pixels")
+    );
+    assert!(
+        trace_field_u64(c_satisfied, "pending_checkpoint_requirements")
+            < trace_field_u64(c_begin, "pending_checkpoint_requirements")
     );
     let b_satisfied = suffix_events
         .iter()

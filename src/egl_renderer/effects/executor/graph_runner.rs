@@ -1014,9 +1014,9 @@ pub(super) fn execute_graph_passes_inner(
                     demand
                         .pass_output_region(pass.id)
                         .cloned()
-                        .unwrap_or_else(|| pass_output_texture_domain(graph, pass))
+                        .unwrap_or_else(|| capture_required_domain(graph, pass))
                 } else {
-                    pass_output_texture_domain(graph, pass)
+                    capture_required_domain(graph, pass)
                 };
                 let required_effect_region =
                     checkpoint_dependency_influence_region(graph, pass, &required);

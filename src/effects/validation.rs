@@ -176,6 +176,7 @@ pub fn validate_effect_program(
         sample_radius_x: 0,
         sample_radius_y: 0,
         output_outsets: program.outsets,
+        grid_alignment: 1,
     })?;
     let requires_composition = program
         .nodes

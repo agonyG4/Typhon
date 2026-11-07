@@ -419,6 +419,12 @@ pub struct EffectFootprint {
     pub sample_radius_x: u32,
     pub sample_radius_y: u32,
     pub output_outsets: EffectOutsets,
+    /// Output-pixel lattice the capture domain must snap to (1 = none).
+    /// Multi-resolution samplers such as Dual Kawase anchor their texel grid to
+    /// the domain origin; snapping keeps that grid fixed on screen when the
+    /// effect region moves or resizes, so unchanged backdrop pixels blur to
+    /// identical results frame after frame.
+    pub grid_alignment: u32,
 }
 
 impl EffectFootprint {
@@ -426,6 +432,7 @@ impl EffectFootprint {
         sample_radius_x: 0,
         sample_radius_y: 0,
         output_outsets: EffectOutsets::ZERO,
+        grid_alignment: 1,
     };
 
     pub const fn symmetric(radius: u32) -> Self {
@@ -433,7 +440,13 @@ impl EffectFootprint {
             sample_radius_x: radius,
             sample_radius_y: radius,
             output_outsets: EffectOutsets::ZERO,
+            grid_alignment: 1,
         }
+    }
+
+    pub const fn with_grid_alignment(mut self, alignment: u32) -> Self {
+        self.grid_alignment = if alignment == 0 { 1 } else { alignment };
+        self
     }
 
     pub fn union(self, other: Self) -> Self {
@@ -446,6 +459,7 @@ impl EffectFootprint {
                 bottom: self.output_outsets.bottom.max(other.output_outsets.bottom),
                 left: self.output_outsets.left.max(other.output_outsets.left),
             },
+            grid_alignment: self.grid_alignment.max(other.grid_alignment),
         }
     }
 
@@ -481,6 +495,7 @@ impl EffectFootprint {
                     .checked_add(stage.output_outsets.left)
                     .ok_or(EffectValidationError::FootprintOverflow)?,
             },
+            grid_alignment: self.grid_alignment.max(stage.grid_alignment),
         })
     }
 }

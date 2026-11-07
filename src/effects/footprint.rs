@@ -45,6 +45,26 @@ pub fn dual_kawase_sampling_radius(
     Ok(reach.ceil() as u32)
 }
 
+/// Output pixels spanned by one texel of the coarsest Dual Kawase level.
+///
+/// Every level is `ceil_div(domain * scale, 2^level)` with its UVs stretched
+/// across the whole texture, so the sampling lattice is anchored at the
+/// capture domain origin. A domain whose edges sit on multiples of this value
+/// keeps every level's texels on the same screen pixels however the effect
+/// region grows or moves (Hyprland gets the same stability by blurring the
+/// whole monitor).
+pub fn dual_kawase_grid_alignment(passes: u8, scale: f32) -> u32 {
+    let coarsest = 1u32 << u32::from(passes.min(16));
+    let scale = if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    };
+    (f64::from(coarsest) / f64::from(scale))
+        .ceil()
+        .clamp(1.0, 65_536.0) as u32
+}
+
 pub(crate) fn node_footprint(
     kind: &EffectNodeKind,
 ) -> Result<EffectFootprint, EffectValidationError> {
@@ -52,7 +72,8 @@ pub(crate) fn node_footprint(
         EffectNodeKind::Source(_) => Ok(EffectFootprint::ZERO),
         EffectNodeKind::DualKawaseBlur(spec) => Ok(EffectFootprint::symmetric(
             dual_kawase_sampling_radius(spec.radius, spec.passes, spec.scale)?,
-        )),
+        )
+        .with_grid_alignment(dual_kawase_grid_alignment(spec.passes, spec.scale))),
         EffectNodeKind::ColorMatrix(spec) => {
             spec.validate()?;
             Ok(EffectFootprint::ZERO)
@@ -170,6 +191,7 @@ mod tests {
         assert_eq!(
             validated.aggregate_footprint,
             EffectFootprint::symmetric(dual_kawase_sampling_radius(4.0, 1, 1.0).unwrap())
+                .with_grid_alignment(dual_kawase_grid_alignment(1, 1.0))
         );
     }
 }
