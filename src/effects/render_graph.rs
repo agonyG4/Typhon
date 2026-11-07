@@ -152,12 +152,33 @@ pub fn builtin_background_blur_program() -> ValidatedEffectProgram {
 /// Dual Kawase depth of the builtin background material.
 pub const BUILTIN_MATERIAL_BLUR_PASSES: u8 = 4;
 
+static BUILTIN_MATERIAL_BLUR_PASSES_OVERRIDE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
+/// Kawase depth the builtin material compiles with now: the runtime override
+/// set by `astreactl effects passes N`, else [`BUILTIN_MATERIAL_BLUR_PASSES`].
+pub fn builtin_material_blur_passes() -> u8 {
+    match BUILTIN_MATERIAL_BLUR_PASSES_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => BUILTIN_MATERIAL_BLUR_PASSES,
+        passes => passes,
+    }
+}
+
+/// Override the builtin material depth for later material generations
+/// (`None` restores the default). Callers republish the material afterwards.
+pub fn set_builtin_material_blur_passes(passes: Option<u8>) {
+    BUILTIN_MATERIAL_BLUR_PASSES_OVERRIDE.store(
+        passes.map_or(0, |passes| passes.clamp(1, 8)),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
 /// Construct the one canonical background material graph from the compositor's
 /// semantic snapshot. Radius and stage details remain Typhon-owned renderer policy.
 pub fn builtin_background_material_program(
     material: crate::material::EffectiveMaterial,
 ) -> ValidatedEffectProgram {
-    builtin_background_material_program_with_passes(material, BUILTIN_MATERIAL_BLUR_PASSES)
+    builtin_background_material_program_with_passes(material, builtin_material_blur_passes())
 }
 
 /// The builtin material graph at an explicit Kawase depth. Production always

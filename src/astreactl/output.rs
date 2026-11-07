@@ -187,6 +187,10 @@ pub fn human(result: &AstreactlResult) -> String {
         AstreactlResult::EffectsPlanner(snapshot) => {
             format!("Planner: {}", sanitize_terminal_text(&snapshot.planner))
         }
+        AstreactlResult::EffectsPasses(snapshot) => format!(
+            "Material blur passes: {} (default {})",
+            snapshot.passes, snapshot.default_passes,
+        ),
         AstreactlResult::EffectsRetained(snapshot) => format!(
             "Retained outputs: {}\nGraphs: {}\nHits: {}/{}",
             if snapshot.enabled { "on" } else { "off" },

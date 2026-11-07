@@ -844,8 +844,28 @@ fn parse_effects_command(
             serde_json::json!({"enabled": enabled}),
         ));
     }
+    if positionals.first().map(String::as_str) == Some("passes") && positionals.len() <= 2 {
+        let passes = match positionals.get(1).map(String::as_str) {
+            None => serde_json::Value::Null,
+            Some("default") => serde_json::json!(0),
+            Some(value) => match value.parse::<u8>() {
+                Ok(passes @ 1..=8) => serde_json::json!(passes),
+                _ => {
+                    return Err(AstreactlError::Usage(
+                        "effects passes takes 1..8 or default".to_string(),
+                    ));
+                }
+            },
+        };
+        return Ok((
+            "effects",
+            "effects.passes",
+            serde_json::json!({"passes": passes}),
+        ));
+    }
     Err(AstreactlError::Usage(
-        "effects command requires reload, planner legacy|regional or retained [on|off]".to_string(),
+        "effects command requires reload, planner legacy|regional, retained [on|off] or passes [1..8|default]"
+            .to_string(),
     ))
 }
 

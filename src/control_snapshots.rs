@@ -1118,6 +1118,15 @@ pub struct EffectsRetainedSnapshot {
     pub candidates: u64,
 }
 
+/// Kawase depth of the builtin material.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct EffectsPassesSnapshot {
+    pub passes: u8,
+    pub default_passes: u8,
+}
+
 /// Whether the per-transaction presentation trace is being written.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1146,6 +1155,7 @@ pub enum AstreactlResult {
     TrustedEffects(TrustedEffectsReloadSnapshot),
     EffectsPlanner(EffectsPlannerSnapshot),
     EffectsRetained(EffectsRetainedSnapshot),
+    EffectsPasses(EffectsPassesSnapshot),
     Blur(crate::blur_policy::BlurPolicySnapshot),
     Animation(crate::animation_control::AnimationControlSnapshot),
     PresentationPolicy(PresentationPolicySnapshot),

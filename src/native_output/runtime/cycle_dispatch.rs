@@ -182,6 +182,14 @@ struct EffectsPlannerArgs {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct EffectsPassesArgs {
+    /// 0 restores the default; absent only reports.
+    #[serde(default)]
+    passes: Option<u8>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct EffectsRetainedArgs {
     #[serde(default)]
     enabled: Option<bool>,
@@ -1308,6 +1316,56 @@ impl NativeRuntime {
             return Some(ControlResponse::success(
                 request.id,
                 serde_json::json!({"planner": parsed.policy.as_str()}),
+            ));
+        }
+        if command == ControlCommand::EffectsPasses {
+            let Ok(args) = serde_json::from_value::<EffectsPassesArgs>(request.args) else {
+                return Some(ControlResponse::failure(
+                    request.id,
+                    ControlError::new(
+                        ControlErrorCode::InvalidArgument,
+                        "effects passes takes an optional passes number (0 = default)",
+                    ),
+                ));
+            };
+            if let Some(passes) = args.passes {
+                if self.pending_worker_effect_reload.is_some() {
+                    return Some(ControlResponse::failure(
+                        request.id,
+                        ControlError::new(
+                            ControlErrorCode::Internal,
+                            "trusted effect registry reload is in flight",
+                        )
+                        .with_detail("effect_reload_busy"),
+                    ));
+                }
+                let previous = oblivion_one::effects::builtin_material_blur_passes();
+                oblivion_one::effects::set_builtin_material_blur_passes(
+                    (passes != 0).then_some(passes),
+                );
+                // Republish the current material so the builtin program is
+                // rebuilt at the new depth.
+                let configuration = self.server.material_snapshot().configuration;
+                match self.server.set_material_configuration(configuration) {
+                    Ok(_) => {
+                        let generation = self.server.trusted_effect_registry().current();
+                        self.head
+                            .scanout
+                            .publish_material_effect_generation(&generation);
+                        self.queued_redraw_requested = true;
+                    }
+                    Err(error) => {
+                        oblivion_one::effects::set_builtin_material_blur_passes(Some(previous));
+                        return Some(material_set_failure_response(request.id, error));
+                    }
+                }
+            }
+            return Some(ControlResponse::success(
+                request.id,
+                serde_json::json!({
+                    "passes": oblivion_one::effects::builtin_material_blur_passes(),
+                    "defaultPasses": oblivion_one::effects::BUILTIN_MATERIAL_BLUR_PASSES,
+                }),
             ));
         }
         if command == ControlCommand::EffectsRetained {
