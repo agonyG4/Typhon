@@ -1768,6 +1768,7 @@ fn run_terminal_builtin_diagnostic_case(
         blur,
         saturation,
         noise,
+        blur_passes: 3,
     };
     let (scene, registry) = terminal_builtin_blur_scene(rect, visual_group, material, coverage);
     let bounds = EffectRect::new(0, 0, output_size.0, output_size.1).expect("output bounds");
@@ -2175,6 +2176,7 @@ fn run_terminal_causal_diagnostic_case(noise: f32, origin: OutputFramebufferOrig
             blur: 0.4,
             saturation: 0.52,
             noise,
+            blur_passes: 3,
         },
     );
     let program_id = program.program.id;
@@ -2594,6 +2596,7 @@ fn terminal_kawase_gles_matches_causal_unfused_frames_exactly() {
             blur: 0.42,
             saturation: 0.31,
             noise: 0.0,
+            blur_passes: 3,
         },
         Some(rounded),
     );
@@ -2700,6 +2703,7 @@ fn terminal_kawase_gles_matches_causal_unfused_frames_exactly() {
             blur: 0.37,
             saturation: 1.0,
             noise: 0.0,
+            blur_passes: 3,
         },
         None,
     );
@@ -2738,6 +2742,7 @@ fn terminal_kawase_gles_matches_causal_unfused_frames_exactly() {
             blur: 0.4,
             saturation: 0.52,
             noise: 0.3,
+            blur_passes: 3,
         },
     );
     let program_id = program.program.id;
@@ -4680,6 +4685,7 @@ fn same_invocation_mrt_reports_real_up2_and_fragment_store_provenance() {
                     blur: 0.37,
                     saturation,
                     noise: 0.0,
+                    blur_passes: 3,
                 };
                 let (scene, registry) =
                     terminal_builtin_blur_scene(rect, visual_group, material, None);
@@ -4854,6 +4860,7 @@ fn canonical_staged_blur_matches_canonical_terminal_fusion_exactly() {
             blur: 0.5,
             saturation: 1.0,
             noise: 0.0,
+            blur_passes: 3,
         },
         None,
     );
@@ -4932,6 +4939,7 @@ fn canonical_staged_blur_exact_matrix_and_legacy_impact() {
                 blur: 0.37,
                 saturation: 1.0,
                 noise: 0.0,
+                blur_passes: 3,
             },
             None,
             false,
@@ -4944,6 +4952,7 @@ fn canonical_staged_blur_exact_matrix_and_legacy_impact() {
                 blur: 0.37,
                 saturation: 0.31,
                 noise: 0.0,
+                blur_passes: 3,
             },
             None,
             true,
@@ -4956,6 +4965,7 @@ fn canonical_staged_blur_exact_matrix_and_legacy_impact() {
                 blur: 0.42,
                 saturation: 0.31,
                 noise: 0.0,
+                blur_passes: 3,
             },
             None,
             true,
@@ -4968,6 +4978,7 @@ fn canonical_staged_blur_exact_matrix_and_legacy_impact() {
                 blur: 0.42,
                 saturation: 0.31,
                 noise: 0.3,
+                blur_passes: 3,
             },
             None,
             true,
@@ -4980,6 +4991,7 @@ fn canonical_staged_blur_exact_matrix_and_legacy_impact() {
                 blur: 0.37,
                 saturation: 0.52,
                 noise: 0.3,
+                blur_passes: 3,
             },
             None,
             true,
@@ -4992,6 +5004,7 @@ fn canonical_staged_blur_exact_matrix_and_legacy_impact() {
                 blur: 0.42,
                 saturation: 0.52,
                 noise: 0.0,
+                blur_passes: 3,
             },
             Some(rounded),
             false,
@@ -5004,6 +5017,7 @@ fn canonical_staged_blur_exact_matrix_and_legacy_impact() {
                 blur: 0.42,
                 saturation: 0.52,
                 noise: 0.0,
+                blur_passes: 3,
             },
             Some(triangle),
             false,
@@ -5024,6 +5038,7 @@ fn canonical_staged_blur_exact_matrix_and_legacy_impact() {
                 blur: 0.37,
                 saturation: 0.52,
                 noise: 0.3,
+                blur_passes: 3,
             },
             None,
             true,
@@ -5107,6 +5122,7 @@ fn synthetic_tint_compiles_to_a_fail_closed_terminal_topology() {
         blur: 0.37,
         saturation: 0.31,
         noise: 0.3,
+        blur_passes: 3,
     };
     let tint = oblivion_one::effects::TintSpec::new([0.96, 0.82, 1.0, 1.0], 0.35)
         .expect("synthetic Tint validates");
@@ -5166,6 +5182,7 @@ fn canonical_causal_abc_noise_free_and_noise_are_exact() {
                 blur: 0.4,
                 saturation: 0.52,
                 noise,
+                blur_passes: 3,
             },
         );
         let program_id = program.program.id;
@@ -5235,6 +5252,7 @@ fn canonical_partial_repair_matches_full_render_for_staged_and_fused_paths() {
             blur: 0.42,
             saturation: 0.31,
             noise: 0.3,
+            blur_passes: 3,
         },
         None,
     );
@@ -5378,6 +5396,7 @@ fn canonical_noise_seed_fields_are_origin_and_translation_independent() {
         blur: 0.42,
         saturation: 0.31,
         noise: 0.3,
+        blur_passes: 3,
     };
     let first_group = VisualGroupId::new(180).expect("first noise group");
     let translated_group = VisualGroupId::new(181).expect("translated noise group");
@@ -5564,6 +5583,7 @@ fn canonical_noise_field_origin_is_invariant_with_capture_clipped_to_output() {
         blur: 0.42,
         saturation: 0.31,
         noise: 0.3,
+        blur_passes: 3,
     };
     let group = VisualGroupId::new(180).expect("noise group");
     let (scene, registry) = terminal_builtin_blur_scene(effect_rect, group, material, None);
@@ -5870,6 +5890,7 @@ fn replay_blur_composite_leaves_pixels_outside_the_repaint_unchanged() {
             blur: 0.37,
             saturation: 1.0,
             noise: 0.0,
+            blur_passes: 3,
         },
         None,
     );

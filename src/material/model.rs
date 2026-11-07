@@ -4,6 +4,10 @@ pub const MATERIAL_CONFIGURATION_VERSION: u8 = 1;
 pub const DEFAULT_MATERIAL_POSITION: f32 = 0.5;
 pub const MATERIAL_VALUE_MIN: f32 = 0.0;
 pub const MATERIAL_VALUE_MAX: f32 = 1.0;
+/// Dual Kawase depth of the builtin material when no override is set.
+pub const DEFAULT_MATERIAL_BLUR_PASSES: u8 = 3;
+pub const MATERIAL_BLUR_PASSES_MIN: u8 = 1;
+pub const MATERIAL_BLUR_PASSES_MAX: u8 = 6;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -44,6 +48,10 @@ pub struct MaterialOverrides {
     pub blur: Option<f32>,
     pub saturation: Option<f32>,
     pub noise: Option<f32>,
+    /// Maximum Dual Kawase depth. Each level doubles the reachable blur size
+    /// and the blur slider spans what this depth can reach.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blur_passes: Option<u8>,
 }
 
 impl MaterialOverrides {
@@ -57,6 +65,13 @@ impl MaterialOverrides {
                 validate_normalized(value, dimension)?;
             }
         }
+        if let Some(passes) = self.blur_passes
+            && !(MATERIAL_BLUR_PASSES_MIN..=MATERIAL_BLUR_PASSES_MAX).contains(&passes)
+        {
+            return Err(MaterialConfigurationError::OutOfRange(
+                MaterialDimension::BlurPasses,
+            ));
+        }
         Ok(())
     }
 
@@ -64,10 +79,14 @@ impl MaterialOverrides {
         self.blur = None;
         self.saturation = None;
         self.noise = None;
+        self.blur_passes = None;
     }
 
     pub fn is_empty(&self) -> bool {
-        self.blur.is_none() && self.saturation.is_none() && self.noise.is_none()
+        self.blur.is_none()
+            && self.saturation.is_none()
+            && self.noise.is_none()
+            && self.blur_passes.is_none()
     }
 }
 
@@ -80,6 +99,13 @@ pub struct EffectiveMaterial {
     pub saturation: f32,
     /// Normalized noise amount.
     pub noise: f32,
+    /// Maximum Dual Kawase depth the blur may use.
+    #[serde(default = "default_material_blur_passes")]
+    pub blur_passes: u8,
+}
+
+const fn default_material_blur_passes() -> u8 {
+    DEFAULT_MATERIAL_BLUR_PASSES
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -166,11 +192,13 @@ impl MaterialCurveV1 {
             blur: 0.12 + 0.88 * position,
             saturation: 1.0 - 0.28 * position,
             noise: 0.02 + 0.12 * position,
+            blur_passes: DEFAULT_MATERIAL_BLUR_PASSES,
         };
         let effective = EffectiveMaterial {
             blur: overrides.blur.unwrap_or(base.blur),
             saturation: overrides.saturation.unwrap_or(base.saturation),
             noise: overrides.noise.unwrap_or(base.noise),
+            blur_passes: overrides.blur_passes.unwrap_or(base.blur_passes),
         };
         debug_assert!(
             [effective.blur, effective.saturation, effective.noise]
@@ -187,6 +215,7 @@ pub enum MaterialDimension {
     Blur,
     Saturation,
     Noise,
+    BlurPasses,
 }
 
 impl MaterialDimension {
@@ -196,6 +225,7 @@ impl MaterialDimension {
             Self::Blur => "blur override",
             Self::Saturation => "saturation override",
             Self::Noise => "noise override",
+            Self::BlurPasses => "blur passes override",
         }
     }
 }
@@ -232,6 +262,10 @@ impl std::fmt::Display for MaterialConfigurationError {
             Self::NonFinite(dimension) => {
                 write!(formatter, "{} must be finite", dimension.as_str())
             }
+            Self::OutOfRange(MaterialDimension::BlurPasses) => write!(
+                formatter,
+                "blur passes override must be within {MATERIAL_BLUR_PASSES_MIN}..={MATERIAL_BLUR_PASSES_MAX}"
+            ),
             Self::OutOfRange(dimension) => {
                 write!(formatter, "{} must be within 0.0..=1.0", dimension.as_str())
             }

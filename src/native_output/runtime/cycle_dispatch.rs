@@ -1339,13 +1339,10 @@ impl NativeRuntime {
                         .with_detail("effect_reload_busy"),
                     ));
                 }
-                let previous = oblivion_one::effects::builtin_material_blur_passes();
-                oblivion_one::effects::set_builtin_material_blur_passes(
-                    (passes != 0).then_some(passes),
-                );
-                // Republish the current material so the builtin program is
-                // rebuilt at the new depth.
-                let configuration = self.server.material_snapshot().configuration;
+                // The depth is a material override: persist it and republish
+                // the material so the builtin program is rebuilt at the new depth.
+                let mut configuration = self.server.material_snapshot().configuration;
+                configuration.overrides.blur_passes = (passes != 0).then_some(passes);
                 match self.server.set_material_configuration(configuration) {
                     Ok(_) => {
                         let generation = self.server.trusted_effect_registry().current();
@@ -1355,7 +1352,6 @@ impl NativeRuntime {
                         self.queued_redraw_requested = true;
                     }
                     Err(error) => {
-                        oblivion_one::effects::set_builtin_material_blur_passes(Some(previous));
                         return Some(material_set_failure_response(request.id, error));
                     }
                 }
@@ -1363,7 +1359,7 @@ impl NativeRuntime {
             return Some(ControlResponse::success(
                 request.id,
                 serde_json::json!({
-                    "passes": oblivion_one::effects::builtin_material_blur_passes(),
+                    "passes": self.server.material_snapshot().effective.blur_passes,
                     "defaultPasses": oblivion_one::effects::BUILTIN_MATERIAL_BLUR_PASSES,
                 }),
             ));

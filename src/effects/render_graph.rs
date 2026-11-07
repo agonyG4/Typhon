@@ -149,28 +149,50 @@ pub fn builtin_background_blur_program() -> ValidatedEffectProgram {
     )
 }
 
-/// Dual Kawase depth of the builtin background material.
-pub const BUILTIN_MATERIAL_BLUR_PASSES: u8 = 3;
+/// Dual Kawase depth of the builtin background material when the material
+/// configuration does not override it.
+pub const BUILTIN_MATERIAL_BLUR_PASSES: u8 = crate::material::DEFAULT_MATERIAL_BLUR_PASSES;
 
-static BUILTIN_MATERIAL_BLUR_PASSES_OVERRIDE: std::sync::atomic::AtomicU8 =
-    std::sync::atomic::AtomicU8::new(0);
+/// Blur sigma, in output pixels, produced per unit of Kawase radius at depth
+/// one (measured: depth 2/3/4 at radius 4 give 11.0/22.6/45.5 px).
+const KAWASE_SIGMA_PER_RADIUS_LEVEL: f32 = 0.71;
+/// Radius at which the blur steps down to a shallower level. Deeper levels at
+/// a small radius are smoother than shallow levels at a large one, so a level
+/// only runs between this and half of it.
+const KAWASE_LEVEL_SWITCH_RADIUS: f32 = 3.0;
+/// Smallest radius before the five-tap downsample degenerates into visible
+/// position-dependent sampling.
+const KAWASE_MIN_RADIUS: f32 = 1.5;
+/// Largest radius before taps skip texels and the kernel turns non-monotone.
+const KAWASE_MAX_RADIUS: f32 = 4.0;
 
-/// Kawase depth the builtin material compiles with now: the runtime override
-/// set by `astreactl effects passes N`, else [`BUILTIN_MATERIAL_BLUR_PASSES`].
-pub fn builtin_material_blur_passes() -> u8 {
-    match BUILTIN_MATERIAL_BLUR_PASSES_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
-        0 => BUILTIN_MATERIAL_BLUR_PASSES,
-        passes => passes,
-    }
+/// Blur sigma (output pixels) the builtin material reaches at `blur` with at
+/// most `max_passes` levels. The slider spans, on a log scale, from a light
+/// two-level blur to the full size `max_passes` can reach, so every depth
+/// keeps the same light end and more passes only extend the heavy end.
+pub fn builtin_material_blur_sigma(blur: f32, max_passes: u8) -> f32 {
+    let max_passes = max_passes.max(1);
+    let min_passes = max_passes.min(2);
+    let level = |passes: u8| KAWASE_SIGMA_PER_RADIUS_LEVEL * f32::from(1u16 << passes);
+    let lightest = level(min_passes) * KAWASE_MIN_RADIUS;
+    let heaviest = level(max_passes) * KAWASE_MAX_RADIUS;
+    lightest * (heaviest / lightest).powf(blur.clamp(0.0, 1.0))
 }
 
-/// Override the builtin material depth for later material generations
-/// (`None` restores the default). Callers republish the material afterwards.
-pub fn set_builtin_material_blur_passes(passes: Option<u8>) {
-    BUILTIN_MATERIAL_BLUR_PASSES_OVERRIDE.store(
-        passes.map_or(0, |passes| passes.clamp(1, 8)),
-        std::sync::atomic::Ordering::Relaxed,
-    );
+/// Kawase depth and radius the builtin material uses at `blur` with at most
+/// `max_passes` levels: the shallowest level whose radius stays at or below
+/// [`KAWASE_LEVEL_SWITCH_RADIUS`] (the deepest level runs up to
+/// [`KAWASE_MAX_RADIUS`]).
+pub fn builtin_material_blur_depth(blur: f32, max_passes: u8) -> (u8, f32) {
+    let max_passes = max_passes.max(1);
+    let min_passes = max_passes.min(2);
+    let sigma = builtin_material_blur_sigma(blur, max_passes);
+    let level = |passes: u8| KAWASE_SIGMA_PER_RADIUS_LEVEL * f32::from(1u16 << passes);
+    let passes = (min_passes..max_passes)
+        .find(|&passes| sigma <= level(passes) * KAWASE_LEVEL_SWITCH_RADIUS + 1.0e-3)
+        .unwrap_or(max_passes);
+    let radius = (sigma / level(passes)).clamp(KAWASE_MIN_RADIUS, KAWASE_MAX_RADIUS);
+    (passes, radius)
 }
 
 /// Construct the one canonical background material graph from the compositor's
@@ -178,30 +200,26 @@ pub fn set_builtin_material_blur_passes(passes: Option<u8>) {
 pub fn builtin_background_material_program(
     material: crate::material::EffectiveMaterial,
 ) -> ValidatedEffectProgram {
-    builtin_background_material_program_with_passes(material, builtin_material_blur_passes())
+    builtin_background_material_program_with_passes(material, material.blur_passes)
 }
 
-/// The builtin material graph at an explicit Kawase depth. Production always
-/// uses [`BUILTIN_MATERIAL_BLUR_PASSES`]; fixtures whose geometry is tuned to a
-/// particular sampling footprint pin their own depth.
+/// The builtin material graph with an explicit maximum Kawase depth in place
+/// of the material's own. Fixtures whose geometry is tuned to a particular
+/// sampling footprint pin their depth this way.
 pub fn builtin_background_material_program_with_passes(
     material: crate::material::EffectiveMaterial,
-    passes: u8,
+    max_passes: u8,
 ) -> ValidatedEffectProgram {
     let source = EffectNodeId::new(1).expect("builtin source node id is non-zero");
     let blur = EffectNodeId::new(2).expect("builtin blur node id is non-zero");
     let saturation = EffectNodeId::new(3).expect("builtin saturation node id is non-zero");
     let noise = EffectNodeId::new(4).expect("builtin noise node id is non-zero");
-    // Renderer-specific radius is deliberately derived here, behind the Typhon
-    // material boundary. Public controls stay normalized and renderer-neutral.
-    // The radius is in half-texel units (the Dual Kawase half-pixel convention),
-    // so it is kept small: larger offsets alias into blocky grid artifacts.
-    // Blur strength comes from depth instead: three levels give a ~23 px sigma
-    // at full blur, twice the old two-level ~11 px that let backdrop text show
-    // through. Four levels (~45 px, Hyprland's `size 5, passes 4`) quadruple
-    // the sampling footprint (88 -> 412 px) and measured 17 ms CPU per frame
-    // with 16 stacked blurs; `astreactl effects passes 4` keeps it for A/B.
-    let radius = 1.5 + material.blur * 2.5;
+    // Renderer-specific depth and radius are deliberately derived here, behind
+    // the Typhon material boundary. Public controls stay normalized and
+    // renderer-neutral. The radius is in half-texel units (the Dual Kawase
+    // half-pixel convention) and kept within 1.5..=4: larger offsets alias
+    // into blocky grid artifacts, so blur size comes from depth instead.
+    let (passes, radius) = builtin_material_blur_depth(material.blur, max_passes);
     let saturation_factor = material.saturation;
     let desaturation = 1.0 - saturation_factor;
     let red_luminance = 0.2126 * desaturation;
@@ -9749,6 +9767,34 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+}
+#[cfg(test)]
+#[test]
+fn builtin_blur_slider_spans_the_reach_of_its_depth() {
+    // Full blur at the default depth is unchanged: three levels at radius 4.
+    assert_eq!(builtin_material_blur_depth(1.0, 3), (3, 4.0));
+    // Every depth shares the same light end; more passes only extend the heavy end.
+    for passes in 2..=6 {
+        assert_eq!(builtin_material_blur_depth(0.0, passes), (2, 1.5));
+        assert!(
+            builtin_material_blur_sigma(1.0, passes) > builtin_material_blur_sigma(1.0, passes - 1)
+        );
+        assert_eq!(builtin_material_blur_depth(1.0, passes), (passes, 4.0));
+    }
+    // Sigma grows monotonically with the slider, the depth never exceeds the
+    // configured maximum and the radius stays in the artifact-free band.
+    for passes in 1..=6 {
+        let mut previous = 0.0;
+        for step in 0..=100 {
+            let blur = step as f32 / 100.0;
+            let sigma = builtin_material_blur_sigma(blur, passes);
+            let (depth, radius) = builtin_material_blur_depth(blur, passes);
+            assert!(sigma >= previous);
+            previous = sigma;
+            assert!(depth <= passes);
+            assert!((1.5..=4.0).contains(&radius));
         }
     }
 }

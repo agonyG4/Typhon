@@ -849,10 +849,10 @@ fn parse_effects_command(
             None => serde_json::Value::Null,
             Some("default") => serde_json::json!(0),
             Some(value) => match value.parse::<u8>() {
-                Ok(passes @ 1..=8) => serde_json::json!(passes),
+                Ok(passes @ 1..=6) => serde_json::json!(passes),
                 _ => {
                     return Err(AstreactlError::Usage(
-                        "effects passes takes 1..8 or default".to_string(),
+                        "effects passes takes 1..6 or default".to_string(),
                     ));
                 }
             },
@@ -864,7 +864,7 @@ fn parse_effects_command(
         ));
     }
     Err(AstreactlError::Usage(
-        "effects command requires reload, planner legacy|regional, retained [on|off] or passes [1..8|default]"
+        "effects command requires reload, planner legacy|regional, retained [on|off] or passes [1..6|default]"
             .to_string(),
     ))
 }

@@ -85,6 +85,7 @@ fn canonical_material_graph(
         blur: 0.42,
         saturation: 0.31,
         noise: 0.3,
+        blur_passes: 3,
     };
     let validated = builtin_background_material_program(material);
     let footprint = validated.aggregate_footprint;
@@ -596,6 +597,7 @@ fn footprint_change_preserves_builtin_terminal_fusion_topology() {
         blur: 0.42,
         saturation: 0.31,
         noise: 0.3,
+        blur_passes: 3,
     };
     let validated = builtin_background_material_program(material);
     let program_id = validated.program.id;
@@ -661,6 +663,7 @@ fn built_in_material_footprint_radii_follow_the_documented_bound() {
         blur: 1.0,
         saturation: 1.0,
         noise: 1.0,
+        blur_passes: 3,
     };
     let fixture_radius = dual_kawase_sampling_radius(5.36, 2, 1.0).unwrap();
     let default_radius =

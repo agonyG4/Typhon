@@ -165,7 +165,7 @@ fn sampled_support_disjointness_prunes_both_checkpoint_representations() {
 
 #[test]
 fn sampled_support_overlap_retains_the_checkpoint_edge() {
-    let graph = two_material_graph(260);
+    let graph = two_material_graph(250);
     let producer = graph.instances[0].id;
     let consumer = graph.instances[1].id;
     let support = derive_effect_sample_support(&graph, consumer).unwrap();

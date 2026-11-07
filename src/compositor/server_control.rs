@@ -1015,6 +1015,7 @@ mod tests {
                 blur: Some(0.42),
                 saturation: Some(0.31),
                 noise: Some(0.27),
+                blur_passes: None,
             },
             ..MaterialConfiguration::default()
         };

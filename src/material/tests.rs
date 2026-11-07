@@ -102,6 +102,7 @@ fn overrides_replace_only_their_corresponding_curve_dimensions() {
         blur: Some(0.91),
         saturation: None,
         noise: Some(0.73),
+        blur_passes: None,
     };
     let position_a = MaterialCurveV1::resolve(0.2, &overrides).unwrap();
     let position_b = MaterialCurveV1::resolve(0.8, &overrides).unwrap();
@@ -124,6 +125,7 @@ fn clearing_an_override_restores_that_dimension_to_the_curve() {
             blur: Some(0.0),
             saturation: Some(1.0),
             noise: Some(0.8),
+            blur_passes: None,
         },
         ..MaterialConfiguration::default()
     };

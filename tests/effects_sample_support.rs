@@ -454,6 +454,7 @@ fn fixture_and_maximum_material_keep_aggregate_bounds_and_contain_sampled_suppor
         blur: 1.0,
         saturation: 1.0,
         noise: 1.0,
+        blur_passes: 3,
     };
     let (graph, id, aggregate) = material_graph_for(maximum, bounds, visible, true);
     assert_eq!(aggregate, 142);
