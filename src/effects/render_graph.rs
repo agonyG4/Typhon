@@ -150,7 +150,7 @@ pub fn builtin_background_blur_program() -> ValidatedEffectProgram {
 }
 
 /// Dual Kawase depth of the builtin background material.
-pub const BUILTIN_MATERIAL_BLUR_PASSES: u8 = 4;
+pub const BUILTIN_MATERIAL_BLUR_PASSES: u8 = 3;
 
 static BUILTIN_MATERIAL_BLUR_PASSES_OVERRIDE: std::sync::atomic::AtomicU8 =
     std::sync::atomic::AtomicU8::new(0);
@@ -196,9 +196,11 @@ pub fn builtin_background_material_program_with_passes(
     // material boundary. Public controls stay normalized and renderer-neutral.
     // The radius is in half-texel units (the Dual Kawase half-pixel convention),
     // so it is kept small: larger offsets alias into blocky grid artifacts.
-    // Blur strength comes from depth instead: four levels give a ~45 px sigma
-    // at full blur, matching Hyprland's `size 5, passes 4` (~43 px); two levels
-    // stopped at ~11 px and let backdrop text show through.
+    // Blur strength comes from depth instead: three levels give a ~23 px sigma
+    // at full blur, twice the old two-level ~11 px that let backdrop text show
+    // through. Four levels (~45 px, Hyprland's `size 5, passes 4`) quadruple
+    // the sampling footprint (88 -> 412 px) and measured 17 ms CPU per frame
+    // with 16 stacked blurs; `astreactl effects passes 4` keeps it for A/B.
     let radius = 1.5 + material.blur * 2.5;
     let saturation_factor = material.saturation;
     let desaturation = 1.0 - saturation_factor;
@@ -3857,7 +3859,7 @@ mod tests {
                 .iter()
                 .filter(|pass| pass.kind == RenderPassKind::DualKawaseDownsample)
                 .count(),
-            60
+            45
         );
         assert_eq!(
             exact
@@ -3865,7 +3867,7 @@ mod tests {
                 .iter()
                 .filter(|pass| pass.kind == RenderPassKind::DualKawaseUpsample)
                 .count(),
-            60
+            45
         );
         assert_eq!(
             exact
@@ -3924,10 +3926,10 @@ mod tests {
         assert_eq!(plan.baseline_anchor, scene.instances[0].anchor);
         assert_eq!(plan.baseline_scene_order, scene.instances[0].scene_order);
         assert_eq!(plan.capture_domain, bounds);
-        assert_eq!(plan.build_passes, 9);
+        assert_eq!(plan.build_passes, 7);
         assert_eq!(plan.consumers.len(), 15);
         let build = compile_precomputed_backdrop_build(&plan, bounds);
-        assert_eq!(build.stages.len(), 9);
+        assert_eq!(build.stages.len(), 7);
         assert_eq!(
             build.stages,
             [
@@ -3947,28 +3949,18 @@ mod tests {
                     width: 300,
                     height: 75,
                 },
-                PrecomputedBackdropBuildStage::KawaseDownsample {
-                    level: 4,
-                    width: 150,
-                    height: 38,
-                },
                 PrecomputedBackdropBuildStage::KawaseUpsample {
                     level: 1,
-                    width: 300,
-                    height: 75,
-                },
-                PrecomputedBackdropBuildStage::KawaseUpsample {
-                    level: 2,
                     width: 600,
                     height: 150,
                 },
                 PrecomputedBackdropBuildStage::KawaseUpsample {
-                    level: 3,
+                    level: 2,
                     width: 1_200,
                     height: 300,
                 },
                 PrecomputedBackdropBuildStage::KawaseUpsample {
-                    level: 4,
+                    level: 3,
                     width: 2_400,
                     height: 600,
                 },
@@ -9247,7 +9239,7 @@ mod tests {
         let off = compile_terminal_fusion_variant(15, bounds, false);
         let on = compile_terminal_fusion_variant(15, bounds, true);
 
-        assert_eq!(off.stats.passes, 165);
+        assert_eq!(off.stats.passes, 135);
         assert_eq!(
             off.passes
                 .iter()
@@ -9260,14 +9252,14 @@ mod tests {
                 .iter()
                 .filter(|pass| pass.kind == RenderPassKind::DualKawaseDownsample)
                 .count(),
-            60
+            45
         );
         assert_eq!(
             off.passes
                 .iter()
                 .filter(|pass| pass.kind == RenderPassKind::DualKawaseUpsample)
                 .count(),
-            60
+            45
         );
         assert_eq!(
             off.passes
@@ -9287,7 +9279,7 @@ mod tests {
         assert_eq!(off.stats.terminal_blur_fusions, 0);
         assert_eq!(off.stats.terminal_blur_passes_elided, 0);
 
-        assert_eq!(on.stats.passes, 135);
+        assert_eq!(on.stats.passes, 105);
         assert_eq!(
             on.passes
                 .iter()
@@ -9300,14 +9292,14 @@ mod tests {
                 .iter()
                 .filter(|pass| pass.kind == RenderPassKind::DualKawaseDownsample)
                 .count(),
-            60
+            45
         );
         assert_eq!(
             on.passes
                 .iter()
                 .filter(|pass| pass.kind == RenderPassKind::DualKawaseUpsample)
                 .count(),
-            45
+            30
         );
         assert_eq!(
             on.passes
@@ -9337,8 +9329,8 @@ mod tests {
                 })
                 .count()
         };
-        assert_eq!(live_intermediate_lifetimes(&off), 135);
-        assert_eq!(live_intermediate_lifetimes(&on), 105);
+        assert_eq!(live_intermediate_lifetimes(&off), 105);
+        assert_eq!(live_intermediate_lifetimes(&on), 75);
         assert!(on.stats.peak_live_intermediates <= off.stats.peak_live_intermediates);
     }
 
@@ -9363,8 +9355,6 @@ mod tests {
                 RenderPassKind::DualKawaseDownsample,
                 RenderPassKind::DualKawaseDownsample,
                 RenderPassKind::DualKawaseDownsample,
-                RenderPassKind::DualKawaseDownsample,
-                RenderPassKind::DualKawaseUpsample,
                 RenderPassKind::DualKawaseUpsample,
                 RenderPassKind::DualKawaseUpsample,
                 RenderPassKind::DualKawaseUpsample,
@@ -9379,8 +9369,6 @@ mod tests {
                 RenderPassKind::DualKawaseDownsample,
                 RenderPassKind::DualKawaseDownsample,
                 RenderPassKind::DualKawaseDownsample,
-                RenderPassKind::DualKawaseDownsample,
-                RenderPassKind::DualKawaseUpsample,
                 RenderPassKind::DualKawaseUpsample,
                 RenderPassKind::DualKawaseUpsample,
                 RenderPassKind::Composite,

@@ -103,7 +103,7 @@ when the variable is unset.
 | `TYPHON_EFFECT_CHECKPOINT_DEPENDENCY_PRUNING` | `on`, `off` | `off` | Newer path, off by default. Unrecognized values fall back to `off`. |
 | `TYPHON_EFFECT_DEMAND_PLANNER` | `legacy`, `regional` | `legacy` | Unrecognized values fall back to `legacy`. `astreactl effects planner legacy\|regional` switches it at runtime. |
 | `TYPHON_EFFECT_RETAINED_TRACE` | `1` | unset | Logs retained blur output hits every 300 executed graphs. A blur whose backdrop is causally unchanged composites from its last pre-composite texture and skips capture and Kawase passes; `astreactl effects retained [on\|off]` toggles the cache and reports cumulative hits/candidates. |
-| (runtime only) | `astreactl effects passes [1..8\|default]` | 4 | Kawase depth of the builtin background material; republishes the current material at the new depth for live A/B. Capture domains snap to the `2^passes` output lattice so the blur grid never moves with the region. |
+| (runtime only) | `astreactl effects passes [1..8\|default]` | 3 | Kawase depth of the builtin background material; republishes the current material at the new depth for live A/B. Capture domains snap to the `2^passes` output lattice so the blur grid never moves with the region. |
 | `TYPHON_EFFECT_PRECOMPUTED_WINDOW_BLUR` | `off`, `on` | `off` | See [Shared window blur](#shared-window-blur). |
 | `TYPHON_EFFECT_RESOURCE_BUDGET_MIB`, `TYPHON_EFFECT_CHECKPOINT_CACHE_BUDGET_MIB` | positive integer MiB | built-in budgets | See [Resource limits and diagnostics](#resource-limits-and-diagnostics). |
 
