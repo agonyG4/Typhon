@@ -866,6 +866,10 @@ impl EffectExecutionContext<'_> {
                     .tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, filter);
                 self.gl
                     .tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, filter);
+                crate::egl_renderer::geometry::set_bound_texture_opaque_alpha(
+                    &self.gl,
+                    command.opaque_region_covers_bounds(),
+                );
                 if let Some(location) = opacity_location.as_ref() {
                     let presentation_opacity =
                         if self.scene.capture_unattenuated_visual_group == command.visual_group {
@@ -1571,6 +1575,10 @@ impl EffectExecutionContext<'_> {
                     .tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, filter);
                 self.gl
                     .tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, filter);
+                crate::egl_renderer::geometry::set_bound_texture_opaque_alpha(
+                    &self.gl,
+                    command.opaque_region_covers_bounds(),
+                );
                 if let Some(location) = opacity_location.as_ref() {
                     let presentation_opacity =
                         if self.scene.capture_unattenuated_visual_group == command.visual_group {

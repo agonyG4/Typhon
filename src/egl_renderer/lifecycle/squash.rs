@@ -424,6 +424,10 @@ impl SquashRenderState {
                         );
                         current_texture_sampling = Some(texture_sampling);
                     }
+                    crate::egl_renderer::geometry::set_bound_texture_opaque_alpha(
+                        &context.gl,
+                        command.opaque_region_covers_bounds(),
+                    );
                     if let Some(location) = &opacity_location {
                         context
                             .gl

@@ -945,6 +945,27 @@ pub(super) struct EglDrawCommand {
 }
 
 impl EglDrawCommand {
+    /// True when the client declared its whole drawn quad opaque.
+    ///
+    /// wl_surface.set_opaque_region is a promise that the content there is
+    /// opaque, and Typhon already culls everything beneath it. Clients still
+    /// commit frames whose alpha is zero inside that region (Chromium does
+    /// while a page loads), so blending with the buffer's alpha would show
+    /// the culled-or-not scene behind the window for a frame. Mutter treats
+    /// the region as opaque when drawing; so does Typhon.
+    pub(super) fn opaque_region_covers_bounds(&self) -> bool {
+        const EPSILON: f32 = 0.5;
+        let bounds = self.bounds;
+        bounds.width > 0.0
+            && bounds.height > 0.0
+            && self.opaque_regions.iter().any(|rect| {
+                rect.x <= bounds.x + EPSILON
+                    && rect.y <= bounds.y + EPSILON
+                    && rect.x + rect.width >= bounds.x + bounds.width - EPSILON
+                    && rect.y + rect.height >= bounds.y + bounds.height - EPSILON
+            })
+    }
+
     fn visible_bounds(&self) -> Option<EglRect> {
         self.presentation_clip
             .map_or(Some(self.bounds), |clip| self.bounds.intersection(clip))
@@ -980,6 +1001,20 @@ pub(super) struct EglLampDrawCommand {
     pub(super) sampling: SurfaceSampling,
     pub(super) presentation_identity:
         oblivion_one::presentation_animation::PresentationRetainedVisualIdentity,
+}
+
+/// Read the bound texture's alpha as 1.0 when `opaque`, as the buffer's
+/// alpha otherwise. Swizzle is texture state, so every binding sets it.
+///
+/// # Safety
+/// Requires a current GL context with the target texture bound to
+/// `TEXTURE_2D`.
+pub(super) unsafe fn set_bound_texture_opaque_alpha(gl: &glow::Context, opaque: bool) {
+    use glow::HasContext;
+    let alpha = if opaque { glow::ONE } else { glow::ALPHA } as i32;
+    unsafe {
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_SWIZZLE_A, alpha);
+    }
 }
 
 pub(super) fn push_draw_command(
@@ -1339,6 +1374,25 @@ mod tests {
         let command = EglRect::new(20.0, 30.0, 40.0, 50.0);
         assert!(command.intersects_output_rect(OutputRect::new(0, 0, 25, 40)));
         assert!(!command.intersects_output_rect(OutputRect::new(0, 0, 19, 29)));
+    }
+
+    #[test]
+    fn opaque_alpha_only_when_declared_region_covers_the_whole_quad() {
+        let bounds = EglRect::new(0.0, 0.0, 1920.0, 955.0);
+        assert!(test_command(bounds, vec![bounds]).opaque_region_covers_bounds());
+        assert!(
+            test_command(bounds, vec![EglRect::new(-0.25, 0.0, 1920.5, 955.0)])
+                .opaque_region_covers_bounds()
+        );
+        // CSD shadow outside the opaque window geometry keeps buffer alpha.
+        assert!(
+            !test_command(
+                EglRect::new(0.0, 0.0, 1952.0, 997.0),
+                vec![EglRect::new(16.0, 10.0, 1920.0, 955.0)],
+            )
+            .opaque_region_covers_bounds()
+        );
+        assert!(!test_command(bounds, Vec::new()).opaque_region_covers_bounds());
     }
 
     fn test_command(bounds: EglRect, opaque_regions: Vec<EglRect>) -> EglDrawCommand {
