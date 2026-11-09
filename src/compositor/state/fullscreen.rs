@@ -651,7 +651,7 @@ impl CompositorState {
             if !active_surfaces
                 .iter()
                 .any(|surface| surface.surface_id == surface_id)
-                || instance.region.intersect_rect(output_bounds).is_empty()
+                || !instance.region.intersects_rect(output_bounds)
             {
                 continue;
             }

@@ -161,7 +161,7 @@ impl CompositorState {
                 } else {
                     analysis.presentation_instance_count =
                         analysis.presentation_instance_count.saturating_add(1);
-                    if instance.region.intersect_rect(output_bounds).is_empty() {
+                    if !instance.region.intersects_rect(output_bounds) {
                         analysis.outside_output_instance_count =
                             analysis.outside_output_instance_count.saturating_add(1);
                         DirectScanoutEffectDisposition::OutsideOutput

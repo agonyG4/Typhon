@@ -43,11 +43,19 @@ type RectSet = HashSet<EffectRect, BuildHasherDefault<RectHasher>>;
 #[derive(Default)]
 struct RectDedup {
     seen: Option<RectSet>,
+    linear_only: bool,
 }
 
 impl RectDedup {
+    fn linear() -> Self {
+        Self {
+            seen: None,
+            linear_only: true,
+        }
+    }
+
     fn contains(&mut self, rects: &[EffectRect], rect: &EffectRect) -> bool {
-        if rects.len() <= LINEAR_DEDUP_RECTS {
+        if self.linear_only || rects.len() <= LINEAR_DEDUP_RECTS {
             return rects.contains(rect);
         }
         self.seen
@@ -245,7 +253,9 @@ impl EffectRegion {
     }
 
     pub fn push(&mut self, rect: EffectRect) {
-        self.push_dedup(rect, &mut RectDedup::default());
+        // A one-off push scans linearly: building a hash set here would cost
+        // more than the scan. Bulk inserts go through `extend_rects`.
+        self.push_dedup(rect, &mut RectDedup::linear());
     }
 
     /// Pushes every rect in order, exactly as repeated [`Self::push`] would,
@@ -350,6 +360,16 @@ impl EffectRegion {
             result.push_dedup(*rect, &mut dedup);
         }
         (result, coalesced)
+    }
+
+    /// Same answer as `!self.intersect_rect(bounds).is_empty()`, without
+    /// building the intersection.
+    pub fn intersects_rect(&self, bounds: EffectRect) -> bool {
+        self.conservative_full
+            || self
+                .rects
+                .iter()
+                .any(|rect| rect.intersect(bounds).is_some())
     }
 
     pub fn intersect_rect(&self, bounds: EffectRect) -> Self {

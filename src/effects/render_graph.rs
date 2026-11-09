@@ -8879,7 +8879,7 @@ mod tests {
         assert!(
             regional
                 .pass_output_region(first_capture.id)
-                .is_some_and(|region| !region.intersect_rect(a).is_empty())
+                .is_some_and(|region| region.intersects_rect(a))
         );
         let second_capture = graph
             .passes
