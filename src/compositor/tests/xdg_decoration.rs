@@ -399,6 +399,97 @@ fn astreactl_control_round_trip_sets_server_policy_for_xdg_without_decoration_ob
 }
 
 #[test]
+fn maximize_requested_before_client_side_mode_fills_the_usable_area() {
+    let (socket_path, commands, server_thread) = start_server();
+    let usable = capture_usable_output_geometry(&commands);
+    let connection = Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let wm_base: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=2, ()).unwrap();
+    let manager: client_zxdg_decoration_manager_v1::ZxdgDecorationManagerV1 =
+        globals.bind(&qh, 1..=1, ()).unwrap();
+    let (surface, xdg_surface, toplevel) =
+        create_test_buffered_toplevel(&compositor, &wm_base, &shm, &qh, 300, 200).unwrap();
+
+    // Chromium's order: the mode arrives after set_maximized, before any commit.
+    let decoration = manager.get_toplevel_decoration(&toplevel, &qh, ());
+    toplevel.set_maximized();
+    decoration.set_mode(client_zxdg_toplevel_decoration_v1::Mode::ClientSide);
+    connection.flush().unwrap();
+
+    let mut state = RegistryTestState {
+        suppress_xdg_surface_ack: true,
+        suppress_xdg_surface_commit: true,
+        ..RegistryTestState::default()
+    };
+    wait_for_server_commands(&commands);
+    queue.roundtrip(&mut state).unwrap();
+
+    assert_eq!(state.decoration_configure_modes.last(), Some(&1));
+    assert!(state.toplevel_has_state(client_xdg_toplevel::State::Maximized));
+    assert_eq!(
+        (state.toplevel_width, state.toplevel_height),
+        (usable.width as i32, usable.height as i32)
+    );
+
+    let placement = capture_xdg_role_snapshot(&commands, surface.id().protocol_id())
+        .placement
+        .expect("maximized window placement");
+    assert_eq!(
+        (placement.local_x, placement.local_y),
+        (usable.x as i32, usable.y as i32)
+    );
+
+    drop((decoration, toplevel, xdg_surface, surface, connection));
+    stop_server(commands, server_thread);
+}
+
+#[test]
+fn decoration_change_on_a_maximized_window_keeps_it_maximized_and_resizes_it() {
+    let (socket_path, commands, server_thread) = start_server();
+    let usable = capture_usable_output_geometry(&commands);
+    let mut client = DecorationClient::connect(
+        &socket_path,
+        &commands,
+        client_zxdg_toplevel_decoration_v1::Mode::ClientSide,
+    )
+    .expect("connect decoration client");
+    client.toplevel.set_maximized();
+    client.connection.flush().unwrap();
+    client.pump(&commands).unwrap();
+    assert_eq!(client.state.toplevel_height, usable.height as i32);
+
+    client
+        .decoration
+        .set_mode(client_zxdg_toplevel_decoration_v1::Mode::ServerSide);
+    client.connection.flush().unwrap();
+    client.pump(&commands).unwrap();
+
+    assert_eq!(client.state.decoration_configure_modes.last(), Some(&2));
+    assert!(client
+        .state
+        .toplevel_has_state(client_xdg_toplevel::State::Maximized));
+    assert_eq!(client.state.toplevel_height, usable.height as i32 - 26);
+
+    client
+        .decoration
+        .set_mode(client_zxdg_toplevel_decoration_v1::Mode::ClientSide);
+    client.connection.flush().unwrap();
+    client.pump(&commands).unwrap();
+
+    assert_eq!(client.state.decoration_configure_modes.last(), Some(&1));
+    assert!(client
+        .state
+        .toplevel_has_state(client_xdg_toplevel::State::Maximized));
+    assert_eq!(client.state.toplevel_height, usable.height as i32);
+
+    drop(client);
+    stop_server(commands, server_thread);
+}
+
+#[test]
 fn dynamic_client_to_server_waits_for_ack_and_commit() {
     let (socket_path, commands, server_thread) = start_server();
     let mut client = DecorationClient::connect(

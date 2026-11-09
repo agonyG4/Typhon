@@ -1440,14 +1440,51 @@ impl CompositorState {
         let can_schedule = self
             .xdg_surface_lifecycle(surface_id)
             .is_some_and(XdgSurfaceLifecycle::can_schedule_decoration_configure);
-        if !can_schedule {
-            return false;
-        }
         let Some(toplevel) = self.toplevel_surfaces.get(&surface_id).cloned() else {
             return false;
         };
-        self.send_toplevel_configure(surface_id, &toplevel, 0, 0, &[], true)
-            .is_some()
+        let mode = self
+            .toplevel_window_state(surface_id)
+            .map(WindowState::mode)
+            .unwrap_or(ToplevelMode::Normal);
+        if mode == ToplevelMode::Normal {
+            return can_schedule
+                && self
+                    .send_toplevel_configure(surface_id, &toplevel, 0, 0, &[], true)
+                    .is_some();
+        }
+
+        // A stateful window keeps its states, and a maximized one's size depends on
+        // whether it draws a titlebar. Chromium sends set_maximized before set_mode,
+        // so that size may already be on its way to a client that has yet to commit.
+        let geometry = self.window_geometry_for_surface_mode(surface_id, mode);
+        let size_is_stale = self
+            .xdg_configure_serials
+            .get(&surface_id)
+            .and_then(|serials| serials.latest_size)
+            .is_some_and(|size| size != (geometry.width, geometry.height));
+        if !can_schedule && !size_is_stale {
+            return false;
+        }
+        let configured = self
+            .send_configure_root_window_to(
+                surface_id,
+                ToplevelConfigureSize::Suggested {
+                    width: geometry.width,
+                    height: geometry.height,
+                },
+                mode.xdg_states(),
+            )
+            .is_some();
+        if size_is_stale {
+            self.set_surface_placement_with_cause(
+                surface_id,
+                geometry.placement,
+                RenderGenerationCause::WindowDecoration,
+            );
+            self.install_toplevel_visual_geometry(surface_id, geometry);
+        }
+        configured
     }
 
     pub(in crate::compositor) fn send_toplevel_configure(
