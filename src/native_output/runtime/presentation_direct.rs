@@ -182,13 +182,11 @@ pub(super) fn inspect_direct_presentation(
     let atomic_primary_commit_pending = inputs.page_flip_pending || inputs.atomic_commit_pending;
     let inspect_candidate =
         should_inspect_direct_scanout(inputs.direct_scanout_preference, inputs.direct_active);
-    let scene_analysis = if scaled_probe_enabled {
-        Some(inputs.server.direct_scanout_probe_scene_analysis())
-    } else if inspect_candidate {
-        Some(inputs.server.direct_scanout_scene_analysis())
-    } else {
-        None
-    };
+    let scene_analysis = (scaled_probe_enabled || inspect_candidate).then(|| {
+        inputs
+            .server
+            .direct_scanout_scene_decision(scaled_probe_enabled)
+    });
     let direct_candidate = inspect_candidate
         .then(|| {
             scene_analysis

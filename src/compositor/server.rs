@@ -2273,6 +2273,16 @@ impl OwnCompositorServer {
         self.state.direct_scanout_probe_scene_analysis()
     }
 
+    /// Scene analysis for the per-cycle presentation decision; see
+    /// `CompositorState::direct_scanout_scene_decision`.
+    pub fn direct_scanout_scene_decision(
+        &self,
+        include_scaled_probe_candidate: bool,
+    ) -> DirectScanoutSceneAnalysis {
+        self.state
+            .direct_scanout_scene_decision(include_scaled_probe_candidate)
+    }
+
     pub fn direct_scanout_layer_shell_doctor_details(
         &self,
         visible_content: &[PresentationCoverageContent],

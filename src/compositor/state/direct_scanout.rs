@@ -54,6 +54,14 @@ impl DirectScanoutSceneAnalysis {
 #[path = "direct_scanout_feedback_tests.rs"]
 mod feedback_tests;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DirectScanoutAnalysisDetail {
+    /// Every field, for diagnostics and tests.
+    Full,
+    /// Only what the presentation decision reads.
+    Decision,
+}
+
 impl CompositorState {
     pub(in crate::compositor) fn direct_scanout_effect_identity_scene(
         &self,
@@ -247,18 +255,35 @@ impl CompositorState {
     pub(in crate::compositor) fn direct_scanout_scene_analysis(
         &self,
     ) -> DirectScanoutSceneAnalysis {
-        self.direct_scanout_scene_analysis_impl(false)
+        self.direct_scanout_scene_analysis_impl(false, DirectScanoutAnalysisDetail::Full)
     }
 
     pub(in crate::compositor) fn direct_scanout_probe_scene_analysis(
         &self,
     ) -> DirectScanoutSceneAnalysis {
-        self.direct_scanout_scene_analysis_impl(true)
+        self.direct_scanout_scene_analysis_impl(true, DirectScanoutAnalysisDetail::Full)
+    }
+
+    /// The analysis the presentation path acts on: identical candidate,
+    /// probe candidate and blocker decisions, but a scene rejected before a
+    /// source surface is known skips the effect analysis, so its `effects`
+    /// stay default and it lacks the `EffectRequiresComposition` blocker.
+    /// Those only feed diagnostics there; resolving every effect instance
+    /// each cycle cost ~13% of the main thread under a maximized window.
+    pub(in crate::compositor) fn direct_scanout_scene_decision(
+        &self,
+        include_scaled_probe_candidate: bool,
+    ) -> DirectScanoutSceneAnalysis {
+        self.direct_scanout_scene_analysis_impl(
+            include_scaled_probe_candidate,
+            DirectScanoutAnalysisDetail::Decision,
+        )
     }
 
     fn direct_scanout_scene_analysis_impl(
         &self,
         include_scaled_probe_candidate: bool,
+        detail: DirectScanoutAnalysisDetail,
     ) -> DirectScanoutSceneAnalysis {
         let output_size = BufferSize::new(self.output_size.width, self.output_size.height)
             .expect("configured output size is nonzero");
@@ -266,12 +291,17 @@ impl CompositorState {
         let active_surfaces = scene.surfaces.as_ref();
         let coverage = self.presentation_coverage_analysis_for_scene(&scene);
         let fullscreen_plan = &scene.fullscreen_plan;
-        let mut effects = self.direct_scanout_effect_analysis_for_scene(
-            &scene,
-            fullscreen_plan,
-            output_size,
-            None,
-        );
+        // Without a source surface the effect analysis only describes why the
+        // scene is not scanned out; the decision path skips it.
+        let sourceless_effects = || match detail {
+            DirectScanoutAnalysisDetail::Full => self.direct_scanout_effect_analysis_for_scene(
+                &scene,
+                fullscreen_plan,
+                output_size,
+                None,
+            ),
+            DirectScanoutAnalysisDetail::Decision => DirectScanoutEffectAnalysis::default(),
+        };
 
         let mut blockers = DirectScanoutSceneBlockers::default();
         if self.workspace_presentation.transition().is_some() {
@@ -306,6 +336,7 @@ impl CompositorState {
 
         let Some(covering_group) = coverage.covering_application_group.as_ref() else {
             blockers.push(DirectScanoutSceneRejection::NoOutputCoveringApplication);
+            let effects = sourceless_effects();
             if effects.requires_composition {
                 blockers.push(DirectScanoutSceneRejection::EffectRequiresComposition);
             }
@@ -417,6 +448,7 @@ impl CompositorState {
             if self.has_pending_frame_prepare_work() {
                 blockers.push(DirectScanoutSceneRejection::PendingOrUnpublishedWork);
             }
+            let effects = sourceless_effects();
             if effects.requires_composition {
                 blockers.push(DirectScanoutSceneRejection::EffectRequiresComposition);
             }
@@ -437,6 +469,7 @@ impl CompositorState {
             if self.has_pending_frame_prepare_work() {
                 blockers.push(DirectScanoutSceneRejection::PendingOrUnpublishedWork);
             }
+            let effects = sourceless_effects();
             if effects.requires_composition {
                 blockers.push(DirectScanoutSceneRejection::EffectRequiresComposition);
             }
@@ -499,7 +532,7 @@ impl CompositorState {
             self.visual_group_for_surface(source_surface_id)
                 .map(|group| group.get())
         };
-        effects = self.direct_scanout_effect_analysis_for_scene(
+        let effects = self.direct_scanout_effect_analysis_for_scene(
             &scene,
             fullscreen_plan,
             output_size,

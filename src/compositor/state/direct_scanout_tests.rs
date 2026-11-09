@@ -1418,3 +1418,81 @@ fn special_workspace_dim_blocks_regular_fullscreen_direct_scanout() {
             .contains(&DirectScanoutSceneRejection::SpecialWorkspaceDim)
     );
 }
+
+fn assert_decision_matches_full_analysis(state: &CompositorState, probe: bool) {
+    let full = if probe {
+        state.direct_scanout_probe_scene_analysis()
+    } else {
+        state.direct_scanout_scene_analysis()
+    };
+    let decision = state.direct_scanout_scene_decision(probe);
+    assert_eq!(
+        decision
+            .candidate
+            .as_ref()
+            .map(|candidate| candidate.surface_id),
+        full.candidate
+            .as_ref()
+            .map(|candidate| candidate.surface_id)
+    );
+    assert_eq!(
+        decision
+            .probe_candidate
+            .as_ref()
+            .map(|probe| probe.buffer_size),
+        full.probe_candidate.as_ref().map(|probe| probe.buffer_size)
+    );
+    assert_eq!(decision.feedback_surface_id(), full.feedback_surface_id());
+    let without_effect_blocker = |analysis: &DirectScanoutSceneAnalysis| {
+        analysis
+            .blockers
+            .reasons()
+            .iter()
+            .copied()
+            .filter(|reason| *reason != DirectScanoutSceneRejection::EffectRequiresComposition)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        without_effect_blocker(&decision),
+        without_effect_blocker(&full)
+    );
+}
+
+#[test]
+fn presentation_decision_matches_full_analysis_and_skips_sourceless_effects() {
+    let mut state = CompositorState::new(None);
+    let output_size = BufferSize::new(state.output_size.width, state.output_size.height)
+        .expect("configured output size");
+    install_probe_scanout_surface(&mut state, 304, output_size);
+    assert!(state.direct_scanout_scene_candidate().is_ok());
+    assert_decision_matches_full_analysis(&state, false);
+    assert_decision_matches_full_analysis(&state, true);
+
+    let mut mismatch = CompositorState::new(None);
+    install_probe_scanout_surface(
+        &mut mismatch,
+        305,
+        BufferSize::new(1600, 900).expect("source size"),
+    );
+    assert_decision_matches_full_analysis(&mismatch, false);
+    assert_decision_matches_full_analysis(&mismatch, true);
+
+    // A window that does not cover the output is rejected before a source
+    // surface is known; its blur only matters to diagnostics.
+    let mut uncovered = CompositorState::new(None);
+    install_off_output_xdg_window(&mut uncovered, 306);
+    assert!(uncovered.set_internal_surface_effect(
+        306,
+        EffectAnchor::BeforeSurface(306),
+        crate::effects::builtin_background_blur_program_id(),
+        EffectRegion::from_rect(EffectRect::new(0, 0, 32, 32).unwrap()),
+    ));
+    let full = uncovered.direct_scanout_scene_analysis();
+    assert!(full.candidate.is_none());
+    assert!(full.coverage.covering_application_group.is_none());
+    assert!(full.effects.raw_instance_count > 0);
+    let decision = uncovered.direct_scanout_scene_decision(false);
+    assert_eq!(decision.effects.raw_instance_count, 0);
+    assert_decision_matches_full_analysis(&uncovered, false);
+    assert_decision_matches_full_analysis(&uncovered, true);
+}
