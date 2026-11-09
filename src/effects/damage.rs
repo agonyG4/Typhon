@@ -1,80 +1,6 @@
-use std::collections::HashSet;
-use std::hash::{BuildHasherDefault, Hasher};
-
 use super::{EffectFootprint, MAX_EFFECT_REGION_RECTS};
 
-/// Below this many rects a linear duplicate scan beats hashing.
-const LINEAR_DEDUP_RECTS: usize = 16;
-
-/// Multiply-rotate hasher for the four integers of an [`EffectRect`]. Rect
-/// dedup sets are local to one region operation, so no DoS resistance is
-/// needed and SipHash would cost more than the scan it replaces.
-#[derive(Default)]
-struct RectHasher(u64);
-
-impl Hasher for RectHasher {
-    fn finish(&self) -> u64 {
-        self.0
-    }
-
-    fn write(&mut self, bytes: &[u8]) {
-        for &byte in bytes {
-            self.write_u64(u64::from(byte));
-        }
-    }
-
-    fn write_u32(&mut self, value: u32) {
-        self.write_u64(u64::from(value));
-    }
-
-    fn write_i32(&mut self, value: i32) {
-        self.write_u64(u64::from(value as u32));
-    }
-
-    fn write_u64(&mut self, value: u64) {
-        self.0 = (self.0.rotate_left(5) ^ value).wrapping_mul(0x51_7cc1_b727_220a_95);
-    }
-}
-
-type RectSet = HashSet<EffectRect, BuildHasherDefault<RectHasher>>;
-
-/// Duplicate lookup over a growing rect list: a linear scan while the list
-/// is short, then a hash set built once and kept in step with the list.
-#[derive(Default)]
-struct RectDedup {
-    seen: Option<RectSet>,
-    linear_only: bool,
-}
-
-impl RectDedup {
-    fn linear() -> Self {
-        Self {
-            seen: None,
-            linear_only: true,
-        }
-    }
-
-    fn contains(&mut self, rects: &[EffectRect], rect: &EffectRect) -> bool {
-        if self.linear_only || rects.len() <= LINEAR_DEDUP_RECTS {
-            return rects.contains(rect);
-        }
-        self.seen
-            .get_or_insert_with(|| rects.iter().copied().collect())
-            .contains(rect)
-    }
-
-    fn inserted(&mut self, rect: EffectRect) {
-        if let Some(seen) = &mut self.seen {
-            seen.insert(rect);
-        }
-    }
-
-    fn reset(&mut self) {
-        self.seen = None;
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EffectRect {
     pub x: i32,
     pub y: i32,
@@ -253,36 +179,16 @@ impl EffectRegion {
     }
 
     pub fn push(&mut self, rect: EffectRect) {
-        // A one-off push scans linearly: building a hash set here would cost
-        // more than the scan. Bulk inserts go through `extend_rects`.
-        self.push_dedup(rect, &mut RectDedup::linear());
-    }
-
-    /// Pushes every rect in order, exactly as repeated [`Self::push`] would,
-    /// without its per-rect linear duplicate scan.
-    pub fn extend_rects(&mut self, rects: impl IntoIterator<Item = EffectRect>) {
-        let mut dedup = RectDedup::default();
-        for rect in rects {
-            if self.conservative_full {
-                return;
-            }
-            self.push_dedup(rect, &mut dedup);
-        }
-    }
-
-    fn push_dedup(&mut self, rect: EffectRect, dedup: &mut RectDedup) {
         if self.conservative_full {
             return;
         }
-        if dedup.contains(&self.rects, &rect) {
+        if self.rects.contains(&rect) {
             return;
         }
         if self.rects.len() < MAX_EFFECT_REGION_RECTS {
             self.rects.push(rect);
-            dedup.inserted(rect);
             return;
         }
-        dedup.reset();
         let mut bounds = rect;
         for existing in &self.rects {
             match bounds.union(*existing) {
@@ -296,6 +202,16 @@ impl EffectRegion {
         }
         self.rects.clear();
         self.rects.push(bounds);
+    }
+
+    /// Pushes every rect in order, exactly as repeated [`Self::push`] would.
+    pub fn extend_rects(&mut self, rects: impl IntoIterator<Item = EffectRect>) {
+        for rect in rects {
+            if self.conservative_full {
+                return;
+            }
+            self.push(rect);
+        }
     }
 
     /// Like [`Self::push`], but treats the region as a coverage set: a rect
@@ -346,18 +262,11 @@ impl EffectRegion {
         }
         let mut result = self.clone();
         let mut coalesced = false;
-        let mut dedup = RectDedup::default();
         for rect in &other.rects {
-            if result.conservative_full {
-                break;
-            }
-            if dedup.contains(&result.rects, rect) {
-                continue;
-            }
-            if result.rects.len() >= MAX_EFFECT_REGION_RECTS {
+            if result.rects.len() >= MAX_EFFECT_REGION_RECTS && !result.rects.contains(rect) {
                 coalesced = true;
             }
-            result.push_dedup(*rect, &mut dedup);
+            result.push(*rect);
         }
         (result, coalesced)
     }
@@ -430,7 +339,6 @@ impl EffectRegion {
         }
         let mut rects = Vec::new();
         let mut duplicate_rects_removed: usize = 0;
-        let mut dedup = RectDedup::default();
         let clip_bounds = clip.bounding_rect();
         for left in &self.rects {
             if clip_bounds.is_some_and(|bounds| bounds.intersect(*left).is_none()) {
@@ -440,7 +348,7 @@ impl EffectRegion {
                 let Some(intersection) = left.intersect(*right) else {
                     continue;
                 };
-                if dedup.contains(&rects, &intersection) {
+                if rects.contains(&intersection) {
                     duplicate_rects_removed += 1;
                     continue;
                 }
@@ -454,7 +362,6 @@ impl EffectRegion {
                     };
                 }
                 rects.push(intersection);
-                dedup.inserted(intersection);
             }
         }
         BoundedRegionIntersection {
@@ -598,7 +505,6 @@ impl EffectRegion {
             return self.clone();
         }
         let mut result = Self::empty();
-        let mut result_dedup = RectDedup::default();
         for source in &self.rects {
             let mut remaining = Self::from_rect(*source);
             for excluded_rect in &excluded.rects {
@@ -611,9 +517,7 @@ impl EffectRegion {
                 }));
                 remaining = next;
             }
-            for rect in &remaining.rects {
-                result.push_dedup(*rect, &mut result_dedup);
-            }
+            result.extend_rects(remaining.rects.iter().copied());
         }
         result
     }
@@ -1607,7 +1511,7 @@ mod tests {
     }
 
     #[test]
-    fn hashed_region_dedup_matches_sequential_push() {
+    fn bulk_region_operations_match_sequential_push() {
         for (seed, count, span, size) in [
             (1, 10, 8, 4),
             (2, 40, 6, 3),
