@@ -365,6 +365,9 @@ impl super::CompositorState {
                 .filter_map(|binding| binding.instance.clone()),
         );
         if self.background_effect_enabled {
+            // One grouping pass serves every surface below; rebuilding it per
+            // surface made this loop quadratic in the scene size.
+            let mut groups = None;
             for (surface, origin) in self
                 .active_scene_surfaces()
                 .iter()
@@ -419,7 +422,16 @@ impl super::CompositorState {
                         coverage.as_ref(),
                     ),
                     frame_demand: selected_frame_demand,
-                    visual_group: self.visual_group_for_surface(surface.surface_id),
+                    visual_group: Self::visual_group_for_surface_in_groups(
+                        self.active_scene_surfaces(),
+                        groups.get_or_insert_with(|| {
+                            visual_stack_groups(
+                                self.active_scene_surfaces(),
+                                self.active_scene_popup_surface_ids(),
+                            )
+                        }),
+                        surface.surface_id,
+                    ),
                     region: assignment.region,
                     target_bounds,
                     parameter_block: selected_parameter_block.clone(),
@@ -1210,11 +1222,12 @@ pub(in crate::compositor) fn map_effect_region(
             .unwrap_or_default();
     }
     let mut mapped = EffectRegion::empty();
-    for rect in region.rects() {
-        if let Some(rect) = map_effect_rect(transform, *rect) {
-            mapped.push(rect);
-        }
-    }
+    mapped.extend_rects(
+        region
+            .rects()
+            .iter()
+            .filter_map(|rect| map_effect_rect(transform, *rect)),
+    );
     mapped
 }
 
@@ -1237,7 +1250,7 @@ pub(in crate::compositor) fn background_effect_output_region(
     surface_width: u32,
     surface_height: u32,
 ) -> EffectRegion {
-    let mut rects = Vec::new();
+    let mut rects = Vec::with_capacity(region.ops().len());
     for operation in region.ops() {
         let Some(local) = clipped_background_effect_rect(
             operation.rect().coordinates(),
@@ -1260,9 +1273,7 @@ pub(in crate::compositor) fn background_effect_output_region(
         }
     }
     let mut output = EffectRegion::empty();
-    for rect in rects {
-        output.push(rect);
-    }
+    output.extend_rects(rects);
     output
 }
 

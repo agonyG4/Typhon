@@ -1,6 +1,72 @@
+use std::collections::HashSet;
+use std::hash::{BuildHasherDefault, Hasher};
+
 use super::{EffectFootprint, MAX_EFFECT_REGION_RECTS};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Below this many rects a linear duplicate scan beats hashing.
+const LINEAR_DEDUP_RECTS: usize = 16;
+
+/// Multiply-rotate hasher for the four integers of an [`EffectRect`]. Rect
+/// dedup sets are local to one region operation, so no DoS resistance is
+/// needed and SipHash would cost more than the scan it replaces.
+#[derive(Default)]
+struct RectHasher(u64);
+
+impl Hasher for RectHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.write_u64(u64::from(byte));
+        }
+    }
+
+    fn write_u32(&mut self, value: u32) {
+        self.write_u64(u64::from(value));
+    }
+
+    fn write_i32(&mut self, value: i32) {
+        self.write_u64(u64::from(value as u32));
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.0 = (self.0.rotate_left(5) ^ value).wrapping_mul(0x51_7cc1_b727_220a_95);
+    }
+}
+
+type RectSet = HashSet<EffectRect, BuildHasherDefault<RectHasher>>;
+
+/// Duplicate lookup over a growing rect list: a linear scan while the list
+/// is short, then a hash set built once and kept in step with the list.
+#[derive(Default)]
+struct RectDedup {
+    seen: Option<RectSet>,
+}
+
+impl RectDedup {
+    fn contains(&mut self, rects: &[EffectRect], rect: &EffectRect) -> bool {
+        if rects.len() <= LINEAR_DEDUP_RECTS {
+            return rects.contains(rect);
+        }
+        self.seen
+            .get_or_insert_with(|| rects.iter().copied().collect())
+            .contains(rect)
+    }
+
+    fn inserted(&mut self, rect: EffectRect) {
+        if let Some(seen) = &mut self.seen {
+            seen.insert(rect);
+        }
+    }
+
+    fn reset(&mut self) {
+        self.seen = None;
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct EffectRect {
     pub x: i32,
     pub y: i32,
@@ -179,16 +245,34 @@ impl EffectRegion {
     }
 
     pub fn push(&mut self, rect: EffectRect) {
+        self.push_dedup(rect, &mut RectDedup::default());
+    }
+
+    /// Pushes every rect in order, exactly as repeated [`Self::push`] would,
+    /// without its per-rect linear duplicate scan.
+    pub fn extend_rects(&mut self, rects: impl IntoIterator<Item = EffectRect>) {
+        let mut dedup = RectDedup::default();
+        for rect in rects {
+            if self.conservative_full {
+                return;
+            }
+            self.push_dedup(rect, &mut dedup);
+        }
+    }
+
+    fn push_dedup(&mut self, rect: EffectRect, dedup: &mut RectDedup) {
         if self.conservative_full {
             return;
         }
-        if self.rects.contains(&rect) {
+        if dedup.contains(&self.rects, &rect) {
             return;
         }
         if self.rects.len() < MAX_EFFECT_REGION_RECTS {
             self.rects.push(rect);
+            dedup.inserted(rect);
             return;
         }
+        dedup.reset();
         let mut bounds = rect;
         for existing in &self.rects {
             match bounds.union(*existing) {
@@ -242,9 +326,7 @@ impl EffectRegion {
             };
         }
         let mut result = self.clone();
-        for rect in &other.rects {
-            result.push(*rect);
-        }
+        result.extend_rects(other.rects.iter().copied());
         result
     }
 
@@ -254,11 +336,18 @@ impl EffectRegion {
         }
         let mut result = self.clone();
         let mut coalesced = false;
+        let mut dedup = RectDedup::default();
         for rect in &other.rects {
-            if result.rects.len() >= MAX_EFFECT_REGION_RECTS && !result.rects.contains(rect) {
+            if result.conservative_full {
+                break;
+            }
+            if dedup.contains(&result.rects, rect) {
+                continue;
+            }
+            if result.rects.len() >= MAX_EFFECT_REGION_RECTS {
                 coalesced = true;
             }
-            result.push(*rect);
+            result.push_dedup(*rect, &mut dedup);
         }
         (result, coalesced)
     }
@@ -268,11 +357,7 @@ impl EffectRegion {
             return Self::from_rect(bounds);
         }
         let mut result = Self::empty();
-        for rect in &self.rects {
-            if let Some(intersection) = rect.intersect(bounds) {
-                result.push(intersection);
-            }
-        }
+        result.extend_rects(self.rects.iter().filter_map(|rect| rect.intersect(bounds)));
         result
     }
 
@@ -284,13 +369,12 @@ impl EffectRegion {
             return self.clone();
         }
         let mut result = Self::empty();
-        for left in &self.rects {
-            for right in &other.rects {
-                if let Some(intersection) = left.intersect(*right) {
-                    result.push(intersection);
-                }
-            }
-        }
+        result.extend_rects(self.rects.iter().flat_map(|left| {
+            other
+                .rects
+                .iter()
+                .filter_map(move |right| left.intersect(*right))
+        }));
         result
     }
 
@@ -326,12 +410,17 @@ impl EffectRegion {
         }
         let mut rects = Vec::new();
         let mut duplicate_rects_removed: usize = 0;
+        let mut dedup = RectDedup::default();
+        let clip_bounds = clip.bounding_rect();
         for left in &self.rects {
+            if clip_bounds.is_some_and(|bounds| bounds.intersect(*left).is_none()) {
+                continue;
+            }
             for right in &clip.rects {
                 let Some(intersection) = left.intersect(*right) else {
                     continue;
                 };
-                if rects.contains(&intersection) {
+                if dedup.contains(&rects, &intersection) {
                     duplicate_rects_removed += 1;
                     continue;
                 }
@@ -345,6 +434,7 @@ impl EffectRegion {
                     };
                 }
                 rects.push(intersection);
+                dedup.inserted(intersection);
             }
         }
         BoundedRegionIntersection {
@@ -488,6 +578,7 @@ impl EffectRegion {
             return self.clone();
         }
         let mut result = Self::empty();
+        let mut result_dedup = RectDedup::default();
         for source in &self.rects {
             let mut remaining = Self::from_rect(*source);
             for excluded_rect in &excluded.rects {
@@ -495,15 +586,13 @@ impl EffectRegion {
                     break;
                 }
                 let mut next = Self::empty();
-                for candidate in remaining.rects() {
-                    for &piece in subtract_effect_rect(*candidate, *excluded_rect).as_slice() {
-                        next.push(piece);
-                    }
-                }
+                next.extend_rects(remaining.rects.iter().flat_map(|candidate| {
+                    subtract_effect_rect(*candidate, *excluded_rect).into_iter()
+                }));
                 remaining = next;
             }
-            for rect in remaining.rects() {
-                result.push(*rect);
+            for rect in &remaining.rects {
+                result.push_dedup(*rect, &mut result_dedup);
             }
         }
         result
@@ -526,11 +615,11 @@ impl EffectRegion {
             return Self::from_rect(bounds);
         }
         let mut result = Self::empty();
-        for rect in &self.rects {
-            if let Some(expanded) = rect.expanded(radius_x, radius_y, bounds) {
-                result.push(expanded);
-            }
-        }
+        result.extend_rects(
+            self.rects
+                .iter()
+                .filter_map(|rect| rect.expanded(radius_x, radius_y, bounds)),
+        );
         result
     }
 
@@ -563,9 +652,14 @@ impl SubtractedRects {
         self.rects[self.len] = rect;
         self.len += 1;
     }
+}
 
-    fn as_slice(&self) -> &[EffectRect] {
-        &self.rects[..self.len]
+impl IntoIterator for SubtractedRects {
+    type Item = EffectRect;
+    type IntoIter = std::iter::Take<std::array::IntoIter<EffectRect, 4>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.rects.into_iter().take(self.len)
     }
 }
 
@@ -1440,6 +1534,115 @@ mod tests {
                 for x in -1..74 {
                     assert_eq!(covering.contains_point(x, y), plain.contains_point(x, y));
                 }
+            }
+        }
+    }
+
+    /// Pushes one rect at a time with the original linear duplicate scan.
+    fn sequential_push(rects: impl IntoIterator<Item = EffectRect>) -> EffectRegion {
+        let mut region = EffectRegion::empty();
+        for rect in rects {
+            if region.conservative_full {
+                break;
+            }
+            if region.rects.contains(&rect) {
+                continue;
+            }
+            if region.rects.len() < MAX_EFFECT_REGION_RECTS {
+                region.rects.push(rect);
+                continue;
+            }
+            let bounds = region
+                .rects
+                .iter()
+                .try_fold(rect, |bounds, existing| bounds.union(*existing));
+            region.rects.clear();
+            match bounds {
+                Some(bounds) => region.rects.push(bounds),
+                None => region.conservative_full = true,
+            }
+        }
+        region
+    }
+
+    fn lcg_rects(seed: u64, count: usize, span: u32, size: u32) -> Vec<EffectRect> {
+        let mut state = seed;
+        let mut next = |bound: u32| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((state >> 33) as u32) % bound
+        };
+        (0..count)
+            .map(|_| {
+                EffectRect::new(
+                    next(span) as i32,
+                    next(span) as i32,
+                    1 + next(size),
+                    1 + next(size),
+                )
+                .unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn hashed_region_dedup_matches_sequential_push() {
+        for (seed, count, span, size) in [
+            (1, 10, 8, 4),
+            (2, 40, 6, 3),
+            (3, 200, 12, 4),
+            (4, 400, 64, 16),
+            (5, 1000, 20, 5),
+        ] {
+            let rects = lcg_rects(seed, count, span, size);
+            let mut doubled = rects.clone();
+            doubled.extend(rects.iter().rev().copied());
+            let expected = sequential_push(doubled.iter().copied());
+            let mut extended = EffectRegion::empty();
+            extended.extend_rects(doubled.iter().copied());
+            assert_eq!(extended, expected, "extend_rects seed {seed}");
+
+            let mut pushed = EffectRegion::empty();
+            for rect in &doubled {
+                pushed.push(*rect);
+            }
+            assert_eq!(pushed, expected, "push seed {seed}");
+
+            let half = doubled.len() / 2;
+            let left = sequential_push(doubled[..half].iter().copied());
+            let right = sequential_push(doubled[half..].iter().copied());
+            assert_eq!(
+                left.union(&right),
+                sequential_push(left.rects.iter().chain(&right.rects).copied()),
+                "union seed {seed}"
+            );
+
+            let other = sequential_push(lcg_rects(seed + 100, count / 2 + 1, span, size));
+            let naive_intersection = sequential_push(
+                left.rects
+                    .iter()
+                    .flat_map(|l| other.rects.iter().filter_map(|r| l.intersect(*r))),
+            );
+            assert_eq!(
+                left.intersect(&other),
+                naive_intersection,
+                "intersect seed {seed}"
+            );
+
+            let bounded = left.intersect_bounded_within_result(&other);
+            if !bounded.overflowed {
+                let mut unique = Vec::new();
+                for rect in left
+                    .rects
+                    .iter()
+                    .flat_map(|l| other.rects.iter().filter_map(|r| l.intersect(*r)))
+                {
+                    if !unique.contains(&rect) {
+                        unique.push(rect);
+                    }
+                }
+                assert_eq!(bounded.region.rects, unique, "bounded seed {seed}");
             }
         }
     }
