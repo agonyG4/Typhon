@@ -505,6 +505,23 @@ pub(crate) struct PrecomputedBackdropCacheKey {
 }
 
 impl PrecomputedBackdropCacheKey {
+    /// Whether this key was built from the same output and scene prefix.
+    pub(in crate::egl_renderer) fn matches_prefix(
+        &self,
+        output_size: (u32, u32),
+        prefix: &[EglCheckpointCommandCausalSnapshot],
+    ) -> bool {
+        self.output_size == output_size && self.prefix == prefix
+    }
+
+    pub(in crate::egl_renderer) fn matches_blur(
+        &self,
+        blur: DualKawaseBlurSpec,
+        working_space: EffectWorkingSpace,
+    ) -> bool {
+        self.blur == blur && self.working_space == working_space
+    }
+
     pub(in crate::egl_renderer) fn new(
         output_size: (u32, u32),
         blur: DualKawaseBlurSpec,
@@ -1490,6 +1507,10 @@ impl EffectGlResourceCache {
         }
         let _ = self.release(texture);
         None
+    }
+
+    pub(crate) fn stored_precomputed_backdrop_key(&self) -> Option<&PrecomputedBackdropCacheKey> {
+        self.precomputed_backdrop.as_ref().map(|(key, _)| key)
     }
 
     pub(crate) fn store_precomputed_backdrop(

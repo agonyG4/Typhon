@@ -77,6 +77,7 @@ fn compile_pruning_graph_for_damage(
             precomputed_window_blur: false,
             terminal_kawase_fusion: false,
             checkpoint_dependency_pruning,
+            shell_backdrop_static: false,
         },
     )
     .expect("three-material G3a fixture compiles");

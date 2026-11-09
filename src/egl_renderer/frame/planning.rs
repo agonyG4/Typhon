@@ -37,6 +37,48 @@ use super::{
     types::{CaptureCursorOverlay, EglFrameOutcome, EglSceneDrawRequest, FrameSkipReason},
 };
 
+/// Shell candidates still on the shared backdrop after validation.
+fn shell_backdrop_consumers(
+    scene: &compositor::ResolvedEffectScene,
+) -> Vec<(oblivion_one::effects::EffectInstanceId, u64)> {
+    scene
+        .instances
+        .iter()
+        .filter(|instance| {
+            instance.backdrop_reuse == compositor::EffectBackdropReuse::PrecomputedShellCandidate
+        })
+        .map(|instance| (instance.id, instance.signature))
+        .collect()
+}
+
+/// Whether the cached shared backdrop was replayed from exactly the scene
+/// prefix below this frame's backdrop point, so it holds this frame's pixels.
+fn shared_backdrop_prefix_cached(
+    scene: &compositor::ResolvedEffectScene,
+    state: &super::super::scene_state::SceneRenderState,
+    resources: &super::super::effects::EffectGlResourceCache,
+    output_size: (u32, u32),
+) -> bool {
+    let (Some(point), Some(snapshot), Some(key)) = (
+        scene.shared_backdrop_point,
+        state.current_checkpoint_scene_causal_snapshot.as_ref(),
+        resources.stored_precomputed_backdrop_key(),
+    ) else {
+        return false;
+    };
+    let (prefix_end, _) = super::super::effects::composition_range_with_metadata(
+        &state.commands,
+        &state.capture_layers,
+        &state.capture_visual_groups,
+        point.anchor,
+        Some(point.visual_group),
+        compositor::EffectAnchorScope::VisualGroup,
+    );
+    snapshot.output_size == output_size
+        && prefix_end <= snapshot.commands.len()
+        && key.matches_prefix(output_size, &snapshot.commands[..prefix_end])
+}
+
 /// Keeps a shell layer blur on the shared below-windows backdrop only while no
 /// command drawn between that backdrop point and the layer touches the
 /// layer's own bounds. Inside its bounds the shared backdrop then holds the
@@ -638,21 +680,65 @@ impl FramePipeline<'_> {
                 &self.scene.capture_layers,
                 &self.scene.capture_visual_groups,
             );
-            match compile_frame_execution_variants_with_options(
-                &effect_scene,
-                &effect_source_damage,
-                output_bounds,
-                &self.effects.effect_registry,
-                FrameExecutionCompileOptions {
-                    precomputed_window_blur: self.effects.precomputed_window_blur_policy
-                        == super::super::effects::PrecomputedWindowBlurPolicy::On,
-                    terminal_kawase_fusion,
-                    checkpoint_dependency_pruning: self
-                        .effects
-                        .checkpoint_dependency_pruning_policy
-                        == super::super::effects::CheckpointDependencyPruningPolicy::On,
-                },
-            ) {
+            let shell_consumers = shell_backdrop_consumers(&effect_scene);
+            let shell_backdrop_static = !shell_consumers.is_empty()
+                && shell_consumers == self.effects.shell_backdrop_consumers
+                && shared_backdrop_prefix_cached(
+                    &effect_scene,
+                    self.scene,
+                    &self.effects.effect_resources,
+                    (width, height),
+                );
+            let compile = |shell_backdrop_static| {
+                compile_frame_execution_variants_with_options(
+                    &effect_scene,
+                    &effect_source_damage,
+                    output_bounds,
+                    &self.effects.effect_registry,
+                    FrameExecutionCompileOptions {
+                        precomputed_window_blur: self.effects.precomputed_window_blur_policy
+                            == super::super::effects::PrecomputedWindowBlurPolicy::On,
+                        terminal_kawase_fusion,
+                        checkpoint_dependency_pruning: self
+                            .effects
+                            .checkpoint_dependency_pruning_policy
+                            == super::super::effects::CheckpointDependencyPruningPolicy::On,
+                        shell_backdrop_static,
+                    },
+                )
+            };
+            let mut compiled = compile(shell_backdrop_static);
+            // The cached texture must also have been blurred the same way.
+            if shell_backdrop_static
+                && let Ok(variants) = &compiled
+                && !variants.precomputed_backdrop.as_ref().is_some_and(|plan| {
+                    self.effects
+                        .effect_resources
+                        .stored_precomputed_backdrop_key()
+                        .is_some_and(|key| key.matches_blur(plan.blur, plan.working_space))
+                })
+            {
+                compiled = compile(false);
+            }
+            self.effects.shell_backdrop_consumers = match &compiled {
+                Ok(variants) => variants
+                    .precomputed_backdrop
+                    .as_ref()
+                    .map(|plan| {
+                        shell_consumers
+                            .iter()
+                            .copied()
+                            .filter(|(id, _)| {
+                                plan.consumers
+                                    .iter()
+                                    .any(|consumer| consumer.instance == *id)
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                Err(_) => Vec::new(),
+            };
+            match compiled {
                 Ok(variants) => {
                     self.effects.effect_trace.checkpoint_dependency_pruning(
                         self.effects.checkpoint_dependency_pruning_policy.as_str(),

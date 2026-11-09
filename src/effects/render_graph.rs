@@ -569,6 +569,11 @@ pub struct FrameExecutionCompileOptions {
     /// Apply exact-graph dependency pruning only after precomputed eligibility
     /// and graph construction have completed on the conservative graph.
     pub checkpoint_dependency_pruning: bool,
+    /// The renderer holds a cached shared backdrop whose replayed prefix
+    /// matches this frame, so shell consumers sample a texture that cannot
+    /// change: only damage inside their own influence needs a repaint, not
+    /// damage within the blur's sample reach.
+    pub shell_backdrop_static: bool,
 }
 
 pub fn compile_precomputed_backdrop_build(
@@ -2452,7 +2457,15 @@ pub fn compile_frame_execution_plan(
     output_bounds: EffectRect,
     registry: &EffectRegistry,
 ) -> Result<FrameExecutionPlan, RenderGraphCompileError> {
-    compile_frame_execution_graph(scene, source_damage, output_bounds, registry, &[], false)
+    compile_frame_execution_graph(
+        scene,
+        source_damage,
+        output_bounds,
+        registry,
+        &[],
+        ShellConsumerDamage::NONE,
+        false,
+    )
 }
 
 /// Compile the exact graph and, when explicitly requested and eligible, a
@@ -2475,6 +2488,7 @@ pub fn compile_frame_execution_variants(
             precomputed_window_blur: precomputed_window_blur_enabled,
             terminal_kawase_fusion: false,
             checkpoint_dependency_pruning: false,
+            shell_backdrop_static: false,
         },
     )
 }
@@ -2525,6 +2539,7 @@ fn compile_frame_execution_variants_unpruned(
         output_bounds,
         registry,
         &[],
+        ShellConsumerDamage::NONE,
         options.terminal_kawase_fusion,
     )?;
     // Shell layer blurs sample the backdrop below every window. That is only
@@ -2601,12 +2616,25 @@ fn compile_frame_execution_variants_unpruned(
         .iter()
         .map(|(instance, _)| instance.id)
         .collect::<Vec<_>>();
+    let shell_consumers = if uses_shell_point {
+        eligible
+            .iter()
+            .filter(|(instance, _)| precomputed_shell_blur_instance(instance))
+            .map(|(instance, _)| instance.id)
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     let precomputed_graph = match compile_frame_execution_graph(
         scene,
         source_damage,
         output_bounds,
         registry,
         &candidates,
+        ShellConsumerDamage {
+            consumers: &shell_consumers,
+            backdrop_static: options.shell_backdrop_static,
+        },
         options.terminal_kawase_fusion,
     )? {
         FrameExecutionPlan::LegacyScene => None,
@@ -2696,6 +2724,20 @@ fn precomputed_window_blur_instance(instance: &ResolvedEffectInstance) -> bool {
         && instance.frame_demand == EffectFrameDemand::OnDamage
 }
 
+/// How shell consumers of the shared below-window backdrop report damage.
+#[derive(Clone, Copy)]
+struct ShellConsumerDamage<'a> {
+    consumers: &'a [EffectInstanceId],
+    backdrop_static: bool,
+}
+
+impl ShellConsumerDamage<'_> {
+    const NONE: ShellConsumerDamage<'static> = ShellConsumerDamage {
+        consumers: &[],
+        backdrop_static: false,
+    };
+}
+
 fn precomputed_shell_blur_instance(instance: &ResolvedEffectInstance) -> bool {
     instance.backdrop_reuse == crate::compositor::EffectBackdropReuse::PrecomputedShellCandidate
         && matches!(instance.anchor, EffectAnchor::BeforeSurface(_))
@@ -2737,6 +2779,7 @@ fn compile_frame_execution_graph(
     output_bounds: EffectRect,
     registry: &EffectRegistry,
     precomputed_consumers: &[EffectInstanceId],
+    shell_damage: ShellConsumerDamage<'_>,
     terminal_kawase_fusion: bool,
 ) -> Result<FrameExecutionPlan, RenderGraphCompileError> {
     #[cfg(test)]
@@ -2765,12 +2808,25 @@ fn compile_frame_execution_graph(
         let program = registry
             .get(instance.program)
             .ok_or(RenderGraphCompileError::MissingProgram(instance.program))?;
-        let effect_damage = plan_effect_damage(
+        let mut effect_damage = plan_effect_damage(
             program.aggregate_footprint,
             &instance.region,
             source_damage,
             output_bounds,
         );
+        if shell_damage.consumers.contains(&instance.id) {
+            effect_damage.output_damage = if shell_damage.backdrop_static {
+                // Its input is a cached texture that cannot change this frame,
+                // so its output changes only where the scene below it is
+                // redrawn, not wherever damage falls within the blur's reach.
+                source_damage.intersect(&effect_damage.dependency_region)
+            } else {
+                // A new backdrop, or pixels last drawn by another path: redraw
+                // the whole consumer once so no stale blur survives.
+                effect_damage.dependency_region.clone()
+            };
+            effect_damage.output_clip_fallback = None;
+        }
         if effect_damage.output_clip_fallback.is_some() {
             region_representation_overflows = region_representation_overflows.saturating_add(1);
             visible_clip_fallbacks = visible_clip_fallbacks.saturating_add(1);
@@ -9279,6 +9335,7 @@ mod tests {
                 precomputed_window_blur: false,
                 terminal_kawase_fusion: enabled,
                 checkpoint_dependency_pruning: false,
+                shell_backdrop_static: false,
             },
         )
         .expect("terminal-fusion graph compiles");
@@ -9676,6 +9733,7 @@ mod tests {
                 precomputed_window_blur: false,
                 terminal_kawase_fusion: enabled,
                 checkpoint_dependency_pruning: false,
+                shell_backdrop_static: false,
             };
             let off = compile_frame_execution_variants_with_options(
                 &scene,

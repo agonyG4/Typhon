@@ -26,6 +26,7 @@ fn two_material_variants(
             precomputed_window_blur: false,
             terminal_kawase_fusion,
             checkpoint_dependency_pruning,
+            shell_backdrop_static: false,
         },
     )
     .unwrap()
@@ -354,6 +355,7 @@ fn precomputed_eligibility_uses_the_raw_exact_graph_before_g3a_pruning() {
         precomputed_window_blur: true,
         terminal_kawase_fusion: false,
         checkpoint_dependency_pruning,
+        shell_backdrop_static: false,
     };
     let raw = compile_frame_execution_variants_with_options(
         &scene,

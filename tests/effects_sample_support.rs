@@ -76,6 +76,7 @@ fn material_graph_for(
             precomputed_window_blur: false,
             terminal_kawase_fusion,
             checkpoint_dependency_pruning: false,
+            shell_backdrop_static: false,
         },
     )
     .unwrap();
@@ -129,6 +130,7 @@ fn multi_material_graph(
             precomputed_window_blur: false,
             terminal_kawase_fusion: true,
             checkpoint_dependency_pruning: false,
+            shell_backdrop_static: false,
         },
     )
     .unwrap();

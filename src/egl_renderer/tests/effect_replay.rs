@@ -382,6 +382,7 @@ fn terminal_graph_variant_with_source_damage(
             precomputed_window_blur: false,
             terminal_kawase_fusion: terminal_fusion,
             checkpoint_dependency_pruning: false,
+            shell_backdrop_static: false,
         },
     )
     .expect("terminal blur graph compiles");
@@ -3536,6 +3537,70 @@ fn shell_blur_shares_backdrop_below_windows_only_with_a_point() {
     if late.instances[0].scene_order < above.scene_order {
         assert!(compile(&late).precomputed_backdrop.is_none());
     }
+}
+
+#[test]
+fn shell_consumer_skips_reach_damage_only_with_a_static_backdrop() {
+    let output_bounds = EffectRect::new(0, 0, 320, 240).expect("output bounds");
+    let a_group = oblivion_one::compositor::VisualGroupId::new(1).expect("A visual group");
+    let b_group = oblivion_one::compositor::VisualGroupId::new(2).expect("B visual group");
+    let a_bounds = EffectRect::new(12, 12, 32, 24).expect("A bounds");
+    let b_bounds = EffectRect::new(232, 112, 32, 24).expect("B bounds");
+    let program = oblivion_one::effects::builtin_background_material_program_with_passes(
+        oblivion_one::material::MaterialConfiguration::default()
+            .effective()
+            .expect("default material validates"),
+        2,
+    );
+    let program_id = program.program.id;
+    let mut registry = oblivion_one::effects::EffectRegistry::empty();
+    registry.insert(program).expect("built-in blur registry");
+    let scene = shell_backdrop_test_scene(
+        program_id,
+        a_bounds,
+        b_bounds,
+        a_group,
+        b_group,
+        oblivion_one::compositor::EffectBackdropReuse::PrecomputedShellCandidate,
+    )
+    .with_shared_backdrop_point(Some(shell_backdrop_point(a_group)));
+    let shell_id = scene.instances[1].id;
+    // Within B's blur reach but outside B, like a window scrolling next to a bar.
+    let damage = EffectRegion::from_rect(EffectRect::new(200, 112, 20, 24).expect("damage"));
+    let final_damage = |shell_backdrop_static| {
+        let variants = oblivion_one::effects::compile_frame_execution_variants_with_options(
+            &scene,
+            &damage,
+            output_bounds,
+            &registry,
+            oblivion_one::effects::FrameExecutionCompileOptions {
+                shell_backdrop_static,
+                ..Default::default()
+            },
+        )
+        .expect("variants compile");
+        assert!(variants.precomputed_backdrop.is_some());
+        let graph = variants
+            .precomputed_graph
+            .expect("shell consumer compiles a precomputed graph");
+        let demand = plan_effect_execution_demand(&graph, &graph.final_damage, false);
+        let executes = demand.instances.iter().any(|instance| {
+            instance.id == shell_id && !instance.presentation_output_region.is_empty()
+        });
+        (graph.final_damage, executes)
+    };
+
+    let (static_damage, static_executes) = final_damage(true);
+    assert!(!static_damage.intersects_rect(b_bounds));
+    assert!(!static_executes);
+
+    // Without a proven cached backdrop the consumer redraws in full once.
+    let (refresh_damage, refresh_executes) = final_damage(false);
+    assert!(refresh_executes);
+    assert_eq!(
+        refresh_damage.intersect_rect(b_bounds),
+        EffectRegion::from_rect(b_bounds)
+    );
 }
 
 #[test]
