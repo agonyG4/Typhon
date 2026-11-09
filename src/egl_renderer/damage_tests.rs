@@ -1805,7 +1805,7 @@ fn execution_repair_preserves_partial_area_threshold() {
 
     planner.apply_execution_repair(
         &mut plan,
-        OutputDamage::rects(100, 80, [rect(0, 0, 80, 80)]),
+        OutputDamage::rects(100, 80, [rect(0, 0, 95, 80)]),
     );
 
     assert_eq!(plan.mode, RepaintMode::Full);
@@ -2363,7 +2363,7 @@ fn policy_falls_back_for_many_rectangles_or_near_full_area() {
         planner.plan(many, BufferAge::Value(1)).mode,
         RepaintMode::Full
     );
-    let near_full = OutputDamage::rects(100, 100, [rect(0, 0, 90, 90)]);
+    let near_full = OutputDamage::rects(100, 100, [rect(0, 0, 95, 95)]);
     assert_eq!(
         planner.plan(near_full, BufferAge::Value(1)).mode,
         RepaintMode::Full

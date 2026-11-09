@@ -19,7 +19,12 @@ use super::effects::{EffectDebugKawaseMode, effect_debug_config};
 pub(crate) const MAX_PARTIAL_REPAINT_RECTS: usize = 8;
 pub(crate) const MAX_DAMAGE_HISTORY_FRAMES: usize = 8;
 const MAX_EXPLICIT_OUTPUT_BUFFER_AGE: u32 = 3;
-const MAX_PARTIAL_REPAINT_PERCENT: u64 = 75;
+// A maximized window's content is ~80% of the output; scrolling it must stay
+// partial so shell bars, wallpaper and their blurs are not redrawn every frame.
+const MAX_PARTIAL_REPAINT_PERCENT: u64 = 90;
+/// Merging scattered rectangles into one box only pays while the box stays
+/// well below a full repaint.
+const MAX_BOUNDING_BOX_REPAINT_PERCENT: u64 = 75;
 pub(crate) const DAMAGE_COMPLEXITY_SHADOW_EXTENTS_FACTOR: u64 = 2;
 const PARTIAL_REPAINT_COMPLEXITY_POLICY_ENV: &str = "TYPHON_PARTIAL_REPAINT_COMPLEXITY_POLICY";
 
@@ -1304,7 +1309,7 @@ fn decide_partial_repaint_candidate(
         };
     };
     if bbox_pixels <= max_bbox_pixels
-        && !partial_repaint_area_threshold_reached(bbox_pixels, output_pixels)
+        && !area_percent_reached(bbox_pixels, output_pixels, MAX_BOUNDING_BOX_REPAINT_PERCENT)
     {
         PartialRepaintCandidateDecision::UseBoundingBox {
             bbox,
@@ -1322,9 +1327,11 @@ fn output_pixel_count(output_size: (u32, u32)) -> Option<u64> {
 }
 
 fn partial_repaint_area_threshold_reached(repair_pixels: u64, output_pixels: u64) -> bool {
-    output_pixels == 0
-        || repair_pixels.saturating_mul(100)
-            >= output_pixels.saturating_mul(MAX_PARTIAL_REPAINT_PERCENT)
+    area_percent_reached(repair_pixels, output_pixels, MAX_PARTIAL_REPAINT_PERCENT)
+}
+
+fn area_percent_reached(repair_pixels: u64, output_pixels: u64, percent: u64) -> bool {
+    output_pixels == 0 || repair_pixels.saturating_mul(100) >= output_pixels.saturating_mul(percent)
 }
 
 fn parse_partial_repaint_complexity_policy(
@@ -1713,7 +1720,7 @@ mod partial_repaint_complexity_tests {
         let large_area = plan_candidate(
             (100, 100),
             PartialRepaintComplexityPolicy::Legacy,
-            OutputDamage::rects(100, 100, [rect(0, 0, 75, 100)]),
+            OutputDamage::rects(100, 100, [rect(0, 0, 90, 100)]),
         );
         assert_eq!(large_area.mode, RepaintMode::Full);
         assert_eq!(
@@ -1803,9 +1810,9 @@ mod partial_repaint_complexity_tests {
         let candidate = OutputDamage::rects(
             300,
             300,
-            [0, 105, 210]
+            [0, 100, 200]
                 .into_iter()
-                .flat_map(|x| [0, 105, 210].into_iter().map(move |y| rect(x, y, 90, 90))),
+                .flat_map(|x| [0, 100, 200].into_iter().map(move |y| rect(x, y, 95, 95))),
         );
         assert_eq!(candidate.rect_count(), 9);
         let plan = plan_candidate(
@@ -1923,14 +1930,14 @@ mod partial_repaint_complexity_tests {
         let just_below_area = plan_candidate(
             (100, 100),
             PartialRepaintComplexityPolicy::StructuredExperimental,
-            OutputDamage::rects(100, 100, [rect(0, 0, 74, 100)]),
+            OutputDamage::rects(100, 100, [rect(0, 0, 89, 100)]),
         );
         assert_eq!(just_below_area.mode, RepaintMode::Partial);
-        assert_eq!(just_below_area.repair_damage.pixels(100, 100), Some(7_400));
+        assert_eq!(just_below_area.repair_damage.pixels(100, 100), Some(8_900));
         let at_area = plan_candidate(
             (100, 100),
             PartialRepaintComplexityPolicy::StructuredExperimental,
-            OutputDamage::rects(100, 100, [rect(0, 0, 75, 100)]),
+            OutputDamage::rects(100, 100, [rect(0, 0, 90, 100)]),
         );
         assert_eq!(at_area.mode, RepaintMode::Full);
         assert_eq!(
