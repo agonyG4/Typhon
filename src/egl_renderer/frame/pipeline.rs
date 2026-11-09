@@ -53,6 +53,7 @@ impl<'a> FramePipeline<'a> {
     ) -> RendererResult<super::types::EglFrameOutcome> {
         self.effects.effect_resources.begin_checkpoint_frame();
 
+        self.scene.current_scene_damage = None;
         self.scene.capture_cursor = None;
         let begun = self.begin_frame(&request, framebuffer_origin)?;
         self.prepare_resources(egl, egl_display, &request, &begun)?;

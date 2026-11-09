@@ -413,6 +413,7 @@ impl GlesSceneRenderer {
                 scene_cache_key: None,
                 presented_scene_key: None,
                 current_checkpoint_scene_causal_snapshot: None,
+                current_scene_damage: None,
                 damage_tracker: EglOutputDamageTracker::with_cursor_image(cursor_image.clone()),
                 repaint_planner: PartialRepaintPlanner::new_configured(
                     (width, height),

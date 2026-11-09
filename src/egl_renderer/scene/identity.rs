@@ -299,6 +299,28 @@ pub(in crate::egl_renderer) struct EglSceneSurfaceSignature {
     pub(in crate::egl_renderer) generation: u64,
 }
 
+impl EglSceneSurfaceSignature {
+    /// Same surface, buffer layout and placement; only its committed content
+    /// (commit, buffer object, generation) may differ.
+    pub(in crate::egl_renderer) fn same_placement_as(&self, other: &Self) -> bool {
+        self.surface_id == other.surface_id
+            && self.buffer_width == other.buffer_width
+            && self.buffer_height == other.buffer_height
+            && self.buffer_scale == other.buffer_scale
+            && self.buffer_transform == other.buffer_transform
+            && self.x == other.x
+            && self.y == other.y
+            && self.width == other.width
+            && self.height == other.height
+            && self.render_x == other.render_x
+            && self.render_y == other.render_y
+            && self.clip_x == other.clip_x
+            && self.clip_y == other.clip_y
+            && self.clip_width == other.clip_width
+            && self.clip_height == other.clip_height
+    }
+}
+
 pub(in crate::egl_renderer) fn egl_scene_surface_signatures(
     surfaces: &[RenderableSurface],
 ) -> Vec<EglSceneSurfaceSignature> {

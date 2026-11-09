@@ -64,6 +64,10 @@ pub(crate) struct SceneRenderState {
     pub(in crate::egl_renderer) presented_scene_key: Option<EglSceneCacheKey>,
     pub(in crate::egl_renderer) current_checkpoint_scene_causal_snapshot:
         Option<EglCheckpointSceneCausalSnapshot>,
+    /// Scene damage of the frame being planned, before effect expansion: every
+    /// output pixel whose scene content may differ from the last presented
+    /// frame. `None` outside ordinary frame planning.
+    pub(in crate::egl_renderer) current_scene_damage: Option<oblivion_one::effects::EffectRegion>,
     pub(in crate::egl_renderer) damage_tracker: EglOutputDamageTracker,
     pub(in crate::egl_renderer) repaint_planner: PartialRepaintPlanner,
     pub(in crate::egl_renderer) active_output_framebuffer: Option<glow::Framebuffer>,
@@ -116,6 +120,7 @@ pub(in crate::egl_renderer) struct SceneCaptureSnapshot {
     current_size: (u32, u32),
     presented_scene_key: Option<EglSceneCacheKey>,
     current_checkpoint_scene_causal_snapshot: Option<EglCheckpointSceneCausalSnapshot>,
+    current_scene_damage: Option<oblivion_one::effects::EffectRegion>,
     damage_tracker: EglOutputDamageTracker,
     repaint_planner: PartialRepaintPlanner,
     frame_stats: GlesSceneFrameStats,
@@ -135,6 +140,7 @@ impl SceneCaptureSnapshot {
             current_checkpoint_scene_causal_snapshot: scene
                 .current_checkpoint_scene_causal_snapshot
                 .clone(),
+            current_scene_damage: scene.current_scene_damage.clone(),
             damage_tracker: scene.damage_tracker.clone(),
             repaint_planner: scene.repaint_planner.clone(),
             frame_stats: scene.frame_stats,
@@ -152,6 +158,7 @@ impl SceneCaptureSnapshot {
         scene.presented_scene_key = self.presented_scene_key;
         scene.current_checkpoint_scene_causal_snapshot =
             self.current_checkpoint_scene_causal_snapshot;
+        scene.current_scene_damage = self.current_scene_damage;
         scene.damage_tracker = self.damage_tracker;
         scene.repaint_planner = self.repaint_planner;
         scene.frame_stats = self.frame_stats;

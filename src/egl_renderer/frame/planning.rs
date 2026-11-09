@@ -531,6 +531,7 @@ impl FramePipeline<'_> {
         let height = self.scene.current_size.1;
         let effect_source_damage =
             super::super::effect_region_from_output_damage(&prepared.output_damage, width, height);
+        self.scene.current_scene_damage = Some(effect_source_damage.clone());
         let output_bounds = oblivion_one::effects::EffectRect::new(0, 0, width, height)
             .expect("non-zero renderer dimensions must form valid effect bounds");
         self.effects.effect_trace.frame_boundary(

@@ -169,6 +169,54 @@ impl EglCheckpointSceneCausalSnapshot {
             .count()
     }
 
+    /// Whether the first `end` commands differ from `current` only in the
+    /// pixels of surfaces drawn with unchanged geometry, clip, opacity and
+    /// opaque regions. Where those pixels changed is then bounded by the
+    /// frame's surface damage.
+    pub(in crate::egl_renderer) fn only_surface_content_changed_before(
+        &self,
+        current: &Self,
+        end: usize,
+    ) -> bool {
+        if self.output_size != current.output_size
+            || self.commands.len() < end
+            || current.commands.len() < end
+        {
+            return false;
+        }
+        self.commands[..end]
+            .iter()
+            .zip(&current.commands[..end])
+            .all(|(previous, current)| {
+                let same_pixels_or_surface_content =
+                    match (previous.pixel_source, current.pixel_source) {
+                        (Some(previous_source), Some(current_source)) => {
+                            previous_source == current_source
+                                || match (previous_source, current_source) {
+                                    (
+                                        EglCheckpointPixelSourceIdentity::Surface(previous),
+                                        EglCheckpointPixelSourceIdentity::Surface(current),
+                                    ) => previous.same_placement_as(&current),
+                                    _ => false,
+                                }
+                        }
+                        _ => false,
+                    };
+                same_pixels_or_surface_content
+                    && previous.layer == current.layer
+                    && previous.visual_group == current.visual_group
+                    && previous.bounds == current.bounds
+                    && previous.opaque_regions == current.opaque_regions
+                    && previous.presentation_clip == current.presentation_clip
+                    && previous.vertex_start == current.vertex_start
+                    && previous.vertex_count == current.vertex_count
+                    && previous.sampling == current.sampling
+                    && previous.presentation_opacity_bits == current.presentation_opacity_bits
+                    && previous.presentation_owner_root == current.presentation_owner_root
+                    && previous.vertices == current.vertices
+            })
+    }
+
     /// Names the first field that ends the unchanged prefix at `index`, for
     /// the causal trace.
     pub(in crate::egl_renderer) fn command_difference(

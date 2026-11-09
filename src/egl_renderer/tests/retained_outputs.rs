@@ -56,7 +56,9 @@ fn render_retained_test_frame(
     full: bool,
     retained: bool,
     rerun_invalidated: bool,
+    scene_damage: Option<EffectRegion>,
 ) -> (usize, usize) {
+    harness.renderer.scene_state.current_scene_damage = scene_damage;
     let config = effects::EffectDebugConfig::new_with_checkpoint_capture_path(
         effects::EffectDebugCaptureMode::Replay,
         effects::EffectDebugKawaseMode::Partial,
@@ -170,6 +172,7 @@ fn run_retained_sequence(retained: bool, rerun_invalidated: bool) -> RetainedRun
         true,
         retained,
         false,
+        None,
     );
     let pixels_1 = read_diagnostic_pixels(&harness);
     let (entries_after_first, _) = harness
@@ -196,6 +199,7 @@ fn run_retained_sequence(retained: bool, rerun_invalidated: bool) -> RetainedRun
         false,
         retained,
         rerun_invalidated,
+        None,
     );
     let pixels_2 = read_diagnostic_pixels(&harness);
 
@@ -220,6 +224,7 @@ fn run_retained_sequence(retained: bool, rerun_invalidated: bool) -> RetainedRun
         false,
         retained,
         false,
+        None,
     );
     let pixels_3 = read_diagnostic_pixels(&harness);
     RetainedRun {
@@ -287,6 +292,121 @@ fn retained_outputs_survive_a_second_execution_in_the_same_frame() {
             diagnostic_difference(&cached.pixels[frame], &uncached.pixels[frame])
         );
     }
+}
+
+/// The three-checkpoint scene on an output wide enough that its far corner
+/// lies beyond every effect's sampling footprint.
+fn wide_three_checkpoint_fixture() -> NativeThreeCheckpointFixture {
+    let mut fixture = native_three_checkpoint_fixture();
+    fixture.output_size = (480, 360);
+    fixture.output_bounds =
+        EffectRect::new(0, 0, 480, 360).expect("wide three-checkpoint output bounds");
+    fixture
+}
+
+/// A full repaint where only the background surface's pixels change inside
+/// `changed`, as when a window below a shell blur scrolls. Returns the second
+/// frame's pixels and retained hits.
+fn run_surface_content_change(
+    retained: bool,
+    changed: OutputRect,
+) -> (Vec<u8>, usize, oblivion_one::effects::CompiledFrameGraph) {
+    let fixture = wide_three_checkpoint_fixture();
+    let full_region = EffectRegion::from_rect(fixture.output_bounds);
+    let full_repair = OutputRect::new(0, 0, fixture.output_size.0, fixture.output_size.1);
+    let mut harness = GlesEffectTestHarness::new(fixture.output_size.0, fixture.output_size.1);
+    harness.install_texture_backed_output();
+    install_native_three_checkpoint_diagnostic_scene(&mut harness, fixture.scene);
+
+    let first_graph = compile_native_three_checkpoint_graph(fixture, &full_region);
+    render_retained_test_frame(
+        &mut harness,
+        &first_graph,
+        &retained_signatures(fixture.scene, &[]),
+        full_repair,
+        fixture.output_size,
+        full_region.clone(),
+        true,
+        retained,
+        false,
+        None,
+    );
+
+    let damage = diagnostic_region(changed);
+    let second_graph = compile_native_three_checkpoint_graph(fixture, &damage);
+    update_diagnostic_background_for_surface(
+        &harness,
+        fixture.scene.background_surface,
+        changed,
+        [236, 28, 42, 255],
+    );
+    let (hits, _) = render_retained_test_frame(
+        &mut harness,
+        &second_graph,
+        &retained_signatures(fixture.scene, &[fixture.scene.background_surface]),
+        full_repair,
+        fixture.output_size,
+        full_region,
+        true,
+        retained,
+        false,
+        Some(damage),
+    );
+    (read_diagnostic_pixels(&harness), hits, second_graph)
+}
+
+#[test]
+fn retained_outputs_hit_when_surface_damage_misses_the_sampled_region() {
+    let fixture = wide_three_checkpoint_fixture();
+    let far_corner = OutputRect::new(
+        fixture.output_size.0 as i32 - 4,
+        fixture.output_size.1 as i32 - 4,
+        4,
+        4,
+    );
+    let (cached, hits, graph) = run_surface_content_change(true, far_corner);
+    let (uncached, _, _) = run_surface_content_change(false, far_corner);
+    let effect_a = graph
+        .instances
+        .iter()
+        .find(|instance| instance.id.get() == fixture.effect_a.id)
+        .expect("effect A is compiled");
+    assert!(
+        !effect_a
+            .capture_region
+            .intersects(&diagnostic_region(far_corner)),
+        "the fixture's far corner must lie outside A's sampled region: {:?}",
+        graph
+            .instances
+            .iter()
+            .map(|i| (i.id, i.capture_region.bounding_rect()))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        hits > 0,
+        "a backdrop whose sampled pixels saw no damage composites from retained output"
+    );
+    assert!(
+        cached == uncached,
+        "{}",
+        diagnostic_difference(&cached, &uncached)
+    );
+}
+
+#[test]
+fn retained_outputs_miss_when_surface_damage_reaches_the_sampled_region() {
+    let fixture = wide_three_checkpoint_fixture();
+    let (cached, hits, _) = run_surface_content_change(true, fixture.repair);
+    let (uncached, _, _) = run_surface_content_change(false, fixture.repair);
+    assert_eq!(
+        hits, 0,
+        "damage inside every sampled region never reuses retained pixels"
+    );
+    assert!(
+        cached == uncached,
+        "{}",
+        diagnostic_difference(&cached, &uncached)
+    );
 }
 
 fn diagnostic_difference(left: &[u8], right: &[u8]) -> String {

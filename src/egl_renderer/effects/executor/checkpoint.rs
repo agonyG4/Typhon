@@ -20,6 +20,7 @@ pub(super) fn checkpoint_causal_stability_plan_for_owners(
         .effect_resources
         .checkpoint_causal_state_for_frame(frame_serial);
     let current_scene = scene.current_checkpoint_scene_causal_snapshot.as_ref();
+    let scene_damage = scene.current_scene_damage.as_ref();
     let common_prefix_end = cache_baseline
         .zip(current_scene)
         .map(|(baseline, current)| baseline.scene.unchanged_command_prefix_len(current));
@@ -90,9 +91,20 @@ pub(super) fn checkpoint_causal_stability_plan_for_owners(
             );
             (draw_end, pass.anchor, pass.visual_group, pass.anchor_scope)
         });
+        // Below the boundary either nothing changed, or only surface pixels
+        // changed and the frame's scene damage stays outside every pixel the
+        // instance samples. Only the instance's output relies on the second
+        // proof; cached captures below still require an unchanged prefix.
         let ordinary_prefix_unchanged =
             current_composition_boundary.is_some_and(|(draw_end, _, _, _)| {
                 common_prefix_end.is_some_and(|common_prefix_end| draw_end <= common_prefix_end)
+                    || scene_damage_misses_unchanged_geometry(
+                        cache_baseline,
+                        current_scene,
+                        scene_damage,
+                        draw_end,
+                        &instance.capture_region,
+                    )
             });
         let composition_boundary_unchanged = previous_instance
             .zip(current_composition_boundary.as_ref())
@@ -201,6 +213,28 @@ pub(super) fn checkpoint_causal_stability_plan_for_owners(
         }
     }
     plan
+}
+
+/// Proves the scene below `draw_end` unchanged inside `capture_region` when
+/// the commands differ only in surface pixels and the frame's scene damage,
+/// which covers every changed surface pixel since the last presented frame
+/// (and so since the baseline frame), misses the sampled region.
+fn scene_damage_misses_unchanged_geometry(
+    baseline: Option<&crate::egl_renderer::checkpoint::CheckpointCausalState>,
+    current: Option<&crate::egl_renderer::checkpoint::EglCheckpointSceneCausalSnapshot>,
+    scene_damage: Option<&EffectRegion>,
+    draw_end: usize,
+    capture_region: &EffectRegion,
+) -> bool {
+    let (Some(baseline), Some(current), Some(scene_damage)) = (baseline, current, scene_damage)
+    else {
+        return false;
+    };
+    !capture_region.is_empty()
+        && !scene_damage.intersects(capture_region)
+        && baseline
+            .scene
+            .only_surface_content_changed_before(current, draw_end)
 }
 
 #[cfg(test)]
