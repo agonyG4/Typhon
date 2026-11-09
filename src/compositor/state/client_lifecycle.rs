@@ -74,7 +74,8 @@ pub(in crate::compositor) struct ClientTeardownSummary {
 #[derive(Debug)]
 pub(in crate::compositor) struct PendingClientResourceExhaustion {
     pub(in crate::compositor) client: Client,
-    pub(in crate::compositor) _evidence_surface_id: u32,
+    pub(in crate::compositor) _evidence_surface_id: Option<u32>,
+    pub(in crate::compositor) message: &'static str,
 }
 
 impl CompositorState {
@@ -127,21 +128,42 @@ impl CompositorState {
             Some(&client_id),
             "surface ownership maps disagree while scheduling resource exhaustion"
         );
+        if !self.queue_client_resource_exhaustion(
+            client,
+            Some(surface_id),
+            "surface Content Update/cache resources exhausted",
+        ) {
+            return false;
+        }
+        self.surface_pacing_metrics.queue_resource_exhaustions = self
+            .surface_pacing_metrics
+            .queue_resource_exhaustions
+            .saturating_add(1);
+        true
+    }
+
+    /// Schedules a `wl_display.no_memory` disconnect for after the dispatch
+    /// cycle. Request handlers must use this instead of `Client::kill`:
+    /// killing destroys the `wl_client` immediately, while libwayland's
+    /// dispatch loop for that client is still on the stack and keeps reading it.
+    pub(in crate::compositor) fn queue_client_resource_exhaustion(
+        &mut self,
+        client: Client,
+        evidence_surface_id: Option<u32>,
+        message: &'static str,
+    ) -> bool {
         if !self
             .pending_client_resource_exhaustion_clients
-            .insert(client_id)
+            .insert(client.id())
         {
             return false;
         }
         self.pending_client_resource_exhaustions
             .push(PendingClientResourceExhaustion {
                 client,
-                _evidence_surface_id: surface_id,
+                _evidence_surface_id: evidence_surface_id,
+                message,
             });
-        self.surface_pacing_metrics.queue_resource_exhaustions = self
-            .surface_pacing_metrics
-            .queue_resource_exhaustions
-            .saturating_add(1);
         true
     }
 

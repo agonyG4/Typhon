@@ -18,14 +18,23 @@ impl OwnCompositorServer {
     pub(super) fn kill_pending_resource_exhaustion_clients(&mut self) {
         let handle = self.display.handle();
         for pending in self.state.take_client_resource_exhaustions() {
-            self.state.mark_client_terminal(pending.client.id());
+            let client_id = pending.client.id();
+            let peer_pid = pending
+                .client
+                .get_data::<crate::compositor::server::TyphonClientData>()
+                .and_then(|data| data.client_pids.lock().ok()?.get(&client_id).copied());
+            eprintln!(
+                "oblivion-one compositor: client_resource_exhaustion client={client_id:?} pid={peer_pid:?} reason={}",
+                pending.message,
+            );
+            self.state.mark_client_terminal(client_id);
             pending.client.kill(
                 &handle,
                 ProtocolError {
                     code: 2,
                     object_id: 1,
                     object_interface: "wl_display".to_string(),
-                    message: "surface Content Update/cache resources exhausted".to_string(),
+                    message: pending.message.to_string(),
                 },
             );
         }
@@ -727,7 +736,7 @@ mod tests {
         );
         assert_eq!(
             server.state.pending_client_resource_exhaustions[0]._evidence_surface_id,
-            surface_id
+            Some(surface_id)
         );
 
         server.kill_pending_resource_exhaustion_clients();

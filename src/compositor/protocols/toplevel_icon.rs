@@ -4,17 +4,13 @@ use std::sync::Mutex;
 use wayland_protocols::xdg::toplevel_icon::v1::server::{
     xdg_toplevel_icon_manager_v1 as manager, xdg_toplevel_icon_v1 as icon,
 };
-use wayland_server::{GlobalDispatch, New, Resource, backend::protocol::ProtocolError};
+use wayland_server::{GlobalDispatch, New, Resource};
 
-fn no_memory(client: &Client, dh: &DisplayHandle) {
-    client.kill(
-        dh,
-        ProtocolError {
-            code: 2, // wl_display.error.no_memory
-            object_id: 1,
-            object_interface: "wl_display".into(),
-            message: "window icon resource limit reached".into(),
-        },
+fn no_memory(state: &mut CompositorState, client: &Client) {
+    state.queue_client_resource_exhaustion(
+        client.clone(),
+        None,
+        "window icon resource limit reached",
     );
 }
 
@@ -40,7 +36,7 @@ impl Dispatch<manager::XdgToplevelIconManagerV1, ()> for CompositorState {
         _: &manager::XdgToplevelIconManagerV1,
         request: manager::Request,
         _: &(),
-        dh: &DisplayHandle,
+        _: &DisplayHandle,
         init: &mut DataInit<'_, Self>,
     ) {
         match request {
@@ -56,7 +52,7 @@ impl Dispatch<manager::XdgToplevelIconManagerV1, ()> for CompositorState {
                         .count()
                         >= MAX_ICON_OBJECTS_PER_CLIENT
                 {
-                    no_memory(client, dh);
+                    no_memory(state, client);
                     return;
                 }
                 state
@@ -77,7 +73,7 @@ impl Dispatch<manager::XdgToplevelIconManagerV1, ()> for CompositorState {
                     && state.toplevel_icons.pending.len() + state.toplevel_icons.current.len()
                         >= MAX_ICON_SURFACES
                 {
-                    no_memory(client, dh);
+                    no_memory(state, client);
                     return;
                 }
                 let snapshot = if let Some(resource) = selected {
@@ -103,7 +99,7 @@ impl Dispatch<manager::XdgToplevelIconManagerV1, ()> for CompositorState {
                         match ToplevelIcon::new(builder.name.clone(), image) {
                             Ok(snapshot) => Some(Arc::new(snapshot)),
                             Err(_) => {
-                                no_memory(client, dh);
+                                no_memory(state, client);
                                 return;
                             }
                         }
@@ -120,12 +116,12 @@ impl Dispatch<manager::XdgToplevelIconManagerV1, ()> for CompositorState {
 
 impl Dispatch<icon::XdgToplevelIconV1, Mutex<IconBuilder>> for CompositorState {
     fn request(
-        _: &mut Self,
+        state: &mut Self,
         client: &Client,
         resource: &icon::XdgToplevelIconV1,
         request: icon::Request,
         data: &Mutex<IconBuilder>,
-        dh: &DisplayHandle,
+        _: &DisplayHandle,
         _: &mut DataInit<'_, Self>,
     ) {
         if matches!(request, icon::Request::Destroy) {
@@ -144,7 +140,7 @@ impl Dispatch<icon::XdgToplevelIconV1, Mutex<IconBuilder>> for CompositorState {
         match request {
             icon::Request::SetName { icon_name } => {
                 if icon_name.len() > 256 {
-                    no_memory(client, dh);
+                    no_memory(state, client);
                     return;
                 }
                 data.name = if icon_name.contains(['/', '\\', ':']) {
@@ -158,14 +154,6 @@ impl Dispatch<icon::XdgToplevelIconV1, Mutex<IconBuilder>> for CompositorState {
                     resource.post_error(icon::Error::InvalidBuffer, "icon buffer must be wl_shm");
                     return;
                 };
-                let replacement = data
-                    .buffers
-                    .iter()
-                    .position(|b| b.source_edge == shm.width && b.scale == scale);
-                if replacement.is_none() && data.buffers.len() >= MAX_ICON_BUFFERS {
-                    no_memory(client, dh);
-                    return;
-                }
                 let image = match snapshot_icon_buffer(shm, scale) {
                     Ok(image) => image,
                     Err(error) => {
@@ -180,10 +168,25 @@ impl Dispatch<icon::XdgToplevelIconV1, Mutex<IconBuilder>> for CompositorState {
                     source_edge,
                     image,
                 };
-                if let Some(index) = replacement {
+                let same_size = data
+                    .buffers
+                    .iter()
+                    .position(|b| b.source_edge == source_edge && b.scale == scale);
+                if let Some(index) = same_size {
                     data.buffers[index] = value;
-                } else {
+                } else if data.buffers.len() < MAX_ICON_BUFFERS {
                     data.buffers.push(value);
+                } else if let Some(smallest) = data
+                    .buffers
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, b)| b.source_edge)
+                    .filter(|(_, b)| b.source_edge < source_edge)
+                    .map(|(index, _)| index)
+                {
+                    // Offering many sizes is legal. Only the largest is used,
+                    // so past the bound keep the largest instead of failing.
+                    data.buffers[smallest] = value;
                 }
             }
             _ => {}

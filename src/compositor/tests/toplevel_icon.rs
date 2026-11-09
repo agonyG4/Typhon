@@ -121,6 +121,84 @@ fn assigning_an_icon_makes_it_immutable_before_surface_commit() {
     assert!(result.is_err());
 }
 
+/// Regression: killing the client from inside its request handler freed the
+/// `wl_client` under libwayland's dispatch loop, which then read the freed
+/// connection and took the whole compositor down.
+#[test]
+fn exceeding_an_icon_limit_disconnects_only_that_client_after_dispatch() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (running, thread) = spawn_test_server(server);
+
+    let offender = Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&offender).unwrap();
+    let qh = queue.handle();
+    let manager: icon_manager::XdgToplevelIconManagerV1 = globals.bind(&qh, 1..=1, ()).unwrap();
+    let icon = manager.create_icon(&qh, ());
+    // Everything after the overlong name sits in the same read as the request
+    // that trips the limit, so the dispatch loop keeps going after the handler.
+    icon.set_name("x".repeat(257));
+    for _ in 0..32 {
+        icon.set_name("after-the-limit".into());
+    }
+    // The kill runs at the end of the dispatch cycle, so a sync read in the same
+    // cycle may still be answered. The cycle after it can only see the hangup.
+    let _ = queue.roundtrip(&mut RegistryTestState::default());
+    assert!(queue.roundtrip(&mut RegistryTestState::default()).is_err());
+
+    let bystander = Connection::from_socket(UnixStream::connect(&socket_path).unwrap()).unwrap();
+    let (_, mut bystander_queue) = registry_queue_init::<RegistryTestState>(&bystander).unwrap();
+    bystander_queue
+        .roundtrip(&mut RegistryTestState::default())
+        .unwrap();
+
+    let server = stop_test_server(running, thread);
+    assert!(server.state.pending_client_resource_exhaustions.is_empty());
+}
+
+#[test]
+fn offering_more_icon_sizes_than_the_bound_keeps_the_largest() {
+    let socket_name = unique_socket_name();
+    let server = OwnCompositorServer::bind(&socket_name).unwrap();
+    let socket_path = runtime_socket_path(&socket_name);
+    let (running, thread) = spawn_test_server(server);
+    let connection = Connection::from_socket(UnixStream::connect(socket_path).unwrap()).unwrap();
+    let (globals, mut queue) = registry_queue_init::<RegistryTestState>(&connection).unwrap();
+    let qh = queue.handle();
+    let compositor: client_wl_compositor::WlCompositor = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shell: client_xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ()).unwrap();
+    let shm: client_wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).unwrap();
+    let manager: icon_manager::XdgToplevelIconManagerV1 = globals.bind(&qh, 1..=1, ()).unwrap();
+    let surface = compositor.create_surface(&qh, ());
+    let xdg = shell.get_xdg_surface(&surface, &qh, ());
+    let top = xdg.get_toplevel(&qh, ());
+
+    let file = create_test_shm_file(&[0xffff_ffff; 16 * 16]).unwrap();
+    let pool = shm.create_pool(file.as_fd(), 4 * 16 * 16, &qh, ());
+    let icon = manager.create_icon(&qh, ());
+    // The largest arrives after the bound is full, the smallest after that.
+    for edge in [2, 3, 4, 5, 6, 7, 8, 9, 16, 1] {
+        let buffer = pool.create_buffer(
+            0,
+            edge,
+            edge,
+            4 * edge,
+            client_wl_shm::Format::Argb8888,
+            &qh,
+            (),
+        );
+        icon.add_buffer(&buffer, 1);
+    }
+    manager.set_icon(&top, Some(&icon));
+    surface.commit();
+    queue.roundtrip(&mut RegistryTestState::default()).unwrap();
+
+    let server = stop_test_server(running, thread);
+    let current = server.state.toplevel_icons.current.values().next().unwrap();
+    assert_eq!(current.image.as_ref().unwrap().size().width, 16);
+}
+
 #[test]
 fn toplevel_icon_manager_is_advertised() {
     let socket_name = unique_socket_name();
