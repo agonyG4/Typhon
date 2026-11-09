@@ -1073,7 +1073,10 @@ impl<'a> ResolvedNativeFrameScene<'a> {
         if let Some(output_id) = presenting_output_id {
             presentation_snapshot.output_id = output_id;
         }
-        let effects = ResolvedEffectScene::new(canonical_effects.generation, effect_instances);
+        // The shared backdrop point travels with the rebuilt scene; without it
+        // shell layer blurs silently fall back to exact captures.
+        let effects = ResolvedEffectScene::new(canonical_effects.generation, effect_instances)
+            .with_shared_backdrop_point(canonical_effects.shared_backdrop_point);
         let mut snapshot =
             NativeSceneSnapshot::from_surfaces_with_scene_nodes_and_presentation_owners(
                 surfaces.as_ref(),
