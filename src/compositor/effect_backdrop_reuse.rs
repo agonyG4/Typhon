@@ -5,6 +5,11 @@ pub enum EffectBackdropReuse {
     #[default]
     Exact,
     PrecomputedWindowCandidate,
+    /// A shell layer blur (topbar, dock) that may sample the shared backdrop
+    /// captured below every window. The renderer keeps it only while no draw
+    /// below the layer and above that capture point covers the layer's own
+    /// bounds, so windows next to the bar never re-run its blur.
+    PrecomputedShellCandidate,
 }
 
 impl From<BlurAssignmentSource> for EffectBackdropReuse {

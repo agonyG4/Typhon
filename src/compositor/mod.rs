@@ -252,6 +252,7 @@ pub(crate) use effects::ProtocolSurfaceEffectBinding;
 pub use effects::{
     EffectAnchor, EffectAnchorScope, EffectFrameDemandSnapshot, EffectSceneOrder,
     EffectSceneSummary, FrameEffectSceneInput, ResolvedEffectInstance, ResolvedEffectScene,
+    SharedBackdropPoint,
 };
 pub(crate) use effects::{SurfaceEffectBindingKey, SurfaceEffectBindingOwners, SurfaceEffectSlot};
 pub use fullscreen::{

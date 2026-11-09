@@ -2527,11 +2527,26 @@ fn compile_frame_execution_variants_unpruned(
         &[],
         options.terminal_kawase_fusion,
     )?;
+    // Shell layer blurs sample the backdrop below every window. That is only
+    // a faithful backdrop when no other effect composites below the point:
+    // the shared capture replays scene commands, not effect outputs.
+    let shell_point = scene.shared_backdrop_point.filter(|point| {
+        scene
+            .instances
+            .iter()
+            .all(|instance| instance.scene_order >= point.scene_order)
+    });
     let mut eligible = scene
         .instances
         .iter()
         .filter_map(|instance| {
-            if instance.region.is_empty() || !precomputed_window_blur_instance(instance) {
+            if instance.region.is_empty() {
+                return None;
+            }
+            let shell = shell_point.is_some() && precomputed_shell_blur_instance(instance);
+            let window =
+                options.precomputed_window_blur && precomputed_window_blur_instance(instance);
+            if !shell && !window {
                 return None;
             }
             let program = registry.get(instance.program)?;
@@ -2539,11 +2554,19 @@ fn compile_frame_execution_variants_unpruned(
         })
         .collect::<Vec<_>>();
     eligible.sort_by_key(|(instance, _)| (instance.scene_order, instance.id));
+    // All consumers share one backdrop, so they must agree on its blur.
+    if let Some((_, first_blur)) = eligible.first().copied() {
+        eligible.retain(|(_, blur)| *blur == first_blur);
+    }
     let eligible_instances = eligible.len();
+    let uses_shell_point = shell_point.is_some()
+        && eligible
+            .iter()
+            .any(|(instance, _)| precomputed_shell_blur_instance(instance));
     // One consumer is enough: the shared backdrop is cached across frames, so
     // a window moving over an unchanged wallpaper reuses it, while a
     // window-local capture changes domain and refreshes on every move.
-    if !options.precomputed_window_blur || eligible_instances == 0 {
+    if eligible_instances == 0 {
         return Ok(CompiledFrameExecutionVariants {
             exact,
             precomputed_graph: None,
@@ -2554,14 +2577,17 @@ fn compile_frame_execution_variants_unpruned(
     }
 
     let (baseline, blur) = eligible[0];
-    let exact_baseline_capture_is_independent = match &exact {
-        FrameExecutionPlan::EffectGraph(graph) => graph
-            .passes
-            .iter()
-            .find(|pass| pass.instance == baseline.id && pass.kind == RenderPassKind::SceneCapture)
-            .is_some_and(|pass| pass.checkpoint_dependencies.is_empty()),
-        FrameExecutionPlan::LegacyScene => false,
-    };
+    let exact_baseline_capture_is_independent = uses_shell_point
+        || match &exact {
+            FrameExecutionPlan::EffectGraph(graph) => graph
+                .passes
+                .iter()
+                .find(|pass| {
+                    pass.instance == baseline.id && pass.kind == RenderPassKind::SceneCapture
+                })
+                .is_some_and(|pass| pass.checkpoint_dependencies.is_empty()),
+            FrameExecutionPlan::LegacyScene => false,
+        };
     if !exact_baseline_capture_is_independent {
         return Ok(CompiledFrameExecutionVariants {
             exact,
@@ -2623,15 +2649,33 @@ fn compile_frame_execution_variants_unpruned(
         });
     }
     let build_passes = 1 + usize::from(blur.passes) * 2;
+    // With a shell consumer the backdrop is captured below every window;
+    // window consumers stay correct there, as their demotion already rejects
+    // any lower window overlapping them.
+    let (baseline_anchor, baseline_scene_order, baseline_anchor_scope, baseline_visual_group) =
+        match shell_point.filter(|_| uses_shell_point) {
+            Some(point) => (
+                point.anchor,
+                point.scene_order,
+                EffectAnchorScope::VisualGroup,
+                Some(point.visual_group),
+            ),
+            None => (
+                baseline.anchor,
+                baseline.scene_order,
+                baseline.anchor_scope,
+                baseline.visual_group,
+            ),
+        };
     Ok(CompiledFrameExecutionVariants {
         exact,
         precomputed_graph,
         precomputed_backdrop: Some(CompiledPrecomputedBackdropPlan {
             baseline_instance: baseline.id,
-            baseline_anchor: baseline.anchor,
-            baseline_scene_order: baseline.scene_order,
-            baseline_anchor_scope: baseline.anchor_scope,
-            baseline_visual_group: baseline.visual_group,
+            baseline_anchor,
+            baseline_scene_order,
+            baseline_anchor_scope,
+            baseline_visual_group,
             consumers,
             capture_domain: output_bounds,
             blur,
@@ -2648,6 +2692,13 @@ fn precomputed_window_blur_instance(instance: &ResolvedEffectInstance) -> bool {
         && matches!(instance.anchor, EffectAnchor::BeforeSurface(_))
         && instance.anchor_scope == EffectAnchorScope::VisualGroup
         && instance.visual_group.is_some()
+        && instance.coverage.is_none()
+        && instance.frame_demand == EffectFrameDemand::OnDamage
+}
+
+fn precomputed_shell_blur_instance(instance: &ResolvedEffectInstance) -> bool {
+    instance.backdrop_reuse == crate::compositor::EffectBackdropReuse::PrecomputedShellCandidate
+        && matches!(instance.anchor, EffectAnchor::BeforeSurface(_))
         && instance.coverage.is_none()
         && instance.frame_demand == EffectFrameDemand::OnDamage
 }

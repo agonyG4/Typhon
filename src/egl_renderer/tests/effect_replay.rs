@@ -3104,6 +3104,162 @@ fn shared_build_has_five_physical_stages_and_external_demand_stays_local() {
     assert!(!demand.is_conservative_full());
 }
 
+/// Clears the output, materializes `precomputed`'s shared backdrop by
+/// replaying its scene prefix, then executes the optimized consumer graph
+/// against it and reads the output back.
+fn precomputed_variant_pixels(
+    harness: &mut GlesEffectTestHarness,
+    precomputed: &oblivion_one::effects::CompiledPrecomputedBackdropPlan,
+    optimized_graph: &oblivion_one::effects::CompiledFrameGraph,
+    full_damage: &EffectRegion,
+    repaint: &RepaintPlan,
+    output_bounds: EffectRect,
+) -> Vec<u8> {
+    unsafe {
+        harness.gl.bind_framebuffer(
+            glow::FRAMEBUFFER,
+            harness.renderer.scene_state.active_output_framebuffer,
+        );
+        harness.gl.disable(glow::SCISSOR_TEST);
+        harness.gl.clear_color(0.0, 0.0, 0.0, 0.0);
+        harness.gl.clear(glow::COLOR_BUFFER_BIT);
+    }
+    harness.renderer.establish_ordinary_scene_state();
+
+    let build =
+        oblivion_one::effects::compile_precomputed_backdrop_build(precomputed, output_bounds);
+    let capture = harness
+        .renderer
+        .effect_runtime
+        .effect_resources
+        .acquire(
+            &harness.gl,
+            EffectTextureKey::new(
+                build.capture.width,
+                build.capture.height,
+                EffectTextureFormat::Rgba8,
+                EffectTextureFilter::Linear,
+                build.capture.working_space,
+            ),
+        )
+        .expect("shared capture texture allocates");
+    let framebuffer = harness
+        .renderer
+        .effect_runtime
+        .effect_resources
+        .bind_draw_target(&harness.gl, &capture)
+        .expect("shared capture framebuffer binds");
+    harness
+        .renderer
+        .establish_scene_state_for_framebuffer(Some(framebuffer));
+    unsafe {
+        harness.gl.disable(glow::SCISSOR_TEST);
+        harness.gl.disable(glow::BLEND);
+        harness.gl.clear_color(0.0, 0.0, 0.0, 1.0);
+        harness.gl.clear(glow::COLOR_BUFFER_BIT);
+    }
+    let (prefix_end, _) = effects::composition_range_with_metadata(
+        &harness.renderer.scene_state.commands,
+        &harness.renderer.scene_state.capture_layers,
+        &harness.renderer.scene_state.capture_visual_groups,
+        precomputed.baseline_anchor,
+        precomputed.baseline_visual_group,
+        precomputed.baseline_anchor_scope,
+    );
+    let capture_result = {
+        let mut context = harness.renderer.effect_execution_context();
+        context.draw_effect_scene_range(
+            &[OutputRect::new(
+                0,
+                0,
+                output_bounds.width,
+                output_bounds.height,
+            )],
+            0,
+            prefix_end,
+            OutputFramebufferOrigin::BottomLeft,
+            EffectFramebufferTarget::new(Some(framebuffer)),
+        )
+    };
+    harness
+        .renderer
+        .effect_runtime
+        .effect_resources
+        .unbind_render_target(&harness.gl);
+    harness.renderer.establish_ordinary_scene_state();
+    capture_result.expect("baseline-only scene prefix replays to the shared capture");
+    let (build_stats, shared_owner) = {
+        let mut context = harness.renderer.effect_execution_context();
+        effects::execute_precomputed_backdrop_build(
+            &mut context,
+            &build,
+            capture,
+            None,
+            OutputFramebufferOrigin::BottomLeft,
+        )
+    }
+    .expect("shared capture and four Kawase stages execute in real GLES");
+    assert_eq!(build_stats.passes, 5);
+    assert_eq!(build_stats.scene_captures, 1);
+    assert_eq!(build_stats.blur_downsamples, 2);
+    assert_eq!(build_stats.blur_upsamples, 2);
+    assert_eq!(shared_owner.key.format, EffectTextureFormat::Rgba16Float);
+    assert_eq!(
+        shared_owner.key.working_space,
+        EffectWorkingSpace::LinearSrgb
+    );
+
+    harness
+        .renderer
+        .effect_runtime
+        .effect_resources
+        .prepare_graph(&harness.gl, optimized_graph)
+        .expect("optimized consumer graph preflights");
+    let optimized_demand = plan_effect_execution_demand(optimized_graph, full_damage, true);
+    let optimized_selection = effects::select_effect_execution(optimized_graph, &optimized_demand);
+    let external_bindings = precomputed
+        .consumers
+        .iter()
+        .map(|consumer| {
+            (
+                consumer.texture,
+                effects::GraphTextureBinding::precomputed_backdrop_alias(shared_owner.clone()),
+            )
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut prepared = {
+        let mut context = harness.renderer.effect_execution_context();
+        effects::prepare_effect_graph_execution_with_external_bindings(
+            &mut context,
+            optimized_graph,
+            OutputFramebufferOrigin::BottomLeft,
+            repaint,
+            &optimized_demand,
+            &optimized_selection,
+            *effects::effect_debug_config(),
+            None,
+            external_bindings,
+        )
+        .expect("optimized graph prepares with non-owning shared aliases")
+    };
+    let optimized_result = {
+        let mut context = harness.renderer.effect_execution_context();
+        effects::execute_prepared_effect_graph_core(&mut context, &mut prepared)
+    };
+    {
+        let mut context = harness.renderer.effect_execution_context();
+        effects::finish_prepared_effect_graph_execution(&mut context, prepared, optimized_result)
+    }
+    .expect("optimized graph executes in real GLES");
+    harness
+        .renderer
+        .effect_runtime
+        .effect_resources
+        .release(shared_owner)
+        .expect("single shared owner releases after graph execution");
+    read_diagnostic_pixels(harness)
+}
+
 #[test]
 fn precomputed_baseline_only_scene_content_matches_exact_gles_pixels() {
     const PIXEL_TOLERANCE: u8 = 2;
@@ -3213,150 +3369,22 @@ fn precomputed_baseline_only_scene_content_matches_exact_gles_pixels() {
     .expect("exact graph executes in real GLES");
     let exact_pixels = read_diagnostic_pixels(&harness);
 
-    unsafe {
-        harness.gl.bind_framebuffer(
-            glow::FRAMEBUFFER,
-            harness.renderer.scene_state.active_output_framebuffer,
-        );
-        harness.gl.disable(glow::SCISSOR_TEST);
-        harness.gl.clear_color(0.0, 0.0, 0.0, 0.0);
-        harness.gl.clear(glow::COLOR_BUFFER_BIT);
-    }
-    harness.renderer.establish_ordinary_scene_state();
-
-    let build =
-        oblivion_one::effects::compile_precomputed_backdrop_build(precomputed, output_bounds);
-    let capture = harness
-        .renderer
-        .effect_runtime
-        .effect_resources
-        .acquire(
-            &harness.gl,
-            EffectTextureKey::new(
-                build.capture.width,
-                build.capture.height,
-                EffectTextureFormat::Rgba8,
-                EffectTextureFilter::Linear,
-                build.capture.working_space,
-            ),
-        )
-        .expect("shared capture texture allocates");
-    let framebuffer = harness
-        .renderer
-        .effect_runtime
-        .effect_resources
-        .bind_draw_target(&harness.gl, &capture)
-        .expect("shared capture framebuffer binds");
-    harness
-        .renderer
-        .establish_scene_state_for_framebuffer(Some(framebuffer));
-    unsafe {
-        harness.gl.disable(glow::SCISSOR_TEST);
-        harness.gl.disable(glow::BLEND);
-        harness.gl.clear_color(0.0, 0.0, 0.0, 1.0);
-        harness.gl.clear(glow::COLOR_BUFFER_BIT);
-    }
-    let (prefix_end, _) = effects::composition_range_with_metadata(
-        &harness.renderer.scene_state.commands,
-        &harness.renderer.scene_state.capture_layers,
-        &harness.renderer.scene_state.capture_visual_groups,
-        precomputed.baseline_anchor,
-        precomputed.baseline_visual_group,
-        precomputed.baseline_anchor_scope,
+    let optimized_pixels = precomputed_variant_pixels(
+        &mut harness,
+        precomputed,
+        optimized_graph,
+        &full_damage,
+        &repaint,
+        output_bounds,
     );
-    let capture_result = {
-        let mut context = harness.renderer.effect_execution_context();
-        context.draw_effect_scene_range(
-            &[OutputRect::new(0, 0, 320, 240)],
-            0,
-            prefix_end,
-            OutputFramebufferOrigin::BottomLeft,
-            EffectFramebufferTarget::new(Some(framebuffer)),
-        )
-    };
-    harness
-        .renderer
-        .effect_runtime
-        .effect_resources
-        .unbind_render_target(&harness.gl);
-    harness.renderer.establish_ordinary_scene_state();
-    capture_result.expect("baseline-only scene prefix replays to the shared capture");
-    let (build_stats, shared_owner) = {
-        let mut context = harness.renderer.effect_execution_context();
-        effects::execute_precomputed_backdrop_build(
-            &mut context,
-            &build,
-            capture,
-            None,
-            OutputFramebufferOrigin::BottomLeft,
-        )
-    }
-    .expect("shared capture and four Kawase stages execute in real GLES");
-    assert_eq!(build_stats.passes, 5);
-    assert_eq!(build_stats.scene_captures, 1);
-    assert_eq!(build_stats.blur_downsamples, 2);
-    assert_eq!(build_stats.blur_upsamples, 2);
-    assert_eq!(shared_owner.key.format, EffectTextureFormat::Rgba16Float);
-    assert_eq!(
-        shared_owner.key.working_space,
-        EffectWorkingSpace::LinearSrgb
-    );
-
-    harness
-        .renderer
-        .effect_runtime
-        .effect_resources
-        .prepare_graph(&harness.gl, optimized_graph)
-        .expect("optimized consumer graph preflights");
-    let optimized_demand = plan_effect_execution_demand(optimized_graph, &full_damage, true);
-    let optimized_selection = effects::select_effect_execution(optimized_graph, &optimized_demand);
-    let external_bindings = precomputed
-        .consumers
-        .iter()
-        .map(|consumer| {
-            (
-                consumer.texture,
-                effects::GraphTextureBinding::precomputed_backdrop_alias(shared_owner.clone()),
-            )
-        })
-        .collect::<std::collections::HashMap<_, _>>();
-    let mut prepared = {
-        let mut context = harness.renderer.effect_execution_context();
-        effects::prepare_effect_graph_execution_with_external_bindings(
-            &mut context,
-            optimized_graph,
-            OutputFramebufferOrigin::BottomLeft,
-            &repaint,
-            &optimized_demand,
-            &optimized_selection,
-            *effects::effect_debug_config(),
-            None,
-            external_bindings,
-        )
-        .expect("optimized graph prepares with non-owning shared aliases")
-    };
-    let optimized_result = {
-        let mut context = harness.renderer.effect_execution_context();
-        effects::execute_prepared_effect_graph_core(&mut context, &mut prepared)
-    };
-    {
-        let mut context = harness.renderer.effect_execution_context();
-        effects::finish_prepared_effect_graph_execution(&mut context, prepared, optimized_result)
-    }
-    .expect("optimized graph executes in real GLES");
-    harness
-        .renderer
-        .effect_runtime
-        .effect_resources
-        .release(shared_owner)
-        .expect("single shared owner releases after graph execution");
-    let optimized_pixels = read_diagnostic_pixels(&harness);
 
     let mut compared_pixels = 0;
     for rect in [a_bounds, b_bounds] {
         for y in rect.y..rect.y + rect.height as i32 {
             for x in rect.x..rect.x + rect.width as i32 {
-                let offset = ((y as usize * 320 + x as usize) * 4) as usize;
+                // Readback rows are bottom-up.
+                let row = 239 - y as usize;
+                let offset = (row * 320 + x as usize) * 4;
                 for channel in 0..4 {
                     let difference =
                         exact_pixels[offset + channel].abs_diff(optimized_pixels[offset + channel]);
@@ -3373,6 +3401,248 @@ fn precomputed_baseline_only_scene_content_matches_exact_gles_pixels() {
         compared_pixels,
         (a_bounds.width * a_bounds.height + b_bounds.width * b_bounds.height) as usize
     );
+}
+
+fn shell_backdrop_test_scene(
+    program_id: oblivion_one::effects::EffectProgramId,
+    a_bounds: EffectRect,
+    b_bounds: EffectRect,
+    a_group: oblivion_one::compositor::VisualGroupId,
+    b_group: oblivion_one::compositor::VisualGroupId,
+    shell_reuse: oblivion_one::compositor::EffectBackdropReuse,
+) -> ResolvedEffectScene {
+    // A is an ordinary window blur; B models a shell bar above it whose
+    // region is clear of A's content.
+    let instance =
+        |id: u64, surface: u32, bounds: EffectRect, visual_group, anchor_scope, backdrop_reuse| {
+            let anchor = oblivion_one::compositor::EffectAnchor::BeforeSurface(surface);
+            oblivion_one::compositor::ResolvedEffectInstance {
+                composite_opacity: None,
+                id: oblivion_one::effects::EffectInstanceId::new(id)
+                    .expect("test effect id is non-zero"),
+                program: program_id,
+                anchor,
+                target_bounds: bounds,
+                region: EffectRegion::from_rect(bounds),
+                parameter_block: oblivion_one::effects::EffectParameterBlock::default(),
+                coverage: None,
+                signature: id,
+                frame_demand: EffectFrameDemand::OnDamage,
+                visual_group: Some(visual_group),
+                anchor_scope,
+                backdrop_reuse,
+                scene_order: oblivion_one::compositor::EffectSceneOrder::for_anchor(anchor),
+            }
+        };
+    ResolvedEffectScene::new(
+        1,
+        vec![
+            instance(
+                1,
+                42,
+                a_bounds,
+                a_group,
+                oblivion_one::compositor::EffectAnchorScope::VisualGroup,
+                oblivion_one::compositor::EffectBackdropReuse::Exact,
+            ),
+            instance(
+                2,
+                43,
+                b_bounds,
+                b_group,
+                oblivion_one::compositor::EffectAnchorScope::Surface,
+                shell_reuse,
+            ),
+        ],
+    )
+}
+
+fn shell_backdrop_point(
+    a_group: oblivion_one::compositor::VisualGroupId,
+) -> oblivion_one::compositor::SharedBackdropPoint {
+    let anchor = oblivion_one::compositor::EffectAnchor::BeforeSurface(42);
+    oblivion_one::compositor::SharedBackdropPoint {
+        anchor,
+        visual_group: a_group,
+        scene_order: oblivion_one::compositor::EffectSceneOrder::for_anchor(anchor),
+    }
+}
+
+#[test]
+fn shell_blur_shares_backdrop_below_windows_only_with_a_point() {
+    let output_bounds = EffectRect::new(0, 0, 320, 240).expect("output bounds");
+    let full_damage = EffectRegion::from_rect(output_bounds);
+    let a_group = oblivion_one::compositor::VisualGroupId::new(1).expect("A visual group");
+    let b_group = oblivion_one::compositor::VisualGroupId::new(2).expect("B visual group");
+    let a_bounds = EffectRect::new(12, 12, 32, 24).expect("A bounds");
+    let b_bounds = EffectRect::new(232, 112, 32, 24).expect("B bounds");
+    let program = oblivion_one::effects::builtin_background_material_program_with_passes(
+        oblivion_one::material::MaterialConfiguration::default()
+            .effective()
+            .expect("default material validates"),
+        2,
+    );
+    let program_id = program.program.id;
+    let mut registry = oblivion_one::effects::EffectRegistry::empty();
+    registry.insert(program).expect("built-in blur registry");
+    let compile = |scene: &ResolvedEffectScene| {
+        oblivion_one::effects::compile_frame_execution_variants(
+            scene,
+            &full_damage,
+            output_bounds,
+            &registry,
+            false,
+        )
+        .expect("variants compile")
+    };
+    let shell = oblivion_one::compositor::EffectBackdropReuse::PrecomputedShellCandidate;
+    let base = shell_backdrop_test_scene(program_id, a_bounds, b_bounds, a_group, b_group, shell);
+
+    // Without a point nothing proves the bar's backdrop is window-free.
+    assert!(compile(&base).precomputed_backdrop.is_none());
+
+    let point = shell_backdrop_point(a_group);
+    let with_point = base.clone().with_shared_backdrop_point(Some(point));
+    let variants = compile(&with_point);
+    let plan = variants
+        .precomputed_backdrop
+        .as_ref()
+        .expect("shell candidate shares the below-window backdrop");
+    assert_eq!(plan.baseline_anchor, point.anchor);
+    assert_eq!(plan.baseline_scene_order, point.scene_order);
+    assert_eq!(
+        plan.baseline_anchor_scope,
+        oblivion_one::compositor::EffectAnchorScope::VisualGroup
+    );
+    assert_eq!(plan.baseline_visual_group, Some(a_group));
+    assert_eq!(plan.consumers.len(), 1);
+    assert_eq!(plan.consumers[0].instance, with_point.instances[1].id);
+
+    // An ordinary window blur never becomes a shell consumer.
+    let exact = oblivion_one::compositor::EffectBackdropReuse::Exact;
+    let plain = shell_backdrop_test_scene(program_id, a_bounds, b_bounds, a_group, b_group, exact)
+        .with_shared_backdrop_point(Some(point));
+    assert!(compile(&plain).precomputed_backdrop.is_none());
+
+    // A point above an effect would drop that effect's output from the
+    // replayed backdrop, so it disables sharing.
+    let above_anchor = oblivion_one::compositor::EffectAnchor::BeforeSurface(43);
+    let above = oblivion_one::compositor::SharedBackdropPoint {
+        anchor: above_anchor,
+        visual_group: b_group,
+        scene_order: oblivion_one::compositor::EffectSceneOrder::for_anchor(above_anchor),
+    };
+    let late = base.with_shared_backdrop_point(Some(above));
+    if late.instances[0].scene_order < above.scene_order {
+        assert!(compile(&late).precomputed_backdrop.is_none());
+    }
+}
+
+#[test]
+fn shell_backdrop_below_windows_matches_exact_gles_pixels() {
+    const PIXEL_TOLERANCE: u8 = 2;
+
+    let mut harness = GlesEffectTestHarness::new(320, 240);
+    harness.install_texture_backed_output();
+    let output_bounds = EffectRect::new(0, 0, 320, 240).expect("output bounds");
+    let full_damage = EffectRegion::from_rect(output_bounds);
+    let a_group = oblivion_one::compositor::VisualGroupId::new(1).expect("A visual group");
+    let b_group = oblivion_one::compositor::VisualGroupId::new(2).expect("B visual group");
+    let a_bounds = EffectRect::new(12, 12, 32, 24).expect("A bounds");
+    // Clear of A's 88 px blur reach, so below-window and exact backdrops
+    // agree inside B.
+    let b_bounds = EffectRect::new(232, 112, 32, 24).expect("B bounds");
+    install_native_stacked_diagnostic_scene(
+        &mut harness,
+        NativeStackedBackdropSceneSpec {
+            background_surface: 7,
+            a_surface: 42,
+            b_surface: 43,
+            a_content_bounds: a_bounds,
+            b_content_bounds: b_bounds,
+            a_visual_group: a_group,
+            b_visual_group: b_group,
+        },
+    );
+    let program = oblivion_one::effects::builtin_background_material_program_with_passes(
+        oblivion_one::material::MaterialConfiguration::default()
+            .effective()
+            .expect("default material validates"),
+        2,
+    );
+    let program_id = program.program.id;
+    let mut registry = oblivion_one::effects::EffectRegistry::empty();
+    registry.insert(program).expect("built-in blur registry");
+    harness.renderer.set_effect_registry(registry.clone());
+    let scene = shell_backdrop_test_scene(
+        program_id,
+        a_bounds,
+        b_bounds,
+        a_group,
+        b_group,
+        oblivion_one::compositor::EffectBackdropReuse::PrecomputedShellCandidate,
+    )
+    .with_shared_backdrop_point(Some(shell_backdrop_point(a_group)));
+    let variants = oblivion_one::effects::compile_frame_execution_variants(
+        &scene,
+        &full_damage,
+        output_bounds,
+        &registry,
+        false,
+    )
+    .expect("exact and precomputed graphs compile");
+    let oblivion_one::effects::FrameExecutionPlan::EffectGraph(exact_graph) = &variants.exact
+    else {
+        panic!("exact scene compiles to an effect graph");
+    };
+    let optimized_graph = variants
+        .precomputed_graph
+        .as_ref()
+        .expect("shell candidate selects the precomputed graph");
+    let precomputed = variants
+        .precomputed_backdrop
+        .as_ref()
+        .expect("shell candidate selects the shared backdrop");
+    let repaint = diagnostic_repaint_plan_for_repairs_in_size(&[], true, (320, 240));
+
+    let exact_demand = plan_effect_execution_demand(exact_graph, &full_damage, true);
+    let exact_selection = effects::select_effect_execution(exact_graph, &exact_demand);
+    effects::execute_effect_graph(
+        &mut harness.renderer,
+        exact_graph,
+        OutputFramebufferOrigin::BottomLeft,
+        &repaint,
+        &exact_demand,
+        &exact_selection,
+    )
+    .expect("exact graph executes in real GLES");
+    let exact_pixels = read_diagnostic_pixels(&harness);
+    let optimized_pixels = precomputed_variant_pixels(
+        &mut harness,
+        precomputed,
+        optimized_graph,
+        &full_damage,
+        &repaint,
+        output_bounds,
+    );
+
+    for rect in [a_bounds, b_bounds] {
+        for y in rect.y..rect.y + rect.height as i32 {
+            for x in rect.x..rect.x + rect.width as i32 {
+                // Readback rows are bottom-up.
+                let row = 239 - y as usize;
+                let offset = (row * 320 + x as usize) * 4;
+                for channel in 0..4 {
+                    let difference =
+                        exact_pixels[offset + channel].abs_diff(optimized_pixels[offset + channel]);
+                    assert!(
+                        difference <= PIXEL_TOLERANCE,
+                        "pixel differs by {difference} at ({x}, {y}) channel {channel}"
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[test]

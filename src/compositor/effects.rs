@@ -175,6 +175,18 @@ pub struct ResolvedEffectScene {
     pub summary: EffectSceneSummary,
     pub generation: u64,
     pub signature: u64,
+    /// Where shell-layer blurs capture their shared backdrop: before the
+    /// lowest window's visual group. Only set when the frame has a
+    /// [`super::EffectBackdropReuse::PrecomputedShellCandidate`].
+    pub shared_backdrop_point: Option<SharedBackdropPoint>,
+}
+
+/// The scene position below every window, as a visual-group anchor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SharedBackdropPoint {
+    pub anchor: EffectAnchor,
+    pub visual_group: VisualGroupId,
+    pub scene_order: EffectSceneOrder,
 }
 
 #[derive(Clone, Copy)]
@@ -226,7 +238,25 @@ impl ResolvedEffectScene {
             summary,
             generation,
             signature,
+            shared_backdrop_point: None,
         }
+    }
+
+    /// Records the shared backdrop point and folds it into the signature, as
+    /// moving it changes what shell candidates sample.
+    pub fn with_shared_backdrop_point(mut self, point: Option<SharedBackdropPoint>) -> Self {
+        if let Some(point) = point {
+            for value in [
+                0x5348_454c_4c00_u64,
+                effect_anchor_surface_id(point.anchor).map_or(u64::MAX, u64::from),
+                u64::from(point.visual_group.get()),
+            ] {
+                self.signature ^= value;
+                self.signature = self.signature.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+        self.shared_backdrop_point = point;
+        self
     }
 
     /// Visual effect identity for damage comparisons. Publishing unrelated
@@ -393,6 +423,7 @@ impl super::CompositorState {
                 if !self.is_effective_blur_assignment(&assignment) {
                     continue;
                 }
+                let backdrop_reuse = self.backdrop_reuse_for_assignment(&assignment);
                 let Some(target_bounds) = assignment.region.bounding_rect() else {
                     continue;
                 };
@@ -437,7 +468,7 @@ impl super::CompositorState {
                     parameter_block: selected_parameter_block.clone(),
                     coverage,
                     anchor_scope: assignment.anchor_scope,
-                    backdrop_reuse: assignment.source.into(),
+                    backdrop_reuse,
                     scene_order: EffectSceneOrder::for_anchor(EffectAnchor::BeforeSurface(
                         surface.surface_id,
                     )),
@@ -454,6 +485,20 @@ impl super::CompositorState {
         }
         instances.sort_by_key(effect_semantic_sort_key);
         ResolvedEffectScene::new(self.scene_render_generation, instances)
+    }
+
+    /// Synthesized window blurs may use the precomputed window backdrop;
+    /// blurs on shell layer surfaces may use the shared below-windows one.
+    fn backdrop_reuse_for_assignment(
+        &self,
+        assignment: &crate::compositor::blur_assignment::ResolvedBlurAssignment,
+    ) -> super::EffectBackdropReuse {
+        let root_surface_id = self.root_surface_id_for_surface(assignment.target_surface_id);
+        if self.layer_surfaces.contains_key(&root_surface_id) {
+            super::EffectBackdropReuse::PrecomputedShellCandidate
+        } else {
+            assignment.source.into()
+        }
     }
 
     pub(in crate::compositor) fn resolved_effect_scene_for_frame_surfaces(
@@ -509,6 +554,7 @@ impl super::CompositorState {
                 if !self.is_effective_blur_assignment(&assignment) {
                     continue;
                 }
+                let backdrop_reuse = self.backdrop_reuse_for_assignment(&assignment);
                 let Some(target_bounds) = assignment.region.bounding_rect() else {
                     continue;
                 };
@@ -548,7 +594,7 @@ impl super::CompositorState {
                     parameter_block: selected_parameter_block.clone(),
                     coverage,
                     anchor_scope: assignment.anchor_scope,
-                    backdrop_reuse: assignment.source.into(),
+                    backdrop_reuse,
                     scene_order: EffectSceneOrder::for_anchor(EffectAnchor::BeforeSurface(
                         surface.surface_id,
                     )),
@@ -1471,6 +1517,7 @@ fn scene_signature(generation: u64, instances: &[ResolvedEffectInstance]) -> u64
             match instance.backdrop_reuse {
                 super::EffectBackdropReuse::Exact => 0,
                 super::EffectBackdropReuse::PrecomputedWindowCandidate => 1,
+                super::EffectBackdropReuse::PrecomputedShellCandidate => 2,
             },
             u64::from(instance.scene_order.group_order),
             u64::from(instance.scene_order.surface_order),

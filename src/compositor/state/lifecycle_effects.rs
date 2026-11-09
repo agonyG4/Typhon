@@ -238,12 +238,50 @@ impl CompositorState {
             instances.push(blur);
         }
 
-        let mut resolved = ResolvedEffectScene::new(scene.generation, instances);
+        let shared_backdrop_point = instances
+            .iter()
+            .any(|instance| {
+                instance.backdrop_reuse == super::EffectBackdropReuse::PrecomputedShellCandidate
+            })
+            .then(|| {
+                self.shared_backdrop_point(frame_source.surfaces, frame_source.popup_surface_ids)
+            })
+            .flatten();
+        let mut resolved = ResolvedEffectScene::new(scene.generation, instances)
+            .with_shared_backdrop_point(shared_backdrop_point);
         if let Some(workspace_sample) = frame_source.workspace_sample {
             resolved.signature =
                 resolved.signature.wrapping_mul(0x0000_0100_0000_01b3) ^ workspace_sample.signature;
         }
         resolved
+    }
+
+    /// The visual group of the lowest desktop window in `surfaces`: everything
+    /// drawn before it (wallpaper and lower layers) forms the shared backdrop
+    /// that shell layer blurs may sample instead of the live scene.
+    pub(in crate::compositor) fn shared_backdrop_point(
+        &self,
+        surfaces: &[RenderableSurface],
+        popup_surface_ids: &[u32],
+    ) -> Option<crate::compositor::effects::SharedBackdropPoint> {
+        let window_root = surfaces.iter().find_map(|surface| {
+            let root = self.root_surface_id_for_surface(surface.surface_id);
+            self.window_id_for_surface(root)
+                .is_some_and(|window_id| self.desktop_windows.contains_key(&window_id))
+                .then_some(root)
+        })?;
+        let groups = crate::compositor::render::visual_stack_groups(surfaces, popup_surface_ids);
+        let visual_group =
+            Self::visual_group_for_surface_in_groups(surfaces, &groups, window_root)?;
+        Some(crate::compositor::effects::SharedBackdropPoint {
+            anchor: EffectAnchor::BeforeSurface(window_root),
+            visual_group,
+            scene_order: crate::compositor::effects::EffectSceneOrder {
+                group_order: visual_group.get(),
+                surface_order: 0,
+                phase: 0,
+            },
+        })
     }
 }
 

@@ -37,6 +37,76 @@ use super::{
     types::{CaptureCursorOverlay, EglFrameOutcome, EglSceneDrawRequest, FrameSkipReason},
 };
 
+/// Keeps a shell layer blur on the shared below-windows backdrop only while no
+/// command drawn between that backdrop point and the layer touches the
+/// layer's own bounds. Inside its bounds the shared backdrop then holds the
+/// same pixels as the live scene; only the blur's reach beyond the bar sees
+/// the wallpaper instead of neighbouring windows. Any other candidate falls
+/// back to the exact live capture, with a distinct signature so no retained
+/// output crosses between the two backdrops.
+fn shell_backdrop_validated_scene<'a>(
+    scene: &'a compositor::ResolvedEffectScene,
+    commands: &[super::super::geometry::EglDrawCommand],
+    layers: &[super::super::effects::CaptureLayer],
+    visual_groups: &[Option<compositor::VisualGroupId>],
+) -> std::borrow::Cow<'a, compositor::ResolvedEffectScene> {
+    let is_shell_candidate = |instance: &compositor::ResolvedEffectInstance| {
+        instance.backdrop_reuse == compositor::EffectBackdropReuse::PrecomputedShellCandidate
+    };
+    if !scene.instances.iter().any(is_shell_candidate) {
+        return std::borrow::Cow::Borrowed(scene);
+    }
+    let point_start = scene.shared_backdrop_point.and_then(|point| {
+        let (start, _) = super::super::effects::composition_range_with_metadata(
+            commands,
+            layers,
+            visual_groups,
+            point.anchor,
+            Some(point.visual_group),
+            compositor::EffectAnchorScope::VisualGroup,
+        );
+        (start < commands.len()).then_some(start)
+    });
+    let keeps_shared_backdrop = |instance: &compositor::ResolvedEffectInstance| {
+        let Some(point_start) = point_start else {
+            return false;
+        };
+        let (anchor_start, _) = super::super::effects::composition_range_with_metadata(
+            commands,
+            layers,
+            visual_groups,
+            instance.anchor,
+            instance.visual_group,
+            instance.anchor_scope,
+        );
+        let bounds = instance.target_bounds;
+        let bounds =
+            super::super::damage::OutputRect::new(bounds.x, bounds.y, bounds.width, bounds.height);
+        point_start <= anchor_start
+            && anchor_start <= commands.len()
+            && commands[point_start..anchor_start]
+                .iter()
+                .all(|command| !command.bounds.intersects_output_rect(bounds))
+    };
+    if scene
+        .instances
+        .iter()
+        .filter(|instance| is_shell_candidate(instance))
+        .all(|instance| keeps_shared_backdrop(instance))
+    {
+        return std::borrow::Cow::Borrowed(scene);
+    }
+    let mut validated = scene.clone();
+    for instance in &mut validated.instances {
+        if is_shell_candidate(instance) && !keeps_shared_backdrop(instance) {
+            instance.backdrop_reuse = compositor::EffectBackdropReuse::Exact;
+            instance.signature =
+                instance.signature.wrapping_mul(0x0000_0100_0000_01b3) ^ 0x5348_454c_4c45_5843;
+        }
+    }
+    std::borrow::Cow::Owned(validated)
+}
+
 fn surface_draw_diagnostic_identity(surface: &RenderableSurface) -> SurfaceDrawDiagnosticIdentity {
     let dmabuf = surface.dmabuf_handle();
     let size = surface.buffer_size();
@@ -562,8 +632,14 @@ impl FramePipeline<'_> {
                 self.effects.canonical_blur_semantics_policy,
                 debug_config.kawase_mode(),
             );
-            match compile_frame_execution_variants_with_options(
+            let effect_scene = shell_backdrop_validated_scene(
                 request.effects,
+                &self.scene.commands,
+                &self.scene.capture_layers,
+                &self.scene.capture_visual_groups,
+            );
+            match compile_frame_execution_variants_with_options(
+                &effect_scene,
                 &effect_source_damage,
                 output_bounds,
                 &self.effects.effect_registry,
